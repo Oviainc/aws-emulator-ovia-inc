@@ -254,7 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
             .unwrap_or_default();
         let output = render(&updated, size);
-        state.pricing_plans.insert(plan_arn.clone(), updated);
+        // A read of a pricing plan is scoped to a billing period, so the write is stored
+        // as the plan's CURRENT generation and the generation it replaces is kept when
+        // this write lands in a later period than that one started in: a closed period
+        // still reports the plan as it stood then
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_plan`).
+        state.put_pricing_plan(updated);
 
         // The audit record for a state-changing call: who asked, what changed and that
         // it succeeded. Never a secret, and never a `@sensitive` member (the plan's name

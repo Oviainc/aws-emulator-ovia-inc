@@ -47,6 +47,9 @@ mod channel_placement_group_deletion;
 #[path = "all/channel_placement_group_listing.rs"]
 mod channel_placement_group_listing;
 
+#[path = "all/channel_placement_group_node_resolution.rs"]
+mod channel_placement_group_node_resolution;
+
 #[path = "all/channel_placement_group_update.rs"]
 mod channel_placement_group_update;
 

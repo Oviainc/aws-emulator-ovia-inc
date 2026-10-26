@@ -276,17 +276,30 @@
 //! at. The shape carries no status member: AWS hands a trust provider back ready, so the
 //! clock owes it no transition and there is nothing to derive on read.
 //!
-//! ## Verified Access groups and endpoints
+//! ## Verified Access instances, groups and endpoints
+//!
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_instances`] holds the account's Verified
+//! Access instances as the modelled [`crate::ops::types::VerifiedAccessInstance`] shape
+//! itself, keyed by `VerifiedAccessInstanceId` in a [`BTreeMap`], and
+//! [`ComAmazonawsEc2Amazonec2State::insert_verified_access_instance`] is the one way an
+//! instance is stored. A group resolves the instance it is created on there, so an id that
+//! names no instance of the account is refused
+//! ([`invalid_verified_access_instance_id_not_found`]) rather than stored as a dangling
+//! reference. The store starts EMPTY and that writer sits ahead of the operation that will
+//! call it — `CreateVerifiedAccessInstance` is still a scaffold stub with its own open issue
+//! — exactly as [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] stands ahead of
+//! `CreateNetworkInterface`.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_groups`] holds the account's Verified
-//! Access groups as the modelled [`crate::ops::types::VerifiedAccessGroup`] shape itself,
-//! keyed by `VerifiedAccessGroupId`, and
+//! Access groups as [`VerifiedAccessGroupRecord`]s, keyed by `VerifiedAccessGroupId`, and
 //! [`ComAmazonawsEc2Amazonec2State::insert_verified_access_group`] is the one way a group is
 //! stored: it derives every member the service owns (the group id, its ARN and the owning
-//! account) rather than taking them from a caller. That writer sits ahead of the operation
-//! that will call it — `CreateVerifiedAccessGroup` is still a scaffold stub with its own
-//! open issue — exactly as [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] does,
-//! so the create lands on this one record rather than on a second copy of a group beside it.
+//! account) rather than taking them from a caller, so `CreateVerifiedAccessGroup` and a
+//! describe of the groups cannot report one group differently. The record is the modelled
+//! [`crate::ops::types::VerifiedAccessGroup`] shape the create answers with, plus the
+//! group-level policy document that shape carries no member for
+//! ([`VerifiedAccessGroupRecord::policy_document`]), which `GetVerifiedAccessGroupPolicy`
+//! reports — kept beside the view exactly as an endpoint's own document is.
 //! An endpoint resolves the group it is attached to here, and reads the instance the group
 //! belongs to off that record, so one endpoint cannot name an instance its group does not.
 //!
@@ -2327,10 +2340,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// minted, so a repeat of the same request answers with that trust provider instead
     /// of creating a second one.
     pub verified_access_trust_provider_client_tokens: HashMap<String, String>,
-    /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as the
-    /// modelled [`crate::ops::types::VerifiedAccessGroup`] shape itself — see the module
-    /// docs. Ordered by id, the order a describe of the groups reports and pages over.
-    pub verified_access_groups: BTreeMap<String, crate::ops::types::VerifiedAccessGroup>,
+    /// Every Verified Access instance the account holds, by `VerifiedAccessInstanceId`, as
+    /// the modelled [`crate::ops::types::VerifiedAccessInstance`] shape itself — see the
+    /// module docs. Ordered by id, the order a describe of the instances reports and pages
+    /// over.
+    pub verified_access_instances: BTreeMap<String, crate::ops::types::VerifiedAccessInstance>,
+    /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as
+    /// [`VerifiedAccessGroupRecord`]s — see the module docs. Ordered by id, the order a
+    /// describe of the groups reports and pages over.
+    pub verified_access_groups: BTreeMap<String, VerifiedAccessGroupRecord>,
+    /// A `CreateVerifiedAccessGroup` `ClientToken` and the group id it minted, so a repeat
+    /// of the same request answers with that group instead of creating a second one.
+    pub verified_access_group_client_tokens: HashMap<String, String>,
     /// Every Verified Access endpoint the account holds, by `VerifiedAccessEndpointId`, as
     /// [`VerifiedAccessEndpointRecord`]s — see the module docs. Ordered by id, which is the
     /// order `DescribeVerifiedAccessEndpoints` reports and pages over.
@@ -2973,8 +2994,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             carrier_gateway_client_tokens: HashMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
-            // A fresh account has created no Verified Access group and no endpoint on one.
+            // A fresh account has created no Verified Access instance, no group on one and
+            // no endpoint on a group.
+            verified_access_instances: BTreeMap::new(),
             verified_access_groups: BTreeMap::new(),
+            verified_access_group_client_tokens: HashMap::new(),
             verified_access_endpoints: BTreeMap::new(),
             verified_access_endpoint_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
@@ -6936,7 +6960,7 @@ impl ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_tables,
             transit_gateways,
             verified_access_endpoints => view,
-            verified_access_groups,
+            verified_access_groups => view,
             volumes => view,
             vpc_block_public_access_exclusions => view,
             vpc_endpoint_services,
@@ -12356,13 +12380,45 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 // =============================================================================
-// Verified Access groups and endpoints
+// Verified Access instances, groups and endpoints
 // =============================================================================
+
+/// The id prefix a Verified Access instance is minted under: EC2 names an instance's ids
+/// `vai-<hex>`, the same `<prefix>-<hex>` form every other EC2 resource id takes, so
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
+pub const VERIFIED_ACCESS_INSTANCE_ID_PREFIX: &str = "vai";
 
 /// The id prefix a Verified Access group is minted under: EC2 names a group's ids
 /// `vagr-<hex>`, the same `<prefix>-<hex>` form every other EC2 resource id takes, so
 /// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
 pub const VERIFIED_ACCESS_GROUP_ID_PREFIX: &str = "vagr";
+
+/// The one `ResourceType` a `CreateVerifiedAccessGroup` tag specification may name: "The
+/// tags to assign to the Verified Access group"
+/// (`CreateVerifiedAccessGroupRequest$TagSpecifications`), spelled as the modelled
+/// `ResourceType` enum spells it (`smithy_query(query="shape",shape="ResourceType")`).
+pub const VERIFIED_ACCESS_GROUP_TAGGABLE_RESOURCE: &str = "verified-access-group";
+
+/// How many Verified Access groups this emulator stores before `CreateVerifiedAccessGroup`
+/// is refused.
+///
+/// CHOSEN, like [`MAX_VERIFIED_ACCESS_ENDPOINTS`] and for the same reason: nothing in this
+/// emulator reclaims a stored group, so the store needs a ceiling that is not the process's
+/// memory. Well above the published per-Region Verified Access quota a test would exercise.
+/// A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] — so the
+/// caller-chosen bytes of each record are charged against that budget too
+/// ([`verified_access_group_payload_bytes`]).
+pub const MAX_VERIFIED_ACCESS_GROUPS: usize = 1_000;
+
+/// EC2's code for a Verified Access instance id that names no instance of the account,
+/// named the way [`INVALID_VERIFIED_ACCESS_GROUP_ID_NOT_FOUND`] is.
+pub const INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND: &str =
+    "InvalidVerifiedAccessInstanceId.NotFound";
+
+/// EC2's quota code for one Verified Access group too many, named the way every other
+/// per-resource EC2 quota code is (`VolumeLimitExceeded`,
+/// `VerifiedAccessEndpointLimitExceeded`).
+pub const VERIFIED_ACCESS_GROUP_LIMIT_EXCEEDED: &str = "VerifiedAccessGroupLimitExceeded";
 
 /// The id prefix a Verified Access endpoint is minted under: `vae-<hex>`, beside the
 /// group's [`VERIFIED_ACCESS_GROUP_ID_PREFIX`] and the trust provider's
@@ -12520,13 +12576,36 @@ pub struct VerifiedAccessEndpointRecord {
     pub policy_document: Option<String>,
 }
 
+/// One stored Verified Access group: the modelled shape every operation that reports one
+/// answers with, plus the one fact that shape carries no member for.
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedAccessGroupRecord {
+    /// The group as `CreateVerifiedAccessGroup` answered it and a describe of the groups
+    /// reports it.
+    pub view: crate::ops::types::VerifiedAccessGroup,
+    /// "The Verified Access policy document"
+    /// (`CreateVerifiedAccessGroupRequest$PolicyDocument`), which the modelled group shape
+    /// carries no member for: `GetVerifiedAccessGroupPolicy` is what reports it (still a
+    /// scaffold stub with its own open issue). Kept here so the document the create accepted
+    /// is the one that reader will answer with, rather than dropped on the floor.
+    pub policy_document: Option<String>,
+}
+
 /// The caller-chosen bytes one stored Verified Access group holds for the process's
-/// lifetime: its tags, its description and the key ARN its SSE block names. The id, the ARN
-/// and the owning account are derived by
+/// lifetime: its tags, its description, the key ARN its SSE block names, the policy document
+/// beside the view and the client token the token map keeps. The id, the ARN and the owning
+/// account are derived by
 /// [`ComAmazonawsEc2Amazonec2State::insert_verified_access_group`], and the timestamps are
 /// this module's own, so they are bounded already and not counted here.
-pub fn verified_access_group_payload_bytes(group: &crate::ops::types::VerifiedAccessGroup) -> usize {
+///
+/// ONE definition of the charge, computed identically by the create's ceiling pre-check and
+/// by that insert, so a writer cannot store bytes the store's budget never saw.
+pub fn verified_access_group_payload_bytes(
+    record: &VerifiedAccessGroupRecord,
+    client_token: Option<&str>,
+) -> usize {
     let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let group = &record.view;
     tag_list_bytes(group.tags.as_deref().unwrap_or_default())
         .saturating_add(text(&group.description))
         .saturating_add(
@@ -12534,6 +12613,25 @@ pub fn verified_access_group_payload_bytes(group: &crate::ops::types::VerifiedAc
                 .sse_specification
                 .as_ref()
                 .map_or(0, |sse| text(&sse.kms_key_arn)),
+        )
+        .saturating_add(text(&record.policy_document))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// The caller-chosen bytes one stored Verified Access instance holds for the process's
+/// lifetime: its tags, its description and the custom subdomain it was given. The id and
+/// the timestamps are the service's own, so they are bounded already and not counted here.
+pub fn verified_access_instance_payload_bytes(
+    instance: &crate::ops::types::VerifiedAccessInstance,
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    tag_list_bytes(instance.tags.as_deref().unwrap_or_default())
+        .saturating_add(text(&instance.description))
+        .saturating_add(
+            instance
+                .cidr_endpoints_custom_sub_domain
+                .as_ref()
+                .map_or(0, |subdomain| text(&subdomain.sub_domain)),
         )
 }
 
@@ -12643,6 +12741,27 @@ pub fn invalid_verified_access_endpoint_id_not_found<E>(
     )
 }
 
+/// Refuse a request that named a Verified Access instance id this account holds no instance
+/// for: HTTP 400 [`INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND`], worded like
+/// [`invalid_verified_access_group_id_not_found`].
+pub fn invalid_verified_access_instance_id_not_found<E>(
+    instance_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND,
+        400,
+        format!("The verified-access-instance ID '{instance_id}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_VERIFIED_ACCESS_GROUPS`]: HTTP 400
+/// [`VERIFIED_ACCESS_GROUP_LIMIT_EXCEEDED`].
+pub fn verified_access_group_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(VERIFIED_ACCESS_GROUP_LIMIT_EXCEEDED, 400, message)
+}
+
 /// Refuse a create that would take the store past [`MAX_VERIFIED_ACCESS_ENDPOINTS`]: HTTP
 /// 400 [`VERIFIED_ACCESS_ENDPOINT_LIMIT_EXCEEDED`].
 pub fn verified_access_endpoint_limit_exceeded<E>(
@@ -12656,26 +12775,67 @@ pub fn verified_access_endpoint_limit_exceeded<E>(
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// Store `group` under a freshly minted `VerifiedAccessGroupId`, derive the members the
+    /// Store `instance` under a freshly minted `VerifiedAccessInstanceId`, write that id onto
+    /// the record, charge the caller-chosen bytes it retains against the store's byte budget,
+    /// and answer the id it was given.
+    ///
+    /// The one way an instance is stored, so two writers cannot report one instance
+    /// differently. `CreateVerifiedAccessInstance` is still a scaffold stub with its own open
+    /// issue; this seam is what it will call, and what a test seeds an instance through,
+    /// exactly as [`Self::insert_network_interface`] stands ahead of
+    /// `CreateNetworkInterface`.
+    pub fn insert_verified_access_instance(
+        &mut self,
+        mut instance: crate::ops::types::VerifiedAccessInstance,
+    ) -> String {
+        let instance_id = self.next_id(VERIFIED_ACCESS_INSTANCE_ID_PREFIX);
+        instance.verified_access_instance_id = Some(instance_id.clone());
+        self.add_stored_bytes(verified_access_instance_payload_bytes(&instance));
+        self.verified_access_instances
+            .insert(instance_id.clone(), instance);
+        instance_id
+    }
+
+    /// Whether another Verified Access group fits inside the store's ceiling
+    /// ([`MAX_VERIFIED_ACCESS_GROUPS`]).
+    ///
+    /// The same contract as [`Self::has_verified_access_endpoint_capacity`]: a create asks
+    /// first and refuses with [`verified_access_group_limit_exceeded`] when it answers
+    /// `false`.
+    pub fn has_verified_access_group_capacity(&self) -> bool {
+        self.verified_access_groups.len() < MAX_VERIFIED_ACCESS_GROUPS
+    }
+
+    /// Store `record` under a freshly minted `VerifiedAccessGroupId`, derive the members the
     /// SERVICE owns on it — the id, the ARN that id and `region` build
     /// ([`verified_access_group_arn`]) and the owning account — charge the caller-chosen
-    /// bytes it retains against the store's byte budget, and answer the id it was given.
+    /// bytes it and `client_token` retain against the store's byte budget, and answer the id
+    /// it was given.
     ///
-    /// The one way a group is stored, so two writers cannot report one group differently.
-    /// `CreateVerifiedAccessGroup` is still a scaffold stub with its own open issue; this
-    /// seam is what it will call, and what a test seeds a group through, exactly as
-    /// [`Self::insert_network_interface`] stands ahead of `CreateNetworkInterface`.
+    /// The one way a group is stored, so two writers cannot report one group differently:
+    /// `CreateVerifiedAccessGroup` lands here, and a test seeds a group through the same
+    /// seam. The charge happens at the insert the way
+    /// [`Self::insert_verified_access_endpoint`] charges an endpoint's, so no path can store
+    /// those bytes uncharged, and it is the SAME figure
+    /// [`verified_access_group_payload_bytes`] gives the create's pre-check — so a create
+    /// still asks [`Self::has_verified_access_group_capacity`] and
+    /// [`Self::would_exceed_stored_bytes`] first and cannot overshoot either ceiling.
     pub fn insert_verified_access_group(
         &mut self,
-        mut group: crate::ops::types::VerifiedAccessGroup,
+        mut record: VerifiedAccessGroupRecord,
         region: &str,
+        client_token: Option<&str>,
     ) -> String {
         let group_id = self.next_id(VERIFIED_ACCESS_GROUP_ID_PREFIX);
-        group.verified_access_group_id = Some(group_id.clone());
-        group.verified_access_group_arn = Some(verified_access_group_arn(region, &group_id));
-        group.owner = Some(::engine::emulator_account_id().to_string());
-        self.add_stored_bytes(verified_access_group_payload_bytes(&group));
-        self.verified_access_groups.insert(group_id.clone(), group);
+        record.view.verified_access_group_id = Some(group_id.clone());
+        record.view.verified_access_group_arn = Some(verified_access_group_arn(region, &group_id));
+        record.view.owner = Some(::engine::emulator_account_id().to_string());
+        self.add_stored_bytes(verified_access_group_payload_bytes(&record, client_token));
+        if let Some(token) = client_token {
+            self.verified_access_group_client_tokens
+                .insert(token.to_string(), group_id.clone());
+        }
+        self.verified_access_groups.insert(group_id.clone(), record);
         group_id
     }
 

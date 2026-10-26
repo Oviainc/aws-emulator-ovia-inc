@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the resource policy away from one Bedrock resource of this account.
+//!
+//! The counterpart of `PutResourcePolicy`: a resource holds at most ONE resource policy,
+//! so this call needs nothing but the resource's ARN to say WHICH document it removes,
+//! and after it that resource is governed by no resource policy — `GetResourcePolicy`
+//! reports the member absent.
+//!
+//! Two answers, as the model separates them:
+//!
+//! * an ARN naming a resource this account HOLDS is 200 with an EMPTY body, whether or
+//!   not a policy was attached. The operation is `@idempotent`, so repeating it must have
+//!   the effect of running it once — which makes "no policy is attached" the state this
+//!   call establishes rather than a failure, exactly as a second delete of a document the
+//!   first one removed is not one;
+//! * an ARN naming no resource of this account is 404 `ResourceNotFoundException` — the
+//!   error the model declares for an ARN that was not found, with the sentence it writes
+//!   for it ([`NO_SUCH_RESOURCE`]). The ARN is resolved through the ONE resolution of a
+//!   caller-supplied resource ARN in this service
+//!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::policy_resource`]),
+//!   the one the put and the read resolve theirs through, so this call reaches exactly the
+//!   resources they reach.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +121,15 @@ impl From<DeleteResourcePolicyErrorModeled> for DeleteResourcePolicyError {
     }
 }
 
+/// What this operation's 404 states for an ARN naming no resource of this account: the
+/// sentence the MODEL writes for `ResourceNotFoundException`
+/// (`smithy_query(query="doc",shape="ResourceNotFoundException")`), word for word. Fixed
+/// text with no variable part — the error names the ARN class, and the ARN the request
+/// carried is already the one the caller sent.
+const NO_SUCH_RESOURCE: &str = "The specified resource Amazon Resource Name (ARN) was not \
+                                found. Check the Amazon Resource Name (ARN) and try your \
+                                request again.";
+
 /// The `DeleteResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +166,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "resource policy state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The ARN first: a 404 reports an ARN naming no resource of this account, which is
+        // a different thing from a resource that carries no policy to remove.
+        let Some(resource) = store.policy_resource(&input.resource_arn, &region, now) else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(NO_SUCH_RESOURCE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The document in force, if any, is gone — and a resource that held none is left
+        // holding none, which is what makes repeating this call the same as making it
+        // once.
+        store.detach_resource_policy(&resource);
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }

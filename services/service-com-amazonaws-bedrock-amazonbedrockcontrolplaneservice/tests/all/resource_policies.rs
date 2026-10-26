@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The resource policy end-to-end: `PutResourcePolicy` attaches one,
-//! `GetResourcePolicy` reads it back, over the same `MultiServiceRouter` the emulator
-//! boots.
+//! `GetResourcePolicy` reads it back and `DeleteResourcePolicy` takes it away, over the
+//! same `MultiServiceRouter` the emulator boots.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than over one
 //! recorded request:
@@ -29,12 +29,22 @@
 //!    account — including a resource that was deleted — is 404
 //!    `ResourceNotFoundException`: a read never reports a grant on a resource that no
 //!    longer exists, and never reports a found resource as missing.
+//! 6. **A delete leaves the resource it names governed by no policy, and only that one** —
+//!    over the same resource types and document forms the attach spans, after which the
+//!    read reports the member absent and a further put attaches again; the delete is
+//!    `@idempotent`, so repeating it, or making it on a resource that holds no policy, is
+//!    the same 200 as making it once, and the other resources keep their documents.
+//! 7. **A delete reaches exactly the resources the put and the read reach** — either ARN
+//!    spelling of one resource removes the one policy, while an ARN naming no resource of
+//!    this account (including a resource that was deleted) is 404
+//!    `ResourceNotFoundException` with the sentence the model writes for it.
 //!
 //! The status codes and error shapes come from the model
-//! (`smithy_query(query="operation",operation="PutResourcePolicy,GetResourcePolicy")`:
+//! (`smithy_query(query="operation",operation="PutResourcePolicy,GetResourcePolicy,DeleteResourcePolicy")`:
 //! `POST /resource-policy` -> 201 with `resourceArn`, `GET /resource-policy/{resourceArn}`
-//! -> 200 with `resourcePolicy`, `ValidationException` 400 on the put and
-//! `ResourceNotFoundException` 404 on the read). The requests go through
+//! -> 200 with `resourcePolicy`, `DELETE /resource-policy/{resourceArn}` -> 200 with no
+//! members and `@idempotent`, `ValidationException` 400 on the put and
+//! `ResourceNotFoundException` 404 on the read and the delete). The requests go through
 //! `crate::support` — the ONE harness every suite in this crate drives the emulator with.
 
 use serde_json::json;
@@ -57,6 +67,15 @@ async fn put_policy(emu: &Emulator, resource_arn: &str, document: &str) -> Reply
 async fn get_policy(emu: &Emulator, resource_arn: &str) -> Reply {
     emu.call(
         "GET",
+        &format!("/resource-policy/{}", label(resource_arn)),
+        None,
+    )
+    .await
+}
+
+async fn delete_policy(emu: &Emulator, resource_arn: &str) -> Reply {
+    emu.call(
+        "DELETE",
         &format!("/resource-policy/{}", label(resource_arn)),
         None,
     )
@@ -658,4 +677,380 @@ async fn a_policy_is_reported_no_longer_once_its_resource_is_deleted() {
         "case \"deleted guardrail after a later put\": still 404, got {} {:?}",
         read.status, read.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 6 + 7. `DeleteResourcePolicy` takes the policy away.
+// ---------------------------------------------------------------------------------------
+
+/// The sentence the model writes for `ResourceNotFoundException`
+/// (`smithy_query(query="doc",shape="ResourceNotFoundException")`), which is what the
+/// delete and the read both state for an ARN naming no resource of this account.
+const NO_SUCH_RESOURCE: &str = "The specified resource Amazon Resource Name (ARN) was not \
+                                found. Check the Amazon Resource Name (ARN) and try your \
+                                request again.";
+
+/// Assert one delete was ACCEPTED: `DELETE /resource-policy/{resourceArn}` is modelled
+/// `-> 200` with an output carrying no members, so the answer is that status, no error
+/// code, and nothing of a policy in the body.
+fn assert_accepted_delete(case: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: DeleteResourcePolicy must answer 200, got {} {:?}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error, None,
+        "case {case:?}: an accepted delete carries no error code, got {:?}",
+        reply.error
+    );
+    assert_eq!(
+        reply.get("resourcePolicy"),
+        json!(null),
+        "case {case:?}: the delete's output models no members, got {:?}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn every_resource_type_and_policy_form_is_taken_away_by_the_delete() {
+    let emu = emulator();
+    // The same dimensions the attach is asserted over: one resource of each type this
+    // service mints an ARN for, each in turn carrying every form a policy document is
+    // written in. What the delete removes is the resource's policy, whatever document it
+    // is and whichever resource holds it.
+    let resources = [
+        ("guardrail", guardrail_arn(&emu, "deleted-policy-guardrail").await),
+        (
+            "prompt router",
+            prompt_router_arn(&emu, "deleted-policy-router").await,
+        ),
+        (
+            "provisioned throughput",
+            provisioned_model_arn(&emu, "deleted-policy-provisioned").await,
+        ),
+    ];
+
+    for (resource, arn) in &resources {
+        for (form, document) in admitted_documents() {
+            let case = format!("{resource} / {form}");
+            let put = put_policy(&emu, arn, &document).await;
+            assert_eq!(
+                put.status, 201,
+                "case {case:?}: PutResourcePolicy must answer 201, got {} {:?}",
+                put.status, put.body
+            );
+
+            let removed = delete_policy(&emu, arn).await;
+            assert_accepted_delete(&case, &removed);
+
+            // The resource is still HELD — so it is found — and now governed by no
+            // policy, which the read reports as the member being absent.
+            let read = get_policy(&emu, arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: the resource is still held after the delete, got {} {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.get("resourcePolicy"),
+                json!(null),
+                "case {case:?}: the deleted policy is reported no longer, got {:?}",
+                read.body
+            );
+
+            // And a further put attaches again, so the delete removed the document
+            // rather than barring the resource from holding one.
+            put_policy(&emu, arn, &document).await;
+            let reattached = get_policy(&emu, arn).await;
+            assert_eq!(
+                reattached.text("resourcePolicy"),
+                document,
+                "case {case:?}: a put after the delete attaches again, got {:?}",
+                reattached.body
+            );
+            delete_policy(&emu, arn).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeating_the_delete_has_the_effect_of_making_it_once() {
+    // The operation is `@idempotent`: a repeat, and a delete on a resource that holds no
+    // policy at all, are the same accepted answer as the first delete — the call
+    // establishes "this resource is governed by no policy" rather than consuming a
+    // document that must be there.
+    let emu = emulator();
+    let rows = [
+        (
+            "guardrail",
+            guardrail_arn(&emu, "idempotent-delete-guardrail").await,
+        ),
+        (
+            "prompt router",
+            prompt_router_arn(&emu, "idempotent-delete-router").await,
+        ),
+        (
+            "provisioned throughput",
+            provisioned_model_arn(&emu, "idempotent-delete-provisioned").await,
+        ),
+    ];
+    let document = admitted_documents()[0].1.clone();
+
+    for (resource, arn) in &rows {
+        // A resource that never held a policy: the delete is accepted all the same.
+        for attempt in 1..=3 {
+            let case = format!("{resource} / never attached / delete #{attempt}");
+            let removed = delete_policy(&emu, arn).await;
+            assert_accepted_delete(&case, &removed);
+            let read = get_policy(&emu, arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: the resource is untouched by the delete, got {} {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.get("resourcePolicy"),
+                json!(null),
+                "case {case:?}: it still holds no policy, got {:?}",
+                read.body
+            );
+        }
+
+        // And a resource that DID hold one: the first delete removes it and every
+        // repeat answers exactly as that first one did.
+        put_policy(&emu, arn, &document).await;
+        for attempt in 1..=3 {
+            let case = format!("{resource} / attached / delete #{attempt}");
+            let removed = delete_policy(&emu, arn).await;
+            assert_accepted_delete(&case, &removed);
+            let read = get_policy(&emu, arn).await;
+            assert_eq!(
+                read.get("resourcePolicy"),
+                json!(null),
+                "case {case:?}: the policy stays removed, got {:?}",
+                read.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_delete_takes_away_only_the_named_resources_policy() {
+    // Each resource holds its OWN policy, so a delete is addressed to one of them: the
+    // rows are three resources of different types, each carrying a different document,
+    // deleted one at a time.
+    let emu = emulator();
+    let documents = admitted_documents();
+    assert!(
+        documents.len() >= 3,
+        "case \"the document table\": this test gives each of the three resources a \
+         DIFFERENT document, so the table needs at least three rows, got {}",
+        documents.len()
+    );
+    let rows = [
+        (
+            "guardrail",
+            guardrail_arn(&emu, "one-of-many-guardrail").await,
+            documents[0].1.clone(),
+        ),
+        (
+            "prompt router",
+            prompt_router_arn(&emu, "one-of-many-router").await,
+            documents[1].1.clone(),
+        ),
+        (
+            "provisioned throughput",
+            provisioned_model_arn(&emu, "one-of-many-provisioned").await,
+            documents[2].1.clone(),
+        ),
+    ];
+    for (_, arn, document) in &rows {
+        put_policy(&emu, arn, document).await;
+    }
+
+    let mut removed_so_far: Vec<&str> = Vec::new();
+    for (case, arn, _) in &rows {
+        let removed = delete_policy(&emu, arn).await;
+        assert_accepted_delete(case, &removed);
+        removed_so_far.push(arn);
+
+        for (other, other_arn, other_document) in &rows {
+            let read = get_policy(&emu, other_arn).await;
+            let expected = if removed_so_far.contains(&other_arn.as_str()) {
+                json!(null)
+            } else {
+                json!(other_document)
+            };
+            assert_eq!(
+                read.get("resourcePolicy"),
+                expected,
+                "case {case:?} deleted / {other:?} read: expected {expected:?}, got {:?}",
+                read.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delete_under_either_arn_spelling_removes_the_one_policy() {
+    // A policy is attached to the RESOURCE, not to one spelling of its ARN, so a delete
+    // under either spelling of a prompt router's ARN removes the policy the other
+    // spelling reports — the same two spellings this service's ARN resolution reads.
+    let emu = emulator();
+    let router = prompt_router_arn(&emu, "delete-two-spellings").await;
+    let other_spelling = router.replace(":default-prompt-router/", ":prompt-router/");
+    let document = admitted_documents()[0].1.clone();
+
+    for (case, written, deleted_through, read_through) in [
+        (
+            "put under the ARN, deleted under the alias",
+            &router,
+            &other_spelling,
+            &router,
+        ),
+        (
+            "put under the alias, deleted under the ARN",
+            &other_spelling,
+            &router,
+            &other_spelling,
+        ),
+    ] {
+        put_policy(&emu, written, &document).await;
+        let read = get_policy(&emu, read_through).await;
+        assert_eq!(
+            read.text("resourcePolicy"),
+            document,
+            "case {case:?}: the policy is attached before the delete, got {:?}",
+            read.body
+        );
+
+        let removed = delete_policy(&emu, deleted_through).await;
+        assert_accepted_delete(case, &removed);
+
+        let read = get_policy(&emu, read_through).await;
+        assert_eq!(
+            read.get("resourcePolicy"),
+            json!(null),
+            "case {case:?}: both spellings address the one policy, got {:?}",
+            read.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_naming_no_resource_of_this_account_is_not_found_on_the_delete() {
+    let emu = emulator();
+    let held = guardrail_arn(&emu, "held-for-delete").await;
+    let document = admitted_documents()[0].1.clone();
+    put_policy(&emu, &held, &document).await;
+    let router = prompt_router_arn(&emu, "held-router-for-delete").await;
+    let router_id = router
+        .rsplit_once(":default-prompt-router/")
+        .expect("a prompt router ARN carries its id")
+        .1
+        .to_string();
+
+    // The rows differ along what the rule generalises over: the ARN's vendor, region,
+    // account, resource type and resource id, plus a value that is no ARN at all.
+    let rows = [
+        (
+            "another vendor's resource",
+            format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:endpoint/x"),
+        ),
+        (
+            "the same prompt router id in another region",
+            format!("arn:aws:bedrock:eu-west-1:{ACCOUNT}:default-prompt-router/{router_id}"),
+        ),
+        (
+            "the same prompt router id in another account",
+            format!("arn:aws:bedrock:{REGION}:000000000001:default-prompt-router/{router_id}"),
+        ),
+        (
+            "a guardrail id nothing minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:guardrail/zzzzzzzzzzzz"),
+        ),
+        (
+            "a Bedrock resource type nothing created",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/zzzzzzzzzzzz"),
+        ),
+        (
+            "an evaluation job nothing created",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:evaluation-job/zzzzzzzzzzzz"),
+        ),
+        ("text that is no ARN", "not-an-arn".to_string()),
+    ];
+
+    for (case, resource_arn) in rows {
+        let removed = delete_policy(&emu, &resource_arn).await;
+        assert_eq!(
+            removed.status, 404,
+            "case {case:?}: an ARN naming no resource of this account is 404, got {} {:?}",
+            removed.status, removed.body
+        );
+        assert_eq!(
+            removed.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: the refusal is the modelled ResourceNotFoundException, got {:?}",
+            removed.error
+        );
+        let stated = removed.text("message");
+        assert_eq!(
+            stated, NO_SUCH_RESOURCE,
+            "case {case:?}: expected {NO_SUCH_RESOURCE:?}, got {stated:?}"
+        );
+    }
+
+    // None of those refusals touched the policy the HELD resource carries.
+    let read = get_policy(&emu, &held).await;
+    assert_eq!(
+        read.text("resourcePolicy"),
+        document,
+        "case \"held guardrail\": a refused delete removes nothing, got {:?}",
+        read.body
+    );
+}
+
+#[tokio::test]
+async fn a_resource_that_was_deleted_is_not_found_on_the_delete() {
+    // A resource that is gone holds no policy to remove, and it is no resource of this
+    // account either: the delete is the same 404 the read answers for it.
+    let emu = emulator();
+    let deleted = guardrail_arn(&emu, "gone-before-the-delete").await;
+    let kept = guardrail_arn(&emu, "kept-across-the-delete").await;
+    let document = admitted_documents()[0].1.clone();
+    put_policy(&emu, &deleted, &document).await;
+    put_policy(&emu, &kept, &document).await;
+
+    let removed = emu.delete(&deleted, None).await;
+    assert_eq!(
+        removed.status, 202,
+        "case \"delete the guardrail\": DeleteGuardrail must answer 202, got {} {:?}",
+        removed.status, removed.body
+    );
+
+    let policy_delete = delete_policy(&emu, &deleted).await;
+    assert_eq!(
+        policy_delete.status, 404,
+        "case \"deleted guardrail\": its policy delete is 404, got {} {:?}",
+        policy_delete.status, policy_delete.body
+    );
+    assert_eq!(
+        policy_delete.error.as_deref(),
+        Some("ResourceNotFoundException"),
+        "case \"deleted guardrail\": the refusal is the modelled ResourceNotFoundException, \
+         got {:?}",
+        policy_delete.error
+    );
+
+    // The resource that remains keeps its own document, and its delete is accepted.
+    let read = get_policy(&emu, &kept).await;
+    assert_eq!(
+        read.text("resourcePolicy"),
+        document,
+        "case \"kept guardrail\": the other resource keeps its policy, got {:?}",
+        read.body
+    );
+    let accepted = delete_policy(&emu, &kept).await;
+    assert_accepted_delete("kept guardrail", &accepted);
 }

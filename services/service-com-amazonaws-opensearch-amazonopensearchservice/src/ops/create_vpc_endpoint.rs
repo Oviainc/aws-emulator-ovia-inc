@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the ONE service-managed VPC endpoint the call asks for, as a
+//! [`crate::state::VpcEndpointRecord`] held beside the domains, and answers with the
+//! stored record through the same `VpcEndpoint` projection `DescribeVpcEndpoints`
+//! reports it with.
+//!
+//! The endpoint can only be minted for a domain this account holds that an endpoint
+//! can reach — the store's one `vpc_endpoint_domain` decides that — and the refusal
+//! names none of the reasons on its own
+//! ([`crate::state::vpc_endpoint_domain_unavailable`]).
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +83,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    stored_vpc_options, vpc_endpoint_domain_unavailable, vpc_endpoint_host, OwedStatus,
+    VpcEndpointRecord, PROVISIONING, VPC_ENDPOINT_QUOTA, VPC_ENDPOINT_STATUS_ACTIVE,
+    VPC_ENDPOINT_STATUS_CREATING,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +163,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcEndpoint"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the endpoints this call reads is materialised
+        // first, so the quota below counts the set at `now`.
+        store.settle_vpc_endpoints(now);
+
+        // "Unique, case-sensitive identifier to ensure idempotency of the request": a
+        // repeat of a create this account already served is answered with the record
+        // the first one made, so a client that retries gets one endpoint rather than
+        // two. A token the account holds a record under for a DIFFERENT domain is not a
+        // repeat of that request at all — it is one token for two creates, which cannot
+        // both be the one the token identifies, so it is the modelled conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(served) = store.vpc_endpoint_of_client_token(token) {
+                if served.domain_arn != input.domain_arn {
+                    return Err(CreateVpcEndpointErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientToken {token} already identifies the endpoint created for \
+                                 {}.",
+                                served.domain_arn
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(CreateVpcEndpointOutput {
+                    vpc_endpoint: served.to_endpoint(),
+                });
+            }
+        }
+
+        // The ONE decision about whether an endpoint can be created for the domain the
+        // ARN names. Resolved before anything is minted, so a refused call leaves the
+        // account's endpoints exactly as they were.
+        let domain = store.vpc_endpoint_domain(&input.domain_arn).ok_or_else(|| {
+            CreateVpcEndpointErrorModeled::ValidationException(vpc_endpoint_domain_unavailable())
+        })?;
+        let domain_name = domain.domain_name.clone();
+        let region = domain.region.clone();
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record, so a caller looping cannot grow the state (or the listing's
+        // answer) without end. `LimitExceededException` is the modelled refusal for
+        // "trying to create more than the allowed number of resources".
+        if store.vpc_endpoints.len() >= VPC_ENDPOINT_QUOTA {
+            return Err(CreateVpcEndpointErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {VPC_ENDPOINT_QUOTA} VPC \
+                         endpoints"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let vpc_endpoint_id = store.mint_vpc_endpoint_id();
+        let suffix = store.mint_endpoint_suffix();
+        let endpoint = VpcEndpointRecord {
+            vpc_endpoint_id,
+            // "The creator of the endpoint", which is the account this emulator serves.
+            owner: ::engine::emulator_account_id().to_string(),
+            domain_arn: input.domain_arn,
+            vpc_options: stored_vpc_options(input.vpc_options),
+            // The endpoint is not up the instant the call returns: it is being
+            // provisioned, and the clock owes it the status that provisioning leaves it
+            // in once the span has passed.
+            status: VPC_ENDPOINT_STATUS_CREATING.to_string(),
+            owed: Some(OwedStatus {
+                status: VPC_ENDPOINT_STATUS_ACTIVE.to_string(),
+                message: None,
+                due: now + PROVISIONING,
+            }),
+            endpoint: vpc_endpoint_host(&domain_name, &suffix, &region),
+            client_token: input.client_token,
+        };
+
+        // Answered from the STORED record, through the projection every read path
+        // reports an endpoint with.
+        Ok(CreateVpcEndpointOutput {
+            vpc_endpoint: store.insert_vpc_endpoint(endpoint).to_endpoint(),
+        })
     }
 }

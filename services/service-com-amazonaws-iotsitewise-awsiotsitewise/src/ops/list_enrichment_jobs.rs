@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnrichmentJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnrichmentJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnrichmentJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! Enumerates the enrichment jobs of ONE workspace, narrowed by the filters the
+//! request carries and paged by `maxResults` / `nextToken`, newest first. A pure
+//! READ: every value a summary reports is derived from the stored job and the
+//! instant the clock has reached ([`crate::state::EnrichmentJobRecord::summary`]),
+//! so a listing moves no job on and two listings of one unchanged store agree.
+//!
+//! One deliberate strictness, recorded here so a failing test is explicable: the
+//! model documents only that `startDate` is exclusive and `endDate` inclusive, and
+//! says nothing about a window whose end precedes its start. Such a window names
+//! no instant at all, so this operation refuses it with the modelled
+//! `InvalidRequestException` — the same answer every other range this service
+//! takes gives — rather than reporting absence as an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -207,20 +213,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnrichmentJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnrichmentJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnrichmentJobs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every value reported below is DERIVED from the stored job and the
+        // instant the clock has reached, so this listing moves no job on and two
+        // readers of one job cannot disagree about where it has got to.
+        let store = state.lock();
+
+        // The listing is scoped to ONE workspace, so that workspace has to exist: a
+        // name this service does not hold is the modelled refusal rather than an
+        // empty page. Resolved BEFORE the filters are read, as every handler in this
+        // crate resolves the resource its path names first, so a request that is
+        // wrong in both ways reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // "You must specify either propertyAlias OR timeSeriesId, but not both.
+        // Attempting to specify both results in an InvalidRequestException." The two
+        // members identify ONE time series, so a request naming both names no job the
+        // way a filter can be satisfied.
+        if input.property_alias.is_some() && input.time_series_id.is_some() {
+            return Err(invalid_request(
+                "You must specify either propertyAlias or timeSeriesId, but not both."
+                    .to_string(),
+            ));
+        }
+
+        // `status` and `jobType` each name a value of a modelled enum, which the
+        // runtime refuses outside its value set BEFORE this handler runs, so a filter
+        // that arrives here names a status or a type this service can report.
+        let status = input.status.as_deref();
+        let job_type = input.job_type.as_deref();
+
+        // "startDate is exclusive, endDate is inclusive", so the date filter is the
+        // half-open range `(startDate, endDate]` — the same window every other range
+        // this service takes spans, and refused the same way when its end precedes
+        // its start, since such a range names no instant at all.
+        let after = input.start_date.as_ref().map(crate::state::date_time_nanos);
+        let until = input.end_date.as_ref().map(crate::state::date_time_nanos);
+        if let (Some(after), Some(until)) = (after, until) {
+            if until < after {
+                return Err(invalid_request(
+                    "The end of the range must not be earlier than its start.".to_string(),
+                ));
+            }
+        }
+
+        // Every job of the named workspace that satisfies every filter the request
+        // carried. The status compared against is the one the CLOCK has made due,
+        // which is the same one the summary reports, so a filtered page can never
+        // disagree with the summaries in it.
+        let mut selected: Vec<&crate::state::EnrichmentJobRecord> = store
+            .enrichment_jobs
+            .values()
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .filter(|record| {
+                input
+                    .dataset_id
+                    .as_deref()
+                    .is_none_or(|wanted| record.dataset_id() == wanted)
+            })
+            .filter(|record| {
+                input
+                    .property_alias
+                    .as_deref()
+                    .is_none_or(|wanted| record.property_alias() == Some(wanted))
+            })
+            .filter(|record| {
+                input
+                    .time_series_id
+                    .as_deref()
+                    .is_none_or(|wanted| record.time_series_id() == Some(wanted))
+            })
+            .filter(|record| status.is_none_or(|wanted| record.status(now) == wanted))
+            .filter(|record| job_type.is_none_or(|wanted| record.job_type() == wanted))
+            .filter(|record| {
+                let created = created_nanos(record);
+                after.is_none_or(|after| created > after)
+                    && until.is_none_or(|until| created <= until)
+            })
+            .collect();
+
+        // "Results are ordered by createdAt timestamp descending (newest first)",
+        // with ties broken by id so two jobs created in the same instant still order
+        // deterministically — which is also what makes `nextToken` resumable.
+        selected.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first job of
+        // the next page, hex-encoded so the token stays opaque to the caller and
+        // keeps the form the member models. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|record| record.job_id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // "Maximum number of jobs to return per page. Defaults to 50 if not
+        // specified." `maxResults` carries the modelled range 1..250, which the
+        // runtime validates BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the
+        // slice arithmetic below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(selected.len());
+        let next_token = selected
+            .get(end)
+            .map(|record| ::hex::encode(record.job_id.as_bytes()));
+
+        // `get` rather than a slice index: the bounds above are derived from the
+        // request, so the page is taken in a form that cannot panic whatever they
+        // resolve to.
+        let page = selected.get(start..end).unwrap_or_default();
+
+        Ok(ListEnrichmentJobsOutput {
+            jobs: page.iter().map(|record| record.summary(now)).collect(),
+            next_token,
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`:
+/// "Defaults to 50 if not specified."
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// When a job was created, in whole nanoseconds since the Unix epoch, so a stored
+/// instant and a modelled `Timestamp` bound compare at one precision.
+fn created_nanos(record: &crate::state::EnrichmentJobRecord) -> i128 {
+    crate::state::date_time_nanos(&crate::state::to_date_time(record.created_at))
+}
+
+/// Decode a `nextToken` back into the `jobId` it resumes from.
+fn decode_token(token: &str) -> Result<String, ListEnrichmentJobsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListEnrichmentJobsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListEnrichmentJobsError {
+    ListEnrichmentJobsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListEnrichmentJobsError {
+    ListEnrichmentJobsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListEnrichmentJobsError {
+    ListEnrichmentJobsErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

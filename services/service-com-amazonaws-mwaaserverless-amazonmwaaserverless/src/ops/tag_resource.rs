@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: ADDS the key-value pairs the request carries to the tag set the resource
+//! the `ResourceArn` names holds in this service's store, and reports the modelled empty
+//! response. Tagging MERGES: a key the resource already carries takes the new value, a
+//! key it does not carry is added, and every key the request does not name keeps the
+//! value it had — so the tag set a later `ListTagsForResource` reports is the union of
+//! what was there and what was sent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags (the entry
+//! count the modelled `Tags` map declares), counted over that union, so a key the
+//! request re-states does not grow the set; a call that would carry the resource past
+//! the ceiling is refused with the modelled `ValidationException` and writes nothing.
+//! A `ResourceArn` this endpoint holds no resource for is the modelled
+//! `ResourceNotFoundException`, answered through [`crate::state::lookup_miss`] like
+//! every other lookup miss in this service.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,30 +166,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the resources created through it.
+        let region = crate::state::request_region(ctx.parts());
 
-        // A member value that fails the constraint its model declares is refused
-        // first, with the modelled `ValidationException` — `Message`,
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
         // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // offending member — rather than the framework's generic 400.
         validate_input(&input).map_err(|refusal| {
             TagResourceError::from(TagResourceErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `TagResourceInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Finish every workflow teardown the clock already made due, so a workflow
+        // past its `DELETING` span is as absent to this call as to any other.
+        store.reap_deleted_workflows(SystemTime::now());
+
+        // `TaggableResourceArn` admits exactly one resource kind — a workflow
+        // (`^arn:aws…:airflow-serverless:<region>:<account>:workflow/<name>-<10>$`) — so
+        // the entity this operation resolves is the workflow the ARN names. One the
+        // store does not hold is a lookup miss, and a workflow of ANOTHER region is not
+        // one this endpoint holds.
+        let workflow = store
+            .workflow_in_mut(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                crate::state::lookup_miss(TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolved(
+                        crate::state::UnresolvedEntity::Workflow,
+                        &input.resource_arn,
+                    ),
+                ))
+            })?;
+
+        // The set the resource will carry is the UNION of what it holds and what the
+        // request names, so a key the request re-states takes a new value without
+        // growing the set. The ceiling applies to that union, and is checked BEFORE the
+        // first write, so a refused call leaves the tag set exactly as it was.
+        let resulting = workflow.tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !workflow.tags.contains_key(*key))
+                .count();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::too_many_tags("Tags", &input.resource_arn, resulting),
+            )
+            .into());
+        }
+
+        // "Adds tags to a … resource": the named keys are added or overwritten in place
+        // and every other key the resource carries keeps the value it had.
+        for (key, value) in input.tags {
+            workflow.tags.insert(key, value);
+        }
+
+        // The tag set is resource metadata, not the workflow's configuration: adding a
+        // tag publishes no new `WorkflowVersion` and leaves the version, the revision
+        // and the code snapshot this workflow reports untouched.
+        Ok(TagResourceOutput {})
     }
 }
 

@@ -57,6 +57,8 @@ mod client_error_envelopes;
 mod create_resource_tag_keys;
 #[path = "all/default_page_sizes.rs"]
 mod default_page_sizes;
+#[path = "all/notification_alarm_state.rs"]
+mod notification_alarm_state;
 #[path = "all/notification_alert_delivery.rs"]
 mod notification_alert_delivery;
 #[path = "all/notification_deletion.rs"]

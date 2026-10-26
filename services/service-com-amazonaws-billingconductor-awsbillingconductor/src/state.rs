@@ -545,6 +545,11 @@ pub fn reconcile_pricing_rule_rate(
 }
 
 /// A pricing plan as `CreatePricingPlan` persisted it.
+///
+/// The record carries the plan as it stands NOW, plus the generations of it that later
+/// writes superseded ([`PricingPlanVersion`]), because every read of a plan is scoped to
+/// a billing period and so reports the generation that was in force in that period —
+/// the same shape [`PricingRuleRecord`] and [`BillingGroupRecord`] carry.
 #[derive(Debug, Clone, Default)]
 pub struct PricingPlanRecord {
     pub arn: String,
@@ -556,6 +561,12 @@ pub struct PricingPlanRecord {
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
     pub last_modified_time_millis: i64,
+    /// The generations of this plan that later writes SUPERSEDED, oldest first, at most
+    /// [`MAX_PRICING_PLAN_VERSIONS`] of them. The generation in effect NOW is not among
+    /// them — it is projected from this record by [`Self::current_version`] — so the
+    /// history and the live plan cannot drift. Held on the record so a deleted plan takes
+    /// its history with it.
+    pub superseded_versions: Vec<PricingPlanVersion>,
 }
 
 impl PricingPlanRecord {
@@ -572,6 +583,113 @@ impl PricingPlanRecord {
             .collect::<BTreeSet<String>>()
             .into_iter()
             .collect()
+    }
+
+    /// The billing period this plan was created in: the first period any read of it
+    /// reports it for, since a resource does not exist in a period that precedes it.
+    pub fn creation_billing_period(&self) -> String {
+        billing_period_at(self.creation_time_millis)
+    }
+
+    /// The billing period this plan's CURRENT generation is in effect FROM.
+    ///
+    /// A write takes effect in the period it is made in, and `LastModifiedTime` is the
+    /// instant of the write that left the plan as it stands, so the period that instant
+    /// falls in is the one the current generation starts in. A second write in the same
+    /// period leaves that period unchanged, which is why one period has one generation.
+    pub fn version_start_billing_period(&self) -> String {
+        billing_period_at(self.last_modified_time_millis)
+    }
+
+    /// This plan's CURRENT generation, as a snapshot of the members a write can change.
+    ///
+    /// Projected from the live record rather than stored twice, so the newest generation
+    /// is the plan a read of the current period reports.
+    pub fn current_version(&self) -> PricingPlanVersion {
+        PricingPlanVersion {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            last_modified_time_millis: self.last_modified_time_millis,
+        }
+    }
+
+    /// Every generation of this plan, OLDEST FIRST: the ones later writes superseded,
+    /// frozen as they stood, and then the one in effect now.
+    pub fn versions(&self) -> Vec<PricingPlanVersion> {
+        let mut versions = self.superseded_versions.clone();
+        versions.push(self.current_version());
+        versions
+    }
+
+    /// Does this plan exist in `billing_period`? A resource does not exist in a period
+    /// that precedes the one it was created in, and a value that is not a billing period
+    /// at all names no period a plan exists in.
+    ///
+    /// The cheap half of [`Self::effective_in`], so a listing can cut its page before
+    /// projecting the generations the page reports.
+    pub fn exists_in(&self, billing_period: &str) -> bool {
+        match (
+            billing_period_key(billing_period),
+            billing_period_key(&self.creation_billing_period()),
+        ) {
+            (Some(wanted), Some(created)) => wanted >= created,
+            _ => false,
+        }
+    }
+
+    /// The generation of this plan that is in force in `billing_period` — what a read
+    /// scoped to that period reports — or `None` when the plan did not exist then
+    /// ([`Self::exists_in`]).
+    ///
+    /// The generation in force is the LATEST one whose own start period is at or before
+    /// the period asked about, so a write made later never shows up in an earlier
+    /// period. When the oldest generations have been dropped from the kept history
+    /// ([`MAX_PRICING_PLAN_VERSIONS`]), the oldest one still kept answers for the periods
+    /// before it, because the plan itself did exist then.
+    pub fn effective_in(&self, billing_period: &str) -> Option<PricingPlanVersion> {
+        if !self.exists_in(billing_period) {
+            return None;
+        }
+        let wanted = billing_period_key(billing_period)?;
+        let versions = self.versions();
+        versions
+            .iter()
+            .rev()
+            .find(|version| {
+                billing_period_key(&version.start_billing_period())
+                    .is_some_and(|start| start <= wanted)
+            })
+            .or_else(|| versions.first())
+            .cloned()
+    }
+}
+
+/// One GENERATION of a pricing plan: the members a write can change, as they stood while
+/// that generation was in force.
+///
+/// A pricing plan read is scoped to a billing period ("The billing period for which the
+/// described pricing plans are applicable"), so the values a read reports are the ones
+/// that held in that period. A superseded generation is FROZEN: nothing writes to it
+/// again, so a read of a closed period reports the plan as it really was rather than as
+/// it has since become. The members no write can change — the ARN and `CreationTime`,
+/// neither of which `UpdatePricingPlanInput` carries — stay on the record, so there is
+/// one copy of them, and `Size` is derived per period from the plan's associations
+/// ([`PricingPlanRecord::associated_rule_arns`]) rather than frozen into a generation.
+#[derive(Debug, Clone, Default)]
+pub struct PricingPlanVersion {
+    pub name: String,
+    pub description: Option<String>,
+    /// `LastModifiedTime` as this generation reported it, which is also the instant the
+    /// generation took effect — see [`Self::start_billing_period`].
+    pub last_modified_time_millis: i64,
+}
+
+impl PricingPlanVersion {
+    /// The billing period this generation is in effect FROM, inclusive: the period the
+    /// write that left it was made in, derived from that write's instant the same way
+    /// [`PricingPlanRecord::version_start_billing_period`] derives the live one.
+    pub fn start_billing_period(&self) -> String {
+        billing_period_at(self.last_modified_time_millis)
     }
 }
 
@@ -1503,7 +1621,9 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 ///   also carries the generations of it that later writes superseded, at most
 ///   [`MAX_PRICING_RULE_VERSIONS`], oldest dropped first;
 ///   `pricing_plans` / `pricing_plan_names` hold one entry per plan, at most
-///   [`MAX_PRICING_PLANS`]; a plan's own association set at most
+///   [`MAX_PRICING_PLANS`], one plan also carrying the generations of it that later
+///   writes superseded, at most [`MAX_PRICING_PLAN_VERSIONS`], oldest dropped first; a
+///   plan's own association set at most
 ///   [`MAX_PRICING_RULES_PER_PRICING_PLAN`]; `billing_groups` / `billing_group_names` one per group,
 ///   at most [`MAX_BILLING_GROUPS`], one group also carrying the generations of it that
 ///   later writes superseded, at most [`MAX_BILLING_GROUP_VERSIONS`], oldest dropped
@@ -2035,6 +2155,39 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             }
         }
         self.pricing_rules.insert(arn, updated);
+    }
+
+    /// Store `updated` as the pricing plan's CURRENT generation, keeping the generation
+    /// it replaces when the write takes effect in a DIFFERENT billing period.
+    ///
+    /// The same rule [`Self::put_pricing_rule`] applies to a pricing rule: a generation
+    /// of a pricing plan is the plan as it stood while it was in force, so a write
+    /// landing in a period AFTER the one the current generation started in closes that
+    /// generation — frozen as it stood, so a later read of that period reports the plan
+    /// as it really was — while a write landing in the generation's own period REPLACES
+    /// it, because one billing period has one generation of the plan.
+    ///
+    /// The kept history is bounded like every other store here: past
+    /// [`MAX_PRICING_PLAN_VERSIONS`] superseded generations the OLDEST is dropped, which
+    /// reads back as the oldest kept generation covering the periods before it — never as
+    /// a plan that vanishes from a period it existed in
+    /// ([`PricingPlanRecord::effective_in`]).
+    pub fn put_pricing_plan(&mut self, mut updated: PricingPlanRecord) {
+        let arn = updated.arn.clone();
+        let superseded = self
+            .pricing_plans
+            .get(&arn)
+            .filter(|previous| {
+                previous.version_start_billing_period() != updated.version_start_billing_period()
+            })
+            .map(PricingPlanRecord::current_version);
+        if let Some(superseded) = superseded {
+            updated.superseded_versions.push(superseded);
+            while updated.superseded_versions.len() > MAX_PRICING_PLAN_VERSIONS {
+                updated.superseded_versions.remove(0);
+            }
+        }
+        self.pricing_plans.insert(arn, updated);
     }
 
     /// Store `updated` as the billing group's CURRENT generation, keeping the generation
@@ -2686,6 +2839,17 @@ pub const MAX_CUSTOM_LINE_ITEM_VERSIONS: usize = 100;
 /// successor answering for the earlier periods — never as the loss of the rule itself,
 /// which a read of every period from its creation onward must still report.
 pub const MAX_PRICING_RULE_VERSIONS: usize = 100;
+
+/// How many SUPERSEDED generations of one pricing plan this emulator keeps, so that a
+/// read scoped to a closed billing period can report the plan as it stood then.
+///
+/// A CHOSEN bound, not an AWS limit, of the same order as
+/// [`MAX_PRICING_RULE_VERSIONS`] and for the same reason: each write that takes effect
+/// in a new billing period adds a generation, so the kept history has to be capped. The
+/// OLDEST generation is dropped first, which reads back as that generation's successor
+/// answering for the earlier periods — never as the loss of the plan itself, which a
+/// read of every period from its creation onward must still report.
+pub const MAX_PRICING_PLAN_VERSIONS: usize = 100;
 
 /// How many SUPERSEDED generations of one billing group this emulator keeps, so that a
 /// read scoped to a closed billing period can report the group as it stood then.

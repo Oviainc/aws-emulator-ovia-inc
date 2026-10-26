@@ -88,7 +88,8 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    domain_not_found, package_named_twice, AssociationRefusal, AssociationRequest, Package,
+    domain_does_not_exist, domain_not_found, package_named_twice, AssociationRefusal,
+    AssociationRequest, Package,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -181,10 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The domain the call names is resolved whatever else the request carries, so
         // a name that names no domain is refused even by a call that goes on to name
-        // no package at all: the domain is what the call acts on.
+        // no package at all: the domain is what the call acts on. It is the SAME
+        // refusal the per-package decision below makes for an unresolvable domain, so
+        // a batch that names one is refused identically however many packages it
+        // carries.
         if !store.domains.contains_key(&input.domain_name) {
-            return Err(AssociatePackagesErrorModeled::ResourceNotFoundException(
-                domain_not_found(&input.domain_name),
+            return Err(AssociatePackagesErrorModeled::ValidationException(
+                domain_does_not_exist(&input.domain_name),
             )
             .into());
         }

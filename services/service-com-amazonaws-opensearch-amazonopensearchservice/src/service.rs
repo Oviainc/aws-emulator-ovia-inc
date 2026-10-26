@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod validation;
+
 /// Whether the request these `parts` came from resolves to this service's signing name
 /// AND addresses a first URI path segment this model publishes
 /// (`crate::ROUTE_PATH_SEGMENTS`).
@@ -149,16 +151,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The words live in [`validation`], which keeps the framework's own
+        // clause for every violation but one class: a violation on an ELEMENT of a
+        // collection member, which this service states as ONE validation error about
+        // that member carrying the element shape's whole constraint set. The code
+        // travels with the message, as it must.
+        validation::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(
