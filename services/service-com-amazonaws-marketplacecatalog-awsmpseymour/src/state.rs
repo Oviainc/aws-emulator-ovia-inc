@@ -116,9 +116,25 @@ pub const CHANGE_SET_SORT_BY: &[&str] = &["StartTime", "EndTime"];
 /// `EntityId`"). The first entry is the default.
 pub const ENTITY_SORT_BY: &[&str] = &["LastModifiedDate", "EntityId"];
 
+/// The `SortOrder` value that orders a page from the greatest sort key down —
+/// the enum's descending member, one of the two values `SortOrder` accepts
+/// (`SORT_ORDER_VALUES` in `crate::ops::types`).
+pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
+
 /// The `SortOrder` a list uses when the request names none: `Sort$SortOrder`
 /// documents "The default value is `DESCENDING`".
-pub const DEFAULT_SORT_ORDER: &str = "DESCENDING";
+pub const DEFAULT_SORT_ORDER: &str = SORT_ORDER_DESCENDING;
+
+/// Whether `sort_order` reads a page from the greatest sort key down.
+///
+/// `Sort$SortOrder` documents "The sorting order. Can be `ASCENDING` or
+/// `DESCENDING`" — so exactly the descending member reverses the ordering and
+/// every other value leaves it ascending. This is the one place that decision
+/// is made, so each list operation turns a `SortOrder` into a direction the
+/// same way, whatever order the default happens to be.
+pub fn sorts_descending(sort_order: &str) -> bool {
+    sort_order == SORT_ORDER_DESCENDING
+}
 
 /// The details members an entity's `Name` is read from.
 ///

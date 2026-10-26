@@ -339,12 +339,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 by: type_sort_by
                     .unwrap_or(crate::state::ENTITY_SORT_BY[0])
                     .to_string(),
-                descending: type_sort_order.unwrap_or(crate::state::DEFAULT_SORT_ORDER)
-                    == crate::state::DEFAULT_SORT_ORDER,
+                descending: crate::state::sorts_descending(
+                    type_sort_order.unwrap_or(crate::state::DEFAULT_SORT_ORDER),
+                ),
             });
         }
         orders.push(PageOrder {
-            descending: sort_order == crate::state::DEFAULT_SORT_ORDER,
+            descending: crate::state::sorts_descending(&sort_order),
             by: sort_by,
         });
 

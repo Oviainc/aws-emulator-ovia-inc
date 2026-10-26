@@ -318,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .sort_key(&sort_by)
                 .cmp(right.sort_key(&sort_by))
                 .then_with(|| left.id.cmp(&right.id));
-            if sort_order == "DESCENDING" {
+            if crate::state::sorts_descending(&sort_order) {
                 ordering.reverse()
             } else {
                 ordering

@@ -39,5 +39,7 @@ mod resource_policy_lifecycle;
 mod resource_policy_reads;
 #[path = "all/resource_policy_validation.rs"]
 mod resource_policy_validation;
+#[path = "all/sort_order_direction.rs"]
+mod sort_order_direction;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
