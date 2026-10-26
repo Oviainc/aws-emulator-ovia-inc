@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePullRequestStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePullRequestStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePullRequestStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePullRequestStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePullRequestStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePullRequestStatus"))
+        // The identity whose call moves the status, which is the actor the pull
+        // request's event log attributes the change to.
+        let actor = crate::state::caller_identity_arn(ctx.parts());
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    UpdatePullRequestStatusErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    UpdatePullRequestStatusErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // `pullRequestStatus` is a modelled enum, so a value outside it is already
+        // refused at the boundary (`crate::service` words that code); classifying it
+        // here as well is what keeps the handler total without a 501.
+        let requested = match input.pull_request_status.as_str() {
+            status @ (crate::state::PULL_REQUEST_STATUS_OPEN
+            | crate::state::PULL_REQUEST_STATUS_CLOSED) => status,
+            _ => {
+                return Err(
+                    UpdatePullRequestStatusErrorModeled::InvalidPullRequestStatusException(
+                        InvalidPullRequestStatusException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_STATUS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
+            UpdatePullRequestStatusErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // "The only valid operations are to update the status from OPEN to OPEN,
+        // OPEN to CLOSED or from CLOSED to CLOSED": the status a pull request
+        // already holds is the state this call asks for, so the update is accepted
+        // and changes NOTHING — no event, because the log records only changes that
+        // happened, and so no move of "the day and time of the last user or system
+        // activity on the pull request" either. Every other move is a reopen, which
+        // the status admits no transition for.
+        if pull_request.status != requested {
+            if requested != crate::state::PULL_REQUEST_STATUS_CLOSED {
+                return Err(
+                    UpdatePullRequestStatusErrorModeled::InvalidPullRequestStatusUpdateException(
+                        InvalidPullRequestStatusUpdateException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_STATUS_UPDATE_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            pull_request.status = requested.to_string();
+            let status = pull_request.status.clone();
+            // The status moved, so the pull request's event log records it through
+            // the one place an entry is appended — which also moves
+            // `lastActivityDate` onto this call.
+            pull_request.record_event(
+                ::std::time::SystemTime::now(),
+                Some(actor),
+                crate::state::PullRequestEventDetail::StatusChanged { status },
+            );
+        }
+
+        Ok(UpdatePullRequestStatusOutput {
+            pull_request: pull_request.to_modeled(),
+        })
     }
 }

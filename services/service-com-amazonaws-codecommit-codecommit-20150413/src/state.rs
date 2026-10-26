@@ -527,6 +527,18 @@ pub const INVALID_PULL_REQUEST_EVENT_TYPE_MESSAGE: &str = "The pull request even
 pub const INVALID_PULL_REQUEST_STATUS_MESSAGE: &str =
     "The pull request status is not valid. The only valid values are OPEN and CLOSED.";
 
+/// `InvalidPullRequestStatusUpdateException`'s message: likewise the shape's own
+/// documented sentence pair, stating the failure and then the ONE transition the
+/// status admits — what an attempt to move a pull request's status any other way
+/// is refused with.
+pub const INVALID_PULL_REQUEST_STATUS_UPDATE_MESSAGE: &str =
+    "The pull request status update is not valid. The only valid update is from OPEN to CLOSED.";
+
+/// `PullRequestStatusRequiredException`'s message: a FIXED sentence, worded here
+/// once for every operation that requires a `pullRequestStatus`.
+pub const PULL_REQUEST_STATUS_REQUIRED_MESSAGE: &str =
+    "A pull request status is required, but none was provided.";
+
 /// The message AWS returns with `RepositoryDoesNotExistException`: the requested
 /// repository name, then `" for "`, then the account the lookup ran in.
 ///

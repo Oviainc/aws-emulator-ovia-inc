@@ -366,7 +366,12 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         // `pullRequestStatus` is a modelled enum too, so a value outside it is
         // likewise refused at the boundary rather than by the handler that reads
         // the pull requests; the code and sentence are the ones the pull request
-        // operations model for that member.
+        // operations model for that member. An operation that REQUIRES the member
+        // names its own code for one that was not provided at all.
+        ("pullRequestStatus", _) if missing => (
+            "PullRequestStatusRequiredException",
+            crate::state::PULL_REQUEST_STATUS_REQUIRED_MESSAGE,
+        ),
         ("pullRequestStatus", _) => (
             "InvalidPullRequestStatusException",
             crate::state::INVALID_PULL_REQUEST_STATUS_MESSAGE,
