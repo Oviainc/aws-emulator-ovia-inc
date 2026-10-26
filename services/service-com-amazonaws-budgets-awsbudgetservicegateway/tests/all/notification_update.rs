@@ -449,15 +449,19 @@ async fn an_update_onto_another_notification_of_the_budget_is_a_duplicate() {
 /// RULE, the alarm state: `NotificationState` "specifies whether this notification is
 /// in alarm", a member the service owns, so it is NOT part of a notification's identity
 /// — whichever state `OldNotification` carries (or none), the notification whose
-/// identity members match is the one updated; and a `NewNotification` that names no
-/// state leaves the state the notification already had, while one that names a state
-/// takes it.
+/// identity members match is the one updated; and the state a read reports afterwards is
+/// the one the SERVICE computes for what the notification now alerts on, so neither the
+/// create nor the update can set it.
 ///
 /// The rows cross the state the notification was CREATED with, the state the update
 /// NAMES on `OldNotification`, and the state it names on `NewNotification` — each over
-/// every `NotificationState` the model lists plus absent.
+/// every `NotificationState` the model lists plus absent. The notification under test
+/// alerts above 80% and then above 90% of a budget nothing has spent against, so the
+/// state the service reports for it is `OK` throughout (`GREATER_THAN` against no spend);
+/// `tests/all/notification_alarm_state.rs` is where an update that moves the state is
+/// asserted.
 #[tokio::test]
-async fn the_alarm_state_is_not_identity_and_survives_an_update_that_omits_it() {
+async fn the_alarm_state_is_not_identity_and_is_the_services_own_after_an_update() {
     let router = router();
     let account_id = caller_account();
     let states: Vec<Option<&str>> = NOTIFICATION_STATE_VALUES
@@ -518,10 +522,10 @@ async fn the_alarm_state_is_not_identity_and_survives_an_update_that_omits_it() 
                     "case {case:?}: expected the update to answer 200, got {status} {body}"
                 );
 
-                // A notification created without a state is out of alarm (`OK`), so the
-                // state after an update that names none is whatever the notification
-                // already carried.
-                let expected_state = wanted.or(*created).unwrap_or("OK");
+                // The alarm state is the service's own reading of the spend behind the
+                // budget: nothing is spent over the 90% this notification now alerts
+                // above, so it is out of alarm whatever the three requests named.
+                let expected_state = "OK";
                 let reported = reported_notifications(&router, &account_id, &budget_name).await;
                 assert_eq!(
                     reported.len(),

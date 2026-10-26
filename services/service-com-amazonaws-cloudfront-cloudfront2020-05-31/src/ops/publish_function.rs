@@ -157,22 +157,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The stage a publish READS and copies from is the one a function is created in, so
-        // the version token the precondition is checked against is that stage's: `IfMatch`
-        // is "The current version (ETag value) of the function that you are publishing,
-        // which you can get using DescribeFunction", and a describe that names no stage
-        // reads the stage a function is created in.
-        let published_from = crate::state::DEFAULT_FUNCTION_STAGE;
-
         // "The name of the function that you are publishing": a name no function holds is
         // "the function does not exist", and is answered before the precondition, which can
-        // only be checked against a stored version.
+        // only be checked against a stored version. The stage a publish READS and copies from
+        // is the one a function is created in, so the version token the precondition is
+        // checked against is that stage's: `IfMatch` is "The current version (ETag value) of
+        // the function that you are publishing, which you can get using DescribeFunction",
+        // and a describe that names no stage reads the stage a function is created in.
         let Some(current_etag) = store
             .function(&input.name)
             .map(|function| function.development.etag.clone())
         else {
             return Err(PublishFunctionErrorModeled::NoSuchFunctionExists(
-                crate::state::no_such_function_exists(&input.name, published_from),
+                crate::state::no_such_function_exists(),
             )
             .into());
         };
@@ -203,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports the same configuration, code, status, stage and timestamps.
         let Some(summary) = store.publish_function(&input.name, now) else {
             return Err(PublishFunctionErrorModeled::NoSuchFunctionExists(
-                crate::state::no_such_function_exists(&input.name, published_from),
+                crate::state::no_such_function_exists(),
             )
             .into());
         };
