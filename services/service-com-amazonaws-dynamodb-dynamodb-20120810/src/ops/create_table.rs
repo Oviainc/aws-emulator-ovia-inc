@@ -17,7 +17,11 @@
 //! enforces it from the table's first request ("the policy application is strongly
 //! consistent"); a `StreamSpecification` that enables a stream registers one in the
 //! DynamoDB Streams store, and the table reports its
-//! `LatestStreamArn`/`LatestStreamLabel`; vector indexes, SSE and the other members
+//! `LatestStreamArn`/`LatestStreamLabel`; `VectorIndexes` are stored with the table and
+//! reported back in its `TableDescription` as `VectorIndexDescription`s, each `CREATING`
+//! until the table's own transition falls due, and the attributes a vector index's
+//! `VectorAttribute` and `SearchSchema` name count as used by the attribute-definition
+//! usage check; SSE and the other members
 //! this slice does not store are refused with the scaffold's 501 and filed as their
 //! own gap issues — after the request's own contradictions, so an on-demand capacity
 //! ceiling named for a table created PROVISIONED is the `ValidationException` the two
@@ -349,6 +353,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .map_err(lift)?;
+        let vector_indexes = validated_vector_indexes(
+            &input,
+            &global_secondary_indexes,
+            &local_secondary_indexes,
+            &region,
+            &name,
+            now,
+        )
+        .map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -435,6 +448,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             throughput_history: crate::state::ThroughputHistory::default(),
             global_secondary_indexes,
             local_secondary_indexes,
+            vector_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
             // A new table's continuous backups are on and its point-in-time recovery is
@@ -494,6 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .local_secondary_indexes
                 .as_ref()
                 .map_or(0, Vec::len),
+            vector_indexes = description.vector_indexes.as_ref().map_or(0, Vec::len),
             outcome = "created",
             "table created"
         );
@@ -599,13 +614,6 @@ fn requested_on_demand_ceilings(
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
     if input
-        .vector_indexes
-        .as_ref()
-        .is_some_and(|indexes| !indexes.is_empty())
-    {
-        return Some("VectorIndexes");
-    }
-    if input
         .sse_specification
         .as_ref()
         .is_some_and(|specification| specification.enabled.unwrap_or(false))
@@ -642,8 +650,10 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
 /// request-chosen counts. Every bound here is one the contract already implies, so a
 /// list past it is invalid whatever its contents: at most
 /// [`crate::state::MAX_GLOBAL_SECONDARY_INDEXES`] indexes, at most
-/// [`crate::state::MAX_INDEX_KEY_ELEMENTS`] key elements per index, and at most
-/// [`crate::state::MAX_ATTRIBUTE_DEFINITIONS`] attribute definitions.
+/// [`crate::state::MAX_INDEX_KEY_ELEMENTS`] key elements per index, at most
+/// [`crate::state::MAX_VECTOR_INDEXES`] vector indexes with at most
+/// [`crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS`] search-schema elements each, and
+/// at most [`crate::state::MAX_ATTRIBUTE_DEFINITIONS`] attribute definitions.
 fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestError> {
     let definitions = input.attribute_definitions.as_ref().map_or(0, Vec::len);
     if definitions > crate::state::MAX_ATTRIBUTE_DEFINITIONS {
@@ -688,6 +698,25 @@ fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestEr
                 index.index_name,
                 crate::state::MAX_INDEX_KEY_ELEMENTS,
                 index.key_schema.len()
+            )));
+        }
+    }
+    let vector_indexes = input.vector_indexes.as_ref().map_or(0, Vec::len);
+    if vector_indexes > crate::state::MAX_VECTOR_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid VectorIndexes: a table may carry at most {} vector indexes, got \
+             {vector_indexes}",
+            crate::state::MAX_VECTOR_INDEXES
+        )));
+    }
+    for index in input.vector_indexes.iter().flatten() {
+        let elements = index.search_schema.as_ref().map_or(0, Vec::len);
+        if elements > crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid SearchSchema for index {}: a vector index's search schema may carry at \
+                 most {} elements, got {elements}",
+                index.index_name,
+                crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS
             )));
         }
     }
@@ -803,7 +832,10 @@ fn validated_key_schema(
     // The key attributes of every requested index, collected ONCE: the loop below asks
     // whether each definition is used, and a per-definition scan of every index's key
     // schema would be the product of two request-chosen counts. Both index kinds declare
-    // their key attributes in the same array, so both are collected here.
+    // their key attributes in the same array, so both are collected here, and so does
+    // every vector index the request declares: a vector index consumes the attribute its
+    // `VectorAttribute` names and each attribute its `SearchSchema` names, whose types
+    // this array is what declares.
     let index_key_attributes: ::std::collections::HashSet<&str> = input
         .global_secondary_indexes
         .iter()
@@ -817,11 +849,19 @@ fn validated_key_schema(
                 .flat_map(|index| index.key_schema.iter()),
         )
         .map(|element| element.attribute_name.as_str())
+        .chain(
+            input
+                .vector_indexes
+                .iter()
+                .flatten()
+                .flat_map(vector_index_attributes),
+        )
         .collect();
     for definition in &definitions {
         // "Some AttributeDefinitions are not used in any KeySchema": every defined
-        // attribute must be a key of the table or of one of its secondary indexes,
-        // whose key attributes are declared in the same array.
+        // attribute must be consumed by a schema of the table — its own key, the key of
+        // one of its secondary indexes, or the vector attribute or search schema of one
+        // of its vector indexes.
         let used_by_table = key_schema
             .iter()
             .any(|element| element.attribute_name == definition.attribute_name);
@@ -834,6 +874,25 @@ fn validated_key_schema(
         }
     }
     Ok(key_schema)
+}
+
+/// Every attribute of the table ONE requested vector index consumes: the one its
+/// `VectorAttribute` names, and each one its `SearchSchema` names.
+///
+/// A `HASH` search-schema element "partitions the vector index for independent scaling"
+/// and an `INLINE_FILTER` one is "an attribute projected into the vector index for
+/// filtering at the storage layer during search"
+/// (`SearchSchemaElement$SearchSchemaElementType`) — either way the index reads that
+/// attribute of the table's items, so the attribute is consumed and its
+/// `AttributeDefinitions` entry is used.
+fn vector_index_attributes(index: &VectorIndex) -> impl Iterator<Item = &str> {
+    ::std::iter::once(index.vector_attribute.attribute_name.as_str()).chain(
+        index
+            .search_schema
+            .iter()
+            .flatten()
+            .map(|element| element.attribute_name.as_str()),
+    )
 }
 
 /// The global secondary indexes to store with the table.
@@ -948,6 +1007,80 @@ fn validated_local_indexes(
             name: index.index_name.clone(),
             key_schema: index.key_schema.clone(),
             projection: index.projection.clone(),
+            reported_counters: crate::state::MeteredCounters::new(now),
+        });
+    }
+    Ok(indexes)
+}
+
+/// The vector indexes to store with the table.
+///
+/// Each one is refused unless its name is free on the table ("Must be unique only for
+/// this table" — `GlobalSecondaryIndex$IndexName`, which holds for every index a table
+/// carries) and its `Projection` is one the model's `ProjectionType` enum names. Its
+/// `DistanceFunction`, its `SearchSchema` element types and its `Dimensions` are
+/// modelled as an enum, an enum and a `@range` minimum, so the request validator has
+/// already refused every value outside them before a request reaches this handler.
+/// A vector index created with the table is reported `CREATING` and becomes `ACTIVE` on
+/// the same clock-owed transition as the table.
+///
+/// The attributes its `SearchSchema` names are the table's own attributes, declared in
+/// `AttributeDefinitions` like any other indexed attribute — which is what
+/// [`validated_key_schema`] counts them as used by, and which this refuses an index for
+/// naming an attribute the request declares no definition for, as an index key schema is
+/// refused for the same thing ([`validated_index_key_schema`]): a search schema
+/// partitions and filters by that attribute's VALUE, so its type has to be declared. A
+/// definition is not REQUIRED for the `VectorAttribute` — no schema is built over the
+/// vector itself — but one the request does declare for it counts as used all the same.
+fn validated_vector_indexes(
+    input: &CreateTableInput,
+    global_secondary_indexes: &[crate::state::GlobalSecondaryIndex],
+    local_secondary_indexes: &[crate::state::LocalSecondaryIndex],
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::VectorIndex>, crate::state::RequestError> {
+    let requested = input.vector_indexes.clone().unwrap_or_default();
+    let definitions = input.attribute_definitions.clone().unwrap_or_default();
+    let mut indexes: Vec<crate::state::VectorIndex> = Vec::new();
+    for index in &requested {
+        let taken = indexes.iter().any(|stored| stored.name == index.index_name)
+            || global_secondary_indexes
+                .iter()
+                .any(|stored| stored.name == index.index_name)
+            || local_secondary_indexes
+                .iter()
+                .any(|stored| stored.name == index.index_name);
+        if taken {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid VectorIndex: duplicate index name {}",
+                index.index_name
+            )));
+        }
+        validated_projection(&index.index_name, &index.projection)?;
+        for element in index.search_schema.iter().flatten() {
+            let name = element.attribute_name.as_str();
+            if !definitions
+                .iter()
+                .any(|definition| definition.attribute_name == name)
+            {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid SearchSchema for index {}: no AttributeDefinition was provided for \
+                     search schema attribute {name}",
+                    index.index_name
+                )));
+            }
+        }
+        indexes.push(crate::state::VectorIndex {
+            arn: crate::state::index_arn(region, table, &index.index_name),
+            name: index.index_name.clone(),
+            vector_attribute: index.vector_attribute.clone(),
+            search_schema: index.search_schema.clone().unwrap_or_default(),
+            projection: index.projection.clone(),
+            dimensions: index.dimensions,
+            distance_function: index.distance_function.clone(),
+            transient_status: crate::state::IndexStatus::Creating,
+            active_at: now + crate::state::STATUS_TRANSITION,
             reported_counters: crate::state::MeteredCounters::new(now),
         });
     }

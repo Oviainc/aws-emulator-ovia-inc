@@ -954,18 +954,19 @@ fn merged_definitions(
     definitions
 }
 
-/// The definitions the updated table keeps: exactly those a key schema still uses —
-/// the table's own, or one of the indexes it carries after the update.
+/// The definitions the updated table keeps: exactly those a schema of the table still
+/// uses — its own key, the key of one of the indexes it carries after the update, or the
+/// vector attribute or search schema of one of its vector indexes.
 ///
-/// This is what bounds the stored list: it can never hold more entries than those key
+/// This is what bounds the stored list: it can never hold more entries than those
 /// schemas name, however many `UpdateTable` calls declare definitions. A definition the
-/// REQUEST declared that no key schema uses is refused rather than dropped silently,
+/// REQUEST declared that no schema uses is refused rather than dropped silently,
 /// which is the same rule `CreateTable` applies ("Some AttributeDefinitions are not
 /// used in any KeySchema"); a definition that was stored and whose index this same
 /// request deleted is simply dropped, since removing an index removes its keys.
 ///
-/// The key attributes are collected ONCE into a set, so the check costs one hash per
-/// definition rather than a walk over every key schema.
+/// The used attributes are collected ONCE into a set, so the check costs one hash per
+/// definition rather than a walk over every schema.
 fn retained_definitions(
     declared: Vec<AttributeDefinition>,
     table: &crate::state::Table,
@@ -976,7 +977,19 @@ fn retained_definitions(
         .key_schema
         .iter()
         .chain(indexes.iter().flat_map(|index| index.key_schema.iter()))
+        .chain(
+            table
+                .local_secondary_indexes
+                .iter()
+                .flat_map(|index| index.key_schema.iter()),
+        )
         .map(|element| element.attribute_name.as_str())
+        .chain(
+            table
+                .vector_indexes
+                .iter()
+                .flat_map(crate::state::VectorIndex::consumed_attributes),
+        )
         .collect();
     for definition in requested {
         if !used.contains(definition.attribute_name.as_str()) {

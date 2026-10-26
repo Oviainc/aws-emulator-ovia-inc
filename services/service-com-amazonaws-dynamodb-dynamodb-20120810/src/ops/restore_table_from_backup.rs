@@ -21,9 +21,11 @@
 //! point-in-time recovery is off.
 //!
 //! `BillingModeOverride`, `ProvisionedThroughputOverride` and the two secondary-index
-//! overrides are applied to the restored table; `SSESpecificationOverride`,
-//! `VectorIndexOverride` and `OnDemandThroughputOverride` are members no table this
-//! service stores carries yet (`CreateTable` refuses the same three), so they answer the
+//! overrides are applied to the restored table, and every vector index the backup
+//! recorded is rebuilt on it — "If not specified, all vector indexes from the backup are
+//! restored" (`$VectorIndexOverride`, the doc below); `SSESpecificationOverride`,
+//! `VectorIndexOverride` itself and `OnDemandThroughputOverride` are members no restore
+//! applies yet (`CreateTable` refuses the same three), so they answer the
 //! scaffold's 501 and are filed as their own gap issues — after the request's own
 //! contradictions, so an on-demand ceiling named for a table restored `PROVISIONED` is
 //! the `ValidationException` the two capacity models make it.
@@ -287,6 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(lift)?;
         let local_secondary_indexes =
             restored_local_indexes(&input, source, &region, &target, now).map_err(lift)?;
+        // "If not specified, all vector indexes from the backup are restored"
+        // (`$VectorIndexOverride`), and an override that names any is refused above, so the
+        // restored table carries the ones the backup recorded.
+        let vector_indexes = restored_vector_indexes(source, &region, &target, now);
 
         // A restore CREATES a table, so it is held to the same quotas a create is, plus
         // the one restores have of their own.
@@ -354,6 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             throughput_history: crate::state::ThroughputHistory::default(),
             global_secondary_indexes,
             local_secondary_indexes,
+            vector_indexes,
             // No `TableClass` is recorded by a backup and no override names one, so the
             // restored table reports none, exactly as a create that names none does.
             table_class: None,
@@ -684,6 +691,41 @@ fn restored_indexes(
         });
     }
     Ok(indexes)
+}
+
+/// The vector indexes the restored table carries: every one the backup recorded — "If
+/// not specified, all vector indexes from the backup are restored"
+/// (`$VectorIndexOverride`), and a request that names an override is refused before this
+/// runs.
+///
+/// Each one is rebuilt from the recorded configuration under the TARGET table's own index
+/// ARN, and is `CREATING` until the restored table's transition falls due, like every
+/// index a restore brings into being.
+fn restored_vector_indexes(
+    source: &crate::state::SourceTableSnapshot,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Vec<crate::state::VectorIndex> {
+    source
+        .vector_indexes
+        .iter()
+        .map(|recorded| {
+            let name = recorded.index_name.clone().unwrap_or_default();
+            crate::state::VectorIndex {
+                arn: crate::state::index_arn(region, table, &name),
+                name,
+                vector_attribute: recorded.vector_attribute.clone().unwrap_or_default(),
+                search_schema: recorded.search_schema.clone().unwrap_or_default(),
+                projection: recorded.projection.clone().unwrap_or_default(),
+                dimensions: recorded.dimensions.unwrap_or_default(),
+                distance_function: recorded.distance_function.clone().unwrap_or_default(),
+                transient_status: crate::state::IndexStatus::Creating,
+                active_at: now + crate::state::STATUS_TRANSITION,
+                reported_counters: crate::state::MeteredCounters::new(now),
+            }
+        })
+        .collect()
 }
 
 /// The local secondary indexes the restored table carries, by the same selection rule

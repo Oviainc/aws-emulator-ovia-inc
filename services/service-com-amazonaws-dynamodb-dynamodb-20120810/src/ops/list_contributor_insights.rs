@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContributorInsights
-//! IMPLEMENTED: reports one `ContributorInsightsSummary` per resource whose setting this
-//! store holds — "a list of ContributorInsightsSummary for a table and all its global
-//! secondary indexes" (the doc below) — each read from
+//! IMPLEMENTED: reports one `ContributorInsightsSummary` per resource this store holds a
+//! contributor insights configuration for — "a list of ContributorInsightsSummary for a
+//! table and all its global secondary indexes" (the doc below) — each read from
 //! [`crate::state::ContributorInsights`], so a summary reports what the last
-//! `UpdateContributorInsights` wrote and the status the clock has made due.
+//! `UpdateContributorInsights` wrote and the status the clock has made due. A resource
+//! whose status has settled `DISABLED` has no configuration to report and so no summary:
+//! it enters the listing when an enable is accepted and drops out again once the disable
+//! settles ([`crate::state::ContributorInsights::listed`]), while
+//! `DescribeContributorInsights` answers for it either way.
 //!
 //! A `TableName` narrows the listing to that one table and its indexes, and a name that
 //! resolves to no stored table is the modelled `ResourceNotFoundException`; a request

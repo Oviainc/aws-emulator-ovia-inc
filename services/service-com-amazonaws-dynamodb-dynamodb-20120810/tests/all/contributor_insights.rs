@@ -17,8 +17,10 @@
 //!    transient status (`ENABLING`/`DISABLING`) and a read after the span reports the
 //!    settled one (`ENABLED`/`DISABLED`), with the mode the enable asked for;
 //! 4. each resource carries its OWN setting — a table and each of its global secondary
-//!    indexes — and `ListContributorInsights` reports one summary per resource, paged by
-//!    `MaxResults`/`NextToken`.
+//!    indexes — and `ListContributorInsights` reports one summary per resource whose
+//!    insights are ON or still settling, paged by `MaxResults`/`NextToken`: a resource
+//!    enters the listing when an enable is accepted and drops out of it once a disable
+//!    settles.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -381,8 +383,9 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
         );
     }
 
-    // The listing narrowed to one table reports that table and all its indexes, in
-    // ascending order, each with the status its own setting is in.
+    // The listing narrowed to one table reports the resources of that table whose
+    // insights are on — the one index enabled above, and neither the table nor the index
+    // left alone, which have no configuration to report.
     let listed = ok(
         &router,
         "ListContributorInsights",
@@ -408,24 +411,12 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
         .collect();
     assert_eq!(
         reported,
-        vec![
-            (
-                "InsightsListed".to_string(),
-                String::new(),
-                "DISABLED".to_string()
-            ),
-            (
-                "InsightsListed".to_string(),
-                "A.Index".to_string(),
-                "ENABLED".to_string()
-            ),
-            (
-                "InsightsListed".to_string(),
-                "B.Index".to_string(),
-                "DISABLED".to_string()
-            ),
-        ],
-        "case one table: the summaries are the table's and its indexes', got {listed}"
+        vec![(
+            "InsightsListed".to_string(),
+            "A.Index".to_string(),
+            "ENABLED".to_string()
+        )],
+        "case one table: only the resource whose insights are on has a summary, got {listed}"
     );
     assert_eq!(
         listed["NextToken"].clone(),
@@ -433,8 +424,16 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
         "case one table: a whole listing reports no token, got {listed}"
     );
 
-    // A listing that names no table reports every table of the region, so the other
-    // table's summary is in it too.
+    // With every resource enabled, the listing reports one summary per resource in
+    // ascending order, and a listing that names no table spans every table of the region.
+    for (table, index) in [
+        ("InsightsListed", None),
+        ("InsightsListed", Some("B.Index")),
+        ("InsightsOther", None),
+    ] {
+        set_insights(&router, table, index, "ENABLE", None).await;
+    }
+    settle().await;
     let all = ok(&router, "ListContributorInsights", json!({})).await;
     let names: Vec<String> = all["ContributorInsightsSummaries"]
         .as_array()
@@ -502,6 +501,47 @@ async fn each_resource_carries_its_own_setting_and_the_listing_reports_one_per_r
             "case {case}: the pages together are the whole listing, got {collected:?}"
         );
     }
+
+    // A resource drops out of the listing once its disable settles, while
+    // `DescribeContributorInsights` still answers for it: both readers report the one
+    // stored setting.
+    set_insights(&router, "InsightsListed", Some("A.Index"), "DISABLE", None).await;
+    settle().await;
+    let after_disable = ok(
+        &router,
+        "ListContributorInsights",
+        json!({"TableName": "InsightsListed"}),
+    )
+    .await;
+    let remaining: Vec<String> = after_disable["ContributorInsightsSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| {
+            format!(
+                "{}{}",
+                summary["TableName"].as_str().unwrap_or_default(),
+                summary["IndexName"]
+                    .as_str()
+                    .map(|index| format!("/{index}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    let described = describe_insights(&router, "InsightsListed", Some("A.Index")).await;
+    assert_eq!(
+        (remaining, described["ContributorInsightsStatus"].clone()),
+        (
+            vec![
+                "InsightsListed".to_string(),
+                "InsightsListed/B.Index".to_string()
+            ],
+            json!("DISABLED")
+        ),
+        "case after the disable settles: the resource drops out of the listing and \
+         describes DISABLED, got {after_disable} then {described}"
+    );
 }
 
 #[tokio::test]

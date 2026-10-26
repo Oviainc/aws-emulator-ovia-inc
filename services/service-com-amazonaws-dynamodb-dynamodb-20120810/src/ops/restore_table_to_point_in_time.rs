@@ -29,10 +29,12 @@
 //! point-in-time recovery is off.
 //!
 //! `BillingModeOverride`, `ProvisionedThroughputOverride` and the two secondary-index
-//! overrides are applied to the restored table; `SSESpecificationOverride`,
-//! `VectorIndexOverride` and `OnDemandThroughputOverride` are members no table this
-//! service stores carries yet (`CreateTable` and `RestoreTableFromBackup` refuse the same
-//! three), so they answer the scaffold's 501 and are filed as their own gap issues —
+//! overrides are applied to the restored table, and the source table's vector indexes are
+//! carried over as they stand — "If not specified, all vector indexes from the source
+//! table are restored" (`$VectorIndexOverride`, the doc below); `SSESpecificationOverride`,
+//! `VectorIndexOverride` itself and `OnDemandThroughputOverride` are members no restore
+//! applies yet (`CreateTable` and `RestoreTableFromBackup` refuse the same three), so they
+//! answer the scaffold's 501 and are filed as their own gap issues —
 //! after the request's own contradictions, so an on-demand ceiling named for a table
 //! restored `PROVISIONED` is the `ValidationException` the two capacity models make it.
 //!
@@ -290,6 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(bad_request)?;
         let local_secondary_indexes =
             restored_local_indexes(&input, source, &region, &target, now).map_err(bad_request)?;
+        // "If not specified, all vector indexes from the source table are restored"
+        // (`$VectorIndexOverride`), and an override that names any is refused above, so
+        // the restored table carries the source's as they stand.
+        let vector_indexes = restored_vector_indexes(source, &region, &target, now);
         let key_schema = source.key_schema.clone();
         let attribute_definitions = source.attribute_definitions.clone();
         let table_class = source.table_class.clone();
@@ -378,6 +384,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             throughput_history: crate::state::ThroughputHistory::default(),
             global_secondary_indexes,
             local_secondary_indexes,
+            vector_indexes,
             // The table class is one of the source table's current settings, and nothing
             // in the list a caller must set up again names it.
             table_class,
@@ -831,6 +838,33 @@ fn restored_indexes(
         });
     }
     Ok(indexes)
+}
+
+/// The vector indexes the restored table carries: the source table's, every one of them —
+/// "If not specified, all vector indexes from the source table are restored"
+/// (`$VectorIndexOverride`), and a request that names an override is refused before this
+/// runs.
+///
+/// Each one is the source's configuration under the TARGET table's own index ARN, and is
+/// `CREATING` until the restored table's transition falls due, like every index a restore
+/// brings into being.
+fn restored_vector_indexes(
+    source: &crate::state::Table,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Vec<crate::state::VectorIndex> {
+    source
+        .vector_indexes
+        .iter()
+        .map(|index| crate::state::VectorIndex {
+            arn: crate::state::index_arn(region, table, &index.name),
+            transient_status: crate::state::IndexStatus::Creating,
+            active_at: now + crate::state::STATUS_TRANSITION,
+            reported_counters: crate::state::MeteredCounters::new(now),
+            ..index.clone()
+        })
+        .collect()
 }
 
 /// The local secondary indexes the restored table carries, by the same selection rule

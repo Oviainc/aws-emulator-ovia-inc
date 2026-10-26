@@ -29,11 +29,14 @@ use crate::ops::types::{
     LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, S3BucketSource,
+    SearchSchemaElement,
     SourceTableDetails,
     OnDemandThroughput,
     SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
-    TableWarmThroughputDescription, WarmThroughput,
+    TableWarmThroughputDescription, VectorAttributeDefinition, VectorIndexDescription,
+    VectorIndexInfo,
+    WarmThroughput,
 };
 
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
@@ -216,17 +219,39 @@ pub const MAX_INDEX_SORT_KEYS: usize = 4;
 /// The most key elements one index's key schema may carry, from the two counts above.
 pub const MAX_INDEX_KEY_ELEMENTS: usize = MAX_INDEX_PARTITION_KEYS + MAX_INDEX_SORT_KEYS;
 
+/// The most vector indexes one table may carry.
+///
+/// AWS documents no ceiling for `CreateTable$VectorIndexes`, so this one is this
+/// emulator's own: the global secondary index quota over again
+/// ([`MAX_GLOBAL_SECONDARY_INDEXES`]), since a vector index is another index on the same
+/// table. A request past it is refused rather than storing a list whose length is the
+/// request's to choose.
+pub const MAX_VECTOR_INDEXES: usize = MAX_GLOBAL_SECONDARY_INDEXES;
+
+/// The most elements one vector index's `SearchSchema` may carry.
+///
+/// The model bounds that list below ("@length min 1") and not above, so this ceiling is
+/// this emulator's own: the widest key schema this service accepts for an index
+/// ([`MAX_INDEX_KEY_ELEMENTS`]), because a search schema plays the same part for a vector
+/// index — "the search schema that defines partition key and inline filter attributes"
+/// (`VectorIndex$SearchSchema`). It is what bounds the work of matching a request's
+/// attribute definitions against its vector indexes, since both counts come from the
+/// request body.
+pub const MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS: usize = MAX_INDEX_KEY_ELEMENTS;
+
 /// The most attribute definitions one table may declare.
 ///
 /// "The attributes in KeySchema must also be defined in the AttributeDefinitions
-/// array", and a definition no key schema uses is refused, so a table's definitions can
+/// array", and a definition no schema uses is refused, so a table's definitions can
 /// never outnumber the key attributes of its own key schema (one `HASH` and at most one
-/// `RANGE`) plus those of its indexes. A request declaring more than that is already
-/// invalid, and clamping it up front is what bounds the work matching definitions
-/// against key schemas: both counts come from the request body.
+/// `RANGE`) plus those of its indexes, plus the attributes its vector indexes consume. A
+/// request declaring more than that is already invalid, and clamping it up front is what
+/// bounds the work matching definitions against those schemas: both counts come from the
+/// request body.
 pub const MAX_ATTRIBUTE_DEFINITIONS: usize = MAX_TABLE_KEY_ELEMENTS
     + MAX_GLOBAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS
-    + MAX_LOCAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS;
+    + MAX_LOCAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS
+    + MAX_VECTOR_INDEXES * (1 + MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS);
 
 /// What one table, and the whole store, may hold in items.
 ///
@@ -962,6 +987,128 @@ impl GlobalSecondaryIndex {
             IndexStatus::Active
         } else {
             self.transient_status
+        }
+    }
+}
+
+/// The `SearchSchemaElementType` of a search-schema element that PARTITIONS a vector
+/// index: "HASH - A partition key that partitions the vector index for independent
+/// scaling. When specified, you must provide this attribute's value in the
+/// SearchConditionExpression" (`SearchSchemaElement$SearchSchemaElementType`).
+///
+/// An element typed this way is a key of the index, so only an item that carries it
+/// reaches the index; the other value, `INLINE_FILTER`, is "an attribute projected into
+/// the vector index for filtering at the storage layer during search", which an item may
+/// leave out.
+pub const SEARCH_SCHEMA_PARTITION_KEY: &str = "HASH";
+
+/// One stored vector index: the vector attribute it indexes, the schema it is searched
+/// through, and its lifecycle instants.
+///
+/// Like a secondary index it holds no items of its own — "attributes that are copied
+/// (projected) from the table into the vector index" (`VectorIndex$Projection`) — so its
+/// `ItemCount` and `IndexSizeBytes` are metered from the TABLE's items on the schedule
+/// [`MeteredCounters`] describes rather than per write.
+#[derive(Debug, Clone)]
+pub struct VectorIndex {
+    pub name: String,
+    pub arn: String,
+    /// "The vector attribute configuration for the index" (`VectorIndex$VectorAttribute`):
+    /// the attribute whose value is the vector each indexed item is found by.
+    pub vector_attribute: VectorAttributeDefinition,
+    /// "The search schema that defines partition key and inline filter attributes for the
+    /// vector index" (`VectorIndex$SearchSchema`), in the order the request declared it.
+    pub search_schema: Vec<SearchSchemaElement>,
+    pub projection: Projection,
+    /// "The number of dimensions in each vector" (`VectorIndex$Dimensions`).
+    pub dimensions: i64,
+    /// "The distance function used to calculate similarity between vectors"
+    /// (`VectorIndex$DistanceFunction`).
+    pub distance_function: String,
+    /// The transient status this index is in until [`Self::active_at`] falls due.
+    pub transient_status: IndexStatus,
+    /// When the clock owes this index its transient -> `ACTIVE` transition.
+    pub active_at: SystemTime,
+    /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
+    /// refreshed with the table's on the documented schedule.
+    pub reported_counters: MeteredCounters,
+}
+
+impl VectorIndex {
+    /// The status at `now`, derived from the stored instants, by the same rule a
+    /// secondary index follows.
+    pub fn status(&self, now: SystemTime) -> IndexStatus {
+        if now >= self.active_at {
+            IndexStatus::Active
+        } else {
+            self.transient_status
+        }
+    }
+
+    /// Every attribute of the TABLE this index consumes: the vector attribute, and each
+    /// attribute its search schema names.
+    ///
+    /// This is what makes an `AttributeDefinitions` entry used by a vector index, and what
+    /// the index stores for an item beside whatever its `Projection` adds.
+    pub fn consumed_attributes(&self) -> impl Iterator<Item = &str> {
+        ::std::iter::once(self.vector_attribute.attribute_name.as_str()).chain(
+            self.search_schema
+                .iter()
+                .map(|element| element.attribute_name.as_str()),
+        )
+    }
+
+    /// Whether `item` reaches this index: it must carry the vector attribute, and the
+    /// value of every attribute the search schema partitions the index by
+    /// ([`SEARCH_SCHEMA_PARTITION_KEY`]). An `INLINE_FILTER` attribute is optional, so an
+    /// item that leaves one out is still indexed.
+    fn covers(&self, item: &Item) -> bool {
+        item.contains_key(&self.vector_attribute.attribute_name)
+            && self
+                .search_schema
+                .iter()
+                .filter(|element| element.search_schema_element_type == SEARCH_SCHEMA_PARTITION_KEY)
+                .all(|element| item.contains_key(&element.attribute_name))
+    }
+
+    /// The bytes this index stores for one covered item: the attributes it consumes, the
+    /// table's own key attributes, and whatever its `Projection` adds — the same
+    /// projection rule a secondary index is sized by ([`index_projects`]).
+    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
+        if self.projection.projection_type.as_deref().unwrap_or("ALL") == "ALL" {
+            return item_size(item);
+        }
+        let projected: Item = item
+            .iter()
+            .filter(|(name, _)| {
+                self.consumed_attributes().any(|consumed| consumed == *name)
+                    || index_projects(&[], &self.projection, table_key_schema, name)
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        item_size(&projected)
+    }
+
+    /// Project this index into the `VectorIndexDescription` every table description
+    /// reports it as. `ItemCount` and `IndexSizeBytes` are the metered figures of the
+    /// last refresh, never the live projection.
+    fn describe(&self, now: SystemTime) -> VectorIndexDescription {
+        VectorIndexDescription {
+            index_name: Some(self.name.clone()),
+            index_arn: Some(self.arn.clone()),
+            vector_attribute: Some(self.vector_attribute.clone()),
+            search_schema: (!self.search_schema.is_empty()).then(|| self.search_schema.clone()),
+            projection: Some(self.projection.clone()),
+            dimensions: Some(self.dimensions),
+            distance_function: Some(self.distance_function.clone()),
+            index_status: Some(self.status(now).as_str().to_string()),
+            // "Specifies whether the index is currently backfilling"
+            // (`VectorIndexDescription$Backfilling`): an index defined WITH the table has
+            // no table data to backfill from, and this emulator projects an index's items
+            // from the table on every read, so none ever is.
+            backfilling: None,
+            item_count: Some(self.reported_counters.item_count),
+            index_size_bytes: Some(self.reported_counters.size_bytes),
         }
     }
 }
@@ -2048,6 +2195,18 @@ impl ContributorInsights {
     pub fn mode(&self) -> Option<String> {
         self.mode.clone()
     }
+
+    /// Whether this setting is one `ListContributorInsights` reports a summary for.
+    ///
+    /// The listing enumerates the contributor insights CONFIGURATIONS that exist — the
+    /// resources insights are being turned on for, are on for, or are still being turned
+    /// off for. A resource whose status has settled `DISABLED` has no configuration, so
+    /// it carries no summary: it drops out of the listing once a `DISABLE` settles, and a
+    /// resource no update has ever named was never in it. `DescribeContributorInsights`
+    /// is what answers for a named resource either way, and reports `DISABLED` for it.
+    pub fn listed(&self, now: SystemTime) -> bool {
+        self.status(now) != CONTRIBUTOR_INSIGHTS_DISABLED
+    }
 }
 
 // =============================================================================
@@ -2507,6 +2666,11 @@ pub struct SourceTableSnapshot {
     pub table_size_bytes: i64,
     pub global_secondary_indexes: Vec<GlobalSecondaryIndexInfo>,
     pub local_secondary_indexes: Vec<LocalSecondaryIndexInfo>,
+    /// The vector indexes the source table carried, as `SourceTableFeatureDetails`
+    /// reports them — and the configuration a table restored from this backup rebuilds
+    /// them from, since "all vector indexes from the backup are restored"
+    /// (`RestoreTableFromBackup$VectorIndexOverride`).
+    pub vector_indexes: Vec<VectorIndexInfo>,
     /// The table's stream configuration, for a table that had a stream.
     pub stream_specification: Option<StreamSpecification>,
 }
@@ -2634,6 +2798,8 @@ impl Backup {
                     .then(|| self.source.local_secondary_indexes.clone()),
                 global_secondary_indexes: (!self.source.global_secondary_indexes.is_empty())
                     .then(|| self.source.global_secondary_indexes.clone()),
+                vector_indexes: (!self.source.vector_indexes.is_empty())
+                    .then(|| self.source.vector_indexes.clone()),
                 stream_description: self.source.stream_specification.clone(),
                 ..SourceTableFeatureDetails::default()
             }),
@@ -2840,6 +3006,10 @@ pub struct Table {
     /// read and never stored as one; unlike them they can only be defined here, at
     /// `CreateTable`.
     pub local_secondary_indexes: Vec<LocalSecondaryIndex>,
+    /// The vector indexes defined on this table, in the order they were declared. Like
+    /// the secondary indexes they are projected into a description on every read and
+    /// never stored as one.
+    pub vector_indexes: Vec<VectorIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
     /// This table's continuous-backups settings: whether point-in-time recovery is on
@@ -3395,6 +3565,23 @@ impl Table {
             .iter()
             .map(|index| self.live_index_figures(&index.key_schema, &index.projection))
             .collect();
+        // A vector index is metered from the same items, by its own coverage and
+        // projection rules ([`VectorIndex::covers`]).
+        let vector: Vec<(i64, i64)> = self
+            .vector_indexes
+            .iter()
+            .map(|index| {
+                self.items
+                    .values()
+                    .filter(|item| index.covers(item))
+                    .fold((0i64, 0i64), |(count, bytes), item| {
+                        (
+                            count.saturating_add(1),
+                            bytes.saturating_add(index.projected_size(item, &self.key_schema)),
+                        )
+                    })
+            })
+            .collect();
         for (index, (item_count, size_bytes)) in
             self.global_secondary_indexes.iter_mut().zip(global)
         {
@@ -3402,6 +3589,9 @@ impl Table {
         }
         for (index, (item_count, size_bytes)) in self.local_secondary_indexes.iter_mut().zip(local)
         {
+            index.reported_counters.refresh(now, item_count, size_bytes);
+        }
+        for (index, (item_count, size_bytes)) in self.vector_indexes.iter_mut().zip(vector) {
             index.reported_counters.refresh(now, item_count, size_bytes);
         }
     }
@@ -3531,6 +3721,10 @@ impl Table {
     /// "ContributorInsightsSummary for a table and all its global secondary indexes"
     /// (the `ListContributorInsights` doc).
     ///
+    /// Only a resource whose setting the listing reports ([`ContributorInsights::listed`])
+    /// is in it, so a table whose insights are off has no summary and drops out once a
+    /// `DISABLE` settles.
+    ///
     /// A local secondary index has none: the feature is addressed through `IndexName`
     /// against the global indexes an `UpdateContributorInsights` can name.
     pub fn contributor_insights_summaries(&self, now: SystemTime) -> Vec<ContributorInsightsSummary> {
@@ -3540,9 +3734,11 @@ impl Table {
             contributor_insights_status: Some(self.contributor_insights.status(now).to_string()),
             contributor_insights_mode: self.contributor_insights.mode(),
         })
+        .filter(|_| self.contributor_insights.listed(now))
         .chain(
             self.global_secondary_indexes
                 .iter()
+                .filter(|index| index.contributor_insights.listed(now))
                 .map(|index| ContributorInsightsSummary {
                     table_name: Some(self.name.clone()),
                     index_name: Some(index.name.clone()),
@@ -3835,6 +4031,14 @@ impl Table {
                     .map(|index| self.describe_local_index(index))
                     .collect()
             }),
+            // "The vector indexes, if any, on the table" (`TableDescription$VectorIndexes`):
+            // reported only for a table that carries one, like both secondary index lists.
+            vector_indexes: (!self.vector_indexes.is_empty()).then(|| {
+                self.vector_indexes
+                    .iter()
+                    .map(|index| index.describe(now))
+                    .collect()
+            }),
             table_class_summary: self.table_class.as_ref().map(|class| TableClassSummary {
                 table_class: Some(class.clone()),
                 last_update_date_time: None,
@@ -3909,6 +4113,21 @@ impl Table {
                     index_name: Some(index.name.clone()),
                     key_schema: Some(index.key_schema.clone()),
                     projection: Some(index.projection.clone()),
+                })
+                .collect(),
+            // The vector indexes the table carried, recorded with the backup so a restore
+            // from it rebuilds them and `DescribeBackup` reports them.
+            vector_indexes: self
+                .vector_indexes
+                .iter()
+                .map(|index| VectorIndexInfo {
+                    index_name: Some(index.name.clone()),
+                    vector_attribute: Some(index.vector_attribute.clone()),
+                    search_schema: (!index.search_schema.is_empty())
+                        .then(|| index.search_schema.clone()),
+                    projection: Some(index.projection.clone()),
+                    dimensions: Some(index.dimensions),
+                    distance_function: Some(index.distance_function.clone()),
                 })
                 .collect(),
             // Reported for a table that has a stream, disabled or not, exactly as the
