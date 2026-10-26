@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAcmeExternalAccountBinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAcmeExternalAccountBinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an external-account-binding ARN under the ACME endpoint the
+//! request names, mints the binding's own credentials (the key id an ACME client
+//! presents in its external-account-binding JWS and the MAC key it signs that JWS
+//! with), persists the record with the IAM role the request bound, the expiry its
+//! `Expiration` names and the resource tags it carries, and returns the stored binding.
+//! An endpoint ARN that names ANOTHER account is `ValidationException` — a verdict on
+//! the request, reached before the store is read; an endpoint ARN of this account with
+//! no record behind it is `ResourceNotFoundException`; an `IdempotencyToken` re-sent
+//! (against the same endpoint) with the same parameters resolves to the binding it
+//! already created, and re-sent with different parameters it is refused as a conflict.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAcmeExternalAccountBinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The credentials are SERVER-GENERATED and immutable: no request member proposes
+//! either, they are minted once here
+//! ([`crate::state::mint_acme_external_account_binding_mac_key`]) and nothing rewrites
+//! them, so `GetAcmeExternalAccountBindingCredentials` reports the same pair on every
+//! later read.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +174,287 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAcmeExternalAccountBinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAcmeExternalAccountBindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAcmeExternalAccountBinding"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                CreateAcmeExternalAccountBindingErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the acm acme external account binding store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The endpoint ARN is INPUT this operation validates, and its account segment is
+        // part of what it validates: a binding's own ARN is minted as a path under the
+        // endpoint's, so an endpoint ARN carrying another account's id could only ever
+        // mint an ARN in that account, which this caller cannot address. That is a
+        // verdict on the request, so it is reached before the store is consulted at all —
+        // never reported as a resource this account happens not to hold.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(validation_exception(
+                crate::service::cross_account_arn_refusal(
+                    crate::state::ACME_ENDPOINT_RESOURCE_TYPE,
+                ),
+            ));
+        }
+
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default())
+            .map_err(validation_exception)?;
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes, dates the binding this call creates and is what its expiry
+        // is counted from.
+        let now = std::time::SystemTime::now();
+
+        // The instant the binding expires: the span the request's `Expiration` names
+        // after the instant it is created, and `None` for a request that named no
+        // expiration. The unit set and the lower bound on the value are modelled, so what
+        // is left to refuse here is an expiry no instant can hold.
+        let expires_at = match input.expiration.as_ref() {
+            Some(expiration) => Some(
+                crate::state::expiration_span(expiration)
+                    .and_then(|span| now.checked_add(span))
+                    .ok_or_else(|| {
+                        validation_exception(format!(
+                            "Expiration of {} {} is further out than this service can represent",
+                            expiration.value, expiration.r#type
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
+        let fingerprint = request_fingerprint(&input, &tags);
+        // A binding is created UNDER one endpoint, so a token names one create against
+        // that endpoint: the index is keyed by the pair, and the endpoint ARN already
+        // carries the Region the request was signed for.
+        let idempotency = input
+            .idempotency_token
+            .as_deref()
+            .map(|token| (input.acme_endpoint_arn.clone(), token.to_string()));
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // What this request's `IdempotencyToken` has already created against this
+        // endpoint, if anything.
+        let replayed = idempotency
+            .as_ref()
+            .and_then(|key| store.acme_external_account_binding_idempotency.get(key))
+            .cloned();
+        if let Some(seen) = replayed {
+            // The token identifies ONE create. Re-sent with the same parameters it
+            // answers with the binding it already created and makes no second one;
+            // re-sent with different parameters it is a different request wearing an
+            // identifier that is already taken, so it is refused rather than silently
+            // discarding the change — which is what `ConflictException` ("you are trying
+            // to update a resource or configuration that is already being created or
+            // updated") names.
+            if seen.fingerprint != fingerprint {
+                return Err(
+                    CreateAcmeExternalAccountBindingErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "the idempotency token of this request already created ACME external account binding {}, with different parameters",
+                                seen.acme_external_account_binding_arn
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // An entry whose binding has since been deleted is stale, so it is not
+            // reused: a minted ARN must always have a record behind it.
+            if let Some(binding) = store
+                .acme_external_account_bindings
+                .get(&seen.acme_external_account_binding_arn)
+            {
+                return Ok(CreateAcmeExternalAccountBindingOutput {
+                    external_account_binding: Some(
+                        crate::state::acme_external_account_binding_detail(binding),
+                    ),
+                });
+            }
+        }
+
+        // An external account binding exists only on the ACME endpoint it registers
+        // accounts with, and its ARN is a path under that endpoint's, so an endpoint this
+        // account does not hold has nothing to create a binding under.
+        let Some(endpoint) = store.acme_endpoints.get(&input.acme_endpoint_arn) else {
+            return Err(
+                CreateAcmeExternalAccountBindingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::acme_endpoint_not_found_message(
+                            &input.acme_endpoint_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let acme_endpoint_arn = endpoint.arn.clone();
+
+        // The cap on the WHOLE map, checked first because it is the one bound nothing in
+        // the request can partition: the per-endpoint quota below is counted over a
+        // parent the caller can create more of. The token index gains an entry only
+        // beside a new binding, so it is bounded with the map; it is checked here as well
+        // so neither can pass the cap.
+        let stored = store.acme_external_account_bindings.len();
+        let tokens = store.acme_external_account_binding_idempotency.len();
+        if stored >= crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_STORE_LIMIT
+            || tokens >= crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_STORE_LIMIT
+        {
+            // Name whichever count reached the cap, so the refusal says what is full.
+            let (full, held) =
+                if stored >= crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_STORE_LIMIT {
+                    ("ACME external account bindings", stored)
+                } else {
+                    ("ACME external account binding idempotency tokens", tokens)
+                };
+            return Err(quota_exceeded(format!(
+                "this emulator already holds {held} {full}, the most it stores ({})",
+                crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_STORE_LIMIT
+            )));
+        }
+
+        // The per-endpoint quota, refused BEFORE the record is inserted, so the store
+        // cannot grow past it however many times the call is repeated.
+        let held = store
+            .acme_external_account_bindings_of(&acme_endpoint_arn)
+            .count();
+        if held >= crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_LIMIT {
+            return Err(quota_exceeded(format!(
+                "ACME endpoint {acme_endpoint_arn} already holds {held} external account bindings, the quota of {}",
+                crate::state::ACME_EXTERNAL_ACCOUNT_BINDING_LIMIT
+            )));
+        }
+
+        // The credentials this binding authorizes a registration with. The MAC key is a
+        // secret, so it comes from the emulator's credential store rather than from
+        // anything this service constructs; the key id is the binding's own id, which is
+        // server-minted too.
+        let binding_id = uuid::Uuid::new_v4().to_string();
+        let Some(mac_key) =
+            crate::state::mint_acme_external_account_binding_mac_key(ctx.credential_store())
+        else {
+            // Nothing was stored, so the caller may retry: minting the credentials is the
+            // emulator's own work, which is what `InternalServerException` names.
+            return Err(
+                CreateAcmeExternalAccountBindingErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "could not mint the MAC key of the external account binding".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let arn = crate::state::acme_external_account_binding_arn(&acme_endpoint_arn, &binding_id);
+        let binding = crate::state::AcmeExternalAccountBindingRecord {
+            arn: arn.clone(),
+            acme_endpoint_arn,
+            role_arn: input.role_arn.clone(),
+            key_id: binding_id,
+            mac_key,
+            // The instant the binding expires is the span the request named after the
+            // instant it was created; a request that named no `Expiration` creates a
+            // binding that carries no expiry.
+            expires_at,
+            // Nothing has revoked the binding and nothing has registered with it yet, so
+            // neither instant exists: each is documented as the time at which that
+            // happened.
+            revoked_at: None,
+            last_used_at: None,
+            tags,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let detail = crate::state::acme_external_account_binding_detail(&binding);
+        store
+            .acme_external_account_bindings
+            .insert(arn.clone(), binding);
+        if let Some(key) = idempotency {
+            store.acme_external_account_binding_idempotency.insert(
+                key,
+                crate::state::AcmeExternalAccountBindingIdempotency {
+                    fingerprint,
+                    acme_external_account_binding_arn: arn,
+                },
+            );
+        }
+
+        Ok(CreateAcmeExternalAccountBindingOutput {
+            external_account_binding: Some(detail),
+        })
     }
+}
+
+/// A refusal of the request as invalid, as this operation's own modelled
+/// `ValidationException` ("the supplied input failed to satisfy constraints").
+fn validation_exception(message: String) -> CreateAcmeExternalAccountBindingError {
+    CreateAcmeExternalAccountBindingErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A refusal of a create that would take a bounded resource past its cap, as this
+/// operation's own modelled `ServiceQuotaExceededException`.
+fn quota_exceeded(message: String) -> CreateAcmeExternalAccountBindingError {
+    CreateAcmeExternalAccountBindingErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// A fingerprint of EVERY parameter the binding is created from: the endpoint it
+/// registers accounts with, the IAM role it binds, the expiration it was configured
+/// with, and the resource tags.
+///
+/// Rendered by [`crate::state::fingerprint_groups`], which frames each group behind its
+/// own part count, so no value can move between groups, or run into its neighbour, and
+/// leave the fingerprint unchanged — which matters because every tag key and value is
+/// arbitrary caller-controlled text. The tag map is rendered in key order, so the same
+/// request with its tags listed in another order fingerprints identically.
+fn request_fingerprint(
+    input: &CreateAcmeExternalAccountBindingInput,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> String {
+    // Each half of the optional `Expiration` renders as the empty string when the
+    // structure is absent, which no modelled value of it can be (`Value` is
+    // `@range(min: 1)` and `Type` an enum), so "absent" and "present" cannot fingerprint
+    // alike.
+    let expiration_value = input
+        .expiration
+        .as_ref()
+        .map(|expiration| expiration.value.to_string())
+        .unwrap_or_default();
+    let expiration_type = input
+        .expiration
+        .as_ref()
+        .map(|expiration| expiration.r#type.as_str())
+        .unwrap_or_default();
+    let configuration: Vec<&str> = vec![
+        &input.acme_endpoint_arn,
+        &input.role_arn,
+        &expiration_value,
+        expiration_type,
+    ];
+
+    let tags: Vec<&str> = tags
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .collect();
+
+    crate::state::fingerprint_groups(&[configuration.as_slice(), tags.as_slice()])
 }
