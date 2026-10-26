@@ -194,7 +194,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(TagResourceError::bad_request(crate::state::tag_refusal(
                     crate::state::ADDED_TAGS_MEMBER,
                     violation,
-                    key,
                     &shown,
                 )));
             }

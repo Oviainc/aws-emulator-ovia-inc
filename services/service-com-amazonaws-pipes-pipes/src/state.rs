@@ -102,6 +102,12 @@ pub const TAG_VALUE_LENGTH: std::ops::RangeInclusive<usize> = 0..=256;
 /// case-insensitively, the way the reservation is stated.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The sentence a key using [`RESERVED_TAG_KEY_PREFIX`] is refused with: FIXED, documented
+/// text whose parenthetical states the rule itself, so it interpolates nothing — neither
+/// the key that used the prefix nor the resource it was meant for reaches the caller.
+pub const RESERVED_TAG_KEY_PREFIX_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
+
 /// The special characters a tag may carry besides letters, numbers and spaces. Source:
 /// the documented tag rule [`TAG_CHARACTER_SET_MESSAGE`] states verbatim.
 const TAG_SPECIAL_CHARACTERS: &[char] = &['_', '.', ':', '/', '=', '+', '-', '@'];
@@ -217,6 +223,34 @@ fn one_validation_error(clause: String) -> String {
     format!("1 validation error detected: {clause}")
 }
 
+/// The member a refusal of the resource-tagging layer carries its validation sentence
+/// under. The layer's message is a JSON DOCUMENT naming this one member rather than the
+/// sentence itself, so the sentence is never the whole text a client reads.
+const TAG_REFUSAL_DOCUMENT_MEMBER: &str = "message";
+
+/// A validation clause as the resource-tagging layer puts it on the wire: the
+/// [`one_validation_error`] sentence as the single member of a JSON document, which is what
+/// that layer's message is.
+///
+/// The sentence is quoted twice over. It goes through `serde_json` first, so a character
+/// the echoed value carries that a JSON string cannot hold literally is escaped as JSON
+/// requires and a caller-influenced echo cannot break the document; then every APOSTROPHE
+/// is backslash-escaped too — the quotes the sentence itself puts around a value and a
+/// member name included.
+///
+/// That second pass is the recorded wording of this layer, deliberately kept: a backslash
+/// before an apostrophe is not one of the escapes a JSON string defines, so the document
+/// is the layer's own quoting rather than a strictly decodable one, and a client reading
+/// the sentence out of it has to undo this escaping. Dropping it would state a message
+/// this layer does not state.
+fn tag_validation_document(clause: String) -> String {
+    let quoted = ::serde_json::Value::String(one_validation_error(clause)).to_string();
+    format!(
+        r#"{{"{TAG_REFUSAL_DOCUMENT_MEMBER}": {}}}"#,
+        quoted.replace('\'', "\\'"),
+    )
+}
+
 /// The tags a request carried, as a validation message echoes the member's value: every
 /// entry in key order, `{k1=v1, k2=v2}`. What such a message echoes is the value of the
 /// MEMBER, not only the entry that broke the rule.
@@ -234,35 +268,26 @@ pub fn echoed_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> St
 
 /// The message a write that installs tags refuses `violation` with, for the `member` the
 /// tags arrived on (the operations name it differently, so the caller passes its own).
-/// `key` is the tag that broke the rule and `tags_shown` the member's value as
-/// [`echoed_tags`] renders it.
+/// `tags_shown` is the member's value as [`echoed_tags`] renders it.
 ///
 /// A violated published BOUND is stated as request validation states one — the member,
 /// its value, and the bounds that value had to satisfy, all from this request and the
-/// model. The character-set and reserved-prefix rules are not modelled constraints, so
-/// each is stated as the rule itself.
-pub fn tag_refusal(
-    member: &str,
-    violation: TagViolation,
-    key: &str,
-    tags_shown: &str,
-) -> String {
+/// model — inside the JSON document the layer's message is ([`tag_validation_document`]).
+/// The character-set and reserved-prefix rules are not modelled constraints and no
+/// validation sentence states them: each is the documented rule itself, stated bare.
+pub fn tag_refusal(member: &str, violation: TagViolation, tags_shown: &str) -> String {
     match violation {
-        TagViolation::KeyLength => one_validation_error(format!(
+        TagViolation::KeyLength => tag_validation_document(format!(
             "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
              Map keys must satisfy constraint: [{}]",
             length_requirements(&TAG_KEY_LENGTH),
         )),
-        TagViolation::ValueLength => one_validation_error(format!(
+        TagViolation::ValueLength => tag_validation_document(format!(
             "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
              Map value must satisfy constraint: [{}]",
             length_requirements(&TAG_VALUE_LENGTH),
         )),
-        TagViolation::ReservedKeyPrefix => format!(
-            "Tag key '{}' uses the prefix '{RESERVED_TAG_KEY_PREFIX}', which is reserved \
-             for Amazon Web Services use.",
-            echoed_key(key),
-        ),
+        TagViolation::ReservedKeyPrefix => RESERVED_TAG_KEY_PREFIX_MESSAGE.to_string(),
         TagViolation::CharacterSet => TAG_CHARACTER_SET_MESSAGE.to_string(),
     }
 }
@@ -275,7 +300,7 @@ pub fn tag_refusal(
 /// which the boundary validator does walk, so it reaches this wording already bounded by
 /// that validator's own rendering.
 pub fn tag_key_refusal(member: &str, key: &str) -> String {
-    one_validation_error(format!(
+    tag_validation_document(format!(
         "Value '[{key}]' at '{member}' failed to satisfy constraint: \
          Member must satisfy constraint: [{}]",
         length_requirements(&TAG_KEY_LENGTH),

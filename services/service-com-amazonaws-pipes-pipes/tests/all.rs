@@ -31,5 +31,7 @@ mod pipe_update;
 mod state_roundtrip;
 #[path = "all/tag_key_rules.rs"]
 mod tag_key_rules;
+#[path = "all/tagging_refusal_wording.rs"]
+mod tagging_refusal_wording;
 #[path = "all/tagging_refusals.rs"]
 mod tagging_refusals;

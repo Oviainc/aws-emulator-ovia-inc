@@ -22,8 +22,11 @@
 //! API, so a tag breaking one is refused with HTTP 400 and the error code
 //! `BadRequestException` — not with the `ValidationException` the operations model for the
 //! refusals the SERVICE itself states (how many tags a pipe may carry, which
-//! `tests/all/pipe_tagging.rs` pins). Each row below also spells out the sentence the
-//! broken rule is stated by, independently of the handler that built it.
+//! `tests/all/pipe_tagging.rs` pins). Each row below also spells out the message the
+//! broken rule is stated by, independently of the handler that built it: a broken
+//! `@length` is the request-validation sentence inside the JSON document that layer's
+//! message is, and a rule the model expresses nowhere is the documented sentence itself —
+//! `tests/all/tagging_refusal_wording.rs` owns that rule and its envelope.
 //!
 //! Every assertion goes through `MultiServiceRouter::dispatch`, reusing the harness
 //! `pipe_lifecycle` owns and the tagging helpers `pipe_tagging` owns, and every refused
@@ -35,6 +38,7 @@ use serde_json::{json, Value};
 
 use crate::pipe_lifecycle::{create, describe, router};
 use crate::pipe_tagging::{assert_tags_agree, create_body, pipe_arn, tag, tag_map};
+use crate::tagging_refusal_wording::tag_refusal_document;
 
 /// `TagKey`'s published maximum (128) and minimum (1), and `TagValue`'s (256 and 0).
 /// Source: the `TagKey` / `TagValue` shapes of
@@ -48,8 +52,14 @@ const MIN_TAG_VALUE_LEN: usize = 0;
 const TAG_RULE_CODE: &str = "BadRequestException";
 
 /// The sentence AWS documents for a tag outside the allowed character set.
-const CHARACTER_SET_SENTENCE: &str = "Tags can only contain letters, numbers, spaces, and \
-                                      the following special characters: _ . : / = + - @";
+pub(crate) const CHARACTER_SET_SENTENCE: &str = "Tags can only contain letters, numbers, \
+                                                spaces, and the following special \
+                                                characters: _ . : / = + - @";
+
+/// The fixed sentence a tag key using the reserved `aws:` prefix is refused with. It names
+/// neither the key nor the resource, and its parenthetical states the rule itself.
+pub(crate) const RESERVED_PREFIX_SENTENCE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
 
 /// The member a refused tag is reported at, per write: `TagResource`'s request validation
 /// names the tags it merges `addedTags`, `CreatePipe`'s names them as the model does.
@@ -68,9 +78,9 @@ enum Broken {
     /// (a map's values ARE walked), which knows the member only as the model names it and
     /// has only the entry that broke the bound to echo.
     ValueBound(String),
-    /// The reserved key prefix, which no modelled constraint expresses: the rule itself,
-    /// naming the key that used it.
-    ReservedPrefix(String),
+    /// The reserved key prefix, which no modelled constraint expresses: the fixed
+    /// documented sentence, naming nothing from the request.
+    ReservedPrefix,
     /// A character outside the documented set: the documented sentence, which names
     /// nothing from the request.
     CharacterSet,
@@ -78,24 +88,26 @@ enum Broken {
 
 impl Broken {
     /// The message this refusal carries for a write whose tags arrived on `member`.
+    ///
+    /// A broken `@length` is stated as request validation states one, inside the JSON
+    /// document the tagging layer's message is (`tagging_refusal_wording`, which owns that
+    /// envelope and the rule behind it); a rule the model expresses nowhere is the
+    /// documented sentence itself, stated bare.
     fn message(&self, member: &str) -> String {
         match self {
-            Self::KeyBound(shown) => format!(
+            Self::KeyBound(shown) => tag_refusal_document(&format!(
                 "1 validation error detected: Value '{shown}' at '{member}' failed to \
                  satisfy constraint: Map keys must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_KEY_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_KEY_LEN}]"
-            ),
-            Self::ValueBound(shown) => format!(
+            )),
+            Self::ValueBound(shown) => tag_refusal_document(&format!(
                 "1 validation error detected: Value '{shown}' at '{CREATE_TAGS}' failed to \
                  satisfy constraint: Map value must satisfy constraint: [Member must have \
                  length less than or equal to {MAX_TAG_VALUE_LEN}, Member must have length \
                  greater than or equal to {MIN_TAG_VALUE_LEN}]"
-            ),
-            Self::ReservedPrefix(key) => format!(
-                "Tag key '{key}' uses the prefix 'aws:', which is reserved for Amazon Web \
-                 Services use."
-            ),
+            )),
+            Self::ReservedPrefix => RESERVED_PREFIX_SENTENCE.to_string(),
             Self::CharacterSet => CHARACTER_SET_SENTENCE.to_string(),
         }
     }
@@ -103,7 +115,7 @@ impl Broken {
 
 /// The tags of a request as a validation sentence echoes the member's value: every entry
 /// in KEY order, which is the one order a refusal states them in.
-fn shown(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn shown(pairs: &[(&str, &str)]) -> String {
     let mut entries: Vec<String> = pairs
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -115,13 +127,13 @@ fn shown(pairs: &[(&str, &str)]) -> String {
 /// A value past `TagValue`'s bound as a refusal echoes it: the boundary validator elides
 /// an echoed value at 256 bytes, on a character boundary, and states the full byte count,
 /// so a request cannot be amplified into an arbitrarily long response.
-fn elided(value: &str) -> String {
+pub(crate) fn elided(value: &str) -> String {
     format!("{}... [{} bytes]", &value[..MAX_TAG_VALUE_LEN], value.len())
 }
 
 /// A tag object from pairs whose keys are computed rather than literal (`json!` takes
 /// only literal keys).
-fn tags_of(pairs: Vec<(String, String)>) -> Value {
+pub(crate) fn tags_of(pairs: Vec<(String, String)>) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
         map.insert(key, Value::String(value));
@@ -130,7 +142,7 @@ fn tags_of(pairs: Vec<(String, String)>) -> Value {
 }
 
 /// One tag, from borrowed parts.
-fn one_tag(key: &str, value: &str) -> Value {
+pub(crate) fn one_tag(key: &str, value: &str) -> Value {
     tags_of(vec![(key.to_string(), value.to_string())])
 }
 
@@ -206,24 +218,22 @@ fn rows() -> Vec<(&'static str, Value, Option<Broken>)> {
         (
             "reserved-prefix-lower-case",
             one_tag("aws:cloudformation:stack-name", "demo"),
-            Some(Broken::ReservedPrefix(
-                "aws:cloudformation:stack-name".to_string(),
-            )),
+            Some(Broken::ReservedPrefix),
         ),
         (
             "reserved-prefix-upper-case",
             one_tag("AWS:createdBy", "demo"),
-            Some(Broken::ReservedPrefix("AWS:createdBy".to_string())),
+            Some(Broken::ReservedPrefix),
         ),
         (
             "reserved-prefix-mixed-case",
             one_tag("Aws:Owner", "demo"),
-            Some(Broken::ReservedPrefix("Aws:Owner".to_string())),
+            Some(Broken::ReservedPrefix),
         ),
         (
             "reserved-prefix-alone",
             one_tag("aws:", "demo"),
-            Some(Broken::ReservedPrefix("aws:".to_string())),
+            Some(Broken::ReservedPrefix),
         ),
         // Only the PREFIX is reserved: `aws` elsewhere in the key is an ordinary key, and
         // so is a value that starts with it.
@@ -238,7 +248,7 @@ fn rows() -> Vec<(&'static str, Value, Option<Broken>)> {
                 ("env".to_string(), "prod".to_string()),
                 ("aws:owner".to_string(), "demo".to_string()),
             ]),
-            Some(Broken::ReservedPrefix("aws:owner".to_string())),
+            Some(Broken::ReservedPrefix),
         ),
         // Every special character the documented set admits, in one key and one value.
         (
@@ -415,8 +425,10 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
         (400, TAG_RULE_CODE),
         "TagResource must refuse an over-long key with 400 {TAG_RULE_CODE}, got {refused:?}"
     );
+    // Inside the document the layer's message is, the apostrophes the sentence quotes the
+    // member name with are backslash-escaped.
     assert!(
-        refused.message().contains(&format!("at '{ADDED_TAGS}'")),
+        refused.message().contains(&format!(r"at \'{ADDED_TAGS}\'")),
         "TagResource's refusal must name its own validation member, got {refused:?}"
     );
     assert_eq!(
@@ -438,7 +450,7 @@ async fn a_refused_tag_names_the_input_member_it_arrived_on() {
          got {refused_create:?}"
     );
     assert!(
-        refused_create.message().contains(&format!("at '{CREATE_TAGS}'")),
+        refused_create.message().contains(&format!(r"at \'{CREATE_TAGS}\'")),
         "CreatePipe's refusal must name its own member, got {refused_create:?}"
     );
 

@@ -71,7 +71,10 @@
 //! its own code — [`TAG_RULE_REFUSAL_CODE`], which no operation of this model declares,
 //! because the layer is not the service. `crate::state::tag_refusal` states the same
 //! sentences for the rules the handlers enforce themselves, so one tag rule is worded one
-//! way whichever layer catches it.
+//! way whichever layer catches it. Its message is not a bare sentence: a rule the model
+//! states as a `@length` is reported as the request-validation sentence wrapped in the JSON
+//! document that layer's message IS, while a rule the model states nowhere is the
+//! documented sentence itself — see `crate::state::tag_refusal` for both.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use service_common::front_door::binds_to_body;
@@ -143,7 +146,6 @@ fn tag_content_clause(violation: &Violation) -> Option<String> {
         "tags" => Some(crate::state::tag_refusal(
             crate::state::CREATE_TAGS_MEMBER,
             crate::state::TagViolation::ValueLength,
-            inside,
             &crate::state::echoed_tags(std::iter::once((inside, value))),
         )),
         // `tagKeys.<position>.member`: that key is outside `TagKey`'s bound.

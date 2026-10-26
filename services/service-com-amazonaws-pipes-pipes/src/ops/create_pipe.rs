@@ -257,7 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreatePipeError::bad_request(crate::state::tag_refusal(
                     crate::state::CREATE_TAGS_MEMBER,
                     violation,
-                    key,
                     &shown,
                 )));
             }

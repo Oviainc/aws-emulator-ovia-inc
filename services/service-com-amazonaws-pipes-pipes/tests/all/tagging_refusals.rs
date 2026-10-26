@@ -32,6 +32,7 @@ use crate::pipe_lifecycle::{call, create, describe, router, REGION};
 use crate::pipe_tagging::{
     assert_tags_agree, create_body, list_tags, pipe_arn, tag, tag_map, untag,
 };
+use crate::tagging_refusal_wording::tag_refusal_document;
 
 /// The sentence the ARN-addressed tagging operations report an unresolvable `resourceArn`
 /// with. Recorded behaviour: a constant, not built from the request.
@@ -277,8 +278,9 @@ async fn the_two_addressing_forms_report_an_absent_pipe_differently() {
 
 /// RULE: a tag key named for REMOVAL that is outside `TagKey`'s published bound is
 /// refused with 400 `BadRequestException` stating the member `UntagResource`'s request
-/// validation names, the key list it was sent in, and both published bounds — and the
-/// pipe's tags are left exactly as they were.
+/// validation names, the key list it was sent in, and both published bounds — inside the
+/// JSON document that layer's message is (`tests/all/tagging_refusal_wording.rs`) — and
+/// the pipe's tags are left exactly as they were.
 ///
 /// The rows sit at the bound and past it, from both ends, with the offending key alone
 /// and beside a key the pipe does carry, and over a unicode key (the bound counts
@@ -345,12 +347,12 @@ async fn untag_resource_refuses_a_key_outside_the_published_bound() {
                 );
                 assert_eq!(
                     reply.message(),
-                    format!(
+                    tag_refusal_document(&format!(
                         "1 validation error detected: Value '[{key}]' at 'removedTagKeys' \
                          failed to satisfy constraint: Member must satisfy constraint: \
                          [Member must have length less than or equal to {MAX_TAG_KEY_LEN}, \
                          Member must have length greater than or equal to {MIN_TAG_KEY_LEN}]"
-                    ),
+                    )),
                     "case {case:?}: expected the member-and-bound sentence, got {reply:?}"
                 );
             }
