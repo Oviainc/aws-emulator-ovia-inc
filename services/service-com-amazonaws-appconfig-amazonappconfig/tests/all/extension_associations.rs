@@ -169,8 +169,10 @@ fn authored_parameter() -> &'static str {
         .expect("the published catalogue declares at least one parameter")
 }
 
-/// The AWS-authored extension that declares no parameter at all.
-fn authored_without_parameter() -> &'static str {
+/// The AWS-authored extension that declares no parameter at all. `pub(crate)` because the
+/// `DeleteExtensionAssociation` suite associates the same one, so both resolve it from the
+/// published catalogue rather than naming an extension.
+pub(crate) fn authored_without_parameter() -> &'static str {
     AWS_AUTHORED_EXTENSIONS
         .iter()
         .find(|authored| authored.parameters.is_empty())

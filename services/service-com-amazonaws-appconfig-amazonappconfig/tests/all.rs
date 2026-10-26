@@ -33,6 +33,8 @@ mod delete_application;
 mod delete_configuration_profile;
 #[path = "all/delete_experiment_definition.rs"]
 mod delete_experiment_definition;
+#[path = "all/delete_extension_association.rs"]
+mod delete_extension_association;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
 #[path = "all/deployment_wire_fidelity.rs"]
