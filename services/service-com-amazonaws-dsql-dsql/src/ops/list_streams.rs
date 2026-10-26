@@ -164,30 +164,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor names the last stream identifier the previous page returned;
-        // this page starts at the first identifier after it.
-        let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_pagination_cursor(token).ok_or_else(
-                || {
-                    // The service's OWN `ValidationException`, so the refusal carries
-                    // the modelled members a client reads — `message`, the `@required`
-                    // `reason` and the `fieldList` naming `nextToken`.
-                    ListStreamsError::from(ListStreamsErrorModeled::ValidationException(
-                        crate::state::unissued_pagination_token(token),
-                    ))
-                },
-            )?),
-            None => None,
-        };
-
-        // `maxResults` carries `@default: 10` and `@range(1..100)`, both enforced
-        // before this handler runs. The conversion and clamp cover only a caller that
-        // reached the handler some other way (an in-process call that built the input
-        // directly): a negative value falls back to the modelled default, and anything
-        // outside the modelled range is pulled back into it.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_RESULTS_DEFAULT)
-            .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
+        // Where this page starts and how many streams it may hold, read by the
+        // page walk every paginated reader of this service shares. A `nextToken`
+        // this service never issued is refused with the service's OWN
+        // `ValidationException`, so the refusal carries the modelled members a
+        // client reads — `message`, the `@required` `reason` and the `fieldList`
+        // naming `nextToken` — and, being about the cursor alone, is decided
+        // before the addressed cluster is looked up.
+        let bounds = crate::state::PageBounds::resolve(
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_RESULTS_DEFAULT,
+        )
+        .map_err(ListStreamsErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
@@ -203,42 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut page: Vec<StreamSummary> = cluster
-            .streams
-            .iter()
-            .filter(|(identifier, _)| {
-                resume_after
-                    .as_ref()
-                    .is_none_or(|cursor| *identifier > cursor)
-            })
-            // One past the page, so the token is emitted only when something remains.
-            .take(page_size + 1)
-            .map(|(_, stream)| StreamSummary {
-                cluster_identifier: cluster.identifier.clone(),
-                stream_identifier: stream.stream_identifier.clone(),
-                arn: stream.arn.clone(),
-                creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
-                status: stream.status.clone(),
-            })
-            .collect();
-
-        let next_token = (page.len() > page_size).then(|| {
-            page.truncate(page_size);
-            crate::state::encode_pagination_cursor(&page[page_size - 1].stream_identifier)
+        let page = bounds.page(&cluster.streams, |stream| StreamSummary {
+            cluster_identifier: cluster.identifier.clone(),
+            stream_identifier: stream.stream_identifier.clone(),
+            arn: stream.arn.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
+            status: stream.status.clone(),
         });
 
         Ok(ListStreamsOutput {
-            next_token,
-            streams: page,
+            next_token: page.next_token,
+            streams: page.items,
         })
     }
 }
 
-/// `maxResults`' modelled default and `@range` bounds, from
-/// `smithy_query(query="operation", operation="ListStreams")`: `@default: 10`,
-/// `@range(min: 1, max: 100)`.
+/// `maxResults`' modelled default for this operation, from
+/// `smithy_query(query="operation", operation="ListStreams")`: `@default: 10`.
+/// Its `@range(min: 1, max: 100)` belongs to the `MaxResults` shape both list
+/// operations bind, so it is spelled once as `crate::state::MAX_RESULTS_MIN` /
+/// `MAX_RESULTS_MAX` and applied by the shared page walk
+/// (`crate::state::PageBounds`).
 const MAX_RESULTS_DEFAULT: usize = 10;
-/// See [`MAX_RESULTS_DEFAULT`].
-const MAX_RESULTS_MIN: usize = 1;
-/// See [`MAX_RESULTS_DEFAULT`].
-const MAX_RESULTS_MAX: usize = 100;

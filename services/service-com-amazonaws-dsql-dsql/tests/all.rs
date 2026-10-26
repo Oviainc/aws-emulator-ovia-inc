@@ -49,6 +49,8 @@ mod reserved_tag_keys;
 mod resource_tags;
 #[path = "all/retired_cluster_token_cleanup.rs"]
 mod retired_cluster_token_cleanup;
+#[path = "all/shared_page_walk.rs"]
+mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]

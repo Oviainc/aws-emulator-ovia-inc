@@ -161,71 +161,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor names the last identifier the previous page returned; this page
-        // starts at the first identifier after it.
-        let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(crate::state::decode_pagination_cursor(token).ok_or_else(
-                || {
-                    // The service's OWN `ValidationException`, so the refusal carries
-                    // the modelled members a client reads — `message`, the `@required`
-                    // `reason` and the `fieldList` naming `nextToken`.
-                    ListClustersError::from(ListClustersErrorModeled::ValidationException(
-                        crate::state::unissued_pagination_token(token),
-                    ))
-                },
-            )?),
-            None => None,
-        };
-
-        // `maxResults` carries `@default: 20` and `@range(1..100)`, both enforced
-        // before this handler runs. The conversion and clamp cover only a caller that
-        // reached the handler some other way (an in-process call that built the input
-        // directly): a negative value falls back to the modelled default, and anything
-        // outside the modelled range is pulled back into it.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(MAX_RESULTS_DEFAULT)
-            .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
+        // Where this page starts and how many clusters it may hold, read by the
+        // page walk every paginated reader of this service shares. A `nextToken`
+        // this service never issued is refused with the service's OWN
+        // `ValidationException`, so the refusal carries the modelled members a
+        // client reads — `message`, the `@required` `reason` and the `fieldList`
+        // naming `nextToken` — and is decided before any cluster is read.
+        let bounds = crate::state::PageBounds::resolve(
+            input.next_token.as_deref(),
+            input.max_results,
+            MAX_RESULTS_DEFAULT,
+        )
+        .map_err(ListClustersErrorModeled::ValidationException)?;
 
         let mut state = state.lock();
         state.settle(std::time::SystemTime::now());
 
-        let mut page: Vec<ClusterSummary> = state
-            .clusters
-            .iter()
-            .filter(|(identifier, _)| {
-                resume_after
-                    .as_ref()
-                    .is_none_or(|cursor| *identifier > cursor)
-            })
-            // One past the page, so the token is emitted only when something remains.
-            .take(page_size + 1)
-            .map(|(_, cluster)| ClusterSummary {
-                identifier: cluster.identifier.clone(),
-                arn: cluster.arn.clone(),
-            })
-            .collect();
-
-        let next_token = (page.len() > page_size).then(|| {
-            page.truncate(page_size);
-            crate::state::encode_pagination_cursor(&page[page_size - 1].identifier)
+        let page = bounds.page(&state.clusters, |cluster| ClusterSummary {
+            identifier: cluster.identifier.clone(),
+            arn: cluster.arn.clone(),
         });
 
         Ok(ListClustersOutput {
-            next_token,
-            clusters: page,
+            next_token: page.next_token,
+            clusters: page.items,
         })
     }
 }
 
-/// `maxResults`' modelled default and `@range` bounds, from
-/// `smithy_query(query="operation", operation="ListClusters")`: `@default: 20`,
-/// `@range(min: 1, max: 100)`.
+/// `maxResults`' modelled default for this operation, from
+/// `smithy_query(query="operation", operation="ListClusters")`: `@default: 20`.
+/// Its `@range(min: 1, max: 100)` belongs to the `MaxResults` shape both list
+/// operations bind, so it is spelled once as `crate::state::MAX_RESULTS_MIN` /
+/// `MAX_RESULTS_MAX` and applied by the shared page walk.
 const MAX_RESULTS_DEFAULT: usize = 20;
-/// See [`MAX_RESULTS_DEFAULT`].
-const MAX_RESULTS_MIN: usize = 1;
-/// See [`MAX_RESULTS_DEFAULT`].
-const MAX_RESULTS_MAX: usize = 100;
 
-// The pagination cursor this handler issues and reads back is the one every
-// paginated reader of this service shares:
-// `crate::state::encode_pagination_cursor` / `crate::state::decode_pagination_cursor`.
+// The page walk this handler cuts its page with — the cursor it issues and
+// reads back, the clamp and the "one past the page" token rule — is the one
+// every paginated reader of this service shares: `crate::state::PageBounds`.

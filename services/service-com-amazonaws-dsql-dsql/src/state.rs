@@ -19,7 +19,11 @@
 //! Besides the data, this module owns the few derivations every cluster handler
 //! shares — the request's region, the cluster ARN, the connection endpoint, the
 //! encryption details and the modelled "no such resource" errors — so the
-//! handlers compute them one way rather than once each.
+//! handlers compute them one way rather than once each. The paginated readers'
+//! page walk ([`PageBounds`]) lives here for the same reason: the cursor, the
+//! `maxResults` bounds and the rule for when a `nextToken` is issued are one
+//! implementation, parameterised by each operation's modelled default and the
+//! summary it builds.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -1240,6 +1244,126 @@ pub fn decode_pagination_cursor(token: &str) -> Option<String> {
     let decoded = ::hex::decode(token).ok()?;
     let cursor = String::from_utf8(decoded).ok()?;
     is_resource_identifier(&cursor).then_some(cursor)
+}
+
+/// `maxResults`' published `@range` bounds. Both list operations bind the one
+/// `MaxResults` shape (`smithy_query(query="shape", shape="MaxResults")`:
+/// `@range(min: 1, max: 100)`), so the bounds belong to the shape and are
+/// spelled once here rather than per operation; only the `@default` is
+/// per-operation (`smithy_query(query="operation",
+/// operation="ListClusters,ListStreams")`: 20 and 10), and that is what each
+/// handler passes to [`PageBounds::resolve`].
+pub const MAX_RESULTS_MIN: usize = 1;
+/// See [`MAX_RESULTS_MIN`].
+pub const MAX_RESULTS_MAX: usize = 100;
+
+/// One page a list operation answers with: the summaries it returns, and the
+/// `nextToken` it carries only when the walk left an entry behind.
+#[derive(Debug)]
+pub struct Page<S> {
+    /// The page's items, in the identifier order the walked map keeps them in,
+    /// at most as many as the resolved page size.
+    pub items: Vec<S>,
+    /// The cursor the next page resumes after — the last item this page
+    /// returned — present only when entries remain beyond it.
+    pub next_token: Option<String>,
+}
+
+/// Where a list call's page starts and how many entries it may hold.
+///
+/// Every paginated reader of this service walks an identifier-ordered
+/// `BTreeMap` the same way: resume after the cursor the previous page issued,
+/// return at most `maxResults` entries, and issue a cursor only when a further
+/// entry exists. That walk lives here, so the two list operations differ only
+/// in the modelled default, the map walked and the summary built.
+#[derive(Debug)]
+pub struct PageBounds {
+    /// The identifier the previous page stopped on; this page starts after it.
+    resume_after: Option<String>,
+    /// The most items this page may hold.
+    page_size: usize,
+}
+
+impl PageBounds {
+    /// Read a list call's `nextToken` and `maxResults` into the bounds its page
+    /// is cut at, refusing a `nextToken` this service never issued with the
+    /// modelled [`unissued_pagination_token`] refusal.
+    ///
+    /// `default_max_results` is the operation's own modelled `@default`.
+    pub fn resolve(
+        next_token: Option<&str>,
+        max_results: i32,
+        default_max_results: usize,
+    ) -> Result<Self, ValidationException> {
+        let resume_after = match next_token {
+            Some(token) => Some(
+                decode_pagination_cursor(token).ok_or_else(|| unissued_pagination_token(token))?,
+            ),
+            None => None,
+        };
+
+        // `maxResults` carries the operation's `@default` and the shape's
+        // `@range`, both enforced before a handler runs. The conversion and
+        // clamp cover only a caller that reached the handler some other way (an
+        // in-process call that built the input directly): a negative value falls
+        // back to the modelled default, and anything outside the modelled range
+        // is pulled back into it.
+        let page_size = usize::try_from(max_results)
+            .unwrap_or(default_max_results)
+            .clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX);
+
+        Ok(Self {
+            resume_after,
+            page_size,
+        })
+    }
+
+    /// The most items this page may hold, after the clamp.
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Cut one page out of `entries`, an identifier-keyed map, mapping each
+    /// entry this page returns through `summarize`.
+    ///
+    /// The walk reads one entry past the page, so the `nextToken` is issued
+    /// exactly when an entry remains beyond the page — and it names the last
+    /// entry the page returned, which is where the next call resumes.
+    pub fn page<V, S>(
+        &self,
+        entries: &BTreeMap<String, V>,
+        mut summarize: impl FnMut(&V) -> S,
+    ) -> Page<S> {
+        let mut items = Vec::new();
+        let mut last_identifier: Option<&String> = None;
+        let mut entries_remain = false;
+
+        for (identifier, value) in entries
+            .iter()
+            .filter(|(identifier, _)| {
+                self.resume_after
+                    .as_ref()
+                    .is_none_or(|cursor| *identifier > cursor)
+            })
+            // One past the page, so the token is emitted only when something
+            // remains.
+            .take(self.page_size + 1)
+        {
+            if items.len() == self.page_size {
+                entries_remain = true;
+                break;
+            }
+            items.push(summarize(value));
+            last_identifier = Some(identifier);
+        }
+
+        let next_token = match (entries_remain, last_identifier) {
+            (true, Some(identifier)) => Some(encode_pagination_cursor(identifier)),
+            _ => None,
+        };
+
+        Page { items, next_token }
+    }
 }
 
 /// A fresh cluster or stream identifier: a ULID, lowercased.
