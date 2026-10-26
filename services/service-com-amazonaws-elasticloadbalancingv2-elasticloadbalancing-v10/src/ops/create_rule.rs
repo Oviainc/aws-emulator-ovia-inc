@@ -269,7 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !guard.target_groups.contains_key(target_group_arn) {
                 return Err(CreateRuleErrorModeled::TargetGroupNotFoundException(
                     TargetGroupNotFoundException {
-                        message: Some(format!("Target group '{target_group_arn}' not found")),
+                        message: Some(crate::state::target_groups_not_found_message([
+                            target_group_arn.as_str(),
+                        ])),
                     },
                 )
                 .into());

@@ -277,7 +277,7 @@ async fn a_declared_but_unimplemented_elbv2_action_is_reached_not_refused_as_unk
     let router = emulator();
 
     // Operations spanning the model's shapes of answer: a list read with no required
-    // input, a read of a named resource, a create, and a tagging write.
+    // input, a read of a named resource, and a write addressing a named resource.
     let scaffolded: [(&str, &[(&str, &str)]); 4] = [
         ("DescribeSSLPolicies", &[]),
         ("DescribeAccountLimits", &[]),
@@ -293,18 +293,15 @@ async fn a_declared_but_unimplemented_elbv2_action_is_reached_not_refused_as_unk
             )],
         ),
         (
-            // `AddTags` was this row until it was implemented (its own stub issue is
-            // closed); `RemoveTags`, the other tagging write over the same
-            // `ResourceArns` input, is the stub that stands in for the same shape of
-            // answer.
-            "RemoveTags",
-            &[
-                (
-                    "ResourceArns.member.1",
-                    "arn:aws:elasticloadbalancing:us-west-2:000000000000:targetgroup/t/0",
-                ),
-                ("TagKeys.member.1", "team"),
-            ],
+            // `AddTags` was this row until it was implemented, and `RemoveTags` stood in
+            // for it until it was implemented too (both stub issues are closed);
+            // `ModifyRule`, a write addressing one named resource, is the stub that
+            // stands in for the same shape of answer.
+            "ModifyRule",
+            &[(
+                "RuleArn",
+                "arn:aws:elasticloadbalancing:us-west-2:000000000000:listener-rule/app/l/0/1/2",
+            )],
         ),
     ];
 

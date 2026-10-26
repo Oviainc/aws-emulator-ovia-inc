@@ -41,6 +41,8 @@ mod shared_endpoint_routing;
 mod ssl_policies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;
 #[path = "all/tag_writes.rs"]
 mod tag_writes;
 #[path = "all/target_group_attribute_writes.rs"]

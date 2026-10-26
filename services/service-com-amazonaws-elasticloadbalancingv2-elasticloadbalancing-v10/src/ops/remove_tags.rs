@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Withdraws the named tag keys from each Elastic Load Balancing resource the request
+//! names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A tag withdrawal resolves every `ResourceArn` by the resource kind the ARN itself
+//! declares and acts only on resources this store holds: an ARN whose kind this service
+//! knows but whose resource is absent — a load balancer that was deleted, a target group,
+//! listener, rule or trust store that never existed — is refused with the `NotFound`
+//! error modelled for that kind, and a string that is not an Elastic Load Balancing
+//! resource ARN is refused as a malformed request. The whole request is checked before
+//! the first write, so a refused call withdraws nothing; a key the resource does not
+//! carry is simply nothing to withdraw, and a resource whose last key is withdrawn holds
+//! no tag at all — which is the same representation as a resource that was never tagged.
+//! Both of the caller's lists are bounded before any per-element work, exactly as the
+//! sibling tag write bounds them.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +76,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::TaggableResource;
+use std::collections::HashSet;
+
+/// How many resources one tag call may name: "You can specify up to 20 resources in a
+/// single call" — the model's documentation of the sibling tag read's own
+/// `DescribeTagsInput$ResourceArns`, which is the same `ResourceArns` shape this call
+/// takes, so the tag API's resource list is bounded the same way for every one of them.
+/// The model declares no length constraint for it, so the bound is enforced here instead
+/// of at the boundary, and it is what keeps the work of one call bounded.
+const MAX_RESOURCES_PER_CALL: usize = 20;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +161,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTags"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("RemoveTags")
+        })?;
+
+        // `ResourceArns` and `TagKeys` are both modelled required, so a call naming no
+        // resource or no key asks for no withdrawal at all. awsQuery cannot carry an
+        // empty list, so the boundary validator refuses it first; this is the refusal
+        // for the callers that can express one.
+        if input.resource_arns.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "ResourceArns must name at least one resource",
+            ));
+        }
+        if input.tag_keys.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "TagKeys must name at least one tag key",
+            ));
+        }
+
+        // Both caller-chosen lists are bounded BEFORE any per-element work, so the cost
+        // of one call is bounded whatever it carries.
+        if input.resource_arns.len() > MAX_RESOURCES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "ResourceArns can name at most {MAX_RESOURCES_PER_CALL} resources in a single call, got {}",
+                input.resource_arns.len()
+            )));
+        }
+        // A resource can hold at most this many tags, so a call naming more keys than
+        // that names keys no resource of this service can carry — the same modelled
+        // quota refusal the sibling tag write answers for a request-level tag count past
+        // the limit.
+        if input.tag_keys.len() > crate::state::TAGS_PER_RESOURCE {
+            return Err(RemoveTagsErrorModeled::TooManyTagsException(TooManyTagsException {
+                message: Some(format!(
+                    "You've reached the limit of {} tags for a resource; the request names {} tag keys",
+                    crate::state::TAGS_PER_RESOURCE,
+                    input.tag_keys.len()
+                )),
+            })
+            .into());
+        }
+
+        // A key named twice names one key: this operation models no duplicate-key error,
+        // and withdrawing a key twice asks for the same end state as withdrawing it once.
+        let mut keys: Vec<&str> = Vec::with_capacity(input.tag_keys.len());
+        let mut named: HashSet<&str> = HashSet::with_capacity(input.tag_keys.len());
+        for key in &input.tag_keys {
+            if named.insert(key.as_str()) {
+                keys.push(key.as_str());
+            }
+        }
+
+        // An ARN repeated in one call names one resource, as it does for the tag read
+        // and the tag write.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(input.resource_arns.len());
+        let mut wanted: Vec<&String> = Vec::with_capacity(input.resource_arns.len());
+        for arn in &input.resource_arns {
+            if seen.insert(arn.as_str()) {
+                wanted.push(arn);
+            }
+        }
+
+        // The whole request is classified before any resource is resolved, so a value
+        // that is not a resource ARN of this service is refused wherever it sits in the
+        // list rather than being masked by an earlier missing resource.
+        let mut resolved: Vec<(&String, TaggableResource)> = Vec::with_capacity(wanted.len());
+        for arn in wanted {
+            let Some(kind) = crate::state::taggable_resource(arn) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "'{arn}' in ResourceArns is not the ARN of an Elastic Load Balancing resource"
+                )));
+            };
+            resolved.push((arn, kind));
+        }
+
+        let mut guard = state.lock();
+
+        // Every resource the call names is checked before the first write, so a refused
+        // call withdraws nothing from any of them: a caller that named one absent
+        // resource beside three live ones can resend the corrected request without
+        // wondering which of them lost its tags.
+        for (arn, kind) in &resolved {
+            if guard.tags_of(arn.as_str()).is_none() {
+                return Err(not_found(*kind, arn));
+            }
+        }
+
+        for (arn, _) in &resolved {
+            // The pass above resolved every one of these under this same lock, so the
+            // lookup answers for each; it is written as an `if let` rather than an
+            // unwrap so that no request can reach a panic here.
+            if let Some(stored) = guard.tags_of_mut(arn.as_str()) {
+                for key in &keys {
+                    // A key the resource does not carry is nothing to withdraw, which is
+                    // not an error: the call asks for an end state, and that state
+                    // already holds. Withdrawing the last key leaves the resource with no
+                    // tag at all, which is the representation of a resource that was
+                    // never tagged.
+                    stored.remove(*key);
+                }
+            }
+        }
+
+        // The operation's output carries no member: what it withdrew is read back
+        // through `DescribeTags`.
+        Ok(RemoveTagsOutput {})
     }
+}
+
+/// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
+/// error of the resource kind the ARN names, worded as every tag operation words it.
+fn not_found(kind: TaggableResource, arn: &str) -> RemoveTagsError {
+    let message = Some(crate::state::taggable_not_found_message(kind, arn));
+    match kind {
+        TaggableResource::LoadBalancer => RemoveTagsErrorModeled::LoadBalancerNotFoundException(
+            LoadBalancerNotFoundException { message },
+        ),
+        TaggableResource::TargetGroup => RemoveTagsErrorModeled::TargetGroupNotFoundException(
+            TargetGroupNotFoundException { message },
+        ),
+        TaggableResource::Listener => {
+            RemoveTagsErrorModeled::ListenerNotFoundException(ListenerNotFoundException { message })
+        }
+        TaggableResource::Rule => {
+            RemoveTagsErrorModeled::RuleNotFoundException(RuleNotFoundException { message })
+        }
+        TaggableResource::TrustStore => {
+            RemoveTagsErrorModeled::TrustStoreNotFoundException(TrustStoreNotFoundException {
+                message,
+            })
+        }
+    }
+    .into()
 }

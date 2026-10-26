@@ -55,7 +55,7 @@ fn rule_fields(tg_arn: &str, host: &str) -> Vec<(String, String)> {
 type BatchRow = (&'static str, Vec<String>, Vec<(&'static str, &'static str)>);
 
 /// `AddTags` over `arns`, carrying `tags`.
-async fn add_tags(
+pub(crate) async fn add_tags(
     router: &MultiServiceRouter,
     arns: &[String],
     tags: &[(String, String)],
@@ -69,12 +69,12 @@ async fn add_tags(
 }
 
 /// `AddTags` over one ARN, carrying `tags`.
-async fn add_tags_to(router: &MultiServiceRouter, arn: &String, tags: &[(String, String)]) -> Reply {
+pub(crate) async fn add_tags_to(router: &MultiServiceRouter, arn: &String, tags: &[(String, String)]) -> Reply {
     add_tags(router, std::slice::from_ref(arn), tags).await
 }
 
 /// Owned tag pairs from literals.
-fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -83,7 +83,7 @@ fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// The tags `DescribeTags` reports for `arn`, sorted by key — what a write is asserted
 /// through.
-async fn stored(router: &MultiServiceRouter, arn: &String) -> Vec<(String, String)> {
+pub(crate) async fn stored(router: &MultiServiceRouter, arn: &String) -> Vec<(String, String)> {
     let reply = describe_tags(router, std::slice::from_ref(arn)).await;
     assert_eq!(
         reply.status, 200,
@@ -98,12 +98,12 @@ async fn stored(router: &MultiServiceRouter, arn: &String) -> Vec<(String, Strin
 }
 
 /// The `<Message>` of an error envelope.
-fn message(reply: &Reply) -> String {
+pub(crate) fn message(reply: &Reply) -> String {
     reply.text("Message").unwrap_or_default()
 }
 
 /// A tag set of `count` distinct pairs.
-fn distinct_tags(count: usize) -> Vec<(String, String)> {
+pub(crate) fn distinct_tags(count: usize) -> Vec<(String, String)> {
     (0..count)
         .map(|index| (format!("key-{index}"), format!("value-{index}")))
         .collect()

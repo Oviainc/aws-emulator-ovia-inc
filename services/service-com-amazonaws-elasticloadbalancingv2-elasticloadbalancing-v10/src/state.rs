@@ -2499,10 +2499,16 @@ pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
 /// fix, quoted under the noun of the kind the ARN itself declares. One function for every
 /// tag operation, so a read and a write of the tags of one absent resource cannot be
 /// refused in different words.
+///
+/// The noun of each kind is the one this service's own refusals use, so a tag call and an
+/// operation addressing the same resource directly word their refusal identically — a
+/// target group is named under the PLURAL noun whatever its number
+/// ([`target_groups_not_found_message`]), a load balancer, listener and rule under the
+/// singular.
 pub fn taggable_not_found_message(kind: TaggableResource, arn: &str) -> String {
     match kind {
         TaggableResource::LoadBalancer => load_balancer_not_found_message(arn),
-        TaggableResource::TargetGroup => format!("Target group '{arn}' not found"),
+        TaggableResource::TargetGroup => target_groups_not_found_message([arn]),
         TaggableResource::Listener => listener_not_found_message(arn),
         TaggableResource::Rule => rule_not_found_message(arn),
         TaggableResource::TrustStore => format!("Trust store '{arn}' not found"),
