@@ -68,10 +68,15 @@ pub const CHECK_FAILED: &str = "FAILED";
 /// * `HOST_COUNT` — "Verifies that the environment meets the minimum host count": the
 ///   environment's hosts decide it against [`MINIMUM_HOST_COUNT`].
 ///
-/// The other ten types each probe something OUTSIDE this emulator — SDDC Manager,
-/// vCenter Server, Operations Manager, or the appliance behind a connector, none of
-/// which this emulator runs or contacts (the same reason [`StoredConnector::checks`] is
-/// always empty) — so no check of those types has run and none is reported: a result
+/// Of the other ten types, FOUR have a connector for their subject rather than the
+/// environment's own record — `CONNECTOR_HEALTH` and the three per-appliance
+/// reachability checks — and are reported on the connector they are about, decided by
+/// that connector's own stored record ([`StoredConnector::checks`]).
+///
+/// The remaining six each probe something OUTSIDE this emulator — the SDDC Manager
+/// inventory, a vCenter Server inventory's virtual machines, or an appliance that no
+/// connector of the environment records a connection to — none of which this emulator
+/// runs or contacts, so no check of those types has run and none is reported: a result
 /// there would claim a probe nothing performed.
 pub const CHECK_TYPE_KEY_REUSE: &str = "KEY_REUSE";
 /// See [`CHECK_TYPE_KEY_REUSE`].
@@ -156,13 +161,17 @@ pub const RESOURCE_TYPE_HOST: &str = "host";
 ///
 /// The model declares `CREATING | CREATE_FAILED | ACTIVE | UPDATING | UPDATE_FAILED |
 /// DELETING | DELETED` (`smithy_query(query="shape", shape="ConnectorState")`). The
-/// five named here are the ones the implemented connector operations produce: a
+/// five the implemented connector operations produce are: a
 /// connector is `CREATING` while `CreateEnvironmentConnector`'s connection is being
 /// established, `UPDATING` while `UpdateEnvironmentConnector`'s new metadata is being
 /// applied, `ACTIVE` once either has settled, `DELETING` while
 /// `DeleteEnvironmentConnector`'s teardown of the connection is in flight, and
 /// `DELETED` once that teardown has settled. The two `_FAILED` values belong to
-/// failures this emulator stages none of.
+/// failures this emulator stages none of, and are named here because what a connector in
+/// one of them reports is a property of the RECORD rather than of one operation's
+/// output: they are the states in which establishing the connection CONCLUDED without
+/// one, which is what a connectivity-health check reports as failed
+/// ([`StoredConnector::decided_result`]).
 pub const CONNECTOR_CREATING: &str = "CREATING";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_UPDATING: &str = "UPDATING";
@@ -172,6 +181,10 @@ pub const CONNECTOR_ACTIVE: &str = "ACTIVE";
 pub const CONNECTOR_DELETING: &str = "DELETING";
 /// See [`CONNECTOR_CREATING`].
 pub const CONNECTOR_DELETED: &str = "DELETED";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_CREATE_FAILED: &str = "CREATE_FAILED";
+/// See [`CONNECTOR_CREATING`].
+pub const CONNECTOR_UPDATE_FAILED: &str = "UPDATE_FAILED";
 
 /// The `ConnectorType` of a connector to a vCenter Server appliance: "VCENTER:
 /// Connector to a vCenter Server appliance. Required for features that depend on
@@ -184,6 +197,51 @@ pub const CONNECTOR_DELETED: &str = "DELETED";
 /// created through: "using the provided vCenter Server connector" (`CreateEntitlement`
 /// doc).
 pub const CONNECTOR_TYPE_VCENTER: &str = "VCENTER";
+
+/// The `ConnectorType` of a connector to an SDDC Manager appliance — the appliance
+/// Amazon EVS monitors environment health and license compliance through
+/// (`CreateEnvironmentConnector` doc).
+pub const CONNECTOR_TYPE_SDDC_MANAGER: &str = "SDDC_MANAGER";
+
+/// The `ConnectorType` of a connector to a VCF Operations Manager appliance — the other
+/// appliance that monitoring can run through (`CreateEnvironmentConnector` doc).
+pub const CONNECTOR_TYPE_OPERATIONS_MANAGER: &str = "OPERATIONS_MANAGER";
+
+/// The `CheckType` of the check run on EVERY connector, whatever appliance type it
+/// connects to: a `ConnectorCheck` is "A check on a connector to identify connectivity
+/// health" (`smithy_query(query="shape", shape="ConnectorCheck")`), and the connector's
+/// own `ConnectorState` is the record of whether the connection to the appliance is
+/// established ([`StoredConnector::decided_result`]).
+pub const CHECK_TYPE_CONNECTOR_HEALTH: &str = "CONNECTOR_HEALTH";
+
+/// The `CheckType` of the reachability check of a vCenter Server appliance.
+pub const CHECK_TYPE_VCENTER_REACHABILITY: &str = "VCENTER_REACHABILITY";
+
+/// The `CheckType` of the reachability check of an SDDC Manager appliance.
+pub const CHECK_TYPE_SDDC_MANAGER_REACHABILITY: &str = "SDDC_MANAGER_REACHABILITY";
+
+/// The `CheckType` of the reachability check of a VCF Operations Manager appliance.
+pub const CHECK_TYPE_OPERATIONS_MANAGER_REACHABILITY: &str = "OPERATIONS_MANAGER_REACHABILITY";
+
+/// The `CheckType` of the check that reports whether the appliance ONE connector
+/// connects to is reachable — the type-specific half of a connector's connectivity
+/// health, beside [`CHECK_TYPE_CONNECTOR_HEALTH`].
+///
+/// `CheckType` declares one reachability type per `ConnectorType` the model declares
+/// (`smithy_query(query="shape", shape="CheckType,ConnectorType")`), so the appliance a
+/// connector names decides which one it runs: a connector to a vCenter Server appliance
+/// reports `VCENTER_REACHABILITY`, one to SDDC Manager `SDDC_MANAGER_REACHABILITY`, and
+/// one to Operations Manager `OPERATIONS_MANAGER_REACHABILITY`. `None` for a type this
+/// service holds no reachability check for, which no stored connector carries: a request
+/// naming anything outside the modelled catalog is refused before a record is written.
+pub fn reachability_check_type(connector_type: &str) -> Option<&'static str> {
+    match connector_type {
+        CONNECTOR_TYPE_VCENTER => Some(CHECK_TYPE_VCENTER_REACHABILITY),
+        CONNECTOR_TYPE_SDDC_MANAGER => Some(CHECK_TYPE_SDDC_MANAGER_REACHABILITY),
+        CONNECTOR_TYPE_OPERATIONS_MANAGER => Some(CHECK_TYPE_OPERATIONS_MANAGER_REACHABILITY),
+        _ => None,
+    }
+}
 
 /// The `EntitlementStatus` values a stored entitlement moves through.
 ///
@@ -610,11 +668,6 @@ pub struct StoredConnector {
     pub state: String,
     /// A detailed description of `state`, when there is one.
     pub state_details: Option<String>,
-    /// The checks run on the connector, which [`Self::status`] rolls up.
-    ///
-    /// Always empty here: a connector check is a probe of the appliance named by
-    /// `applianceFqdn`, and this emulator contacts no appliance, so no check has run.
-    pub checks: Vec<ConnectorCheck>,
     /// Epoch milliseconds the connector was created at.
     pub created_at_ms: i64,
     /// Epoch milliseconds the connector was last modified at.
@@ -644,7 +697,6 @@ impl StoredConnector {
             secret_arn,
             state: CONNECTOR_CREATING.to_string(),
             state_details: None,
-            checks: Vec::new(),
             created_at_ms,
             modified_at_ms: created_at_ms,
             pending: Some(pending),
@@ -665,30 +717,99 @@ impl StoredConnector {
         self.pending = None;
     }
 
-    /// `status`: the roll-up of the connector's `checks`, which identify "connectivity
-    /// health". A failed check is `FAILED`; a connector no check has yet run on, or
-    /// one that is not `ACTIVE` so its checks cannot have run, is `UNKNOWN`; anything
-    /// else is `PASSED`.
+    /// The `CheckResult` this connector's own stored record decides for every check of
+    /// it, or `None` while the record decides nothing.
     ///
-    /// Nothing in this emulator probes an appliance, so `checks` is empty and this
-    /// reports `UNKNOWN`: `PASSED` would claim a reachability check nothing performed.
+    /// A connector IS the connection: "A connector establishes a connection to the given
+    /// appliance type using the credentials stored in Amazon Web Services Secrets
+    /// Manager" (`Connector` doc), and its `ConnectorState` is this service's own record
+    /// of how that attempt stands. So the state decides the connectivity health the
+    /// checks report, and nothing is claimed that the record does not already say:
+    ///
+    /// * [`CONNECTOR_ACTIVE`] — the connection is established, so the appliance answered
+    ///   it: `PASSED`.
+    /// * [`CONNECTOR_CREATE_FAILED`] / [`CONNECTOR_UPDATE_FAILED`] — establishing it
+    ///   concluded WITHOUT a connection: `FAILED`.
+    /// * `CREATING` / `UPDATING` — the attempt is still in flight, so nothing has
+    ///   concluded: no result, exactly as an environment that is not yet `CREATED`
+    ///   reports no check ([`StoredEnvironment::refresh_checks`]).
+    /// * `DELETING` / `DELETED` — the connection is being torn down or is gone, so there
+    ///   is no connectivity left to report on.
+    pub fn decided_result(&self) -> Option<&'static str> {
+        match self.state.as_str() {
+            CONNECTOR_ACTIVE => Some(CHECK_PASSED),
+            CONNECTOR_CREATE_FAILED | CONNECTOR_UPDATE_FAILED => Some(CHECK_FAILED),
+            _ => None,
+        }
+    }
+
+    /// `checks`: "A list of checks that are run on the connector", each "A check on a
+    /// connector to identify connectivity health".
+    ///
+    /// A DERIVED value — a pure function of the stored record — so every operation that
+    /// reports this connector reports the same checks and a read changes nothing a later
+    /// caller sees. Two checks are run on a connector whose record has decided one
+    /// ([`Self::decided_result`]): [`CHECK_TYPE_CONNECTOR_HEALTH`], which every connector
+    /// runs, and the reachability check of the appliance type this connector connects to
+    /// ([`reachability_check_type`]). A connector whose record has decided nothing runs
+    /// neither, rather than reporting a result nothing concluded.
+    ///
+    /// Both stamps are STORED instants, never the reading instant: `lastCheckAttempt`
+    /// ("The date and time of the last check attempt") is when the connection attempt
+    /// this result comes from concluded, which is the connector's `modifiedAt`, and
+    /// `impairedSince` ("The time when connector health began to be impaired") is that
+    /// same instant for a FAILED result and absent for any other — only an impaired
+    /// connector has been impaired since anything.
+    pub fn checks(&self) -> Vec<ConnectorCheck> {
+        let Some(result) = self.decided_result() else {
+            return Vec::new();
+        };
+        let attempted_at = timestamp(self.modified_at_ms);
+        let impaired_since = (result == CHECK_FAILED).then(|| timestamp(self.modified_at_ms));
+        [
+            Some(CHECK_TYPE_CONNECTOR_HEALTH),
+            reachability_check_type(&self.connector_type),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|check_type| ConnectorCheck {
+            r#type: Some(check_type.to_string()),
+            result: Some(result.to_string()),
+            last_check_attempt: Some(attempted_at),
+            impaired_since,
+        })
+        .collect()
+    }
+
+    /// `status`: the roll-up of the connector's [`Self::checks`], which identify
+    /// "connectivity health".
+    ///
+    /// A failed check makes it `FAILED`; otherwise a check that passed makes it `PASSED`;
+    /// and a connector no check has decided anything for is `UNKNOWN` — the same roll-up
+    /// `environmentStatus` is of an environment's checks
+    /// ([`StoredEnvironment::environment_status`]), because both members are the same
+    /// `CheckResult` over the same kind of list.
     pub fn status(&self) -> &'static str {
-        if self
-            .checks
-            .iter()
-            .any(|check| check.result.as_deref() == Some(CHECK_FAILED))
-        {
+        Self::roll_up(&self.checks())
+    }
+
+    /// The roll-up itself, over checks already in hand, so [`Self::to_wire`] derives both
+    /// members from ONE computation of them.
+    fn roll_up(checks: &[ConnectorCheck]) -> &'static str {
+        let results = || checks.iter().filter_map(|check| check.result.as_deref());
+        if results().any(|result| result == CHECK_FAILED) {
             CHECK_FAILED
-        } else if self.checks.is_empty() || self.state != CONNECTOR_ACTIVE {
-            CHECK_UNKNOWN
-        } else {
+        } else if results().any(|result| result == CHECK_PASSED) {
             CHECK_PASSED
+        } else {
+            CHECK_UNKNOWN
         }
     }
 
     /// This connector as the modelled `Connector` shape, reported for the environment
     /// that holds it.
     pub fn to_wire(&self, environment_id: &str) -> Connector {
+        let checks = self.checks();
         Connector {
             environment_id: Some(environment_id.to_string()),
             connector_id: Some(self.connector_id.clone()),
@@ -697,8 +818,8 @@ impl StoredConnector {
             secret_arn: Some(self.secret_arn.clone()),
             state: Some(self.state.clone()),
             state_details: self.state_details.clone(),
-            status: Some(self.status().to_string()),
-            checks: (!self.checks.is_empty()).then(|| self.checks.clone()),
+            status: Some(Self::roll_up(&checks).to_string()),
+            checks: (!checks.is_empty()).then_some(checks),
             created_at: Some(timestamp(self.created_at_ms)),
             modified_at: Some(timestamp(self.modified_at_ms)),
         }

@@ -27,8 +27,9 @@
 //! "Before deleting a host, you must unassign and decommission the host from within the
 //! SDDC Manager user interface": nothing here judges that, because SDDC Manager is not
 //! part of this emulator — no operation of this service reports whether a host is
-//! assigned to a VCF cluster (the same reason [`crate::state::StoredConnector::checks`]
-//! is always empty) — so there is no fact to refuse the request on.
+//! assigned to a VCF cluster (the same reason no `SDDC_MANAGER_*` check is reported —
+//! see [`crate::state::CHECK_TYPE_KEY_REUSE`]) — so there is no fact to refuse the
+//! request on.
 //!
 //! The operation is `@idempotent`
 //! (`smithy_query(query="operation",operation="DeleteEnvironmentHost")`): a host that is

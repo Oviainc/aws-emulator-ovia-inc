@@ -347,8 +347,9 @@ async fn a_connector_is_deleted_and_the_deletion_is_read_back() {
             // The connection is still being torn down: the span is never zero, so a
             // caller reading straight after the call sees the transient state.
             ("state", json!("DELETING")),
-            // No check has run: this emulator contacts no appliance, so the
-            // connectivity-health roll-up is UNKNOWN and there are no checks.
+            // The connection is being torn down, so there is no connectivity left to
+            // report on: the roll-up is UNKNOWN and there are no checks
+            // (`tests/all/connector_health_checks.rs` owns that rule).
             ("status", json!("UNKNOWN")),
             ("checks", Value::Null),
             ("createdAt", created["createdAt"].clone()),

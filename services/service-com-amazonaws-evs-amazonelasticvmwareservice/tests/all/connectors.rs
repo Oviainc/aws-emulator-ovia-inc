@@ -285,8 +285,9 @@ async fn a_connector_is_created_and_read_back_by_list() {
             ("secretArn", json!(secret_arn_of(&secret_identifier))),
             // The connection is still being established.
             ("state", json!("CREATING")),
-            // No check has run: this emulator contacts no appliance, so the
-            // connectivity-health roll-up is UNKNOWN and there are no checks.
+            // The connection is still being established, so no check of it has
+            // concluded: the connectivity-health roll-up is UNKNOWN and there are no
+            // checks (`tests/all/connector_health_checks.rs` owns that rule).
             ("status", json!("UNKNOWN")),
             ("checks", Value::Null),
             ("stateDetails", Value::Null),

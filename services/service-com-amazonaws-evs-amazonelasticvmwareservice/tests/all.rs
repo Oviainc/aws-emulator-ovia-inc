@@ -17,6 +17,8 @@ mod account_settings;
 mod authorization;
 #[path = "all/connector_deletion.rs"]
 mod connector_deletion;
+#[path = "all/connector_health_checks.rs"]
+mod connector_health_checks;
 #[path = "all/connector_secret_arn.rs"]
 mod connector_secret_arn;
 #[path = "all/connectors.rs"]
