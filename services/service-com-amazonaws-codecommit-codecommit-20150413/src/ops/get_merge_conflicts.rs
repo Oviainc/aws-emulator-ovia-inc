@@ -9,9 +9,10 @@
 //! every merge question in this service shares (`GetMergeOptions` answers from the same
 //! one): it walks both tips' histories to their merge base, compares the union of the
 //! three snapshots at the requested detail level and resolution strategy, and charges
-//! every phase of that to one per-request budget. What this file adds is the REPORT this
-//! operation makes about each path that evaluation names — the three sides of the path and
-//! which of its facets they disagree about — plus the paging the output models.
+//! every phase of that to one per-request budget. The REPORT about each path that
+//! evaluation names — the three sides of the path and which of its facets they disagree
+//! about — is `crate::state::conflict_report`, shared with every other operation that
+//! describes a conflicting path. What this file adds is the paging the output models.
 //!
 //! Where the model leaves a choice, this handler's chosen reading is:
 //!
@@ -178,54 +179,28 @@ use super::types::*;
 
 use std::collections::BTreeMap;
 
-use crate::state::{FileEntry, Repository};
+use crate::state::conflict_report::{conflict_metadata, TreeSlot};
+use crate::state::FileEntry;
 
 // ---------------------------------------------------------------------------
 // Describing a conflicting path
 //
 // WHICH paths a merge cannot reconcile is `crate::state::merge`, the merge
 // evaluation every merge question in this service shares (`GetMergeOptions`
-// answers from the same one). What this file adds is the REPORT this operation
-// makes about a path that evaluation named: the three sides of it, and which of
-// its facets they disagree about.
+// answers from the same one). The REPORT about a path that evaluation named —
+// the three sides of it, and which of its facets they disagree about — is
+// `crate::state::conflict_report`, shared with every other operation that
+// describes a conflicting path (`BatchDescribeMergeConflicts`), so no two of
+// them can describe the same path differently. What this file adds is the paging
+// this operation's output models.
 // ---------------------------------------------------------------------------
 
-/// `objectType` values the model's `ObjectTypeEnum` declares, catalogued by the
-/// generated `OBJECT_TYPE_ENUM_VALUES`. A commit's tree in this store holds
-/// files and the folders their paths imply, so `GIT_LINK` — a submodule — is a
-/// type no stored tree reports.
-pub const OBJECT_TYPE_FILE: &str = "FILE";
-pub const OBJECT_TYPE_DIRECTORY: &str = "DIRECTORY";
-pub const OBJECT_TYPE_SYMBOLIC_LINK: &str = "SYMBOLIC_LINK";
-
-/// `changeType` values the model's `ChangeTypeEnum` declares, catalogued by the
-/// generated `CHANGE_TYPE_ENUM_VALUES`: what one side of a merge did to a path —
-/// added it, modified it, deleted it.
-pub const CHANGE_TYPE_ADDED: &str = "A";
-pub const CHANGE_TYPE_MODIFIED: &str = "M";
-pub const CHANGE_TYPE_DELETED: &str = "D";
-
-/// How many of a blob's leading bytes are examined before it is called binary:
-/// git's own test, which looks for a NUL byte in the first 8000 bytes of a file.
-const BINARY_SNIFF_BYTES: usize = 8_000;
-
-/// Is this blob binary rather than text? A NUL byte in the leading
-/// [`BINARY_SNIFF_BYTES`] is git's own test, and content whose leading bytes are
-/// not valid UTF-8 is binary here too, because its lines cannot be compared at
-/// all. Only that prefix is examined, whatever the file's size, so the test costs
-/// the same for every blob.
-fn is_binary(content: &[u8]) -> bool {
-    let sniffed = &content[..content.len().min(BINARY_SNIFF_BYTES)];
-    if sniffed.contains(&0) {
-        return true;
-    }
-    match ::std::str::from_utf8(sniffed) {
-        Ok(_) => false,
-        // An error with no length is the prefix ending in the middle of a
-        // character — the cut, not the content, so the content is still text.
-        Err(error) => error.error_len().is_some(),
-    }
-}
+/// The `ObjectTypeEnum` and `ChangeTypeEnum` values the report names, re-exported
+/// from the one place this crate names them.
+pub use crate::state::conflict_report::{
+    CHANGE_TYPE_ADDED, CHANGE_TYPE_DELETED, CHANGE_TYPE_MODIFIED, OBJECT_TYPE_DIRECTORY,
+    OBJECT_TYPE_FILE, OBJECT_TYPE_SYMBOLIC_LINK,
+};
 
 // Which paths a merge of two commits cannot reconcile is
 // `crate::state::merge::evaluate` — the crate's ONE merge evaluation, shared
@@ -236,198 +211,15 @@ fn is_binary(content: &[u8]) -> bool {
 // `crate::state::merge::MergeProblem`, which this handler reports as the
 // modelled error for that limit.
 //
-// What is left here is what this operation reports ON TOP of that answer: for
-// each conflicting path, the metadata `ConflictMetadata` carries about the three
-// sides of it.
+// What is left here is this operation's own output: the page of conflicting
+// paths it reports, each described by `crate::state::conflict_report`.
 
-/// What one commit's tree holds at one path: the file entry, if any, and whether
-/// the tree holds entries BELOW the path, which is what makes that path a
-/// directory in that commit.
-#[derive(Debug, Clone, Copy)]
-struct TreeSlot<'tree> {
-    entry: Option<&'tree FileEntry>,
-    directory: bool,
-}
-
-impl<'tree> TreeSlot<'tree> {
-    /// Read what `files` holds at `path`.
-    ///
-    /// The directory test walks the keys just above `path` for as long as they
-    /// still begin with it — those are the only keys that could sit BELOW it —
-    /// and asks whether one of them continues with a separator. No prefix string
-    /// is built, because this runs three times (base, source, destination) for
-    /// every path a merge compares.
-    fn at(files: &'tree BTreeMap<String, FileEntry>, path: &str) -> Self {
-        let directory = files
-            .range::<str, _>((::std::ops::Bound::Excluded(path), ::std::ops::Bound::Unbounded))
-            .take_while(|(other, _)| other.starts_with(path))
-            .any(|(other, _)| other.as_bytes().get(path.len()) == Some(&b'/'));
-        Self {
-            entry: files.get(path),
-            directory,
-        }
-    }
-
-    /// The modeled `ObjectTypeEnum` value for what sits here, or `None` where
-    /// this commit holds nothing at the path at all.
-    fn object_type(&self) -> Option<&'static str> {
-        match self.entry {
-            Some(entry) if entry.file_mode == crate::state::FILE_MODE_SYMLINK => {
-                Some(OBJECT_TYPE_SYMBOLIC_LINK)
-            }
-            Some(_) => Some(OBJECT_TYPE_FILE),
-            None => self.directory.then_some(OBJECT_TYPE_DIRECTORY),
-        }
-    }
-
-    /// Do two commits hold the very same thing here? The file entries are
-    /// compared by [`crate::state::merge::same_entry`], the same reading the
-    /// shared merge evaluation decides "unchanged" by, plus whether the path is
-    /// a directory in both.
-    fn same_as(&self, other: &Self) -> bool {
-        self.directory == other.directory
-            && crate::state::merge::same_entry(self.entry, other.entry)
-    }
-
-    /// The `ChangeTypeEnum` value for how this slot differs from the merge
-    /// base's, or `None` where this side left the path exactly as the base had
-    /// it.
-    fn change_from(&self, base: &Self) -> Option<&'static str> {
-        if self.same_as(base) {
-            return None;
-        }
-        match (base.object_type().is_some(), self.object_type().is_some()) {
-            (false, true) => Some(CHANGE_TYPE_ADDED),
-            (true, false) => Some(CHANGE_TYPE_DELETED),
-            _ => Some(CHANGE_TYPE_MODIFIED),
-        }
-    }
-
-    /// The size this side records for the file, and `0` where it holds none —
-    /// the default the model gives every `FileSizes` member.
-    fn size(&self) -> i64 {
-        self.entry.map_or(0, |entry| entry.size)
-    }
-
-    /// The modeled `fileMode` of the file this side holds, absent where it holds
-    /// none.
-    fn file_mode(&self) -> Option<String> {
-        self.entry.map(|entry| entry.file_mode.clone())
-    }
-}
-
-/// The metadata this operation reports for ONE path a merge evaluation could not
-/// reconcile: which facet of the path the two sides disagree about, and what each
-/// of the three sides holds there.
-///
-/// WHETHER a path conflicts is [`crate::state::merge::evaluate`]'s answer, shared
-/// with every other merge question this service answers; this function only
-/// describes a path that evaluation already named, by reading the three tree
-/// snapshots and the stored blobs of the sides that hold a file.
-///
-/// A facet is a disagreement when both sides hold the path and moved that facet
-/// away from the base DIFFERENTLY — a different blob (content), a different mode,
-/// a different kind of object: a facet only one side moved is that side's change
-/// and reconciles, which is the same reading [`crate::state::merge`] decides a
-/// conflict by. Content is also a disagreement where one side no longer holds the
-/// path at all, because the other side's change cannot be carried into a file
-/// that is gone. At `LINE_LEVEL` a path is reported only when its lines could not
-/// be merged, so a content difference on a reported path is a content conflict
-/// there too.
-fn conflict_metadata(
-    repository: &Repository,
-    path: &str,
-    base: TreeSlot<'_>,
-    source: TreeSlot<'_>,
-    destination: TreeSlot<'_>,
-) -> ConflictMetadata {
-    let content_of =
-        |slot: &TreeSlot<'_>| slot.entry.and_then(|entry| repository.blob(&entry.blob_id));
-
-    let object_type_conflict = match (source.object_type(), destination.object_type()) {
-        (Some(mine), Some(theirs)) => {
-            mine != theirs
-                && base
-                    .object_type()
-                    .is_none_or(|base| base != mine && base != theirs)
-        }
-        _ => false,
-    };
-    let file_mode_conflict = match (source.entry, destination.entry) {
-        (Some(mine), Some(theirs)) => {
-            mine.file_mode != theirs.file_mode
-                && base.entry.is_none_or(|base| {
-                    base.file_mode != mine.file_mode && base.file_mode != theirs.file_mode
-                })
-        }
-        _ => false,
-    };
-    let content_conflict = match (source.entry, destination.entry) {
-        (Some(mine), Some(theirs)) => {
-            mine.blob_id != theirs.blob_id
-                && base.entry.is_none_or(|base| {
-                    base.blob_id != mine.blob_id && base.blob_id != theirs.blob_id
-                })
-        }
-        // One side no longer holds a file where the other does: that side has no
-        // content left to carry the other side's change into.
-        (Some(_), None) | (None, Some(_)) => true,
-        // Neither side holds a file at the path — whatever these two sides
-        // disagree about here, it is not the file's content.
-        (None, None) => false,
-    };
-
-    // "The number of conflicts, including both hunk conflicts and metadata
-    // conflicts": the facets above that disagree, and never fewer than the one
-    // disagreement that put this path in the list.
-    let counted = usize::from(content_conflict)
-        + usize::from(file_mode_conflict)
-        + usize::from(object_type_conflict);
-    let number_of_conflicts = i32::try_from(counted.max(1)).unwrap_or(i32::MAX);
-
-    ConflictMetadata {
-        file_path: Some(path.to_string()),
-        file_sizes: Some(FileSizes {
-            source: source.size(),
-            destination: destination.size(),
-            base: base.size(),
-        }),
-        file_modes: Some(FileModes {
-            source: source.file_mode(),
-            destination: destination.file_mode(),
-            base: base.file_mode(),
-        }),
-        object_types: Some(ObjectTypes {
-            source: source.object_type().map(str::to_string),
-            destination: destination.object_type().map(str::to_string),
-            base: base.object_type().map(str::to_string),
-        }),
-        number_of_conflicts,
-        // A sniff of each side's leading bytes (see [`is_binary`]), so the test
-        // costs the same whatever the file's size.
-        is_binary_file: Some(IsBinaryFile {
-            source: content_of(&source).map(is_binary),
-            destination: content_of(&destination).map(is_binary),
-            base: content_of(&base).map(is_binary),
-        }),
-        content_conflict,
-        file_mode_conflict,
-        object_type_conflict,
-        merge_operations: Some(MergeOperations {
-            source: source.change_from(&base).map(str::to_string),
-            destination: destination.change_from(&base).map(str::to_string),
-        }),
-    }
-}
-
-/// Can this specifier name a commit at all? `CommitName` is "the branch, tag,
-/// HEAD, or other fully qualified reference used to identify a commit (for
-/// example, a branch name or a full commit ID)", so a git object id and any git
-/// reference name can; anything git itself would refuse as a reference name
-/// cannot, and that is what the `Invalid…CommitSpecifierException` pair reports.
-fn names_a_commit(specifier: &str) -> bool {
-    crate::state::is_object_id(specifier) || crate::state::is_valid_branch_name(specifier)
-}
+// Whether a specifier can name a commit at all is one reading for every
+// operation that takes one, so it is `crate::state::names_a_commit` rather than a
+// second copy here; what differs per operation is only the error the refusal is
+// reported as (for this one, the `Invalid…CommitSpecifierException` pair it
+// models).
+use crate::state::names_a_commit;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

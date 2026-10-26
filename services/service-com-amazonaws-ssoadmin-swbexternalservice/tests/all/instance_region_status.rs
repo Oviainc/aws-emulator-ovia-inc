@@ -294,10 +294,10 @@ async fn a_removing_region_reports_the_third_region_status_value() {
         .as_str()
         .unwrap_or_else(|| panic!("no InstanceArn in {created}"))
         .to_string();
-    // The activation is due, so the instance is operational; `AddRegion` is still a
-    // scaffold stub with an issue of its own, so the additional Region is seeded through
-    // the service's own `state::Region` constructor and everything asserted then goes over
-    // the wire.
+    // The activation is due, so the instance is operational; the additional Region is
+    // seeded through the service's own `state::Region` constructor so it starts out
+    // `ACTIVE` (the add over the wire is `instance_region_addition.rs`), and everything
+    // asserted then goes over the wire.
     hold_activation(&engine, SystemTime::now() - Duration::from_secs(1));
     with_store(&engine, |store| {
         store

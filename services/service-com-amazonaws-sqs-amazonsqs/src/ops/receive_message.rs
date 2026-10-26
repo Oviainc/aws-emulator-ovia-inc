@@ -170,6 +170,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
 use crate::state as sqs;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -297,8 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Default: 1." (ReceiveMessageRequest$MaxNumberOfMessages)
         let max_messages = input.max_number_of_messages.unwrap_or(1);
         if !(1..=10).contains(&max_messages) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "MaxNumberOfMessages must be an integer from 1 to 10; got {max_messages}."
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                &max_messages.to_string(),
+                "MaxNumberOfMessages",
+                "Must be between 1 and 10, if provided.",
             )));
         }
         // Each caller-chosen span is clamped against the range the model documents for
@@ -317,19 +320,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ] {
             let (min, max) = sqs::integer_bounds(attribute);
             if let Some(given) = value.map(i64::from).filter(|v| *v < min || *v > max) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "{member} must be an integer from {min} to {max}; got {given}."
+                return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                    &given.to_string(),
+                    member,
+                    &format!("Must be >= {min} and <= {max}, if provided."),
                 )));
             }
+        }
+
+        // `ReceiveRequestAttemptId` is a FIFO token, bounded exactly as the two a send
+        // carries: "the maximum length of ReceiveRequestAttemptId is 128 characters" out
+        // of "alphanumeric characters and punctuation". A token outside that is refused
+        // before anything is handed over.
+        if let Some(reason) = input
+            .receive_request_attempt_id
+            .as_deref()
+            .and_then(|token| sqs::message_token_refusal("ReceiveRequestAttemptId", token))
+        {
+            return Err(Scaffolded::invalid_parameter_value(reason));
         }
 
         // `AttributeNames` is the deprecated spelling of `MessageSystemAttributeNames`;
         // a request may use either, so both carry the same value set and both select the
         // same system attributes.
-        let mut system_requested: Vec<String> =
-            input.message_system_attribute_names.unwrap_or_default();
-        system_requested.extend(input.attribute_names.unwrap_or_default());
-        check_system_attribute_names(&system_requested)?;
+        let mut system_requested: Vec<String> = Vec::new();
+        for (member, names) in [
+            (
+                "MessageSystemAttributeNames",
+                input.message_system_attribute_names,
+            ),
+            ("AttributeNames", input.attribute_names),
+        ] {
+            let names = names.unwrap_or_default();
+            check_system_attribute_names(member, &names)?;
+            system_requested.extend(names);
+        }
         let attribute_requested: Vec<String> = input.message_attribute_names.unwrap_or_default();
 
         // "The token used for deduplication of ReceiveMessage calls", bounded exactly as
@@ -523,14 +548,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// takes the same ones. Applied here rather than at the boundary because the alias's
 /// modelled target is the queue attribute enum, which names none of them (see the
 /// `skip_validation` note on `ReceiveMessageInput`), and applying it once keeps the two
-/// spellings from answering the same request differently.
-fn check_system_attribute_names(requested: &[String]) -> Result<(), ReceiveMessageError> {
+/// spellings from answering the same request differently. The refusal names the member
+/// the caller actually supplied and the set it accepts, which is the whole fix.
+fn check_system_attribute_names(
+    member: &str,
+    requested: &[String],
+) -> Result<(), ReceiveMessageError> {
     for name in requested {
+        // Membership is the generated value set; the refusal states the set in the order
+        // the model publishes it (`sqs::MESSAGE_SYSTEM_ATTRIBUTE_NAMES`).
         if !MESSAGE_SYSTEM_ATTRIBUTE_NAME_VALUES.contains(&name.as_str()) {
-            return Err(ReceiveMessageErrorModeled::InvalidAttributeName(
-                sqs::unknown_attribute_name(name),
-            )
-            .into());
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                &format!("({name})"),
+                member,
+                &format!(
+                    "Must be one of: {}.",
+                    sqs::MESSAGE_SYSTEM_ATTRIBUTE_NAMES.join(", ")
+                ),
+            )));
         }
     }
     Ok(())

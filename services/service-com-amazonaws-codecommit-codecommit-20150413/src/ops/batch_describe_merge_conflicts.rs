@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDescribeMergeConflicts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDescribeMergeConflicts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: evaluates merging the source commit into the destination commit, both
+//! resolved out of `crate::state`, against their merge base, and describes the paths that
+//! merge cannot reconcile — each one's conflict metadata and the hunks of the differences
+//! between its two versions.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDescribeMergeConflicts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WHICH paths those are is `crate::state::merge::evaluate`, the one merge evaluation
+//! every merge question in this service shares, and the DESCRIPTION of each one is
+//! `crate::state::conflict_report`, shared with `GetMergeConflicts` so no two operations
+//! can describe the same conflicting path differently. What this file adds is which paths
+//! this request asks about and how the report is paged.
+//!
+//! Where the model leaves a choice, this handler's chosen reading is:
+//!
+//! * The operation "returns information about one or more merge conflicts in the attempted
+//!   merge of two commit specifiers using the squash or three-way merge strategy", so
+//!   those are the two strategies it accepts: `FAST_FORWARD_MERGE` is refused as
+//!   `InvalidMergeOptionException`, the error whose documented sentence is "the specified
+//!   merge option is not valid for this operation. Not all merge strategies are supported
+//!   for all operations." `SQUASH_MERGE` and `THREE_WAY_MERGE` take the same comparison:
+//!   they differ in the commit a merge WRITES, not in what conflicts.
+//! * `filePaths` names the paths to describe ("if not specified, the default is all
+//!   conflict files"), and a path it names that this merge has no conflict at — including
+//!   one no side of the merge holds at all — is reported in `errors` rather than in
+//!   `conflicts`, as the error shape CodeCommit models for that failure
+//!   (`FileDoesNotExistException`, or `PathRequiredException` /`InvalidPathException` for a
+//!   value that addresses no file at all) with that shape's own documented sentence.
+//! * `maxConflictFiles` ("the maximum number of files to include in the output") pages the
+//!   conflicting paths, with `nextToken` resuming after the last one reported;
+//!   `maxMergeHunks` ("the maximum number of merge hunks to include in the output") bounds
+//!   the hunks reported for EACH of those paths, which is what it bounds for the one path
+//!   `DescribeMergeConflicts` reports on.
+//!
+//! Reporting only: the evaluation and the report both read stored history, stored
+//! snapshots and stored object bytes and write nothing, so describing a merge leaves the
+//! repository exactly as the next caller would have found it. The work is bounded by one
+//! per-request `crate::state::merge::MergeBudget` — the commits walked, the paths
+//! compared, the content bytes loaded (by the evaluation AND by the hunks this report
+//! reads) and the time — and runs off the async worker
+//! (`crate::service::off_the_async_worker`), so the store lock it holds is never held on a
+//! worker thread other requests need.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +174,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::state::conflict_report::{conflict_metadata, merge_hunks, TreeSlot};
+use crate::state::{names_a_commit, FileEntry};
+
+/// One `filePaths` entry this report cannot describe, as the `errors` list
+/// carries it: the path the request named, the error shape CodeCommit models for
+/// that failure, and that shape's own documented sentence.
+fn path_error(
+    file_path: &str,
+    exception_name: &str,
+    message: &str,
+) -> BatchDescribeMergeConflictsError2 {
+    BatchDescribeMergeConflictsError2 {
+        file_path: file_path.to_string(),
+        exception_name: exception_name.to_string(),
+        message: message.to_string(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -231,18 +282,418 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDescribeMergeConflicts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDescribeMergeConflictsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDescribeMergeConflicts"))
+        let _ = ctx;
+
+        // The three enum members. A value outside an enum is already refused at
+        // the boundary (as the modelled `Invalid…Exception`, see
+        // `crate::service`); these keep the handler's own invariant explicit, and
+        // settle the defaults the members document. The catalogs they are checked
+        // against are the model-generated ones in `super::types`, so a model
+        // change cannot leave a second, divergent copy here.
+        let merge_option = input.merge_option.as_str();
+        if merge_option.is_empty() {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::MergeOptionRequiredException(
+                    MergeOptionRequiredException {
+                        message: Some("a merge option or strategy is required".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "Returns information about one or more merge conflicts in the attempted
+        // merge of two commit specifiers using the squash or three-way merge
+        // strategy": a fast-forward merge is not a strategy this operation
+        // describes conflicts for, and that is what
+        // `InvalidMergeOptionException`'s "not all merge strategies are supported
+        // for all operations" words.
+        if !MERGE_OPTION_TYPE_ENUM_VALUES.contains(&merge_option)
+            || merge_option == crate::state::merge::MERGE_OPTION_FAST_FORWARD
+        {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::InvalidMergeOptionException(
+                    InvalidMergeOptionException {
+                        message: Some(format!(
+                            "the merge option {merge_option} is not valid for this operation"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let detail_level = input
+            .conflict_detail_level
+            .as_deref()
+            .unwrap_or(crate::state::merge::CONFLICT_DETAIL_FILE_LEVEL);
+        if !CONFLICT_DETAIL_LEVEL_TYPE_ENUM_VALUES.contains(&detail_level) {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::InvalidConflictDetailLevelException(
+                    InvalidConflictDetailLevelException {
+                        message: Some(format!(
+                            "the conflict detail level {detail_level} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let resolution_strategy = input
+            .conflict_resolution_strategy
+            .as_deref()
+            .unwrap_or(crate::state::merge::CONFLICT_RESOLUTION_NONE);
+        if !CONFLICT_RESOLUTION_STRATEGY_TYPE_ENUM_VALUES.contains(&resolution_strategy) {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::InvalidConflictResolutionStrategyException(
+                    InvalidConflictResolutionStrategyException {
+                        message: Some(format!(
+                            "the conflict resolution strategy {resolution_strategy} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both specifiers are required, so the boundary already refused an absent
+        // one; one that carries nothing at all specifies no commit, and one that
+        // is neither an object id nor a reference name cannot name a commit —
+        // which is what a specifier of spaces is, since git refuses a reference
+        // name holding one. This operation models `InvalidCommitException` for
+        // that, rather than the per-side pair `GetMergeConflicts` models.
+        let source_specifier = input.source_commit_specifier.as_str();
+        let destination_specifier = input.destination_commit_specifier.as_str();
+        if source_specifier.is_empty() || destination_specifier.is_empty() {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::CommitRequiredException(
+                    CommitRequiredException {
+                        message: Some("a commit was not specified".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        for specifier in [source_specifier, destination_specifier] {
+            if !names_a_commit(specifier) {
+                return Err(
+                    BatchDescribeMergeConflictsErrorModeled::InvalidCommitException(
+                        InvalidCommitException {
+                            message: Some(format!(
+                                "the commit specifier {specifier} is not valid: provide a valid \
+                                 branch name, tag, or full commit ID"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The maximum number of merge hunks to include in the output": the
+        // figure that bounds the hunks reported for each path, held to the same
+        // range as every other page size this service publishes.
+        let max_merge_hunks = match input.max_merge_hunks {
+            None => crate::state::DEFAULT_MAX_RESULTS,
+            Some(requested)
+                if (crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                    .contains(&requested) =>
+            {
+                requested
+            }
+            Some(_) => {
+                return Err(
+                    BatchDescribeMergeConflictsErrorModeled::InvalidMaxMergeHunksException(
+                        InvalidMaxMergeHunksException {
+                            message: Some(crate::state::invalid_max_results_message(
+                                crate::state::MIN_MAX_RESULTS,
+                                crate::state::MAX_MAX_RESULTS,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        let max_merge_hunks = usize::try_from(max_merge_hunks).unwrap_or(0);
+
+        // The repository name is the store's key, read exactly as it arrived. The
+        // boundary refuses a value outside the model's `RepositoryName`
+        // constraints (len 1..100, pattern ^[\w\.-]+$) as
+        // `InvalidRepositoryNameException` / `RepositoryNameRequiredException`,
+        // see `crate::service`; the check here is the same invariant stated for a
+        // caller that does not come through the wire, as the handlers beside this
+        // one state it.
+        let repository_name = input.repository_name.as_str();
+        if repository_name.is_empty() {
+            return Err(
+                BatchDescribeMergeConflictsErrorModeled::RepositoryNameRequiredException(
+                    RepositoryNameRequiredException {
+                        message: Some("a repository name is required".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+
+        // The comparison is CPU-bound and runs under this service's store lock,
+        // so it is moved off the async worker — the same construct the git
+        // transport's work uses — and bounded by one request's `MergeBudget`:
+        // paths compared, file content read and time.
+        crate::service::off_the_async_worker(move || {
+            let store = state.lock();
+            let repository = store
+                .repositories
+                .get(repository_name)
+                .ok_or_else(|| {
+                    BatchDescribeMergeConflictsErrorModeled::RepositoryDoesNotExistException(
+                        RepositoryDoesNotExistException {
+                            message: Some(crate::state::repository_does_not_exist_message(
+                                repository_name,
+                            )),
+                        },
+                    )
+                })?;
+
+            // The message is `crate::state::commit_does_not_exist_message`, the one
+            // place this crate words this code, so every handler that cannot
+            // resolve a specifier words it identically.
+            let commit_does_not_exist = |specifier: &str| {
+                BatchDescribeMergeConflictsErrorModeled::CommitDoesNotExistException(
+                    CommitDoesNotExistException {
+                        message: Some(crate::state::commit_does_not_exist_message(specifier)),
+                    },
+                )
+            };
+            let source = repository
+                .resolve_commit(source_specifier)
+                .ok_or_else(|| commit_does_not_exist(source_specifier))?;
+            let destination = repository
+                .resolve_commit(destination_specifier)
+                .ok_or_else(|| commit_does_not_exist(destination_specifier))?;
+
+            // ONE evaluation per request, through the merge module every merge
+            // question in this service shares: it walks both histories to their
+            // merge base, compares the union of the three snapshots at the
+            // requested detail level and resolution strategy, and charges every
+            // phase to one budget, so the work a caller can drive is bounded in
+            // commits, paths, content bytes and time. The hunks this report reads
+            // are charged to the SAME budget.
+            let mut budget = crate::state::merge::MergeBudget::for_one_request();
+            let evaluation = crate::state::merge::evaluate(
+                repository,
+                source,
+                destination,
+                detail_level,
+                resolution_strategy,
+                &mut budget,
+            )
+            .map_err(|problem| merge_problem(problem, source_specifier, destination_specifier))?;
+
+            // Which of the conflicting paths this request asks about: all of them
+            // where it names none ("if not specified, the default is all conflict
+            // files"), and otherwise the ones it names, each held to the same
+            // canonical path form a read of a file uses. A path it names that
+            // this merge has no conflict at is reported in `errors`, in the order
+            // the request named it, while the conflicts themselves keep the
+            // evaluation's path order, so a page token addresses the same
+            // position whatever order the request listed its paths in.
+            let conflicting: BTreeSet<&str> =
+                evaluation.conflicts.iter().map(String::as_str).collect();
+            let mut errors: Vec<BatchDescribeMergeConflictsError2> = Vec::new();
+            let requested = input.file_paths.as_deref().unwrap_or_default();
+            let ordered: Vec<String> = if requested.is_empty() {
+                evaluation.conflicts.clone()
+            } else {
+                let mut asked: BTreeSet<String> = BTreeSet::new();
+                for raw in requested {
+                    match crate::state::normalize_path(raw) {
+                        Err(crate::state::PathProblem::Missing) => errors.push(path_error(
+                            raw,
+                            "PathRequiredException",
+                            "The folderPath for a location cannot be null.",
+                        )),
+                        Err(crate::state::PathProblem::Invalid) => errors.push(path_error(
+                            raw,
+                            "InvalidPathException",
+                            "The specified path is not valid.",
+                        )),
+                        Ok(path) if conflicting.contains(path.as_str()) => {
+                            asked.insert(path);
+                        }
+                        // A path this merge has no conflict at has no conflict to
+                        // describe, which is the failure
+                        // `FileDoesNotExistException` words — and a path no side
+                        // of the merge holds at all is the same answer.
+                        Ok(_) => errors.push(path_error(
+                            raw,
+                            "FileDoesNotExistException",
+                            "The specified file does not exist. Verify that you have used the \
+                             correct file name, full path, and extension.",
+                        )),
+                    }
+                }
+                evaluation
+                    .conflicts
+                    .iter()
+                    .filter(|path| asked.contains(*path))
+                    .cloned()
+                    .collect()
+            };
+
+            // One page of those paths, in the path order the evaluation reports
+            // them in. The whole evaluation is a pure function of stored state,
+            // so the next page picks up exactly where this one stopped; the token
+            // belongs to THIS evaluation, so one issued for another pair of
+            // commits (or another detail level, or another set of paths) is not a
+            // token here.
+            let scope = format!(
+                "BatchDescribeMergeConflicts:{repository_name}:{}:{}:\
+                 {merge_option}:{detail_level}:{resolution_strategy}:{}",
+                evaluation.source_commit_id,
+                evaluation.destination_commit_id,
+                ordered.join(",")
+            );
+            let (page, next_token) = crate::state::page_of(
+                &scope,
+                &ordered,
+                input.next_token.as_deref(),
+                input.max_conflict_files,
+            )
+            .map_err(|problem| match problem {
+                crate::state::PageProblem::InvalidMaxResults(message) => {
+                    BatchDescribeMergeConflictsErrorModeled::InvalidMaxConflictFilesException(
+                        InvalidMaxConflictFilesException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::PageProblem::InvalidContinuationToken(message) => {
+                    BatchDescribeMergeConflictsErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            })?;
+
+            // Each path of the page is described from the three snapshots the
+            // evaluation compared: the metadata about its three sides, and the
+            // hunks of the differences between its two versions.
+            let base_files = repository
+                .commits
+                .get(&evaluation.base_commit_id)
+                .map(|base| &base.files);
+            let empty: BTreeMap<String, FileEntry> = BTreeMap::new();
+            let base_files = base_files.unwrap_or(&empty);
+            let mut conflicts: Vec<Conflict> = Vec::with_capacity(page.len());
+            for path in &page {
+                let base = TreeSlot::at(base_files, path);
+                let in_source = TreeSlot::at(&source.files, path);
+                let in_destination = TreeSlot::at(&destination.files, path);
+                let mut hunks = merge_hunks(
+                    repository,
+                    base,
+                    in_source,
+                    in_destination,
+                    detail_level,
+                    &mut budget,
+                )
+                .map_err(|problem| {
+                    merge_problem(problem, source_specifier, destination_specifier)
+                })?;
+                hunks.truncate(max_merge_hunks);
+                conflicts.push(Conflict {
+                    conflict_metadata: Some(conflict_metadata(
+                        repository,
+                        path,
+                        base,
+                        in_source,
+                        in_destination,
+                    )),
+                    merge_hunks: Some(hunks),
+                });
+            }
+
+            Ok(BatchDescribeMergeConflictsOutput {
+                conflicts,
+                next_token,
+                // "A list of any errors returned while describing the merge
+                // conflicts for each file": the list is always reported, and is
+                // empty where every path the request named was described.
+                errors: Some(errors),
+                destination_commit_id: evaluation.destination_commit_id.clone(),
+                source_commit_id: evaluation.source_commit_id.clone(),
+                base_commit_id: Some(evaluation.base_commit_id.clone()),
+            })
+        })
+    }
+}
+
+/// What a merge this emulator will not carry to the end is refused as: the
+/// modelled error for the allowance that ran out, worded with what was being
+/// compared and the figure that bounds it.
+fn merge_problem(
+    problem: crate::state::merge::MergeProblem,
+    source_specifier: &str,
+    destination_specifier: &str,
+) -> BatchDescribeMergeConflictsErrorModeled {
+    match problem {
+        // Two tips with no commit in common: there is no base to evaluate either
+        // side's changes against, which is what the model words "the divergence
+        // between the tips of the provided commit specifiers is too great to
+        // determine whether there might be any merge conflicts".
+        crate::state::merge::MergeProblem::NoMergeBase => {
+            BatchDescribeMergeConflictsErrorModeled::TipsDivergenceExceededException(
+                TipsDivergenceExceededException {
+                    message: Some(format!(
+                        "the divergence between {source_specifier} and {destination_specifier} \
+                         is too great to determine whether there might be any merge conflicts. \
+                         Locally compare the specifiers using git diff or a diff tool."
+                    )),
+                },
+            )
+        }
+        crate::state::merge::MergeProblem::ItemsToCompare => {
+            BatchDescribeMergeConflictsErrorModeled::MaximumItemsToCompareExceededException(
+                MaximumItemsToCompareExceededException {
+                    message: Some(format!(
+                        "comparing {source_specifier} and {destination_specifier} exceeds the {} \
+                         items this emulator compares against the merge base at once",
+                        crate::state::merge::MAX_ITEMS_TO_COMPARE_PER_REQUEST
+                    )),
+                },
+            )
+        }
+        // A comparison that ran past the deadline is reported as the same
+        // refusal: of the errors this operation models, that is the one whose
+        // meaning covers a comparison this emulator will not carry to the end,
+        // and the message says time is what ran out.
+        crate::state::merge::MergeProblem::Deadline => {
+            BatchDescribeMergeConflictsErrorModeled::MaximumItemsToCompareExceededException(
+                MaximumItemsToCompareExceededException {
+                    message: Some(format!(
+                        "comparing {source_specifier} and {destination_specifier} took longer \
+                         than the {} seconds this emulator spends comparing two commits",
+                        crate::state::merge::MAX_MERGE_SECONDS
+                    )),
+                },
+            )
+        }
+        crate::state::merge::MergeProblem::ContentToLoad => {
+            BatchDescribeMergeConflictsErrorModeled::MaximumFileContentToLoadExceededException(
+                MaximumFileContentToLoadExceededException {
+                    message: Some(format!(
+                        "comparing {source_specifier} and {destination_specifier} line by line \
+                         exceeds the {} bytes of file content this emulator loads at once",
+                        crate::state::merge::MAX_CONTENT_BYTES_PER_REQUEST
+                    )),
+                },
+            )
+        }
     }
 }

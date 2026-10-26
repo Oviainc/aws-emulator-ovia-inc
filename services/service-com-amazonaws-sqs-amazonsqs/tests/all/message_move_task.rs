@@ -252,7 +252,7 @@ async fn a_start_naming_no_queue_or_a_rate_outside_its_range_is_refused() {
             "a source queue no other queue drives messages to",
             json!({"SourceArn": plain_arn}),
             400,
-            "UnsupportedOperation",
+            "InvalidParameterValue",
         ),
         (
             "a DestinationArn no queue of this account answers to",
@@ -273,19 +273,19 @@ async fn a_start_naming_no_queue_or_a_rate_outside_its_range_is_refused() {
             "a rate of zero, one below the smallest rate that moves anything",
             json!({"SourceArn": dead_letter_arn, "MaxNumberOfMessagesPerSecond": 0}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a negative rate",
             json!({"SourceArn": dead_letter_arn, "MaxNumberOfMessagesPerSecond": -1}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a rate of 501, one past the published maximum of 500",
             json!({"SourceArn": dead_letter_arn, "MaxNumberOfMessagesPerSecond": 501}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
     ];
 

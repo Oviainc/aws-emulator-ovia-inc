@@ -197,7 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(start) if start <= names.len() => start,
                 _ => {
                     return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                        format!("Value {token} for parameter NextToken is invalid. Reason: it was not issued by this listing."),
+                        crate::state::invalid_parameter_message(
+                            token,
+                            "NextToken",
+                            "it was not issued by this listing.",
+                        ),
                     ))
                 }
             },

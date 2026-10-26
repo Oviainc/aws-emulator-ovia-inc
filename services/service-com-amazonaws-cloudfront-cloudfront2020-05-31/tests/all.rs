@@ -59,6 +59,8 @@ mod distributions_by_connection_mode;
 mod distributions_by_origin_request_policy_id;
 #[path = "all/distributions_by_realtime_log_config.rs"]
 mod distributions_by_realtime_log_config;
+#[path = "all/distributions_by_response_headers_policy_id.rs"]
+mod distributions_by_response_headers_policy_id;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/field_level_encryption_profile_lifecycle.rs"]

@@ -31,6 +31,8 @@ mod aws_error_message_text;
 mod batch_associate_approval_rule_template;
 #[path = "all/batch_get_repositories.rs"]
 mod batch_get_repositories;
+#[path = "all/batch_merge_conflict_descriptions.rs"]
+mod batch_merge_conflict_descriptions;
 #[path = "all/blob_content.rs"]
 mod blob_content;
 #[path = "all/blob_differences.rs"]

@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `PutAnomalyDetector`, end to end over HTTP.
+//! `PutAnomalyDetector` UPDATING a detector the addressed workspace already holds, end to
+//! end over HTTP. (The same operation CREATING one the workspace holds nothing for is
+//! `tests/all/anomaly_detector_creation_by_put.rs`.)
 //!
-//! The rule under test: the operation REPLACES the whole specification of the detector
-//! its two path labels address — the algorithm configuration, the evaluation interval,
+//! The rule under test: for an id the workspace holds, the operation REPLACES that
+//! detector's whole specification — the algorithm configuration, the evaluation interval,
 //! the missing-data action and the metric labels, with an optional member the request
 //! omits left holding nothing — leaves every member that identifies the resource alone
 //! (id, ARN, alias, creation instant, tags), moves only `modifiedAt`, and reports the
-//! detector `UPDATING` until the clock owes its move back to `ACTIVE`. It only ever
-//! updates: a workspace or a detector that does not resolve is
-//! `ResourceNotFoundException` (404), a detector or workspace that is not `ACTIVE` is
-//! `ConflictException` (409), and a specification the service does not accept is
-//! `ValidationException` (400) with nothing stored.
+//! detector `UPDATING` until the clock owes its move back to `ACTIVE`. A workspace that
+//! does not resolve is `ResourceNotFoundException` (404), a detector or workspace that is
+//! not `ACTIVE` is `ConflictException` (409), and a specification the service does not
+//! accept is `ValidationException` (400) with nothing stored.
 //!
 //! Each suite spans what that rule generalises over — the configuration's members and
 //! their documented defaults, the evaluation interval across its published bounds, the
@@ -25,16 +26,21 @@
 use crate::workspace_lifecycle::{tags_of, text, wait_for_due_transition, Amp, Reply};
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::ANOMALY_DETECTOR_STATUS_CODE_VALUES;
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    ANOMALY_DETECTOR_NOT_FOUND_MESSAGE, ANOMALY_DETECTOR_RESOURCE_TYPE,
-    RANDOM_CUT_FOREST_AGGREGATION_OPERATORS, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETING,
-    STATUS_UPDATING, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_RESOURCE_TYPE,
+    ANOMALY_DETECTOR_RESOURCE_TYPE, RANDOM_CUT_FOREST_AGGREGATION_OPERATORS, STATUS_ACTIVE,
+    STATUS_CREATING, STATUS_DELETING, STATUS_UPDATING, WORKSPACE_NOT_FOUND_MESSAGE,
+    WORKSPACE_RESOURCE_TYPE,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// `POST /workspaces/{workspaceId}/anomalydetectors` — CreateAnomalyDetector, the only
-/// operation that brings a detector into existence (it is where `alias` is given).
-async fn create_detector(amp: &Amp, region: &str, workspace_id: &str, body: &Value) -> Reply {
+/// `POST /workspaces/{workspaceId}/anomalydetectors` — CreateAnomalyDetector, the
+/// operation that brings a detector into existence with an `alias` of its own.
+pub(crate) async fn create_detector(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    body: &Value,
+) -> Reply {
     amp.call(
         "POST",
         &format!("/workspaces/{workspace_id}/anomalydetectors"),
@@ -46,7 +52,7 @@ async fn create_detector(amp: &Amp, region: &str, workspace_id: &str, body: &Val
 
 /// `PUT /workspaces/{workspaceId}/anomalydetectors/{anomalyDetectorId}` —
 /// PutAnomalyDetector, the operation under test.
-async fn put_detector(
+pub(crate) async fn put_detector(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -64,7 +70,12 @@ async fn put_detector(
 
 /// `GET /workspaces/{workspaceId}/anomalydetectors/{anomalyDetectorId}` — the reader the
 /// update is asserted through, so every assertion is made against what was PERSISTED.
-async fn describe_detector(amp: &Amp, region: &str, workspace_id: &str, detector_id: &str) -> Reply {
+pub(crate) async fn describe_detector(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    detector_id: &str,
+) -> Reply {
     amp.call(
         "GET",
         &format!("/workspaces/{workspace_id}/anomalydetectors/{detector_id}"),
@@ -74,7 +85,7 @@ async fn describe_detector(amp: &Amp, region: &str, workspace_id: &str, detector
     .await
 }
 
-fn json_map(entries: &[(&str, &str)]) -> Value {
+pub(crate) fn json_map(entries: &[(&str, &str)]) -> Value {
     Value::Object(
         entries
             .iter()
@@ -83,7 +94,7 @@ fn json_map(entries: &[(&str, &str)]) -> Value {
     )
 }
 
-fn expected_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn expected_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -94,7 +105,7 @@ fn expected_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// back. Every member but `query` is optional, which is what a replacement has to be
 /// able to drop.
 #[derive(Clone)]
-struct Spec {
+pub(crate) struct Spec {
     query: String,
     /// `shingleSize` and `sampleSize`, or `None` to leave them to their documented
     /// defaults. Modelled `@range(min: 2, max: 1024)` and `@range(min: 256, max: 1024)`.
@@ -122,7 +133,7 @@ const DEFAULT_SHINGLE_SIZE: i64 = 8;
 const DEFAULT_SAMPLE_SIZE: i64 = 256;
 
 impl Spec {
-    fn new(query: &str) -> Self {
+    pub(crate) fn new(query: &str) -> Self {
         Self {
             query: query.to_string(),
             sizes: None,
@@ -134,32 +145,32 @@ impl Spec {
         }
     }
 
-    fn sizes(mut self, shingle: i64, sample: i64) -> Self {
+    pub(crate) fn sizes(mut self, shingle: i64, sample: i64) -> Self {
         self.sizes = Some((shingle, sample));
         self
     }
 
-    fn ignore_above(mut self, member: Value) -> Self {
+    pub(crate) fn ignore_above(mut self, member: Value) -> Self {
         self.ignore_above = Some(member);
         self
     }
 
-    fn ignore_below(mut self, member: Value) -> Self {
+    pub(crate) fn ignore_below(mut self, member: Value) -> Self {
         self.ignore_below = Some(member);
         self
     }
 
-    fn interval(mut self, seconds: i64) -> Self {
+    pub(crate) fn interval(mut self, seconds: i64) -> Self {
         self.interval = Some(seconds);
         self
     }
 
-    fn missing_data_action(mut self, action: Value) -> Self {
+    pub(crate) fn missing_data_action(mut self, action: Value) -> Self {
         self.missing_data_action = Some(action);
         self
     }
 
-    fn labels(mut self, labels: &[(&'static str, &'static str)]) -> Self {
+    pub(crate) fn labels(mut self, labels: &[(&'static str, &'static str)]) -> Self {
         self.labels = labels.to_vec();
         self
     }
@@ -196,7 +207,7 @@ impl Spec {
     }
 
     /// The `PutAnomalyDetector` request body for this specification.
-    fn put_body(&self) -> Value {
+    pub(crate) fn put_body(&self) -> Value {
         let mut body = serde_json::Map::new();
         body.insert("configuration".to_string(), self.configuration_sent());
         if let Some(interval) = self.interval {
@@ -213,7 +224,7 @@ impl Spec {
 
     /// The `CreateAnomalyDetector` request body for this specification — the same members
     /// plus the two this operation does not carry, `alias` and `tags`.
-    fn create_body(&self, alias: &str, tags: &[(&str, &str)]) -> Value {
+    pub(crate) fn create_body(&self, alias: &str, tags: &[(&str, &str)]) -> Value {
         let mut body = self.put_body();
         let map = body.as_object_mut().expect("an object body");
         map.insert("alias".to_string(), json!(alias));
@@ -225,7 +236,7 @@ impl Spec {
 }
 
 /// Assert the detector the service PERSISTED holds exactly `spec`, with `status`.
-fn assert_persisted(case: &str, described: &Reply, spec: &Spec, status: &str) {
+pub(crate) fn assert_persisted(case: &str, described: &Reply, spec: &Spec, status: &str) {
     assert_eq!(
         described.status, 200,
         "case {case:?}: DescribeAnomalyDetector must answer 200, got {described:?}"
@@ -280,7 +291,7 @@ fn assert_persisted(case: &str, described: &Reply, spec: &Spec, status: &str) {
 }
 
 /// The epoch seconds a timestamp member carries.
-fn instant(case: &str, value: &Value) -> f64 {
+pub(crate) fn instant(case: &str, value: &Value) -> f64 {
     value
         .as_f64()
         .unwrap_or_else(|| panic!("case {case:?}: expected an epoch-seconds timestamp, got {value:?}"))
@@ -289,8 +300,8 @@ fn instant(case: &str, value: &Value) -> f64 {
 /// A workspace id and a detector id that are well formed but name nothing — the shapes
 /// the service mints (`ws-`/`ad-` followed by a UUID), so these reach the handler rather
 /// than being refused by `WorkspaceId`/`AnomalyDetectorId`'s own patterns.
-const ABSENT_WORKSPACE_ID: &str = "ws-00000000-0000-4000-8000-000000000000";
-const ABSENT_DETECTOR_ID: &str = "ad-00000000-0000-4000-8000-000000000000";
+pub(crate) const ABSENT_WORKSPACE_ID: &str = "ws-00000000-0000-4000-8000-000000000000";
+pub(crate) const ABSENT_DETECTOR_ID: &str = "ad-00000000-0000-4000-8000-000000000000";
 
 /// An update replaces the WHOLE specification of an existing detector and the describe
 /// reads the replacement back, while the members that identify the resource — id, ARN,
@@ -605,18 +616,19 @@ async fn put_is_idempotent_per_client_token() {
     );
 }
 
-/// The operation only ever updates a detector that already exists: neither path label
-/// may name something this account does not hold, and a refusal stores nothing.
+/// A detector lives INSIDE its workspace, so the `workspaceId` label — the parent — has
+/// to resolve before anything is stored, and a refusal stores nothing.
 ///
-/// The rows span both labels and the scope each is resolved in — an unknown workspace, an
-/// unknown detector, and a detector that exists but belongs to ANOTHER workspace, which
-/// is not reachable through this one.
+/// (The `anomalyDetectorId` label is NOT resolved this way: an id the workspace holds
+/// nothing for is created, which `tests/all/anomaly_detector_creation_by_put.rs` covers.)
+/// The rows span the forms an unresolvable parent takes: an id no workspace was ever
+/// minted for, and one whose workspace the clock has already taken away.
 #[tokio::test]
-async fn put_refuses_a_label_that_resolves_to_nothing() {
+async fn put_refuses_a_workspace_that_resolves_to_nothing() {
     let amp = Amp::new();
     let region = "eu-central-1";
     let left = amp.active_workspace(region, "left").await;
-    let right = amp.active_workspace(region, "right").await;
+    let doomed = amp.active_workspace(region, "doomed").await;
 
     let spec = Spec::new("sum(rate(requests_total[5m]))");
     let created = create_detector(&amp, region, &left, &spec.create_body("requests", &[])).await;
@@ -625,6 +637,13 @@ async fn put_refuses_a_label_that_resolves_to_nothing() {
         "case \"seed\": CreateAnomalyDetector must answer 202, got {created:?}"
     );
     let detector_id = text(&created.body["anomalyDetectorId"]);
+    // The second workspace is deleted and the clock takes it away, so its id is one that
+    // named a workspace this account held and now names nothing.
+    let deleted = amp.delete(region, &doomed, None).await;
+    assert_eq!(
+        deleted.status, 202,
+        "case \"seed\": DeleteWorkspace must answer 202, got {deleted:?}"
+    );
     wait_for_due_transition();
 
     let replacement = Spec::new("max(node_memory_bytes)").interval(300);
@@ -638,20 +657,20 @@ async fn put_refuses_a_label_that_resolves_to_nothing() {
             WORKSPACE_NOT_FOUND_MESSAGE,
         ),
         (
-            "unknown detector",
-            left.clone(),
-            ABSENT_DETECTOR_ID.to_string(),
-            ABSENT_DETECTOR_ID.to_string(),
-            ANOMALY_DETECTOR_RESOURCE_TYPE,
-            ANOMALY_DETECTOR_NOT_FOUND_MESSAGE,
+            "a workspace the clock has removed",
+            doomed.clone(),
+            detector_id.clone(),
+            doomed.clone(),
+            WORKSPACE_RESOURCE_TYPE,
+            WORKSPACE_NOT_FOUND_MESSAGE,
         ),
         (
-            "a detector of another workspace",
-            right.clone(),
-            detector_id.clone(),
-            detector_id.clone(),
-            ANOMALY_DETECTOR_RESOURCE_TYPE,
-            ANOMALY_DETECTOR_NOT_FOUND_MESSAGE,
+            "an unknown workspace addressed with an unknown detector id",
+            ABSENT_WORKSPACE_ID.to_string(),
+            ABSENT_DETECTOR_ID.to_string(),
+            ABSENT_WORKSPACE_ID.to_string(),
+            WORKSPACE_RESOURCE_TYPE,
+            WORKSPACE_NOT_FOUND_MESSAGE,
         ),
     ];
 

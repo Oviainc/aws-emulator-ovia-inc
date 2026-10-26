@@ -274,6 +274,16 @@ pub const MAX_AUTHORIZERS_PER_API: usize = 10;
 /// published quota.
 pub const MAX_IDENTITY_SOURCES_PER_AUTHORIZER: usize = 100;
 
+/// The sentence every writer of an authorizer refuses a list past
+/// [`MAX_IDENTITY_SOURCES_PER_AUTHORIZER`] with, stated once here so the create and the
+/// update cannot drift apart about the bound they share.
+pub fn identity_source_limit_message() -> String {
+    format!(
+        "The maximum number of identity sources ({MAX_IDENTITY_SOURCES_PER_AUTHORIZER}) for \
+         an authorizer has been reached."
+    )
+}
+
 /// The `AuthorizerType` value that selects a JWT authorizer, from the generated
 /// `AUTHORIZER_TYPE_VALUES` catalog (`JWT | REQUEST`); the integration test
 /// `the_authorizer_type_names_are_the_modelled_catalog` pins these two names against

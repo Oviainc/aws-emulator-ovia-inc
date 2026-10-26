@@ -270,7 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|question| {
                 let risk =
                     improvement_risk(workload.answer(&input.lens_alias, &question.question_id))?;
-                Some(improvement_summary(question, risk))
+                Some(improvement_summary(
+                    question,
+                    risk,
+                    workload
+                        .question_jira_configuration(&input.lens_alias, &question.question_id),
+                ))
             })
             .collect();
 
@@ -313,6 +318,7 @@ fn improvement_risk(answer: Option<&crate::state::AnswerRecord>) -> Option<&'sta
 fn improvement_summary(
     question: &crate::state::ReviewQuestion,
     risk: &str,
+    jira_configuration: Option<JiraConfiguration>,
 ) -> ImprovementSummary {
     ImprovementSummary {
         question_id: Some(question.question_id.clone()),
@@ -329,9 +335,11 @@ fn improvement_summary(
         // documents nothing.
         improvement_plan_url: None,
         improvement_plans: None,
-        // A question's Jira issue exists once the workload's Jira integration has synced
-        // one; `UpdateIntegration` is still a stub, so nothing is synced here.
-        jira_configuration: None,
+        // The integration state of this question's issue in the integrated service,
+        // which exists once a sync has recorded one
+        // (`crate::state::WorkloadRecord::question_jira_configuration`, the one place every
+        // read of an answer reads it from).
+        jira_configuration,
     }
 }
 

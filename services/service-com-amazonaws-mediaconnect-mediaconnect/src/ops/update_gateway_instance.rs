@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored instance the request's ARN addresses: the only member the request
+//! carries beside that ARN is `BridgePlacement`, "the availability of the instance to host
+//! new bridges", so the update writes that value onto the stored record and the response is
+//! read back off the record this call wrote.
+//!
+//! `BridgePlacement` is OPTIONAL (`smithy_query(query="operation",
+//! operation="UpdateGatewayInstance")`), so a request that omits it asks for no change and
+//! gets the instance's stored placement back — which is also why this `@idempotent` call is
+//! safe to repeat. A value the enum does not name is refused before any instance is
+//! resolved, so only a modelled placement ever reaches the store.
+//!
+//! The placement is the instance's availability to host bridges, so it is only meaningful
+//! while the instance is registered with its gateway and not between two states:
+//!
+//! * an instance whose registration or deregistration is still in flight (`REGISTERING`,
+//!   `DEREGISTERING`) is between two states, which is the conflict `ConflictException`
+//!   describes — the same reading `crate::ops::deregister_gateway_instance` makes;
+//! * an instance that reached the terminal `DEREGISTERED` is no longer registered with its
+//!   gateway (`crate::state::StoredGatewayInstance::is_registered`), so it can host no
+//!   bridges at all and the write is refused as a semantic error, in the same lifecycle
+//!   envelope `crate::state::state_precondition_message` words for every other operation
+//!   whose precondition is a resource's state.
+//!
+//! Changing the placement moves nothing else: the modelled `InstanceState` enum
+//! (`smithy_query(query="shape",shape="InstanceState")`) carries no updating value and this
+//! operation answers HTTP 200 rather than 202, so the new placement is in force as soon as
+//! the call returns and the clock owes the instance nothing.
+//!
+//! An instance is never created by a client: see `crate::state::StoredGatewayInstance` for
+//! the out-of-band channel an instance registration reaches this service through.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +107,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The values `BridgePlacement` names (`smithy_query(query="shape",shape="BridgePlacement")`:
+/// AVAILABLE | LOCKED), as the only values this operation ever writes to the store.
+const BRIDGE_PLACEMENT_VALUES: &[&str] = &[
+    crate::state::BRIDGE_PLACEMENT_AVAILABLE,
+    crate::state::BRIDGE_PLACEMENT_LOCKED,
+];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +188,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateGatewayInstanceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect gateway store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The placement the request asks for, resolved to one of the values the enum names
+        // BEFORE any instance is resolved, so only a modelled value is ever stored and a
+        // refusal about the REQUEST's content is made whatever instance it addressed. A value
+        // outside the enum is refused by the framework's constraint walk before this handler
+        // runs, so reaching here with one means the member carried nothing at all; either way
+        // the refusal is the semantic error `BadRequestException` describes.
+        let requested_placement = match input.bridge_placement.as_deref() {
+            None => None,
+            Some(placement) if BRIDGE_PLACEMENT_VALUES.contains(&placement) => Some(placement),
+            Some(_) => {
+                return Err(UpdateGatewayInstanceErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::validation_failed_message(&format!(
+                            "BridgePlacement must name the availability of the instance to \
+                             host new bridges, one of: {}.",
+                            BRIDGE_PLACEMENT_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The state change the clock already owes an instance is materialised before the
+        // update is judged, exactly as the reporting operations do it, so an instance whose
+        // registration has settled is updated rather than refused for a transition that is
+        // no longer in flight.
+        store.settle_due_transitions(now);
+
+        let Some(instance) = store.gateway_instances.get_mut(&input.gateway_instance_arn) else {
+            return Err(UpdateGatewayInstanceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.gateway_instance_arn),
+                },
+            )
+            .into());
+        };
+
+        // An instance between two states cannot take a new placement: the registration or
+        // deregistration it is in the middle of decides whether it hosts bridges at all,
+        // which is the conflict `ConflictException` describes ("would cause a conflict with
+        // the current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the transition it is waiting on has settled).
+        if matches!(
+            instance.instance_state.as_str(),
+            crate::state::INSTANCE_STATE_REGISTERING | crate::state::INSTANCE_STATE_DEREGISTERING
+        ) {
+            return Err(UpdateGatewayInstanceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Gateway instance {} is in state {}, so its bridge placement cannot \
+                         be changed until that transition has settled.",
+                        instance.gateway_instance_arn, instance.instance_state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // An instance that reached the terminal `DEREGISTERED` is no longer registered with
+        // its gateway, so there is no availability to host bridges left to change. The
+        // refusal is the semantic error `BadRequestException` is "thrown if the request
+        // contains", worded in the one lifecycle envelope every state precondition in this
+        // service uses, and the stored record is left exactly as it was.
+        if !instance.is_registered() {
+            return Err(UpdateGatewayInstanceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: crate::state::state_precondition_message(
+                        "Instance",
+                        crate::state::INSTANCE_STATE_ACTIVE,
+                        "PUT",
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The one member an update carries is optional, so the value the request names
+        // replaces the stored placement and a request that names none leaves it alone — the
+        // repeat of this `@idempotent` call then reports the same record it reported before.
+        if let Some(bridge_placement) = requested_placement {
+            instance.bridge_placement = bridge_placement.to_string();
+        }
+
+        // The response is the STORED record, read back off the instance this call wrote,
+        // never anything derived from the request.
+        Ok(UpdateGatewayInstanceOutput {
+            bridge_placement: Some(instance.bridge_placement.clone()),
+            gateway_instance_arn: Some(instance.gateway_instance_arn.clone()),
+        })
     }
 }

@@ -3392,6 +3392,21 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         true
     }
 
+    /// Forget the extension association `association_id` names, answering the record that
+    /// was removed, or `None` when this account created none under that id.
+    ///
+    /// `DeleteExtensionAssociation` is the caller this exists for. The association record
+    /// holds the binding and the tags that were assigned to it and nothing else, so taking
+    /// it out of the map takes both — and because the extension it bound is held in its own
+    /// map, removing the association leaves that extension and every version of it exactly
+    /// where it was. Removing the record also frees its slot and releases its id.
+    pub fn remove_extension_association(
+        &mut self,
+        association_id: &str,
+    ) -> Option<ExtensionAssociation> {
+        self.extension_associations.remove(association_id)
+    }
+
     /// Resolve a deployment strategy id to the strategy it names: one this account
     /// created, or one of AppConfig's predefined `AppConfig.*` strategies, which are
     /// deployable without a `CreateDeploymentStrategy` call.

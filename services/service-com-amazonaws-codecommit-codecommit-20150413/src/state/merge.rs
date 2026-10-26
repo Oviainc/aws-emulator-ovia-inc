@@ -276,7 +276,12 @@ impl MergeBudget {
     }
 
     /// Charge the bytes one three-way merge reads.
-    fn content(&mut self, bytes: usize) -> Result<(), MergeProblem> {
+    ///
+    /// `pub(crate)` because the report a conflicting path's hunks are read out of
+    /// ([`super::conflict_report::merge_hunks`]) loads the same three versions of
+    /// a file, and one request's content allowance covers every byte it loads,
+    /// whichever question asked for them.
+    pub(crate) fn content(&mut self, bytes: usize) -> Result<(), MergeProblem> {
         self.content_bytes_left = self
             .content_bytes_left
             .checked_sub(bytes)

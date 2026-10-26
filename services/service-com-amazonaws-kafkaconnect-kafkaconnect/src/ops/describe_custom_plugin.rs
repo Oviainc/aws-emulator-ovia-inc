@@ -164,11 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
-        let Some(plugin) = state.custom_plugins.get(&input.custom_plugin_arn) else {
+        // A regional endpoint resolves only its own region's plugins, so a
+        // customPluginArn minted in another region is as absent here as one
+        // this service never minted.
+        let Some(plugin) = state.custom_plugin_in(&region, &input.custom_plugin_arn) else {
             return Err(DescribeCustomPluginErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "customPluginArn",

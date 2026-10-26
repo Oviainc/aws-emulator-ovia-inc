@@ -42,7 +42,10 @@ fn valid_instruction() -> Value {
 
 /// [`valid_instruction`] with `members` applied: a `null` value REMOVES the member, so a
 /// row can drop one as easily as it can change one.
-fn with(members: &[(&str, Value)]) -> Value {
+///
+/// `pub(crate)` so every suite in this test target builds its instruction rows from the
+/// one valid instruction rather than from a second copy of it.
+pub(crate) fn with(members: &[(&str, Value)]) -> Value {
     let mut built = valid_instruction();
     let object = built.as_object_mut().expect("an instruction is an object");
     for (member, value) in members {

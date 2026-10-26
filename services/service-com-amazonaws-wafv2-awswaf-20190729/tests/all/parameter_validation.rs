@@ -9,9 +9,9 @@
 //!    with its `Field`, `Parameter` and `Reason` members filled, and a `message`
 //!    composed from exactly those three — never an unmodelled error shape with the
 //!    structured members absent.
-//! 2. WAF resolves what a request REFERENCES before it judges the syntax of the
-//!    request's other members, so an unresolvable resource ARN is reported even
-//!    when another member also violates its modelled constraint.
+//! 2. WAF judges the resource ARNs a request CARRIES before it judges the syntax
+//!    of the request's other members, so an ARN WAF will not accept at all is
+//!    reported even when another member also violates its modelled constraint.
 //! 3. A collection whose ELEMENTS fail the element shape's constraints is reported
 //!    against the collection member's own path, with the value rendered as the
 //!    whole list and every constraint of the element shape in one bracketed set.
@@ -122,16 +122,18 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
     }
 
     let malformed_arn = "arn:aws:s3:::a-bucket-named-like-this";
-    let absent_rule_group = "arn:aws:wafv2:us-east-1:000000000000:regional/rulegroup/\
-                             does-not-exist/00000000-0000-0000-0000-000000000000";
+    // A wafv2 ARN whose first resource segment is neither `global` nor `regional`,
+    // so it is not a wafv2 resource ARN at all.
+    let unknown_scope_arn = "arn:aws:wafv2:us-east-1:000000000000:worldwide/rulegroup/\
+                             absent/00000000-0000-0000-0000-000000000000";
 
     let cases = vec![
         Case {
-            case: "PutManagedRuleSetVersions, a rule-group ARN that resolves to nothing",
+            case: "PutManagedRuleSetVersions, a reference with an unknown scope segment",
             operation: "PutManagedRuleSetVersions",
-            request: put_versions(Some(absent_rule_group), WELL_FORMED_LOCK),
+            request: put_versions(Some(unknown_scope_arn), WELL_FORMED_LOCK),
             field: "RESOURCE_ARN",
-            parameter: absent_rule_group.to_string(),
+            parameter: unknown_scope_arn.to_string(),
         },
         Case {
             case: "PutManagedRuleSetVersions, another service's ARN as the reference",
@@ -255,15 +257,19 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
 }
 
 /// An ARN WAF will not accept for a resource reference is refused with the one
-/// `Reason` that class carries, whichever way the ARN fails to resolve.
+/// `Reason` that class carries, whichever way the ARN fails to be one.
 ///
 /// The rows differ in HOW the ARN fails — not an ARN at all, another service's
-/// ARN, a wafv2 ARN with an unknown scope segment, too few resource segments, a
-/// well-formed `rulegroup` ARN naming nothing, and a well-formed ARN of a resource
-/// of the WRONG kind that really exists — so none of them can be passing by the
-/// same test as the recorded one. Each is at least the modelled 20 characters and
-/// carries no whitespace, so `ResourceArn`'s own boundary constraints are not what
-/// refuses it.
+/// ARN, a wafv2 ARN with an unknown scope segment, too few resource segments, and
+/// a well-formed ARN of a resource of the WRONG kind that really exists — so none
+/// of them can be passing by the same test as the recorded one. Each is at least
+/// the modelled 20 characters and carries no whitespace, so `ResourceArn`'s own
+/// boundary constraints are not what refuses it.
+///
+/// A well-formed `rulegroup` ARN naming a rule group that does not exist is NOT in
+/// this table: that is target resolution rather than a bad parameter, and WAF
+/// answers it with its nonexistent-item failure (see
+/// `crate::managed_rule_sets`).
 #[tokio::test]
 async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
     let waf = Waf::new();
@@ -283,12 +289,6 @@ async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
         (
             "too few resource segments",
             "arn:aws:wafv2:us-east-1:000000000000:regional/rulegroup/absent".to_string(),
-        ),
-        (
-            "a well-formed rule-group ARN naming nothing",
-            "arn:aws:wafv2:us-east-1:000000000000:regional/rulegroup/absent/\
-             00000000-0000-0000-0000-000000000000"
-                .to_string(),
         ),
         ("a live resource of the wrong kind", ip_set_arn.clone()),
     ];
@@ -322,18 +322,20 @@ async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
     }
 }
 
-/// WAF resolves what a request REFERENCES before it judges the syntax of the
-/// request's other members: with both wrong, the reference is what is reported.
+/// WAF judges the resource ARNs a request CARRIES before it judges the syntax of
+/// the request's other members: with both wrong, the ARN is what is reported.
 ///
-/// The table crosses the reference (unresolvable / absent) with the lock token
-/// (malformed in three different ways / well formed), so every combination is
-/// pinned — including that a request whose reference resolves still has its token
-/// checked, and that a request with neither fault reaches the operation itself.
+/// The table crosses the reference (an ARN WAF will not accept / absent) with the
+/// lock token (malformed in three different ways / well formed), so every
+/// combination is pinned — including that a request whose reference is acceptable
+/// still has its token checked, and that a request with neither fault reaches the
+/// operation itself.
 #[tokio::test]
 async fn a_resource_reference_is_resolved_before_the_lock_token() {
     let waf = Waf::new();
-    let absent_rule_group = "arn:aws:wafv2:us-east-1:000000000000:regional/rulegroup/\
-                             does-not-exist/00000000-0000-0000-0000-000000000000";
+    // Not a wafv2 resource ARN at all, so it is a bad PARAMETER whatever the store
+    // holds.
+    let unacceptable_arn = "arn:aws:s3:::a-bucket-named-like-this";
 
     // Three ways a `LockToken` can fail its modelled constraints: the wrong shape,
     // a hex-looking value of the wrong length, and the empty string (the length
@@ -341,14 +343,14 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
     let bad_tokens = ["stale-token", "1111111", ""];
 
     for token in bad_tokens {
-        // Reference unresolvable AND token bad: the reference wins.
+        // Reference unacceptable AND token bad: the reference wins.
         let (status, body) = waf
             .call(
                 "PutManagedRuleSetVersions",
-                put_versions(Some(absent_rule_group), token),
+                put_versions(Some(unacceptable_arn), token),
             )
             .await;
-        let case = format!("unresolvable reference with LockToken {token:?}");
+        let case = format!("unacceptable reference with LockToken {token:?}");
         assert_eq!(
             status, 400,
             "case {case:?}: expected 400, got status {status} and body {body}"
@@ -356,7 +358,7 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
         assert_eq!(
             error_code(&body),
             "WAFInvalidParameterException",
-            "case {case:?}: the unresolvable reference must be what is reported, got {body}"
+            "case {case:?}: the unacceptable reference must be what is reported, got {body}"
         );
         assert_eq!(
             body["Field"].as_str().unwrap_or_default(),
@@ -392,9 +394,10 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
         );
     }
 
-    // Neither fault: the request reaches the operation, which is still scaffolded.
-    // A validation layer that answered anything else here would be refusing valid
-    // input.
+    // Neither fault: the request reaches the operation, which resolves its target —
+    // the managed rule set `(Scope, Name, Id)` names — and refuses a request naming
+    // one this account does not hold. A validation layer that answered anything else
+    // here would be refusing valid input.
     let (status, body) = waf
         .call(
             "PutManagedRuleSetVersions",
@@ -402,9 +405,14 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "a request with no bad parameter must reach the unimplemented operation, \
-         got status {status} and body {body}"
+        status, 400,
+        "a request with no bad parameter must reach the operation, got status \
+         {status} and body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "WAFNonexistentItemException",
+        "the operation must refuse an identity no managed rule set carries, got {body}"
     );
 }
 

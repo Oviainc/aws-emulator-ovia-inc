@@ -37,6 +37,8 @@ mod queue_lifecycle;
 mod queue_tags;
 #[path = "all/receive_message_attribute_names.rs"]
 mod receive_message_attribute_names;
+#[path = "all/refusal_taxonomy.rs"]
+mod refusal_taxonomy;
 #[path = "all/send_message_batch.rs"]
 mod send_message_batch;
 #[path = "all/state_roundtrip.rs"]

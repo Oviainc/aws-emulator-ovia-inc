@@ -37,7 +37,7 @@ use crate::resource_tagging::escape;
 use crate::transit_gateway_peering::transit_gateway_arn;
 
 /// The resource type a refusal names for an association, which has no id of its own.
-const ASSOCIATION_KIND: &str = "transit-gateway-connect-peer-association";
+pub(crate) const ASSOCIATION_KIND: &str = "transit-gateway-connect-peer-association";
 
 /// The request member a refusal names when the Connect peer ARN is at fault: Network
 /// Manager names the offending member in its own lowerCamelCase spelling.
@@ -49,7 +49,7 @@ const ARN_MEMBER: &str = "transitGatewayConnectPeerArn";
 /// (`smithy_query shape=VpcArn`) — with the `transit-gateway-connect-peer` resource type and
 /// a `tgw-connect-peer-` id; `digits` is how many hex digits that id carries, which that
 /// pattern writes as 8 to 17.
-fn connect_peer_arn(
+pub(crate) fn connect_peer_arn(
     partition: &str,
     region: &str,
     account: &str,
@@ -188,7 +188,7 @@ struct Fixture {
 }
 
 /// `AssociateTransitGatewayConnectPeer` on `network` with `body`.
-async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
     emulator
         .post(
             &format!("/global-networks/{network}/transit-gateway-connect-peer-associations"),
@@ -199,7 +199,7 @@ async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Val
 
 /// `DisassociateTransitGatewayConnectPeer` for `arn` on `network`. The ARN travels in a
 /// NON-greedy `@httpLabel`, so a client sends its `:` and `/` percent-encoded.
-async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
+pub(crate) async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
     emulator
         .delete(&format!(
             "/global-networks/{network}/transit-gateway-connect-peer-associations/{}",
@@ -209,7 +209,11 @@ async fn disassociate(emulator: &Emulator, network: &str, arn: &str) -> (u16, Va
 }
 
 /// `GetTransitGatewayConnectPeerAssociations` on `network` with `query` appended to the URI.
-async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn get_associations(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/transit-gateway-connect-peer-associations")
     } else {
@@ -229,7 +233,7 @@ async fn get_associations_ok(emulator: &Emulator, case: &str, network: &str, que
 }
 
 /// The `TransitGatewayConnectPeerArn`s one page lists, in the order returned.
-fn arns_of(case: &str, body: &Value) -> Vec<String> {
+pub(crate) fn arns_of(case: &str, body: &Value) -> Vec<String> {
     body["TransitGatewayConnectPeerAssociations"]
         .as_array()
         .unwrap_or_else(|| {
@@ -270,7 +274,7 @@ async fn read_one(emulator: &Emulator, case: &str, network: &str, arn: &str) -> 
 }
 
 /// `RegisterTransitGateway` that must succeed.
-async fn register_gateway(emulator: &Emulator, network: &str, arn: &str) {
+pub(crate) async fn register_gateway(emulator: &Emulator, network: &str, arn: &str) {
     let (status, body) = emulator
         .post(
             &format!("/global-networks/{network}/transit-gateway-registrations"),

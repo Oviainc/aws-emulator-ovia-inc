@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alert_manager_definition.rs"]
 mod alert_manager_definition;
+#[path = "all/anomaly_detector_creation_by_put.rs"]
+mod anomaly_detector_creation_by_put;
 #[path = "all/anomaly_detector_lifecycle.rs"]
 mod anomaly_detector_lifecycle;
 #[path = "all/anomaly_detector_listing.rs"]

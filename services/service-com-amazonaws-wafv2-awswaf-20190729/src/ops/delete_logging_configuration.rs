@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the logging configuration of the web ACL its `ResourceArn` names away,
+//! under the `LogScope` the request addresses. A web ACL with none there is
+//! `WAFNonexistentItemException` (HTTP 400). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLoggingConfiguration"))
+        // `ctx` carries only request metadata, which this operation does not need:
+        // the configuration is addressed by the `ResourceArn` the request names.
+        let _ = ctx;
+
+        // The malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&input.resource_arn) {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&input.resource_arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // The web ACL the configuration belongs to, for the audit record: it carries
+        // the resource a call names by its identity, never the request's own text,
+        // and nothing is known about an ARN that resolves to no web ACL here.
+        let (scope, name, id) = state
+            .web_acl_by_arn(&input.resource_arn)
+            .map(|entry| {
+                (
+                    entry.scope.clone(),
+                    entry.web_acl.name.clone(),
+                    entry.web_acl.id.clone(),
+                )
+            })
+            .unwrap_or_default();
+
+        // "Deletes the LoggingConfiguration from the specified web ACL": there is
+        // one to delete only when one was put in front of that web ACL under the
+        // `LogScope` the request addresses, so a web ACL with none there — including
+        // one whose configuration this call already deleted — names a resource that
+        // doesn't exist.
+        if state
+            .remove_logging_configuration(&input.resource_arn, input.log_scope.as_deref())
+            .is_none()
+        {
+            crate::state::audit(
+                "DeleteLoggingConfiguration",
+                &scope,
+                &name,
+                &id,
+                "WAFNonexistentItemException",
+            );
+            return Err(
+                DeleteLoggingConfigurationErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        }
+
+        crate::state::audit("DeleteLoggingConfiguration", &scope, &name, &id, "deleted");
+        Ok(DeleteLoggingConfigurationOutput {})
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIdentityPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIdentityPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutIdentityPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes one sending-authorization policy onto the identity record this account
+//! holds, after reading the document through the shared IAM resource-policy
+//! grammar; `ListIdentityPolicies` and `GetIdentityPolicies` report what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +105,40 @@ impl From<PutIdentityPolicyErrorModeled> for PutIdentityPolicyError {
     }
 }
 
+/// What SES answers for a document that is not a sending authorization policy.
+///
+/// The service reports ONE opaque phrase for that whole class — it does not name
+/// the clause of the policy grammar the document broke — so a document that is
+/// not JSON and one that is JSON but carries no statement are refused in the same
+/// words.
+const NOT_A_POLICY: &str = "Unable to parse policy.";
+
+/// The operation's own modeled refusal: the document is not a policy this
+/// service can hold.
+///
+/// `InvalidPolicyException` is documented as "indicates that the provided policy
+/// is invalid. Check the error stack for more information about what caused the
+/// error". It renders as HTTP 400 with the awsQuery error code `InvalidPolicy`,
+/// from the model's own `awsQueryError` trait.
+fn invalid_policy(message: impl Into<String>) -> PutIdentityPolicyError {
+    PutIdentityPolicyErrorModeled::InvalidPolicyException(InvalidPolicyException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The characters `PolicyName` admits, from its own documentation: "The name of
+/// the policy. The policy name cannot exceed 64 characters and can only include
+/// alphanumeric characters, dashes, and underscores." The length is modeled
+/// (`length 1..64`) and so already refused at the boundary; the character set is
+/// not, so this handler reads it.
+fn is_policy_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 /// The `PutIdentityPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +175,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIdentityPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIdentityPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIdentityPolicy"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        if !is_policy_name(&input.policy_name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "PolicyName can only include alphanumeric characters, dashes, and \
+                 underscores, got {:?}",
+                input.policy_name
+            )));
+        }
+
+        // The document's ceiling: "The policy cannot exceed 4 KB." The model
+        // bounds `Policy` only below, so a longer document reaches this handler,
+        // and an invalid policy is what it is — the operation's own modeled
+        // error. Its own message, because the size rule is not the parse rule.
+        if input.policy.len() > crate::state::MAX_POLICY_BYTES {
+            return Err(invalid_policy(format!(
+                "Policy exceeds the maximum size of {} bytes.",
+                crate::state::MAX_POLICY_BYTES
+            )));
+        }
+
+        // A sending authorization policy IS an IAM resource-based policy
+        // document — each statement names the `Principal` it authorizes to send
+        // through the identity — so whether the text is a policy at all is read
+        // through the ONE shared grammar rather than by asking `serde_json`
+        // whether it parses, which would accept `5`, `"hello"` and `{}` as
+        // policies and store them.
+        if ::service_common::iam_policy::resource_policy_defect(&input.policy).is_some() {
+            return Err(invalid_policy(NOT_A_POLICY));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and the error it models
+            // is about the policy, not the server.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutIdentityPolicy",
+            ));
+        };
+        let mut state = state.lock();
+
+        // "This operation is for the identity owner only. If you have not
+        // verified the identity, it returns an error." The identity may be named
+        // by its name or by its ARN, which is what `identity_key` reads.
+        let maximum = crate::state::MAX_IDENTITY_POLICIES;
+        let Some(policies) = state.identity_policies_mut(&input.identity) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Identity {:?} is not a verified identity of this account; verify it before \
+                 attaching a sending authorization policy to it",
+                input.identity
+            )));
+        };
+
+        // "Adds or UPDATES a sending authorization policy": a name the identity
+        // already carries is replaced, so a repeated put is an upsert and never
+        // grows the store. Only a NEW name can reach the identity's limit.
+        if !policies.contains_key(&input.policy_name) && policies.len() >= maximum {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Identity {:?} already carries the maximum of {maximum} sending authorization \
+                 policies; delete one before adding another",
+                input.identity
+            )));
+        }
+        // Stored VERBATIM, so `GetIdentityPolicies` reports back the document
+        // that was submitted — whitespace and member order included — rather
+        // than a re-rendering of it.
+        policies.insert(input.policy_name.clone(), input.policy.clone());
+
+        // `PutIdentityPolicyResponse` has no members: what the call produced is
+        // the state it wrote, which the two read operations report.
+        Ok(PutIdentityPolicyOutput {})
     }
 }

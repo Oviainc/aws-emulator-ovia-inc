@@ -2539,6 +2539,17 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             })
     }
 
+    /// Whether any stored access association names the domain name `domain_name_arn`.
+    ///
+    /// The dependency lookup, beside the pair lookup above: an association is created only
+    /// against a STORED private custom domain name, so one naming a domain name DEPENDS on
+    /// that record, and this is the one query that decides whether anything still does.
+    pub fn access_associations_depend_on(&self, domain_name_arn: &str) -> bool {
+        self.domain_name_access_associations
+            .values()
+            .any(|association| association.domain_name_arn == domain_name_arn)
+    }
+
     /// The tag collection stored on the resource a `resourceArn` named, as
     /// [`parse_tagged_resource`] read it.
     ///
@@ -2870,6 +2881,23 @@ pub const NO_SUCH_DOMAIN_NAME: &str = "Invalid domain name identifier specified"
 /// failure.
 pub const NO_SUCH_ACCESS_ASSOCIATION: &str =
     "Invalid domain name access association identifier specified";
+
+/// The `ConflictException` message for a custom domain name a stored
+/// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`
+/// refuses while the dependency stands (see
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::access_associations_depend_on`]).
+///
+/// AWS publishes no fixed sentence for this condition, so the message is BUILT FROM
+/// STORED STATE the way [`no_such_tagged_resource`] is: it names the record the request
+/// addressed and the dependent resource kind, in the modelled spelling of both
+/// (`DomainName`, `DomainNameAccessAssociation`), so the caller can see which call to
+/// make first.
+pub fn domain_name_has_access_associations(domain_name: &str) -> String {
+    format!(
+        "The domain name {domain_name} has domain name access associations. Delete the \
+         domain name access associations before deleting the domain name."
+    )
+}
 
 /// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
 /// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers

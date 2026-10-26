@@ -50,9 +50,17 @@
 //!
 //! FORM TYPES — the metadata schemas `PutFormType` registers — sit in such a per-account
 //! namespace too, keyed by form type name, because a put names its form type by `Name`
-//! alone and no `CatalogId`. They are ADDRESSED by the opaque `FormTypeId` the first put
-//! under a name mints, which is the shape every operation that reads, deletes or attaches
-//! to one takes.
+//! alone and no `CatalogId`. They are ADDRESSED by the identifier a client holds for one —
+//! the opaque `FormTypeId` the first put under a name mints, or that name itself — which is
+//! the shape every operation that reads, deletes or attaches to one takes.
+//!
+//! ASSET TYPES — the asset structures `PutAssetType` registers, each naming the forms an
+//! asset of that type includes — sit in their own per-account namespace beside the form
+//! types they reference ([`ComAmazonawsGlueAwsglueState::asset_types`]), keyed by asset
+//! type name for the same reason: a put names its asset type by `Name` alone and no
+//! `CatalogId`. Each of its form references carries the `FormTypeId` of a form type in
+//! this same store, and the asset type is itself ADDRESSED by the opaque `AssetTypeId` the
+//! first put under a name mints.
 //!
 //! BUSINESS GLOSSARIES — the containers for business-concept terms `CreateGlossary`
 //! registers — sit beside that tree in another per-account namespace
@@ -75,6 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
+    AssetTypeFormReference,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput,
@@ -207,6 +216,14 @@ pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
 /// refused rather than stored; `PutFormType` models no limit error, so the refusal is
 /// the closest client error it does model (`InvalidInputException`).
 pub const MAX_FORM_TYPES: usize = 1_000;
+
+/// Ceiling on the asset types this emulator will hold, for the same reason as
+/// [`MAX_FORM_TYPES`]: `PutAssetType` writes a record any caller can reach, each one
+/// carrying up to the modelled 100 form references, so the number of records one process
+/// will hold is bounded here. A put that would add one past the ceiling is refused rather
+/// than stored; `PutAssetType` models no limit error, so the refusal is the closest client
+/// error it does model (`InvalidInputException`).
+pub const MAX_ASSET_TYPES: usize = 1_000;
 
 /// Ceiling on the business glossaries this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `CreateGlossary` writes a record any caller can reach, so the number
@@ -479,10 +496,26 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// exactly as sent — the model documents no case fold for `FormTypeName`, whose
     /// pattern (`^[A-Z]\w*$`) already fixes the first character's case.
     ///
-    /// A form type is ADDRESSED by its id rather than by its name: `GetFormType` and
-    /// `DeleteFormType` take an `Identifier` targeting `FormTypeId`, the same shape
-    /// `PutFormType`'s `Id` carries. [`Self::form_type_by_id`] is that resolution.
+    /// A form type is ADDRESSED by an `Identifier` rather than by this key: `GetFormType`
+    /// and `DeleteFormType` take one targeting `FormTypeId`, the same shape
+    /// `PutFormType`'s `Id` carries, and a client holds either that minted id or the name
+    /// it registered the form type under. [`Self::form_type_by_reference`] is that
+    /// resolution.
     pub form_types: BTreeMap<String, FormTypeEntry>,
+    /// Every asset type this emulator holds, keyed by `AssetTypeName`.
+    ///
+    /// Per account and beside the catalog tree, like form types: `PutAssetType` names an
+    /// asset type by `Name` alone, with no `CatalogId` member, and that name is what
+    /// decides whether a put creates an asset type or updates the one already stored.
+    /// Ordered, so `ListAssetTypes` has one deterministic order to page over. The key is
+    /// the name exactly as sent — the model documents no case fold for `AssetTypeName`.
+    ///
+    /// An asset type is ADDRESSED by an `Identifier` rather than by this key:
+    /// `GetAssetType` and `DeleteAssetType` take one targeting `AssetTypeId`, the same
+    /// shape `PutAssetType`'s `Id` carries, and a client holds either that minted id or
+    /// the name it registered the asset type under. [`Self::asset_type_by_reference`] is
+    /// that resolution.
+    pub asset_types: BTreeMap<String, AssetTypeEntry>,
     /// Every business glossary this emulator holds, keyed by its `GlossaryId`.
     ///
     /// Per account, like crawlers and job definitions: `GetGlossary`, `UpdateGlossary`,
@@ -858,6 +891,54 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types
             .values()
             .find(|form_type| form_type.id == id)
+    }
+
+    /// The stored form type an `AssetTypeFormReference$FormTypeIdentifier` names, or
+    /// `None` when this store holds no such form type.
+    ///
+    /// A reference carries a form type's identifier as the CLIENT holds it, which is
+    /// either the `FormTypeId` the catalog minted for it or the `FormTypeName` it was
+    /// registered under: a client that put a form type by name addresses it by that name,
+    /// and the catalog serves that reference, so both resolve to the one record. The
+    /// minted id is tried first, so an identifier that could be read either way names the
+    /// record it was minted for.
+    pub fn form_type_by_reference(&self, identifier: &str) -> Option<&FormTypeEntry> {
+        self.form_type_by_id(identifier)
+            .or_else(|| self.form_types.get(identifier))
+    }
+
+    /// Whether the store can hold another asset type, i.e. is below [`MAX_ASSET_TYPES`].
+    pub fn can_store_asset_type(&self) -> bool {
+        self.asset_types.len() < MAX_ASSET_TYPES
+    }
+
+    /// The stored asset type whose `Id` is `id`, or `None` when this store holds no asset
+    /// type under that id.
+    ///
+    /// Every operation that ADDRESSES an asset type does so by an `AssetTypeId`
+    /// (`GetAssetType$Identifier`, `DeleteAssetType$Identifier` and `PutAsset$AssetTypeId`
+    /// all target that shape), while the records are keyed by the name a put addresses
+    /// them by — so the id resolution is a walk, bounded by [`MAX_ASSET_TYPES`]. One copy,
+    /// shared, so no two operations can disagree about which record an id names.
+    pub fn asset_type_by_id(&self, id: &str) -> Option<&AssetTypeEntry> {
+        self.asset_types
+            .values()
+            .find(|asset_type| asset_type.id == id)
+    }
+
+    /// The stored asset type an `Identifier` targeting `AssetTypeId` names, or `None` when
+    /// this store holds no such asset type.
+    ///
+    /// An identifier carries an asset type's address as the CLIENT holds it, which is
+    /// either the `AssetTypeId` the catalog minted for it or the `AssetTypeName` it was
+    /// registered under, exactly as a form type reference does
+    /// ([`Self::form_type_by_reference`]): a client that put an asset type by name
+    /// addresses it by that name, and the catalog serves that read. The minted id is tried
+    /// first, so an identifier that could be read either way names the record it was
+    /// minted for.
+    pub fn asset_type_by_reference(&self, identifier: &str) -> Option<&AssetTypeEntry> {
+        self.asset_type_by_id(identifier)
+            .or_else(|| self.asset_types.get(identifier))
     }
 
     /// Whether the store can hold another business glossary, i.e. is below
@@ -1969,6 +2050,81 @@ impl FormTypeEntry {
             name,
             schema,
         }
+    }
+}
+
+/// How many asset type ids this process has minted. A nonce source for
+/// [`new_asset_type_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
+static MINTED_ASSET_TYPE_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `AssetTypeId`: the opaque identifier the Data Catalog assigns an asset type
+/// when `PutAssetType` first stores it under a name.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, the same shape a form type id has
+/// and inside `AssetTypeId`'s `length 1..256`. The bits come from [`mint_hex_id`], so two
+/// puts landing in the same nanosecond cannot be given the same id. It is minted ONCE,
+/// when the name is first stored, and kept on the [`AssetTypeEntry`] through every later
+/// update, so every read of that asset type reports the same id and two asset types never
+/// share one.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_asset_type_id() -> String {
+    mint_hex_id(&MINTED_ASSET_TYPE_IDS, CATALOG_ID_WORDS)
+}
+
+/// A stored asset type: the structure of an asset `PutAssetType` registers in the Data
+/// Catalog, as the set of forms an asset of that type includes.
+///
+/// Every member of the modelled asset type is held here — its id, its name and its forms
+/// — and nothing else: the model gives an asset type no status, owner or timestamp. The
+/// name and the forms come from the request; the id is the one server-set member, minted
+/// by [`new_asset_type_id`] when the name is first stored.
+#[derive(Debug, Clone)]
+pub struct AssetTypeEntry {
+    /// `AssetTypeId`, minted by [`new_asset_type_id`] at the first put under this name and
+    /// unchanged by every later one, so a caller that kept the id from an earlier put can
+    /// still address the asset type after it has been updated.
+    pub id: String,
+    /// The asset type's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::asset_types`].
+    pub name: String,
+    /// "The forms that make up the asset type, keyed by form name", each value the
+    /// identifier of the form type that defines that form's schema, stored exactly as the
+    /// put sent it (`AssetTypeFormReference$FormTypeIdentifier`, the reference's only
+    /// member) so a read reports the identifier the client wrote. It resolved against this
+    /// store's form types when it was stored
+    /// ([`ComAmazonawsGlueAwsglueState::form_type_by_reference`]), so it is either a
+    /// minted `FormTypeId` or the `FormTypeName` the form type was registered under.
+    /// Ordered by form name, so two reads of one asset type report the forms in one order.
+    pub forms: BTreeMap<String, String>,
+}
+
+impl AssetTypeEntry {
+    /// The record a put stores for a name this store does not hold yet: the request's
+    /// name and form references, under a freshly minted id.
+    pub fn new(name: String, forms: BTreeMap<String, String>) -> Self {
+        Self {
+            id: new_asset_type_id(),
+            name,
+            forms,
+        }
+    }
+
+    /// This record's forms as the modelled `AssetTypeFormsMap`, which is what every
+    /// operation that reports an asset type answers with.
+    pub fn forms_map(&self) -> HashMap<String, AssetTypeFormReference> {
+        self.forms
+            .iter()
+            .map(|(form_name, form_type_id)| {
+                (
+                    form_name.clone(),
+                    AssetTypeFormReference {
+                        form_type_identifier: form_type_id.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 }
 

@@ -35,7 +35,10 @@ use crate::search_jobs::{
 /// A `RoleArn` the service can be passed: a role in the account this emulator attributes
 /// every caller to. Satisfies `IamRoleArn`'s modelled `@pattern`
 /// (`^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$`).
-fn passable_role(partition: &str, name: &str) -> String {
+///
+/// `pub(crate)` because the export `ClientToken` expiry suite
+/// (`tests/all/export_client_token_expiry.rs`) starts exports under the same roles.
+pub(crate) fn passable_role(partition: &str, name: &str) -> String {
     format!(
         "arn:{partition}:iam::{}:role/{name}",
         engine::emulator_account_id()

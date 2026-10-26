@@ -4861,6 +4861,27 @@ pub fn references_origin_request_policy(
     .any(|id| id == origin_request_policy_id)
 }
 
+/// Whether `config` associates any of its cache behaviours with the response headers policy
+/// `response_headers_policy_id` names.
+///
+/// A response headers policy is attached to a distribution by a cache behaviour's
+/// `ResponseHeadersPolicyId`, and a distribution's behaviours are its DEFAULT cache behaviour
+/// together with its ordered ones — both declare the member, so both are walked here and a
+/// distribution is associated with the policy as soon as ONE of them names it. The SAME rule
+/// [`references_cache_policy`] states for the other policies a cache behaviour attaches, over
+/// the same walk.
+pub fn references_response_headers_policy(
+    config: &DistributionConfig,
+    response_headers_policy_id: &str,
+) -> bool {
+    behavior_attachments(
+        config,
+        |behavior| behavior.response_headers_policy_id.as_deref(),
+        |behavior| behavior.response_headers_policy_id.as_deref(),
+    )
+    .any(|id| id == response_headers_policy_id)
+}
+
 /// What every cache behaviour of `config` attaches through one of its members — the default
 /// behaviour first, then each ordered one — skipping the behaviours that attach nothing.
 ///
@@ -7140,9 +7161,8 @@ pub fn comment_too_long(length: usize) -> crate::ops::types::InvalidArgument {
 /// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for a response headers policy
 /// id the store does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The response headers
-/// policy does not exist." — a property of the store rather than of the request, so
-/// nothing from the request belongs in the text.
+/// The sentence ([`NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE`]) states a property of the store
+/// rather than of the request, so nothing from the request belongs in the text.
 pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
     NoSuchResponseHeadersPolicy {
         message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
@@ -7232,9 +7252,17 @@ pub fn no_such_monitoring_subscription() -> NoSuchMonitoringSubscription {
 pub const NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE: &str =
     "The monitoring subscription does not exist.";
 
-/// `NoSuchResponseHeadersPolicy`'s message, as the model documents the shape.
+/// The message `NoSuchResponseHeadersPolicy` carries, on the wire.
+///
+/// The WIRE text CloudFront answers this code with for a response headers policy id no
+/// policy holds, in the form this service states that condition in for every other named
+/// resource ([`NO_SUCH_CACHE_POLICY_MESSAGE`], [`NO_SUCH_DISTRIBUTION_MESSAGE`],
+/// [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]): "The specified <resource> does not exist."
+/// It differs from the sentence the MODEL's documentation of the error shape uses for the
+/// same rule ("The response headers policy does not exist."), which documents the condition
+/// rather than stating what is served, so do not "correct" this constant to it.
 pub const NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
-    "The response headers policy does not exist.";
+    "The specified response headers policy does not exist.";
 
 /// The modelled `NoSuchOriginAccessControl` (HTTP 404) for an origin access control id
 /// the store does not hold.

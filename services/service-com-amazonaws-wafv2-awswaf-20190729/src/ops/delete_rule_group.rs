@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the rule group named by `(Scope, Name, Id)` once its `LockToken` still
+//! matches the stored one. A stale token is `WAFOptimisticLockException`, an unknown
+//! triple `WAFNonexistentItemException`, and a rule group a live rule tree still
+//! references `WAFAssociatedItemException` (all HTTP 400). This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +175,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRuleGroup"))
+        // `ctx` carries only request metadata, which this operation does not need.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state.rule_group(&input.scope, &input.name, &input.id) else {
+            crate::state::audit(
+                "DeleteRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(DeleteRuleGroupErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "DeleteRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(DeleteRuleGroupErrorModeled::WAFOptimisticLockException(
+                crate::state::optimistic_lock_exception(),
+            )
+            .into());
+        }
+        // A rule group a stored rule tree still RUNS is in use, exactly as an IP set
+        // a rule tree still matches against is: the same check, over the same rule
+        // trees, for whatever kind of resource is being deleted.
+        let arn = entry.rule_group.arn.clone();
+        if let Some(referrer) = state.rule_tree_referencing(&arn) {
+            crate::state::audit(
+                "DeleteRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                // WHICH stored rule tree still references the group is a diagnostic,
+                // so it is recorded here; the refusal itself carries the exception
+                // type's constant sentence.
+                &format!("WAFAssociatedItemException: referenced by {referrer}"),
+            );
+            return Err(DeleteRuleGroupErrorModeled::WAFAssociatedItemException(
+                crate::state::associated_item_exception(),
+            )
+            .into());
+        }
+
+        state.remove_rule_group(&input.scope, &input.id);
+        crate::state::audit(
+            "DeleteRuleGroup",
+            &input.scope,
+            &input.name,
+            &input.id,
+            "deleted",
+        );
+        Ok(DeleteRuleGroupOutput {})
     }
 }

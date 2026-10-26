@@ -136,7 +136,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
 use crate::state as sqs;
+// The two wire codes a batch entry reports are the ones the error channel's parameter
+// variants carry, read from where that channel owns them.
+use crate::scaffolded::{INVALID_PARAMETER_VALUE, MISSING_PARAMETER};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
@@ -241,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.entries.is_empty() {
             return Err(SendMessageBatchErrorModeled::EmptyBatchRequest(
                 EmptyBatchRequest {
-                    message: Some("The batch request doesn't contain any entries.".to_string()),
+                    message: Some(sqs::empty_batch_message("SendMessageBatch")),
                 },
             )
             .into());
@@ -309,11 +313,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .is_some_and(|attributes| !attributes.is_empty())
         }) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Entry {} includes MessageSystemAttributes, which this emulator does not \
-                 support yet: it carries the X-Ray trace header, which nothing here propagates.",
-                entry.id
-            )));
+            return Err(SendMessageBatchErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(format!(
+                        "Entry {} includes MessageSystemAttributes, which this emulator does not \
+                         support yet: it carries the X-Ray trace header, which nothing here \
+                         propagates.",
+                        entry.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A parameter the queue's TYPE does not take cannot be satisfied by ANY entry of
+        // this batch — every entry addresses the one queue — so it is the whole request
+        // that is refused, before anything is enqueued, exactly as `SendMessage` refuses
+        // the same parameter. This is RECORDED behaviour and not a choice: a batch one of
+        // whose entries carries a per-message delay on a FIFO queue is refused whole,
+        // with nothing enqueued, rather than answered 200 with that entry alone under
+        // `Failed`. A fault in an entry's own content (its body, a value outside a range,
+        // an absent required member) is still that entry's alone. A per-message delay of
+        // zero asks for nothing a FIFO queue does not already do, so only a positive one
+        // is a parameter the queue type does not take.
+        for entry in &input.entries {
+            let misused = if fifo {
+                entry
+                    .delay_seconds
+                    .filter(|delay| *delay > 0)
+                    .map(|delay| (delay.to_string(), sqs::DELAY_SECONDS))
+            } else {
+                entry
+                    .message_deduplication_id
+                    .clone()
+                    .map(|token| (token, "MessageDeduplicationId"))
+            };
+            if let Some((value, parameter)) = misused {
+                return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                    &value,
+                    parameter,
+                    sqs::QUEUE_TYPE_PARAMETER_REASON,
+                )));
+            }
         }
 
         // Everything each message carries counts toward the batch's payload, attributes
@@ -495,7 +536,7 @@ fn prepare(
         return Err(refused(
             entry,
             MISSING_PARAMETER,
-            "The request must contain the parameter MessageBody.".to_string(),
+            sqs::missing_parameter_message("MessageBody"),
         ));
     }
 
@@ -506,11 +547,7 @@ fn prepare(
         return Err(refused(
             entry,
             INVALID_MESSAGE_CONTENTS,
-            format!(
-                "MessageBody holds U+{:04X}, which is outside the allowed set \
-                 #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to #x10FFFF.",
-                character as u32
-            ),
+            sqs::invalid_body_character_message(character),
         ));
     }
 
@@ -530,9 +567,7 @@ fn prepare(
             return Err(refused(
                 entry,
                 MISSING_PARAMETER,
-                "The entry must carry a MessageGroupId: the queue it addresses is a FIFO \
-                 queue, which hands a group's messages over in strict order."
-                    .to_string(),
+                sqs::missing_parameter_message("MessageGroupId"),
             ));
         }
         None => {}
@@ -545,15 +580,8 @@ fn prepare(
     // ContentBasedDeduplication set, the action fails with an error."
     let deduplication_id = match entry.message_deduplication_id.clone() {
         Some(given) => {
-            if !fifo {
-                return Err(refused(
-                    entry,
-                    INVALID_PARAMETER_VALUE,
-                    "The entry includes MessageDeduplicationId, which applies only to a FIFO \
-                     queue; the queue it addresses is a standard queue."
-                        .to_string(),
-                ));
-            }
+            // A standard queue never reaches here: the handler refuses the whole batch
+            // for a parameter the queue type does not take, before any entry is judged.
             if let Some(reason) = sqs::message_token_refusal("MessageDeduplicationId", &given) {
                 return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
             }
@@ -565,29 +593,19 @@ fn prepare(
         None if fifo => {
             return Err(refused(
                 entry,
-                MISSING_PARAMETER,
-                "The entry must carry a MessageDeduplicationId, or the FIFO queue it \
-                 addresses must have ContentBasedDeduplication enabled."
-                    .to_string(),
+                INVALID_PARAMETER_VALUE,
+                sqs::NO_DEDUPLICATION_ID.to_string(),
             ));
         }
         None => None,
     };
 
     // "When you set FifoQueue, you can't set DelaySeconds per message. You can set this
-    // parameter only on a queue level." The queue's own value applies when the entry
-    // names none; either way the value must be inside the range the model documents for
-    // the attribute.
+    // parameter only on a queue level." A FIFO queue never reaches here carrying one:
+    // the handler refuses the whole batch for it. The queue's own value applies when the
+    // entry names none; either way the value must be inside the range the model
+    // documents for the attribute.
     let (min_delay, max_delay) = sqs::integer_bounds(sqs::DELAY_SECONDS);
-    if fifo && entry.delay_seconds.is_some() {
-        return Err(refused(
-            entry,
-            INVALID_PARAMETER_VALUE,
-            "The entry includes DelaySeconds, which cannot be set per message on a FIFO \
-             queue; set the DelaySeconds attribute on the queue instead."
-                .to_string(),
-        ));
-    }
     let delay = match entry.delay_seconds {
         Some(requested) => i64::from(requested),
         None => queue.integer(sqs::DELAY_SECONDS),
@@ -596,7 +614,14 @@ fn prepare(
         return Err(refused(
             entry,
             INVALID_PARAMETER_VALUE,
-            format!("DelaySeconds must be an integer from {min_delay} to {max_delay}; got {delay}."),
+            sqs::invalid_parameter_message(
+                &delay.to_string(),
+                sqs::DELAY_SECONDS,
+                &format!(
+                    "{} must be >= {min_delay} and <= {max_delay}.",
+                    sqs::DELAY_SECONDS
+                ),
+            ),
         ));
     }
 
@@ -605,9 +630,9 @@ fn prepare(
             entry,
             INVALID_PARAMETER_VALUE,
             format!(
-                "A message can have up to {} attributes; got {}.",
+                "Number of message attributes [{}] exceeds the allowed maximum [{}].",
+                attributes.len(),
                 sqs::MAX_MESSAGE_ATTRIBUTES,
-                attributes.len()
             ),
         ));
     }
@@ -652,12 +677,9 @@ fn refused(
 /// name of the modelled error `SendMessage` answers for the same condition
 /// (`com.amazonaws.sqs#InvalidMessageContents`), which is what AWS reports in a batch
 /// result entry's `Code`.
+///
+/// The two parameter-level codes an entry can carry are NOT restated here: a batch entry
+/// reports the same codes a single send does, so it reads them from
+/// [`crate::scaffolded::INVALID_PARAMETER_VALUE`] and
+/// [`crate::scaffolded::MISSING_PARAMETER`] — one spelling of each for the whole crate.
 const INVALID_MESSAGE_CONTENTS: &str = "InvalidMessageContents";
-
-/// The per-entry error code for a member whose value this queue does not accept: the
-/// sender-fault code AWS answers a send whose parameter value a queue rejects.
-const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
-
-/// The per-entry error code for a member the entry had to carry and did not: the
-/// sender-fault code AWS answers a send that leaves out a required parameter.
-const MISSING_PARAMETER: &str = "MissingParameter";

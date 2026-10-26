@@ -80,3 +80,35 @@ Actual (emulator replay): 'AssertionError: a 1048577-byte body gave code Validat
 5. CreateQueue with FifoQueue=true and a name lacking the .fifo suffix; Error.Code is 'InvalidAttributeValue' instead of 'InvalidParameterValue'.
 6. StartMessageMoveTask with the ARN of a queue that is not a DLQ; Error.Code is 'AWS.SimpleQueueService.UnsupportedOperation' instead of 'InvalidParameterValue'.
 7. Re-replay the check ids listed in trace_ids.
+
+## Resolution, and what is NOT fixed
+
+Fixed: every input-validation refusal of this service now carries a code its API has, at
+HTTP 400 — `MissingParameter` for a parameter the call requires and did not get,
+`InvalidParameterValue` for a supplied parameter's value it does not accept, the model's
+`InvalidAttributeName` / `InvalidAttributeValue` / `InvalidMessageContents` / batch faults
+for an attribute, a body or a batch — and never `ValidationException`, which this model
+does not declare. 28 of this issue's 31 recorded checks pass (0 did before).
+
+NOT fixed — three MESSAGE texts, each on a refusal whose status and code are now correct.
+The checks that own them assert the message against a constant they do not print, so the
+sentence AWS answers is not recoverable from the replay, from this service's model or from
+any other record in this repository. What ships is text that is cited rather than
+invented, and the three rows of `tests/all/refusal_taxonomy.rs` assert it in full, so the
+day the recorded sentence is known they fail until it is put in:
+
+* `sqs.list-message-move-tasks-max-results-out-of-range-rejected` — ListMessageMoveTasks
+  with `MaxResults` outside 1..10 answers `Value <v> for parameter MaxResults is invalid.
+  Reason: must be between 1 and 10.`, the shared page-size template every listing of this
+  crate uses (`crate::state::max_results_refusal`); the recorded message differs.
+* `sqs.op-tag-and-permission-validation-rejected` — a tag value past 256 characters
+  answers `Value for parameter TagValue is invalid. Reason: the value of tag key <key>
+  must be at most 256 characters long, but was <n>.`
+  (`crate::state::tag_refusal`); the recorded message differs. The tag-COUNT refusal
+  (`Too many tags added for queue <name>.`) does match.
+* `sqs.op-message-move-task-on-non-dlq-rejected` — StartMessageMoveTask on a source that
+  is not a dead-letter queue answers that operation's own documented rule verbatim
+  (`crate::state::DEAD_LETTER_SOURCE_REQUIRED`); the recorded message differs.
+
+A later change that has the recorded sentences should replace those three templates and
+the three expectations that quote them.
