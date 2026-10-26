@@ -7,6 +7,10 @@
 //! `GetMetricsSummary` read. Reporting only: it writes nothing, and it reports nothing
 //! about scan runs, so it has no clock-owed transition to materialise.
 //!
+//! The two bounds have to name an interval: a request whose `endDate` falls on an earlier
+//! UTC day than its `startDate` fails a specified constraint on its input and is refused
+//! with the modelled `ValidationException` (`crate::state::interval_order_refusal`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -315,17 +319,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ListFindingsMetricsRequest$startDate` / `$endDate`): the interval is a span of
         // whole UTC days, so each bound selects the day its instant falls in and the
         // answer reports one `AccountFindingsMetric` per day from the first through the
-        // last, INCLUSIVE. An interval whose end day precedes its start day contains no
-        // day, so it reports no metrics — the model declares no error for it.
+        // last, INCLUSIVE.
         //
         // Neither bound is window-checked: unlike the sibling metrics operation, whose
         // `date` the model documents as having to fall within a bounded span back from
         // today, these members carry no documented window, so a day that precedes every
         // finding the account has simply reports zeros.
-        let start_day =
-            crate::state::start_of_utc_day_millis(crate::state::from_timestamp(&input.start_date));
-        let end_day =
-            crate::state::start_of_utc_day_millis(crate::state::from_timestamp(&input.end_date));
+        let start_millis = crate::state::from_timestamp(&input.start_date);
+        let end_millis = crate::state::from_timestamp(&input.end_date);
+
+        // The two bounds have to name an interval: an end day that falls before the start
+        // day spans no day at all, so the request fails a specified constraint on its
+        // input and is reported with the modelled `ValidationException` (HTTP 400) naming
+        // the member at fault — rather than answered as a successful measurement over
+        // nothing, which no caller could tell apart from a genuinely quiet window.
+        if let Some(refusal) =
+            crate::state::interval_order_refusal("startDate", "endDate", start_millis, end_millis)
+        {
+            return Err(ListFindingsMetricsErrorModeled::ValidationException(refusal).into());
+        }
+
+        let start_day = crate::state::start_of_utc_day_millis(start_millis);
+        let end_day = crate::state::start_of_utc_day_millis(end_millis);
 
         let page_size = usize::try_from(
             input

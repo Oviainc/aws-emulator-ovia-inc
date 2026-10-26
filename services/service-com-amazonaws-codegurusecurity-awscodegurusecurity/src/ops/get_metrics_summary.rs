@@ -239,11 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now_millis,
             METRICS_SUMMARY_WINDOW_DAYS,
         ) {
-            let day_of = |millis: i64| {
-                crate::state::to_timestamp(crate::state::start_of_utc_day_millis(millis))
-                    .fmt(::aws_smithy_types::date_time::Format::DateTime)
-                    .unwrap_or_else(|_| millis.to_string())
-            };
+            let day_of = crate::state::utc_day_label;
             let earliest = day_of(now_millis.saturating_sub(
                 METRICS_SUMMARY_WINDOW_DAYS.saturating_mul(crate::state::MILLIS_PER_DAY),
             ));

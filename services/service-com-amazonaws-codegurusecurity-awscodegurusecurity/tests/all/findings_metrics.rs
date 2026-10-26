@@ -13,7 +13,10 @@
 //! day (`newFindings`), the findings CLOSED that day (`closedFindings`), the findings OPEN
 //! as of the end of that day (`openFindings`) and the mean days-to-close of the findings
 //! closed by then (`meanTimeToClose`, absent for a severity nothing of which had closed),
-//! paginated at `maxResults` days per page.
+//! paginated at `maxResults` days per page. The two bounds have to name an interval: a
+//! request whose `endDate` falls on an earlier UTC day than its `startDate` spans no day,
+//! so it is refused with the modelled `ValidationException` (HTTP 400) naming the member
+//! at fault rather than answered with an empty measurement.
 //!
 //! The cases vary what the rule generalises over: where the interval sits relative to the
 //! stored findings, how wide it is, the severity, status, creation and close day of each
@@ -398,7 +401,6 @@ async fn an_interval_of_any_width_or_position_reports_the_days_it_covers() {
             5,
             &[-1, 0, 1, 2, 3, 4, 5],
         ),
-        ("an interval whose end precedes its start", 3, 1, &[]),
     ];
 
     for (label, start_index, end_index, expected_days) in cases {
@@ -439,6 +441,127 @@ async fn an_interval_of_any_width_or_position_reports_the_days_it_covers() {
                 }
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn an_interval_whose_end_day_precedes_its_start_day_is_refused() {
+    let (engine, router) = harness();
+    seed(&engine, SEEDED);
+
+    // Rows: how far the end falls before the start, and where the inverted interval sits
+    // relative to the stored findings — the two bounds of the seeded span swapped (the
+    // classic caller mistake), a one-day inversion, a wider one, one entirely before every
+    // stored finding and one entirely after. Every row names an end day earlier than its
+    // start day, so every row asks for no day at all.
+    let cases: &[(&str, i64, i64)] = &[
+        ("the bounds of the seeded span swapped", 4, 0),
+        ("inverted by one day", 2, 1),
+        ("inverted by five days", 3, -2),
+        ("inverted, entirely before every finding", -2, -7),
+        ("inverted, entirely after every finding", 40, 9),
+    ];
+
+    for (label, start_index, end_index) in cases {
+        // The page size cannot make an inverted interval into one: the refusal is about
+        // the two bounds, so it holds whether or not the request paginates.
+        for max_results in [None, Some(1_i64), Some(i64::from(MAX_PAGE_SIZE))] {
+            let label = format!("{label}, maxResults={max_results:?}");
+            let answer = list_findings_metrics(
+                &router,
+                day(*start_index) + NOON,
+                day(*end_index) + NOON,
+                max_results,
+                None,
+            )
+            .await;
+            assert_eq!(
+                answer.status, 400,
+                "case {label:?}: an end day before the start day is refused, got {} {}",
+                answer.status, answer.json
+            );
+            assert_eq!(
+                answer.error_type, "ValidationException",
+                "case {label:?}: the refusal is the modelled ValidationException, got {:?}",
+                answer.error_type
+            );
+            assert_eq!(
+                answer.json["reason"].as_str(),
+                Some("fieldValidationFailed"),
+                "case {label:?}: an input constraint failed, got {}",
+                answer.json
+            );
+            let fields = answer.json["fieldList"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                fields
+                    .iter()
+                    .any(|field| field["name"].as_str() == Some("endDate")),
+                "case {label:?}: the refusal names the member at fault, got {}",
+                answer.json
+            );
+            let message = answer.json["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("endDate") && message.contains("startDate"),
+                "case {label:?}: the message states the relation the two bounds must \
+                 satisfy, got {message:?}"
+            );
+            assert!(
+                answer.json["findingsMetrics"].is_null(),
+                "case {label:?}: a refused request reports no metrics, got {}",
+                answer.json
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_interval_whose_bounds_do_name_a_day_is_answered() {
+    let (engine, router) = harness();
+    seed(&engine, SEEDED);
+
+    // The control rows of the refusal above: each bound names a day, so an interval is
+    // only inverted when its end DAY falls before its start day. Rows: the bounds equal
+    // to the instant, two instants of one day in reverse order (the latest instant of the
+    // day as the start, the earliest as the end), and the ordered pairs either side of
+    // that — against the days each must report.
+    let cases: &[(&str, i64, i64, &[i64])] = &[
+        ("one instant, named twice", day(2) + NOON, day(2) + NOON, &[2]),
+        (
+            "the end instant earlier in the same day as the start",
+            day(2) + DAY - 1,
+            day(2),
+            &[2],
+        ),
+        (
+            "the start instant earlier in the same day as the end",
+            day(2),
+            day(2) + DAY - 1,
+            &[2],
+        ),
+        (
+            "the last instant of a day through the first of the next",
+            day(2) + DAY - 1,
+            day(3),
+            &[2, 3],
+        ),
+    ];
+
+    for (label, start_secs, end_secs, expected_days) in cases {
+        let answer = list_findings_metrics(&router, *start_secs, *end_secs, None, None).await;
+        let metrics = metrics_of(label, &answer);
+        let reported: Vec<i64> = metrics
+            .iter()
+            .map(|metric| instant_secs(label, &metric["date"]))
+            .collect();
+        let expected: Vec<i64> = expected_days.iter().map(|index| day(*index)).collect();
+        assert_eq!(
+            reported, expected,
+            "case {label:?}: the days of the interval, in order, got {}",
+            answer.json
+        );
     }
 }
 

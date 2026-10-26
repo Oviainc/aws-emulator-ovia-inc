@@ -963,6 +963,59 @@ pub fn day_within_past_window(day_start_millis: i64, now_millis: i64, window_day
     (earliest..=today).contains(&day_start_millis)
 }
 
+/// The UTC day `epoch_millis` falls in, rendered as the modelled `Timestamp` format, for
+/// a refusal that has to name the day a request asked about. The ONE place a day is
+/// spelled for a message, so every refusal of this service names a day the same way.
+pub fn utc_day_label(epoch_millis: i64) -> String {
+    to_timestamp(start_of_utc_day_millis(epoch_millis))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| epoch_millis.to_string())
+}
+
+/// The modelled refusal of a request whose interval ends before it begins — a
+/// `ValidationException` (HTTP 400) naming the member at fault, the two days the request
+/// named and the relation they have to satisfy — or `None` when the two bounds do name an
+/// interval.
+///
+/// The ONE place the relation between the start and the end of a requested interval is
+/// decided, so every pair of members the model documents as the bounds of an interval is
+/// judged the same way: an end that falls before the start is not an interval, so the
+/// request fails a specified constraint rather than measuring an empty span. The
+/// comparison is on whole UTC days, because a bound the model rounds to the nearest day
+/// names a day and not an instant: two instants of ONE day name a one-day interval
+/// whichever order they came in, and only an end day genuinely earlier than the start day
+/// asks for no day at all.
+///
+/// Takes the RAW instants the request named and floors each to its day here, so the
+/// comparison cannot be made on instants by a caller that passed the two members through
+/// unfloored.
+pub fn interval_order_refusal(
+    start_member: &str,
+    end_member: &str,
+    start_millis: i64,
+    end_millis: i64,
+) -> Option<ValidationException> {
+    let start_day_millis = start_of_utc_day_millis(start_millis);
+    let end_day_millis = start_of_utc_day_millis(end_millis);
+    if end_day_millis >= start_day_millis {
+        return None;
+    }
+    let start = utc_day_label(start_day_millis);
+    let end = utc_day_label(end_day_millis);
+    Some(ValidationException {
+        error_code: "ValidationException".to_string(),
+        message: format!(
+            "{end_member} must name a day no earlier than {start_member}: the requested \
+             interval begins on {start} and ends on {end}"
+        ),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: end_member.to_string(),
+            message: format!("name a day on or after {start_member} ({start})"),
+        }]),
+    })
+}
+
 /// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
 /// or `None` when the finding records no modelled `Severity` value.
 ///
