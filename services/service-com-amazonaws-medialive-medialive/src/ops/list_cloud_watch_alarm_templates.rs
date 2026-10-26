@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCloudWatchAlarmTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCloudWatchAlarmTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCloudWatchAlarmTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists cloudwatch alarm templates": a REPORTING operation over the cloudwatch
+//! alarm templates this service's store holds, in the order their ids were
+//! minted, narrowed by the filters the request named and cut into pages of at
+//! most `MaxResults`. Nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCloudWatchAlarmTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCloudWatchAlarmTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCloudWatchAlarmTemplates"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // A template, and the group it lives in, belongs to the region it was
+        // created in, so both the listing and the identifiers it filters by
+        // resolve in the region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to the service's finite ceiling, and an
+        // absent one uses that ceiling, so no single request can ask the service
+        // to project an unbounded number of templates in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // `Scope` names which provenance of template to report and is modelled as
+        // a `__string` rather than as an enum, so the service is what reads the
+        // options its documentation names and refuses a value naming none of
+        // them. An absent one narrows nothing, which is the all-scopes option.
+        let scope = match input.scope.as_deref() {
+            Some(requested) => crate::state::template_scope::parse(requested).ok_or_else(|| {
+                bad_request(format!(
+                    "{requested} is not a resource scope: Scope is one of {}",
+                    crate::state::template_scope::VALUES.join(", ")
+                ))
+            })?,
+            None => crate::state::template_scope::ALL,
+        };
+
+        // A pure read: a template has no status and no transient state, so the
+        // clock owes this listing nothing to materialise, and what a later caller
+        // sees is unchanged by this call.
+        let state = state.lock();
+
+        // A group identifier narrows the listing to the templates of THAT group,
+        // so it is resolved to a stored group's id first — by id or by current
+        // name, the two forms a group identifier documents. An identifier naming
+        // no stored group names no set of templates at all, which is this
+        // operation's modelled `NotFoundException`.
+        let group_id = match input.group_identifier.as_deref() {
+            Some(identifier) => Some(
+                state
+                    .alarm_template_group(&region, identifier)
+                    .ok_or_else(|| not_found("cloudwatch alarm template group", identifier))?
+                    .id
+                    .clone(),
+            ),
+            None => None,
+        };
+
+        // A signal map identifier narrows it to the templates that monitor that
+        // map: a signal map records the cloudwatch alarm template GROUPS it is
+        // associated with, so the templates it admits are the ones stored in
+        // those groups, and a map associated with no group admits none.
+        let signal_map_group_ids = match input.signal_map_identifier.as_deref() {
+            Some(identifier) => Some(
+                state
+                    .signal_map_id_for_identifier(identifier)
+                    .and_then(|id| state.signal_maps.get(id))
+                    .ok_or_else(|| not_found("Signal map", identifier))?
+                    .cloud_watch_alarm_template_group_ids
+                    .clone(),
+            ),
+            None => None,
+        };
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the store, so resuming is a range scan from that id. Every
+        // filter the request named must hold, so naming several narrows the
+        // listing to the templates all of them admit.
+        let mut remaining = state
+            .alarm_templates_in(&region, input.next_token.as_deref())
+            .filter(|template| {
+                group_id.as_ref().is_none_or(|id| &template.group_id == id)
+                    && signal_map_group_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&template.group_id))
+                    && crate::state::template_scope::admits(scope, &template.id)
+            });
+
+        let templates: Vec<CloudWatchAlarmTemplateSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::alarm_template_summary)
+            .collect();
+        // Absent on the last page: a token is handed out only when a template the
+        // filters admit is left over after this one.
+        let next_token = remaining.next().map(|template| template.id.clone());
+
+        Ok(ListCloudWatchAlarmTemplatesOutput {
+            cloud_watch_alarm_templates: Some(templates),
+            next_token,
+        })
     }
+}
+
+/// The request asked for a page that cannot be served, or named a scope outside
+/// the options its member documents. The operation's own modelled 400, worded
+/// from the request so it says what the caller must change.
+fn bad_request(message: String) -> ListCloudWatchAlarmTemplatesError {
+    ListCloudWatchAlarmTemplatesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The request filtered by a resource that does not exist where this request can
+/// see it, so the filter names no set of templates. The operation's own modelled
+/// 404, whose message this family composes from the request: the resource type,
+/// the identifier, then `not found`.
+fn not_found(resource_type: &str, identifier: &str) -> ListCloudWatchAlarmTemplatesError {
+    ListCloudWatchAlarmTemplatesErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(resource_type, identifier)),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the templates from. A modelled server error,
+/// never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListCloudWatchAlarmTemplatesError {
+    ListCloudWatchAlarmTemplatesErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

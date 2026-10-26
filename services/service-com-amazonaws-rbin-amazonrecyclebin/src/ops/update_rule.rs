@@ -201,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // A retention rule exists only in the Region it was created in, so the rule an
+        // identifier addresses is resolved in the Region this request is signed for.
+        let region = crate::state::request_region(ctx.parts());
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -213,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The merge is computed first, and the whole store is still free to be read
         // afterwards, because the cross-rule quota below counts the OTHER rules.
         let (merged_resource_tags, merged_exclude_resource_tags) = {
-            let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            let Some(rule) = store.rule_mut(&region, &input.identifier) else {
                 return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
                     crate::state::rule_not_found(&input.identifier),
                 )
@@ -261,7 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is refused and the rule is left exactly as it was. The rule being updated does
         // not count against itself, so re-sending the pairs it already selects on — or
         // any other member beside them — is never refused.
-        if store.exceeds_resource_tag_quota(&merged_resource_tags, Some(&input.identifier)) {
+        if store.exceeds_resource_tag_quota(&region, &merged_resource_tags, Some(&input.identifier))
+        {
             return Err(UpdateRuleErrorModeled::ServiceQuotaExceededException(
                 crate::state::resource_tag_quota_exceeded(),
             )
@@ -269,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Every guard has passed, so the rule is taken for modification again — the
         // store, not a copy, is what the response is read back out of.
-        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+        let Some(rule) = store.rule_mut(&region, &input.identifier) else {
             return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
                 crate::state::rule_not_found(&input.identifier),
             )

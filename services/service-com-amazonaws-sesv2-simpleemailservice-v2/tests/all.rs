@@ -19,6 +19,8 @@ mod configuration_set_event_destinations;
 mod configuration_sets;
 #[path = "all/contact_lists.rs"]
 mod contact_lists;
+#[path = "all/email_identity_feedback_attributes.rs"]
+mod email_identity_feedback_attributes;
 #[path = "all/email_identity_lifecycle.rs"]
 mod email_identity_lifecycle;
 #[path = "all/multi_region_endpoints.rs"]

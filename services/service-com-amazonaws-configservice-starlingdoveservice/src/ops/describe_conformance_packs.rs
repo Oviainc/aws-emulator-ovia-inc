@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConformancePacks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConformancePacks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConformancePacks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored CONFIGURATION of the conformance packs this account and Region
+//! holds: each pack's identity, the Amazon S3 location its template is stored at, the
+//! input parameters it was deployed with and when its deployment was last requested.
+//! How far that deployment has got is what `DescribeConformancePackStatus` reports.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * "Comma-separated list of conformance pack names for which you want details. If you
+//!   do not specify any names, Config returns details for all your conformance packs":
+//!   a request naming no pack reports every pack;
+//! * unlike the status read, this operation models `NoSuchConformancePackException`
+//!   ("You specified one or more conformance packs that do not exist"), so a name this
+//!   account holds no pack for is REFUSED rather than skipped, and the refusal names
+//!   every such name the request carried;
+//! * every reported member is read back out of the pack the deployment stored
+//!   ([`crate::state::ConformancePackEntry::to_detail`]), so this read changes nothing
+//!   and a pack reports what it was last deployed with;
+//! * `Limit` is the page size, with the modelled default of 0 meaning the maximum
+//!   ([`crate::state::DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE`]), and a limit outside the
+//!   modelled range is `InvalidLimitException`; `NextToken` resumes at the pack name the
+//!   previous page stopped at; a token outside the opaque form this operation issues is
+//!   `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +102,10 @@ use super::types::*;
 // `DescribeConformancePacksError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The most conformance pack names one request may name (`ConformancePackNamesList`,
+/// `@length(min: 0, max: 25)`).
+const MAX_CONFORMANCE_PACK_NAMES: usize = 25;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DescribeConformancePacksError` alias below. An operation that models no errors
@@ -153,18 +171,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConformancePacks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConformancePacksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConformancePacks"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.conformance_pack_names.unwrap_or_default();
+        // "Comma-separated list of conformance pack names": the modelled list carries at
+        // most 25 of them, which the request boundary enforces; the check stands so a
+        // longer list answers this operation's own modelled
+        // `InvalidParameterValueException` either way, with a message BUILT FROM THE
+        // REQUEST.
+        if names.len() > MAX_CONFORMANCE_PACK_NAMES {
+            return Err(
+                DescribeConformancePacksErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Value at 'conformancePackNames' failed to satisfy constraint: \
+                             Member must have length less than or equal to \
+                             {MAX_CONFORMANCE_PACK_NAMES}, and {} names were sent",
+                            names.len(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The maximum number of conformance packs returned on each page." The modelled
+        // range (0..20) is refused at the request boundary where the boundary enforces
+        // it; the check stands so a limit outside it answers this operation's own
+        // modelled `InvalidLimitException` either way, with a message BUILT FROM THE
+        // REQUEST. A limit of 0 is the modelled default — "unspecified" — which is the
+        // largest page the model lets one response carry.
+        let requested = input.limit;
+        let page_size = match usize::try_from(requested) {
+            Ok(0) => crate::state::DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE,
+            Ok(limit) if limit <= crate::state::DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE => limit,
+            _ => {
+                return Err(DescribeConformancePacksErrorModeled::InvalidLimitException(
+                    InvalidLimitException {
+                        message: Some(format!(
+                            "Value '{requested}' at 'limit' failed to satisfy constraint: \
+                             Member must be between 0 and {}",
+                            crate::state::DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConformancePacksErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // "You specified one or more conformance packs that do not exist": a name that
+        // resolves to no pack is REFUSED rather than skipped, and the refusal names every
+        // such name the request carried, so a caller can fix them all at once. The check
+        // is over the whole request, so which page is being served does not change it.
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|name| !store.conformance_packs.contains_key(*name))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(
+                DescribeConformancePacksErrorModeled::NoSuchConformancePackException(
+                    NoSuchConformancePackException {
+                        message: Some(crate::state::no_such_conformance_pack_message(&missing)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Page over the store's own name ordering, so a token holds the NAME the next
+        // page resumes at and survives packs created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, entry) in &store.conformance_packs {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !names.is_empty() && !names.iter().any(|requested| requested == name) {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(entry.to_detail());
+        }
+
+        Ok(DescribeConformancePacksOutput {
+            conformance_pack_details: Some(page),
+            next_token,
+        })
     }
 }

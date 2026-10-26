@@ -95,6 +95,20 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 pub const TEARDOWN_IN_FLIGHT_MESSAGE: &str =
     "Another request is being processed. Wait a few minutes and try again.";
 
+/// The sentence this service refuses with when an ARN a request supplied names no
+/// stored configuration manager.
+///
+/// The model declares `ResourceNotFoundException` with a single `Message` member and
+/// states no text for it, so the wording is what the service itself emits: the fixed
+/// text `Quick setup manager with arn: ` and ` could not be found.` around the ARN the
+/// REQUEST carried, echoed verbatim. Nothing else varies — no account id, Region or
+/// uuid is part of the template, and the ARN is never re-derived from stored state.
+/// The one place the message lives, so every operation that addresses a manager by ARN
+/// refuses an absent one the same way.
+pub fn manager_not_found_message(manager_arn: &str) -> String {
+    format!("Quick setup manager with arn: {manager_arn} could not be found.")
+}
+
 /// Largest page either list operation will build, and the page size applied when the
 /// request names no `MaxItems`: the maximum of that member's modelled `@range(1,
 /// 100)`.

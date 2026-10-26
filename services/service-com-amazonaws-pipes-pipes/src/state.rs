@@ -2,11 +2,14 @@
 
 //! Engine state for the com-amazonaws-pipes-pipes service.
 //!
-//! An EventBridge Pipes pipe is a CONFIGURATION record in this emulator: the control
-//! plane (the record, its ARN, its lifecycle states and its timestamps) is real and
-//! persisted here; nothing polls the source or delivers to the target.
+//! An EventBridge Pipes pipe is a record here: the control plane (the record, its ARN,
+//! its lifecycle states and its timestamps) is real and persisted in this module, and
+//! what a RUNNING pipe DOES with no client action — poll the source, hand the batch to
+//! the enrichment, deliver each event to the target — is [`data_plane`].
 
-use std::collections::BTreeMap;
+pub mod data_plane;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
@@ -504,6 +507,10 @@ pub struct ComAmazonawsPipesPipesState {
     /// Every pipe this account holds, keyed by name. A `BTreeMap` so `ListPipes` and its
     /// `NextToken` paging enumerate in a single deterministic order.
     pub pipes: BTreeMap<String, PipeRecord>,
+    /// The pipes a data-plane poller is currently running for, by name. One poller per
+    /// pipe: a pipe is polled once however many lifecycle calls asked it to run (see
+    /// [`data_plane`]).
+    pollers: BTreeSet<String>,
 }
 
 impl ComAmazonawsPipesPipesState {
@@ -520,6 +527,19 @@ impl ComAmazonawsPipesPipesState {
     /// [`Self::pipe_by_arn`] for the operations that write the record's tags.
     pub fn pipe_by_arn_mut(&mut self, arn: &str) -> Option<&mut PipeRecord> {
         self.pipes.values_mut().find(|pipe| pipe.arn == arn)
+    }
+
+    /// Claim the one data-plane poller of the pipe named `pipe`, answering whether this
+    /// caller is the one that got it. `false` means a poller is already running for that
+    /// pipe, so the caller starts none.
+    pub fn claim_poller(&mut self, pipe: &str) -> bool {
+        self.pollers.insert(pipe.to_string())
+    }
+
+    /// Release the claim of [`Self::claim_poller`], so a later lifecycle call can start a
+    /// poller for this pipe again. Called by the poller itself as it ends.
+    pub fn release_poller(&mut self, pipe: &str) {
+        self.pollers.remove(pipe);
     }
 
     /// Apply every state move the clock has already made due. Call this after locking,

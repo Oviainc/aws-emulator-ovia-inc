@@ -24,7 +24,9 @@
 //!    `DryRunOperation` once the request's own members have been read — including for a
 //!    source the store holds nothing for — and writes nothing.
 //! 5. ONE `ClientToken` NAMES ONE AFI of the account: a replay reports the AFI that token
-//!    minted and mints nothing more, whichever call minted it.
+//!    minted and mints nothing more, and a `CreateFpgaImage` carrying that token mints
+//!    nothing either — it is refused for the design checkpoint it cannot read — so the token
+//!    still names the copy.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which id shape,
 //! which Region, which name/description combination, which token length — so no row is the
@@ -56,7 +58,8 @@ const UNRESOLVABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
 const UNKNOWN_FPGA_IMAGE_ID: &str = "afi-0123456789abcdef0";
 
 /// A bucket name inside every one of Amazon S3's general-purpose naming rules, so a
-/// `CreateFpgaImage` that uses it is refused for nothing.
+/// `CreateFpgaImage` that names it is refused for the object it cannot read rather than for
+/// the name.
 const READABLE_BUCKET: &str = "my-design-checkpoints";
 
 async fn op(router: &MultiServiceRouter, action: &str, params: &[(String, String)]) -> (u16, String) {
@@ -67,20 +70,15 @@ fn emulator() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
     super::ec2_query::emulator()
 }
 
-/// Create one AFI named `name`, and answer its id.
-async fn create_fpga_image(router: &MultiServiceRouter, name: &str) -> String {
-    let params = vec![
-        p("InputStorageLocation.Bucket", READABLE_BUCKET),
-        p("InputStorageLocation.Key", "dcp/checkpoint.tar"),
-        p("Name", name),
-        p("Description", format!("the source AFI {name}")),
-    ];
-    let (status, body) = op(router, "CreateFpgaImage", &params).await;
-    assert_eq!(
-        status, 200,
-        "creating the source AFI: expected HTTP 200, got {status} with body {body}"
-    );
-    element(&body, "fpgaImageId").unwrap_or_default()
+/// Store one AFI named `name`, and answer its id.
+///
+/// SEEDED through [`super::fpga_image_tasks_and_volume_io::seed_fpga_image`] rather than
+/// created through `CreateFpgaImage`: that call reads the design checkpoint the request names
+/// out of Amazon S3, and this emulator holds no Amazon S3 object for any location to name, so
+/// it mints no AFI ([`super::create_fpga_image`] owns that rule). `CopyFpgaImage` is the
+/// minting call this suite is about, and its source has to be stored for it to copy.
+fn seed_source(engine: &engine::InMemoryEngine, name: &str) -> String {
+    super::fpga_image_tasks_and_volume_io::seed_fpga_image(engine, name).0
 }
 
 /// The parameters of a copy of `source_fpga_image_id` made from the Region the suite calls
@@ -214,7 +212,7 @@ async fn resolving_an_afi_of_this_region_still_answers_malformed_before_not_foun
 #[tokio::test]
 async fn a_copy_source_region_has_to_name_a_region() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "source-afi").await;
+    let source = seed_source(&engine, "source-afi");
 
     // The accepted rows are Regions of the account's partition, which the catalog
     // `ec2::state::regions_in_partition_of` derives, plus the Region the call is signed for;
@@ -318,7 +316,7 @@ type NamingRow = (
 #[tokio::test]
 async fn a_copy_is_a_new_afi_named_after_the_request_or_the_source() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "golden-bitstream").await;
+    let source = seed_source(&engine, "golden-bitstream");
 
     // A load permission, a tag and the bitstream facts of a REAL AFI on the SOURCE, all of
     // them different from what a freshly created AFI carries — so "the copy inherits the
@@ -524,7 +522,7 @@ async fn a_copy_is_a_new_afi_named_after_the_request_or_the_source() {
 #[tokio::test]
 async fn a_copy_is_pending_and_then_fails_on_the_clock() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "source-afi").await;
+    let source = seed_source(&engine, "source-afi");
 
     let (status, body) = op(&router, "CopyFpgaImage", &copy_params(&source)).await;
     assert_eq!(
@@ -616,7 +614,7 @@ async fn a_copy_is_pending_and_then_fails_on_the_clock() {
 #[tokio::test]
 async fn a_dry_run_copy_is_answered_before_the_source_is_resolved_and_writes_nothing() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "source-afi").await;
+    let source = seed_source(&engine, "source-afi");
 
     // `(case, the source id, the status, the code)`.
     let rows: [(&str, &str, u16, &str); 3] = [
@@ -672,7 +670,7 @@ async fn a_dry_run_copy_is_answered_before_the_source_is_resolved_and_writes_not
 #[tokio::test]
 async fn one_client_token_names_one_copy() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "source-afi").await;
+    let source = seed_source(&engine, "source-afi");
 
     // The token lengths differ along the one bound there is: one character, the maximum
     // `ec2::state::MAX_CLIENT_TOKEN_CHARS` accepts, and one character past it.
@@ -724,49 +722,63 @@ async fn one_client_token_names_one_copy() {
     );
 }
 
-/// One `ClientToken` names ONE AFI of the account, whichever call minted it: a token a
-/// `CreateFpgaImage` already used names the AFI that create minted, so a `CopyFpgaImage`
-/// carrying it reports that AFI and copies nothing — the two calls share the one token map
-/// (`ec2::state::ComAmazonawsEc2Amazonec2State::fpga_image_client_tokens`) because they mint
-/// into the one AFI space.
+/// One `ClientToken` names ONE AFI of the account: the token map
+/// (`ec2::state::ComAmazonawsEc2Amazonec2State::fpga_image_client_tokens`) is the one every
+/// call that mints into the AFI space reads, so a `CreateFpgaImage` carrying a token a copy
+/// already minted under mints nothing and takes nothing away from it — that call is refused
+/// for the design checkpoint it cannot read, and the token still names the copy.
 #[tokio::test]
-async fn a_token_names_one_afi_whichever_call_minted_it() {
+async fn a_token_names_one_afi_and_a_refused_create_leaves_it_alone() {
     let (router, engine) = emulator();
-    let source = create_fpga_image(&router, "source-afi").await;
+    let source = seed_source(&engine, "source-afi");
 
     let token = "shared-token";
-    let created = {
-        let params = vec![
-            p("InputStorageLocation.Bucket", READABLE_BUCKET),
-            p("InputStorageLocation.Key", "dcp/checkpoint.tar"),
-            p("ClientToken", token),
-        ];
-        let (status, body) = op(&router, "CreateFpgaImage", &params).await;
-        assert_eq!(
-            status, 200,
-            "creating with a token: expected HTTP 200, got {status} with body {body}"
-        );
-        element(&body, "fpgaImageId").unwrap_or_default()
-    };
-    let stored_before = stored_afi_count(&engine);
-
-    let mut params = copy_params(&source);
-    params.push(p("ClientToken", token));
-    let (status, body) = op(&router, "CopyFpgaImage", &params).await;
+    let mut copy_with_token = copy_params(&source);
+    copy_with_token.push(p("ClientToken", token));
+    let (status, body) = op(&router, "CopyFpgaImage", &copy_with_token).await;
     assert_eq!(
         status, 200,
-        "copying with a token the create used: expected HTTP 200, got {status} \
+        "copying with a token: expected HTTP 200, got {status} with body {body}"
+    );
+    let copy = element(&body, "fpgaImageId").unwrap_or_default();
+    let stored_before = stored_afi_count(&engine);
+
+    let create_with_token = vec![
+        p("InputStorageLocation.Bucket", READABLE_BUCKET),
+        p("InputStorageLocation.Key", "dcp/checkpoint.tar"),
+        p("ClientToken", token),
+    ];
+    let (status, body) = op(&router, "CreateFpgaImage", &create_with_token).await;
+    assert_eq!(
+        status, 400,
+        "creating with the token the copy used: expected HTTP 400, got {status} \
          with body {body}"
     );
     assert_eq!(
+        error_code(&body),
+        "InaccessibleStorageLocation",
+        "a create is refused for the design checkpoint it cannot read, got {body}"
+    );
+    assert!(
+        element(&body, "fpgaImageId").is_none(),
+        "a refused create reports no AFI, not the one the token minted, got {body}"
+    );
+
+    let (status, body) = op(&router, "CopyFpgaImage", &copy_with_token).await;
+    assert_eq!(
+        status, 200,
+        "replaying the copy: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
         element(&body, "fpgaImageId").as_deref(),
-        Some(created.as_str()),
-        "the token names the AFI it minted, got {body}"
+        Some(copy.as_str()),
+        "the token still names the AFI it minted, got {body}"
     );
     assert_eq!(
         stored_afi_count(&engine),
         stored_before,
-        "a replayed token mints nothing, got {} AFIs stored where there were {stored_before}",
+        "neither the refused create nor the replayed copy mints anything, got {} AFIs \
+         stored where there were {stored_before}",
         stored_afi_count(&engine)
     );
 }

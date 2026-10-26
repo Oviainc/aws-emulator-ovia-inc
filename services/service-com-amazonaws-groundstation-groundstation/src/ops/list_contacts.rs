@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         /// Names this listing inside its pagination tokens, so a token another listing
         /// issued is not accepted here.
@@ -160,27 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A filter this emulator cannot evaluate is REFUSED, not silently satisfied: no
-        // contact in state can carry an ephemeris while `CreateEphemeris` and its
-        // siblings answer 501, so an `ephemeris` filter would otherwise select nothing
-        // and a caller could not tell "no contact uses it" from "the filter was never
-        // applied". It is refused with the operation's own modelled
-        // `InvalidParameterException`, naming the member.
-        // TODO: evaluate this against the contact's own ephemeris once the ephemeris
-        // operations land.
-        if input.ephemeris.is_some() {
-            return Err(ListContactsErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        "ephemeris filtering is not available: no contact can reference an \
-                         ephemeris until the ephemeris operations are implemented"
-                            .to_string(),
-                    ),
-                    parameter_name: Some("ephemeris".to_string()),
-                },
-            )
-            .into());
-        }
+        // The modelled `ephemeris` member is a FILTER — "filter for selecting contacts that
+        // use a specific ephemeris" (`smithy_query(query="shape", shape="EphemerisFilter")`),
+        // whose `azEl` member names one by its `id` — so it NARROWS this listing and the
+        // model declares no condition under which supplying it is an error. A filter naming
+        // an ephemeris nothing is pointed by therefore selects nothing, which is an empty
+        // page rather than a refusal.
+        let filter_ephemeris_id: Option<&str> = match &input.ephemeris {
+            Some(EphemerisFilter::azEl(filter)) => Some(filter.id.as_str()),
+            None => None,
+        };
 
         // The window a listing searches runs forwards: a request whose `endTime`
         // precedes its `startTime` describes no interval at all, so it is refused rather
@@ -200,7 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // satelliteArn" — an availability search is for one antenna/satellite pairing
         // under one mission profile, not a store-wide scan. A request that asks for
         // AVAILABLE without all three is refused, naming the member it left out.
-        if input.status_list.iter().any(|status| status == "AVAILABLE") {
+        if input
+            .status_list
+            .iter()
+            .any(|status| status == crate::state::CONTACT_AVAILABLE)
+        {
             let missing = [
                 ("groundStation", input.ground_station.is_none()),
                 ("missionProfileArn", input.mission_profile_arn.is_none()),
@@ -237,6 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.ground_station.clone().unwrap_or_default(),
                 input.satellite_arn.clone().unwrap_or_default(),
                 input.mission_profile_arn.clone().unwrap_or_default(),
+                filter_ephemeris_id.unwrap_or_default().to_string(),
             ],
         );
 
@@ -262,11 +256,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // SCHEDULING -> SCHEDULED move and the steps of the pass lifecycle a contact's
         // own window owes it — so the status filter sees the status in force now.
         guard.settle_due_contacts();
+        // And every ephemeris status move too: an ephemeris finishes validating and expires
+        // on the clock alone, and whether it is in force is what decides which contacts the
+        // `ephemeris` filter selects and which pointing data an availability search reads.
+        guard.settle_due_ephemerides();
 
-        // Ordered by contact id: a page boundary is only stable over a stable order.
+        // Which contacts the `ephemeris` filter admits: the ones the ephemeris it names
+        // points, by this service's one rule for that (`contacts_using_ephemeris`, the same
+        // rule that keeps such an ephemeris from being deleted).
+        let pointed_by_filter: Option<Vec<String>> =
+            filter_ephemeris_id.map(|id| guard.contacts_using_ephemeris(id));
+
+        // The contacts the store holds, ordered by contact id: a page boundary is only
+        // stable over a stable order. The windows an availability search computes are
+        // appended after them, in start-time order, so the whole sequence a token offsets
+        // into is stable too.
         let mut ids: Vec<&String> = guard.contacts.keys().collect();
         ids.sort();
-        let items: Vec<ContactData> = ids
+        let mut items: Vec<ContactData> = ids
             .into_iter()
             .filter_map(|id| guard.contacts.get(id))
             .filter(|contact| input.status_list.contains(&contact.contact_status))
@@ -301,6 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|arn| *arn == contact.mission_profile_arn)
             })
+            .filter(|contact| {
+                pointed_by_filter
+                    .as_ref()
+                    .is_none_or(|pointed| pointed.contains(&contact.contact_id))
+            })
             .map(|contact| ContactData {
                 contact_id: Some(contact.contact_id.clone()),
                 mission_profile_arn: Some(contact.mission_profile_arn.clone()),
@@ -311,10 +323,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 post_pass_end_time: Some(contact.post_pass_end_time),
                 ground_station: Some(contact.ground_station.clone()),
                 contact_status: Some(contact.contact_status.clone()),
-                // No contact has failed and no antenna has tracked a pass in this
-                // emulator, so the members reporting those carry nothing.
-                // `maximumElevation` and the visibility times are the pass GEOMETRY,
-                // which nothing this service holds determines (see DescribeContact).
+                // No contact has failed and no antenna has TRACKED a pass in this
+                // emulator, so the members reporting a flown pass carry nothing: a
+                // reserved contact's `maximumElevation` and visibility times are what the
+                // antenna measured while flying it (see DescribeContact), unlike the
+                // projected peak of a window that is merely offered below.
                 error_message: None,
                 maximum_elevation: None,
                 region: Some(contact.region.clone()),
@@ -325,6 +338,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 version: Some(contact.version()),
             })
             .collect();
+
+        // `AVAILABLE` is not a status any contact in this store holds — it is a window the
+        // service OFFERS and nothing has reserved — so an availability search is COMPUTED
+        // rather than selected: it answers with the contact windows the pairing the request
+        // names can still fly inside the window it asks about
+        // (`available_contact_windows`), which is what makes the first step of the
+        // discovery-then-reserve loop answerable. The three members that pairing is made of
+        // are present: the request was refused above otherwise.
+        if input
+            .status_list
+            .iter()
+            .any(|status| status == crate::state::CONTACT_AVAILABLE)
+        {
+            // The mission profile is not a filter here: its pre- and post-pass durations and
+            // its minimum viable contact duration are part of what the windows are computed
+            // FROM, so an ARN naming no profile of this account names nothing to compute
+            // them for. That is a missing resource, answered with the text this service
+            // already answers for a mission profile a reservation could not find.
+            let profile = guard
+                .mission_profile_by_arn(input.mission_profile_arn.as_deref().unwrap_or_default())
+                .cloned()
+                .ok_or_else(|| {
+                    ListContactsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
+                    })
+                })?;
+            // A satellite this account is not on-boarded to, and a station nothing was
+            // supplied for, have no pointing data in force and so fly nothing: that is an
+            // empty answer rather than a refusal.
+            if let (Some(ground_station), Some(satellite_arn)) = (
+                input.ground_station.as_deref(),
+                input.satellite_arn.as_deref(),
+            ) {
+                // The sequence of windows a search resolves is the same for every page of
+                // it (`available_contact_windows` is bounded by constants, not by what the
+                // request asks for), so the offset a token carries addresses the same
+                // window on every call.
+                let offered = guard.available_contact_windows(
+                    satellite_arn,
+                    ground_station,
+                    &profile,
+                    (window_start, window_end),
+                    crate::state::now_timestamp().as_secs_f64(),
+                    // The same filter, on a computed window: the ephemeris that determines
+                    // its antenna pointing is the one its geometry was read from.
+                    filter_ephemeris_id,
+                );
+                // Nothing below reads the store, so the lock is released before the answer
+                // is built: a listing holds it only while it is reading.
+                drop(guard);
+
+                // An offered window is not a reservation, so it carries no `contactId`, no
+                // tags and no version: none of them exists until `ReserveContact` admits a
+                // contact over it. Its pre- and post-pass periods are the profile's
+                // durations around it, exactly as the reservation would record them, so the
+                // window a caller is shown is the window it gets.
+                let region = crate::state::request_region(ctx.parts());
+                let pre_pass = i64::from(profile.contact_pre_pass_duration_seconds.unwrap_or(0));
+                let post_pass = i64::from(profile.contact_post_pass_duration_seconds.unwrap_or(0));
+                for pass in offered {
+                    items.push(ContactData {
+                        contact_id: None,
+                        mission_profile_arn: Some(profile.mission_profile_arn.clone()),
+                        satellite_arn: Some(satellite_arn.to_string()),
+                        start_time: Some(pass.start_time),
+                        end_time: Some(pass.end_time),
+                        pre_pass_start_time: Some(crate::state::shift_seconds(
+                            &pass.start_time,
+                            -pre_pass,
+                        )),
+                        post_pass_end_time: Some(crate::state::shift_seconds(
+                            &pass.end_time,
+                            post_pass,
+                        )),
+                        ground_station: Some(ground_station.to_string()),
+                        contact_status: Some(crate::state::CONTACT_AVAILABLE.to_string()),
+                        error_message: None,
+                        // The peak of the offered pass, as the pointing data in force for
+                        // this pairing carries it.
+                        maximum_elevation: Some(pass.maximum_elevation),
+                        region: Some(region.clone()),
+                        tags: None,
+                        // The visibility times are the crossings of the ground station's
+                        // RECEIVE MASK, which is a property of the site this service records
+                        // nowhere, so they carry nothing: the horizon the pointing data
+                        // crosses is not that mask.
+                        visibility_start_time: None,
+                        visibility_end_time: None,
+                        ephemeris: Some(EphemerisResponseData {
+                            ephemeris_id: Some(pass.ephemeris_id),
+                            ephemeris_type: pass.ephemeris_type,
+                        }),
+                        version: None,
+                    });
+                }
+            }
+        }
 
         let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
 

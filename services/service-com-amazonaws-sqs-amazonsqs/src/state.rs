@@ -65,6 +65,16 @@
 //! is recorded on the task, which is all every later reader needs to report its status
 //! and its progress.
 //!
+//! # Queue permissions
+//!
+//! A permission is a statement of the queue's own `Policy` attribute rather than a
+//! record beside it: `AddPermission` "generates a policy", so
+//! [`Queue::granted_policy`] assembles the document the grant leaves the queue
+//! carrying and [`Queue::revoke_permission`] takes the statement a label identifies
+//! back out of it. Every grant is therefore reported by `GetQueueAttributes` and
+//! replaced by an uploaded `SetQueueAttributes` policy, because there is only ever one
+//! policy.
+//!
 //! Everything a caller can make this in-memory store hold is bounded — see the
 //! "Store bounds" section — and a bound is REFUSED rather than enforced by eviction,
 //! because dropping a message a client was told had been accepted would lose it.
@@ -1211,6 +1221,182 @@ impl Queue {
         }
         None
     }
+
+    // -----------------------------------------------------------------------
+    // The queue's access policy
+    // -----------------------------------------------------------------------
+
+    /// The access policy document this queue carries, as the JSON object a policy is,
+    /// with the members a generated one declares filled in where the stored value has
+    /// none.
+    ///
+    /// A queue that carries no `Policy` attribute, or one whose value is not a JSON
+    /// object, grants nothing: the document a grant is added to is then the generated
+    /// one, whose `Id` is this queue's ARN and the suffix a generated queue policy
+    /// carries.
+    fn policy_document(&self) -> ::serde_json::Map<String, ::serde_json::Value> {
+        let stored = self
+            .attributes
+            .get(POLICY)
+            .and_then(|policy| ::serde_json::from_str::<::serde_json::Value>(policy).ok());
+        let mut document = match stored {
+            Some(::serde_json::Value::Object(members)) => members,
+            _ => ::serde_json::Map::new(),
+        };
+        document
+            .entry(POLICY_VERSION_MEMBER)
+            .or_insert_with(|| POLICY_VERSION.into());
+        document
+            .entry(POLICY_ID_MEMBER)
+            .or_insert_with(|| format!("{}{DEFAULT_POLICY_ID_SUFFIX}", self.arn).into());
+        document
+    }
+
+    /// The statements this queue's policy carries, in policy order.
+    ///
+    /// `Statement` is "an array of individual statements", and the policy language also
+    /// takes a lone statement object, so both forms answer the same list here and
+    /// neither is lost by a grant that appends to it.
+    fn policy_statements(&self) -> Vec<::serde_json::Value> {
+        match self.policy_document().get(POLICY_STATEMENT_MEMBER) {
+            Some(::serde_json::Value::Array(statements)) => statements.clone(),
+            Some(statement @ ::serde_json::Value::Object(_)) => vec![statement.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The label of every permission this queue's policy grants, in policy order: a
+    /// permission's label is the `Sid` of the statement that carries it, which is what
+    /// makes a label the handle `RemovePermission` revokes one by.
+    pub fn permission_labels(&self) -> Vec<String> {
+        self.policy_statements()
+            .iter()
+            .filter_map(|statement| {
+                statement
+                    .get(POLICY_SID_MEMBER)
+                    .and_then(::serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    /// The policy document this queue would carry once `label` granted `actions` on it
+    /// to each account in `account_numbers`, or why that grant cannot be served.
+    ///
+    /// The statement is added to whatever the queue's policy already carries, so a
+    /// policy a caller uploaded keeps every statement it had and a second grant does not
+    /// displace the first.
+    pub fn granted_policy(
+        &self,
+        label: &str,
+        account_numbers: &[String],
+        actions: &[String],
+    ) -> Result<String, PermissionRefusal> {
+        if let Some(reason) = permission_label_refusal(label) {
+            return Err(PermissionRefusal::Parameter(reason));
+        }
+        if let Some(reason) = principals_refusal(account_numbers) {
+            return Err(reason);
+        }
+        if let Some(reason) = actions_refusal(actions) {
+            return Err(reason);
+        }
+        let labels = self.permission_labels();
+        if labels.iter().any(|existing| existing == label) {
+            return Err(PermissionRefusal::Parameter(invalid_parameter_message(
+                label,
+                PERMISSION_LABEL_PARAMETER,
+                LABEL_ALREADY_EXISTS,
+            )));
+        }
+        let mut statements = self.policy_statements();
+        if statements.len() >= MAX_POLICY_STATEMENTS {
+            return Err(PermissionRefusal::Limit(format!(
+                "An Amazon SQS policy can have a maximum of {MAX_POLICY_STATEMENTS} statements, \
+                 and the policy of queue {} already has {}.",
+                self.name,
+                statements.len()
+            )));
+        }
+        statements.push(permission_statement(
+            label,
+            account_numbers,
+            actions,
+            &self.arn,
+        ));
+        let document = self.policy_with_statements(statements);
+        // The policy is stored for the queue's lifetime, so the document a grant leaves
+        // behind is held to the ceiling AWS publishes for it — "The policy size is
+        // limited to 8,192 bytes" (the `Policy` attribute's own documentation) — which
+        // is the same bound an uploaded policy is held to.
+        if document.len() > MAX_ATTRIBUTE_VALUE_BYTES {
+            return Err(PermissionRefusal::Limit(format!(
+                "The policy size is limited to {MAX_ATTRIBUTE_VALUE_BYTES} bytes, and the policy \
+                 of queue {} would be {} bytes.",
+                self.name,
+                document.len()
+            )));
+        }
+        Ok(document)
+    }
+
+    /// This queue's policy document carrying `statements`, as the string the `Policy`
+    /// attribute holds — or no document at all when nothing is left to grant, which is
+    /// what makes a queue whose last permission was revoked carry no policy again.
+    fn policy_with_statements(&self, statements: Vec<::serde_json::Value>) -> String {
+        let mut document = self.policy_document();
+        document.insert(
+            POLICY_STATEMENT_MEMBER.to_string(),
+            ::serde_json::Value::Array(statements),
+        );
+        ::serde_json::Value::Object(document).to_string()
+    }
+
+    /// Record `policy` as this queue's access policy as of `now`; `None` leaves the
+    /// queue carrying no policy at all.
+    fn set_policy(&mut self, policy: Option<String>, now: SystemTime) {
+        match policy {
+            Some(policy) => {
+                self.attributes.insert(POLICY.to_string(), policy);
+            }
+            None => {
+                self.attributes.remove(POLICY);
+            }
+        }
+        self.last_modified_at = now;
+    }
+
+    /// Grant the permission `policy` describes, as of `now`.
+    pub fn grant_permission(&mut self, policy: String, now: SystemTime) {
+        self.set_policy(Some(policy), now);
+    }
+
+    /// Revoke the permission labelled `label`, as of `now`, answering whether the policy
+    /// carried such a permission at all.
+    ///
+    /// Only the statement that label identifies goes; every other statement stays, and a
+    /// policy left with no statement is dropped rather than stored empty, so a queue
+    /// whose last permission was revoked reports no `Policy` exactly as one that was
+    /// never granted a permission does.
+    pub fn revoke_permission(&mut self, label: &str, now: SystemTime) -> bool {
+        let statements = self.policy_statements();
+        let remaining: Vec<::serde_json::Value> = statements
+            .iter()
+            .filter(|statement| {
+                statement
+                    .get(POLICY_SID_MEMBER)
+                    .and_then(::serde_json::Value::as_str)
+                    != Some(label)
+            })
+            .cloned()
+            .collect();
+        if remaining.len() == statements.len() {
+            return false;
+        }
+        let policy = (!remaining.is_empty()).then(|| self.policy_with_statements(remaining));
+        self.set_policy(policy, now);
+        true
+    }
 }
 
 impl ComAmazonawsSqsAmazonsqsState {
@@ -1729,6 +1915,295 @@ pub fn dead_letter_target_arn(policy: &str) -> Option<String> {
         .get("deadLetterTargetArn")?
         .as_str()
         .map(ToString::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// Queue permissions
+// ---------------------------------------------------------------------------
+//
+// A permission is not a record of its own: `AddPermission` "generates a policy for you",
+// so a granted permission IS a statement of the queue's `Policy` attribute — the same
+// attribute `SetQueueAttributes` uploads a policy into and `GetQueueAttributes` reports.
+// Keeping it there is what makes a grant observable by every later reader, and lets
+// `RemovePermission` "revoke any permissions in the queue policy that matches the
+// specified Label parameter" whether the statement came from a grant or from an upload.
+// The document and the statement are assembled and taken apart by the [`Queue`] methods
+// above and the helpers at the end of this module; the bounds and the wording of every
+// refusal live here. The statement SHAPE is the one every service whose `AddPermission`
+// generates a policy writes, and Amazon SNS's own state assembles its own copy of it;
+// the two are kept apart deliberately, because each carries the statement in its own
+// representation — this one as the JSON a `Policy` attribute string holds, that one as a
+// typed record with the condition and passthrough members a topic policy keeps — so a
+// change to the shape has to be made in both.
+
+/// The policy language version a generated queue policy declares.
+pub const POLICY_VERSION: &str = "2012-10-17";
+
+/// The `Version` member of a policy document.
+pub const POLICY_VERSION_MEMBER: &str = "Version";
+
+/// The `Id` member of a policy document.
+pub const POLICY_ID_MEMBER: &str = "Id";
+
+/// The `Statement` member of a policy document: "an array of individual statements".
+pub const POLICY_STATEMENT_MEMBER: &str = "Statement";
+
+/// The `Sid` member of a policy statement, which carries the `Label` the permission was
+/// granted under.
+pub const POLICY_SID_MEMBER: &str = "Sid";
+
+/// What the `Id` of a generated queue policy is: the queue's ARN followed by this.
+pub const DEFAULT_POLICY_ID_SUFFIX: &str = "/SQSDefaultPolicy";
+
+/// The prefix a granted action carries in the generated policy, qualifying the action
+/// name with the service it belongs to.
+pub const POLICY_ACTION_PREFIX: &str = "SQS:";
+
+/// The action name that stands for every action: "Valid values: the name of any action
+/// or *" (the `Actions` member's own documentation).
+pub const ANY_ACTION: &str = "*";
+
+/// The longest `Label` a permission may carry: "Maximum 80 characters"
+/// (`AddPermissionRequest$Label`).
+pub const MAX_PERMISSION_LABEL_LENGTH: usize = 80;
+
+/// How many digits an Amazon Web Services account number has, which is the only
+/// principal form this call takes: "Amazon SQS AddPermission does not support adding a
+/// non-account principal."
+pub const ACCOUNT_NUMBER_DIGITS: usize = 12;
+
+/// How many statements one queue policy may carry — therefore how many permissions a
+/// queue can have, since each grant adds one statement. The ceiling AWS publishes for a
+/// queue policy ("The maximum limit is 8,192 bytes, 20 statements, 50 principals, or 10
+/// conditions"), and what `OverLimit` means for this call: "AddPermission returns this
+/// error if the maximum number of permissions for the queue is reached".
+pub const MAX_POLICY_STATEMENTS: usize = 20;
+
+/// How many principals one statement may name, from the same published ceiling.
+pub const MAX_PRINCIPALS_PER_STATEMENT: usize = 50;
+
+/// How many actions one statement may allow: "An Amazon SQS policy can have a maximum of
+/// seven actions per statement" (`AddPermission`'s own documentation).
+pub const MAX_ACTIONS_PER_STATEMENT: usize = 7;
+
+/// The parameter a label is supplied for, as the request carries it.
+pub const PERMISSION_LABEL_PARAMETER: &str = "Label";
+
+/// The parameter a principal is supplied for, as the request carries it: the
+/// `AWSAccountIds` list is flattened to repeated `AWSAccountId` entries on the wire
+/// (`xmlName: AWSAccountId`, `xmlFlattened`).
+pub const PRINCIPAL_PARAMETER: &str = "AWSAccountId";
+
+/// The parameter an action is supplied for, as the request carries it: the `Actions`
+/// list is flattened to repeated `ActionName` entries on the wire (`xmlName: ActionName`,
+/// `xmlFlattened`).
+pub const ACTION_PARAMETER: &str = "ActionName";
+
+/// The reason a grant is refused for a label the queue's policy already grants: a label
+/// is "the unique identification of the permission you're setting", so the policy cannot
+/// carry two.
+pub const LABEL_ALREADY_EXISTS: &str = "Already exists.";
+
+/// The reason a revoke is refused for a label the queue's policy does not grant: there
+/// is no statement for it to revoke.
+pub const LABEL_NOT_FOUND: &str = "can't find label on existing policy.";
+
+/// The action names a permission may allow, which is "the name of any action" of this
+/// service (`AddPermissionRequest$Actions`), beside [`ANY_ACTION`].
+///
+/// Source: `smithy_query(query="list_operations",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`
+/// — the operations bound to this service, in the order it reports them.
+pub const ACTION_NAMES: &[&str] = &[
+    "AddPermission",
+    "CancelMessageMoveTask",
+    "ChangeMessageVisibility",
+    "ChangeMessageVisibilityBatch",
+    "CreateQueue",
+    "DeleteMessage",
+    "DeleteMessageBatch",
+    "DeleteQueue",
+    "GetQueueAttributes",
+    "GetQueueUrl",
+    "ListDeadLetterSourceQueues",
+    "ListMessageMoveTasks",
+    "ListQueueTags",
+    "ListQueues",
+    "PurgeQueue",
+    "ReceiveMessage",
+    "RemovePermission",
+    "SendMessage",
+    "SendMessageBatch",
+    "SetQueueAttributes",
+    "StartMessageMoveTask",
+    "TagQueue",
+    "UntagQueue",
+];
+
+/// Why a permission cannot be granted, as the text of the refusal a caller has to fix
+/// the request from. The two kinds answer under different error codes, which is why they
+/// are told apart here rather than in a handler.
+#[derive(Debug)]
+pub enum PermissionRefusal {
+    /// A parameter's value is not one the call accepts.
+    Parameter(String),
+    /// A published limit on what a queue policy may hold.
+    Limit(String),
+}
+
+/// Why `label` is not a `Label` this service accepts, or `None` when it is.
+///
+/// The rule is the member's own: "Maximum 80 characters. Allowed characters include
+/// alphanumeric characters, hyphens (-), and underscores (_)."
+pub fn permission_label_refusal(label: &str) -> Option<String> {
+    let length = label.chars().count();
+    let well_formed = (1..=MAX_PERMISSION_LABEL_LENGTH).contains(&length)
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if well_formed {
+        return None;
+    }
+    // The rule, not which half of it this label broke: a caller fixes the label against
+    // the whole rule either way. The value is echoed only where it is already known to
+    // be inside its length bound, so a refusal never hands an unbounded string back.
+    let reason = format!(
+        "Label can only include alphanumeric characters, hyphens, or underscores. 1 to \
+         {MAX_PERMISSION_LABEL_LENGTH} in length"
+    );
+    Some(if length > MAX_PERMISSION_LABEL_LENGTH {
+        invalid_parameter_message_without_value(PERMISSION_LABEL_PARAMETER, &reason)
+    } else {
+        invalid_parameter_message(label, PERMISSION_LABEL_PARAMETER, &reason)
+    })
+}
+
+/// Why the principals a grant names cannot receive it, or `None` when they can.
+///
+/// Each one is "the Amazon Web Services account number of a principal", and nothing
+/// else: "Amazon SQS AddPermission does not support adding a non-account principal."
+fn principals_refusal(account_numbers: &[String]) -> Option<PermissionRefusal> {
+    for account_number in account_numbers {
+        let account = account_number.chars().count() == ACCOUNT_NUMBER_DIGITS
+            && account_number.chars().all(|c| c.is_ascii_digit());
+        if !account {
+            let reason = "Amazon SQS AddPermission does not support adding a non-account \
+                          principal.";
+            return Some(PermissionRefusal::Parameter(
+                if account_number.chars().count() > ACCOUNT_NUMBER_DIGITS {
+                    invalid_parameter_message_without_value(PRINCIPAL_PARAMETER, reason)
+                } else {
+                    invalid_parameter_message(account_number, PRINCIPAL_PARAMETER, reason)
+                },
+            ));
+        }
+    }
+    (account_numbers.len() > MAX_PRINCIPALS_PER_STATEMENT).then(|| {
+        PermissionRefusal::Limit(format!(
+            "An Amazon SQS policy statement can name a maximum of \
+             {MAX_PRINCIPALS_PER_STATEMENT} principals, and this one names {}.",
+            account_numbers.len()
+        ))
+    })
+}
+
+/// Why the actions a grant allows cannot be allowed, or `None` when they can.
+///
+/// The per-statement ceiling is refused as a PARAMETER fault rather than as a limit: the
+/// condition `OverLimit` is documented for on this call is the other one — "AddPermission
+/// returns this error if the maximum number of permissions for the queue is reached" —
+/// and a request naming more actions than one statement may allow is a request this call
+/// could never serve, whatever the queue already carries.
+fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
+    for action in actions {
+        if action != ANY_ACTION && !ACTION_NAMES.contains(&action.as_str()) {
+            let reason = format!("Valid values: the name of any action or {ANY_ACTION}.");
+            return Some(PermissionRefusal::Parameter(
+                if action.chars().count() > MAX_ACTION_NAME_LENGTH {
+                    invalid_parameter_message_without_value(ACTION_PARAMETER, &reason)
+                } else {
+                    invalid_parameter_message(action, ACTION_PARAMETER, &reason)
+                },
+            ));
+        }
+    }
+    (actions.len() > MAX_ACTIONS_PER_STATEMENT).then(|| {
+        PermissionRefusal::Parameter(invalid_parameter_message_without_value(
+            ACTION_PARAMETER,
+            &format!(
+                "An Amazon SQS policy can have a maximum of {MAX_ACTIONS_PER_STATEMENT} actions \
+                 per statement, and this one has {}.",
+                actions.len()
+            ),
+        ))
+    })
+}
+
+/// The longest action name a refusal echoes back: the longest name this service has, so
+/// a value no longer than any action name is reported and anything longer is not.
+const MAX_ACTION_NAME_LENGTH: usize = longest_action_name();
+
+/// The length of the longest entry of [`ACTION_NAMES`].
+const fn longest_action_name() -> usize {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < ACTION_NAMES.len() {
+        let length = ACTION_NAMES[index].len();
+        if length > longest {
+            longest = length;
+        }
+        index += 1;
+    }
+    longest
+}
+
+/// The statement that grants `actions` on the queue ARN `resource` to each account in
+/// `account_numbers`, labelled `label`.
+///
+/// A member naming one value carries it alone and several as a list, which is how a
+/// policy document states the two cases.
+fn permission_statement(
+    label: &str,
+    account_numbers: &[String],
+    actions: &[String],
+    resource: &str,
+) -> ::serde_json::Value {
+    let principals: Vec<String> = account_numbers
+        .iter()
+        .map(|account_number| account_principal(account_number))
+        .collect();
+    let allowed: Vec<String> = actions
+        .iter()
+        .map(|action| format!("{POLICY_ACTION_PREFIX}{action}"))
+        .collect();
+    ::serde_json::json!({
+        POLICY_SID_MEMBER: label,
+        "Effect": "Allow",
+        "Principal": { "AWS": one_or_many(principals) },
+        "Action": one_or_many(allowed),
+        "Resource": resource,
+    })
+}
+
+/// The principal a policy names for the account numbered `account_number`: an account
+/// number identifies that account's root user, which is the principal the grant is
+/// recorded for.
+fn account_principal(account_number: &str) -> String {
+    format!("arn:aws:iam::{account_number}:root")
+}
+
+/// `values` as a policy member states them: the value alone when there is exactly one,
+/// the list otherwise.
+fn one_or_many(mut values: Vec<String>) -> ::serde_json::Value {
+    if values.len() == 1 {
+        return ::serde_json::Value::String(values.remove(0));
+    }
+    ::serde_json::Value::Array(
+        values
+            .into_iter()
+            .map(::serde_json::Value::String)
+            .collect(),
+    )
 }
 
 /// A `SystemTime` as the whole seconds since the Unix epoch, which is how SQS reports

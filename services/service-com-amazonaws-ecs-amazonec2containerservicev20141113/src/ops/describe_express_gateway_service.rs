@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExpressGatewayService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExpressGatewayService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExpressGatewayService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE Express service from this service's store — the operation's own doc:
+//! "Retrieves detailed information about an Express service, including current status,
+//! configuration, managed infrastructure, and service revisions". A REPORT: it writes
+//! nothing of its own, so what the next caller sees is what the create, the update and
+//! the clock left. The `serviceArn` carries the cluster that hosts the service, so an ARN
+//! naming a cluster this account does not hold is refused as that, and one naming a
+//! cluster that holds no such service is a `ResourceNotFoundException` — which is what
+//! tells a deleted Express service apart from a cluster that was never there.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +161,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExpressGatewayService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExpressGatewayServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExpressGatewayService"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeExpressGatewayServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Only the transitions the clock already made due — the rollout an update
+        // started, the removal a delete started — which were owed at this instant whether
+        // or not anybody called.
+        guard.advance_clock(now);
+
+        let stored = guard
+            .express_gateway_service(&input.service_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::ExpressGatewayRefusal::ClusterNotFound => {
+                    DescribeExpressGatewayServiceErrorModeled::ClusterNotFoundException(
+                        ClusterNotFoundException {
+                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::ExpressGatewayRefusal::NotFound => {
+                    DescribeExpressGatewayServiceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::EXPRESS_GATEWAY_SERVICE_NOT_FOUND_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // "Use the include parameter to retrieve additional information such as resource
+        // tags": the tags are reported only where the request asked for them.
+        let include_tags = crate::state::include_requests_tags(input.include.as_ref());
+        Ok(DescribeExpressGatewayServiceOutput {
+            service: Some(stored.view(include_tags)),
+        })
     }
 }

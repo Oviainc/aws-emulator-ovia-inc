@@ -51,6 +51,8 @@ mod query_column_selection;
 mod query_statement_subset;
 #[path = "all/quota_service_code.rs"]
 mod quota_service_code;
+#[path = "all/refusal_message_bound.rs"]
+mod refusal_message_bound;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]

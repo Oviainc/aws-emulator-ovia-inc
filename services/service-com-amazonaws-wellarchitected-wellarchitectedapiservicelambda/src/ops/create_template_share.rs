@@ -249,8 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One principal holds at most one share of one review template: the access a
         // second share would grant belongs to the share that already exists, which
-        // `DeleteTemplateShare` is the operation to revoke (still a scaffold with its own
-        // issue, so nothing revokes one yet).
+        // `DeleteTemplateShare` is the operation to revoke.
         if let Some(existing) = store.template_share_with(&input.template_arn, &input.shared_with) {
             let conflict = crate::state::template_share_conflict(existing);
             return Err(CreateTemplateShareErrorModeled::ConflictException(conflict).into());

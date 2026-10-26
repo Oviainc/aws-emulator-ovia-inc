@@ -260,21 +260,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        // One instant for the whole request, so the name lookup, the record and
+        // the insertion path all agree about which channels the clock has already
+        // removed.
+        let now = std::time::SystemTime::now();
 
         // A channel reads from a cluster, so the cluster in the request path has
-        // to be one this endpoint's region holds before anything is minted.
-        // The message is informative, not contractual: AWS neither documents nor
-        // models the text of this error, so this handler says what a caller can
-        // act on (which region looked, and for which ARN) rather than copying any
-        // one recorded phrasing.
+        // to be one this endpoint's region holds before anything is minted. The
+        // refusal carries the service's one fixed not-found sentence, as every
+        // other operation that answers `NotFoundException` does; the parameter at
+        // fault is named by `NotFoundException$InvalidParameter`.
         let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
             return Err(
                 CreateChannelErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in use under THIS cluster is a conflict; the same name under another
         // cluster is a different channel.
         if let Some(existing) =
-            state.channel_arn_for_name(&input.cluster_arn, &input.channel_name)
+            state.channel_arn_for_name(&input.cluster_arn, &input.channel_name, now)
         {
             return Err(
                 CreateChannelErrorModeled::ConflictException(ConflictException {
@@ -302,8 +302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation's ARN distinct; it advances whether or not anything else
         // about the request repeats an earlier one.
         let suffix = state.next_channel_suffix;
-        let channel =
-            crate::state::Channel::streaming(cluster, suffix, std::time::SystemTime::now(), input);
+        let channel = crate::state::Channel::streaming(cluster, suffix, now, input);
         let output = CreateChannelOutput {
             channel_arn: channel.arn.clone(),
             cluster_operation_arn: Some(channel.cluster_operation_arn.clone()),
@@ -313,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store by one more call. A refused create registers nothing, so the
         // ordinal it would have taken is left unspent: the counter counts
         // channels ever registered, not calls ever made.
-        if let Err(rejected) = state.register_channel(channel) {
+        if let Err(rejected) = state.register_channel(channel, now) {
             return Err(match rejected {
                 crate::state::ChannelRejected::ClusterQuota => {
                     CreateChannelErrorModeled::TooManyRequestsException(TooManyRequestsException {

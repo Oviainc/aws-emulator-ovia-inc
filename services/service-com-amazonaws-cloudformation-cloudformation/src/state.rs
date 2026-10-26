@@ -67,8 +67,9 @@
 //! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set,
 //! [`stack_sets::MAX_STACK_SETS`] stack sets with
 //! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first),
-//! and [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
-//! progress record (oldest-first).
+//! [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
+//! progress record (oldest-first),
+//! and [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first).
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -254,6 +255,10 @@ pub mod resource_schema;
 /// The Hook invocation results this account and Region holds, which `ListHookResults`
 /// reports summaries of.
 pub mod hook_results;
+
+/// The resource scans this account and Region holds, which `ListResourceScans` reports
+/// summaries of.
+pub mod resource_scans;
 
 /// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
 /// reports.
@@ -3064,6 +3069,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// rather than a stack's, so it is neither settled on the stack clock nor reclaimed
     /// with a stack; [`stack_sets::MAX_STACK_SETS`] is what bounds the list.
     pub stack_sets: Vec<stack_sets::StoredStackSet>,
+    /// Every resource scan this account and Region has started, in the order the scans were
+    /// started, so `ListResourceScans` pages over them deterministically (see
+    /// [`resource_scans`]). A scan belongs to the account rather than to a stack, so it is
+    /// never reclaimed with one; the one transition the clock owes it is its own completion,
+    /// which [`Self::settle`] materialises, and it is bounded at
+    /// [`resource_scans::MAX_RESOURCE_SCANS`], oldest reclaimed first.
+    pub resource_scans: Vec<resource_scans::StoredResourceScan>,
     /// Every resource-handler invocation this account and Region has a progress record for,
     /// in invocation order, so `RecordHandlerProgress` judges a report against the status
     /// the invocation its bearer token names holds (see [`handler_progress`]). An
@@ -3091,6 +3103,9 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         for extension in &mut self.extensions {
             extension.settle(now);
+        }
+        for scan in &mut self.resource_scans {
+            scan.settle(now);
         }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
@@ -3232,6 +3247,40 @@ impl ComAmazonawsCloudformationCloudformationState {
             self.hook_results.remove(0);
         }
         self.hook_results.push(result);
+    }
+
+    /// Record one resource scan. The oldest record is reclaimed past
+    /// [`resource_scans::MAX_RESOURCE_SCANS`], so the store cannot grow without limit.
+    ///
+    /// This is the ONLY way a scan enters the store: starting a scan is what creates one,
+    /// and [`resource_scans`] is where what writes one is written down.
+    pub fn record_resource_scan(&mut self, scan: resource_scans::StoredResourceScan) {
+        while self.resource_scans.len() >= resource_scans::MAX_RESOURCE_SCANS {
+            self.resource_scans.remove(0);
+        }
+        self.resource_scans.push(scan);
+    }
+
+    /// The scans of one Region, NEWEST FIRST: `ListResourceScans` "list[s] the resource
+    /// scans from newest to oldest", so the order is the records' own `StartTime` rather
+    /// than the order they entered the store.
+    ///
+    /// Accurate only once [`Self::settle`] has materialised the completions the clock
+    /// already made due; every caller settles first.
+    pub fn resource_scans_newest_first(
+        &self,
+        region: &str,
+    ) -> Vec<&resource_scans::StoredResourceScan> {
+        let mut scans: Vec<&resource_scans::StoredResourceScan> = self
+            .resource_scans
+            .iter()
+            .rev()
+            .filter(|scan| scan.region == region)
+            .collect();
+        // A stable sort over the reversed store: scans that started at the same instant keep
+        // the most recently recorded one first, so the whole order is "newest to oldest".
+        scans.sort_by_key(|scan| ::std::cmp::Reverse(scan.start_time));
+        scans
     }
 
     /// The ONE recorded Hook invocation result this Region holds under `hook_result_id`,
@@ -4192,6 +4241,8 @@ pub enum PageOf {
     ChangeSetSummaries,
     /// `ListHookResults`'s `HookResults`.
     HookResults,
+    /// `ListResourceScans`'s `ResourceScanSummaries`.
+    ResourceScanSummaries,
     /// `DescribeChangeSetHooks`'s `Hooks`.
     ChangeSetHooks,
     /// `ListExports`'s `Exports`.
@@ -4218,6 +4269,7 @@ impl PageOf {
             Self::Changes => "changes",
             Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
+            Self::ResourceScanSummaries => "resource-scan-summaries",
             Self::ChangeSetHooks => "change-set-hooks",
             Self::Exports => "exports",
             Self::AccountLimits => "account-limits",

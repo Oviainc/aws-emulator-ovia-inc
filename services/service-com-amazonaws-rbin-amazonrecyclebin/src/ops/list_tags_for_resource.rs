@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
@@ -153,10 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // A retention rule exists only in the Region it was created in, so the rule the
+        // ARN addresses is resolved in the Region this request is signed for.
+        let region = crate::state::request_region(ctx.parts());
         // The ARN addresses the rule; a well-formed ARN naming no stored rule is a
         // missing resource, not a malformed request (the modelled `RuleArn` pattern is
         // already enforced before this handler runs).
-        let Some(rule) = store.rule_by_arn(&input.resource_arn) else {
+        let Some(rule) = store.rule_by_arn(&region, &input.resource_arn) else {
             // Composed from the value the request addressed the rule by — here the
             // `ResourceArn` — by the one place this service words a rule that does not
             // exist.

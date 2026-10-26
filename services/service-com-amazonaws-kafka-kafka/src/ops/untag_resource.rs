@@ -180,7 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Resolved exactly as `TagResource` resolves it, through the one shared
         // lookup, so the two operations answer the same ARN the same way.
-        let tags = match state.resource_tags_mut_in(&region, &input.resource_arn) {
+        let tags = match state.resource_tags_mut_in(
+            &region,
+            &input.resource_arn,
+            std::time::SystemTime::now(),
+        ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
                 return Err(
