@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetIdentityHeadersInNotificationsEnabled
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetIdentityHeadersInNotificationsEnabled`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetIdentityHeadersInNotificationsEnabled::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets whether the original email headers travel with one class of an
+//! identity's notifications: the flag it writes onto the identity's record is
+//! what `GetIdentityNotificationAttributes` reports as
+//! `HeadersIn<Type>NotificationsEnabled`.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +135,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetIdentityHeadersInNotificationsEnabled` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetIdentityHeadersInNotificationsEnabledErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetIdentityHeadersInNotificationsEnabled"))
+        // `ctx` carries the request's Region, which is the Region an identity ARN
+        // this request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+        // Which class of notification this call is about. The model declares the
+        // value set, so the boundary validator normally refuses anything else;
+        // this operation reads the value rather than trusting the spelling, and
+        // names the admitted set if one gets through.
+        let Some(notification_type) =
+            crate::state::NotificationType::from_wire(&input.notification_type)
+        else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Invalid NotificationType {:?}: NotificationType must be one of {}",
+                    input.notification_type,
+                    NOTIFICATION_TYPE_VALUES.join(", ")
+                ),
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetIdentityHeadersInNotificationsEnabled",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The identity has to be one this account holds, keyed the way the
+        // writers key it (the ARN form the member documents resolved to the
+        // identity it names, in this account and this Region).
+        let identity = crate::state::resolve_identity(&input.identity, &region)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
+            .to_string();
+        let Some(record) = state.identities.get_mut(&identity) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!("Identity {identity} is not verified"),
+            ));
+        };
+
+        // "This value can only be set when `NotificationType` is already set to
+        // use a particular Amazon SNS topic" (the `Enabled` member's own
+        // documentation): the headers travel with a notification SES PUBLISHES,
+        // so with no topic for that class there is no notification to carry them
+        // and the request is refused rather than stored.
+        if record.notifications.topic(notification_type).is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Enabled can only be set when NotificationType is already set to use a \
+                     particular Amazon SNS topic; {identity} has no {} topic",
+                    notification_type.as_wire()
+                ),
+            ));
+        }
+        record
+            .notifications
+            .set_headers_enabled(notification_type, input.enabled);
+
+        // `SetIdentityHeadersInNotificationsEnabledResponse` has no members: what
+        // the call produced is the state it wrote, which
+        // `GetIdentityNotificationAttributes` reports.
+        Ok(SetIdentityHeadersInNotificationsEnabledOutput {})
     }
 }
