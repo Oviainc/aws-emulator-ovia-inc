@@ -34,7 +34,7 @@ use std::time::Duration;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, filters, indexed};
+use super::ec2_query::{element, elements, error_code, error_message, filters, indexed};
 use super::wire::{Param, child, child_text, document, is_long_id, param};
 
 /// The Region every call here is signed for. The default VPC's subnets — the subnets a
@@ -1107,4 +1107,320 @@ async fn describe_route_server_peers_pages_in_id_order() {
             "case {case:?}: expected every peer exactly once in id order, got {seen:?}"
         );
     }
+}
+
+/// The rule: ONE filter's values are joined with an OR, and each value is matched
+/// case-sensitively against the WHOLE attribute with EC2's two wildcards — `*` for zero or
+/// more characters, `?` for exactly one, either made literal by a backslash — so a value
+/// that is not a wildcard selects only an attribute equal to it.
+///
+/// The rows differ along what that rule generalises over: how many values a filter carries
+/// (one, two, one of them matching nothing), which wildcard and where in the value it sits
+/// (leading, trailing, inner, escaped), and which KIND of attribute is named — a stored
+/// member, a member inherited from the peer's endpoint network interface, a number, the
+/// state, a tag value and the tag keys. The two inherited network-interface filters are
+/// reached nowhere else.
+#[tokio::test]
+async fn describe_route_server_peers_joins_values_with_or_and_matches_wildcards() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+    let first = create_endpoint("the first endpoint", &router, &route_server, &subnets[0]).await;
+    let second = create_endpoint("the second endpoint", &router, &route_server, &subnets[1]).await;
+    assert_ne!(
+        first.eni_id, second.eni_id,
+        "the two endpoints must hold different network interfaces, got {:?} twice",
+        first.eni_id
+    );
+
+    // Three peers: two sharing the first endpoint's network interface, one on the second.
+    let bodies = [
+        (
+            "the first peer",
+            peer_params(&first.id, "10.0.1.5", "65000", None, &[("role", "firewall")]),
+        ),
+        (
+            "the second peer",
+            peer_params(
+                &first.id,
+                "10.0.1.6",
+                "65001",
+                Some(ec2::state::PEER_LIVENESS_BFD),
+                &[("role", "router")],
+            ),
+        ),
+        (
+            "the third peer",
+            peer_params(&second.id, "192.168.44.7", "4200000000", None, &[("tier", "edge")]),
+        ),
+    ];
+    let mut created: Vec<String> = Vec::new();
+    for (case, params) in bodies {
+        let body = call_ok(case, &router, "CreateRouteServerPeer", &params).await;
+        created.push(peer_member(case, &body, "routeServerPeerId").expect("a peer id"));
+    }
+    let (first_peer, second_peer, third_peer) =
+        (created[0].clone(), created[1].clone(), created[2].clone());
+
+    // The `state` row below is about a settled store rather than a race: every peer is
+    // `available` once the clock has passed the due instant its create started.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let all = vec![first_peer.clone(), second_peer.clone(), third_peer.clone()];
+
+    // (case, the request's form fields, the ids it must select, in id order)
+    let cases: Vec<(&str, Vec<Param>, Vec<String>)> = vec![
+        (
+            "by the network interface the peer's endpoint holds",
+            filters(&[("endpoint-eni-id", &[first.eni_id.as_str()])]),
+            vec![first_peer.clone(), second_peer.clone()],
+        ),
+        (
+            "by the address of that network interface",
+            filters(&[("endpoint-eni-address", &[first.eni_address.as_str()])]),
+            vec![first_peer.clone(), second_peer.clone()],
+        ),
+        (
+            "two values of one filter, which are joined with an OR",
+            filters(&[("peer-address", &["10.0.1.5", "192.168.44.7"])]),
+            vec![first_peer.clone(), third_peer.clone()],
+        ),
+        (
+            "a value that selects nothing beside one that does",
+            filters(&[("peer-address", &["10.255.255.254", "10.0.1.6"])]),
+            vec![second_peer.clone()],
+        ),
+        (
+            "both network interfaces as the values of one filter",
+            filters(&[(
+                "endpoint-eni-id",
+                &[first.eni_id.as_str(), second.eni_id.as_str()],
+            )]),
+            all.clone(),
+        ),
+        (
+            "a trailing multi-character wildcard",
+            filters(&[("peer-address", &["10.0.1.*"])]),
+            vec![first_peer.clone(), second_peer.clone()],
+        ),
+        (
+            "a single-character wildcard",
+            filters(&[("peer-address", &["10.0.1.?"])]),
+            vec![first_peer.clone(), second_peer.clone()],
+        ),
+        (
+            "a leading multi-character wildcard",
+            filters(&[("peer-address", &["*.44.7"])]),
+            vec![third_peer.clone()],
+        ),
+        (
+            "an inner multi-character wildcard",
+            filters(&[("peer-address", &["10.*.6"])]),
+            vec![second_peer.clone()],
+        ),
+        (
+            "a value that is a prefix of an address but carries no wildcard",
+            filters(&[("peer-address", &["10.0.1"])]),
+            Vec::new(),
+        ),
+        (
+            "a single-character wildcard where two characters stand",
+            filters(&[("peer-address", &["10.0.1?"])]),
+            Vec::new(),
+        ),
+        (
+            "an escaped wildcard, which is the literal character",
+            filters(&[("peer-address", &[r"10.0.1.\*"])]),
+            Vec::new(),
+        ),
+        (
+            "a wildcard on a numeric attribute",
+            filters(&[("bgp-options.peer-asn", &["6500?"])]),
+            vec![first_peer.clone(), second_peer.clone()],
+        ),
+        (
+            "a wildcard on the state",
+            filters(&[("state", &["avail*"])]),
+            all.clone(),
+        ),
+        (
+            "a wildcard on every minted peer id",
+            filters(&[("route-server-peer-id", &["rsp-*"])]),
+            all.clone(),
+        ),
+        (
+            "a wildcard on a tag's value",
+            filters(&[("tag:role", &["r*"])]),
+            vec![second_peer.clone()],
+        ),
+        (
+            "a wildcard on the tag keys a peer carries",
+            filters(&[("tag-key", &["t*"])]),
+            vec![third_peer.clone()],
+        ),
+        (
+            "a wildcard matched case-sensitively",
+            filters(&[("tag:role", &["R*"])]),
+            Vec::new(),
+        ),
+        (
+            "a wildcard nothing matches",
+            filters(&[("peer-address", &["172.*"])]),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, params, expected) in cases {
+        let body = call_ok(case, &router, "DescribeRouteServerPeers", &params).await;
+        let reported = reported_ids(&body);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+}
+
+/// The rule: a `NextToken` this service did not mint is refused with
+/// `InvalidPaginationToken` naming the token the request sent, while a token it DID mint
+/// resumes the report; and a `DryRun` probe from a caller holding the action's permissions
+/// is answered `DryRunOperation` (HTTP 412) and reports nothing, whatever else the request
+/// selects, where `DryRun=false` is an ordinary call.
+///
+/// The token rows differ in HOW the token fails to be one of this service's — not hex at
+/// all, hex carrying nothing it minted, and one of its own with bytes appended — and the
+/// dry-run rows in what the probe asks for beside the flag.
+#[tokio::test]
+async fn describe_route_server_peers_refuses_a_foreign_token_and_performs_no_dry_run() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+    let endpoint = create_endpoint("an endpoint", &router, &route_server, &subnets[0]).await;
+
+    // Six peers: one more than the smallest page the model's `MaxResults` range publishes,
+    // so the first page of that size is followed by a token this service really minted.
+    let mut stored: Vec<String> = Vec::new();
+    for index in 0..6u8 {
+        let case = "one of six peers";
+        let body = call_ok(
+            case,
+            &router,
+            "CreateRouteServerPeer",
+            &peer_params(
+                &endpoint.id,
+                &format!("10.0.2.{}", index + 10),
+                "65000",
+                None,
+                &[],
+            ),
+        )
+        .await;
+        stored.push(peer_member(case, &body, "routeServerPeerId").expect("a peer id"));
+    }
+
+    let body = call_ok(
+        "the first page",
+        &router,
+        "DescribeRouteServerPeers",
+        &[param("MaxResults", "5")],
+    )
+    .await;
+    let minted = element(&body, "nextToken")
+        .unwrap_or_else(|| panic!("a token while a peer follows the page, got {body}"));
+
+    // A token this service minted resumes the report: the refusals below are about a
+    // token's provenance, not about paging.
+    let body = call_ok(
+        "the token this service minted",
+        &router,
+        "DescribeRouteServerPeers",
+        &[param("MaxResults", "5"), param("NextToken", &minted)],
+    )
+    .await;
+    let reported = reported_ids(&body);
+    assert_eq!(
+        reported,
+        stored[5..].to_vec(),
+        "case \"the token this service minted\": expected the peers after the first page, \
+         got {reported:?}"
+    );
+
+    let tampered = format!("{minted}00");
+    // (case, the token the request sends)
+    let refusals: [(&str, &str); 3] = [
+        ("a token that is not hex at all", "not-a-token"),
+        ("hex carrying nothing this service minted", "deadbeef"),
+        ("a minted token with bytes appended", tampered.as_str()),
+    ];
+    for (case, token) in refusals {
+        let (status, body) = call(
+            &router,
+            "DescribeRouteServerPeers",
+            &[param("NextToken", token)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::INVALID_PAGINATION_TOKEN,
+            "case {case:?}: expected {}, got {code:?} with body {body}",
+            ec2::state::INVALID_PAGINATION_TOKEN
+        );
+        let message = error_message(&body);
+        let expected = format!("Next token '{token}' is invalid");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
+
+    // (case, the form fields of the probe)
+    let mut filtered = vec![param("DryRun", "true")];
+    filtered.extend(filters(&[("peer-address", &["10.0.2.10"])]));
+    let mut by_id = vec![param("DryRun", "true")];
+    by_id.extend(indexed("RouteServerPeerId", &[stored[0].as_str()]));
+    let probes: Vec<(&str, Vec<Param>)> = vec![
+        ("a dry run with nothing else", vec![param("DryRun", "true")]),
+        (
+            "a dry run beside a page size",
+            vec![param("DryRun", "true"), param("MaxResults", "5")],
+        ),
+        ("a dry run beside a filter", filtered),
+        ("a dry run beside an id that names a peer", by_id),
+    ];
+    for (case, params) in probes {
+        let (status, body) = call(&router, "DescribeRouteServerPeers", &params).await;
+        assert_eq!(
+            status, 412,
+            "case {case:?}: expected HTTP 412, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::DRY_RUN_OPERATION,
+            "case {case:?}: expected {}, got {code:?} with body {body}",
+            ec2::state::DRY_RUN_OPERATION
+        );
+        let reported = reported_ids(&body);
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: a dry run reports no peer, got {reported:?}"
+        );
+    }
+
+    // `DryRun=false` is not a probe: the report is served.
+    let body = call_ok(
+        "DryRun=false",
+        &router,
+        "DescribeRouteServerPeers",
+        &[param("DryRun", "false")],
+    )
+    .await;
+    let reported = reported_ids(&body);
+    assert_eq!(
+        reported, stored,
+        "case \"DryRun=false\": expected every peer, got {reported:?}"
+    );
 }

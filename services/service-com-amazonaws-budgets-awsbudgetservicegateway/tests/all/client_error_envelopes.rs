@@ -205,21 +205,26 @@ async fn a_scaffolded_operation_still_answers_501() {
     // rather than the validation layer in front of it.
     for (operation, request) in [
         (
-            // `TagResource` and `ListTagsForResource` are implemented now (they write
-            // and read a budget's tag set), so `UntagResource` is the tagging stub row
-            // here, still under its own issue.
-            "UntagResource",
-            json!({
-                "ResourceARN": format!("arn:aws:budgets::{account_id}:budget/stub"),
-                "ResourceTagKeys": ["owner"]
-            }),
-        ),
-        (
             // `DescribeBudgetActionsForBudget` is implemented now (it lists the actions
             // `CreateBudgetAction` writes onto a budget), so the account-wide list is
-            // the stub row here, still under its own issue.
+            // one stub row here, still under its own issue.
             "DescribeBudgetActionsForAccount",
             json!({"AccountId": &account_id}),
+        ),
+        (
+            // `CreateSubscriber` / `UpdateSubscriber` are implemented now, so the
+            // subscriber delete is the other stub row, still under its own issue.
+            "DeleteSubscriber",
+            json!({
+                "AccountId": &account_id,
+                "BudgetName": "stub",
+                "Notification": {
+                    "NotificationType": "ACTUAL",
+                    "ComparisonOperator": "GREATER_THAN",
+                    "Threshold": 80.0
+                },
+                "Subscriber": {"SubscriptionType": "EMAIL", "Address": "ops@example.com"}
+            }),
         ),
     ] {
         let (status, body) = call(&router, operation, &request).await;

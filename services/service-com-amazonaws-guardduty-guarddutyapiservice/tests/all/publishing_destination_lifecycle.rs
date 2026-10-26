@@ -197,20 +197,13 @@ async fn a_destination_reports_back_the_properties_it_was_created_with() {
             "case {case:?}: expected the stored destinationProperties {:?}, got {:?}",
             trip.properties, read["destinationProperties"]
         );
-        match trip.tags.as_ref() {
-            Some(tags) => assert_eq!(
-                read["tags"], *tags,
-                "case {case:?}: expected the stored tags {tags:?}, got {:?}",
-                read["tags"]
-            ),
-            // `TagMap` carries `len 1..200`, so an untagged destination reports no
-            // `tags` member rather than an empty map.
-            None => assert!(
-                read.get("tags").is_none_or(Value::is_null),
-                "case {case:?}: an untagged destination must report no tags, got {:?}",
-                read["tags"]
-            ),
-        }
+        // The tag map is always reported, empty for a destination nothing tagged.
+        let expected_tags = trip.tags.clone().unwrap_or_else(|| json!({}));
+        assert_eq!(
+            read["tags"], expected_tags,
+            "case {case:?}: expected the stored tags {expected_tags:?}, got {:?}",
+            read["tags"]
+        );
         assert_eq!(
             read["publishingFailureStartTimestamp"].as_i64(),
             Some(0),

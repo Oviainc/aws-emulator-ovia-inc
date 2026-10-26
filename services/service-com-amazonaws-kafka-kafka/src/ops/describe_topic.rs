@@ -10,7 +10,10 @@
 //! cluster ARN, or a `TopicName` Apache Kafka itself would refuse, is a
 //! `BadRequestException`, while a well-formed ARN this endpoint's region holds no
 //! cluster for and a legal name the cluster holds no topic for are both this
-//! operation's only modelled 404, `NotFoundException`.
+//! operation's only modelled 404, `NotFoundException`. A cluster this endpoint
+//! holds whose `ClusterType` is serverless is refused on its KIND with
+//! [`crate::state::serverless_topic_apis_unsupported`], before the topic is looked
+//! up: the Topic Management surface is not offered for that cluster kind.
 //!
 //! REPORTING ONLY: the one write it makes materialises a transition the clock
 //! already owed THIS topic -- `CREATING` -> `ACTIVE` once the activation instant
@@ -190,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut state = state.lock();
 
-        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
             return Err(
                 DescribeTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
@@ -198,6 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        };
+
+        // The Topic Management surface applies to a cluster whose brokers this
+        // service manages for the caller, so a serverless one is refused on its
+        // KIND -- before the topic is looked up at all, since no answer about a
+        // topic of such a cluster is this API's to give.
+        if cluster.is_serverless() {
+            return Err(crate::state::serverless_topic_apis_unsupported());
         }
 
         // Reporting only: the writes this makes materialise the transitions the

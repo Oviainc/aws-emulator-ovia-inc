@@ -24,6 +24,16 @@ tracing = { workspace = true }
 # AES-256-GCM (and the OS CSPRNG) for the ciphertext envelope a SYMMETRIC_DEFAULT
 # KMS key seals and opens; `ring` is already in this workspace's lock file.
 ring = "0.17"
+# RSA, NIST ECDSA, secp256k1 and Ed25519 key pair generation, and the DER
+# encodings (PKCS#8, X.509 SubjectPublicKeyInfo) a data key pair is reported in;
+# already in this workspace's lock file.
+aws-lc-rs = "1"
+# The SM2 curve of an SM2 data key pair, which aws-lc-rs does not expose.
+sm2 = { version = "0.14", default-features = false, features = [
+    "arithmetic",
+    "pkcs8",
+    "std",
+] }
 # KeyMaterialId (64 lowercase hex characters) and the opaque ListKeys marker.
 sha2 = { workspace = true }
 hex = { workspace = true }

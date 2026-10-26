@@ -228,16 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut stored_status: Option<String> = None;
         let written_at = ::std::time::Instant::now();
         let mut store = state.lock();
-        let mut addressed: ::std::collections::BTreeSet<&str> =
-            ::std::collections::BTreeSet::new();
-        for account_id in &input.account_ids {
-            // `accountIds` is "List of unique account identifiers", and one
-            // entry is written to every account the request names, so an id
-            // named twice names the SAME write: it is performed once rather
-            // than a second time against the record this very call just wrote.
-            if !addressed.insert(account_id.as_str()) {
-                continue;
-            }
+        // One entry is written to every account the request addresses, once, in
+        // the order the request names them, so the `errors` rows below are built
+        // in request order — see [`crate::state::distinct_account_ids`], which is
+        // where what a repeated id means is stated for this whole service.
+        for account_id in crate::state::distinct_account_ids(&input.account_ids) {
             // The same write `PutTaxRegistration` performs, so one entry cannot
             // be stored two different ways, and neither can one account's state
             // be judged two different ways. An account the write refuses — one
@@ -255,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exception's name is the only code there is.
             if let Err(refusal) = store.check_registration_type_against_stored(account_id, entry) {
                 errors.push(BatchPutTaxRegistrationError2 {
-                    account_id: account_id.clone(),
+                    account_id: account_id.to_string(),
                     message: refusal.message,
                     code: Some(refusal.error_code),
                 });
@@ -264,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match store.store_registration(account_id, entry, written_at) {
                 Ok(status) => stored_status = Some(status),
                 Err(conflict) => errors.push(BatchPutTaxRegistrationError2 {
-                    account_id: account_id.clone(),
+                    account_id: account_id.to_string(),
                     message: conflict.message,
                     // The code this account's own single-account write would
                     // have failed with: `PutTaxRegistration` answers both

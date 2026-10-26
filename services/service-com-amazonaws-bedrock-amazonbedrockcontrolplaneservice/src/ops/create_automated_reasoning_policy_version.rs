@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutomatedReasoningPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutomatedReasoningPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutomatedReasoningPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cuts an immutable, numbered snapshot of a policy's draft. The version's definition,
+//! hash, name and description are COPIED out of the draft at the instant the version is
+//! cut, so a later write to the draft is invisible to it; the version is read back through
+//! `GetAutomatedReasoningPolicy` under the versioned `AutomatedReasoningPolicyArn` this
+//! operation answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +180,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutomatedReasoningPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutomatedReasoningPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutomatedReasoningPolicyVersion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // `TagList` admits up to 200 entries, while one RESOURCE may carry at most
+        // `MAX_TAGS_PER_RESOURCE` — the bound `TooManyTagsException` itself documents — so
+        // a request past it is refused rather than stored.
+        let tag_count = input.tags.as_ref().map_or(0, Vec::len);
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                CreateAutomatedReasoningPolicyVersionErrorModeled::TooManyTagsException(
+                    TooManyTagsException {
+                        message: Some(format!(
+                            "a resource may carry at most {} tags, and this request carries \
+                             {tag_count}",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                        resource_name: Some(input.policy_arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A version is cut from the policy's DRAFT, so the ARN this operation takes is the
+        // policy's own; the `:<version>` suffix `AutomatedReasoningPolicyArn` also admits
+        // names a snapshot, which is not something another version can be cut from.
+        let (base_arn, version) =
+            crate::state::automated_reasoning_policy_arn_parts(&input.policy_arn);
+        if version.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "policyArn {} names a version of an Automated Reasoning policy; a version \
+                 is created from the policy, so policyArn must carry no version",
+                input.policy_arn
+            )));
+        }
+        let base_arn = base_arn.to_string();
+
+        let mut store = state.lock();
+        let Some(policy) = store.automated_reasoning_policy_mut(&base_arn) else {
+            return Err(
+                CreateAutomatedReasoningPolicyVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no automated reasoning policy {base_arn} exists in this account"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `@idempotencyToken`: a replay answers with the version the first request cut,
+        // rather than cutting a second one. The member documents the whole behaviour —
+        // "If this token matches a previous request, Amazon Bedrock ignores the request,
+        // but does not return an error" — so a replay is answered from the version the
+        // token names and the rest of the request is ignored, including a
+        // `lastUpdatedDefinitionHash` the draft has since moved past: the call the token
+        // names already completed, and it completes no more than one time. The record the
+        // token names is held on the policy, so the token cannot outlive the version it
+        // minted.
+        if let Some(minted) = input
+            .client_request_token
+            .as_deref()
+            .and_then(|token| policy.version_tokens.get(token).copied())
+            .and_then(|number| policy.version(number))
+        {
+            return Ok(created(minted));
+        }
+
+        // `lastUpdatedDefinitionHash` is the concurrency token its member documents: the
+        // hash of the definition the caller last read. A hash that is not the draft's
+        // current one means the draft has been written since, so the snapshot the caller
+        // asked for is not the one this call would cut.
+        if input.last_updated_definition_hash != policy.definition_hash {
+            return Err(
+                CreateAutomatedReasoningPolicyVersionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the definition of automated reasoning policy {base_arn} has \
+                             changed since it was last retrieved; retrieve the policy again \
+                             and retry with its current definition hash"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-policy version quota, which is what bounds how many snapshots one policy
+        // can accumulate: numbers are never reused, and no operation of this service
+        // removes a single version.
+        let number = policy.next_version;
+        if policy.versions.len() >= crate::state::MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY
+        {
+            return Err(
+                CreateAutomatedReasoningPolicyVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this automated reasoning policy already holds the maximum of {} \
+                             versions; delete the policy or request a quota increase",
+                            crate::state::MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The snapshot: every member is COPIED out of the draft as it stands now, which is
+        // what makes the version immutable under a later write to that draft.
+        let snapshot = crate::state::AutomatedReasoningPolicyVersionRecord {
+            arn: crate::state::automated_reasoning_policy_version_arn(&policy.arn, number),
+            version: number,
+            name: policy.name.clone(),
+            description: policy.description.clone(),
+            definition: policy.definition.clone(),
+            definition_hash: policy.definition_hash.clone(),
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+        };
+        policy.versions.insert(number, snapshot);
+        policy.next_version = number.saturating_add(1);
+        if let Some(token) = input.client_request_token {
+            policy.version_tokens.insert(token, number);
+        }
+
+        // Read the response back out of the STORED snapshot, so what the caller is told is
+        // exactly what a later read of that versioned ARN will find.
+        let Some(stored) = policy.version(number) else {
+            return Err(server_error());
+        };
+        Ok(created(stored))
     }
+}
+
+/// What this operation answers for a stored version, so the create and its idempotent
+/// replay report ONE snapshot the same way.
+fn created(
+    record: &crate::state::AutomatedReasoningPolicyVersionRecord,
+) -> CreateAutomatedReasoningPolicyVersionOutput {
+    CreateAutomatedReasoningPolicyVersionOutput {
+        // The VERSIONED ARN, as the member documents ("The versioned Amazon Resource Name
+        // (ARN) of the policy version"), which is also the ARN a read of this version is
+        // addressed by.
+        policy_arn: record.arn.clone(),
+        version: record.version.to_string(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        definition_hash: record.definition_hash.clone(),
+        created_at: crate::state::date_time(record.created_at),
+    }
+}
+
+/// The modelled 500 this operation answers when the engine carries no store for this
+/// service — never a fresh engine, which would drop the version on return.
+fn server_error() -> CreateAutomatedReasoningPolicyVersionError {
+    CreateAutomatedReasoningPolicyVersionErrorModeled::InternalServerException(
+        InternalServerException {
+            message: Some(
+                "automated reasoning policy state is not available on this engine".to_string(),
+            ),
+        },
+    )
+    .into()
 }

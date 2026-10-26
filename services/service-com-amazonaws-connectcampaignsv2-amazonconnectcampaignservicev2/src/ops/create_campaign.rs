@@ -323,8 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // declares for a conflict with the current state of the resource.
             Err(crate::state::InsertRejected::NameTaken) => {
                 return Err(CreateCampaignErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "A campaign named {requested_name} already exists in Connect instance {requested_instance}"
+                    message: crate::state::campaign_name_taken_message(
+                        &requested_name,
+                        &requested_instance,
                     ),
                     x_amz_error_type: None,
                 })

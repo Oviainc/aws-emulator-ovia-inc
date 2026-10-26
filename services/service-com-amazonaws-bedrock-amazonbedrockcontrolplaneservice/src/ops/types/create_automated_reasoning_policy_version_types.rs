@@ -20,7 +20,15 @@ pub struct CreateAutomatedReasoningPolicyVersionInput {
     pub tags: Option<Vec<Tag>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#CreateAutomatedReasoningPolicyVersionResponse")]
+/// `CreateAutomatedReasoningPolicyVersionResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="CreateAutomatedReasoningPolicyVersion")`),
+/// which the derive does not put on a member schema — see `types/date_time_wire.rs` for
+/// that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateAutomatedReasoningPolicyVersionOutput {
     pub policy_arn: String,
@@ -30,4 +38,25 @@ pub struct CreateAutomatedReasoningPolicyVersionOutput {
     pub definition_hash: String,
     pub created_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    CreateAutomatedReasoningPolicyVersionOutput,
+    CREATE_AUTOMATED_REASONING_POLICY_VERSION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#CreateAutomatedReasoningPolicyVersionResponse",
+    "com.amazonaws.bedrock",
+    "CreateAutomatedReasoningPolicyVersionResponse",
+    (M_POLICY_ARN, policy_arn, "policyArn", 0, req, string),
+    (M_VERSION, version, "version", 1, req, string),
+    (M_NAME, name, "name", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_DEFINITION_HASH,
+        definition_hash,
+        "definitionHash",
+        4,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 5, req, date_time),
+);
 

@@ -189,17 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 kms_key_arn: Some(destination.kms_key_arn.clone()),
                 expected_bucket_owner: destination.expected_bucket_owner.clone(),
             },
-            // `TagMap` carries `len 1..200`
-            // (`smithy_query(operation="DescribePublishingDestination")`), so an
-            // untagged destination reports no member rather than an empty map.
-            tags: Some(
-                destination
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<std::collections::HashMap<_, _>>(),
-            )
-            .filter(|tags| !tags.is_empty()),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the destination.
+            tags: crate::state::reported_tags(&destination.tags),
         })
     }
 }

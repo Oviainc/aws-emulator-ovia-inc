@@ -7,10 +7,10 @@
 //! client takes. The rules under test are the ones this operation states:
 //!
 //! * an export REPORTS ON A PERSISTED INQUIRY: it answers a presigned URL that names the
-//!   inquiry it was exported from, in the region the request was signed for, beside the
-//!   tags that one stored record carries — whatever form the submission took, whatever
-//!   export options the request named, and whatever status the clock has brought the
-//!   inquiry to;
+//!   inquiry it was exported from, at the endpoint the caller reached this emulator on,
+//!   beside the tags that one stored record carries — whatever form the submission took,
+//!   whatever export options the request named, and whatever status the clock has brought
+//!   the inquiry to;
 //! * exporting CREATES a document, so every call answers a URL of its own: two exports of
 //!   one inquiry are two documents;
 //! * `queryIdentifiers` selects which of the inquiry's queries the export covers, so an
@@ -34,10 +34,15 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the suite signs for unless a case names another.
 const REGION: &str = "eu-west-1";
 
-/// The host this emulator publishes documents under
-/// (`crate::state`'s `DOCUMENT_HOST`), spelled out here so a change to it has to be
-/// made deliberately in both places.
-const DOCUMENT_HOST: &str = "artifact-documents";
+/// The endpoint host every request of this suite addresses the emulator on. A document
+/// URL this service announces names the endpoint the caller reached, so this is the host
+/// the announced export URL must carry.
+const ENDPOINT: &str = "artifact.eu-west-1.amazonaws.com";
+
+/// The path prefix the export documents are published under (`crate::state`'s
+/// `EXPORT_DOCUMENT_PATH_PREFIX`), spelled out here so a change to it has to be made
+/// deliberately in both places.
+const EXPORT_DOCUMENT_PATH_PREFIX: &str = "/v1/compliance-inquiry/download";
 
 /// The span after which an inquiry's processing is due to be over, plus slack. The
 /// handlers store the due instant rather than sleeping, so only the test waits.
@@ -49,8 +54,8 @@ const PAST_THE_PROCESSING_SPAN: Duration = Duration::from_millis(900);
 /// Base64 of an uploaded document's bytes, as restJson1 carries a blob.
 const FILE_CONTENT: &str = "cXVlc3Rpb25uYWlyZQ==";
 
-/// A SigV4 credential scope for `region` naming this service — what routes the request
-/// and what region a document URL is built for.
+/// A SigV4 credential scope for `region` naming this service — what routes the request to
+/// it.
 fn signed_for(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/artifact/aws4_request, \
@@ -124,7 +129,7 @@ async fn create_in(router: &MultiServiceRouter, region: &str, body: &Value) -> A
     let request = ::http::Request::builder()
         .method("POST")
         .uri("/v1/compliance-inquiry/create")
-        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("host", ENDPOINT)
         .header("content-type", "application/json")
         .header("authorization", signed_for(region))
         .body(Bytes::from(body.to_string()))
@@ -141,7 +146,7 @@ async fn export_in(router: &MultiServiceRouter, region: &str, body: &Value) -> A
     let request = ::http::Request::builder()
         .method("POST")
         .uri("/v1/compliance-inquiry/export")
-        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("host", ENDPOINT)
         .header("content-type", "application/json")
         .header("authorization", signed_for(region))
         .body(Bytes::from(body.to_string()))
@@ -159,7 +164,7 @@ async fn get_metadata(router: &MultiServiceRouter, inquiry_id: &str) -> Answer {
         .uri(format!(
             "/v1/compliance-inquiry/getMetadata?complianceInquiryId={inquiry_id}"
         ))
-        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("host", ENDPOINT)
         .header("authorization", signed_for(REGION))
         .body(Bytes::new())
         .expect("the test request is well formed");
@@ -455,10 +460,8 @@ async fn an_export_answers_a_url_naming_the_inquiry_it_was_taken_from() {
         );
 
         let url = exported.url().to_string();
-        let expected_prefix = format!(
-            "https://{DOCUMENT_HOST}.{region}.amazonaws.com/compliance-inquiry/{id}/export/",
-            region = case.region
-        );
+        let expected_prefix =
+            format!("https://{ENDPOINT}{EXPORT_DOCUMENT_PATH_PREFIX}/{id}/export/");
         assert!(
             url.starts_with(&expected_prefix),
             "case {label:?}: expected a URL under {expected_prefix:?}, got {url:?}"
@@ -679,15 +682,19 @@ async fn a_document_url_that_names_no_export_is_404() {
     let missing = [
         (
             "an export id that was never minted",
-            format!("/compliance-inquiry/{first_id}/export/export-dead0000beef0000/{object}"),
+            format!(
+                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/export-dead0000beef0000/{object}"
+            ),
         ),
         (
             "the export under another inquiry",
-            format!("/compliance-inquiry/{second_id}/export/{export_id}/{object}"),
+            format!("{EXPORT_DOCUMENT_PATH_PREFIX}/{second_id}/export/{export_id}/{object}"),
         ),
         (
             "the export under another object name",
-            format!("/compliance-inquiry/{first_id}/export/{export_id}/other-report.json"),
+            format!(
+                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/{export_id}/other-report.json"
+            ),
         ),
     ];
     for (label, candidate) in missing {

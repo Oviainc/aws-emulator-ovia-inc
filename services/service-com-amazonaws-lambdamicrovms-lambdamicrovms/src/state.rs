@@ -182,12 +182,15 @@ pub fn image_name_conflict_message(name: &str) -> String {
     format!("A MicroVM image with the name '{name}' already exists in this account")
 }
 
-/// The `message` of the 400 `CreateMicrovmImage` answers when the `baseImageArn` the
-/// request names cannot be resolved to a base image, built from that ARN.
+/// The `message` the service answers when a reference to an AWS-MANAGED MicroVM image
+/// cannot be resolved to a published one, built from the reference the request carried.
 ///
 /// `baseImageArn` is "The ARN of the Lambda-managed base MicroVM image to build upon",
 /// so the one refusal for an unresolvable base-image reference is worded for a managed
-/// image whatever namespace the ARN names.
+/// image whatever namespace the ARN names. The same wording names a missing managed
+/// image wherever one is addressed: as `CreateMicrovmImage`'s 400 on its own
+/// `baseImageArn` member, and as the 404 the managed-catalogue reads answer for an
+/// `imageIdentifier` the catalogue does not publish.
 pub fn base_image_not_found_message(base_image_arn: &str) -> String {
     format!("Managed VMI not found: {base_image_arn}")
 }
@@ -268,6 +271,62 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
     format!("arn:aws:lambda:{region}:{MANAGED_RESOURCE_ACCOUNT}:microvm-image:{image_id}")
 }
 
+/// The versions the AWS-managed catalogue publishes, as `(base image id, version)`.
+///
+/// A managed base image is versioned the same way an account's own image is — a
+/// `major.minor` string a client feeds back as `CreateMicrovmImage$baseImageVersion`
+/// ("The specific version of the base MicroVM image to use") — so the published
+/// version set is what that member is resolved against: each image of
+/// [`MANAGED_BASE_IMAGE_IDS`] is published at its initial version
+/// ([`FIRST_IMAGE_VERSION`]), which is therefore the version a create that names none
+/// gets ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]).
+/// `ListManagedMicrovmImageVersions` serves this same set, so a listing of an image's
+/// versions and a create that builds on one cannot disagree.
+pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str)] = &[("al2023-1", FIRST_IMAGE_VERSION)];
+
+/// A `ManagedMicrovmImageVersionStatus` value
+/// (`MANAGED_MICROVM_IMAGE_VERSION_STATUS_VALUES`): "the version is available for
+/// use".
+///
+/// The other value, `DEPRECATED`, is for a version AWS has retired ("Do not use this
+/// version for new MicroVM images"); the catalogue publishes nothing retired, so
+/// every entry it serves is available for use.
+pub const MANAGED_VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The versions the catalogue publishes for the base image `image_id`, in the order a
+/// listing pages them (see [`version_order`]). Empty for an id the catalogue does not
+/// publish, which holds no versions either.
+pub fn published_managed_base_image_versions(image_id: &str) -> Vec<&'static str> {
+    let mut versions: Vec<&'static str> = match is_published_managed_base_image(image_id) {
+        true => MANAGED_BASE_IMAGE_VERSIONS
+            .iter()
+            .filter(|(id, _)| *id == image_id)
+            .map(|(_, version)| *version)
+            .collect(),
+        false => Vec::new(),
+    };
+    versions.sort_unstable_by_key(|version| version_order(version));
+    versions
+}
+
+/// The newest version the catalogue publishes for the base image `image_id` — the one
+/// a build that pins no `baseImageVersion` is resolved to.
+pub fn latest_managed_base_image_version(image_id: &str) -> Option<&'static str> {
+    published_managed_base_image_versions(image_id)
+        .into_iter()
+        .next_back()
+}
+
+/// The order versions of one image sort in: as the `major.minor` pair the version
+/// names, so `1.10` follows `1.9` rather than preceding it (see
+/// [`FIRST_IMAGE_VERSION`]). A version in no such form (nothing this service
+/// publishes is) sorts after every version that is, by its own text, so the order is
+/// total whatever is stored.
+pub fn version_order(version: &str) -> (u64, u64, String) {
+    let (major, minor) = parse_image_version(version).unwrap_or((u64::MAX, u64::MAX));
+    (major, minor, version.to_string())
+}
+
 /// The ARN account field an AWS-OWNED resource of this service carries, as against an
 /// account's own resources, which carry that account's id.
 pub const MANAGED_RESOURCE_ACCOUNT: &str = "aws";
@@ -286,6 +345,32 @@ pub enum ImageReference {
     Absent,
     /// Neither an id this account holds nor a well-formed ARN.
     Malformed,
+}
+
+/// The catalogue id of the AWS-MANAGED base image a `MicrovmImageIdentifier` names.
+///
+/// `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage" wherever it
+/// appears, so a managed image is addressed by the SAME two forms an account's own
+/// image is ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_image_reference`]),
+/// resolved against the published catalogue rather than against this account's store:
+/// the catalogue id first, then the AWS-owned ARN that carries it. A well-formed ARN
+/// the catalogue does not publish is [`ImageReference::Absent`] — a resource that is
+/// missing — while a value that is neither a published id nor an ARN addresses nothing
+/// this API can name and is [`ImageReference::Malformed`].
+pub fn resolve_managed_base_image(identifier: &str) -> ImageReference {
+    if is_published_managed_base_image(identifier) {
+        return ImageReference::Resolved(identifier.to_string());
+    }
+    if let Some(image_id) = managed_microvm_image_id(identifier) {
+        return match is_published_managed_base_image(image_id) {
+            true => ImageReference::Resolved(image_id.to_string()),
+            false => ImageReference::Absent,
+        };
+    }
+    match ::service_common::arn::parse(identifier).is_some() {
+        true => ImageReference::Absent,
+        false => ImageReference::Malformed,
+    }
 }
 
 /// The `DEFAULT_CPU_ARCHITECTURE` a MicroVM image is built for when the request names
@@ -577,6 +662,23 @@ pub struct ManagedBaseImage {
     pub updated_at: Option<DateTime>,
 }
 
+/// One published VERSION of an AWS-managed base image, as a reporting operation
+/// projects it for one region.
+#[derive(Debug, Clone)]
+pub struct ManagedBaseImageVersion {
+    /// The ARN of the managed image this version belongs to, in the region the request
+    /// was signed for.
+    pub image_arn: String,
+    /// The version itself — one of [`published_managed_base_image_versions`].
+    pub image_version: String,
+    /// The version's lifecycle status; see [`MANAGED_VERSION_STATUS_AVAILABLE`].
+    pub status: String,
+    /// When the version was published, as [`ManagedBaseImage::created_at`].
+    pub created_at: DateTime,
+    /// When the version was last written, as [`ManagedBaseImage::updated_at`].
+    pub updated_at: Option<DateTime>,
+}
+
 impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// Apply every lifecycle transition the clock has already made due.
     ///
@@ -703,6 +805,31 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             .collect()
     }
 
+    /// The versions the AWS-managed catalogue publishes for the base image `image_id`,
+    /// in the order a listing pages them and projected into `region`.
+    ///
+    /// The same catalogue [`Self::managed_base_images`] serves, read one image deep
+    /// ([`MANAGED_BASE_IMAGE_VERSIONS`]), so a listing of an image's versions, the
+    /// version a build that pins none resolves to, and the images the catalogue
+    /// publishes cannot disagree. Nothing an account does writes a catalogue entry, so
+    /// each version reports the instant the catalogue was published.
+    pub fn managed_base_image_versions(
+        &self,
+        image_id: &str,
+        region: &str,
+    ) -> Vec<ManagedBaseImageVersion> {
+        published_managed_base_image_versions(image_id)
+            .into_iter()
+            .map(|image_version| ManagedBaseImageVersion {
+                image_arn: managed_base_image_arn(region, image_id),
+                image_version: image_version.to_string(),
+                status: MANAGED_VERSION_STATUS_AVAILABLE.to_string(),
+                created_at: self.managed_catalogue_published_at,
+                updated_at: Some(self.managed_catalogue_published_at),
+            })
+            .collect()
+    }
+
     /// How many MicroVMs are not terminated — what [`MAX_ACTIVE_MICROVMS`] caps.
     pub fn active_microvm_count(&self) -> usize {
         self.microvms
@@ -820,13 +947,22 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     ///
     /// `baseImageVersion` is "the specific version of the base MicroVM image to use",
     /// so the service resolves one rather than recording none: the base image's own
-    /// active version when this account holds it, and otherwise — an AWS-managed base
-    /// image, whose catalogue this emulator does not hold — that image's initial
-    /// version, [`FIRST_IMAGE_VERSION`].
+    /// active version when this account holds it, the newest version the AWS-managed
+    /// catalogue publishes for it when the ARN names a managed image
+    /// ([`latest_managed_base_image_version`] — the same set
+    /// `ListManagedMicrovmImageVersions` serves), and otherwise the initial version,
+    /// [`FIRST_IMAGE_VERSION`].
     pub fn resolve_base_image_version(&self, base_image_arn: &str) -> String {
-        self.image(base_image_arn)
+        if let Some(active) = self
+            .image(base_image_arn)
             .and_then(|image| image.latest_active_image_version.clone())
-            .unwrap_or_else(|| FIRST_IMAGE_VERSION.to_string())
+        {
+            return active;
+        }
+        managed_microvm_image_id(base_image_arn)
+            .and_then(latest_managed_base_image_version)
+            .unwrap_or(FIRST_IMAGE_VERSION)
+            .to_string()
     }
 
     /// The MicroVM `identifier` names, for mutation.

@@ -266,6 +266,11 @@ mod global_settings;
 #[path = "all/agent_context_updates.rs"]
 mod agent_context_updates;
 
+// Declared last for the same reason as the declarations above: modules are appended here
+// so a new suite does not collide with another insertion.
+#[path = "all/template_shares.rs"]
+mod template_shares;
+
 // Declared last for the same reason as the declarations above: the sorted position for a
 // profile suite falls in a crowded run of this list.
 #[path = "all/profile_revisions.rs"]

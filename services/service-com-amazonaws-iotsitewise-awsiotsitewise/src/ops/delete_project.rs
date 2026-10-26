@@ -154,25 +154,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The project goes, ARN and tags with it: the record owns its own tag set, so
-        // removing it is what makes the tagging operations stop resolving its ARN. An
-        // id that resolves to no stored project is the modelled 404 rather than a
-        // silent success — which is also what a retry carrying the `clientToken` of a
-        // delete that already landed gets, because this store keeps no token ->
-        // answer mapping to replay from, exactly as the creates in this crate leave it
-        // to the idempotency issue.
+        // removing it is what makes the tagging operations stop resolving its ARN. The
+        // dashboards the project CONTAINED go with it, through the one state helper
+        // that states that containment ([`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::forget_project`]),
+        // which a portal's delete removes its projects through too: a dashboard is
+        // created in a project and names that project on every read, so one whose
+        // project is gone could never have been created. The access policies that name
+        // the project are left alone — a policy is a resource of its own, addressed by
+        // its own id and removed by `DeleteAccessPolicy`. An id that resolves to no
+        // stored project is the modelled 404 rather than a silent success — which is
+        // also what a retry carrying the `clientToken` of a delete that already landed
+        // gets, because this store keeps no token -> answer mapping to replay from,
+        // exactly as the creates in this crate leave it to the idempotency issue.
         let mut store = state.lock();
-        if store.projects.remove(&input.project_id).is_none() {
+        if store.forget_project(&input.project_id).is_none() {
             return Err(not_found(&input.project_id));
         }
-
-        // The dashboards the project CONTAINED go with it: a dashboard is created in a
-        // project and names that project on every read, so one whose project is gone
-        // could never have been created. The access policies that name the project are
-        // left alone — a policy is a resource of its own, addressed by its own id and
-        // removed by `DeleteAccessPolicy`.
-        store
-            .dashboards
-            .retain(|_, dashboard| dashboard.project_id != input.project_id);
 
         Ok(DeleteProjectOutput {})
     }
