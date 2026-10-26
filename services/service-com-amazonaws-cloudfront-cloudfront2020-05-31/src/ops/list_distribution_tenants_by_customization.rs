@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDistributionTenantsByCustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDistributionTenantsByCustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the persisted distribution tenants associated with ONE customization, a page
+//! at a time: the request names either the ACM certificate ARN or the WAF web ACL ARN to
+//! filter by, `MaxItems` is the page size, `Marker` is the tenant id the previous page
+//! ended at, and `NextMarker` arrives exactly when tenants remain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDistributionTenantsByCustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A tenant is associated with a customization when its own stored `Customizations` names
+//! that ARN, so every summary — and the filter decision behind it — is read from the record
+//! the create or the last update persisted, never from the request being served.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +77,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::ops::Bound;
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -111,6 +113,13 @@ impl From<ListDistributionTenantsByCustomizationErrorModeled> for ListDistributi
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The sentence CloudFront answers a request that does not name exactly one customization
+/// to filter by: the operation's own documented rule, which states the condition and
+/// echoes no part of the request.
+const ONE_CUSTOMIZATION_REQUIRED_MESSAGE: &str =
+    "You must specify either the CertificateArn parameter or WebACLArn parameter, but not \
+     both in the same request.";
 
 /// The `ListDistributionTenantsByCustomization` operation.
 ///
@@ -146,20 +155,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDistributionTenantsByCustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDistributionTenantsByCustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDistributionTenantsByCustomization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of distribution tenants to return by the specified
+        // customization" — a page holds at least one item, so a non-positive size names no
+        // page at all. The size served is bounded above by this emulator's own page
+        // ceiling, the same one every listing of this service is bounded by.
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(
+                ListDistributionTenantsByCustomizationErrorModeled::InvalidArgument(
+                    crate::state::invalid_max_items(),
+                )
+                .into(),
+            );
+        };
+
+        // "You must specify either the CertificateArn parameter or WebACLArn parameter, but
+        // not both in the same request": the listing is about ONE customization, so a
+        // request that names neither describes no filter and one that names both describes
+        // two. A member carrying no value names nothing, so it does not specify a
+        // customization either.
+        let certificate_arn = input
+            .certificate_arn
+            .as_deref()
+            .filter(|arn| !arn.is_empty());
+        let web_acl_arn = input.web_acl_arn.as_deref().filter(|arn| !arn.is_empty());
+        let filter = match (certificate_arn, web_acl_arn) {
+            (Some(certificate_arn), None) => Customization::Certificate(certificate_arn),
+            (None, Some(web_acl_arn)) => Customization::WebAcl(web_acl_arn),
+            _ => {
+                return Err(
+                    ListDistributionTenantsByCustomizationErrorModeled::InvalidArgument(
+                        InvalidArgument {
+                            message: Some(ONE_CUSTOMIZATION_REQUIRED_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so no summary this listing
+        // reports carries a stale status.
+        store.settle(SystemTime::now());
+
+        // "The marker for the next set of results" is the tenant id the previous page ended
+        // at: a value that is not one was never a resume point this service handed out
+        // (`InvalidArgument`), and one that is but names no stored tenant names no entity,
+        // which is what this listing's `EntityNotFound` is about.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_distribution_tenant_id(marker) {
+                return Err(
+                    ListDistributionTenantsByCustomizationErrorModeled::InvalidArgument(
+                        InvalidArgument {
+                            message: Some(format!(
+                                "Marker {marker} is not a distribution tenant id returned by \
+                                 ListDistributionTenantsByCustomization"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if !store.distribution_tenants.contains_key(marker) {
+                return Err(
+                    ListDistributionTenantsByCustomizationErrorModeled::EntityNotFound(
+                        crate::state::distribution_tenant_not_found(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every tenant that carries the customization exactly
+        // once. The store is ordered by tenant id, so the resume point is a range bound
+        // rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut tenants: Vec<DistributionTenantSummary> = Vec::new();
+        let mut more_remain = false;
+        for (_, stored) in store
+            .distribution_tenants
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            // The tenant is part of this listing when the customization the request names
+            // is the one its own record carries. An ARN is the identity of a resource of
+            // another service, so it is compared whole, and a tenant that customizes the
+            // other kind — or that disables the setting it inherits, which names no ARN —
+            // carries none of this one.
+            let carries = match filter {
+                Customization::Certificate(arn) => {
+                    stored.customization_certificate_arn() == Some(arn)
+                }
+                Customization::WebAcl(arn) => stored.customization_web_acl_arn() == Some(arn),
+            };
+            if !carries {
+                continue;
+            }
+            if tenants.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            tenants.push(stored.to_summary());
+        }
+
+        Ok(ListDistributionTenantsByCustomizationOutput {
+            // The resume point the next request carries as its `Marker`: present exactly
+            // when tenants remain, carrying the id this page ended at. A page that left
+            // tenants behind is a FULL page, so it has a last summary to name.
+            next_marker: tenants
+                .last()
+                .filter(|_| more_remain)
+                .map(|summary| summary.id.clone()),
+            // "A list of distribution tenants with the specified customization" — every one
+            // of them read from its stored record.
+            distribution_tenant_list: Some(tenants),
+        })
     }
+}
+
+/// The ONE customization a request filters by: "either the CertificateArn parameter or
+/// WebACLArn parameter, but not both", so the two are alternatives rather than two
+/// independent filters.
+#[derive(Debug, Clone, Copy)]
+enum Customization<'a> {
+    /// `CertificateArn` — "filter by the ARN of the associated ACM certificate."
+    Certificate(&'a str),
+    /// `WebACLArn` — "filter by the ARN of the associated WAF web ACL."
+    WebAcl(&'a str),
 }

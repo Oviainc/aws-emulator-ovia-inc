@@ -66,7 +66,7 @@ pub(crate) fn window(
 /// `StartTime` is an epoch-seconds `Timestamp` on `restJson1`, so a request may spell it as
 /// an integer where the response renders it as a float; it is compared as a number to three
 /// decimal places rather than as JSON, which would make `1` and `1.0` different windows.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowKey {
     duration_unit: Option<String>,
     duration: Option<i64>,
@@ -102,6 +102,55 @@ pub(crate) fn keys_of(page: &Value) -> Vec<WindowKey> {
 /// The configurations `windows` states, in order.
 pub(crate) fn keys_sent(windows: &[Value]) -> Vec<WindowKey> {
     windows.iter().map(key_of).collect()
+}
+
+/// The windows a list page reports, as the JSON configurations a later call can name them by.
+pub(crate) fn windows_of(page: &Value) -> Vec<Value> {
+    page["ExclusionWindows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Assert that `reported` holds exactly the configurations `sent`, in order, in the form the
+/// service STORES them: every member as sent, and — where a row omitted `StartTime` — some
+/// concrete instant, since that member "defaults to current time if not specified"
+/// (`smithy_query(shape="ExclusionWindow")`, member `StartTime`). WHICH instant the service
+/// settles an omission to is pinned by the `exclusion_window_start_time` suite; here it is
+/// only required to be a real instant, so a suite about some other rule does not depend on
+/// the clock.
+pub(crate) fn assert_stored(case: &str, reported: &[WindowKey], sent: &[Value]) {
+    let expected = keys_sent(sent);
+    assert_eq!(
+        reported.len(),
+        expected.len(),
+        "case {case}: expected {} stored window(s), got {reported:?}",
+        expected.len()
+    );
+    for (index, (actual, wanted)) in reported.iter().zip(expected.iter()).enumerate() {
+        match wanted.start_time.as_ref() {
+            Some(stated) => assert_eq!(
+                actual.start_time.as_ref(),
+                Some(stated),
+                "case {case} window {index}: expected the StartTime sent ({stated}), got {actual:?}"
+            ),
+            None => assert!(
+                actual.start_time.is_some(),
+                "case {case} window {index}: expected a defaulted StartTime, got {actual:?}"
+            ),
+        }
+        assert_eq!(
+            WindowKey {
+                start_time: None,
+                ..actual.clone()
+            },
+            WindowKey {
+                start_time: None,
+                ..wanted.clone()
+            },
+            "case {case} window {index}: expected the configuration sent, got {actual:?}"
+        );
+    }
 }
 
 /// One `BatchUpdateExclusionWindows` call. A list the row leaves empty is omitted from the
@@ -280,8 +329,9 @@ fn window_table() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Every configuration the table spans is stored as sent, reported back by a later read, and
-/// removed again by that same configuration.
+/// Every configuration the table spans is stored as sent — bar the members the service
+/// defaults — reported back by a later read, and removed again by the configuration that read
+/// reports.
 ///
 /// The rows differ along what the rule generalises over: the duration unit, the duration, and
 /// which of the three optional members the configuration states.
@@ -313,13 +363,12 @@ async fn each_window_configuration_is_stored_reported_and_removed_by_its_configu
             status, 200,
             "case {label:?}: expected the read to succeed, got {status} with {page}"
         );
-        assert_eq!(
-            keys_of(&page),
-            keys_sent(std::slice::from_ref(&sent)),
-            "case {label:?}: expected the stored set to be the configuration sent, got {page}"
-        );
+        assert_stored(label, &keys_of(&page), std::slice::from_ref(&sent));
 
-        let (status, removed) = batch(&router, std::slice::from_ref(&name), &[], std::slice::from_ref(&sent)).await;
+        // A removal names a window by the configuration the read reports for it, which is the
+        // configuration sent with every server-defaulted member settled.
+        let stored = windows_of(&page);
+        let (status, removed) = batch(&router, std::slice::from_ref(&name), &[], &stored).await;
         assert_eq!(
             status, 200,
             "case {label:?}: expected the removal to succeed, got {status} with {removed}"
@@ -374,11 +423,7 @@ async fn one_call_applies_the_windows_to_every_slo_it_names() {
             status, 200,
             "case {name:?}: expected the read to succeed, got {status} with {page}"
         );
-        assert_eq!(
-            keys_of(&page),
-            keys_sent(&sent),
-            "case {name:?}: expected every window of the call, in the order sent, got {page}"
-        );
+        assert_stored(name, &keys_of(&page), &sent);
     }
 
     // The same SLO named twice, once by name and once by ARN, is one SLO: it is applied once
@@ -402,11 +447,7 @@ async fn one_call_applies_the_windows_to_every_slo_it_names() {
         "case repeated-id: expected the repeated SLO to be reported once, got {updated}"
     );
     let (_, page) = list(&router, repeated, "").await;
-    assert_eq!(
-        keys_of(&page),
-        keys_sent(&sent),
-        "case repeated-id: expected the windows to be stored once, got {page}"
-    );
+    assert_stored("repeated-id", &keys_of(&page), &sent);
 }
 
 /// A batch reports each id it could not apply the update to in `Errors`, and still applies it
@@ -474,11 +515,7 @@ async fn a_batch_reports_the_ids_it_could_not_apply_and_applies_the_rest() {
 
     for name in &stored {
         let (_, page) = list(&router, name, "").await;
-        assert_eq!(
-            keys_of(&page),
-            keys_sent(&sent),
-            "case {name:?}: expected the update to have been applied to this SLO, got {page}"
-        );
+        assert_stored(name, &keys_of(&page), &sent);
     }
 }
 
@@ -546,11 +583,7 @@ async fn a_batch_that_applies_to_nothing_is_refused_with_the_modelled_exception(
             "case {label:?}: expected the refusal to name the member and the requirement, got {error}"
         );
         let (_, page) = list(&router, stored, "").await;
-        assert_eq!(
-            keys_of(&page),
-            keys_sent(&sent),
-            "case {label:?}: expected the refused removal to leave the set untouched, got {page}"
-        );
+        assert_stored(label, &keys_of(&page), &sent);
     }
 }
 
@@ -582,15 +615,14 @@ async fn an_slo_holds_at_most_ten_exclusion_windows() {
         "case fill: expected ten windows to be accepted, got {status} with {updated}"
     );
     let (_, page) = list(&router, name, "").await;
-    assert_eq!(
-        keys_of(&page),
-        keys_sent(&full),
-        "case fill: expected all ten windows in the order added, got {page}"
-    );
+    assert_stored("fill", &keys_of(&page), &full);
+    // The ten windows as the service stores them: the configurations sent, each with its
+    // `StartTime` settled, which is how a later call names a window it already holds.
+    let stored = windows_of(&page);
 
     // Re-adding configurations the SLO already holds is a no-op: the set is identified by
     // configuration, so no slot is consumed and the call succeeds.
-    let (status, updated) = batch(&router, &[name.to_string()], &full[..3], &[]).await;
+    let (status, updated) = batch(&router, &[name.to_string()], &stored[..3], &[]).await;
     assert_eq!(
         status, 200,
         "case repeat: expected re-adding stored configurations to succeed, got {status} with {updated}"
@@ -598,7 +630,7 @@ async fn an_slo_holds_at_most_ten_exclusion_windows() {
     let (_, page) = list(&router, name, "").await;
     assert_eq!(
         keys_of(&page),
-        keys_sent(&full),
+        keys_sent(&stored),
         "case repeat: expected the set to be unchanged, got {page}"
     );
 
@@ -626,7 +658,7 @@ async fn an_slo_holds_at_most_ten_exclusion_windows() {
     let (_, page) = list(&router, name, "").await;
     assert_eq!(
         keys_of(&page),
-        keys_sent(&full),
+        keys_sent(&stored),
         "case overflow: expected the refused addition to leave the set untouched, got {page}"
     );
 
@@ -636,21 +668,17 @@ async fn an_slo_holds_at_most_ten_exclusion_windows() {
         &router,
         &[name.to_string()],
         std::slice::from_ref(&eleventh),
-        &full[..1],
+        &stored[..1],
     )
     .await;
     assert_eq!(
         status, 200,
         "case replace: expected a removal plus an addition to succeed at the limit, got {status} with {updated}"
     );
-    let mut expected: Vec<Value> = full[1..].to_vec();
+    let mut expected: Vec<Value> = stored[1..].to_vec();
     expected.push(eleventh);
     let (_, page) = list(&router, name, "").await;
-    assert_eq!(
-        keys_of(&page),
-        keys_sent(&expected),
-        "case replace: expected the removed window gone and the new one last, got {page}"
-    );
+    assert_stored("replace", &keys_of(&page), &expected);
 }
 
 /// A read pages over the window set: following `NextToken` reports every window exactly once,
@@ -673,11 +701,7 @@ async fn a_read_pages_over_the_window_set_for_every_page_size_the_model_admits()
     // between, plus the omitted bound, which reports the whole set.
     for max_results in [Some(1), Some(2), Some(3), Some(5), Some(10), None] {
         let (collected, pages) = paged(&router, name, max_results).await;
-        assert_eq!(
-            collected,
-            keys_sent(&sent),
-            "case {max_results:?}: expected every window exactly once in the stored order"
-        );
+        assert_stored(&format!("MaxResults {max_results:?}"), &collected, &sent);
         let expected_pages = max_results.map_or(1, |size| sent.len().div_ceil(size).max(1));
         assert_eq!(
             pages, expected_pages,
@@ -807,9 +831,5 @@ async fn a_batch_with_no_windows_changes_nothing() {
         "case no-op: expected the id to be reported as processed, got {updated}"
     );
     let (_, page) = list(&router, name, "").await;
-    assert_eq!(
-        keys_of(&page),
-        keys_sent(&sent),
-        "case no-op: expected the stored set to be unchanged, got {page}"
-    );
+    assert_stored("no-op", &keys_of(&page), &sent);
 }

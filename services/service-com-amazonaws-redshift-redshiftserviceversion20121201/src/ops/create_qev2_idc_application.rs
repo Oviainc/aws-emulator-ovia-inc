@@ -179,11 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name carry modelled length and pattern constraints, which the boundary
         // validator already refused by the time this handler runs.
         if input.idc_instance_arn.len() > st::MAX_ARN_LENGTH {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                "Invalid value for IdcInstanceArn: the value is {} characters long; an Amazon Resource Name (ARN) is at most {} characters.",
-                input.idc_instance_arn.len(),
-                st::MAX_ARN_LENGTH
-            )));
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::arn_too_long_message("IdcInstanceArn", input.idc_instance_arn.len()),
+            ));
         }
         if !st::is_arn(&input.idc_instance_arn) {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(

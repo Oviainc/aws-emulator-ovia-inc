@@ -224,14 +224,27 @@ pub fn is_open_request_status(status: &str) -> bool {
 /// request with no usable credential scope is served as.
 pub const TEMPLATE_HOME_REGION: &str = "us-east-1";
 
-/// How long a quota increase request stays `PENDING` before it is decided.
+/// How long a quota increase request stays `PENDING` before the support case that
+/// processes it is opened.
+///
+/// CHOSEN, not an AWS-documented duration: Service Quotas publishes no deadline for
+/// taking a request up. It is kept inside the 250-750 ms band this project fixes for
+/// a transition the clock owes, so a caller that reads the request straight after
+/// making it still observes `PENDING`, and nothing ever sleeps: the due instant is
+/// stored on the request and materialised on the next read that is already past it.
+/// It is the same length as [`REQUEST_DECISION_DELAY`] and a different fact: this one
+/// is how long a request waits to be taken up, that one how long its review takes.
+pub const SUPPORT_CASE_OPEN_DELAY: Duration = Duration::from_millis(500);
+
+/// How long the support case reviewing a quota increase request stays open before the
+/// request is decided.
 ///
 /// CHOSEN, not an AWS-documented duration: a real increase is decided by Service
 /// Quotas' own review and publishes no deadline. It is kept inside the 250-750 ms
 /// band this project fixes for a transition the clock owes, so a caller that reads
-/// the request straight after making it still observes `PENDING`, and nothing ever
-/// sleeps: the due instant is stored on the request and materialised on the next
-/// read that is already past it.
+/// the request straight after its case was opened still observes `CASE_OPENED`, and
+/// nothing ever sleeps: the due instant is stored on the request and materialised on
+/// the next read that is already past it.
 pub const REQUEST_DECISION_DELAY: Duration = Duration::from_millis(500);
 
 /// How far back the SERVICE-WIDE quota request history reaches.
@@ -519,12 +532,15 @@ pub struct QuotaRequest {
     pub status: String,
     pub created: SystemTime,
     pub last_updated: SystemTime,
-    /// When the request becomes due for a decision. Stored, never slept on.
-    pub decided_at: SystemTime,
+    /// When the request's next clock-owed step comes due: opening the support case
+    /// that processes it while it is still `PENDING`, and the decision on it once a
+    /// case is open. Stored, never slept on.
+    pub due_at: SystemTime,
     /// `Requester` — the identity that made the request.
     pub requester: String,
-    /// `CaseId`: `None` until a support case is opened for the request, which is what
-    /// `CreateSupportCase` does.
+    /// `CaseId`: `None` until a support case is opened for the request — by Service
+    /// Quotas itself once the request has been taken up (unless its submitter opted
+    /// out of a case), or by `CreateSupportCase` before then.
     pub case_id: Option<String>,
     /// `SupportCaseAllowed`, as the request carried it (or
     /// [`SUPPORT_CASE_ALLOWED_BY_DEFAULT`] when it carried nothing). `false` is the
@@ -908,7 +924,8 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// the RESOURCE level and applies to that resource alone.
     ///
     /// `support_case_allowed` is recorded, not acted on: it is what
-    /// [`Self::settle_due_requests`] reads when the decision comes due.
+    /// [`Self::settle_due_requests`] reads when the request is taken up, to decide
+    /// whether a support case is opened for it.
     #[allow(clippy::too_many_arguments)]
     pub fn record_request(
         &mut self,
@@ -938,7 +955,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             status: STATUS_PENDING.to_string(),
             created: now,
             last_updated: now,
-            decided_at: now + REQUEST_DECISION_DELAY,
+            due_at: now + SUPPORT_CASE_OPEN_DELAY,
             requester,
             case_id: None,
             support_case_allowed,
@@ -963,83 +980,99 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .map_or(0, |state| state.request_order.len())
     }
 
-    /// Materialise every decision the clock has already made due in `region`.
+    /// Materialise every step the clock has already made due on `region`'s quota
+    /// increase requests.
     ///
-    /// An OPEN request ([`is_open_request_status`]) whose `decided_at` has passed is
-    /// decided by whether a support case reviews it:
+    /// An OPEN request ([`is_open_request_status`]) whose `due_at` has passed takes
+    /// the next step of the workflow its submitter asked for:
     ///
-    /// * a case reviews it — because `SupportCaseAllowed` let Service Quotas open one
-    ///   (the model's default), or because `CreateSupportCase` opened one for it — so
-    ///   the increase is `APPROVED` and its desired value becomes the quota's applied
-    ///   value;
-    /// * no case reviews it — `SupportCaseAllowed = false` and nothing opened one
-    ///   since — so the request ends `NOT_APPROVED`: no `CaseId`, and NOTHING is put in
-    ///   force, so the quota keeps the value it had.
+    /// * it is still `PENDING` and no case has been opened for it, and
+    ///   `SupportCaseAllowed` lets Service Quotas open one (the model's default) — so
+    ///   the support case that processes the request is opened: the request moves to
+    ///   [`STATUS_CASE_OPENED`] carrying that case's `CaseId`, and the decision the
+    ///   case reviews becomes due in turn;
+    /// * it is still `PENDING` and no case has been opened for it because its
+    ///   submitter opted out of one (`SupportCaseAllowed = false`) — so the request
+    ///   ends `NOT_APPROVED`: no `CaseId`, and NOTHING is put in force, so the quota
+    ///   keeps the value it had;
+    /// * a support case is processing it — opened here or by `CreateSupportCase` — so
+    ///   the review it waits on is what decides it: the increase is `APPROVED` and its
+    ///   desired value becomes the quota's applied value.
     ///
-    /// This is the ONLY writer of the applied overlay, and the decision is owed at
-    /// `decided_at` whether or not anybody calls — so a reporting operation may settle
-    /// it before answering, and reading twice yields the same answer.
+    /// One call can owe MORE than one step (a request minted long enough ago has had
+    /// its case opened AND the decision on that case fall due), so the steps are
+    /// materialised until none is due: every step is owed at its own `due_at` whether
+    /// or not anybody calls, which is why a reporting operation may settle them before
+    /// answering and reading twice yields the same answer. Each step either ends the
+    /// request or moves it one place along `PENDING` -> `CASE_OPENED` -> decided, so
+    /// the walk terminates.
     ///
-    /// The overlay goes where the quota's own scope says: account-wide for a
-    /// `GlobalQuota`, this region for a regional one.
+    /// This is the ONLY writer of the applied overlay, and the overlay goes where the
+    /// quota's own scope says: account-wide for a `GlobalQuota`, this region for a
+    /// regional one.
     pub fn settle_due_requests(&mut self, region: &str, now: SystemTime) {
-        let Some(state) = self.regions.get(region) else {
-            return;
-        };
-        let due: Vec<String> = state
-            .request_order
-            .iter()
-            .filter(|id| {
-                state
-                    .quota_requests
-                    .get(*id)
-                    .is_some_and(|request| {
-                        is_open_request_status(&request.status) && request.decided_at <= now
+        loop {
+            let Some(state) = self.regions.get(region) else {
+                return;
+            };
+            let due: Vec<String> = state
+                .request_order
+                .iter()
+                .filter(|id| {
+                    state.quota_requests.get(*id).is_some_and(|request| {
+                        is_open_request_status(&request.status) && request.due_at <= now
                     })
-            })
-            .cloned()
-            .collect();
-        if due.is_empty() {
-            return;
-        }
-
-        // The decision: flip the stored requests, and note the overlay each APPROVED
-        // one puts in force. A request no support case ever reviewed settles to
-        // NOT_APPROVED and contributes no overlay.
-        let mut decided: Vec<(AppliedKey, AppliedQuota)> = Vec::new();
-        if let Some(state) = self.regions.get_mut(region) {
-            for id in due {
-                let Some(request) = state.quota_requests.get_mut(&id) else {
-                    continue;
-                };
-                // The decision happened when it came due, not when somebody looked.
-                request.last_updated = request.decided_at;
-                if request.case_id.is_none() && !request.support_case_allowed {
-                    request.status = STATUS_NOT_APPROVED.to_string();
-                    continue;
-                }
-                request.status = STATUS_APPROVED.to_string();
-                decided.push((
-                    (
-                        request.service_code.clone(),
-                        request.quota_code.clone(),
-                        request.context_id.clone(),
-                    ),
-                    AppliedQuota {
-                        value: request.desired_value,
-                    },
-                ));
+                })
+                .cloned()
+                .collect();
+            if due.is_empty() {
+                return;
             }
-        }
 
-        for (key, applied) in decided {
-            if self
-                .default_quota(&key.0, &key.1)
-                .is_some_and(|quota| quota.global_quota)
-            {
-                self.global_applied_quotas.insert(key, applied);
-            } else if let Some(state) = self.regions.get_mut(region) {
-                state.applied_quotas.insert(key, applied);
+            // Take each due request's next step, and note the overlay each APPROVED
+            // one puts in force. A request no support case ever reviewed settles to
+            // NOT_APPROVED and contributes no overlay.
+            let mut decided: Vec<(AppliedKey, AppliedQuota)> = Vec::new();
+            if let Some(state) = self.regions.get_mut(region) {
+                for id in due {
+                    let Some(request) = state.quota_requests.get_mut(&id) else {
+                        continue;
+                    };
+                    // The step happened when it came due, not when somebody looked.
+                    let due_at = request.due_at;
+                    if request.status == STATUS_PENDING && request.case_id.is_none() {
+                        if request.support_case_allowed {
+                            open_case_on(request, due_at);
+                        } else {
+                            request.status = STATUS_NOT_APPROVED.to_string();
+                            request.last_updated = due_at;
+                        }
+                        continue;
+                    }
+                    request.status = STATUS_APPROVED.to_string();
+                    request.last_updated = due_at;
+                    decided.push((
+                        (
+                            request.service_code.clone(),
+                            request.quota_code.clone(),
+                            request.context_id.clone(),
+                        ),
+                        AppliedQuota {
+                            value: request.desired_value,
+                        },
+                    ));
+                }
+            }
+
+            for (key, applied) in decided {
+                if self
+                    .default_quota(&key.0, &key.1)
+                    .is_some_and(|quota| quota.global_quota)
+                {
+                    self.global_applied_quotas.insert(key, applied);
+                } else if let Some(state) = self.regions.get_mut(region) {
+                    state.applied_quotas.insert(key, applied);
+                }
             }
         }
     }
@@ -1052,15 +1085,13 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// Open a support case for the stored quota increase request `id` and return the
     /// record as it now stands — or why no case was opened.
     ///
-    /// Opening a case is what `CreateSupportCase` does: the request keeps its `Id`,
-    /// `DesiredValue` and `Created`, and gains a `CaseId` and the
-    /// [`STATUS_CASE_OPENED`] status its `Status` member documents. The case is the
-    /// review the decision waits on, so the decision becomes due
-    /// [`REQUEST_DECISION_DELAY`] after the case was opened — never at that same
-    /// instant, so a caller reading straight afterwards sees the request under its new
-    /// status.
+    /// Opening a case ON DEMAND is what `CreateSupportCase` does, and Service Quotas
+    /// opens one itself for a request that allows it ([`Self::settle_due_requests`]);
+    /// both go through [`open_case_on`], so a case opened either way is the same
+    /// record: the request keeps its `Id`, `DesiredValue` and `Created`, and gains a
+    /// `CaseId` and the [`STATUS_CASE_OPENED`] status its `Status` member documents.
     ///
-    /// The caller must have settled the decisions the clock already owes
+    /// The caller must have settled the steps the clock already owes
     /// ([`Self::settle_due_requests`]) first, so a request whose decision was already
     /// due is seen in the status it had earned rather than as still open.
     pub fn open_support_case(
@@ -1086,10 +1117,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         if let Some(case_id) = request.case_id.clone() {
             return Err(SupportCaseRefusal::CaseAlreadyOpen { case_id });
         }
-        request.case_id = Some(support_case_id(&request.id, now));
-        request.status = STATUS_CASE_OPENED.to_string();
-        request.last_updated = now;
-        request.decided_at = now + REQUEST_DECISION_DELAY;
+        open_case_on(request, now);
         Ok(request.clone())
     }
 
@@ -1690,6 +1718,25 @@ fn request_id(
 /// `^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` and its 1..128 length.
 fn report_id(region: &str, sequence: u64, now: SystemTime) -> String {
     derive_id(&format!("report:{region}:{sequence}"), now)
+}
+
+/// Open the support case that processes `request`, as of `at`.
+///
+/// The ONE place a case is opened, so a case Service Quotas opened itself and one
+/// `CreateSupportCase` asked for are the same record: the request gains the case's
+/// `CaseId` and the [`STATUS_CASE_OPENED`] status its `Status` member documents, and
+/// the decision the case reviews becomes due [`REQUEST_DECISION_DELAY`] after the case
+/// was opened — never at that same instant, so a caller reading straight afterwards
+/// sees the request under its new status. Nothing else about the request moves: a case
+/// is opened ON the stored request.
+///
+/// The caller has already checked that the request is still awaiting a decision and
+/// carries no case.
+fn open_case_on(request: &mut QuotaRequest, at: SystemTime) {
+    request.case_id = Some(support_case_id(&request.id, at));
+    request.status = STATUS_CASE_OPENED.to_string();
+    request.last_updated = at;
+    request.due_at = at + REQUEST_DECISION_DELAY;
 }
 
 /// Derive the `CaseId` of the support case opened for one quota increase request.

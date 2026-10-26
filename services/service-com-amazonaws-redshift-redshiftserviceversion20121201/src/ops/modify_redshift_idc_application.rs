@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyRedshiftIdcApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyRedshiftIdcApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyRedshiftIdcApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: changes the members a request names on one Redshift IAM Identity Center
+//! application. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +150,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyRedshiftIdcApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyRedshiftIdcApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyRedshiftIdcApplication"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyRedshiftIdcApplicationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The IAM role ARN is modelled only by length, so a value that is no ARN
+        // at all names no role and is refused before anything is written — the
+        // same two refusals the create makes on the same member, so both
+        // operations describe the same bad value identically. The display name
+        // and the identity namespace carry modelled pattern and length
+        // constraints, already refused by the time this handler runs.
+        if let Some(iam_role_arn) = input.iam_role_arn.as_deref() {
+            if iam_role_arn.len() > st::MAX_ARN_LENGTH {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::arn_too_long_message("IamRoleArn", iam_role_arn.len()),
+                ));
+            }
+            if !st::is_arn(iam_role_arn) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::not_an_arn_message("IamRoleArn", iam_role_arn),
+                ));
+            }
+        }
+
+        // The token issuers a modify replaces the list with are ARN-valued on
+        // the same terms, and are held to the same rule as the create's.
+        if let Err(message) = st::check_authorized_token_issuers(
+            input.authorized_token_issuer_list.as_deref().unwrap_or_default(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+        }
+
+        let mut store = state.lock();
+
+        // One precondition, the one every operation taking a
+        // `RedshiftIdcApplicationArn` enforces: the ARN must name an application
+        // the account created.
+        let Some(position) =
+            store.redshift_idc_application_position(&input.redshift_idc_application_arn)
+        else {
+            return Err(
+                ModifyRedshiftIdcApplicationErrorModeled::RedshiftIdcApplicationNotExistsFault(
+                    RedshiftIdcApplicationNotExistsFault {
+                        message: Some(st::redshift_idc_application_not_exists(
+                            &input.redshift_idc_application_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only the members the request NAMES change: a modify that carries no
+        // display name leaves the application's display name exactly as it was,
+        // and one that carries an empty list sets an empty list, which is a
+        // value the request named.
+        let application = &mut store.redshift_idc_applications[position];
+        if let Some(identity_namespace) = input.identity_namespace.as_deref() {
+            application.identity_namespace = Some(identity_namespace.to_string());
+        }
+        if let Some(iam_role_arn) = input.iam_role_arn.as_deref() {
+            application.iam_role_arn = Some(iam_role_arn.to_string());
+        }
+        if let Some(display_name) = input.idc_display_name.as_deref() {
+            application.idc_display_name = Some(display_name.to_string());
+        }
+        if let Some(issuers) = input.authorized_token_issuer_list.clone() {
+            application.authorized_token_issuer_list = Some(issuers);
+        }
+        if let Some(integrations) = input.service_integrations.clone() {
+            application.service_integrations = Some(integrations);
+        }
+
+        Ok(ModifyRedshiftIdcApplicationOutput {
+            redshift_idc_application: Some(application.clone()),
+        })
     }
 }

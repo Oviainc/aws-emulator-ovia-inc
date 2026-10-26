@@ -43,6 +43,8 @@ mod policy_catalog;
 mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/refused_write_mints_nothing.rs"]
+mod refused_write_mints_nothing;
 #[path = "all/rejection_wording.rs"]
 mod rejection_wording;
 #[path = "all/reserved_tag_namespace.rs"]

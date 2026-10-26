@@ -80,7 +80,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_hosted_zone, normalize_zone_id, MAX_VPC_AUTHORIZATIONS_PER_PAGE};
+use crate::state::{
+    invalid_pagination_token, no_such_hosted_zone, normalize_zone_id,
+    MAX_VPC_AUTHORIZATIONS_PER_PAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -179,16 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the authorization list itself, so a page always resumes at the same
         // authorization however the list has changed in between, and a token
         // naming an authorization this zone does not hold is the modelled
-        // `InvalidPaginationToken` rather than a silently empty page.
+        // `InvalidPaginationToken` rather than a silently empty page. What the
+        // token ENCODES is this service's own business, so the refusal names
+        // the token that arrived and nothing else.
         let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             Some(token) => zone.vpc_authorization_position(token).ok_or_else(|| {
                 ListVPCAssociationAuthorizationsErrorModeled::InvalidPaginationToken(
-                    InvalidPaginationToken {
-                        message: Some(format!(
-                            "The specified pagination token is not valid: {token:?} names no VPC \
-                             authorized for hosted zone {zone_id}"
-                        )),
-                    },
+                    invalid_pagination_token(token),
                 )
             })?,
             None => 0,

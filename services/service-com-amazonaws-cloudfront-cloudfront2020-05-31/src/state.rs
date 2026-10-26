@@ -63,8 +63,9 @@ use crate::ops::types::{
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
     CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     Customizations, DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
-    DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound,
-    FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig, ForwardedValues,
+    DistributionTenant, DistributionTenantSummary, DomainResult, EntityAlreadyExists,
+    EntityNotFound, FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
+    ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateDetails, ManagedCertificateRequest, MonitoringSubscription,
@@ -1840,6 +1841,21 @@ impl StoredDistributionTenant {
         tags_projection(&self.tags)
     }
 
+    /// The `DomainResult` list every projection of this tenant reports: the domains it
+    /// holds, in the order they were associated, each in [`DOMAIN_STATUS_ACTIVE`].
+    ///
+    /// ONE mapping, so the full document and a listing's summary cannot drift apart about a
+    /// tenant's domains.
+    fn to_domain_results(&self) -> Vec<DomainResult> {
+        self.domains
+            .iter()
+            .map(|domain| DomainResult {
+                domain: domain.clone(),
+                status: Some(DOMAIN_STATUS_ACTIVE.to_string()),
+            })
+            .collect()
+    }
+
     /// The `DistributionTenant` projection every distribution tenant operation returns,
     /// read from the one stored record.
     pub fn to_distribution_tenant(&self) -> DistributionTenant {
@@ -1848,15 +1864,7 @@ impl StoredDistributionTenant {
             distribution_id: Some(self.distribution_id.clone()),
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
-            domains: Some(
-                self.domains
-                    .iter()
-                    .map(|domain| DomainResult {
-                        domain: domain.clone(),
-                        status: Some(DOMAIN_STATUS_ACTIVE.to_string()),
-                    })
-                    .collect(),
-            ),
+            domains: Some(self.to_domain_results()),
             tags: Some(self.to_tags()),
             customizations: self.customizations.clone(),
             // A tenant that was created with no parameter values carries none, rather
@@ -1870,6 +1878,58 @@ impl StoredDistributionTenant {
             enabled: Some(self.enabled),
             status: Some(self.status.clone()),
         }
+    }
+
+    /// The `DistributionTenantSummary` projection every LISTING of distribution tenants
+    /// reports, read from the same stored record [`Self::to_distribution_tenant`] reads, so
+    /// a listing and a single-tenant read can never disagree about one tenant.
+    ///
+    /// The summary carries the tenant's current version (`DistributionTenantSummary$ETag`),
+    /// which the full projection reports beside the document rather than inside it; every
+    /// other member is the same value under the same name. A summary carries no
+    /// `Parameters`, so the parameter values a tenant holds are reached through a read of
+    /// the tenant itself.
+    pub fn to_summary(&self) -> DistributionTenantSummary {
+        DistributionTenantSummary {
+            id: self.id.clone(),
+            distribution_id: self.distribution_id.clone(),
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            domains: self.to_domain_results(),
+            connection_group_id: Some(self.connection_group_id.clone()),
+            customizations: self.customizations.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_time),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            e_tag: self.etag.clone(),
+            enabled: Some(self.enabled),
+            status: Some(self.status.clone()),
+        }
+    }
+
+    /// The ARN of the ACM certificate this tenant's customizations name, or `None` when its
+    /// customizations name none.
+    ///
+    /// `Customizations$Certificate` is "the Certificate Manager (ACM) certificate" the
+    /// tenant overrides its distribution's with, so the ARN a tenant is associated with is
+    /// the one in that member of its stored record — never one derived from anything else.
+    pub fn customization_certificate_arn(&self) -> Option<&str> {
+        self.customizations
+            .as_ref()?
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.arn.as_str())
+    }
+
+    /// The ARN of the WAF web ACL this tenant's customizations name, or `None` when its
+    /// customizations name none — which includes a customization that DISABLES the web ACL
+    /// it inherits, since disabling names no ARN.
+    pub fn customization_web_acl_arn(&self) -> Option<&str> {
+        self.customizations
+            .as_ref()?
+            .web_acl
+            .as_ref()?
+            .arn
+            .as_deref()
     }
 }
 
@@ -5208,6 +5268,20 @@ pub fn is_streaming_distribution_id(value: &str) -> bool {
 pub fn is_connection_group_id(value: &str) -> bool {
     value
         .strip_prefix(CONNECTION_GROUP_ID_PREFIX)
+        .is_some_and(is_token_body)
+}
+
+/// Whether `value` has the shape of a distribution tenant id this service mints
+/// ([`DISTRIBUTION_TENANT_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of the id
+/// alphabet).
+///
+/// A distribution tenant listing's `Marker` is "the marker for the next set of results",
+/// which is a tenant id this service handed out, and the model constrains it no further
+/// than `string` — so this is what tells a resume point the service issued from a value a
+/// client made up.
+pub fn is_distribution_tenant_id(value: &str) -> bool {
+    value
+        .strip_prefix(DISTRIBUTION_TENANT_ID_PREFIX)
         .is_some_and(is_token_body)
 }
 

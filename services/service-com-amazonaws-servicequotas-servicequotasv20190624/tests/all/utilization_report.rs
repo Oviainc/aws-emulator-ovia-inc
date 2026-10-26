@@ -42,8 +42,10 @@ use crate::quota_workflow::{base64_of, client, emulator, walk_pages, Client};
 /// started before this wait has completed afterwards.
 const PAST_COMPLETION: Duration = Duration::from_millis(1_200);
 
-/// Comfortably past `crate::state::REQUEST_DECISION_DELAY` (500 ms).
-const PAST_DECISION: Duration = Duration::from_millis(1_200);
+/// Comfortably past BOTH steps the clock owes a quota increase request
+/// (`crate::state::SUPPORT_CASE_OPEN_DELAY`, then
+/// `crate::state::REQUEST_DECISION_DELAY` once its support case is open).
+const PAST_DECISION: Duration = Duration::from_millis(1_800);
 
 /// Start a report and return its `ReportId`.
 async fn start_report(client: &Client) -> String {

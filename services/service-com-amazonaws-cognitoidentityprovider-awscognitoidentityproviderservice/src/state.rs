@@ -27,7 +27,8 @@ use crate::ops::types::{
     RiskExceptionConfigurationType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, SmsMfaConfigType,
     SoftwareTokenMfaConfigType, StringAttributeConstraintsType,
-    TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType,
+    TermsDescriptionType, TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType,
+    UserImportJobType,
     UserPoolAddOnsType,
     UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
     UsernameConfigurationType, VerificationMessageTemplateType, WebAuthnConfigurationType,
@@ -2678,6 +2679,20 @@ impl Terms {
                 .iter()
                 .map(|(language, url)| (language.clone(), url.clone()))
                 .collect(),
+            creation_date: to_date_time(self.creation_date),
+            last_modified_date: to_date_time(self.last_modified_date),
+        }
+    }
+
+    /// The summary view a listing renders of these terms documents: the subset
+    /// of the stored record `TermsDescriptionType` declares, so a list and a
+    /// describe of one document agree member for member on every member both
+    /// carry.
+    pub fn to_terms_description_type(&self) -> TermsDescriptionType {
+        TermsDescriptionType {
+            terms_id: self.terms_id.clone(),
+            terms_name: self.terms_name.clone(),
+            enforcement: self.enforcement.clone(),
             creation_date: to_date_time(self.creation_date),
             last_modified_date: to_date_time(self.last_modified_date),
         }

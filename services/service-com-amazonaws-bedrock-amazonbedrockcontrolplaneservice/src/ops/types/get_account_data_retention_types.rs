@@ -16,10 +16,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bedrock-amazonbedrockco
 pub struct GetAccountDataRetentionInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetAccountDataRetentionResponse")]
+/// `GetAccountDataRetentionResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `updatedAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetAccountDataRetention")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct GetAccountDataRetentionOutput {
     pub mode: String,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_schema_and_codec!(
+    GetAccountDataRetentionOutput,
+    GET_ACCOUNT_DATA_RETENTION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetAccountDataRetentionResponse",
+    "com.amazonaws.bedrock",
+    "GetAccountDataRetentionResponse",
+    (M_MODE, mode, "mode", 0, req, string),
+    (M_UPDATED_AT, updated_at, "updatedAt", 1, opt, date_time),
+);
 

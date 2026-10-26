@@ -2,19 +2,20 @@
 
 //! @op GetServiceSettings
 //!
-//! Reports the Quick Setup settings persisted for the account and region this
-//! request was signed for — what the last successful `UpdateServiceSettings` wrote
-//! there — or no `ServiceSettings` at all when that region has never been
-//! configured, which is how a client tells "Quick Setup is not configured here"
-//! from "it is".
+//! Reports the Quick Setup settings of the account and region this request was
+//! signed for — what the last successful `UpdateServiceSettings` wrote there.
+//!
+//! Settings are not a creatable resource: the operation models no way for them to be
+//! absent (its errors are AccessDenied/Conflict/InternalServer/Throttling, with no
+//! not-found and no validation error), so every account and region always has a
+//! settings record and every call reports the `ServiceSettings` structure. A region
+//! no update has configured is a 200 carrying that structure with its optional
+//! `ExplorerEnablingRoleArn` absent — the unconfigured state lives INSIDE the
+//! structure — never a 404, never a 501 and never a body without the member.
 //!
 //! `@readonly`: this handler only reads the store. It never writes, so a Get leaves
-//! the next caller seeing exactly what it saw, and it never fabricates a settings
-//! record for a region nothing was written for.
-//!
-//! The operation models no not-found error (its errors are
-//! AccessDenied/Conflict/InternalServer/Throttling), so an unconfigured region is a
-//! 200 whose optional `ServiceSettings` member is absent, never a 404 and never a 501.
+//! the next caller seeing exactly what it saw; reporting the structure for a region
+//! nothing was written for persists nothing.
 //!
 //! Hand-authored rather than scaffolded: the op-stub generator declined this
 //! operation because its input is `smithy.api#Unit` (recorded in
@@ -159,10 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::ServiceSettingsRecord::to_service_settings);
 
         Ok(GetServiceSettingsOutput {
-            // Absent, not an empty structure, when this region has never been
-            // configured: the member is optional, and reporting it empty would claim a
-            // settings record exists where none does.
-            service_settings: stored,
+            // Always present. A region no update has configured still HAS settings —
+            // the model gives the operation no way to report them missing — so its
+            // answer is the structure with every member it has nothing for left unset,
+            // which is exactly `ServiceSettings::default()`.
+            service_settings: Some(stored.unwrap_or_default()),
         })
     }
 }

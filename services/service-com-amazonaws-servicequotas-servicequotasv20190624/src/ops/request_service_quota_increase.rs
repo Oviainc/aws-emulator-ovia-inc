@@ -7,19 +7,25 @@
 //! `ListRequestedServiceQuotaChangeHistoryByQuota` read back the same record.
 //!
 //! The minted request carries a derived `Id`, `Status = PENDING`, and `Created` /
-//! `LastUpdated` timestamps. A request this emulator accepts is decided
-//! ([`crate::state::REQUEST_DECISION_DELAY`] after the call) by what its submitter
-//! asked for in `SupportCaseAllowed`:
+//! `LastUpdated` timestamps. A request this emulator accepts then walks the workflow
+//! its submitter asked for in `SupportCaseAllowed`, one clock-owed step at a time —
+//! nothing sleeps, each step's due instant is stored and materialised by the next read
+//! past it:
 //!
-//! * allowed (the model's default) — the request is `APPROVED` and its `DesiredValue`
-//!   is put in force as the quota's applied value; the AWS DEFAULT value is untouched,
-//!   which is why `GetAWSDefaultServiceQuota` keeps answering the same number;
+//! * allowed (the model's default) — Service Quotas opens the support case that
+//!   processes the request ([`crate::state::SUPPORT_CASE_OPEN_DELAY`] after the call):
+//!   it moves to `CASE_OPENED` carrying that case's `CaseId`, which is the case a
+//!   client follows up on. The review that case waits on then decides it
+//!   ([`crate::state::REQUEST_DECISION_DELAY`] later): the increase is `APPROVED` and
+//!   its `DesiredValue` is put in force as the quota's applied value, while the case
+//!   id it was processed under is kept. The AWS DEFAULT value is untouched, which is
+//!   why `GetAWSDefaultServiceQuota` keeps answering the same number;
 //! * `SupportCaseAllowed = false` — the submitter opted out of the support case that
-//!   reviews an increase, so AWS opens none and the request ends `NOT_APPROVED`: no
-//!   `CaseId`, and the quota keeps the value it had.
+//!   reviews an increase, so AWS opens none and the request goes straight from
+//!   `PENDING` to `NOT_APPROVED`: no `CaseId`, and the quota keeps the value it had.
 //!
-//! `CaseId` stays absent while nothing has opened a case: `CreateSupportCase` is what
-//! opens one for a request that is still awaiting a decision.
+//! `CreateSupportCase` is how a case is opened on a request BEFORE Service Quotas
+//! takes it up — including one whose submitter had opted out.
 //!
 //! A `ContextId` names the resource the increase is asked for, on a quota AWS
 //! publishes as adjustable per resource: the request is recorded at the `RESOURCE`

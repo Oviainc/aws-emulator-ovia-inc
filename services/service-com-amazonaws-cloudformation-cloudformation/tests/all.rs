@@ -51,6 +51,8 @@ mod generated_physical_names;
 mod generated_template_reads;
 #[path = "all/generated_templates.rs"]
 mod generated_templates;
+#[path = "all/handler_progress_reports.rs"]
+mod handler_progress_reports;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/hook_result_invocations.rs"]
