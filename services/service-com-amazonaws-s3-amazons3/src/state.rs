@@ -5527,6 +5527,43 @@ pub const DEFAULT_RESTORE_TIER: &str = "Standard";
 
 
 impl Object {
+    /// A freshly written object of `body`, as a write that names nothing about it beyond its
+    /// content type stores it.
+    ///
+    /// A convenience for a writer that carries only bytes — the data plane of another service
+    /// of this emulator delivering into a bucket — so it does not restate this struct's whole
+    /// member list: the entity tag is computed from the bytes the object is stored with, the
+    /// storage class is [`DEFAULT_STORAGE_CLASS`], the version id is minted by
+    /// [`ComAmazonawsS3Amazons3State::put_object`] rather than here, and the members a later
+    /// call places on a stored version — its tag set, its Object Lock retention and legal
+    /// hold, its restore and its annotations — are unset, which is the state a write leaves a
+    /// version in. S3's
+    /// own `PutObject` and `CopyObject` build the object they store themselves, because they
+    /// carry the cache-control, metadata, tag set and encryption configuration of the request.
+    pub fn stored(body: Vec<u8>, content_type: Option<String>) -> Self {
+        Self {
+            etag: object_etag(&body),
+            body,
+            version_id: None,
+            last_modified: SystemTime::now(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
+            content_type,
+            cache_control: None,
+            content_disposition: None,
+            content_encoding: None,
+            content_language: None,
+            expires: None,
+            website_redirect_location: None,
+            metadata: BTreeMap::new(),
+            tags: Vec::new(),
+            encryption: ObjectEncryption::default(),
+            retention: None,
+            legal_hold: None,
+            restore: None,
+            annotations: BTreeMap::new(),
+        }
+    }
+
     /// How many bytes this stored object retains: its payload AND every string kept
     /// beside it (its entity tag, storage class, the response headers it carries, its
     /// user-defined metadata and its tag set).

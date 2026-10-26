@@ -1123,6 +1123,7 @@ use crate::ops::types::{
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
     CapacityReservationCommitmentInfo, CapacityReservationInfo, ExportTask, FpgaImage,
     FpgaImageState, ImageUsageReport,
+    DestinationOptionsResponse, FlowLog, TagFieldSpecificationResponse,
     LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
@@ -2328,6 +2329,36 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// repeat of the same request answers with that gateway instead of creating a second
     /// one.
     pub carrier_gateway_client_tokens: HashMap<String, String>,
+    /// Every VPC flow log the account holds, by `FlowLogId`, as the modelled
+    /// [`FlowLog`] shape beside the one fact that shape carries no member for — the bytes
+    /// the record was charged ([`FlowLogRecord`]) — so a member a writer sets round-trips
+    /// through `DescribeFlowLogs` without a field-by-field copy that can silently drop one,
+    /// the way [`Self::vpcs`] holds [`Vpc`]s. Ordered by id, the one stable order that
+    /// describe reports and pages over, so a pagination token can name the id the next page
+    /// starts at.
+    ///
+    /// Starts EMPTY: nothing in AWS gives an account a flow log until `CreateFlowLogs`
+    /// turns one on. This map is also what separates "this account holds no such flow log"
+    /// from "that flow log is not selected by this request": `DeleteFlowLogs` resolves every
+    /// id it is given here before it removes anything, while `DescribeFlowLogs` treats the
+    /// ids it is given as a FILTER over the same map.
+    pub flow_logs: BTreeMap<String, FlowLogRecord>,
+    /// A `CreateFlowLogs` `ClientToken` and the flow log ids that request minted, so a
+    /// repeat of the same request answers with those flow logs instead of turning on a
+    /// second set: "Unique, case-sensitive identifier that you provide to ensure the
+    /// idempotency of the request" (`CreateFlowLogsRequest$ClientToken`).
+    ///
+    /// A LIST of ids, not one, because a single call monitors every resource in its
+    /// `ResourceIds` and mints one flow log per resource.
+    ///
+    /// What this map does NOT hold is the rest of the request the token came with, so a
+    /// token reused with DIFFERENT members answers with the flow logs the first request
+    /// minted rather than refusing it as a mismatched replay. That is the same arrangement
+    /// every client-token map of this crate has
+    /// ([`Self::carrier_gateway_client_tokens`], [`Self::volume_client_tokens`]); telling a
+    /// mismatched replay apart needs the original request kept beside the token, which is a
+    /// change those maps share and belongs to all of them at once rather than to this one.
+    pub flow_log_client_tokens: HashMap<String, Vec<String>>,
     /// Every Verified Access trust provider the account holds, by
     /// `VerifiedAccessTrustProviderId`, as the modelled
     /// [`crate::ops::types::VerifiedAccessTrustProvider`] shape itself — so a member a
@@ -2992,6 +3023,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             carrier_gateways: BTreeMap::new(),
             carrier_gateway_available_at: BTreeMap::new(),
             carrier_gateway_client_tokens: HashMap::new(),
+            // A fresh account monitors nothing, so it holds no flow log.
+            flow_logs: BTreeMap::new(),
+            flow_log_client_tokens: HashMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             // A fresh account has created no Verified Access instance, no group on one and
@@ -31181,6 +31215,481 @@ impl ComAmazonawsEc2Amazonec2State {
         self.release_stored_bytes(released);
         self.add_stored_bytes(charged);
         Some(view)
+    }
+}
+
+// =============================================================================
+// VPC flow logs
+// =============================================================================
+//
+// A flow log is the record of ONE monitored resource: "Creates one or more flow logs to
+// capture information about IP traffic for a specific network interface, subnet, or VPC"
+// (`CreateFlowLogs`), so a call naming N resources mints N flow logs. Each is stored as
+// the modelled `FlowLog` shape ([`ComAmazonawsEc2Amazonec2State::flow_logs`]) for the
+// reason a VPC is stored as a `Vpc`: `DescribeFlowLogs` reports exactly what the create
+// stored, so the two cannot disagree about one flow log.
+//
+// What the three flow-log operations SHARE lives here — the id mint, the documented
+// default record format, the status a stored flow log reports, the capacity ceiling and
+// the error codes a refusal carries — so `CreateFlowLogs`, `DescribeFlowLogs` and
+// `DeleteFlowLogs` cannot answer differently about the same flow log. Each operation's
+// own validation stays in its `src/ops/<operation>.rs` file.
+
+/// The record format a flow log created without a `LogFormat` gets: "If you omit this
+/// parameter, the flow log is created using the default format"
+/// (`CreateFlowLogsRequest$LogFormat`), which is the default set of fields AWS documents
+/// for a flow log record, in the order it documents them (Amazon VPC User Guide, "Flow log
+/// records" — the default format's field list).
+///
+/// A CONCRETE value rather than an absent member, because a client reads `LogFormat` to
+/// learn the layout of the records it is about to parse.
+pub const DEFAULT_FLOW_LOG_FORMAT: &str = "${version} ${account-id} ${interface-id} \
+                                           ${srcaddr} ${dstaddr} ${srcport} ${dstport} \
+                                           ${protocol} ${packets} ${bytes} ${start} \
+                                           ${end} ${action} ${log-status}";
+
+/// The status a stored flow log reports: "The status of the flow log (`ACTIVE`)"
+/// (`FlowLog$FlowLogStatus`) — the one value the member documents, and the status AWS
+/// answers a flow log in as soon as `CreateFlowLogs` has made it, so this store owes it no
+/// later move.
+pub const FLOW_LOG_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The destination type a `CreateFlowLogs` that names none gets: "Default:
+/// `cloud-watch-logs`" (`CreateFlowLogsRequest$LogDestinationType`). One of the
+/// `LogDestinationType` enum's members
+/// (`smithy_query(query="shape",shape="LogDestinationType")`).
+pub const LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS: &str = "cloud-watch-logs";
+
+/// The `LogDestinationType` member naming an S3 bucket.
+pub const LOG_DESTINATION_TYPE_S3: &str = "s3";
+
+/// The `LogDestinationType` member naming a Firehose delivery stream.
+pub const LOG_DESTINATION_TYPE_KINESIS_DATA_FIREHOSE: &str = "kinesis-data-firehose";
+
+/// The aggregation interval a `CreateFlowLogs` that names none gets: "Default: 600"
+/// (`CreateFlowLogsRequest$MaxAggregationInterval`).
+pub const DEFAULT_MAX_AGGREGATION_INTERVAL: i32 = 600;
+
+/// The aggregation intervals a flow log may be created with: "The possible values are 60
+/// seconds (1 minute) or 600 seconds (10 minutes)"
+/// (`CreateFlowLogsRequest$MaxAggregationInterval`), which `FlowLog$MaxAggregationInterval`
+/// repeats as "Valid Values: 60 | 600".
+pub const FLOW_LOG_AGGREGATION_INTERVALS: [i32; 2] = [60, DEFAULT_MAX_AGGREGATION_INTERVAL];
+
+/// The aggregation interval a transit gateway flow log must use: "This parameter must be 60
+/// seconds for transit gateway resource types"
+/// (`CreateFlowLogsRequest$MaxAggregationInterval`).
+pub const TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL: i32 = 60;
+
+/// The id prefix every flow log id carries (`fl-…`, the form EC2 reports a flow log under
+/// and `VpcFlowLogId` values take).
+pub const FLOW_LOG_ID_PREFIX: &str = "fl";
+
+/// The `ResourceType` a `CreateFlowLogs` tag specification may name: the flow log it
+/// creates (`ResourceType` enum member `vpc-flow-log`).
+pub const RESOURCE_TYPE_VPC_FLOW_LOG: &str = "vpc-flow-log";
+
+/// The `FlowLogsResourceType` members that monitor a transit gateway rather than a network
+/// resource — the types `TrafficType` "is not supported for" and whose `ResourceIds` list
+/// carries its own smaller maximum (`CreateFlowLogsRequest$TrafficType`,
+/// `$ResourceIds`, `$MaxAggregationInterval`).
+pub const FLOW_LOG_TRANSIT_GATEWAY_RESOURCE_TYPES: [&str; 2] =
+    ["TransitGateway", "TransitGatewayAttachment"];
+
+/// The most resources one `CreateFlowLogs` may name for a transit gateway resource type:
+/// "Maximum of 25 for transit gateway resource types"
+/// (`CreateFlowLogsRequest$ResourceIds`).
+pub const MAX_TRANSIT_GATEWAY_FLOW_LOG_RESOURCE_IDS: usize = 25;
+
+/// The most resources one `CreateFlowLogs` may name for every other resource type:
+/// "Maximum of 300 for the other resource types" (`CreateFlowLogsRequest$ResourceIds`).
+pub const MAX_FLOW_LOG_RESOURCE_IDS: usize = 300;
+
+/// The most characters a `LogFormat` may carry.
+///
+/// A CHOSEN retention bound, not a published quota: the member is caller-chosen text the
+/// store keeps for as long as the flow log lives, and the model declares no `@length` for
+/// it, so the handler is the only place its size can be bounded. Well above the documented
+/// default format and any record layout a caller would write. Counted in CHARACTERS, the
+/// way every other caller-text bound of this crate is ([`MAX_CLIENT_TOKEN_CHARS`]).
+pub const MAX_FLOW_LOG_FORMAT_CHARS: usize = 4096;
+
+/// The file format a flow log's destination options get when the request names none: "The
+/// format for the flow log. The default is `plain-text`"
+/// (`DestinationOptionsRequest$FileFormat`), a `DestinationFileFormat` enum member.
+pub const DEFAULT_FLOW_LOG_FILE_FORMAT: &str = "plain-text";
+
+/// EC2's error code for a flow-log call that named a flow log id this account holds no
+/// flow log for (`DeleteFlowLogs`, `InvalidFlowLogId.NotFound`).
+pub const INVALID_FLOW_LOG_ID_NOT_FOUND: &str = "InvalidFlowLogId.NotFound";
+
+/// The codes `CreateFlowLogs` refuses an unresolvable `ResourceIds` entry with, one per
+/// `FlowLogsResourceType` member that is named by a resource id.
+///
+/// The id segment is spelled `Id` rather than `ID`, which is how the flow-log API spells
+/// its OWN code ([`INVALID_FLOW_LOG_ID_NOT_FOUND`]) and the spelling a recorded
+/// `CreateFlowLogs` refusal of an unknown VPC carries. That is a DIVERGENCE from the codes
+/// the rest of this crate answers for the same resources — [`INVALID_VPC_ID_NOT_FOUND`] is
+/// `InvalidVpcID.NotFound`, [`INVALID_SUBNET_ID_NOT_FOUND`] is `InvalidSubnetID.NotFound`,
+/// [`INVALID_NETWORK_INTERFACE_ID_NOT_FOUND`] and
+/// [`INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND`] likewise — which is EC2's own documented
+/// error-code list for the operations of those resources. Both spellings are therefore
+/// deliberate: an operation answers the one its own API family answers, and these four
+/// belong to the flow-log family alone. A NAT gateway has no `Invalid…Id.NotFound` code at
+/// all, so that resource type keeps [`NAT_GATEWAY_NOT_FOUND`].
+pub const INVALID_FLOW_LOG_VPC_ID_NOT_FOUND: &str = "InvalidVpcId.NotFound";
+
+/// The flow-log family's code for a subnet it cannot resolve — see
+/// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`] for why the spelling differs from
+/// [`INVALID_SUBNET_ID_NOT_FOUND`].
+pub const INVALID_FLOW_LOG_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetId.NotFound";
+
+/// The flow-log family's code for a network interface it cannot resolve — see
+/// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`].
+pub const INVALID_FLOW_LOG_NETWORK_INTERFACE_ID_NOT_FOUND: &str =
+    "InvalidNetworkInterfaceId.NotFound";
+
+/// The flow-log family's code for a transit gateway it cannot resolve — see
+/// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`].
+pub const INVALID_FLOW_LOG_TRANSIT_GATEWAY_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayId.NotFound";
+
+/// The flow-log family's code for a transit gateway attachment it cannot resolve — see
+/// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`].
+pub const INVALID_FLOW_LOG_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND: &str =
+    "InvalidTransitGatewayAttachmentId.NotFound";
+
+/// The error code a create refuses with once the flow-log store is full, in the form EC2
+/// names every quota refusal with (`VpcLimitExceeded`, `SubnetLimitExceeded`):
+/// `<Resource>LimitExceeded`. The ceiling it reports is this store's
+/// ([`MAX_STORED_RECORDS_PER_STORE`]), not a published AWS quota.
+pub const FLOW_LOGS_LIMIT_EXCEEDED: &str = "FlowLogsLimitExceeded";
+
+/// Refuse a flow-log call that named flow log ids this account holds no flow log for, the
+/// way EC2 refuses the WHOLE batch: HTTP 400 [`INVALID_FLOW_LOG_ID_NOT_FOUND`], with a
+/// message built from the request — the count of unknown ids, then the ids themselves, one
+/// space before each, which is the form a recorded refusal of a single unknown id shows
+/// (`… are not found: [TotalCount: 1] fl-…`).
+///
+/// Only the UNKNOWN ids are named: an id the account does hold is not at fault and the
+/// call leaves it untouched.
+pub fn invalid_flow_log_id_not_found<E>(unknown: &[String]) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FLOW_LOG_ID_NOT_FOUND,
+        400,
+        format!(
+            "These flow log ids in the input list are not found: [TotalCount: {count}] {ids}",
+            count = unknown.len(),
+            ids = unknown.join(" "),
+        ),
+    )
+}
+
+/// Refuse a create that would take the flow-log store past
+/// [`MAX_STORED_RECORDS_PER_STORE`]: HTTP 400 [`FLOW_LOGS_LIMIT_EXCEEDED`].
+pub fn flow_logs_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(FLOW_LOGS_LIMIT_EXCEEDED, 400, message)
+}
+
+/// Refuse a `CreateFlowLogs` whose `ResourceIds` names a resource of `resource_type` this
+/// account does not hold — the whole call, because the batch is resolved before anything is
+/// stored.
+///
+/// Each code is the flow-log family's own for that resource (see
+/// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`] for the spelling and why it differs from the code
+/// the operations of those resources answer). `resource_type` is a `FlowLogsResourceType`
+/// member (`smithy_query(query="shape",shape="FlowLogsResourceType")`).
+pub fn invalid_flow_log_resource_id<E>(resource_type: &str, resource_id: &str) -> Scaffolded<E> {
+    match resource_type {
+        "VPC" => id_not_found(INVALID_FLOW_LOG_VPC_ID_NOT_FOUND, "vpc ID", resource_id),
+        "Subnet" => id_not_found(
+            INVALID_FLOW_LOG_SUBNET_ID_NOT_FOUND,
+            "subnet ID",
+            resource_id,
+        ),
+        "NetworkInterface" => id_not_found(
+            INVALID_FLOW_LOG_NETWORK_INTERFACE_ID_NOT_FOUND,
+            "networkInterface ID",
+            resource_id,
+        ),
+        "TransitGateway" => id_not_found(
+            INVALID_FLOW_LOG_TRANSIT_GATEWAY_ID_NOT_FOUND,
+            "transitGateway ID",
+            resource_id,
+        ),
+        "TransitGatewayAttachment" => id_not_found(
+            INVALID_FLOW_LOG_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+            "transitGatewayAttachment ID",
+            resource_id,
+        ),
+        // The one remaining `FlowLogsResourceType` member, `RegionalNatGateway`.
+        _ => nat_gateway_not_found(resource_id),
+    }
+}
+
+/// The ARN of the CloudWatch Logs log group a flow log publishes to:
+/// `arn:aws:logs:<region>:<account>:log-group:<name>`, the form
+/// `CreateFlowLogsRequest$LogDestination` documents ("If the destination type is
+/// cloud-watch-logs, specify the ARN of a CloudWatch Logs log group. For example:
+/// arn:aws:logs:region:account_id:log-group:my_group Alternatively, use the LogGroupName
+/// parameter").
+///
+/// The two members name ONE destination, so this is how the one a caller gave by name is
+/// also reported as an ARN.
+pub fn flow_log_group_arn(region: &str, log_group_name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("log-group:{log_group_name}"))
+}
+
+/// The name of the log group a `log-group:` CloudWatch Logs ARN names, or `None` when the
+/// ARN names something else — the inverse of [`flow_log_group_arn`], for the caller that
+/// gave the destination as an ARN rather than by name.
+///
+/// A log-group ARN may carry a further segment after the name — the log-stream wildcard
+/// `…:log-group:my_group:*` that a CloudWatch Logs resource ARN conventionally ends with —
+/// so the name is the segment up to the next `:`, never the rest of the ARN.
+pub fn log_group_name_in_arn(log_destination: &str) -> Option<&str> {
+    let (_, resource) = log_destination
+        .strip_prefix("arn:")?
+        .split_once(":log-group:")?;
+    let name = resource.split(':').next().unwrap_or_default();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The caller-chosen bytes one stored flow log will hold: every member whose length the
+/// REQUEST chose, plus the `ClientToken` the token map keeps for it, on top of the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs. The id, the creation time
+/// and the status are derived by this module, so they are fixed-size.
+///
+/// The ONE definition of that charge, the way [`carrier_gateway_payload_bytes`] is for a
+/// carrier gateway: `CreateFlowLogs` asks it before the write,
+/// [`ComAmazonawsEc2Amazonec2State::insert_flow_log`] charges exactly it and records the
+/// number it charged, and [`ComAmazonawsEc2Amazonec2State::remove_flow_log`] gives back
+/// exactly that number.
+pub fn flow_log_payload_bytes(spec: &FlowLogSpec) -> usize {
+    let text = |value: Option<&str>| value.map_or(0, str::len);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(tag_list_bytes(&spec.tags))
+        .saturating_add(spec.resource_id.len())
+        .saturating_add(text(spec.log_group_name.as_deref()))
+        .saturating_add(text(spec.log_destination.as_deref()))
+        // A request that named no format is stored with the default one, which is text the
+        // record holds just the same.
+        .saturating_add(
+            spec.log_format
+                .as_deref()
+                .map_or(DEFAULT_FLOW_LOG_FORMAT.len(), str::len),
+        )
+        .saturating_add(text(spec.deliver_logs_permission_arn.as_deref()))
+        .saturating_add(text(spec.deliver_cross_account_role.as_deref()))
+        .saturating_add(
+            spec.tag_field_specifications
+                .iter()
+                .flatten()
+                .map(|specification| {
+                    text(specification.resource_type.as_deref()).saturating_add(
+                        specification
+                            .tag_keys
+                            .iter()
+                            .flatten()
+                            .map(String::len)
+                            .sum::<usize>(),
+                    )
+                })
+                .sum::<usize>(),
+        )
+        .saturating_add(text(spec.client_token.as_deref()))
+}
+
+/// One stored flow log: the modelled [`FlowLog`] shape `DescribeFlowLogs` reports, beside
+/// the two facts that shape carries no member for — the bytes this record was charged
+/// against [`MAX_STORED_BYTES`], and the `ClientToken` that minted it.
+///
+/// The charge is kept ON the record, the way [`SecurityGroupRuleRecord`] keeps its own, so
+/// a removal gives back exactly what the insert took however the accounting changes later.
+/// The token is kept here for the same reason: a removal then reaches the one token entry
+/// that names this flow log directly, instead of walking every entry of
+/// [`ComAmazonawsEc2Amazonec2State::flow_log_client_tokens`].
+#[derive(Debug, Clone)]
+pub struct FlowLogRecord {
+    /// The flow log as every reader of it reports it.
+    pub view: FlowLog,
+    /// What [`flow_log_payload_bytes`] charged for this record when it was stored.
+    pub payload_bytes: usize,
+    /// The `ClientToken` of the `CreateFlowLogs` that minted this flow log, if it carried
+    /// one — the key of its [`ComAmazonawsEc2Amazonec2State::flow_log_client_tokens`] entry.
+    pub client_token: Option<String>,
+}
+
+/// What ONE flow log is created with, beyond everything the service itself derives
+/// ([`ComAmazonawsEc2Amazonec2State::insert_flow_log`] mints the id, stamps the creation
+/// time, sets the status and fills in the documented defaults).
+///
+/// One spec per MONITORED RESOURCE: a `CreateFlowLogs` naming several resources builds one
+/// of these for each of them, so every flow log of that call is stored the same way.
+#[derive(Debug, Clone)]
+pub struct FlowLogSpec {
+    /// "The ID of the resource being monitored" (`FlowLog$ResourceId`) — one entry of the
+    /// call's `ResourceIds`.
+    pub resource_id: String,
+    /// "The type of traffic captured for the flow log" (`FlowLog$TrafficType`), absent for
+    /// the transit gateway resource types the member is not supported for.
+    pub traffic_type: Option<String>,
+    /// "The type of destination for the flow log data" (`FlowLog$LogDestinationType`),
+    /// already defaulted to [`LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS`] by the caller when
+    /// the request named none.
+    pub log_destination_type: String,
+    /// "The Amazon Resource Name (ARN) of the destination for the flow log data"
+    /// (`FlowLog$LogDestination`).
+    pub log_destination: Option<String>,
+    /// "The name of the flow log group" (`FlowLog$LogGroupName`) — set only for a
+    /// CloudWatch Logs destination, which is the one destination type the member is valid
+    /// for.
+    pub log_group_name: Option<String>,
+    /// "The fields to include in the flow log record" (`CreateFlowLogsRequest$LogFormat`),
+    /// or `None` for a request that omitted it — which is what makes the flow log carry
+    /// [`DEFAULT_FLOW_LOG_FORMAT`].
+    pub log_format: Option<String>,
+    /// "The ARN of the IAM role allows the service to publish logs to CloudWatch Logs"
+    /// (`FlowLog$DeliverLogsPermissionArn`).
+    pub deliver_logs_permission_arn: Option<String>,
+    /// "The ARN of the IAM role that allows the service to publish flow logs across
+    /// accounts" (`FlowLog$DeliverCrossAccountRole`).
+    pub deliver_cross_account_role: Option<String>,
+    /// "The maximum interval of time, in seconds, during which a flow of packets is
+    /// captured and aggregated into a flow log record"
+    /// (`FlowLog$MaxAggregationInterval`), already defaulted by the caller.
+    pub max_aggregation_interval: i32,
+    /// "The destination options" (`FlowLog$DestinationOptions`), as the request gave them.
+    pub destination_options: Option<DestinationOptionsResponse>,
+    /// "The tag configuration associated with the Flow Logs Amazon EC2 Tags feature fields
+    /// in your custom log format" (`FlowLog$TagFieldSpecifications`).
+    pub tag_field_specifications: Option<Vec<TagFieldSpecificationResponse>>,
+    /// "The tags for the flow log" (`FlowLog$Tags`).
+    pub tags: Vec<Tag>,
+    /// The `ClientToken` the request carried, if any: the token map keeps it for as long as
+    /// the flow log lives, so the bytes it holds are charged with the flow log's.
+    pub client_token: Option<String>,
+    /// When the flow log was created ("The date and time the flow log was created" —
+    /// `FlowLog$CreationTime`). Taken from the request's instant rather than read here, so
+    /// every flow log one call mints carries the same creation time.
+    pub created_at: SystemTime,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` flow logs fit inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// A COUNT, not one record, because `CreateFlowLogs` stores one flow log per monitored
+    /// resource and either stores the whole batch or none of it. The same contract as
+    /// [`Self::has_carrier_gateway_capacity`] otherwise: a create asks first and refuses
+    /// with [`flow_logs_limit_exceeded`] when it answers `false`.
+    pub fn has_flow_log_capacity_for(&self, count: usize) -> bool {
+        self.flow_logs.len().saturating_add(count) <= MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Whether this account holds the resource `resource_id` of the `FlowLogsResourceType`
+    /// `resource_type` — the question `CreateFlowLogs` asks of every entry of its
+    /// `ResourceIds` before it stores anything.
+    ///
+    /// Each type is resolved against the ONE store this service keeps that resource in, so
+    /// a flow log can never name a resource no describe of that resource would report. A
+    /// READ: an id no store holds is not given a resource here.
+    pub fn holds_flow_log_resource(&self, resource_type: &str, resource_id: &str) -> bool {
+        match resource_type {
+            "VPC" => self.vpcs.contains_key(resource_id),
+            "Subnet" => self.subnets.contains_key(resource_id),
+            "NetworkInterface" => self.network_interfaces.contains_key(resource_id),
+            "TransitGateway" => self.transit_gateways.contains_key(resource_id),
+            "TransitGatewayAttachment" => {
+                self.transit_gateway_attachments.contains_key(resource_id)
+            }
+            "RegionalNatGateway" => self.nat_gateways.contains_key(resource_id),
+            // Unreachable: the model's `FlowLogsResourceType` enum has no other member, and
+            // the boundary validator refuses a value outside it before a handler runs. An
+            // unknown type resolves NO id, so it can only refuse, never admit.
+            _ => false,
+        }
+    }
+
+    /// Insert one flow log, and answer the `FlowLogId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller
+    /// — the id, the creation time, the status and the record format a request that named
+    /// none gets ([`DEFAULT_FLOW_LOG_FORMAT`]) — so no writer can store a flow log a
+    /// describe would have to invent a member for. Like [`Self::insert_carrier_gateway`],
+    /// the caller-chosen bytes the record retains ([`flow_log_payload_bytes`]) are charged
+    /// against the store's byte budget here, so a writer cannot store them uncharged.
+    pub fn insert_flow_log(&mut self, spec: FlowLogSpec) -> String {
+        let payload_bytes = flow_log_payload_bytes(&spec);
+        let flow_log_id = self.next_id(FLOW_LOG_ID_PREFIX);
+        let view = FlowLog {
+            creation_time: Some(system_time_to_date_time(spec.created_at)),
+            // Nothing in this emulator delivers a flow log record, so there is no delivery
+            // to report a status or an error for: `DeliverLogsStatus` and
+            // `DeliverLogsErrorMessage` stay absent rather than claiming an outcome.
+            deliver_logs_error_message: None,
+            deliver_logs_status: None,
+            deliver_logs_permission_arn: spec.deliver_logs_permission_arn,
+            deliver_cross_account_role: spec.deliver_cross_account_role,
+            flow_log_id: Some(flow_log_id.clone()),
+            flow_log_status: Some(FLOW_LOG_STATUS_ACTIVE.to_string()),
+            log_group_name: spec.log_group_name,
+            resource_id: Some(spec.resource_id),
+            traffic_type: spec.traffic_type,
+            log_destination_type: Some(spec.log_destination_type),
+            log_destination: spec.log_destination,
+            // "If you omit this parameter, the flow log is created using the default
+            // format" (`CreateFlowLogsRequest$LogFormat`) — applied HERE, so no writer can
+            // store a flow log whose record layout a client cannot read.
+            log_format: Some(
+                spec.log_format
+                    .unwrap_or_else(|| DEFAULT_FLOW_LOG_FORMAT.to_string()),
+            ),
+            tags: Some(spec.tags),
+            max_aggregation_interval: Some(spec.max_aggregation_interval),
+            destination_options: spec.destination_options,
+            tag_field_specifications: spec.tag_field_specifications,
+        };
+        self.add_stored_bytes(payload_bytes);
+        let client_token = spec.client_token;
+        if let Some(token) = client_token.clone() {
+            self.flow_log_client_tokens
+                .entry(token)
+                .or_default()
+                .push(flow_log_id.clone());
+        }
+        self.flow_logs.insert(
+            flow_log_id.clone(),
+            FlowLogRecord {
+                view,
+                payload_bytes,
+                client_token,
+            },
+        );
+        flow_log_id
+    }
+
+    /// Remove the flow log `flow_log_id` and answer it as it was last reported, or `None`
+    /// when the store holds no such flow log. The bytes the record held go back to the
+    /// store's budget — exactly the number the insert charged — and the `ClientToken` that
+    /// minted it stops naming it, so a replayed create cannot answer with a flow log that is
+    /// gone.
+    ///
+    /// The token entry is reached through the record's own
+    /// [`FlowLogRecord::client_token`], so removing a batch of flow logs costs one lookup
+    /// each rather than a walk of every stored token.
+    pub fn remove_flow_log(&mut self, flow_log_id: &str) -> Option<FlowLog> {
+        let record = self.flow_logs.remove(flow_log_id)?;
+        if let Some(token) = record.client_token.as_deref() {
+            if let Some(minted) = self.flow_log_client_tokens.get_mut(token) {
+                minted.retain(|minted_id| minted_id != flow_log_id);
+                if minted.is_empty() {
+                    self.flow_log_client_tokens.remove(token);
+                }
+            }
+        }
+        self.release_stored_bytes(record.payload_bytes);
+        Some(record.view)
     }
 }
 

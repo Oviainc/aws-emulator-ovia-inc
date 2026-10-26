@@ -11,7 +11,10 @@
 //! Compute Optimizer does not stand alone: an Amazon ECS service recommendation is computed
 //! over the ECS service the ECS emulator holds and the `AWS/ECS` utilization the CloudWatch
 //! emulator holds, so [`emulator_with_analysed_services`] mounts all three on ONE engine —
-//! exactly what `core/router` assembles.
+//! exactly what `core/router` assembles. Amazon S3 is mounted by every emulator here for the
+//! same reason: a recommendations export is written into a bucket of the one object store
+//! this emulator holds, so an export suite CREATES its destination bucket over S3's own wire
+//! ([`create_bucket`]) and reads the exported objects back over it ([`get_object`]).
 
 use std::sync::Arc;
 
@@ -63,6 +66,9 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     (router, engine)
 }
 
@@ -92,7 +98,72 @@ pub(crate) fn emulator_with_analysed_services_and_engine(
             Arc::clone(&engine),
         ),
     );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     (router, engine)
+}
+
+/// The endpoint every Amazon S3 request below is addressed to (its `Host`), which is what
+/// makes it a PATH-STYLE request: `PUT /<bucket>`, `GET /<bucket>/<key>`.
+const OBJECT_ENDPOINT_HOST: &str = "127.0.0.1:9297";
+
+/// Create `bucket` in the one object store this emulator holds, over Amazon S3's own
+/// `CreateBucket`.
+///
+/// "You must create the destination Amazon S3 bucket for your recommendations export before
+/// you create the export job. Compute Optimizer does not create the S3 bucket for you"
+/// (`S3DestinationConfig`), so an export suite creates its destination the way a client does
+/// — through S3 — rather than reaching into the object store.
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+    let (status, body) = object_request(router, "PUT", &format!("/{bucket}")).await;
+    assert!(
+        (200..300).contains(&status),
+        "creating bucket {bucket}: expected 2xx, got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// `GET /<bucket>/<key>` — Amazon S3's `GetObject`, answering the status and the object's
+/// bytes, which is how a client downloads an exported recommendations file.
+pub(crate) async fn get_object(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+) -> (u16, Vec<u8>) {
+    object_request(router, "GET", &format!("/{bucket}/{key}")).await
+}
+
+/// `DELETE /<bucket>` — Amazon S3's `DeleteBucket`, for a suite that has to take the
+/// destination of an export away again.
+pub(crate) async fn delete_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
+    object_request(router, "DELETE", &format!("/{bucket}")).await.0
+}
+
+/// One path-style Amazon S3 request, answering its status and body.
+async fn object_request(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+) -> (u16, Vec<u8>) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{OBJECT_ENDPOINT_HOST}{path}"))
+        .header("host", OBJECT_ENDPOINT_HOST)
+        // The SigV4 credential scope's service field is what routes a request to S3.
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{REGION}/s3/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .body(Bytes::new())
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (status, response.body().to_vec())
 }
 
 /// Write datapoints straight into the CloudWatch metric store, the way the AWS service that

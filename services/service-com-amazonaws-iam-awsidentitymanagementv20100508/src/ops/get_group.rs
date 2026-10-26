@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A read: it reports the stored group and its members and writes nothing.
+        let store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the group is found under
+        // the case-folded name whatever case the request spelled it in — the key
+        // `CreateGroup` stored it under.
+        let key = crate::state::name_key(&input.group_name);
+
+        // The group the request addresses, if the account holds one. The LOOKUP comes
+        // first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource: a caller that may not read this group learns that it may not, never
+        // whether the group exists. The decision is made on the held group's own ARN,
+        // or, for a name the account holds no group under, the ARN that name would
+        // carry at the default path, since there is no other path to attribute it to. A
+        // refusal names the group as the request named it (`group Admins`).
+        let held = store.groups.get(&key);
+        let resource = held.map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_GROUP,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
+        // The group reported is one the account holds: a name it holds none under names
+        // no group, which is the modelled client error this operation declares.
+        let Some(group) = held else {
+            return Err(GetGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "A list of users in the group": the members are the users the account
+        // persists a membership for. `AddUserToGroup` is the operation that records a
+        // membership, and it is still scaffolded, so the account holds none — the
+        // reading `state::principal_sourced_policies` takes of a user's group
+        // memberships for the same reason — and no group has a member to report. The
+        // whole member list therefore fits in the page any `MaxItems` asks for, which
+        // is why `IsTruncated` is false and no `Marker` is issued, and why `MaxItems`
+        // is not consulted yet: when a membership can be persisted, this is where the
+        // page is drawn and where that bound, the truncation flag and the `Marker`
+        // below have to be honoured.
+        let users = Vec::new();
+
+        // No page of this collection is ever truncated, so this operation has issued no
+        // `Marker`: a request carrying one carries a token this service did not issue,
+        // which is refused through the crate's generic client-input channel (HTTP 400,
+        // `ValidationException`) rather than read as "start from the beginning". A
+        // marker names a position in ONE group's member order, so the group is resolved
+        // first: a request that names no group the account holds is answered with the
+        // modelled not-found error whatever token it carries.
+        if input.marker.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Invalid Marker: the value is not a marker this service issued",
+            ));
+        }
+
+        Ok(GetGroupOutput {
+            // Every member of `Group` is `@required` and this read withholds none of
+            // them, so the stored record is what the response reports.
+            group: group.clone(),
+            users,
+            is_truncated: false,
+            marker: None,
+        })
     }
 }

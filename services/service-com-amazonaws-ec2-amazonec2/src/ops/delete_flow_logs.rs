@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFlowLogs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFlowLogs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFlowLogs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the flow logs the request names. The WHOLE `FlowLogIds` batch is resolved
+//! against [`crate::state`] before anything is removed, so a call that names one flow log
+//! this account does not hold deletes nothing and is refused outright — the flow logs it
+//! named that DO exist survive untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFlowLogs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFlowLogsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFlowLogs"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "One or more flow log IDs" (`$FlowLogIds`) is `@required`, which the boundary
+        // validator enforces as "present" — an EMPTY list is still present, and names no
+        // flow log to delete.
+        if input.flow_log_ids.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter FlowLogIds",
+            ));
+        }
+        // "Constraint: Maximum of 1000 flow log IDs" (`$FlowLogIds`) — the documented
+        // maximum, which is also the cap this crate holds every resource-id list to; the
+        // model declares no `@length`, so the handler is the only place it can exist.
+        if input.flow_log_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "FlowLogIds carries {count} ids, above the maximum of {max}",
+                count = input.flow_log_ids.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // One flow log gets one answer however many times the batch names it.
+        let flow_log_ids = state::deduplicate_ids(&input.flow_log_ids);
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request … If you have the required permissions, the error response is
+        // DryRunOperation" (`$DryRun`). The flag asks whether the CALLER is permitted, which
+        // is not a question about which flow logs the account holds — so an authorized dry
+        // run is answered here, before any id is resolved, and the answer does not depend on
+        // whether the flow logs the request names exist. Nothing is removed on this path.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The WHOLE batch is resolved BEFORE anything is removed: a call that names one id
+        // this account holds no flow log for is refused outright, deletes nothing, and the
+        // refusal names only the ids at fault — never the ones it could have deleted, which
+        // are still there afterwards.
+        let unknown: Vec<String> = flow_log_ids
+            .iter()
+            .filter(|flow_log_id| !store.flow_logs.contains_key(flow_log_id.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(state::invalid_flow_log_id_not_found(&unknown));
+        }
+
+        for flow_log_id in &flow_log_ids {
+            store.remove_flow_log(flow_log_id);
+        }
+
+        Ok(DeleteFlowLogsOutput {
+            // "Information about the flow logs that could not be deleted successfully"
+            // (`$Unsuccessful`): every id was resolved before anything was removed, so a
+            // call that gets this far deleted every flow log it named and none of them
+            // failed.
+            unsuccessful: Some(Vec::new()),
+        })
     }
 }

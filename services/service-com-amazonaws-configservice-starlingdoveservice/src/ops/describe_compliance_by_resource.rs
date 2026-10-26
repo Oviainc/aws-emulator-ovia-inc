@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComplianceByResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComplianceByResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComplianceByResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports whether each of this account's resources is compliant: the resource's
+//! `ComplianceType` rolled up from the evaluation results every Config rule in
+//! [`crate::state`] recorded against it, plus the number of rules contributing a
+//! `NON_COMPLIANT` result, narrowed by the requested resource type and id and by the
+//! requested compliance types, and paged over the store's stable
+//! `(resourceType, resourceId)` ordering.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComplianceByResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComplianceByResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComplianceByResource"))
+        // `ctx` carries request metadata only; this report is computed from state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `INSUFFICIENT_DATA` is a `ComplianceType` a resource can roll up to but no
+        // filter may name — which is why the filter list is one value shorter than the
+        // published enum — so a filter naming it is a bad parameter rather than an empty
+        // page.
+        let wanted = input.compliance_types.unwrap_or_default();
+        if let Some(rejected) = wanted.iter().find(|compliance_type| {
+            !crate::state::FILTERABLE_COMPLIANCE_TYPES.contains(&compliance_type.as_str())
+        }) {
+            return Err(invalid_parameter(
+                crate::state::unfilterable_compliance_type_message("ComplianceTypes", rejected),
+            ));
+        }
+
+        // A resource is identified by its type AND its id, so an id without a type names
+        // no resource at all. A type on its own is a narrowing rather than an
+        // identification: it selects every resource of that type.
+        let resource_type = input
+            .resource_type
+            .as_deref()
+            .filter(|resource_type| !resource_type.is_empty());
+        let resource_id = input
+            .resource_id
+            .as_deref()
+            .filter(|resource_id| !resource_id.is_empty());
+        if resource_id.is_some() && resource_type.is_none() {
+            return Err(invalid_parameter(
+                crate::state::RESOURCE_TYPE_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_compliance_by_resource_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeComplianceByResourceErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // "The maximum number of evaluation results returned on each page. The default is
+        // 10. … If you specify 0, Config uses the default" — and a `Limit` past the
+        // modelled maximum is refused before this handler runs.
+        let page_size = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(crate::state::DESCRIBE_COMPLIANCE_BY_RESOURCE_PAGE_SIZE);
+
+        // A reporting operation: every entry is computed from the evaluation results
+        // already in state and nothing is written. A resource falls in the scope of every
+        // rule that evaluates it, so its compliance is the roll-up of what all of them
+        // recorded for it and one resource is reported ONCE however many rules placed it.
+        // The store is read under the lock and NOTHING else happens there — the roll-ups
+        // come back owned, so the guard is released before this request's own narrowing
+        // runs over them.
+        let placed = crate::state::resource_compliance_shapes(state.lock().config_rules.values());
+
+        // Paging follows the store's own `(resourceType, resourceId)` ordering, so a
+        // token holds the resource the next page resumes at and survives verdicts
+        // recorded between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (resource, compliance) in &placed {
+            if resume_at
+                .as_ref()
+                .is_some_and(|resume_at| resource < resume_at)
+            {
+                continue;
+            }
+            if resource_type.is_some_and(|requested| requested != resource.0)
+                || resource_id.is_some_and(|requested| requested != resource.1)
+            {
+                continue;
+            }
+            // The compliance filter selects on what the resource ROLLS UP TO, so a
+            // resource whose verdicts do not place it in a requested compliance type is
+            // left out rather than reported with another one.
+            if !wanted.is_empty()
+                && !wanted
+                    .iter()
+                    .any(|requested| Some(requested.as_str()) == compliance.compliance_type.as_deref())
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_compliance_by_resource_token(resource));
+                break;
+            }
+            page.push(ComplianceByResource {
+                resource_type: Some(resource.0.clone()),
+                resource_id: Some(resource.1.clone()),
+                compliance: Some(compliance.clone()),
+            });
+        }
+
+        // "If Config has no current evaluation results for the resource, it returns
+        // INSUFFICIENT_DATA": a request that IDENTIFIES one resource is answered about
+        // that resource even where no rule has placed it, while a request that identifies
+        // none reports only the resources rules have evaluated — it names no resource an
+        // absence could be reported for. A filter can never name `INSUFFICIENT_DATA`, so
+        // a filtered request is not answered with it either.
+        let identified = resource_type.zip(resource_id);
+        if let Some((resource_type, resource_id)) = identified {
+            if page.is_empty() && resume_at.is_none() && wanted.is_empty() {
+                page.push(ComplianceByResource {
+                    resource_type: Some(resource_type.to_string()),
+                    resource_id: Some(resource_id.to_string()),
+                    compliance: Some(Compliance {
+                        compliance_type: Some(
+                            crate::state::COMPLIANCE_TYPE_INSUFFICIENT_DATA.to_string(),
+                        ),
+                        compliance_contributor_count: None,
+                    }),
+                });
+            }
+        }
+
+        Ok(DescribeComplianceByResourceOutput {
+            compliance_by_resources: Some(page),
+            next_token,
+        })
     }
+}
+
+/// A bad parameter value carrying `message`: how this operation refuses a request it
+/// cannot serve for any reason other than a `NextToken` it did not issue, which is what
+/// its other modelled error is for.
+fn invalid_parameter(message: String) -> DescribeComplianceByResourceError {
+    DescribeComplianceByResourceErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

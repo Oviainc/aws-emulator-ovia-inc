@@ -2483,6 +2483,21 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
         Some((entry, api_key))
     }
 
+    /// The ids of every stored API key in creation order, the stable sequence
+    /// [`page_of`] cuts a `GetApiKeys` page out of.
+    ///
+    /// The sequence is fixed when each key is created — by the creation rank
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`] stamps on the
+    /// record, with the key's own id breaking a tie — so nothing a caller can change
+    /// moves a key in the collection: renaming, describing, enabling or disabling a key
+    /// leaves it where it was, and the `position` cursor a page handed back keeps naming
+    /// the same point in the sequence.
+    pub fn api_key_ids_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&ApiKeyEntry> = self.api_keys.values().collect();
+        ordered.sort_by_key(|key| (key.sequence, key.id.clone()));
+        ordered.into_iter().map(|key| key.id.clone()).collect()
+    }
+
     /// The ids of every stored usage plan in creation order, the stable sequence
     /// [`page_of`] cuts a `GetUsagePlans` page out of.
     pub fn usage_plan_ids_in_creation_order(&self) -> Vec<String> {
