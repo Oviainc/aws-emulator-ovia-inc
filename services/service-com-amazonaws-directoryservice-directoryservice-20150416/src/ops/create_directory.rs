@@ -270,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `RegisterCertificate` is what registers a certificate with the directory;
             // a fresh directory has none.
             certificates: ::std::collections::BTreeMap::new(),
+            // `StartSchemaExtension` is what applies a schema extension to a directory;
+            // a fresh directory has been through none.
+            schema_extensions: ::std::collections::BTreeMap::new(),
             // `RegisterEventTopic` is what associates an Amazon SNS topic with the
             // directory; a fresh directory publishes to none.
             event_topics: ::std::collections::BTreeMap::new(),

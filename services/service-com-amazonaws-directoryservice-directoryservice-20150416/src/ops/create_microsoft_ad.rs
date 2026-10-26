@@ -304,6 +304,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `RegisterCertificate` is what registers a certificate with the directory;
             // a fresh directory has none.
             certificates: ::std::collections::BTreeMap::new(),
+            // No schema extension until `StartSchemaExtension` applies one.
+            schema_extensions: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
             // No log subscription until `CreateLogSubscription` creates one.

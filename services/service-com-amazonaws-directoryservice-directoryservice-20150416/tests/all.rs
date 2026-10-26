@@ -47,6 +47,8 @@ mod log_subscriptions;
 mod microsoft_ad;
 #[path = "all/request_id_header.rs"]
 mod request_id_header;
+#[path = "all/schema_extensions.rs"]
+mod schema_extensions;
 #[path = "all/shared_directories.rs"]
 mod shared_directories;
 #[path = "all/snapshot_deletion.rs"]

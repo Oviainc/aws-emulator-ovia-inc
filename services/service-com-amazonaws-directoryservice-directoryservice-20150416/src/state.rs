@@ -7,7 +7,8 @@
 //! `CreateAlias` assigns, the computer accounts `CreateComputer` creates in them, the
 //! Amazon SNS topics `RegisterEventTopic` associates, the log subscriptions
 //! `CreateLogSubscription` creates, the trust relationships
-//! `CreateTrust` establishes, the directory shares `ShareDirectory` creates, the
+//! `CreateTrust` establishes, the directory shares `ShareDirectory` creates, the schema
+//! extensions `StartSchemaExtension` applies, the
 //! assessments
 //! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
 //! the pieces of behaviour that cannot live in any single operation file:
@@ -19,7 +20,8 @@
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
-//!   leaving `Sharing` (and an unshared one leaving the store)).
+//!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
+//!   leaving `Initializing`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -27,13 +29,15 @@
 //!   reports the same derived values (`Alias`, `AccessUrl`), and
 //!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`] /
 //!   [`LogSubscriptionRecord::to_log_subscription`] /
-//!   [`TrustRecord::to_trust`] / [`SharedDirectoryRecord::to_shared_directory`], the
+//!   [`TrustRecord::to_trust`] / [`SharedDirectoryRecord::to_shared_directory`] /
+//!   [`SchemaExtensionRecord::to_info`], the
 //!   same for a stored snapshot, a stored topic association, a stored log subscription, a
-//!   stored trust and a stored
-//!   directory share.
+//!   stored trust, a stored
+//!   directory share and a stored schema extension.
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
 //!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListLogSubscriptions`,
+//!   `ListSchemaExtensions`,
 //!   `ListTagsForResource`) issue and
 //!   resolve.
 //! * [`refusal`], the one place a modelled refusal of this service is built: every error
@@ -55,7 +59,7 @@ use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, Certificate, ClientAuthenticationSettingInfo,
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
     DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, LogSubscription,
-    SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
+    SchemaExtensionInfo, SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -344,6 +348,28 @@ pub const MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY: usize = 5;
 /// create-directory / snapshot / delete-directory cycle from growing the store without
 /// end. Past it `CreateSnapshot` is refused.
 pub const MAX_SNAPSHOTS: usize = MAX_DIRECTORIES * MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY;
+
+/// The `SchemaExtensionStatus` an extension carries between `StartSchemaExtension` and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `SchemaExtensionStatus` enum.
+///
+/// `StartSchemaExtension` answers while the extension is still being applied, so the
+/// move to [`SCHEMA_EXTENSION_STATUS_COMPLETED`] is owed by the clock rather than by any
+/// later call, on the same span a create's stage transition uses.
+pub const SCHEMA_EXTENSION_STATUS_INITIALIZING: &str = "Initializing";
+
+/// The `SchemaExtensionStatus` an extension reaches once [`TRANSITION_SPAN`] has
+/// elapsed: the `Completed` value of the modelled `SchemaExtensionStatus` enum.
+pub const SCHEMA_EXTENSION_STATUS_COMPLETED: &str = "Completed";
+
+/// The most schema extensions this emulator keeps for one directory.
+///
+/// NOT an AWS quota: a resource guard, like [`MAX_COMPUTERS_PER_DIRECTORY`]. AWS
+/// publishes no limit on how many schema extensions a directory may have been through,
+/// and `StartSchemaExtension` models no limit-exceeded error of its own, so this is not
+/// an emulated quota — it is what keeps a loop of extensions from growing the store
+/// without end. Past it `StartSchemaExtension` is refused with the generic
+/// `ClientException` the model offers.
+pub const MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY: usize = 100;
 
 /// The `TopicStatus` of an association this emulator has just made.
 ///
@@ -1090,6 +1116,12 @@ pub struct Directory {
     /// FOR a directory, so the registrations live on the directory record and deleting
     /// the directory takes them with it.
     pub certificates: BTreeMap<String, CertificateRecord>,
+    /// The schema extensions `StartSchemaExtension` applied to this directory, keyed by
+    /// `SchemaExtensionId`; `ListSchemaExtensions` reports them. An extension is applied
+    /// TO one directory — which is why that listing requires a `DirectoryId` — so the
+    /// records live on the directory record and deleting the directory takes them with
+    /// it.
+    pub schema_extensions: BTreeMap<String, SchemaExtensionRecord>,
     /// The Amazon SNS topics `RegisterEventTopic` associated with this directory, keyed
     /// by topic name — a directory publishes to a given topic at most once, and the
     /// associations live on the directory record, so deleting the directory takes its
@@ -1165,6 +1197,15 @@ impl Directory {
             })
             .map(|registration| registration.to_event_topic(&self.directory_id))
             .collect()
+    }
+
+    /// This directory's schema extensions in the order they were started \u2014 the order
+    /// `ListSchemaExtensions` pages over, which the records' creation rank gives, since
+    /// they are keyed by id rather than by rank.
+    pub fn schema_extensions_in_creation_order(&self) -> Vec<&SchemaExtensionRecord> {
+        let mut ordered: Vec<&SchemaExtensionRecord> = self.schema_extensions.values().collect();
+        ordered.sort_by_key(|extension| extension.seq);
+        ordered
     }
 
     /// The key [`Self::conditional_forwarders`] holds `remote_domain_name` under:
@@ -1435,6 +1476,51 @@ impl SnapshotRecord {
     }
 }
 
+/// One stored schema extension: what `StartSchemaExtension` persisted and
+/// `ListSchemaExtensions` reports.
+///
+/// The `LdifContent` the start was called with is deliberately NOT a field: it is the
+/// schema change itself, which this emulator holds no representation of, no operation
+/// reports it back, and state this emulator does not need is state it must not hold.
+#[derive(Debug, Clone)]
+pub struct SchemaExtensionRecord {
+    pub schema_extension_id: String,
+    /// The `Description` the start was called with, reported back unchanged.
+    pub description: String,
+    /// One of the modelled `SchemaExtensionStatus` values.
+    pub status: String,
+    /// "The reason for the `SchemaExtensionStatus`", when there is one to report.
+    pub status_reason: Option<String>,
+    /// "The date and time that the schema extension started being applied to the
+    /// directory", the `StartDateTime` member reports.
+    pub start_date_time: SystemTime,
+    /// "The date and time that the schema extension was completed": `None` until the
+    /// extension reaches a status that has an end.
+    pub end_date_time: Option<SystemTime>,
+    /// When the status transition the start owes falls due; `None` once there is no
+    /// transition left to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    /// Creation rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
+    /// with the directories so every listing of this service pages over one ordering.
+    pub seq: u64,
+}
+
+impl SchemaExtensionRecord {
+    /// This schema extension as the modelled `SchemaExtensionInfo` structure.
+    pub fn to_info(&self, directory_id: &str) -> SchemaExtensionInfo {
+        SchemaExtensionInfo {
+            directory_id: Some(directory_id.to_string()),
+            schema_extension_id: Some(self.schema_extension_id.clone()),
+            description: Some(self.description.clone()),
+            schema_extension_status: Some(self.status.clone()),
+            schema_extension_status_reason: self.status_reason.clone(),
+            start_date_time: Some(as_timestamp(self.start_date_time)),
+            end_date_time: self.end_date_time.map(as_timestamp),
+        }
+    }
+}
+
 /// One stored trust relationship: what `CreateTrust` persisted and `DescribeTrusts`
 /// reports.
 ///
@@ -1642,6 +1728,8 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// Drives [`Self::mint_trust_id`], kept apart from the other seeds so the id spaces
     /// advance independently.
     trust_id_seed: u64,
+    /// Drives [`Self::mint_schema_extension_id`], its own id space for the same reason.
+    schema_extension_id_seed: u64,
     /// Drives [`Self::next_seq`]: the creation rank stamped on each directory.
     seq_counter: u64,
 }
@@ -1719,6 +1807,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// through the same bijection as [`Self::mint_directory_id`] over its own seed.
     pub fn mint_trust_id(&mut self) -> String {
         mint_id(&mut self.trust_id_seed, 't')
+    }
+
+    /// Mint a fresh `SchemaExtensionId` of the shape the model declares,
+    /// `^e-[0-9a-f]{10}$`, through the same bijection as [`Self::mint_directory_id`]
+    /// over its own seed.
+    pub fn mint_schema_extension_id(&mut self) -> String {
+        mint_id(&mut self.schema_extension_id_seed, 'e')
     }
 
     /// The next creation rank. Stamped on a directory or an assessment when it is
@@ -1807,6 +1902,21 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 if now >= due && certificate.state == CERTIFICATE_STATE_REGISTERING {
                     certificate.state = CERTIFICATE_STATE_REGISTERED.to_string();
                     certificate.state_due_at = None;
+                }
+            }
+            // The status transition `StartSchemaExtension` owes: the transient
+            // `Initializing` settles on `Completed`, which is when the extension first
+            // has an end instant to report. The move to `Cancelled` belongs to
+            // `CancelSchemaExtension`, which is still scaffolded, so it lands with that
+            // handler rather than as a branch nothing can reach.
+            for extension in directory.schema_extensions.values_mut() {
+                let Some(due) = extension.status_due_at else {
+                    continue;
+                };
+                if now >= due && extension.status == SCHEMA_EXTENSION_STATUS_INITIALIZING {
+                    extension.status = SCHEMA_EXTENSION_STATUS_COMPLETED.to_string();
+                    extension.end_date_time = Some(due);
+                    extension.status_due_at = None;
                 }
             }
         }
@@ -2005,6 +2115,67 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     && snapshot.snapshot_type == SNAPSHOT_TYPE_MANUAL
             })
             .count()
+    }
+
+    /// Why no further manual snapshot of `directory_id` can be stored — the message the
+    /// modelled `SnapshotLimitExceededException` carries — or `None` when one can.
+    ///
+    /// Both bounds are checked here: the snapshot store's absolute ceiling
+    /// ([`MAX_SNAPSHOTS`]) and the per-directory manual snapshot quota
+    /// ([`MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY`]), which is the one
+    /// `SnapshotLimitExceededException` describes. One place, so every operation that
+    /// takes a snapshot of a directory — `CreateSnapshot`, and the
+    /// `StartSchemaExtension` that was asked to snapshot first — refuses on the same
+    /// bounds with the same wording.
+    pub fn manual_snapshot_quota_exceeded(&self, directory_id: &str) -> Option<String> {
+        if self.snapshots.len() >= MAX_SNAPSHOTS {
+            return Some(format!(
+                "Maximum number of snapshots has been reached: {max}",
+                max = MAX_SNAPSHOTS
+            ));
+        }
+        if self.manual_snapshot_count(directory_id) >= MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY {
+            return Some(format!(
+                "Maximum number of manual snapshots for directory {directory_id} has been \
+                 reached: {max}",
+                max = MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY
+            ));
+        }
+        None
+    }
+
+    /// Persist a manual snapshot of `directory_id`, taken at `now`, and return its
+    /// minted `SnapshotId`.
+    ///
+    /// The ONE place a snapshot record is built, so a snapshot taken on a caller's
+    /// behalf is the same record whichever operation asked for it. The status transition
+    /// the take owes (`Creating` to `Completed`) is stored as a due instant for
+    /// [`Self::advance_clock`] to materialise. Callers check
+    /// [`Self::manual_snapshot_quota_exceeded`] first.
+    pub fn insert_manual_snapshot(
+        &mut self,
+        directory_id: &str,
+        name: Option<String>,
+        now: SystemTime,
+    ) -> String {
+        let snapshot_id = self.mint_snapshot_id();
+        let seq = self.next_seq();
+        self.snapshots.insert(
+            snapshot_id.clone(),
+            SnapshotRecord {
+                snapshot_id: snapshot_id.clone(),
+                directory_id: directory_id.to_string(),
+                name,
+                // A snapshot a caller asked for is a manual one; `Auto` is for the ones
+                // Directory Service takes on its own schedule.
+                snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
+                status: SNAPSHOT_STATUS_CREATING.to_string(),
+                status_due_at: Some(now + TRANSITION_SPAN),
+                start_time: now,
+                seq,
+            },
+        );
+        snapshot_id
     }
 
     /// The manual snapshot limits `GetSnapshotLimits` reports for `directory_id`, as

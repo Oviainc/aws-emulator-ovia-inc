@@ -181,51 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Nothing grows the store without end: the snapshot store's absolute ceiling is
-        // checked before anything is minted or inserted. With the per-directory quota
-        // below holding and `DeleteDirectory` dropping the snapshots of the directory it
-        // deletes, this branch is unreachable by construction — it is the guard that
-        // keeps it so, and it reports the store-wide bound rather than a directory's.
-        if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
-            return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
-                crate::state::refusal(format!(
-                    "Maximum number of snapshots has been reached: {max}",
-                    max = crate::state::MAX_SNAPSHOTS
-                )),
-            )
-            .into());
+        // Nothing grows the store without end, and the per-directory manual snapshot
+        // quota is what `SnapshotLimitExceededException` reports: both bounds are
+        // checked, through the one place that words them, before anything is minted or
+        // inserted.
+        if let Some(message) = store.manual_snapshot_quota_exceeded(&input.directory_id) {
+            return Err(
+                CreateSnapshotErrorModeled::SnapshotLimitExceededException(
+                    crate::state::refusal(message),
+                )
+                .into(),
+            );
         }
 
-        // The per-directory manual snapshot quota, which is what
-        // `SnapshotLimitExceededException` reports: "The maximum number of manual
-        // snapshots for the directory has been reached."
-        let held = store.manual_snapshot_count(&input.directory_id);
-        if held >= crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY {
-            return Err(CreateSnapshotErrorModeled::SnapshotLimitExceededException(
-                crate::state::refusal(format!(
-                    "Maximum number of manual snapshots for directory {id} has been reached: {max}",
-                    id = input.directory_id,
-                    max = crate::state::MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY
-                )),
-            )
-            .into());
-        }
-
-        let snapshot_id = store.mint_snapshot_id();
-        let seq = store.next_seq();
-        let record = crate::state::SnapshotRecord {
-            snapshot_id: snapshot_id.clone(),
-            directory_id: input.directory_id.clone(),
-            name: input.name,
-            // A snapshot a caller asked for is a manual one; `Auto` is for the ones
-            // Directory Service takes on its own schedule.
-            snapshot_type: crate::state::SNAPSHOT_TYPE_MANUAL.to_string(),
-            status: crate::state::SNAPSHOT_STATUS_CREATING.to_string(),
-            status_due_at: Some(now + crate::state::TRANSITION_SPAN),
-            start_time: now,
-            seq,
-        };
-        store.snapshots.insert(snapshot_id.clone(), record);
+        let snapshot_id = store.insert_manual_snapshot(&input.directory_id, input.name, now);
 
         // Read the id back out of the store, so the response cannot name a snapshot the
         // insert did not persist.

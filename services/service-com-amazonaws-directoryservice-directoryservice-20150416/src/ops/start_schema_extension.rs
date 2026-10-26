@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSchemaExtension
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSchemaExtension`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSchemaExtension::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a schema extension of a stored Managed Microsoft AD directory in
+//! [`crate::state`], which `ListSchemaExtensions` then reports. The status transition the
+//! start owes (`Initializing` to `Completed`) is stored as a due instant and materialised
+//! by
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`].
+//! A request that asked to be snapshotted first takes a manual snapshot of the directory
+//! through the same store `CreateSnapshot` writes, which is what the modelled
+//! `SnapshotLimitExceededException` reports on.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSchemaExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSchemaExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSchemaExtension"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // A schema extension is applied TO a directory, so the directory is resolved
+        // first: an id naming none is the modelled "specified entity could not be
+        // found".
+        let directory = store
+            .directories
+            .get(&input.directory_id)
+            .ok_or_else(|| {
+                StartSchemaExtensionErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+                )
+            })?;
+
+        // This operation's own documentation: "Applies a schema extension to a Microsoft
+        // AD directory." The model declares no `UnsupportedOperationException` for this
+        // operation, so the directory type the request named is reported as the invalid
+        // parameter it is, naming the member and the type that admits an extension.
+        if directory.directory_type != crate::state::TYPE_MICROSOFT_AD {
+            return Err(invalid_parameter(format!(
+                "DirectoryId {id} names a {directory_type} directory, to which no schema \
+                 extension can be applied; schema extensions are supported for \
+                 {supported}",
+                id = input.directory_id,
+                directory_type = directory.directory_type,
+                supported = crate::state::TYPE_MICROSOFT_AD
+            )));
+        }
+
+        // Extending the schema changes the directory itself, so it needs a directory
+        // that is in service: one still being built by the transition its create owes is
+        // unavailable, which is the modelled refusal for exactly that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                StartSchemaExtensionErrorModeled::DirectoryUnavailableException(
+                    crate::state::refusal(format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         schema extensions",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // Nothing grows the store without end: the per-directory guard is checked before
+        // anything is minted or inserted. It is not an AWS quota — see
+        // [`crate::state::MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY`] — so it is reported with
+        // the generic `ClientException` the model offers rather than a bound-specific
+        // error, which this operation declares none of.
+        if directory.schema_extensions.len() >= crate::state::MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY
+        {
+            return Err(StartSchemaExtensionErrorModeled::ClientException(
+                crate::state::refusal(format!(
+                    "Directory {id} holds the maximum number of schema extensions this \
+                     emulator keeps: {max}",
+                    id = input.directory_id,
+                    max = crate::state::MAX_SCHEMA_EXTENSIONS_PER_DIRECTORY
+                )),
+            )
+            .into());
+        }
+
+        // `CreateSnapshotBeforeSchemaExtension`: "If true, creates a snapshot of the
+        // directory before applying the schema extension." That snapshot is a manual one
+        // of the directory, so it counts towards the same quota `CreateSnapshot` is bound
+        // by — which is why this operation models `SnapshotLimitExceededException` at
+        // all. It is taken BEFORE the extension is persisted, so a request refused on the
+        // quota records no extension either.
+        if input.create_snapshot_before_schema_extension {
+            if let Some(message) = store.manual_snapshot_quota_exceeded(&input.directory_id) {
+                return Err(
+                    StartSchemaExtensionErrorModeled::SnapshotLimitExceededException(
+                        crate::state::refusal(message),
+                    )
+                    .into(),
+                );
+            }
+            store.insert_manual_snapshot(&input.directory_id, None, now);
+        }
+
+        let schema_extension_id = store.mint_schema_extension_id();
+        let seq = store.next_seq();
+        let record = crate::state::SchemaExtensionRecord {
+            schema_extension_id: schema_extension_id.clone(),
+            description: input.description,
+            status: crate::state::SCHEMA_EXTENSION_STATUS_INITIALIZING.to_string(),
+            // Nothing to report about a status this call just set: the member is "the
+            // reason for the `SchemaExtensionStatus`", and an extension that is simply
+            // under way has none.
+            status_reason: None,
+            start_date_time: now,
+            // An extension that is still being applied has no end instant yet; the
+            // transition this call owes is what gives it one.
+            end_date_time: None,
+            status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            seq,
+        };
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        directory
+            .schema_extensions
+            .insert(schema_extension_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name an extension
+        // the insert did not persist.
+        let stored = directory
+            .schema_extensions
+            .get(&schema_extension_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(StartSchemaExtensionOutput {
+            schema_extension_id: Some(stored.schema_extension_id.clone()),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> StartSchemaExtensionError {
+    StartSchemaExtensionErrorModeled::InvalidParameterException(crate::state::refusal(message))
+        .into()
 }

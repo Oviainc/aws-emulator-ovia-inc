@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemaExtensions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemaExtensions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemaExtensions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the schema extensions `StartSchemaExtension` persisted for one directory in
+//! [`crate::state`], a page at a time, in the order they were started. A reporting
+//! operation: the only write is
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],
+//! which materialises the status transitions the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemaExtensions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemaExtensionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemaExtensions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The cursor a previous page handed back: the creation rank of the extension this
+        // page resumes after, together with the filter it was issued under. A token this
+        // service did not issue, or one issued for a different listing, is refused rather
+        // than served as a page of another listing.
+        let filter = crate::state::cursor_filter(&[input.directory_id.as_str()]);
+        let after_seq = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
+                .and_then(|value| {
+                    let (seq, issued_for) = value.split_once(crate::state::CURSOR_SEPARATOR)?;
+                    if issued_for != filter.as_str() {
+                        return None;
+                    }
+                    seq.parse::<u64>().ok()
+                })
+                .ok_or_else(|| {
+                    ListSchemaExtensionsErrorModeled::InvalidNextTokenException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // The listing is of ONE directory's extensions, and an id naming no stored
+        // directory is reported rather than served as an empty page.
+        let directory = store
+            .directories
+            .get(&input.directory_id)
+            .ok_or_else(|| {
+                ListSchemaExtensionsErrorModeled::EntityDoesNotExistException(
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+                )
+            })?;
+
+        // Every extension of that directory, in the order they were started, from the
+        // cursor on. A directory that has been through none contributes nothing.
+        let mut selected: Vec<(u64, SchemaExtensionInfo)> = directory
+            .schema_extensions_in_creation_order()
+            .into_iter()
+            .filter(|extension| extension.seq > after_seq)
+            .map(|extension| (extension.seq, extension.to_info(&directory.directory_id)))
+            .collect();
+        drop(store);
+
+        let truncated = selected.len() > page_size;
+        selected.truncate(page_size);
+        let page_ended_after = selected.last().map(|(seq, _)| *seq);
+        let schema_extensions_info: Vec<SchemaExtensionInfo> =
+            selected.into_iter().map(|(_, entry)| entry).collect();
+
+        Ok(ListSchemaExtensionsOutput {
+            schema_extensions_info: Some(schema_extensions_info),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|seq| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!(
+                            "{seq}{separator}{filter}",
+                            separator = crate::state::CURSOR_SEPARATOR
+                        ),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
 }
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "schema-extensions";
