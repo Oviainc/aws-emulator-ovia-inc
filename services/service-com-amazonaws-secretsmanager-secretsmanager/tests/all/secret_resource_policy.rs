@@ -16,7 +16,8 @@
 //! * a `ResourcePolicy` that is not an IAM policy document (JSON object whose
 //!   `Statement` is a statement, or a non-empty list of statements, each with an
 //!   `Effect` of `Allow` or `Deny`) is refused with
-//!   `MalformedPolicyDocumentException` and attaches nothing;
+//!   `MalformedPolicyDocumentException`, carrying the one sentence the service
+//!   says about that condition, and attaches nothing;
 //! * a request that blocks public policies is refused with
 //!   `PublicPolicyException` exactly when the document ALLOWS a wildcard
 //!   principal; without that flag the same document attaches;
@@ -44,6 +45,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The documented upper bound on a policy document
 /// (`NonEmptyResourcePolicyType`, len 1..20480, this service's Smithy model).
 const MAX_POLICY_LEN: usize = 20_480;
+
+/// The one sentence Secrets Manager says about a resource policy it cannot read
+/// as a policy document — the `MalformedPolicyDocumentException` message, and
+/// the message `ValidateResourcePolicy` reports for its syntax check.
+const SYNTAX_ERROR_MESSAGE: &str = "This resource policy contains a syntax error.";
 
 /// A fresh emulator holding only this service, over its own engine.
 fn emulator() -> MultiServiceRouter {
@@ -85,13 +91,14 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &st
     parsed
 }
 
-/// Send one request that must fail with a 400, and return its wire error code.
-async fn err_code(
+/// Send one request that must fail with a 400, and return its wire error code
+/// and the message it carries.
+async fn refusal(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
     case: &str,
-) -> String {
+) -> (String, String) {
     let (status, parsed) = call(router, operation, &body).await;
     assert_eq!(
         status, 400,
@@ -102,7 +109,24 @@ async fn err_code(
         .get("__type")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: no __type in error body {parsed}"));
-    raw.split('#').next_back().unwrap_or(raw).to_string()
+    let code = raw.split('#').next_back().unwrap_or(raw).to_string();
+    let message = parsed
+        .get("message")
+        .or_else(|| parsed.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no message in error body {parsed}"))
+        .to_string();
+    (code, message)
+}
+
+/// Send one request that must fail with a 400, and return its wire error code.
+async fn err_code(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> String {
+    refusal(router, operation, body, case).await.0
 }
 
 /// Create a secret and return its ARN.
@@ -491,7 +515,7 @@ async fn a_document_that_is_not_a_policy_is_refused() {
     .await;
 
     for (case, document) in malformed {
-        let code = err_code(
+        let (code, message) = refusal(
             &router,
             "PutResourcePolicy",
             json!({"SecretId": name, "ResourcePolicy": &document}),
@@ -501,6 +525,15 @@ async fn a_document_that_is_not_a_policy_is_refused() {
         assert_eq!(
             code, "MalformedPolicyDocumentException",
             "case {case:?}: expected MalformedPolicyDocumentException, got {code}"
+        );
+        // One fixed sentence for the condition, whatever the document got wrong
+        // and whatever it contained: the refusal names no part of it. It is the
+        // sentence `ValidateResourcePolicy` reports for the same check, so the
+        // pre-flight guard and the refusal read alike.
+        assert_eq!(
+            message, SYNTAX_ERROR_MESSAGE,
+            "case {case:?}: expected the refusal message {SYNTAX_ERROR_MESSAGE:?}, got \
+             {message:?}"
         );
         // The refused document replaced nothing.
         let read = ok(

@@ -23,6 +23,8 @@ mod secret_policy_validation;
 mod secret_public_policy_message;
 #[path = "all/secret_resource_policy.rs"]
 mod secret_resource_policy;
+#[path = "all/secret_resource_policy_targeting.rs"]
+mod secret_resource_policy_targeting;
 #[path = "all/secret_restore.rs"]
 mod secret_restore;
 #[path = "all/secret_rotation.rs"]

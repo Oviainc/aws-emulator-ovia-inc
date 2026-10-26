@@ -574,11 +574,16 @@ pub const VALIDATE_SYNTAX_ERROR_MESSAGE: &str = "This resource policy contains a
 
 /// What a resource policy document that is not a policy document is refused
 /// with: `MalformedPolicyDocumentException` is "The resource policy has syntax
-/// errors." (this service's Smithy model), and the message names the grammar
-/// the document has to satisfy rather than quoting the document back.
-pub const MALFORMED_POLICY_MESSAGE: &str = "Syntax errors in policy. The resource policy must be \
-     a JSON object whose Statement is a statement, or a non-empty list of statements, each with an \
-     Effect of Allow or Deny.";
+/// errors." (this service's Smithy model).
+///
+/// One fixed sentence, naming no part of the document and no secret, and the
+/// SAME sentence wherever the service speaks about that condition: the
+/// `MalformedPolicyDocumentException` an attach is refused with, and the message
+/// the syntax check reports on the validation channel
+/// ([`VALIDATE_SYNTAX_ERROR_MESSAGE`]) — so a caller using
+/// `ValidateResourcePolicy` as a pre-flight guard reads the very text the
+/// refusal will carry.
+pub const MALFORMED_POLICY_MESSAGE: &str = VALIDATE_SYNTAX_ERROR_MESSAGE;
 
 /// What this service says about a resource policy that grants public access to a
 /// secret: `PublicPolicyException` is "The BlockPublicPolicy parameter is set to

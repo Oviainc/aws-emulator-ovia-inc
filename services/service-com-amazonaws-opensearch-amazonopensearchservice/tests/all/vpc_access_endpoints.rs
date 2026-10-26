@@ -176,8 +176,14 @@ fn host_id(host: &str, tail: &str, case: &str) -> String {
 
 /// Assert `status` publishes exactly what the rule says for `row`, and answer with the
 /// hosts it published so a caller can compare two reads or two domains.
+///
+/// `Endpoints` is a MAP, so the order its members arrive in is no part of the answer —
+/// the same reason the key-set assertion below sorts. The hosts are answered in key
+/// order so a caller comparing two reads compares their CONTENTS and not the order one
+/// serialization happened to put them in.
 fn assert_rule(status: &Value, row: &Row, name: &str, case: &str) -> Vec<(String, String)> {
-    let published = endpoints(status, case);
+    let mut published = endpoints(status, case);
+    published.sort();
     let mut keys: Vec<&str> = published.iter().map(|(key, _)| key.as_str()).collect();
     keys.sort_unstable();
     let mut expected: Vec<&str> = row.endpoints_keys.to_vec();
