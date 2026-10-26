@@ -300,9 +300,9 @@ async fn tag_resource_classifies_the_resource_arn_before_it_looks_at_the_tags() 
     // fields, an empty required field, an account that is not twelve digits), another
     // service, a resource type this service does not own, an id outside the modelled
     // bound — is a bad request, while an ARN that DOES parse and merely names nothing
-    // this account holds is not found. The region and the partition are not part of
-    // resolution (the inventory and the task store are per-account, as
-    // `crate::state::parse_tagged_resource_arn` documents), so no row varies them.
+    // this endpoint holds is not found. Every row names the signed Region, because
+    // which Region an ARN may name is its own rule (`tagging_region_scope.rs`) and
+    // would otherwise decide these rows instead of the field under test.
     let bad_request: &[(&str, String)] = &[
         ("not an ARN at all", "not-an-arn".to_string()),
         ("the bare prefix", "arn".to_string()),
