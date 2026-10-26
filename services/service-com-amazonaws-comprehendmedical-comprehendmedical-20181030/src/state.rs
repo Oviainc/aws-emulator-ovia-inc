@@ -89,13 +89,27 @@ impl JobStatus {
         .find(|status| status.as_wire() == value)
     }
 
-    /// Whether the job has finished: a terminal status never changes again, so a
-    /// stop request against it is a no-op.
+    /// Whether the job has finished: a terminal status never changes again, so there is
+    /// nothing left for a stop request to do.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Completed | Self::PartialSuccess | Self::Failed | Self::Stopped
         )
+    }
+}
+
+/// A stop request that named a job which had already reached a terminal status.
+///
+/// Carries the sentence the service states for it, so every job family's stop operation
+/// refuses that request with one wording rather than each inventing its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobAlreadyTerminal;
+
+impl JobAlreadyTerminal {
+    /// What the refusal reports: the job had finished, so it cannot be stopped.
+    pub fn message(self) -> &'static str {
+        "Job is already in terminal state."
     }
 }
 
@@ -184,15 +198,25 @@ impl AsyncJob {
         }
     }
 
-    /// Record that a caller asked for this job to stop. A job already in a terminal
-    /// status is left alone — it finished before the stop could take effect.
-    pub fn request_stop(&mut self, now: f64) {
-        if self.job_status.is_terminal() || self.job_status == JobStatus::StopRequested {
-            return;
+    /// Record that a caller asked for this job to stop.
+    ///
+    /// A job that already reached a terminal status has nothing left to stop, so the
+    /// request is REFUSED and the stored job is left exactly as it was: the stop
+    /// operations document stopping a job "in progress", and a caller has to be able to
+    /// tell a stop that took effect from one that named a job which had already
+    /// finished. A stop repeated while the first is still pending is the same request
+    /// again, so it is accepted and changes nothing.
+    pub fn request_stop(&mut self, now: f64) -> Result<(), JobAlreadyTerminal> {
+        if self.job_status.is_terminal() {
+            return Err(JobAlreadyTerminal);
+        }
+        if self.job_status == JobStatus::StopRequested {
+            return Ok(());
         }
         self.job_status = JobStatus::StopRequested;
         self.stop_requested_time = Some(date_time(now));
         self.message = Some("The job was stopped at the request of the caller.".to_string());
+        Ok(())
     }
 
     /// Whether this job's metadata has been kept past its `ExpirationTime`.

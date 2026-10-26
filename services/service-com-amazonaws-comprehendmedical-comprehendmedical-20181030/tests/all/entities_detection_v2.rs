@@ -444,17 +444,23 @@ async fn stopping_a_job_is_observed_by_a_later_describe() {
         "case {job_id:?}: a stopped job carries an EndTime, got {stopped}"
     );
 
-    // Stopping a job that already finished leaves its terminal status alone.
+    // Stopping a job that already finished is refused, and leaves its terminal status
+    // alone. The refusal itself is table-tested in `tests/all/refusal_messages.rs`.
     wait(50);
-    let (status, _) = call(
+    let (status, answer) = call(
         &router,
         "StopEntitiesDetectionV2Job",
         &json!({"JobId": job_id.clone()}),
     )
     .await;
     assert_eq!(
-        status, 200,
-        "stopping a stopped job: expected 200, got {status}"
+        status, 400,
+        "stopping a stopped job: expected 400, got {status} {answer}"
+    );
+    assert_eq!(
+        answer["__type"].as_str(),
+        Some("InvalidRequestException"),
+        "stopping a stopped job: expected InvalidRequestException, got {answer}"
     );
     let still = describe_job(&router, &job_id).await;
     assert_eq!(
