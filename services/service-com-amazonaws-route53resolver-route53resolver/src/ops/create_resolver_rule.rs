@@ -114,7 +114,7 @@
 use super::types::*;
 
 use crate::state::{
-    DNS_PORT, ENDPOINT_DIRECTION_OUTBOUND, RULE_TYPE_DELEGATE, RULE_TYPE_FORWARD,
+    TargetAddressFault, ENDPOINT_DIRECTION_OUTBOUND, RULE_TYPE_DELEGATE, RULE_TYPE_FORWARD,
     RULE_TYPE_RECURSIVE, RULE_TYPE_SYSTEM,
 };
 
@@ -220,35 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A rule of a type Resolver answers itself names no forwarding target:
-        // `TargetIps` "is available only when the value of Rule type is
-        // FORWARD", and `ResolverEndpointId` is "the ID of the outbound Resolver
-        // endpoint that you want to use to route DNS queries to the IP addresses
-        // that you specify in TargetIps" — with no target IPs there is nothing
-        // to route through an endpoint. So a SYSTEM rule carrying either member
-        // is refused, naming both in the RSLVR-coded refusal.
-        if rule_type == RULE_TYPE_SYSTEM
-            && (!target_ips.is_empty() || input.resolver_endpoint_id.is_some())
-        {
-            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                crate::state::system_rule_forbids_forwarding_target(),
-            )
-            .into());
-        }
-
-        // `TargetIps`: "when creating a DELEGATE rule, you must not provide the
-        // TargetIps parameter. If you provide the TargetIps, you may receive an
-        // ERROR message similar to 'Delegate resolver rules need to specify a
-        // nameserver name'" — the model states that wording, so it is reported.
-        if rule_type == RULE_TYPE_DELEGATE && !target_ips.is_empty() {
-            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(
-                        "Delegate resolver rules need to specify a nameserver name.".to_string(),
-                    ),
-                },
-            )
-            .into());
+        // Which forwarding members the rule's TYPE admits is the same question
+        // on a create as on an update, so both ask
+        // [`crate::state::forwarding_target_forbidden`]: a rule of a type
+        // Resolver answers itself carries neither the target addresses nor the
+        // endpoint they would be reached through.
+        if let Some(fault) = crate::state::forwarding_target_forbidden(
+            rule_type,
+            !target_ips.is_empty(),
+            input.resolver_endpoint_id.is_some(),
+        ) {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(fault).into());
         }
 
         // A FORWARD rule is what forwards queries through a Resolver endpoint
@@ -256,68 +238,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint and the target addresses TOGETHER: either one alone describes
         // no forwarding path. That makes it ONE precondition, reported with one
         // RSLVR-coded refusal whichever of the two members is missing — the
-        // mirror image of the SYSTEM refusal above. No other rule type may carry
-        // target addresses.
-        if rule_type == RULE_TYPE_FORWARD {
-            if target_ips.is_empty() || input.resolver_endpoint_id.is_none() {
-                return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                    crate::state::forward_rule_requires_forwarding_target(),
-                )
-                .into());
-            }
-        } else if !target_ips.is_empty() {
+        // mirror image of the SYSTEM refusal above.
+        if rule_type == RULE_TYPE_FORWARD
+            && (target_ips.is_empty() || input.resolver_endpoint_id.is_none())
+        {
             return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "TargetIps is available only for a rule with RuleType {RULE_TYPE_FORWARD}, not {rule_type}"
-                    )),
-                },
+                crate::state::forward_rule_requires_forwarding_target(),
             )
             .into());
         }
 
-        // The model puts no maximum on `TargetList`, so the list one record can
-        // hold is bounded here; refused before the store is locked, so nothing
-        // is written.
-        if target_ips.len() > crate::state::MAX_TARGET_IPS {
-            return Err(CreateResolverRuleErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "A Resolver rule accepts at most {} target IP addresses in this emulator",
-                        crate::state::MAX_TARGET_IPS
-                    )),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_RESOLVER_RULE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // Each target address names where to forward to, so one that carries
-        // neither `Ip` nor `Ipv6` says nothing; and `TargetIps`: "You can
-        // specify either Ipv4 or Ipv6 addresses but not both in the same rule."
-        let ipv4_targets = target_ips.iter().filter(|target| target.ip.is_some()).count();
-        let ipv6_targets = target_ips
-            .iter()
-            .filter(|target| target.ipv6.is_some())
-            .count();
-        if ipv4_targets + ipv6_targets < target_ips.len() {
-            return Err(CreateResolverRuleErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: "Each target address must specify Ip or Ipv6".to_string(),
-                    field_name: Some("TargetIps".to_string()),
-                },
-            )
-            .into());
-        }
-        if ipv4_targets > 0 && ipv6_targets > 0 {
-            return Err(CreateResolverRuleErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: "A Resolver rule can specify either Ip or Ipv6 target addresses, not both"
-                        .to_string(),
-                    field_name: Some("TargetIps".to_string()),
-                },
-            )
-            .into());
+        // The bound on one rule's target-address list, and the preconditions
+        // each address has to satisfy, are the same on every write of
+        // `TargetIps`; refused before the store is locked, so nothing is
+        // written.
+        match crate::state::target_address_fault(&target_ips) {
+            Some(TargetAddressFault::TooMany(fault)) => {
+                return Err(CreateResolverRuleErrorModeled::LimitExceededException(fault).into());
+            }
+            Some(TargetAddressFault::Invalid(fault)) => {
+                return Err(
+                    CreateResolverRuleErrorModeled::InvalidParameterException(fault).into(),
+                );
+            }
+            None => {}
         }
 
         // `DomainName`: "DNS queries for this domain name are forwarded to the
@@ -424,28 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("resolver-rule/{id}"),
         );
 
-        let stored_targets: Vec<TargetAddress> = target_ips
-            .iter()
-            .map(|target| TargetAddress {
-                ip: target.ip.clone(),
-                // DNS answers on port 53 (RFC 1035 §4.2), which is the port a
-                // target address that names none forwards to.
-                port: Some(target.port.unwrap_or(DNS_PORT)),
-                ipv6: target.ipv6.clone(),
-                // The `Protocol` enum's `Do53` is what "None" means for a
-                // Resolver protocol, per `CreateResolverEndpoint`'s `Protocols`
-                // doc: "None, which is treated as Do53."
-                protocol: Some(
-                    target
-                        .protocol
-                        .clone()
-                        .unwrap_or_else(|| crate::state::DEFAULT_PROTOCOL.to_string()),
-                ),
-                // "only used if the Protocol of the TargetAddress is DoH", so
-                // it is echoed, never invented.
-                server_name_indication: target.server_name_indication.clone(),
-            })
-            .collect();
+        let stored_targets = crate::state::normalize_target_addresses(&target_ips);
 
         let record = crate::state::ResolverRuleRecord {
             seq,

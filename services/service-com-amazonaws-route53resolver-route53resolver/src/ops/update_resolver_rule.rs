@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResolverRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResolverRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLD REPLACED: implemented. The new settings are written onto the stored
+//! [`crate::state::ResolverRuleRecord`] and the answer is projected off that record, so a
+//! later `GetResolverRule`, `ListResolverRules` or `UpdateResolverRule` reads exactly what
+//! this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResolverRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule's `ModificationTime` moves only when a member actually changed, and its
+//! `ResolverRuleStatus` stays the settled `COMPLETE`: the new settings take effect with
+//! this call, so the clock owes the rule no later transition.
+//!
+//! The preconditions the new settings have to satisfy are the rule-write preconditions in
+//! [`crate::state`], the same ones `CreateResolverRule` enforces: which forwarding members
+//! the rule's type admits, the bound on one rule's target-address list, and that an
+//! endpoint named is a stored OUTBOUND one.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +87,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{TargetAddressFault, ENDPOINT_DIRECTION_OUTBOUND};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -159,18 +165,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResolverRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResolverRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResolverRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateResolverRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let config = &input.config;
+
+        let mut store = state.lock();
+
+        // "Updates settings for a specified Resolver rule": the settings belong
+        // to a rule that has to exist, and the members this call does not
+        // change (the rule's type above all) are what decides which new
+        // settings it may carry.
+        let Some(current) = store.resolver_rules.get(&input.resolver_rule_id) else {
+            return Err(UpdateResolverRuleErrorModeled::ResourceNotFoundException(
+                crate::state::resolver_rule_not_found(&input.resolver_rule_id),
+            )
+            .into());
+        };
+        let rule_type = current.rule_type.clone();
+
+        // Which forwarding members a rule may carry follows from its TYPE, so
+        // the new settings are held to the same precondition the create was,
+        // against the type the STORED rule has.
+        if let Some(fault) = crate::state::forwarding_target_forbidden(
+            &rule_type,
+            config.target_ips.is_some(),
+            config.resolver_endpoint_id.is_some(),
+        ) {
+            return Err(UpdateResolverRuleErrorModeled::InvalidRequestException(fault).into());
+        }
+
+        // The new target addresses are held to the bound and the per-address
+        // preconditions every write of `TargetIps` is held to. Refused before
+        // anything is written, so a rejected update leaves the rule exactly as
+        // it was.
+        let new_target_ips = match config.target_ips.as_deref() {
+            Some(targets) => {
+                match crate::state::target_address_fault(targets) {
+                    Some(TargetAddressFault::TooMany(fault)) => {
+                        return Err(
+                            UpdateResolverRuleErrorModeled::LimitExceededException(fault).into()
+                        );
+                    }
+                    Some(TargetAddressFault::Invalid(fault)) => {
+                        return Err(
+                            UpdateResolverRuleErrorModeled::InvalidParameterException(fault).into(),
+                        );
+                    }
+                    None => {}
+                }
+                Some(crate::state::normalize_target_addresses(targets))
+            }
+            None => None,
+        };
+
+        // `ResolverEndpointId`: "The ID of the new outbound Resolver endpoint
+        // that you want to use to route DNS queries to the IP addresses that
+        // you specify in TargetIps" — whatever names an endpoint must name a
+        // stored OUTBOUND one, as it must on a create.
+        if let Some(endpoint_id) = config.resolver_endpoint_id.as_deref() {
+            let Some(endpoint) = store.resolver_endpoints.get(endpoint_id) else {
+                return Err(UpdateResolverRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_endpoint_not_found(endpoint_id),
+                )
+                .into());
+            };
+            if endpoint.direction != ENDPOINT_DIRECTION_OUTBOUND {
+                return Err(UpdateResolverRuleErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Resolver endpoint {endpoint_id} is {}; a Resolver rule routes queries through an {ENDPOINT_DIRECTION_OUTBOUND} endpoint",
+                            endpoint.direction
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(record) = store.resolver_rules.get_mut(&input.resolver_rule_id) else {
+            return Err(UpdateResolverRuleErrorModeled::ResourceNotFoundException(
+                crate::state::resolver_rule_not_found(&input.resolver_rule_id),
+            )
+            .into());
+        };
+
+        // "ResolverRuleId is required, and all other parameters are optional.
+        // If you don't specify a parameter, it retains its current value." So
+        // only the members the new settings name are written, and a request
+        // that names none writes nothing at all — it does not move the rule's
+        // `ModificationTime`.
+        let mut written = false;
+        if let Some(name) = config.name.clone() {
+            record.name = Some(name);
+            written = true;
+        }
+        if let Some(targets) = new_target_ips {
+            record.target_ips = targets;
+            written = true;
+        }
+        if let Some(endpoint_id) = config.resolver_endpoint_id.clone() {
+            record.resolver_endpoint_id = Some(endpoint_id);
+            written = true;
+        }
+        if written {
+            record.modification_time = crate::state::now_rfc3339();
+        }
+
+        Ok(UpdateResolverRuleOutput {
+            resolver_rule: Some(record.to_rule()),
+        })
     }
 }

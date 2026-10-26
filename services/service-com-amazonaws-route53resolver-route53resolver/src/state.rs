@@ -16,11 +16,11 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidRequestException,
-    IpAddressResponse, IpAddressUpdate, LimitExceededException, OutpostResolver, ResolverConfig,
-    ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
-    ResourceExistsException, ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress,
-    ValidationException,
+    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidParameterException,
+    InvalidRequestException, IpAddressResponse, IpAddressUpdate, LimitExceededException,
+    OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint, ResolverRule,
+    ResolverRuleAssociation, ResourceExistsException, ResourceInUseException,
+    ResourceNotFoundException, Tag, TargetAddress, ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -294,8 +294,9 @@ pub const RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION: &str = "ResolverRuleAssociati
 /// is `COMPLETE | DELETING | UPDATING | FAILED`: it has no provisioning value,
 /// so a created rule is settled the moment it exists and the clock owes it no
 /// transition. `DELETING` is what the rule a delete has just taken out reports,
-/// as that call's answer "including the status of the request"; `UPDATING` and
-/// `FAILED` describe operations this slice does not perform.
+/// as that call's answer "including the status of the request"; the settings an
+/// update writes are likewise in effect when that call answers, so `UPDATING`
+/// and `FAILED` describe work this slice never leaves outstanding.
 pub const RULE_STATUS_COMPLETE: &str = "COMPLETE";
 pub const RULE_STATUS_DELETING: &str = "DELETING";
 
@@ -598,6 +599,132 @@ pub fn system_rule_forbids_forwarding_target() -> InvalidRequestException {
             ),
         )),
     }
+}
+
+/// The `InvalidRequestException` a rule write answers when the rule's TYPE
+/// forbids the forwarding members the request names, or `None` when that type
+/// admits them.
+///
+/// `TargetIps` "is available only when the value of Rule type is FORWARD", and
+/// `ResolverEndpointId` is the endpoint the queries named by those addresses
+/// pass through, so a rule of any other type carries neither. Decided here
+/// rather than in each handler so the create and the update of one rule cannot
+/// disagree about which member its type admits; the type is the one the rule
+/// HAS (the request's on a create, the stored record's on an update).
+pub fn forwarding_target_forbidden(
+    rule_type: &str,
+    names_target_ips: bool,
+    names_resolver_endpoint: bool,
+) -> Option<InvalidRequestException> {
+    // A rule of a type Resolver answers itself names no forwarding target at
+    // all, so the endpoint is refused on its own as well as with the addresses.
+    if rule_type == RULE_TYPE_SYSTEM && (names_target_ips || names_resolver_endpoint) {
+        return Some(system_rule_forbids_forwarding_target());
+    }
+    // "when creating a DELEGATE rule, you must not provide the TargetIps
+    // parameter. If you provide the TargetIps, you may receive an ERROR message
+    // similar to 'Delegate resolver rules need to specify a nameserver name'" —
+    // the model states that wording, so it is reported.
+    if rule_type == RULE_TYPE_DELEGATE && names_target_ips {
+        return Some(InvalidRequestException {
+            message: Some("Delegate resolver rules need to specify a nameserver name.".to_string()),
+        });
+    }
+    if rule_type != RULE_TYPE_FORWARD && names_target_ips {
+        return Some(InvalidRequestException {
+            message: Some(format!(
+                "TargetIps is available only for a rule with RuleType {RULE_TYPE_FORWARD}, not {rule_type}"
+            )),
+        });
+    }
+    None
+}
+
+/// What is wrong with the target-address list a rule write carries, when
+/// anything is.
+///
+/// The two faults are reported with DIFFERENT modelled errors, so
+/// [`target_address_fault`] names which one it found and the handler lifts it
+/// into the error its own operation models.
+#[derive(Debug)]
+pub enum TargetAddressFault {
+    /// More target addresses than one stored rule holds ([`MAX_TARGET_IPS`]).
+    TooMany(LimitExceededException),
+    /// An address that names no address at all, or a list mixing the two
+    /// address families.
+    Invalid(InvalidParameterException),
+}
+
+/// Whether the target addresses a rule write carries can be stored as they are,
+/// and what is wrong with them when they cannot.
+///
+/// One function for every write of a rule's `TargetIps`, so the bound and the
+/// per-address preconditions a create enforces are the ones an update enforces
+/// too.
+pub fn target_address_fault(targets: &[TargetAddress]) -> Option<TargetAddressFault> {
+    // The model puts no maximum on `TargetList`, so the list one record can
+    // hold is bounded here.
+    if targets.len() > MAX_TARGET_IPS {
+        return Some(TargetAddressFault::TooMany(LimitExceededException {
+            message: Some(format!(
+                "A Resolver rule accepts at most {MAX_TARGET_IPS} target IP addresses in this emulator"
+            )),
+            resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
+        }));
+    }
+
+    // Each target address names where to forward to, so one that carries
+    // neither `Ip` nor `Ipv6` says nothing; and `TargetIps`: "You can specify
+    // either Ipv4 or Ipv6 addresses but not both in the same rule."
+    let ipv4_targets = targets.iter().filter(|target| target.ip.is_some()).count();
+    let ipv6_targets = targets.iter().filter(|target| target.ipv6.is_some()).count();
+    if ipv4_targets + ipv6_targets < targets.len() {
+        return Some(TargetAddressFault::Invalid(InvalidParameterException {
+            message: "Each target address must specify Ip or Ipv6".to_string(),
+            field_name: Some("TargetIps".to_string()),
+        }));
+    }
+    if ipv4_targets > 0 && ipv6_targets > 0 {
+        return Some(TargetAddressFault::Invalid(InvalidParameterException {
+            message: "A Resolver rule can specify either Ip or Ipv6 target addresses, not both"
+                .to_string(),
+            field_name: Some("TargetIps".to_string()),
+        }));
+    }
+
+    None
+}
+
+/// The target addresses a rule stores for the list a request carried: the same
+/// addresses, in the same order, with the members the request left out filled
+/// in from the documented defaults.
+///
+/// The order is the request's: `TargetIps` is the list of resolvers a query is
+/// forwarded to, so the list a read reports is the list the write was given,
+/// neither sorted nor de-duplicated.
+pub fn normalize_target_addresses(targets: &[TargetAddress]) -> Vec<TargetAddress> {
+    targets
+        .iter()
+        .map(|target| TargetAddress {
+            ip: target.ip.clone(),
+            // DNS answers on port 53 (RFC 1035 §4.2), which is the port a
+            // target address that names none forwards to.
+            port: Some(target.port.unwrap_or(DNS_PORT)),
+            ipv6: target.ipv6.clone(),
+            // The `Protocol` enum's `Do53` is what "None" means for a Resolver
+            // protocol, per `CreateResolverEndpoint`'s `Protocols` doc: "None,
+            // which is treated as Do53."
+            protocol: Some(
+                target
+                    .protocol
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_PROTOCOL.to_string()),
+            ),
+            // "only used if the Protocol of the TargetAddress is DoH", so it is
+            // echoed, never invented.
+            server_name_indication: target.server_name_indication.clone(),
+        })
+        .collect()
 }
 
 /// The `ResourceNotFoundException` the rule operations answer for an id they
