@@ -158,13 +158,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — one region's endpoint cannot change another region's Outpost.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
-        // same stored record.
-        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
-            UpdateOutpostErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::outpost_id_pattern_report()),
+        // How this operation states that the `OutpostId` names no Outpost this
+        // endpoint holds: the identifier echo of the value AS SUPPLIED — not of the
+        // bare id an ARN resolved to.
+        let not_found = || {
+            UpdateOutpostErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_ID_MEMBER,
+                    &input.outpost_id,
+                )),
             })
-        })?;
+        };
+        // `OutpostId` accepts the bare id or the full Outpost ARN. A bare id names an
+        // Outpost of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no Outpost it holds — so it changes nothing here.
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id, &region)
+            .ok_or_else(|| {
+                UpdateOutpostErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // This call reports the Outpost it updated, so it reports the status the
@@ -172,16 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised first, exactly as every other path that reports an Outpost
         // does, so an update never answers a stale lifecycle status.
         store.settle_outposts();
-        let record = store.outpost_mut(&region, &outpost_id).ok_or_else(|| {
-            UpdateOutpostErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of
-                // `outpost_id`, which is the bare id an ARN resolved to.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_ID_MEMBER,
-                    &input.outpost_id,
-                )),
-            })
-        })?;
+        let record = store
+            .outpost_mut(&region, &outpost_id)
+            .ok_or_else(not_found)?;
         // The three members this operation takes besides the identifier, each
         // written only when the request carried it. `OutpostDescription` is the one
         // string in this API modelled `length(min: 0)`, so the empty string is a
