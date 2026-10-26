@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReputationEntityCustomerManagedStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReputationEntityCustomerManagedStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReputationEntityCustomerManagedStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the customer-managed sending status of the reputation entity the request
+//! names, leaving its Amazon-SES-managed status as it was. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReputationEntityCustomerManagedStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReputationEntityCustomerManagedStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReputationEntityCustomerManagedStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateReputationEntityCustomerManagedStatus without the shared emulator state",
+            ));
+        };
+
+        // Both enums arrive as plain strings, so a value outside the enum is this
+        // handler's to refuse, with the `BadRequestException` the model binds for "the
+        // input you provided is invalid".
+        // The one entity type the model binds: a request naming another names no entity
+        // this account could hold, so the checked value constrains nothing further.
+        crate::state::modelled_enum_value(
+            "ReputationEntityType",
+            input.reputation_entity_type,
+            &[crate::state::REPUTATION_ENTITY_TYPE_RESOURCE],
+        )
+        .map_err(bad_request)?;
+        let sending_status = crate::state::modelled_enum_value(
+            "SendingStatus",
+            input.sending_status,
+            &crate::state::SENDING_STATUSES,
+        )
+        .map_err(bad_request)?;
+
+        let reference = input.reputation_entity_reference;
+        // The entity this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names: the
+        // reference it carries is checked against that scope before it resolves to
+        // anything.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An entity exists only for a resource this call reaches, and the reference of
+        // a resource-type entity is that resource's ARN, so a reference outside the
+        // call's scope, or naming no resource inside it, is invalid input — and the two
+        // are answered alike, so neither tells the caller about anything outside its
+        // own scope.
+        let Some(tenant) = store.tenant_by_reputation_entity_reference(&reference, &scope) else {
+            return Err(bad_request(crate::state::reputation_entity_not_found(
+                &reference,
+            )));
+        };
+
+        // "When you update the customer-managed status, the Amazon Web Services Amazon
+        // SES-managed status remains unchanged": this writes the one record, and the
+        // aggregate status every read reports is recomputed from both of them.
+        tenant.set_customer_managed_sending_status(sending_status, now);
+
+        Ok(UpdateReputationEntityCustomerManagedStatusOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> UpdateReputationEntityCustomerManagedStatusError {
+    UpdateReputationEntityCustomerManagedStatusErrorModeled::BadRequestException(
+        BadRequestException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

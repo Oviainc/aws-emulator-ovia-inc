@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReputationEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReputationEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReputationEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the reputation entities of this account — one per resource whose reputation
+//! SES tracks, referenced by that resource's ARN — narrowed by the filter the request
+//! carried and paged by its `PageSize` and `NextToken`. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReputationEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReputationEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReputationEntities"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to read. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListReputationEntities without the shared emulator state",
+            ));
+        };
+
+        // The listing reports the entities of the account this request is
+        // authenticated for, in the Region its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+        let filter = EntityFilter::from_request(input.filter.unwrap_or_default())?;
+
+        // "The number of results to show in a single call": the model puts no bound on
+        // `MaxItems`, so only a positive count truncates a page; a non-positive one is
+        // read as no truncation, which keeps a caller that sends 0 from being stuck on
+        // an empty page forever. The same reading as this service's other listings, so
+        // one page size means one thing across them.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last entity the previous page
+        // returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::REPUTATION_ENTITIES_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        // Every entity this call reaches — the account's, in the Region it executes in
+        // — ordered by reference, then narrowed by the filter the request carried: the
+        // two together decide the sequence a page is a window over, so a token is a
+        // position in the NARROWED listing.
+        let matching: Vec<ReputationEntity> = {
+            let store = state.lock();
+            store
+                .reputation_entities(&scope)
+                .into_iter()
+                .filter(|entity| filter.matches(entity))
+                .collect()
+        };
+
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|entity| {
+                entity
+                    .reputation_entity_reference
+                    .as_deref()
+                    .unwrap_or_default()
+                    <= last
+            }),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+        // A token only when entities remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last()
+                    .and_then(|entity| entity.reputation_entity_reference.as_deref())
+                    .map(|reference| {
+                        crate::state::encode_tagged_page_token(
+                            crate::state::REPUTATION_ENTITIES_PAGE_TOKEN_TAG,
+                            reference,
+                        )
+                    })
+            })
+            .flatten();
+
+        Ok(ListReputationEntitiesOutput {
+            reputation_entities: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// The `ReputationEntityFilter` a request carried, resolved to the entity members it
+/// constrains.
+///
+/// `ReputationEntityFilterKey` names four keys and each constrains ONE member of a
+/// listed entity: `ENTITY_TYPE` its type, `REPUTATION_IMPACT` its impact,
+/// `SENDING_STATUS` its aggregate sending status and `ENTITY_REFERENCE_PREFIX` the
+/// start of its reference. A filter naming several keys keeps only the entities that
+/// satisfy all of them.
+#[derive(Debug, Default)]
+struct EntityFilter {
+    /// `ENTITY_TYPE`, a `ReputationEntityType`.
+    entity_type: Option<String>,
+    /// `REPUTATION_IMPACT`, a `RecommendationImpact`.
+    reputation_impact: Option<String>,
+    /// `SENDING_STATUS`, a `SendingStatus`, compared against the entity's AGGREGATE
+    /// status: the key is documented as "filter by aggregate sending status".
+    sending_status: Option<String>,
+    /// `ENTITY_REFERENCE_PREFIX`, any prefix of a reference.
+    reference_prefix: Option<String>,
+}
+
+impl EntityFilter {
+    /// Read the filter map, refusing a key the enum does not name and a value outside
+    /// the enum the key filters on.
+    ///
+    /// The filter arrives as a map of plain strings, so both are the handler's to
+    /// check: the modelled constraints a boundary validator can enforce are already
+    /// enforced by the time this runs, and an enum member is not one of them.
+    fn from_request(
+        filter: ::std::collections::HashMap<String, String>,
+    ) -> Result<Self, ListReputationEntitiesError> {
+        let mut resolved = Self::default();
+        for (key, value) in filter {
+            let key = crate::state::modelled_enum_value(
+                "Filter key",
+                key,
+                &crate::state::REPUTATION_ENTITY_FILTER_KEYS,
+            )
+            .map_err(bad_request)?;
+            match key.as_str() {
+                "ENTITY_TYPE" => {
+                    resolved.entity_type = Some(
+                        crate::state::modelled_enum_value(
+                            "ENTITY_TYPE filter value",
+                            value,
+                            &[crate::state::REPUTATION_ENTITY_TYPE_RESOURCE],
+                        )
+                        .map_err(bad_request)?,
+                    );
+                }
+                "REPUTATION_IMPACT" => {
+                    resolved.reputation_impact = Some(
+                        crate::state::modelled_enum_value(
+                            "REPUTATION_IMPACT filter value",
+                            value,
+                            &crate::state::RECOMMENDATION_IMPACTS,
+                        )
+                        .map_err(bad_request)?,
+                    );
+                }
+                "SENDING_STATUS" => {
+                    resolved.sending_status = Some(
+                        crate::state::modelled_enum_value(
+                            "SENDING_STATUS filter value",
+                            value,
+                            &crate::state::SENDING_STATUSES,
+                        )
+                        .map_err(bad_request)?,
+                    );
+                }
+                // The only key the check above leaves is `ENTITY_REFERENCE_PREFIX`,
+                // which filters on a free-form prefix whose only constraint is the
+                // modelled length of a filter value. Named rather than taken as a
+                // fallthrough, so a key added to the enum without a branch here is a
+                // compile-time-visible gap instead of a silent prefix filter.
+                "ENTITY_REFERENCE_PREFIX" => resolved.reference_prefix = Some(value),
+                other => {
+                    return Err(bad_request(format!(
+                        "Filter key {other} is not one of {}.",
+                        crate::state::REPUTATION_ENTITY_FILTER_KEYS.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Whether `entity` satisfies every key this filter named.
+    fn matches(&self, entity: &ReputationEntity) -> bool {
+        let member_is = |member: &Option<String>, wanted: &Option<String>| match wanted {
+            None => true,
+            Some(wanted) => member.as_deref() == Some(wanted.as_str()),
+        };
+        member_is(&entity.reputation_entity_type, &self.entity_type)
+            && member_is(&entity.reputation_impact, &self.reputation_impact)
+            && member_is(&entity.sending_status_aggregate, &self.sending_status)
+            && self.reference_prefix.as_deref().is_none_or(|prefix| {
+                entity
+                    .reputation_entity_reference
+                    .as_deref()
+                    .is_some_and(|reference| reference.starts_with(prefix))
+            })
+    }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> ListReputationEntitiesError {
+    ListReputationEntitiesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -181,9 +181,129 @@ pub const ARN_NAMESPACE: &str = "ses";
 /// naming one.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// `SendingStatus$ENABLED`: "sending is allowed for this entity".
+pub const SENDING_STATUS_ENABLED: &str = "ENABLED";
+
+/// `SendingStatus$REINSTATED`: "sending is allowed even if there are active
+/// reputation findings".
+pub const SENDING_STATUS_REINSTATED: &str = "REINSTATED";
+
+/// `SendingStatus$DISABLED`: "sending is prevented for this entity".
+pub const SENDING_STATUS_DISABLED: &str = "DISABLED";
+
+/// Every `SendingStatus` the model binds, for the operations that take one as a
+/// plain string and so refuse an unmodelled value themselves.
+pub const SENDING_STATUSES: [&str; 3] = [
+    SENDING_STATUS_ENABLED,
+    SENDING_STATUS_REINSTATED,
+    SENDING_STATUS_DISABLED,
+];
+
 /// The `SendingStatus` a freshly created tenant carries: sending is allowed for a
 /// new tenant, and `ENABLED` is terminal — the clock owes no transition out of it.
-pub const TENANT_SENDING_STATUS_CREATED: &str = "ENABLED";
+pub const TENANT_SENDING_STATUS_CREATED: &str = SENDING_STATUS_ENABLED;
+
+/// The one `ReputationEntityType` the model binds: "currently, only `RESOURCE` type
+/// entities are supported, which represent resources in your Amazon SES account that
+/// have reputation tracking capabilities".
+pub const REPUTATION_ENTITY_TYPE_RESOURCE: &str = "RESOURCE";
+
+/// Every `ReputationEntityFilterKey` the model binds, in the order the enum lists
+/// them: a listing filter is a map keyed by one of these.
+pub const REPUTATION_ENTITY_FILTER_KEYS: [&str; 4] = [
+    "ENTITY_TYPE",
+    "REPUTATION_IMPACT",
+    "SENDING_STATUS",
+    "ENTITY_REFERENCE_PREFIX",
+];
+
+/// Every `RecommendationImpact` the model binds, which is what a reputation entity's
+/// `ReputationImpact` is one of.
+pub const RECOMMENDATION_IMPACTS: [&str; 2] = ["LOW", "HIGH"];
+
+/// The `StatusRecord$Status` of every entity's Amazon-SES-managed status record.
+///
+/// SES moves that status itself, on a reputation finding it raised against the
+/// entity; nothing here raises one — no finding is observed or recorded anywhere in
+/// this service — so the Amazon-SES-managed status of every entity permits sending
+/// and the aggregate is decided by the customer-managed status alone.
+pub const AWS_SES_MANAGED_SENDING_STATUS: &str = SENDING_STATUS_ENABLED;
+
+/// The aggregate `SendingStatus` of an entity whose two status records read
+/// `customer_managed` and `aws_ses_managed`.
+///
+/// `ReputationEntity$SendingStatusAggregate` states the rule: "if either the
+/// customer-managed status or the Amazon Web Services Amazon SES-managed status is
+/// DISABLED, the aggregate status will be DISABLED and the entity will not be allowed
+/// to send emails. When the customer-managed status is set to REINSTATED, the entity
+/// can continue sending even if there are active reputation findings, provided the
+/// Amazon Web Services Amazon SES-managed status also permits sending."
+pub fn aggregate_sending_status(customer_managed: &str, aws_ses_managed: &str) -> String {
+    let statuses = [customer_managed, aws_ses_managed];
+    if statuses.contains(&SENDING_STATUS_DISABLED) {
+        return SENDING_STATUS_DISABLED.to_string();
+    }
+    if statuses.contains(&SENDING_STATUS_REINSTATED) {
+        return SENDING_STATUS_REINSTATED.to_string();
+    }
+    SENDING_STATUS_ENABLED.to_string()
+}
+
+/// How this service words `BadRequestException` for a reputation entity reference
+/// that names no resource this account holds.
+///
+/// A reputation entity is not created by a request of its own, so the reference a
+/// write carries is invalid input rather than a missing resource of that write's
+/// own making — which is why the writes model `BadRequestException` and no
+/// `NotFoundException` at all.
+pub fn reputation_entity_not_found(reference: &str) -> String {
+    format!("Reputation entity {reference} does not exist.")
+}
+
+/// The account and Region one call is scoped to, and the check that decides which
+/// resource ARNs that call may name.
+///
+/// The account is the one this emulator serves: a handler runs only after the
+/// framework has verified the request's signature, so that account is the caller's
+/// account, and the Region is the one the request's own SigV4 credential scope names.
+/// Both are read from the call rather than from anything the request body carries.
+#[derive(Debug, Clone)]
+pub struct CallerScope {
+    /// The account id an ARN must carry to be one this caller may name.
+    pub account_id: &'static str,
+    /// The Region an ARN must carry to be reachable from this call.
+    pub region: String,
+}
+
+impl CallerScope {
+    /// The scope the call `parts` belongs to.
+    pub fn of(parts: &::http::request::Parts) -> Self {
+        Self {
+            account_id: ::emulator_server::emulator_account_id(),
+            region: request_region(parts),
+        }
+    }
+
+    /// Whether `arn` names a resource of this service that this call may reach: an
+    /// ARN of this service's namespace whose Region is this call's and whose account
+    /// is the caller's.
+    ///
+    /// A reputation entity is reached only by the ARN of the resource it tracks, and
+    /// the reputation operations report and manage "reputation entities in your
+    /// Amazon SES account in the current Amazon Web Services Region" — so the
+    /// account and Region fields of a reference a request carries are checked here,
+    /// against the call, before anything resolves it. A reference failing the check
+    /// names no entity this call can reach, whatever it names elsewhere, and is
+    /// answered exactly as one that was never created, so the two are
+    /// indistinguishable to the caller.
+    ///
+    /// The ARN itself is read by the shared parse, which is where what an ARN of this
+    /// vendor is — fields, partition, the resource field's own colons — is decided.
+    pub fn covers_resource(&self, arn: &str) -> bool {
+        ::service_common::arn::parse_of(arn, ARN_NAMESPACE)
+            .is_some_and(|arn| arn.region == self.region && arn.account == self.account_id)
+    }
+}
 
 /// The `SuppressionListScope` a tenant gets when the request names none:
 /// `TenantSuppressionAttributes$SuppressionScope` documents that "if you don't
@@ -377,6 +497,67 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         // moves past entries that no longer count.
         let charged = self.recipients_in_quota_window(now);
         self.send_counters.sent_last_24h = charged;
+    }
+
+    /// Every reputation entity reachable by the call `scope` describes, ordered by
+    /// `ReputationEntityReference`.
+    ///
+    /// No operation creates a reputation entity: one exists for each resource whose
+    /// reputation SES tracks and whose sending it can stop, referenced by that
+    /// resource's ARN. The table is therefore DERIVED from the resource records on
+    /// every read instead of being kept beside them, and a resource's own record
+    /// stays the single place its status lives.
+    ///
+    /// Which resources those are is decided by the one member that carries an
+    /// entity's status: a reputation entity's `CustomerManagedStatus` is a
+    /// `SendingStatus`, and `Tenant$SendingStatus` is the only resource member in
+    /// this service's model that targets that shape — the status the reputation
+    /// writes move. A configuration set's `SendingOptions$SendingEnabled` and
+    /// `ReputationOptions$ReputationMetricsEnabled` are a boolean switch and a
+    /// metrics flag the configuration-set operations own, not a `SendingStatus` a
+    /// reputation entity could report or a reputation write could move, and an email
+    /// identity carries no sending status at all; so neither is a tracked resource
+    /// here, and the derivation spans the tenants.
+    ///
+    /// The scope is applied here, so a read and a write of one call cannot disagree
+    /// about which entities it reaches; see [`CallerScope::covers_resource`].
+    pub fn reputation_entities(
+        &self,
+        scope: &CallerScope,
+    ) -> Vec<crate::ops::types::ReputationEntity> {
+        let mut entities: Vec<crate::ops::types::ReputationEntity> = self
+            .tenants
+            .values()
+            .filter(|tenant| scope.covers_resource(&tenant.arn))
+            .map(TenantRecord::reputation_entity)
+            .collect();
+        // Ordered by reference, so a listing of them enumerates and pages
+        // deterministically whatever order the resources were created in.
+        entities.sort_by(|left, right| {
+            left.reputation_entity_reference
+                .cmp(&right.reputation_entity_reference)
+        });
+        entities
+    }
+
+    /// The tenant a reputation entity reference names, for a write that has to
+    /// change its status: the reference of a resource-type entity is that resource's
+    /// ARN, which a tenant record carries from the moment it was created.
+    ///
+    /// `None` unless the reference is one the call `scope` describes may reach — the
+    /// same scope [`Self::reputation_entities`] reports over, so a write can only
+    /// reach an entity a listing of the same call would have reported.
+    pub fn tenant_by_reputation_entity_reference(
+        &mut self,
+        reference: &str,
+        scope: &CallerScope,
+    ) -> Option<&mut TenantRecord> {
+        if !scope.covers_resource(reference) {
+            return None;
+        }
+        self.tenants
+            .values_mut()
+            .find(|tenant| tenant.arn == reference)
     }
 
     /// Put `record` on the suppression list `key` names, refusing a NEW entry once
@@ -1055,8 +1236,14 @@ pub struct TenantRecord {
     pub created_at: SystemTime,
     /// Tags, in the order they were supplied.
     pub tags: Vec<(String, String)>,
-    /// `SendingStatus`.
+    /// `SendingStatus`: the status the account's own reputation decisions leave the
+    /// tenant in, which is the `CustomerManagedStatus` of the tenant's reputation
+    /// entity. `UpdateReputationEntityCustomerManagedStatus` is what writes it.
     pub sending_status: String,
+    /// When [`Self::sending_status`] was last written, which is the
+    /// `StatusRecord$LastUpdatedTimestamp` of the customer-managed status record:
+    /// the tenant's creation instant until a caller first changes the status.
+    pub sending_status_updated_at: SystemTime,
     /// `TenantSuppressionAttributes$SuppressedReasons`: the reasons an address is
     /// added to this tenant's suppression list, in the order supplied.
     pub suppressed_reasons: Vec<String>,
@@ -1075,6 +1262,7 @@ impl TenantRecord {
             created_at: now,
             tags: Vec::new(),
             sending_status: TENANT_SENDING_STATUS_CREATED.to_string(),
+            sending_status_updated_at: now,
             suppressed_reasons: Vec::new(),
             suppression_scope: DEFAULT_SUPPRESSION_SCOPE.to_string(),
         }
@@ -1101,9 +1289,76 @@ impl TenantRecord {
             tenant_arn: Some(self.arn.clone()),
             created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             tags: Some(self.tag_list()),
-            sending_status: Some(self.sending_status.clone()),
+            // "The status of sending capability for the tenant" is the tenant's
+            // reputation entity's aggregate status, not the customer-managed record
+            // alone: a tenant Amazon SES disabled may not send whatever the account
+            // asked for.
+            sending_status: Some(self.aggregate_sending_status()),
             suppression_attributes: Some(self.suppression_attributes()),
         }
+    }
+
+    /// The customer-managed status record of this tenant's reputation entity: the
+    /// status the account left it in, and when that status was written.
+    pub fn customer_managed_status(&self) -> crate::ops::types::StatusRecord {
+        crate::ops::types::StatusRecord {
+            status: Some(self.sending_status.clone()),
+            // `StatusCause` describes "the reason for a status change, such as
+            // automated actions taken due to reputation findings or manual status
+            // updates"; a status this account set carries no finding to describe.
+            cause: None,
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
+                self.sending_status_updated_at,
+            )),
+        }
+    }
+
+    /// The Amazon-SES-managed status record of this tenant's reputation entity.
+    ///
+    /// See [`AWS_SES_MANAGED_SENDING_STATUS`]: nothing here raises a reputation
+    /// finding, so this record has permitted sending since the tenant was created.
+    pub fn aws_ses_managed_status(&self) -> crate::ops::types::StatusRecord {
+        crate::ops::types::StatusRecord {
+            status: Some(AWS_SES_MANAGED_SENDING_STATUS.to_string()),
+            cause: None,
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+        }
+    }
+
+    /// The aggregate sending status of this tenant's reputation entity, over its two
+    /// status records — see [`aggregate_sending_status`].
+    pub fn aggregate_sending_status(&self) -> String {
+        aggregate_sending_status(&self.sending_status, AWS_SES_MANAGED_SENDING_STATUS)
+    }
+
+    /// The modelled `ReputationEntity` view of this tenant, as
+    /// `ListReputationEntities` reports it.
+    pub fn reputation_entity(&self) -> crate::ops::types::ReputationEntity {
+        crate::ops::types::ReputationEntity {
+            // "For resource-type entities, this is the Amazon Resource Name (ARN) of
+            // the resource."
+            reputation_entity_reference: Some(self.arn.clone()),
+            reputation_entity_type: Some(REPUTATION_ENTITY_TYPE_RESOURCE.to_string()),
+            // A reputation management policy is attached by
+            // `UpdateReputationEntityPolicy`; until one is, the entity has none.
+            reputation_management_policy: None,
+            customer_managed_status: Some(self.customer_managed_status()),
+            aws_ses_managed_status: Some(self.aws_ses_managed_status()),
+            sending_status_aggregate: Some(self.aggregate_sending_status()),
+            // "The reputation impact reflects the highest impact reputation finding
+            // for the entity": with no finding against the entity there is no
+            // highest one, so the member is absent rather than a level nothing
+            // computed.
+            reputation_impact: None,
+        }
+    }
+
+    /// Write the customer-managed sending status of this tenant's reputation entity,
+    /// as `UpdateReputationEntityCustomerManagedStatus` asks for, and stamp when it
+    /// was written.
+    pub fn set_customer_managed_sending_status(&mut self, status: String, now: SystemTime) {
+        self.sending_status = status;
+        self.sending_status_updated_at = now;
     }
 
     /// The modelled `TagList` view of this record's tags.
@@ -2132,6 +2387,9 @@ pub const SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG: &str = "sesv2:suppressed-desti
 
 /// The tag `ListMultiRegionEndpoints`'s own tokens carry.
 pub const MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG: &str = "sesv2:multi-region-endpoints:";
+
+/// The tag `ListReputationEntities`'s own tokens carry.
+pub const REPUTATION_ENTITIES_PAGE_TOKEN_TAG: &str = "sesv2:reputation-entities:";
 
 /// The tag `ListResourceTenants`'s own tokens carry.
 pub const RESOURCE_TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:resource-tenants:";

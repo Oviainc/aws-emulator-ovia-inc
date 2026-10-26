@@ -117,20 +117,33 @@ impl Ses {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+        self.call_in("us-east-1", method, path, body).await
+    }
+
+    /// The same call, signed for `region`: the SigV4 credential scope is what names the
+    /// Region a request executes in, so a case about regional behaviour varies it here.
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
             None => bytes::Bytes::new(),
         };
+        let host = format!("email.{region}.amazonaws.com");
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://email.us-east-1.amazonaws.com{path}"))
-            .header("host", "email.us-east-1.amazonaws.com")
+            .uri(format!("https://{host}{path}"))
+            .header("host", host)
             .header("content-type", "application/json")
             // The SigV4 credential scope is what routes the request to the `ses` signing
             // name; the signature itself is not checked here.
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/20260101/us-east-1/ses/aws4_request, SignedHeaders=host, Signature=00",
+                format!("AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/20260101/{region}/ses/aws4_request, SignedHeaders=host, Signature=00"),
             )
             .body(payload)
             .expect("build request");

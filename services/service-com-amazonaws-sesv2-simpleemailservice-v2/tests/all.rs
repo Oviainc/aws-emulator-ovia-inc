@@ -37,6 +37,8 @@ mod email_identity_lifecycle;
 mod email_identity_policies;
 #[path = "all/multi_region_endpoints.rs"]
 mod multi_region_endpoints;
+#[path = "all/reputation_entities.rs"]
+mod reputation_entities;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
