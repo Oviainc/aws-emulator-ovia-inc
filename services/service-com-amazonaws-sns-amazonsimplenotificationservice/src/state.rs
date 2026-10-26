@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{MessageAttributeValue, Subscription};
 
+pub mod filter_policy;
+
 /// The region an ARN carries when the request names none.
 ///
 /// Every emulator writes `region = us-east-1` into the shared AWS config it hands a
@@ -261,6 +263,21 @@ pub const MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION: usize = 100;
 /// does not: 8 MiB of retained payload holds 32 messages of the documented 256 KiB
 /// maximum, however many subscriptions or publishes produced them.
 pub const MAX_RETAINED_DELIVERY_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many messages ONE topic's message archive retains before dropping the oldest.
+///
+/// This is NOT AWS's archive, which holds every message published inside the retention
+/// period its policy states: it is the emulator's own memory ceiling on a store a caller
+/// grows by publishing, the archive counterpart of
+/// [`MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION`]. A replay therefore redelivers the most
+/// recent messages of the window it names rather than an unbounded history.
+pub const MAX_ARCHIVED_MESSAGES_PER_TOPIC: usize = 100;
+
+/// The total bytes of message payload the archives retain across every topic, oldest
+/// message of the fullest archive evicted first — the archive counterpart of
+/// [`MAX_RETAINED_DELIVERY_BYTES`], which bounds the (payload x publishes x topics)
+/// product a caller can make the store hold.
+pub const MAX_ARCHIVED_BYTES: usize = 8 * 1024 * 1024;
 
 /// The message a store at [`MAX_RECORDS_PER_STORE`] refuses a new record with;
 /// `store` names the records it holds, e.g. `"topics"`.
@@ -644,7 +661,7 @@ impl TopicRecord {
 
     /// How long this topic's archive keeps a message, or `None` when it archives nothing
     /// or its policy states no retention period.
-    fn archive_retention(&self) -> Option<Duration> {
+    pub fn archive_retention(&self) -> Option<Duration> {
         let days = json_object(self.attributes.get(ARCHIVE_POLICY_ATTRIBUTE)?)?
             .get(MESSAGE_RETENTION_PERIOD_MEMBER)
             .and_then(retention_days)?;
@@ -1057,6 +1074,76 @@ pub struct SubscriptionRecord {
     /// response carries it and no refusal names it.
     pub confirmation_token: Option<String>,
     pub created_at: SystemTime,
+    /// The message replay the subscription's current [`REPLAY_POLICY_ATTRIBUTE`] asked
+    /// for, or `None` for a subscription no replay was ever asked for on.
+    ///
+    /// What [`REPLAY_STATUS_ATTRIBUTE`] reports is computed from it and the clock, so a
+    /// replay reports the state it is in rather than a value a caller wrote.
+    pub replay: Option<ReplayRecord>,
+}
+
+/// The replay one write of a subscription's [`REPLAY_POLICY_ATTRIBUTE`] started.
+///
+/// A replay redelivers the messages already in the topic's archive, so the work itself
+/// is done by the call that asked for it; what remains is the state the subscription
+/// REPORTS while it settles, which is why only the instant it started and whether the
+/// policy named a window at all are held.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayRecord {
+    /// When the call that asked for this replay started it.
+    pub started_at: SystemTime,
+    /// Whether the policy named a window of the archive that could be read: one that
+    /// names none redelivers nothing, which is a replay that could not complete.
+    pub window_was_readable: bool,
+}
+
+/// The subscription attribute a message replay's state is reported under:
+/// "ReplayStatus – Retrieves the status of the subscription message replay"
+/// (`SubscribeInput$Attributes` doc). COMPUTED from the replay record and the clock, so
+/// no caller sets it and it is not in [`SUBSCRIPTION_ATTRIBUTE_NAMES`].
+pub const REPLAY_STATUS_ATTRIBUTE: &str = "ReplayStatus";
+
+/// "Completed – The replay has successfully redelivered all messages, and is now
+/// delivering newly published messages" (`SubscribeInput$Attributes` doc).
+pub const REPLAY_STATUS_COMPLETED: &str = "Completed";
+
+/// "Pending – The default state while the replay initiates" (`SubscribeInput$Attributes`
+/// doc).
+pub const REPLAY_STATUS_PENDING: &str = "Pending";
+
+/// "Failed – The replay was unable to complete" (`SubscribeInput$Attributes` doc).
+pub const REPLAY_STATUS_FAILED: &str = "Failed";
+
+/// How long a replay reports itself [`REPLAY_STATUS_PENDING`] before it reports itself
+/// [`REPLAY_STATUS_COMPLETED`].
+///
+/// A span this emulator chooses: AWS documents the statuses a replay moves through but no
+/// duration for them, and the span is deliberately non-zero so a caller that reads the
+/// subscription straight after asking for the replay still observes the state the replay
+/// starts in rather than a replay that was never pending.
+pub const REPLAY_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+impl ReplayRecord {
+    /// What [`REPLAY_STATUS_ATTRIBUTE`] reports for this replay now.
+    ///
+    /// A replay whose policy named no readable window redelivered nothing and stays
+    /// [`REPLAY_STATUS_FAILED`]; every other replay has redelivered the archive's
+    /// messages already, so it settles from [`REPLAY_STATUS_PENDING`] to
+    /// [`REPLAY_STATUS_COMPLETED`] once [`REPLAY_SETTLES_AFTER`] has passed — a
+    /// transition the clock owes, not one a read performs.
+    pub fn status(&self) -> &'static str {
+        if !self.window_was_readable {
+            return REPLAY_STATUS_FAILED;
+        }
+        let settled = SystemTime::now()
+            .duration_since(self.started_at)
+            .is_ok_and(|elapsed| elapsed >= REPLAY_SETTLES_AFTER);
+        if settled {
+            REPLAY_STATUS_COMPLETED
+        } else {
+            REPLAY_STATUS_PENDING
+        }
+    }
 }
 
 /// One subscription as a LISTING reports it: the wire shape every paginated
@@ -1185,6 +1272,43 @@ pub const REPLAY_POLICY_ATTRIBUTE: &str = "ReplayPolicy";
 /// doc).
 pub const SUBSCRIPTION_ROLE_ARN_ATTRIBUTE: &str = "SubscriptionRoleArn";
 
+/// The member of a replay policy that says where in the archive the replay starts.
+pub const STARTING_POINT_MEMBER: &str = "StartingPoint";
+
+/// The member of a replay policy that says where the replay stops: "If an ending point
+/// was specified in the ReplayPolicy then the subscription will no longer receive newly
+/// published messages" (`SubscribeInput$Attributes` doc), so it is optional — a policy
+/// without one replays up to now and keeps delivering.
+pub const ENDING_POINT_MEMBER: &str = "EndingPoint";
+
+/// The window of a topic's message archive a replay policy names — `(from, until)`, with
+/// `until` of `None` for a policy that names no ending point — or `None` when the
+/// document names no window that can be read.
+///
+/// A replay "replay[s] messages stored in the specified Amazon SNS topic"
+/// (`SubscribeInput$Attributes` doc) from a point in time, so the points are instants,
+/// written in the same RFC 3339 form this service reports every timestamp in (see
+/// [`rfc3339`], which is what a caller reads a topic's
+/// [`BEGINNING_ARCHIVE_TIME_ATTRIBUTE`] as).
+pub fn replay_window(policy: &str) -> Option<(SystemTime, Option<SystemTime>)> {
+    let members = json_object(policy)?;
+    let point = |name: &str| {
+        members
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .and_then(instant_from_rfc3339)
+    };
+    Some((point(STARTING_POINT_MEMBER)?, point(ENDING_POINT_MEMBER)))
+}
+
+/// The instant `value` names when it is an RFC 3339 timestamp, or `None` when it is not
+/// one — the reading counterpart of [`rfc3339`].
+fn instant_from_rfc3339(value: &str) -> Option<SystemTime> {
+    ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .and_then(|at| SystemTime::try_from(at).ok())
+}
+
 /// The member of a redrive policy that names the dead-letter queue.
 pub const DEAD_LETTER_TARGET_ARN: &str = "deadLetterTargetArn";
 
@@ -1194,7 +1318,7 @@ pub const DEAD_LETTER_TARGET_ARN: &str = "deadLetterTargetArn";
 /// Amazon SQS dead-letter queue" (`SetSubscriptionAttributesInput$AttributeName` doc):
 /// the queue is the document's [`DEAD_LETTER_TARGET_ARN`] member, which is the member
 /// every stored redrive policy carries, since a document without it is refused
-/// ([`REDRIVE_POLICY_MISSING_VALUE_REFUSAL`]).
+/// ([`missing_required_value_refusal`]).
 pub fn dead_letter_target_arn(attributes: &HashMap<String, String>) -> Option<String> {
     json_object(attributes.get(REDRIVE_POLICY_ATTRIBUTE)?)?
         .get(DEAD_LETTER_TARGET_ARN)
@@ -1210,7 +1334,14 @@ pub const RAW_MESSAGE_DELIVERY_ENABLED: &str = "true";
 /// choose the filtering scope by using one of the following string value types:
 /// MessageAttributes (default) … MessageBody"
 /// (`SetSubscriptionAttributesInput$AttributeName` doc).
-pub const FILTER_POLICY_SCOPES: &[&str] = &[DEFAULT_FILTER_POLICY_SCOPE, "MessageBody"];
+pub const FILTER_POLICY_SCOPES: &[&str] =
+    &[DEFAULT_FILTER_POLICY_SCOPE, MESSAGE_BODY_FILTER_POLICY_SCOPE];
+
+/// The scope whose filtering reads the message BODY: "MessageBody – The filter is applied
+/// on the message body" (`GetSubscriptionAttributesResponse$Attributes` doc) — the other
+/// value of [`FILTER_POLICY_SCOPES`], and the one
+/// [`filter_policy::admits`] reads the body under.
+pub const MESSAGE_BODY_FILTER_POLICY_SCOPE: &str = "MessageBody";
 
 /// The `FilterPolicyScope` a subscription REPORTS, or `None` when it reports none.
 ///
@@ -1351,10 +1482,40 @@ pub const POLICY_DOCUMENT_ATTRIBUTES: &[&str] = &[
 /// asks for a record that holds no such policy rather than naming a document that failed
 /// to parse. The record then reports what it reports for a policy it was never given.
 ///
+/// A policy whose document AWS REQUIRES a member of is the exception
+/// ([`POLICY_ATTRIBUTES_WITH_A_REQUIRED_MEMBER`]): the empty value carries no such
+/// member, so it is judged as the document it is and refused
+/// ([`missing_required_value_refusal`]) rather than read as an instruction to remove the
+/// policy — two different intents a caller would otherwise have no way to tell apart.
+///
 /// Shared by every operation that writes an attribute of either record kind, so a policy
 /// is removed the same way whichever call carried the write.
 pub fn clears_attribute(name: &str, value: &str) -> bool {
-    value.is_empty() && POLICY_DOCUMENT_ATTRIBUTES.contains(&name)
+    value.is_empty()
+        && POLICY_DOCUMENT_ATTRIBUTES.contains(&name)
+        && !POLICY_ATTRIBUTES_WITH_A_REQUIRED_MEMBER.contains(&name)
+}
+
+/// The policy-valued attributes whose document AWS requires a member of, so that a value
+/// carrying no document at all — an empty value included — names no policy those
+/// attributes can be read as.
+///
+/// The redrive policy is one: "sends undeliverable messages to the specified Amazon SQS
+/// dead-letter queue" (`SetSubscriptionAttributesInput$AttributeName` doc), and the queue
+/// it specifies is the document's [`DEAD_LETTER_TARGET_ARN`] member, without which the
+/// policy redrives nowhere. Recorded evidence: an empty `RedrivePolicy` is refused `400
+/// InvalidParameter` with [`missing_required_value_refusal`]'s sentence rather than
+/// clearing the policy the subscription holds.
+pub const POLICY_ATTRIBUTES_WITH_A_REQUIRED_MEMBER: &[&str] = &[REDRIVE_POLICY_ATTRIBUTE];
+
+/// The sentence SNS refuses a policy document that carries none of the members the
+/// attribute requires with: the attribute the write named, and that a value it cannot do
+/// without is missing.
+///
+/// The attribute name comes from the request, so one sentence serves every attribute of
+/// [`POLICY_ATTRIBUTES_WITH_A_REQUIRED_MEMBER`].
+pub fn missing_required_value_refusal(name: &str) -> String {
+    format!("Invalid parameter: {name}: missing required value")
 }
 
 /// The sentence SNS refuses a `FilterPolicyScope` outside its value set with: the
@@ -1365,11 +1526,6 @@ fn filter_policy_scope_refusal(value: &str) -> String {
          Please use either MessageBody or MessageAttributes"
     )
 }
-
-/// The sentence SNS refuses a `RedrivePolicy` that names no dead-letter target with:
-/// the required member of the document is the value that is missing.
-pub const REDRIVE_POLICY_MISSING_VALUE_REFUSAL: &str =
-    "Invalid parameter: RedrivePolicy: missing required value";
 
 /// The sentence SNS refuses a `RedrivePolicy` whose dead-letter target is not a queue
 /// with: "sends undeliverable messages to the specified Amazon SQS dead-letter queue"
@@ -1428,12 +1584,12 @@ pub fn subscription_attribute_refusal(name: &str, value: &str) -> Option<String>
         REDRIVE_POLICY_ATTRIBUTE => match json_object(value) {
             // A value that is not a policy document at all carries no dead-letter
             // target either, which is the member the document is refused for.
-            None => Some(REDRIVE_POLICY_MISSING_VALUE_REFUSAL.to_string()),
+            None => Some(missing_required_value_refusal(name)),
             Some(members) => match members
                 .get(DEAD_LETTER_TARGET_ARN)
                 .and_then(serde_json::Value::as_str)
             {
-                None => Some(REDRIVE_POLICY_MISSING_VALUE_REFUSAL.to_string()),
+                None => Some(missing_required_value_refusal(name)),
                 // "sends undeliverable messages to the specified Amazon SQS dead-letter
                 // queue" — a redrive policy that names no SQS queue redrives nowhere.
                 Some(arn) if arn_resource(arn, "sqs").is_none() => {
@@ -2010,6 +2166,38 @@ pub fn message_attribute_bytes(attributes: &HashMap<String, MessageAttributeValu
                 + value.binary_value.as_ref().map_or(0, Vec::len)
         })
         .sum()
+}
+
+/// The data type of a numeric message attribute: "Number – Numbers are positive or
+/// negative integers or floating-point numbers" (`MessageAttributeValue$DataType` doc).
+pub const NUMBER_DATA_TYPE: &str = "Number";
+
+/// The data type of a textual message attribute: "String – Strings are Unicode with UTF-8
+/// binary encoding" (`MessageAttributeValue$DataType` doc).
+pub const STRING_DATA_TYPE: &str = "String";
+
+/// The data type of a message attribute carrying BYTES: "Binary – Binary type attributes
+/// can store any binary data" (`MessageAttributeValue$DataType` doc).
+pub const BINARY_DATA_TYPE: &str = "Binary";
+
+/// The data type of a message attribute carrying a LIST of values: "String.Array –
+/// Strings, numbers, true, false and null" (`MessageAttributeValue$DataType` doc), written
+/// as a JSON array.
+pub const STRING_ARRAY_DATA_TYPE: &str = "String.Array";
+
+/// What separates a data type from the custom label a publisher may append to it
+/// (`Number.int`): "You can also append custom labels"
+/// (`MessageAttributeValue$DataType` doc).
+pub const DATA_TYPE_LABEL_SEPARATOR: char = '.';
+
+/// The data type `value` carries, without the custom label a publisher may have appended
+/// to it — so `Number.int` is a `Number` wherever a type decides what a value MEANS.
+pub fn attribute_data_type(value: &MessageAttributeValue) -> &str {
+    value
+        .data_type
+        .split(DATA_TYPE_LABEL_SEPARATOR)
+        .next()
+        .unwrap_or(&value.data_type)
 }
 
 /// One message `Publish` FANNED OUT to one subscription.
@@ -2820,6 +3008,15 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// allocate its body per subscription (the same sharing the queue deliveries of
     /// `crate::ops::publish` use for the envelope they hand out).
     pub delivered: HashMap<String, Vec<::std::sync::Arc<PublishedMessage>>>,
+    /// The messages each ARCHIVING topic's message archive holds, oldest first, keyed by
+    /// the topic's ARN: what a replay redelivers. Bounded: write through
+    /// [`Self::archive_message`], never by hand.
+    ///
+    /// The records are SHARED with the delivery log, so archiving a publish costs one
+    /// more handle rather than a second copy of the body.
+    archive: HashMap<String, Vec<::std::sync::Arc<PublishedMessage>>>,
+    /// The payload bytes currently retained in `archive`.
+    archived_bytes: usize,
     /// The subscription each retained delivery belongs to, oldest delivery first:
     /// the eviction order of the whole log.
     delivery_order: VecDeque<String>,
@@ -3172,6 +3369,126 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// The payload bytes the delivery log currently retains, for a test or a diagnostic.
     pub fn retained_delivery_bytes(&self) -> usize {
         self.retained_delivery_bytes
+    }
+
+    /// Keep `message` in the message archive of `topic_arn`, after dropping what
+    /// `retention` has run out on, then bring the archive back within
+    /// [`MAX_ARCHIVED_MESSAGES_PER_TOPIC`] and [`MAX_ARCHIVED_BYTES`] by dropping its
+    /// oldest messages. This is the ONLY way to write `archive`.
+    ///
+    /// Only a topic that holds an [`ARCHIVE_POLICY_ATTRIBUTE`] archives, so the caller
+    /// decides whether to archive at all; `retention` is that policy's retention period
+    /// ([`TopicRecord::archive_retention`]), and dropping what it has run out on is a
+    /// write the CLOCK already owed — a message leaves the archive the moment its
+    /// retention period ends, whether or not anyone publishes or replays.
+    pub fn archive_message(
+        &mut self,
+        topic_arn: &str,
+        retention: Option<Duration>,
+        message: ::std::sync::Arc<PublishedMessage>,
+    ) {
+        if let Some(retention) = retention {
+            self.expire_archive(topic_arn, retention);
+        }
+        self.archived_bytes = self.archived_bytes.saturating_add(message.retained_bytes());
+        self.archive
+            .entry(topic_arn.to_string())
+            .or_default()
+            .push(message);
+        while self
+            .archive
+            .get(topic_arn)
+            .is_some_and(|held| held.len() > MAX_ARCHIVED_MESSAGES_PER_TOPIC)
+        {
+            self.drop_oldest_archived(topic_arn);
+        }
+        while self.archived_bytes > MAX_ARCHIVED_BYTES {
+            let Some(fullest) = self
+                .archive
+                .iter()
+                .max_by_key(|(_, held)| held.len())
+                .map(|(arn, _)| arn.clone())
+            else {
+                break;
+            };
+            self.drop_oldest_archived(&fullest);
+        }
+    }
+
+    /// Drop `topic_arn`'s oldest archived message, keeping the retained-byte count in
+    /// step with it.
+    fn drop_oldest_archived(&mut self, topic_arn: &str) {
+        let Some(held) = self.archive.get_mut(topic_arn) else {
+            return;
+        };
+        if held.is_empty() {
+            self.archive.remove(topic_arn);
+            return;
+        }
+        let dropped = held.remove(0);
+        if held.is_empty() {
+            self.archive.remove(topic_arn);
+        }
+        self.archived_bytes = self.archived_bytes.saturating_sub(dropped.retained_bytes());
+    }
+
+    /// Forget every archived message of `topic_arn` whose `retention` has run out: the
+    /// archive holds nothing older than the retention period its policy states.
+    pub fn expire_archive(&mut self, topic_arn: &str, retention: Duration) {
+        let Some(held) = self.archive.get_mut(topic_arn) else {
+            return;
+        };
+        let now = SystemTime::now();
+        let mut released = 0;
+        held.retain(|message| {
+            let kept = now
+                .duration_since(message.published_at)
+                .is_ok_and(|age| age < retention);
+            if !kept {
+                released += message.retained_bytes();
+            }
+            kept
+        });
+        if held.is_empty() {
+            self.archive.remove(topic_arn);
+        }
+        self.archived_bytes = self.archived_bytes.saturating_sub(released);
+    }
+
+    /// The archived messages of `topic_arn` inside the window `from ..= until` (`until`
+    /// of `None` being every message from `from` on), oldest publish first — which is
+    /// the order a replay redelivers them in.
+    pub fn archived_messages(
+        &self,
+        topic_arn: &str,
+        from: SystemTime,
+        until: Option<SystemTime>,
+    ) -> Vec<::std::sync::Arc<PublishedMessage>> {
+        self.archive
+            .get(topic_arn)
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.published_at >= from
+                    && until.is_none_or(|until| message.published_at <= until)
+            })
+            .map(::std::sync::Arc::clone)
+            .collect()
+    }
+
+    /// The payload bytes the message archives currently retain, for a test or a
+    /// diagnostic.
+    pub fn archived_bytes(&self) -> usize {
+        self.archived_bytes
+    }
+
+    /// Forget the whole message archive of `topic_arn` — the topic is gone, or it stopped
+    /// archiving, so there is nothing left to replay and the bytes it held are released.
+    pub fn forget_archive(&mut self, topic_arn: &str) {
+        if let Some(held) = self.archive.remove(topic_arn) {
+            let released: usize = held.iter().map(|message| message.retained_bytes()).sum();
+            self.archived_bytes = self.archived_bytes.saturating_sub(released);
+        }
     }
 
     /// The message an earlier publish under this deduplication key was accepted as, or

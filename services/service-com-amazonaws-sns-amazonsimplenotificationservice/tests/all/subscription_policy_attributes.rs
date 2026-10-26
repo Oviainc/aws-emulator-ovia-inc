@@ -11,7 +11,8 @@
 //! * an attribute whose value is a policy DOCUMENT is removed by writing an EMPTY value to
 //!   it ("To delete a filter policy, set the FilterPolicy attribute to an empty value",
 //!   SNS Developer Guide), so the subscription then reports what it reports for a policy it
-//!   was never given — while an attribute whose value is not a document still refuses one;
+//!   was never given — while an attribute whose value is not a document, and one whose
+//!   document AWS requires a member of, still refuses one;
 //! * a `FilterPolicyScope` says which part of a message "the filter is applied on"
 //!   (`GetSubscriptionAttributesResponse$Attributes` doc), so it is reported only while
 //!   there is a policy to apply: a scope set without a policy is held and hidden until one
@@ -124,13 +125,6 @@ async fn an_empty_value_removes_a_policy_attribute() {
             FILTER_POLICY,
         ),
         (
-            "a redrive policy",
-            "sqs",
-            "arn:aws:sqs:us-east-1:000000000000:removal-redrive",
-            "RedrivePolicy",
-            REDRIVE_POLICY,
-        ),
-        (
             "a delivery policy",
             "https",
             "https://example.test/removal",
@@ -215,7 +209,8 @@ async fn an_empty_value_removes_a_policy_attribute() {
 
     // An attribute whose value is NOT a policy document is not removed by an empty value:
     // the value is judged against the constraint the attribute documents, and an empty
-    // one satisfies none.
+    // one satisfies none. Neither is a policy whose document AWS requires a member of: the
+    // empty value carries no such member, so it names no policy to store.
     let topic = sns.topic("removal-flag").await;
     let arn = subscribe(
         &sns,
@@ -223,10 +218,10 @@ async fn an_empty_value_removes_a_policy_attribute() {
         &topic,
         "sqs",
         "arn:aws:sqs:us-east-1:000000000000:removal-flag",
-        &[],
+        &[("RedrivePolicy", REDRIVE_POLICY)],
     )
     .await;
-    for name in ["RawMessageDelivery", "FilterPolicyScope"] {
+    for name in ["RawMessageDelivery", "FilterPolicyScope", "RedrivePolicy"] {
         let (status, code, message) = set(&sns, &arn, name, "").await;
         assert_eq!(
             status, 400,
@@ -237,6 +232,14 @@ async fn an_empty_value_removes_a_policy_attribute() {
             "an empty {name} must be refused with InvalidParameter, got {code} {message}"
         );
     }
+    // And the refused write changed nothing: the redrive policy the subscription held is
+    // still the one it reports.
+    let held = read(&sns, "a flag", &arn).await;
+    assert_eq!(
+        held.get("RedrivePolicy").map(String::as_str),
+        Some(REDRIVE_POLICY),
+        "a refused empty RedrivePolicy must leave the stored policy as it was, got {held:?}"
+    );
 }
 
 /// A filtering scope is reported only beside the policy it scopes: one set without a

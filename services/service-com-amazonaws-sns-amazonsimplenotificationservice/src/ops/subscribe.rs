@@ -339,8 +339,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's lock is taken and released by the write below; the deliveries a
+        // replay that write started owes are performed afterwards, because a delivery is
+        // an in-process call into another service, which must not run under this store's
+        // lock.
+        let (output, replay) = self.subscribe_into_store(input)?;
+        super::publish::deliver_to_queues(ctx, &replay).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Subscribe<Eng> {
+    /// Create (or re-apply) the subscription the request names, and report the answer
+    /// beside the deliveries the replay it may have started owes to that subscription's
+    /// endpoint.
+    ///
+    /// The whole store-touching half of the operation, so the store's lock is taken and
+    /// released here and the caller performs the deliveries with it released.
+    fn subscribe_into_store(
+        &self,
+        input: SubscribeInput,
+    ) -> Result<(SubscribeOutput, Vec<super::publish::QueueDelivery>), SubscribeError> {
         // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
         // not an ARN at all is bad input, not a topic that does not exist.
         if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
@@ -495,6 +516,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (name, stored)
             })
             .collect();
+        // Whether THIS call asks for a message replay: a replay is started by the write of
+        // a `ReplayPolicy`, so a re-subscribe that carries none does not replay the
+        // archive again to a subscription that already holds one.
+        let asked_for_replay = attributes.contains_key(state::REPLAY_POLICY_ATTRIBUTE);
 
         let (arn, pending_confirmation) = match existing {
             Some((arn, pending_confirmation)) => {
@@ -565,10 +590,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         pending_confirmation,
                         confirmation_token,
                         created_at: std::time::SystemTime::now(),
+                        // No replay has been asked for yet: the write below is what starts
+                        // the one a `ReplayPolicy` carried on this call asks for.
+                        replay: None,
                     },
                 );
                 (arn, pending_confirmation)
             }
+        };
+
+        // A `ReplayPolicy` this call wrote asks for the topic's archived messages to be
+        // redelivered to this subscription, which is the same redelivery
+        // `SetSubscriptionAttributes` starts when it writes one.
+        let replay = if asked_for_replay {
+            super::publish::replay_deliveries(&mut store, &arn)
+        } else {
+            Vec::new()
         };
 
         // An unconfirmed subscription's ARN is withheld unless the caller asked for it.
@@ -577,8 +614,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             arn
         };
-        Ok(SubscribeOutput {
-            subscription_arn: Some(reported),
-        })
+        Ok((
+            SubscribeOutput {
+                subscription_arn: Some(reported),
+            },
+            replay,
+        ))
     }
 }

@@ -166,9 +166,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let invalid_parameter = |message: String| -> Self::Error {
+        // The store's lock is taken and released by the write below; the deliveries a
+        // replay that write started owes are performed afterwards, because a delivery is
+        // an in-process call into another service, which must not run under this store's
+        // lock.
+        let replay = self.write_attribute(input)?;
+        super::publish::deliver_to_queues(ctx, &replay).await;
+        Ok(SetSubscriptionAttributesOutput)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetSubscriptionAttributes<Eng> {
+    /// Write the attribute the request names, and report the deliveries the replay it may
+    /// have started owes to the subscription's endpoint.
+    ///
+    /// The whole store-touching half of the operation, so the store's lock is taken and
+    /// released here and the caller performs the deliveries with it released.
+    fn write_attribute(
+        &self,
+        input: SetSubscriptionAttributesInput,
+    ) -> Result<Vec<super::publish::QueueDelivery>, SetSubscriptionAttributesError> {
+        let invalid_parameter = |message: String| -> SetSubscriptionAttributesError {
             SetSubscriptionAttributesErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),
@@ -297,13 +317,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports for one that was never given it.
         match stored {
             Some(value) => {
-                subscription.attributes.insert(input.attribute_name, value);
+                subscription.attributes.insert(input.attribute_name.clone(), value);
             }
             None => {
                 subscription.attributes.remove(&input.attribute_name);
             }
         }
 
-        Ok(SetSubscriptionAttributesOutput)
+        // A `ReplayPolicy` this call wrote asks for the topic's archived messages to be
+        // redelivered to this subscription — the same redelivery `Subscribe` starts when
+        // it carries one.
+        let replay = if input.attribute_name == state::REPLAY_POLICY_ATTRIBUTE {
+            super::publish::replay_deliveries(&mut store, &input.subscription_arn)
+        } else {
+            Vec::new()
+        };
+
+        Ok(replay)
     }
 }

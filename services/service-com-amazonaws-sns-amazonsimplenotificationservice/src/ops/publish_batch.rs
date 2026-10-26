@@ -412,8 +412,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut deliveries: Vec<QueueDelivery> = Vec::new();
             // ONE delivery budget for the whole batch, so the (entries x subscriptions x body
             // bytes) product one request can fan out to is capped rather than each factor on
-            // its own.
+            // its own, and ONE matching budget, which caps the (entries x subscriptions x
+            // conditions x values) product the filter evaluation costs the same way.
             let mut budget = DeliveryBudget::new();
+            let mut matching = state::filter_policy::MatchBudget::new();
             for (entry, message_deduplication_id) in entries.into_iter().zip(deduplication_ids) {
                 // A batched publish is deduplicated like any other: "messages are
                 // deduplicated within the batch and across batches for five minutes"
@@ -460,10 +462,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 // The deliveries this entry owes to the SQS queues subscribed to the topic,
                 // built through `Publish`'s one definition of the envelope, within the
-                // batch's shared budget, and performed below with the lock released.
-                deliveries.extend(queue_deliveries(&recipients, &published, &mut budget));
-                for recipient in &recipients {
+                // batch's shared budget, and performed below with the lock released. A
+                // subscription whose filter policy withholds this entry is not among them.
+                let accepted: Vec<state::SubscriptionRecord> = recipients
+                    .iter()
+                    .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
+                    .cloned()
+                    .collect();
+                deliveries.extend(queue_deliveries(&accepted, &published, &mut budget));
+                for recipient in &accepted {
                     store.record_delivery(&recipient.arn, ::std::sync::Arc::clone(&published));
+                }
+                // A topic that archives its messages keeps every entry of a batch too, so a
+                // later replay redelivers them in the order they were published.
+                if topic.is_archiving() {
+                    store.archive_message(
+                        &topic.arn,
+                        topic.archive_retention(),
+                        ::std::sync::Arc::clone(&published),
+                    );
                 }
 
                 successful.push(PublishBatchResultEntry {

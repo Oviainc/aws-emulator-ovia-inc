@@ -312,6 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The archive window follows the attribute map: setting the archive policy starts
         // archiving now, and clearing it leaves the topic with no replayable window.
         topic.refresh_archive_window();
+        let archives = topic.is_archiving();
+        if !archives {
+            // A topic that archives nothing holds no archive either: there is no window
+            // left for a replay to read from.
+            store.forget_archive(&input.topic_arn);
+        }
 
         Ok(SetTopicAttributesOutput)
     }

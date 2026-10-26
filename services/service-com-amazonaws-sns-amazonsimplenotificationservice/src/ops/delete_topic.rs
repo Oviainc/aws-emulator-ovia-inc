@@ -199,6 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.subscriptions.remove(&arn);
                 store.forget_deliveries(&arn);
             }
+            // And the topic's message archive goes with it: there is no topic left to
+            // replay its messages to a subscription of.
+            store.forget_archive(&input.topic_arn);
         }
 
         Ok(DeleteTopicOutput)

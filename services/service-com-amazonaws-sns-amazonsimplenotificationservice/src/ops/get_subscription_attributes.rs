@@ -268,6 +268,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             attributes.insert(name.clone(), value.clone());
         }
+        // "ReplayStatus – Retrieves the status of the subscription message replay"
+        // (`SubscribeInput$Attributes` doc): the state of the replay the subscription's
+        // replay policy asked for, so it is reported beside that policy and not without
+        // one. It is COMPUTED from the replay record and the clock — a replay that has not
+        // settled yet is still the state it starts in — so reading it moves nothing.
+        if subscription
+            .attributes
+            .contains_key(state::REPLAY_POLICY_ATTRIBUTE)
+        {
+            attributes.insert(
+                state::REPLAY_STATUS_ATTRIBUTE.to_string(),
+                subscription
+                    .replay
+                    .as_ref()
+                    .map_or(state::REPLAY_STATUS_PENDING, state::ReplayRecord::status)
+                    .to_string(),
+            );
+        }
 
         Ok(GetSubscriptionAttributesOutput {
             attributes: Some(attributes),

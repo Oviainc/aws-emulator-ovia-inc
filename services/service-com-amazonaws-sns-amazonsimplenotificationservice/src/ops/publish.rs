@@ -406,16 +406,33 @@ fn publish_into_store(
 
     // SNS "delivers the message to each endpoint that is subscribed to the topic"
     // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
-    // it receives nothing.
+    // it receives nothing, and a subscription whose filter policy withholds this
+    // message receives nothing either. ONE matching budget for the request, so the
+    // (subscriptions x conditions x values) product the matching costs is capped.
+    let mut matching = state::filter_policy::MatchBudget::new();
     let subscriptions: Vec<state::SubscriptionRecord> = store
         .subscriptions_of(&topic.arn)
         .into_iter()
         .filter(|sub| !sub.pending_confirmation)
+        .filter(|sub| state::filter_policy::admits(sub, &published, &mut matching))
         .cloned()
         .collect();
     let deliveries = queue_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
     for subscription in &subscriptions {
         store.record_delivery(&subscription.arn, ::std::sync::Arc::clone(&published));
+    }
+    // A topic that archives its messages keeps this one too: "ArchivePolicy – The policy
+    // that sets the retention period for messages stored in the message archive of an
+    // Amazon SNS FIFO topic" (`GetTopicAttributesResponse$Attributes` doc), and the
+    // archive is what a subscription's `ReplayPolicy` redelivers from. It is kept whether
+    // or not any subscription received the message: a replay exists to reach subscribers
+    // that did not exist when the message was published.
+    if topic.is_archiving() {
+        store.archive_message(
+            &topic.arn,
+            topic.archive_retention(),
+            ::std::sync::Arc::clone(&published),
+        );
     }
 
     Ok((
@@ -653,6 +670,74 @@ pub(crate) fn queue_deliveries(
     deliveries
 }
 
+/// The deliveries the message replay asked for on `subscription_arn` owes, and the replay
+/// record it leaves on that subscription.
+///
+/// "ReplayPolicy – Adds or updates an inline policy document for a subscription to replay
+/// messages stored in the specified Amazon SNS topic" (`SubscribeInput$Attributes` doc):
+/// the messages the topic's archive holds inside the window that policy names are
+/// redelivered to this subscription, oldest publish first, so a subscriber that did not
+/// exist when they were published receives them in the order they were published. A
+/// subscription that asks for no replay owes nothing, and the messages a replay
+/// redelivers are filtered by that subscription's own filter policy like any other
+/// delivery.
+///
+/// `pub(crate)` because every operation that WRITES a subscription's replay policy starts
+/// the replay the same way — `Subscribe` and `SetSubscriptionAttributes` — through this
+/// one definition, so the redelivery does not depend on which call configured it. The
+/// deliveries are returned rather than performed: they are handed to
+/// [`deliver_to_queues`] with the store's lock released, exactly as a publish's are.
+pub(crate) fn replay_deliveries(
+    store: &mut crate::state::ComAmazonawsSnsAmazonsimplenotificationserviceState,
+    subscription_arn: &str,
+) -> Vec<QueueDelivery> {
+    let Some(subscription) = store.subscriptions.get(subscription_arn).cloned() else {
+        return Vec::new();
+    };
+    let Some(policy) = subscription.attributes.get(state::REPLAY_POLICY_ATTRIBUTE) else {
+        // The subscription asks for no replay — its policy was removed, or it never had
+        // one — so there is no replay to redeliver from and none to report.
+        if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
+            held.replay = None;
+        }
+        return Vec::new();
+    };
+    let started_at = ::std::time::SystemTime::now();
+    let Some((from, until)) = state::replay_window(policy) else {
+        // A policy that names no readable window has no messages to redeliver, which is
+        // a replay that could not complete rather than one that replayed nothing.
+        if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
+            held.replay = Some(state::ReplayRecord {
+                started_at,
+                window_was_readable: false,
+            });
+        }
+        return Vec::new();
+    };
+    let archived = store.archived_messages(&subscription.topic_arn, from, until);
+    // ONE budget for the whole replay, so the (archived messages x body bytes) product it
+    // fans out is capped the way a publish's fan-out is, and ONE matching budget, so the
+    // filter evaluation the replay costs is capped the way a publish's is.
+    let mut budget = DeliveryBudget::new();
+    let mut matching = state::filter_policy::MatchBudget::new();
+    let mut deliveries: Vec<QueueDelivery> = Vec::new();
+    let recipients = [subscription.clone()];
+    for message in archived {
+        if !state::filter_policy::admits(&subscription, &message, &mut matching) {
+            continue;
+        }
+        deliveries.extend(queue_deliveries(&recipients, &message, &mut budget));
+        store.record_delivery(subscription_arn, ::std::sync::Arc::clone(&message));
+    }
+    if let Some(held) = store.subscriptions.get_mut(subscription_arn) {
+        held.replay = Some(state::ReplayRecord {
+            started_at,
+            window_was_readable: true,
+        });
+    }
+    deliveries
+}
+
 /// One published message attribute as the subscribed queue's OWN message attribute.
 ///
 /// A raw delivery carries the published attributes as the queue's own, and the value of a
@@ -662,10 +747,7 @@ pub(crate) fn queue_deliveries(
 /// is — and so does a `Number` whose value is not a number this service can read, which it
 /// passes on rather than rewriting.
 fn queue_attribute(value: &MessageAttributeValue) -> MessageAttributeValue {
-    let is_number = value.data_type == NUMBER_DATA_TYPE
-        || value
-            .data_type
-            .starts_with(&format!("{NUMBER_DATA_TYPE}{DATA_TYPE_LABEL_SEPARATOR}"));
+    let is_number = state::attribute_data_type(value) == state::NUMBER_DATA_TYPE;
     let Some(number) = value
         .string_value
         .as_deref()
@@ -679,14 +761,6 @@ fn queue_attribute(value: &MessageAttributeValue) -> MessageAttributeValue {
         ..value.clone()
     }
 }
-
-/// The data type of a numeric message attribute: "Number – Numbers are positive or negative
-/// integers or floating-point numbers" (`MessageAttributeValue$DataType` doc).
-const NUMBER_DATA_TYPE: &str = "Number";
-
-/// What separates a data type from the custom label a publisher may append to it
-/// (`Number.int`): "You can also append custom labels" (`MessageAttributeValue$DataType`).
-const DATA_TYPE_LABEL_SEPARATOR: char = '.';
 
 /// `value` as the number it names, spelled canonically — or `None` when it names none.
 ///
@@ -745,21 +819,6 @@ impl QueueTarget {
         }
         let endpoint = subscription.endpoint.as_deref()?;
         let location = QueueLocation::of_queue_arn(endpoint)?;
-        if subscription
-            .attributes
-            .contains_key(state::FILTER_POLICY_ATTRIBUTE)
-        {
-            // A filter policy decides WHICH messages the subscription receives, and applying
-            // one is not implemented here. A subscriber that asked to be filtered must not be
-            // handed every message instead — that would deliver what it filtered out — so the
-            // delivery does not happen and says so.
-            ::tracing::warn!(
-                subscription = %subscription.arn,
-                "a subscription carrying a FilterPolicy is not delivered to: message \
-                 filtering is not implemented in this emulator"
-            );
-            return None;
-        }
         Some(Self {
             location,
             // "RawMessageDelivery – When set to true, enables raw message delivery to Amazon
