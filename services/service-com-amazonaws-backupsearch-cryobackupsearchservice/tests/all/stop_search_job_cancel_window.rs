@@ -21,12 +21,15 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
+// The two per-call helpers these rows drive the service through — the recovery points an
+// account holds and the cancel itself — live beside the harness, so every suite that
+// cancels a job over a scope it chose uses the one copy.
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, start_s3_search_job,
-    Answer, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    call, cancel_search_job as cancel, emulator_with_engine, held_s3_recovery_points as held,
+    seed_recovery_points, start_s3_search_job, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
+    WITHIN_THE_DUE_INSTANT,
 };
 
 /// A cancel sent with no wait at all, which is what a back-to-back client call does.
@@ -79,38 +82,6 @@ fn cancel_cases() -> Vec<CancelCase> {
             scan_would_reach: state::FAILED,
         },
     ]
-}
-
-/// `count` S3 recovery points this account holds, which is what a scope resolves against.
-fn held(count: usize) -> Vec<types::SearchJobBackupsResult> {
-    (0..count)
-        .map(|index| {
-            recovery_point(
-                // `ResourceType` accepts S3 and EBS (model enum `ResourceType`); the
-                // scope these rows start with selects S3.
-                "S3",
-                &format!("arn:aws:backup:us-west-2:000000000000:recovery-point:rp-{index}"),
-                &format!("arn:aws:s3:::bucket-{index}"),
-                std::time::SystemTime::now(),
-            )
-        })
-        .collect()
-}
-
-/// A cancel of `identifier`.
-async fn cancel(
-    emulator: &smithy_server_runtime::MultiServiceRouter,
-    region: &str,
-    identifier: &str,
-) -> Answer {
-    call(
-        emulator,
-        region,
-        "PUT",
-        &format!("/search-jobs/{identifier}/actions/cancel"),
-        None,
-    )
-    .await
 }
 
 #[tokio::test]

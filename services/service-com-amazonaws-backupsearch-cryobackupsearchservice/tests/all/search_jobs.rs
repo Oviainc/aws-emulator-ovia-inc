@@ -192,6 +192,42 @@ pub(crate) async fn start_s3_search_job(
     started.string("SearchJobIdentifier")
 }
 
+/// `count` S3 recovery points this account holds, which is what a `SearchScope` resolves
+/// against — so a row that needs the scope to resolve to something seeds these and a row
+/// that needs it to resolve to nothing asks for none. Beside the harness because every
+/// suite whose rows differ in what the scope resolved to needs exactly this.
+pub(crate) fn held_s3_recovery_points(count: usize) -> Vec<types::SearchJobBackupsResult> {
+    (0..count)
+        .map(|index| {
+            recovery_point(
+                // `ResourceType` accepts S3 and EBS (model enum `ResourceType`); the
+                // scope `start_s3_search_job` above submits selects S3.
+                "S3",
+                &format!("arn:aws:backup:us-west-2:000000000000:recovery-point:rp-{index}"),
+                &format!("arn:aws:s3:::bucket-{index}"),
+                std::time::SystemTime::now(),
+            )
+        })
+        .collect()
+}
+
+/// `StopSearchJob` for `identifier`, which is one call every suite that cancels a job
+/// makes, so it lives beside the harness rather than once per suite.
+pub(crate) async fn cancel_search_job(
+    emulator: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+) -> Answer {
+    call(
+        emulator,
+        region,
+        "PUT",
+        &format!("/search-jobs/{identifier}/actions/cancel"),
+        None,
+    )
+    .await
+}
+
 /// One row of the start-a-job table: a `StartSearchJob` body and the region it is signed
 /// for. The rows differ in resource type, in whether `Name`/`ItemFilters`/`Tags` are
 /// present, in filter count and in signing region.
