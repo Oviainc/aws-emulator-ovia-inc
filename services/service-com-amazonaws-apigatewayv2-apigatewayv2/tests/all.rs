@@ -55,6 +55,8 @@ mod domain_name_pagination;
 mod http_api_integration_fault_status;
 #[path = "all/http_api_jwt_data_plane.rs"]
 mod http_api_jwt_data_plane;
+#[path = "all/http_api_request_authorizer.rs"]
+mod http_api_request_authorizer;
 #[path = "all/http_api_route_precedence.rs"]
 mod http_api_route_precedence;
 #[path = "all/http_api_servable_stage.rs"]
