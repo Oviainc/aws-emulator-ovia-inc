@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants the principals a request names the actions it names on the queue its
+//! `QueueUrl` addresses, under the `Label` that identifies the permission.
+//!
+//! The permission is not a record of its own: "AddPermission generates a policy for
+//! you", so the grant becomes one statement of the queue's `Policy` attribute — the
+//! same attribute `SetQueueAttributes` uploads a policy into and `GetQueueAttributes`
+//! reports — which is what makes it observable by every later reader and revocable by
+//! `RemovePermission`. The document is assembled by
+//! [`crate::state::Queue::granted_policy`], which keeps every statement the policy
+//! already carried, so a second grant adds to the first rather than displacing it, and
+//! the queue's `LastModifiedTimestamp` moves to now exactly as any other attribute
+//! change moves it.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +198,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPermission"))
+        use crate::state as sqs;
+
+        // Request metadata this call records: the access key id identifies the caller in
+        // the audit record below, the way the real service's trail does.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        // A list that names nothing grants nothing, so the parameter the call requires
+        // was not really supplied. Each is named as the request carries it: both lists
+        // are flattened to repeated entries on the wire.
+        if input.aws_account_ids.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(
+                sqs::PRINCIPAL_PARAMETER,
+            ));
+        }
+        if input.actions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(
+                sqs::ACTION_PARAMETER,
+            ));
+        }
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            AddPermissionErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut store = store.lock();
+
+        let name = sqs::queue_name_from_url(&input.queue_url)
+            .filter(|name| store.queues.contains_key(*name))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                AddPermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
+            })?;
+        let queue = store
+            .queues
+            .get_mut(&name)
+            .expect("the queue was resolved out of this same store");
+
+        // The grant is judged against the policy the queue carries TODAY — the label it
+        // already grants, the statements it already holds — so the document is assembled
+        // before anything is written and the queue is left untouched by a refusal.
+        let policy = queue
+            .granted_policy(&input.label, &input.aws_account_ids, &input.actions)
+            .map_err(|refusal| match refusal {
+                sqs::PermissionRefusal::Parameter(message) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+                // "The specified action violates a limit ... AddPermission returns this
+                // error if the maximum number of permissions for the queue is reached."
+                sqs::PermissionRefusal::Limit(message) => {
+                    AddPermissionErrorModeled::OverLimit(OverLimit {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+            })?;
+        queue.grant_permission(policy, ::std::time::SystemTime::now());
+
+        // The audit record for a change of who may reach this queue: who asked, what
+        // changed, outcome. No secret and no credential material — only the access key
+        // id, the queue, the label the grant is identified by and how much it granted.
+        ::tracing::info!(
+            operation = "AddPermission",
+            akid = %akid,
+            queue = %name,
+            label = %input.label,
+            principals = input.aws_account_ids.len(),
+            actions = input.actions.len(),
+            outcome = "granted",
+            "queue permission granted"
+        );
+
+        Ok(AddPermissionOutput)
     }
 }

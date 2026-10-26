@@ -44,25 +44,12 @@ const BUNDLE: &str = "nano_3_0";
 /// publishes (8 GB), since the size selects nothing about an add-on.
 const DISK_SIZE_IN_GB: i64 = 8;
 
-/// A resource kind an add-on can be enabled on. The two the model gives an
+/// A resource kind an add-on can be enabled on — the two the model gives an
 /// `addOns` member, and the pair the modelled `AutoSnapshotAddOnRequest`
-/// documentation names ("an Amazon Lightsail instance or disk").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Instance,
-    Disk,
-}
-
-impl Kind {
-    /// The modelled `ResourceType` value this kind reports, and that the
-    /// operation-log entry of a change to it carries.
-    fn resource_type(self) -> &'static str {
-        match self {
-            Self::Instance => "Instance",
-            Self::Disk => "Disk",
-        }
-    }
-}
+/// documentation names ("an Amazon Lightsail instance or disk") — is the one a
+/// sibling suite publishes to this test target, so the two suites name one kind
+/// rather than two.
+use crate::auto_snapshots::Kind;
 
 /// Create the resource `name` of `kind`, carrying `add_ons` at creation time.
 async fn create(emulator: &Emulator, kind: Kind, name: &str, add_ons: &[Value]) {
@@ -91,7 +78,12 @@ async fn create(emulator: &Emulator, kind: Kind, name: &str, add_ons: &[Value]) 
 
 /// The `addOns` a read of the resource `name` of `kind` reports, in the order it
 /// reports them.
-async fn add_ons(emulator: &Emulator, kind: Kind, name: &str) -> Vec<Value> {
+///
+/// `pub(crate)` so a sibling suite in this test target reads a resource's
+/// add-ons the same way rather than carrying a second copy of it
+/// (`auto_snapshot_delete.rs`, where the add-on must survive the deletion of a
+/// copy it took).
+pub(crate) async fn add_ons(emulator: &Emulator, kind: Kind, name: &str) -> Vec<Value> {
     let resource = match kind {
         Kind::Instance => {
             emulator

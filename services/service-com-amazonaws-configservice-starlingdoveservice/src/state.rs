@@ -39,7 +39,9 @@ use crate::ops::types::BaseConfigurationItem;
 
 // The conformance pack shapes, named separately for the same reason: the pack surface
 // landed on its own and stays out of the shared import list above.
-use crate::ops::types::{ConformancePackInputParameter, ConformancePackStatusDetail};
+use crate::ops::types::{
+    ConformancePackDetail, ConformancePackInputParameter, ConformancePackStatusDetail,
+};
 
 // `AggregateResourceIdentifier` and `ConfigurationItem` are named separately for the
 // same reason: the first is how an aggregate read path NAMES one resource, the second
@@ -625,6 +627,27 @@ pub const CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER: Duration = Duration::from_millis
 /// is "unspecified" rather than "no results". 20 is `Limit`'s own maximum (range
 /// 0..20), so it is the largest page the model lets one response carry.
 pub const DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE: usize = 20;
+
+/// How many conformance packs one `DescribeConformancePacks` page carries when the
+/// request does not ask for a page size, for the same reason as
+/// [`DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE`]: `Limit` defaults to 0, which is
+/// "unspecified" rather than "no results", and 20 is that member's own maximum (range
+/// 0..20).
+pub const DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE: usize = 20;
+
+/// How Config words `NoSuchConformancePackException` ("You specified one or more
+/// conformance packs that do not exist") for the `missing` names of a request that
+/// named packs this account and Region does not hold.
+///
+/// The message is BUILT FROM THE REQUEST: the fixed sentence names the class of
+/// failure, and the names it lists are the ones the caller sent that resolved to no
+/// pack, in the order they were sent.
+pub fn no_such_conformance_pack_message(missing: &[String]) -> String {
+    format!(
+        "One or more conformance packs are not valid. Name(s): {}",
+        missing.join(", ")
+    )
+}
 
 /// The third-party cloud service provider a connector connects to
 /// (`com.amazonaws.configservice#Provider`, whose only published value is `AZURE`;
@@ -3033,8 +3056,7 @@ pub struct ConformancePackEntry {
     /// The template the pack was last deployed from, byte for byte as it was sent, and
     /// the Amazon S3 location Config stores conformance pack templates at. Both are
     /// replaced by a later `PutConformancePack` for the same name, and
-    /// `DescribeConformancePacks` — still a scaffold with a stub issue of its own — is
-    /// what reports the pack's stored configuration back.
+    /// `DescribeConformancePacks` is what reports the pack's stored configuration back.
     pub template_body: Option<String>,
     pub delivery_s3_bucket: Option<String>,
     pub delivery_s3_key_prefix: Option<String>,
@@ -3100,6 +3122,30 @@ impl ConformancePackEntry {
             last_update_requested_time: timestamp(self.last_update_requested_at),
             last_update_completed_time: complete
                 .then(|| timestamp(self.deployment_completes_at)),
+        }
+    }
+
+    /// The modelled `ConformancePackDetail` — the pack's stored CONFIGURATION, as
+    /// `DescribeConformancePacks` reports it, which is what the deployment was last
+    /// requested with rather than how far that deployment has got
+    /// ([`Self::to_status_detail`] is what reports the latter).
+    ///
+    /// `CreatedBy` is "the Amazon Web Services service that created the conformance
+    /// pack", which a pack the account deployed itself through `PutConformancePack` has
+    /// none of, and `TemplateSSMDocumentDetails` is carried only by a pack deployed from
+    /// a Systems Manager document, which this store holds none of: `PutConformancePack`
+    /// refuses that leg rather than deploying from a template it never read.
+    pub fn to_detail(&self) -> ConformancePackDetail {
+        ConformancePackDetail {
+            conformance_pack_name: self.name.clone(),
+            conformance_pack_arn: self.arn.clone(),
+            conformance_pack_id: self.id.clone(),
+            delivery_s3_bucket: self.delivery_s3_bucket.clone(),
+            delivery_s3_key_prefix: self.delivery_s3_key_prefix.clone(),
+            conformance_pack_input_parameters: Some(self.input_parameters.clone()),
+            last_update_requested_time: Some(timestamp(self.last_update_requested_at)),
+            created_by: None,
+            template_ssm_document_details: None,
         }
     }
 }

@@ -19,6 +19,8 @@ mod agent_lifecycle;
 mod agent_registration_tags;
 #[path = "all/antenna_inventory.rs"]
 mod antenna_inventory;
+#[path = "all/available_contacts.rs"]
+mod available_contacts;
 #[path = "all/config_defaults_and_references.rs"]
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]

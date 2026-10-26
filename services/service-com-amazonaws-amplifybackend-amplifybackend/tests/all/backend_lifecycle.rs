@@ -1057,10 +1057,14 @@ async fn operations_outside_this_slice_still_answer_501() {
             Some(json!({ "targetEnvironmentName": "copy" })),
         ),
         (
-            "RemoveAllBackends",
+            "CreateBackendAPI",
             "POST",
-            "/backend/dstub/remove",
-            Some(json!({})),
+            "/backend/dstub/api",
+            Some(json!({
+                "backendEnvironmentName": "staging",
+                "resourceName": "apione",
+                "resourceConfig": { "service": "AppSync" },
+            })),
         ),
     ];
     for (operation, method, path, body) in rows {

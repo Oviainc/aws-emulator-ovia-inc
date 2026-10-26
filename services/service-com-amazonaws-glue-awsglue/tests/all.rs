@@ -31,6 +31,8 @@ mod connection_listing;
 mod connection_updates;
 #[path = "all/crawler_event_queue.rs"]
 mod crawler_event_queue;
+#[path = "all/crawler_schedules.rs"]
+mod crawler_schedules;
 #[path = "all/crawler_updates.rs"]
 mod crawler_updates;
 #[path = "all/crawlers.rs"]

@@ -4,15 +4,16 @@
 //!
 //! This module owns the stream records the implemented operations read and write: the
 //! shard map `CreateStream` lays down, the ARN a stream is addressed by, the tags assigned
-//! to it, and the single place where the `CREATING` -> `ACTIVE` transition the clock owes a
-//! new stream is decided ([`Stream::status`]).
+//! to it, the record log a producer appends to and a consumer drains, and the single place
+//! where the `CREATING` -> `ACTIVE` and `DELETING` -> gone transitions the clock owes a
+//! stream are decided ([`Stream::status`], [`Stream::is_held`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     EnhancedMetrics, HashKeyRange, Record, SequenceNumberRange, Shard, StreamDescription,
-    StreamDescriptionSummary, StreamModeDetails, Tag, WarmThroughputObject,
+    StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag, WarmThroughputObject,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -29,6 +30,11 @@ pub const STREAM_CREATING: &str = "CREATING";
 
 /// A stream that is ready for read and write operations.
 pub const STREAM_ACTIVE: &str = "ACTIVE";
+
+/// A stream a `DeleteStream` has been accepted for, which is gone once the deletion the
+/// call armed completes: "After a DeleteStream request, the specified stream is in the
+/// DELETING state until Kinesis Data Streams completes the deletion" (`DeleteStream`).
+pub const STREAM_DELETING: &str = "DELETING";
 
 /// The `StreamMode` whose streams carry the shard count the caller asked for.
 pub const STREAM_MODE_PROVISIONED: &str = "PROVISIONED";
@@ -47,6 +53,12 @@ pub const DEFAULT_STREAM_MODE: &str = STREAM_MODE_PROVISIONED;
 /// so a caller that reads the stream straight after creating it still observes
 /// `CREATING`. The instant it falls due is stored on the record and never slept on.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after the `DeleteStream` call the stream's removal falls due, taking it from
+/// `DELETING` to gone. A CHOSEN span, not an AWS-documented duration: it only has to be
+/// non-zero, so a caller that reads the stream straight after deleting it still observes
+/// `DELETING`. The instant it falls due is stored on the record and never slept on.
+pub const DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// The retention window a new stream gets, in hours: "By default, a stream's data records
 /// are accessible for 24 hours from the time they are added to the stream"
@@ -129,10 +141,24 @@ pub const DEFAULT_LIST_SHARDS_LIMIT: i32 = 1_000;
 /// modelled `range 1..10000` deliberately leaves room above.
 pub const MAX_LIST_SHARDS_LIMIT: i32 = 1_000;
 
-/// How long a `ListShards` pagination token stays usable: "Tokens expire after 300
-/// seconds. When you obtain a value for NextToken in the response to a call to ListShards,
-/// you have 300 seconds to use that value" (`ListShardsOutput$NextToken`).
-pub const LIST_SHARDS_TOKEN_TTL: Duration = Duration::from_secs(300);
+/// How long a pagination token of this service stays usable. `ListShards` is the operation
+/// that publishes the lifetime — "Tokens expire after 300 seconds. When you obtain a value
+/// for NextToken in the response to a call to ListShards, you have 300 seconds to use that
+/// value" (`ListShardsOutput$NextToken`) — and a cursor of this service is a cursor
+/// whichever listing minted it, so every one of them has that lifetime.
+pub const PAGE_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// See [`PAGE_TOKEN_TTL`]: how long a `ListShards` token stays usable.
+pub const LIST_SHARDS_TOKEN_TTL: Duration = PAGE_TOKEN_TTL;
+
+/// How many streams `ListStreams` returns when the request names no `Limit`: "The maximum
+/// number of streams to list. The default value is 100" (`ListStreamsInput$Limit`).
+pub const DEFAULT_LIST_STREAMS_LIMIT: i32 = 100;
+
+/// The most streams `ListStreams` returns in one call: "If you specify a value greater than
+/// 100, at most 100 results are returned" (`ListStreamsInput$Limit`), which the modelled
+/// `range 1..10000` deliberately leaves room above.
+pub const MAX_LIST_STREAMS_LIMIT: i32 = 100;
 
 /// How many records `GetRecords` returns when the request names no `Limit`: "The maximum
 /// number of records to return. Specify a value of up to 10,000... The default value is
@@ -472,6 +498,11 @@ pub struct Stream {
     pub max_record_size_in_ki_b: Option<i32>,
     /// `RecordDistributionStrategy`, which only an on-demand stream carries.
     pub record_distribution_strategy: Option<String>,
+    /// When the stream's `DELETING` -> gone transition falls due, set by the
+    /// `DeleteStream` that accepted the removal: "After a DeleteStream request, the
+    /// specified stream is in the DELETING state until Kinesis Data Streams completes the
+    /// deletion" (`DeleteStream`). `None` for a stream nothing has deleted.
+    pub deleted_at: Option<SystemTime>,
     /// The tags the create carried.
     pub tags: HashMap<String, String>,
 }
@@ -590,15 +621,26 @@ impl Stream {
         Some((shard.shard_id.clone(), sequence_number))
     }
 
-    /// The stream's status at `now`: `CREATING` until the transition the create armed
-    /// falls due, `ACTIVE` from then on. Derived from the stored instant, so two reads at
-    /// the same instant agree and no read has to write.
+    /// The stream's status at `now`: `DELETING` once a delete has been accepted for it,
+    /// `CREATING` until the transition the create armed falls due, `ACTIVE` from then on.
+    /// Derived from the stored instants, so two reads at the same instant agree and no read
+    /// has to write.
     pub fn status(&self, now: SystemTime) -> &'static str {
-        if now < self.active_at {
+        if self.deleted_at.is_some() {
+            STREAM_DELETING
+        } else if now < self.active_at {
             STREAM_CREATING
         } else {
             STREAM_ACTIVE
         }
+    }
+
+    /// Whether this account and region still hold the stream at `now`: a stream a delete
+    /// armed is held, in `DELETING`, until the removal that delete owes falls due, and
+    /// names no resource from then on. Derived from the stored instant, so a reader reaches
+    /// the same answer as a writer without either of them having to prune the store.
+    pub fn is_held(&self, now: SystemTime) -> bool {
+        self.deleted_at.is_none_or(|due| now < due)
     }
 
     /// The stream's trim horizon at `now`: the oldest instant data is still retained for.
@@ -619,6 +661,18 @@ impl Stream {
     pub fn open_shard_count(&self) -> i32 {
         i32::try_from(self.shards.iter().filter(|shard| shard.is_open()).count())
             .unwrap_or(i32::MAX)
+    }
+
+    /// This record as the modelled `StreamSummary`, which is what a listing reports beside
+    /// the stream's name.
+    pub fn to_stream_summary(&self, now: SystemTime) -> StreamSummary {
+        StreamSummary {
+            stream_name: self.name.clone(),
+            stream_arn: self.arn.clone(),
+            stream_status: self.status(now).to_string(),
+            stream_mode_details: Some(self.stream_mode_details()),
+            stream_creation_timestamp: Some(timestamp(self.created_at)),
+        }
     }
 
     /// The stream's tags as the modelled `Tag` list, ordered by key.
@@ -753,19 +807,38 @@ pub struct ComAmazonawsKinesisKinesis20131202State {
 }
 
 impl ComAmazonawsKinesisKinesis20131202State {
-    /// The stream `region`'s endpoint holds under `name`, if any.
-    pub fn stream_in(&self, region: &str, name: &str) -> Option<&Stream> {
-        self.streams.get(&RegionalName::new(region, name))
+    /// The stream `region`'s endpoint holds under `name` at `now`, if any.
+    pub fn stream_in(&self, now: SystemTime, region: &str, name: &str) -> Option<&Stream> {
+        self.streams
+            .get(&RegionalName::new(region, name))
+            .filter(|stream| stream.is_held(now))
     }
 
-    /// The stream `region`'s endpoint holds under `arn`, if any.
-    pub fn stream_by_arn(&self, region: &str, arn: &str) -> Option<&Stream> {
+    /// The stream `region`'s endpoint holds under `arn` at `now`, if any.
+    pub fn stream_by_arn(&self, now: SystemTime, region: &str, arn: &str) -> Option<&Stream> {
         self.streams
             .values()
             .find(|stream| stream.region == region && stream.arn == arn)
+            .filter(|stream| stream.is_held(now))
     }
 
-    /// The stream a request's `StreamName` / `StreamARN` pair names.
+    /// Every stream `region`'s endpoint holds at `now`, ordered by name.
+    ///
+    /// A listing is paged by name ("you can request more streams by using the name of the
+    /// last stream returned by the ListStreams request in the ExclusiveStartStreamName
+    /// parameter", `ListStreams`), so the streams a read reports need ONE total order that
+    /// every page agrees on, and the cursor names the stream: the order is by name.
+    pub fn streams_ordered_in(&self, now: SystemTime, region: &str) -> Vec<&Stream> {
+        let mut streams: Vec<&Stream> = self
+            .streams
+            .values()
+            .filter(|stream| stream.region == region && stream.is_held(now))
+            .collect();
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        streams
+    }
+
+    /// The stream a request's `StreamName` / `StreamARN` pair names at `now`.
     ///
     /// "When invoking this API, you must use either the StreamARN or the StreamName
     /// parameter, or both" (`DescribeStream`), and that holds for every operation of this
@@ -773,6 +846,7 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// answered, and a request naming both has to name ONE stream with them.
     pub fn resolve_stream(
         &self,
+        now: SystemTime,
         region: &str,
         name: Option<&str>,
         arn: Option<&str>,
@@ -780,14 +854,14 @@ impl ComAmazonawsKinesisKinesis20131202State {
         match (name, arn) {
             (None, None) => Err(StreamLookupFailure::Unspecified),
             (Some(name), None) => self
-                .stream_in(region, name)
+                .stream_in(now, region, name)
                 .ok_or(StreamLookupFailure::NotFound),
             (None, Some(arn)) => self
-                .stream_by_arn(region, arn)
+                .stream_by_arn(now, region, arn)
                 .ok_or(StreamLookupFailure::NotFound),
             (Some(name), Some(arn)) => {
                 let stream = self
-                    .stream_by_arn(region, arn)
+                    .stream_by_arn(now, region, arn)
                     .ok_or(StreamLookupFailure::NotFound)?;
                 if stream.name == name {
                     Ok(stream)
@@ -802,11 +876,12 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// by exactly the rule [`Self::resolve_stream`] applies.
     fn resolve_stream_key(
         &self,
+        now: SystemTime,
         region: &str,
         name: Option<&str>,
         arn: Option<&str>,
     ) -> Result<RegionalName, StreamLookupFailure> {
-        self.resolve_stream(region, name, arn)
+        self.resolve_stream(now, region, name, arn)
             .map(|stream| RegionalName::new(&stream.region, &stream.name))
     }
 
@@ -815,42 +890,66 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// [`Self::resolve_stream_key`] and the stored record is then reached by its key.
     pub fn resolve_stream_mut(
         &mut self,
+        now: SystemTime,
         region: &str,
         name: Option<&str>,
         arn: Option<&str>,
     ) -> Result<&mut Stream, StreamLookupFailure> {
-        let key = self.resolve_stream_key(region, name, arn)?;
+        let key = self.resolve_stream_key(now, region, name, arn)?;
         self.streams
             .get_mut(&key)
             .ok_or(StreamLookupFailure::NotFound)
     }
 
-    /// How many streams `region`'s endpoint holds, which is what
+    /// Drop every stream whose removal has fallen due at `now`, freeing its shard logs.
+    ///
+    /// The removal a `DeleteStream` armed is what makes the stream stop naming a resource
+    /// ([`Stream::is_held`]), which every lookup decides from the stored instant — so this
+    /// changes what no caller sees and only hands the memory back. Called by the operations
+    /// that change which streams this account holds, which are the ones whose ceilings are
+    /// counted against the store.
+    pub fn drop_removed_streams(&mut self, now: SystemTime) {
+        self.streams.retain(|_, stream| stream.is_held(now));
+    }
+
+    /// How many streams `region`'s endpoint holds at `now`, which is what
     /// [`MAX_STREAMS_PER_REGION`] bounds.
-    pub fn streams_held_in(&self, region: &str) -> usize {
+    pub fn streams_held_in(&self, now: SystemTime, region: &str) -> usize {
         self.streams
-            .keys()
-            .filter(|key| key.region == region)
+            .iter()
+            .filter(|(key, stream)| key.region == region && stream.is_held(now))
             .count()
     }
 
-    /// How many shards `region`'s endpoint holds across every stream, which is what
-    /// [`MAX_SHARDS_PER_REGION`] bounds.
-    pub fn shards_held_in(&self, region: &str) -> u32 {
+    /// How many shards `region`'s endpoint holds at `now` across every stream, which is
+    /// what [`MAX_SHARDS_PER_REGION`] bounds.
+    pub fn shards_held_in(&self, now: SystemTime, region: &str) -> u32 {
         self.streams
             .values()
-            .filter(|stream| stream.region == region)
+            .filter(|stream| stream.region == region && stream.is_held(now))
             .fold(0u32, |held, stream| {
                 held.saturating_add(u32::try_from(stream.shards.len()).unwrap_or(u32::MAX))
             })
     }
 
-    /// How many shards this emulator holds across every region, which is what
+    /// How many streams this emulator holds at `now` across every region, which is what
+    /// [`MAX_STREAMS_TOTAL`] bounds: the ceiling no request can partition.
+    pub fn streams_held(&self, now: SystemTime) -> usize {
+        self.streams
+            .values()
+            .filter(|stream| stream.is_held(now))
+            .count()
+    }
+
+    /// How many shards this emulator holds at `now` across every region, which is what
     /// [`MAX_SHARDS_TOTAL`] bounds: the ceiling no request can partition.
-    pub fn shards_held(&self) -> u32 {
-        self.streams.values().fold(0u32, |held, stream| {
-            held.saturating_add(u32::try_from(stream.shards.len()).unwrap_or(u32::MAX))
-        })
+    pub fn shards_held(&self, now: SystemTime) -> u32 {
+        self.streams
+            .values()
+            .filter(|stream| stream.is_held(now))
+            .fold(0u32, |held, stream| {
+                held.saturating_add(u32::try_from(stream.shards.len()).unwrap_or(u32::MAX))
+            })
     }
 }
 
@@ -1228,16 +1327,96 @@ impl ShardPageToken {
     /// represented, or one still in the future — names no page either, so it counts as past
     /// its lifetime rather than reaching the store.
     pub fn is_expired(&self, now: SystemTime) -> bool {
-        let millis = u64::try_from(self.issued_at_millis).unwrap_or(u64::MAX);
-        let Some(issued_at) = UNIX_EPOCH.checked_add(Duration::from_millis(millis)) else {
-            return true;
-        };
-        match now.duration_since(issued_at) {
-            Ok(age) => age > LIST_SHARDS_TOKEN_TTL,
-            // Minted after the instant it is being used at, which no page of this emulator
-            // ever is.
-            Err(_) => true,
+        is_past_token_lifetime(self.issued_at_millis, now)
+    }
+}
+
+/// What a `ListStreams` pagination token is tagged with, so a string the service never
+/// issued is refused rather than read as a stream name.
+const STREAM_PAGE_TOKEN_TAG: &str = "listStreams";
+
+/// Where a truncated `ListStreams` page continues, and whose streams it continues.
+///
+/// A stream name is scoped to one region, so the token carries the region the page was
+/// served for beside the stream the next page starts at; and it expires, so it carries the
+/// instant it was minted. All of it travels INSIDE the token: a read mints one without
+/// writing anything a later caller could see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamPageToken {
+    /// The region whose streams are being listed.
+    pub region: String,
+    /// The name of the first stream the page did NOT return, which the next page starts at.
+    pub next_stream_name: String,
+    /// When the page that handed this token out was served, in milliseconds since the
+    /// epoch.
+    pub issued_at_millis: u128,
+}
+
+impl StreamPageToken {
+    /// The token that resumes `region`'s listing at `next_stream_name`, minted at
+    /// `issued_at`.
+    pub fn new(region: &str, next_stream_name: &str, issued_at: SystemTime) -> Self {
+        Self {
+            region: region.to_string(),
+            next_stream_name: next_stream_name.to_string(),
+            issued_at_millis: epoch_millis(issued_at),
         }
+    }
+
+    /// This token as the opaque `NextToken` a client is handed.
+    ///
+    /// Opaque (hex of a tagged byte string) because the model gives `NextToken` no
+    /// structure: a client passes back what it was handed rather than constructing one. Two
+    /// hex characters per byte keeps it far inside the modelled length 1..1048576.
+    pub fn encode(&self) -> String {
+        hex::encode(format!(
+            "{STREAM_PAGE_TOKEN_TAG}:{}:{}:{}",
+            self.issued_at_millis, self.region, self.next_stream_name
+        ))
+    }
+
+    /// The token `token` carries, or `None` when it is not one this service issued.
+    pub fn decode(token: &str) -> Option<Self> {
+        let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+        let mut fields = decoded.splitn(4, ':');
+        if fields.next()? != STREAM_PAGE_TOKEN_TAG {
+            return None;
+        }
+        let issued_at_millis = fields.next()?.parse().ok()?;
+        let region = fields.next()?.to_string();
+        let next_stream_name = fields.next()?.to_string();
+        if region.is_empty() || next_stream_name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            region,
+            next_stream_name,
+            issued_at_millis,
+        })
+    }
+
+    /// Whether the token is past its lifetime at `now` ([`PAGE_TOKEN_TTL`]).
+    ///
+    /// A mint instant no clock of this emulator could have produced — one that cannot be
+    /// represented, or one still in the future — names no page either, so it counts as past
+    /// its lifetime rather than reaching the store.
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        is_past_token_lifetime(self.issued_at_millis, now)
+    }
+}
+
+/// Whether a pagination token minted at `issued_at_millis` is past [`PAGE_TOKEN_TTL`] at
+/// `now`, which is the ONE lifetime rule every cursor of this service is judged by.
+fn is_past_token_lifetime(issued_at_millis: u128, now: SystemTime) -> bool {
+    let millis = u64::try_from(issued_at_millis).unwrap_or(u64::MAX);
+    let Some(issued_at) = UNIX_EPOCH.checked_add(Duration::from_millis(millis)) else {
+        return true;
+    };
+    match now.duration_since(issued_at) {
+        Ok(age) => age > PAGE_TOKEN_TTL,
+        // Minted after the instant it is being used at, which no page of this emulator
+        // ever is.
+        Err(_) => true,
     }
 }
 
@@ -1500,22 +1679,24 @@ fn instant_text(millis: u128) -> String {
 
 /// How a request that pairs `NextToken` with a member the token already determines is
 /// refused: "Don't specify StreamName or StreamCreationTimestamp if you specify NextToken
-/// because the latter unambiguously identifies the stream" (`ListShardsInput$NextToken`).
-/// Built FROM the request, so the member at fault names it.
+/// because the latter unambiguously identifies the stream" (`ListShardsInput$NextToken`),
+/// which holds for every listing of this service that hands out a cursor. Built FROM the
+/// request, so the member at fault names it.
 pub fn next_token_conflict_message(member: &str) -> String {
     format!(
         "{member} cannot be specified together with NextToken, which already identifies \
-         the stream and the shard to resume at"
+         what is being listed and where the listing resumes"
     )
 }
 
 /// How a read refuses a `NextToken` that is past its lifetime, or one this service never
 /// issued: the rule `ExpiredNextTokenException` publishes ("The pagination token passed to
-/// the operation is expired") together with the lifetime `ListShards` documents.
+/// the operation is expired") together with the lifetime a cursor of this service carries
+/// ([`PAGE_TOKEN_TTL`]).
 pub fn next_token_expired_message() -> String {
     format!(
         "the pagination token is expired or was not issued by this service; a NextToken is \
          usable for {} seconds after the page that returned it",
-        LIST_SHARDS_TOKEN_TTL.as_secs()
+        PAGE_TOKEN_TTL.as_secs()
     )
 }

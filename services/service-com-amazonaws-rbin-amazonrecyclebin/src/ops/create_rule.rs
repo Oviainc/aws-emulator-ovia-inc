@@ -262,11 +262,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let mut store = state.lock();
+        // The cap on the WHOLE store, checked before the per-Region quota because it is
+        // the one bound nothing in the request can partition: the Region below comes off
+        // the caller's own credential scope, so the per-Region quota alone would let a
+        // caller that varies the Region string grow the store without end.
+        let stored = store.rules.len();
+        if stored >= crate::state::RULE_STORE_LIMIT {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds {stored} retention rules, the most it \
+                         stores ({})",
+                        crate::state::RULE_STORE_LIMIT
+                    )),
+                    reason: Some(crate::state::SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
         // Bound the store before it grows: a Region holds at most
         // `crate::state::MAX_RULES` retention rules, which is the service's own
         // published quota, so this check dominates every `mint_identifier` /
-        // `insert_rule` below.
-        if store.rules.len() >= crate::state::MAX_RULES {
+        // `insert_rule` below. Only the rules of the Region this request is signed for
+        // are counted — a rule exists in one Region, so another Region's rules fill
+        // neither this Region's quota nor its endpoint.
+        if store.rule_count_in_region(&region) >= crate::state::MAX_RULES {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -283,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rules, so a create that would make a pair the selector of one rule too many is
         // refused before any rule is minted. No rule is excluded from the count: the
         // rule this request would create does not exist yet.
-        if store.exceeds_resource_tag_quota(&resource_tags, None) {
+        if store.exceeds_resource_tag_quota(&region, &resource_tags, None) {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
                 crate::state::resource_tag_quota_exceeded(),
             )
@@ -302,6 +322,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|_| "locked".to_string());
         let mut rule = crate::state::Rule {
             identifier: identifier.clone(),
+            // The rule exists in the Region this create was signed for, and nowhere
+            // else: every later read, update, lock and delete resolves it through that
+            // Region alone.
+            region: region.clone(),
             rule_arn,
             description: input.description,
             resource_type: input.resource_type,
@@ -328,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read the response back OUT of the store, so the caller sees what a later
         // GetRule or ListRules will see rather than the request object.
-        let Some(stored) = store.rules.get(&identifier) else {
+        let Some(stored) = store.rule(&region, &identifier) else {
             return Err(CreateRuleErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(

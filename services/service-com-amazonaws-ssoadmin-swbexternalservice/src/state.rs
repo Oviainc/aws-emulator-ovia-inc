@@ -3657,8 +3657,9 @@ pub fn mint_application_arn(instance_arn: &str) -> String {
 /// `CreateApplication` is scoped to — the same rule as
 /// [`trusted_token_issuer_fingerprint`], over this operation's members.
 ///
-/// `Tags` go in SORTED, because a tag set carries no order the caller chose; everything
-/// else is length-prefixed in a fixed order by [`request_fingerprint`].
+/// `Tags` go in through [`push_sorted_tag_parts`], because a tag set carries no order the
+/// caller chose; everything else is length-prefixed in a fixed order by
+/// [`request_fingerprint`].
 pub fn application_fingerprint(
     instance_arn: &str,
     application_provider_arn: &str,
@@ -3683,15 +3684,7 @@ pub fn application_fingerprint(
             .and_then(|options| options.application_url.clone())
             .unwrap_or_default(),
     ];
-    let mut sorted: Vec<(&str, &str)> = tags
-        .iter()
-        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
-        .collect();
-    sorted.sort_unstable();
-    for (key, value) in sorted {
-        parts.push(key.to_string());
-        parts.push(value.to_string());
-    }
+    push_sorted_tag_parts(&mut parts, tags);
     request_fingerprint(&parts)
 }
 
@@ -3700,7 +3693,9 @@ pub fn application_fingerprint(
 ///
 /// It is what tells a genuine retry (the same `ClientToken` AND the same request) from
 /// the same token carrying a different request, which is a conflict rather than a
-/// replay. `Tags` go in SORTED, because a tag set carries no order the caller chose.
+/// replay. `Tags` go in through [`push_sorted_tag_parts`], the same way
+/// [`application_fingerprint`] folds them in, because a tag set carries no order the
+/// caller chose.
 pub fn trusted_token_issuer_fingerprint(
     instance_arn: &str,
     name: &str,
@@ -3722,6 +3717,19 @@ pub fn trusted_token_issuer_fingerprint(
             parts.push(oidc.jwks_retrieval_option.clone());
         }
     }
+    push_sorted_tag_parts(&mut parts, tags);
+    request_fingerprint(&parts)
+}
+
+/// Fold a create's `Tags` into its fingerprint `parts`: the pairs SORTED by key then
+/// value, each key and each value as its own part.
+///
+/// The one place every `@idempotencyToken`-scoped create expresses the rule that a tag
+/// set carries no order the caller chose, so two requests differing only in the order
+/// their tags arrived fingerprint alike and the second is a replay rather than a
+/// conflict. Both [`application_fingerprint`] and [`trusted_token_issuer_fingerprint`]
+/// call it, so neither can drift from the other.
+fn push_sorted_tag_parts(parts: &mut Vec<String>, tags: &[Tag]) {
     let mut sorted: Vec<(&str, &str)> = tags
         .iter()
         .map(|tag| (tag.key.as_str(), tag.value.as_str()))
@@ -3731,7 +3739,6 @@ pub fn trusted_token_issuer_fingerprint(
         parts.push(key.to_string());
         parts.push(value.to_string());
     }
-    request_fingerprint(&parts)
 }
 
 /// A stable digest of a request's parts, each LENGTH-PREFIXED so `["a", "bc"]` and

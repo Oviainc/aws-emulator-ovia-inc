@@ -1510,11 +1510,10 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
         );
     }
 
-    // A filter this emulator cannot evaluate is REFUSED, not answered with an empty
-    // page: no contact can reference an ephemeris while the ephemeris operations are
-    // unimplemented, so filtering by one must raise the operation's modelled
-    // InvalidParameterException rather than a 200 a caller would read as "no contact
-    // uses that ephemeris".
+    // The `ephemeris` member NARROWS the listing: one naming an ephemeris that points no
+    // contact of this account selects nothing, which is an answered request with an empty
+    // page rather than a refusal. What each ephemeris filter DOES select is
+    // `crate::available_contacts`'s subject.
     let by_ephemeris = send(
         &router,
         "POST",
@@ -1528,14 +1527,14 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
     )
     .await;
     assert_eq!(
-        by_ephemeris.status, 431,
-        "case by-ephemeris: expected 431, got {} {}",
+        by_ephemeris.status, 200,
+        "case by-ephemeris: expected 200, got {} {}",
         by_ephemeris.status, by_ephemeris.body
     );
     assert_eq!(
-        by_ephemeris.error_code(),
-        "InvalidParameterException",
-        "case by-ephemeris: wrong error shape, got {}",
+        by_ephemeris.field("contactList").as_array(),
+        Some(&Vec::new()),
+        "case by-ephemeris: a filter nothing is pointed by must select nothing, got {}",
         by_ephemeris.body
     );
 
@@ -1613,9 +1612,11 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
         );
     }
 
-    // An AVAILABLE search that names all three is a well-formed request; this emulator
-    // holds no AVAILABLE contact (nothing computes availability windows), so it answers
-    // an empty page rather than an error.
+    // An AVAILABLE search that names all three is a well-formed request; no pointing data
+    // is in force for the pairing it names — this account is on-boarded to no satellite
+    // here and holds no ephemeris — so that pairing can fly nothing and no window is
+    // offered. The windows a pairing that HAS pointing data is offered are
+    // `crate::available_contacts`'s subject.
     let available = send(
         &router,
         "POST",
@@ -1634,6 +1635,13 @@ async fn list_contacts_returns_exactly_the_contacts_its_filters_select() {
         available.status, 200,
         "case available-with-every-member: expected 200, got {} {}",
         available.status, available.body
+    );
+    assert_eq!(
+        available.field("contactList").as_array(),
+        Some(&Vec::new()),
+        "case available-with-every-member: a pairing with no pointing data in force offers \
+         no window, got {}",
+        available.body
     );
 
     // maxResults pages the same selection, and the token round-trips.

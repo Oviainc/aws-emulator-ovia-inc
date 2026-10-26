@@ -958,9 +958,10 @@ async fn deleting_a_name_that_identifies_no_grant_is_refused() {
 /// under ANOTHER grant, so the refusal follows the grant a cluster names and not
 /// the mere presence of a cluster.
 ///
-/// `EnableSnapshotCopy`, the operation that records a grant on a cluster's
-/// `ClusterSnapshotCopyStatus`, is still a scaffold, so the configuration is
-/// seeded straight into the same shared store the handlers read.
+/// The configuration is seeded straight into the same shared store the handlers
+/// read, so this suite exercises the delete rule over several clusters without
+/// driving `EnableSnapshotCopy` (which [`crate::snapshot_copy_configuration`]
+/// covers end to end) for each of them.
 #[tokio::test]
 async fn a_grant_a_cluster_copies_under_cannot_be_deleted() {
     let emulator = Emulator::new();

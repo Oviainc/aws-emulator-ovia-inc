@@ -189,6 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // A service-owned registry is AWS's, not the caller's, so what governs access
+        // to it is not a caller's to remove — the same refusal every other write to one
+        // gets, and the same one `PutResourcePolicy` answers for it.
+        if registry.scope.is_managed() {
+            return Err(DeleteResourcePolicyErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&registry_name),
+            )
+            .into());
+        }
+
         // `take` is the whole mutation: the policy leaves the store, so every later
         // `GetResourcePolicy` of this registry reports that it does not exist and a
         // later `PutResourcePolicy` creates a fresh one at a new revision. A registry

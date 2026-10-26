@@ -996,6 +996,26 @@ async fn a_queue_whose_kms_key_cannot_serve_a_call_refuses_it() {
             send_refused_with: Some("KmsNotFound"),
             receive_refused_with: Some("KmsNotFound"),
         },
+        // A KMS ARN whose account segment is not an account id is refused for want of
+        // permission before the resource it names is looked up, so neither form of it
+        // reaches a key at all — not the key form and not the alias form.
+        GateRow {
+            case: "a key ARN whose account segment is not an account id",
+            master_key_id: Some(format!(
+                "arn:aws:kms:{REGION}:not-an-account:key/\
+                 1234abcd-12ab-34cd-56ef-1234567890ab"
+            )),
+            access_key_id: ACCOUNT_KEY.to_string(),
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: Some("KmsAccessDenied"),
+        },
+        GateRow {
+            case: "an alias ARN whose account segment is not an account id",
+            master_key_id: Some(format!("arn:aws:kms:{REGION}:not-an-account:alias/aws/sqs")),
+            access_key_id: ACCOUNT_KEY.to_string(),
+            send_refused_with: Some("KmsAccessDenied"),
+            receive_refused_with: Some("KmsAccessDenied"),
+        },
     ];
 
     drive(&emulator, "keyless", &rows).await;

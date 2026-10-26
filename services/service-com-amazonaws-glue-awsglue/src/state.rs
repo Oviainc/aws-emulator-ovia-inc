@@ -2438,6 +2438,26 @@ impl CrawlerEntry {
         self.last_updated = now;
     }
 
+    /// Apply an `UpdateCrawlerSchedule` request's schedule to this stored crawler.
+    ///
+    /// That request STATES the crawler's schedule rather than merging into it: the cron
+    /// expression it carries becomes the crawler's schedule, and a request that carries
+    /// NONE leaves the crawler with no schedule at all. `CrawlerName` only ADDRESSES the
+    /// crawler, so the schedule is the one thing the request says anything about and its
+    /// absence can only mean "no schedule" — which is also the one way a caller can take
+    /// a schedule off a crawler, since `UpdateCrawler`'s own `Schedule` is a plain
+    /// expression whose absence means "leave the crawler alone".
+    ///
+    /// The write moves the server-set members exactly as [`Self::apply_update`] does,
+    /// because it writes the same member of the same crawler definition: `Version`
+    /// advances by one and `LastUpdated` becomes `now`. Nothing else about the crawler is
+    /// this request's to change.
+    pub fn apply_schedule(&mut self, schedule: Option<&str>, now: SystemTime) {
+        self.schedule_expression = schedule.map(str::to_string);
+        self.version = self.version.saturating_add(1);
+        self.last_updated = now;
+    }
+
     /// Rebuild the modelled `Crawler` output shape from what is stored.
     pub fn to_crawler(&self) -> Crawler {
         Crawler {
@@ -4731,6 +4751,20 @@ pub mod messages {
     /// carrying only the requested `Name`.
     pub fn crawler_running(name: &str) -> String {
         format!("Crawler with name {name} is running")
+    }
+
+    /// A crawler write whose `Schedule` is not the `cron(..)` expression the service
+    /// documents ([`super::is_cron_expression`]). NOT recorded: what is pinned is the
+    /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
+    /// sentence carrying only the requested expression plus the form it has to take.
+    /// Shared by every operation that writes that member (`CreateCrawler`,
+    /// `UpdateCrawler`, `UpdateCrawlerSchedule`), so one refusal cannot drift from
+    /// another's.
+    pub fn schedule_not_a_cron_expression(expression: &str) -> String {
+        format!(
+            "Schedule {expression} is not a cron expression of the form \
+             cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
+        )
     }
 
     /// `CreateCrawler` for a name already taken. NOT recorded: inferred from the

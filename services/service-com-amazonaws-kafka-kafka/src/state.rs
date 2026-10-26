@@ -55,7 +55,12 @@
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
 //! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
 //! streams from, so it is only ever resolved through that cluster and disappears
-//! with it.
+//! with it. `DeleteChannel` accepts a channel's deletion through
+//! [`ComAmazonawsKafkaKafkaState::begin_channel_deletion`], which moves it to
+//! `DELETING` and records the instant the clock owes its removal, and the
+//! channel lookups ([`ComAmazonawsKafkaKafkaState::settled_channel_in`] and the
+//! by-ARN pair the tagging operations resolve through) materialise that removal
+//! — so every reader agrees about when a deleted channel is gone.
 //!
 //! The replicator registry sits beside them on the same principle: a [`Replicator`]
 //! holds the whole replication setup, and the readers derive their shapes from that
@@ -316,6 +321,24 @@ pub const TOPIC_STATE_DELETING: &str = "DELETING";
 /// 250–750 ms, so a caller that describes the channel immediately still observes
 /// `CREATING` while a caller that waits sees `ACTIVE`.
 pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteChannel` a channel marked `DELETING` is actually gone.
+///
+/// CHOSEN, not documented, for the same reason: `DeleteChannel` is documented to
+/// move the channel through the non-terminal `DELETING` status and remove it once
+/// the asynchronous delete completes, so the record must stay readable for a span
+/// before it leaves the registry.
+pub const CHANNEL_DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `ChannelStatus` values this emulator reports, spelled as the model's enum
+/// declares them. Named here so every channel operation reports the same
+/// spellings. (`UPDATING`, `FAILED`, `SUSPENDING` and `SUSPENDED`, the model's
+/// other values, belong to operations that are still scaffolds.)
+pub const CHANNEL_STATUS_CREATING: &str = "CREATING";
+/// The status of a channel whose delivery pipeline is up.
+pub const CHANNEL_STATUS_ACTIVE: &str = "ACTIVE";
+/// The status of a channel whose deletion has been accepted but not completed.
+pub const CHANNEL_STATUS_DELETING: &str = "DELETING";
 
 /// Topic configurations one channel carries: `CreateChannelRequest$TopicConfigurationList`
 /// documents "Currently exactly one topic must be specified", so a list of any
@@ -1204,6 +1227,9 @@ pub struct Channel {
     pub active_due: SystemTime,
     /// A `ChannelStatus` value.
     pub status: String,
+    /// Set by `DeleteChannel`: the instant the clock owes this channel's removal
+    /// from the registry. `None` for a channel nobody has deleted.
+    pub removal_due: Option<SystemTime>,
     /// A `ChannelDestinationType` value, DERIVED from which destination
     /// configuration the create carried rather than taken from the request.
     pub destination_type: String,
@@ -1218,6 +1244,11 @@ pub struct Channel {
     /// `DescribeChannel` both report it: minted once with the channel and stored,
     /// so the two readers never disagree about it.
     pub cluster_operation_arn: String,
+    /// The cluster operation carrying out this channel's delete, minted once when
+    /// the delete is accepted. `None` until then, so `DeleteChannel` and a reader
+    /// inside the `DELETING` window report the same in-flight operation however
+    /// often the idempotent delete is repeated.
+    pub deletion_operation_arn: Option<String>,
 }
 
 /// The `ChannelDestinationType` value for a channel whose records land in an
@@ -2135,7 +2166,8 @@ impl ComAmazonawsKafkaKafkaState {
             .filter(|cluster| cluster.region == region)
     }
 
-    /// The stored tag set of the resource `arn` names in `region`.
+    /// The stored tag set of the resource `arn` names in `region`, as a caller at
+    /// `now` sees it.
     ///
     /// This is the ONE resolution the tagging operations share, so
     /// `TagResource`, `UntagResource` and `ListTagsForResource` cannot disagree
@@ -2143,11 +2175,14 @@ impl ComAmazonawsKafkaKafkaState {
     /// ARN earns. Tags live on the resource record itself, which is why a tag
     /// written here is visible to every other reader of that resource (a
     /// cluster's tags are reported by `DescribeCluster` and `ListClusters`, a
-    /// channel's by `DescribeChannel` and `ListChannels`).
+    /// channel's by `DescribeChannel` and `ListChannels`) — and why `now` is
+    /// needed: a channel whose removal the clock already owes is gone for the
+    /// tagging operations exactly as it is for its own reader.
     pub fn resource_tags_in(
         &self,
         region: &str,
         arn: &str,
+        now: SystemTime,
     ) -> Result<&BTreeMap<String, String>, TagTargetRejected> {
         match resource_type_of_arn(arn)? {
             CLUSTER_RESOURCE_TYPE => self
@@ -2155,7 +2190,7 @@ impl ComAmazonawsKafkaKafkaState {
                 .map(|cluster| &cluster.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
             CHANNEL_RESOURCE_TYPE => self
-                .channel_by_arn_in(region, arn)
+                .channel_by_arn_in(region, arn, now)
                 .map(|channel| &channel.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
             REPLICATOR_RESOURCE_TYPE => self
@@ -2179,6 +2214,7 @@ impl ComAmazonawsKafkaKafkaState {
         &mut self,
         region: &str,
         arn: &str,
+        now: SystemTime,
     ) -> Result<&mut BTreeMap<String, String>, TagTargetRejected> {
         match resource_type_of_arn(arn)? {
             CLUSTER_RESOURCE_TYPE => self
@@ -2186,7 +2222,7 @@ impl ComAmazonawsKafkaKafkaState {
                 .map(|cluster| &mut cluster.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
             CHANNEL_RESOURCE_TYPE => self
-                .channel_by_arn_mut_in(region, arn)
+                .channel_by_arn_mut_in(region, arn, now)
                 .map(|channel| &mut channel.tags)
                 .ok_or(TagTargetRejected::NoSuchResource),
             REPLICATOR_RESOURCE_TYPE => self
@@ -2197,27 +2233,33 @@ impl ComAmazonawsKafkaKafkaState {
         }
     }
 
-    /// The channel `arn` names, as an endpoint for `region` sees it, resolved by
-    /// its OWN ARN alone.
+    /// The channel `arn` names, as an endpoint for `region` sees it at `now`,
+    /// resolved by its OWN ARN alone.
     ///
     /// That is the form an operation that takes any resource ARN addresses a
     /// channel in: the cluster is not a separate request member there, it is a
     /// segment of the channel ARN itself (`channel/<cluster>/<cluster-id>/...`),
     /// so a channel ARN already names the cluster that holds it.
     /// [`Self::channel_in`] stays the resolution for the paths that carry the
-    /// cluster separately and must agree with it.
-    pub fn channel_by_arn_in(&self, region: &str, arn: &str) -> Option<&Channel> {
+    /// cluster separately and must agree with it. A channel whose removal the
+    /// clock already owes resolves to `None`, exactly as it does there.
+    pub fn channel_by_arn_in(&self, region: &str, arn: &str, now: SystemTime) -> Option<&Channel> {
         self.channels
             .get(arn)
-            .filter(|channel| channel.region == region)
+            .filter(|channel| channel.region == region && channel.is_live(now))
     }
 
     /// The same lookup, mutably — the write counterpart of
     /// [`Self::channel_by_arn_in`], with the same regional scoping.
-    pub fn channel_by_arn_mut_in(&mut self, region: &str, arn: &str) -> Option<&mut Channel> {
+    pub fn channel_by_arn_mut_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut Channel> {
         self.channels
             .get_mut(arn)
-            .filter(|channel| channel.region == region)
+            .filter(|channel| channel.region == region && channel.is_live(now))
     }
 
     /// The replicator `arn` names in `region`, mutably — the write counterpart of
@@ -2544,11 +2586,26 @@ impl ComAmazonawsKafkaKafkaState {
         Some(replicator)
     }
 
-    /// The ARN registered for channel `name` under the cluster `cluster_arn`, if
-    /// any. This is the lookup that makes a repeated `CreateChannel` a conflict.
-    pub fn channel_arn_for_name(&self, cluster_arn: &str, name: &str) -> Option<&String> {
-        self.channel_arn_by_name
-            .get(&(cluster_arn.to_string(), name.to_string()))
+    /// The ARN registered for channel `name` under the cluster `cluster_arn` as a
+    /// caller at `now` sees it — the lookup that makes a repeated `CreateChannel`
+    /// a conflict.
+    ///
+    /// A channel whose removal the clock already owes has freed its name, so this
+    /// answers `None` for it: the create that follows must see the same registry
+    /// the insertion path does.
+    pub fn channel_arn_for_name(
+        &self,
+        cluster_arn: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&String> {
+        let arn = self
+            .channel_arn_by_name
+            .get(&(cluster_arn.to_string(), name.to_string()))?;
+        self.channels
+            .get(arn)
+            .filter(|channel| channel.is_live(now))
+            .map(|_| arn)
     }
 
     /// How many channels `cluster_arn` currently holds — what the per-cluster
@@ -2560,14 +2617,46 @@ impl ComAmazonawsKafkaKafkaState {
             .map_or(0, BTreeSet::len)
     }
 
+    /// Drop the channels of `cluster_arn` whose removal the clock owed by `now`.
+    /// Scoped to the one cluster through the per-cluster index, so this never
+    /// walks the whole registry.
+    fn prune_removed_channels(&mut self, cluster_arn: &str, now: SystemTime) {
+        let removed: Vec<String> = self
+            .channel_arns_by_cluster
+            .get(cluster_arn)
+            .into_iter()
+            .flatten()
+            .filter(|arn| {
+                self.channels
+                    .get(*arn)
+                    .is_some_and(|channel| !channel.is_live(now))
+            })
+            .cloned()
+            .collect();
+        for arn in removed {
+            self.unregister_channel(&arn);
+        }
+    }
+
     /// Add `channel` to every index that must know about it. The one insertion
     /// path, so the ARN registry, the (cluster, name) index and the per-cluster
     /// index cannot drift apart — and the one place the per-cluster ceiling is
     /// enforced, so it holds for every caller of this module.
     ///
+    /// `now` is the instant the create is served: the removals this cluster's
+    /// channels are already owed are materialised FIRST, so a name whose channel
+    /// is gone as far as every reader is concerned is free here too (whether or
+    /// not anybody read it in between) and the ceiling bounds what the registry
+    /// actually holds.
+    ///
     /// Refuses, changing nothing, when the cluster is at
     /// [`MAX_CHANNELS_PER_CLUSTER`] or when the ARN is already registered.
-    pub fn register_channel(&mut self, channel: Channel) -> Result<(), ChannelRejected> {
+    pub fn register_channel(
+        &mut self,
+        channel: Channel,
+        now: SystemTime,
+    ) -> Result<(), ChannelRejected> {
+        self.prune_removed_channels(&channel.cluster_arn, now);
         if self.channels.contains_key(&channel.arn) {
             return Err(ChannelRejected::DuplicateArn);
         }
@@ -2606,20 +2695,23 @@ impl ComAmazonawsKafkaKafkaState {
     ///
     /// A channel is addressed under its cluster, so a channel ARN presented with
     /// another cluster's ARN resolves to `None` exactly as an absent one does —
-    /// the same way [`Self::cluster_in`] refuses another region's cluster.
+    /// the same way [`Self::cluster_in`] refuses another region's cluster. A
+    /// channel whose removal the clock already owes is absent too.
     pub fn channel_in(
         &self,
         region: &str,
         cluster_arn: &str,
         channel_arn: &str,
+        now: SystemTime,
     ) -> Option<&Channel> {
-        self.channels
-            .get(channel_arn)
-            .filter(|channel| channel.region == region && channel.cluster_arn == cluster_arn)
+        self.channels.get(channel_arn).filter(|channel| {
+            channel.region == region && channel.cluster_arn == cluster_arn && channel.is_live(now)
+        })
     }
 
-    /// The same lookup, with the `CREATING` -> `ACTIVE` transition the clock
-    /// already owed THIS channel materialised.
+    /// The same lookup, with the transitions the clock already owed THIS channel
+    /// materialised: a channel whose removal is due is gone (so this answers
+    /// `None`), and one whose activation is due is `ACTIVE`.
     ///
     /// Scoped to the one channel being reported, for the same reason
     /// [`Self::settled_cluster_in`] is.
@@ -2630,11 +2722,38 @@ impl ComAmazonawsKafkaKafkaState {
         channel_arn: &str,
         now: SystemTime,
     ) -> Option<&Channel> {
-        let channel = self.channels.get_mut(channel_arn)?;
+        let channel = self.channels.get(channel_arn)?;
         if channel.region != region || channel.cluster_arn != cluster_arn {
             return None;
         }
+        if !channel.is_live(now) {
+            self.unregister_channel(channel_arn);
+            return None;
+        }
+        let channel = self.channels.get_mut(channel_arn)?;
         channel.settle(now);
+        Some(channel)
+    }
+
+    /// Accept the deletion of the channel `channel_arn` names under
+    /// `cluster_arn`, as an endpoint for `region` sees it, handing back the record
+    /// as the caller must now see it: `DELETING`, with the instant the clock owes
+    /// its removal and the delete's own cluster operation set.
+    ///
+    /// Answers `None` when this region holds no such channel under that cluster —
+    /// including one whose removal the clock already owed, which the settling
+    /// lookup materialises first, so a channel is never deleted twice. Idempotent
+    /// through [`Channel::begin_deletion`].
+    pub fn begin_channel_deletion(
+        &mut self,
+        region: &str,
+        cluster_arn: &str,
+        channel_arn: &str,
+        now: SystemTime,
+    ) -> Option<&Channel> {
+        self.settled_channel_in(region, cluster_arn, channel_arn, now)?;
+        let channel = self.channels.get_mut(channel_arn)?;
+        channel.begin_deletion(now);
         Some(channel)
     }
 
@@ -3142,7 +3261,8 @@ impl Channel {
             region: cluster.region.clone(),
             creation_time: now,
             active_due: now + CHANNEL_ACTIVATION_DELAY,
-            status: "CREATING".to_string(),
+            status: CHANNEL_STATUS_CREATING.to_string(),
+            removal_due: None,
             destination_type: destination_type.to_string(),
             encryption_configuration: input.encryption_configuration,
             iceberg_destination_configuration: input.iceberg_destination_configuration,
@@ -3158,16 +3278,65 @@ impl Channel {
                     cluster.name
                 ),
             ),
+            deletion_operation_arn: None,
         }
     }
 
     /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
     /// [`Self::active_due`]. Idempotent, and a no-op for every other status: only
-    /// a transition the clock already owed is materialised here.
+    /// a transition the clock already owed is materialised here. A channel that is
+    /// `DELETING` never goes back to `ACTIVE`.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.status == "CREATING" && now >= self.active_due {
-            self.status = "ACTIVE".to_string();
+        if self.status == CHANNEL_STATUS_CREATING && now >= self.active_due {
+            self.status = CHANNEL_STATUS_ACTIVE.to_string();
         }
+    }
+
+    /// Whether this channel is still part of the registry a caller at `now` sees:
+    /// a channel whose removal the clock already owes is gone, whether or not the
+    /// record has been dropped yet.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        self.removal_due.is_none_or(|due| now < due)
+    }
+
+    /// Accept this channel's deletion at `now`: move it to `DELETING`, record the
+    /// instant the clock owes its removal, and mint the cluster operation carrying
+    /// the delete out.
+    ///
+    /// Idempotent — a channel already `DELETING` keeps the removal instant and the
+    /// operation ARN it was given, so repeating the call cannot postpone the
+    /// removal or re-identify the operation.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.removal_due.is_some() {
+            return;
+        }
+        // The delete's operation id is derived from the channel's own identity, so
+        // it is distinct from the create's (a different digest input) and stable
+        // across repeats of this call. It lives under the same cluster as the
+        // create operation, so the ARN keeps that prefix and replaces only the
+        // operation id.
+        let operation_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
+            "{}:{}:channel-delete-operation",
+            ::engine::emulator_account_id(),
+            self.arn
+        )));
+        let prefix = self
+            .cluster_operation_arn
+            .rsplit_once('/')
+            .map_or(self.cluster_operation_arn.as_str(), |(head, _)| head);
+        self.deletion_operation_arn = Some(format!("{prefix}/{operation_id}"));
+        self.status = CHANNEL_STATUS_DELETING.to_string();
+        self.removal_due = Some(now + CHANNEL_DELETION_DELAY);
+    }
+
+    /// The cluster operation a reader reports as this channel's in-flight one
+    /// (`DescribeChannelResponse$ClusterOperationArn`, "the ARN of the in-flight
+    /// cluster operation"): the delete once one has been accepted, otherwise the
+    /// create that minted the channel.
+    pub fn in_flight_cluster_operation_arn(&self) -> &str {
+        self.deletion_operation_arn
+            .as_deref()
+            .unwrap_or(&self.cluster_operation_arn)
     }
 
     /// The channel as `DescribeChannel` reports it. Kept next to the record for
@@ -3189,7 +3358,7 @@ impl Channel {
             // explaining; nothing has gone wrong with a channel this emulator
             // creates, so there is none to report.
             state_info: None,
-            cluster_operation_arn: Some(self.cluster_operation_arn.clone()),
+            cluster_operation_arn: Some(self.in_flight_cluster_operation_arn().to_string()),
             tags: Some(self.tags.clone().into_iter().collect()),
         }
     }
@@ -4383,9 +4552,16 @@ pub fn is_cluster_operation_arn(value: &str) -> bool {
 }
 
 /// Whether `value` is shaped like an MSK channel ARN —
-/// `arn:<partition>:kafka:<region>:<account>:channel/<cluster>/<cluster-id>/<name>/<id>`,
-/// the form [`Channel::streaming`] mints: a channel is a sub-resource of the
-/// cluster it reads from, so its ARN names that cluster.
+/// `arn:<partition>:kafka:<region>:<account>:channel/<cluster>/<cluster-id>/<name>`,
+/// optionally followed by the channel's own id: a channel is a sub-resource of
+/// the cluster it reads from, so its ARN names that cluster and then the channel.
+///
+/// The cluster name, the cluster id and the channel name are what identify a
+/// channel — a channel name is unique within its cluster — and
+/// [`Channel::streaming`] appends the channel's own id after them. BOTH forms are
+/// channel ARNs here: the behavioural corpus records the real service answering
+/// `NotFoundException`, not `BadRequestException`, for one that stops at the
+/// channel name, so that trailing id is not part of what a caller must supply.
 ///
 /// Same division of labour as [`is_cluster_arn`]: a value that is not an ARN of
 /// this kind is a `BadRequestException`, and `NotFoundException` is reserved for
@@ -4395,27 +4571,11 @@ pub fn is_channel_arn(value: &str) -> bool {
         return false;
     };
     let mut segments = resource.split('/');
-    matches!(
-        (
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next()
-        ),
-        (
-            Some("channel"),
-            Some(cluster),
-            Some(cluster_id),
-            Some(name),
-            Some(id),
-            None,
-        ) if !cluster.is_empty()
-            && !cluster_id.is_empty()
-            && !name.is_empty()
-            && !id.is_empty()
-    )
+    if segments.next() != Some(CHANNEL_RESOURCE_TYPE) {
+        return false;
+    }
+    let identity: Vec<&str> = segments.collect();
+    matches!(identity.len(), 3 | 4) && identity.iter().all(|segment| !segment.is_empty())
 }
 
 /// Whether `value` is an EC2 resource id of `kind` (`"vpc"`, `"subnet"`,

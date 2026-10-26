@@ -696,8 +696,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "service {name:?} already exists in cluster {cluster_name:?}"
+                        message: Some(crate::state::service_name_taken_message(
+                            &name,
+                            &cluster_name,
                         )),
                     },
                 )

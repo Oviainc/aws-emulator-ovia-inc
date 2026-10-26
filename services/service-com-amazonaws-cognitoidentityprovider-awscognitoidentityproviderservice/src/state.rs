@@ -166,7 +166,8 @@ const DEFAULT_DELETION_PROTECTION: &str = "INACTIVE";
 /// which is the mode that answers `UserNotFoundException` for an absent user.
 const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 
-/// The message every `UserNotFoundException` carries.
+/// The message a `UserNotFoundException` carries for an operation that resolves
+/// the user against a pool it names, or against the access token it is given.
 ///
 /// `UserNotFoundException` is "the message returned when a user isn't found"
 /// (this service's model) and the answer is the same sentence whatever was asked
@@ -174,7 +175,22 @@ const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 /// the lookup found nothing without telling the caller which identity it looked
 /// for. A message built from the requested username would answer a different
 /// sentence per username, which is what makes the refusal an existence oracle.
+///
+/// The public sign-up and password-recovery operations resolve the user from a
+/// different pair and answer their own sentence —
+/// [`USERNAME_CLIENT_NOT_FOUND_MESSAGE`].
 pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+
+/// The message a `UserNotFoundException` carries for an operation that resolves
+/// the user from the `Username` and the `ClientId` of the request TOGETHER.
+///
+/// The public sign-up and password-recovery operations — the ones whose input
+/// models a required `Username` beside a required `ClientId` and no
+/// `UserPoolId`, so the app client is what names the pool to look in — report an
+/// unresolved user as the combination of the two not being found, rather than as
+/// a statement about the username alone. Like [`USER_NOT_FOUND_MESSAGE`] it is
+/// one fixed sentence that quotes neither the username nor the client id.
+pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
 /// The message a device operation's `ResourceNotFoundException` carries for a
 /// `DeviceKey` the signed-in user holds no confirmed device for. Like
@@ -1361,7 +1377,9 @@ impl UserPool {
     /// How long a temporary password this pool issues stays usable.
     pub fn temporary_password_validity(&self) -> Duration {
         let days = self.password_policy().temporary_password_validity_days;
-        Duration::from_secs(u64::try_from(days).unwrap_or(0) * 24 * 60 * 60)
+        // Saturating, so no stored policy value can ask for a number of seconds
+        // the arithmetic cannot represent.
+        Duration::from_secs(u64::try_from(days).unwrap_or(0).saturating_mul(24 * 60 * 60))
     }
 
     /// `None` when every name in `names` is an attribute this pool's schema
@@ -2284,10 +2302,12 @@ impl User {
         if self.password_permanent {
             return false;
         }
-        match self.password_set_at {
-            Some(set_at) => now > set_at + validity,
-            None => false,
-        }
+        // The deadline is computed with the CHECKED addition: a window whose end
+        // is not a representable instant is a deadline that never arrives, so
+        // such a password is not expired rather than a failure of this read.
+        self.password_set_at
+            .and_then(|set_at| set_at.checked_add(validity))
+            .is_some_and(|deadline| now > deadline)
     }
 
     /// Store `device` for this user, evicting the device authenticated longest
