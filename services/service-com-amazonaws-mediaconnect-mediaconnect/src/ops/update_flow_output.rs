@@ -379,6 +379,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An output references the flow's own sub-resources BY NAME, and this update can
+        // move either reference: the media stream associations it carries name media
+        // streams of this flow, and the VPC interface attachment names a VPC interface of
+        // this flow. Each name is resolved against what the flow actually holds, through
+        // the one place this crate resolves such a reference (`crate::state`), BEFORE the
+        // merged record is written — so a refused update leaves the output exactly as it
+        // was. A request that moves neither reference is never refused for what the output
+        // already carries.
+        let held_media_streams = flow.media_stream_names();
+        let held_vpc_interfaces = flow.vpc_interface_names();
+        if let Some(rejection) = crate::state::media_stream_output_configuration_rejection(
+            "",
+            input
+                .media_stream_output_configurations
+                .as_deref()
+                .unwrap_or_default(),
+            &held_media_streams,
+            &held_vpc_interfaces,
+        ) {
+            return Err(bad_request(rejection));
+        }
+        if let Some(rejection) = crate::state::vpc_interface_attachment_rejection(
+            "VpcInterfaceAttachment",
+            input.vpc_interface_attachment.as_ref(),
+            &held_vpc_interfaces,
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         // What each setting becomes once this request is applied: the request's value
         // where it carries one, the stored value where it does not.
         if let Some(description) = input.description.clone() {

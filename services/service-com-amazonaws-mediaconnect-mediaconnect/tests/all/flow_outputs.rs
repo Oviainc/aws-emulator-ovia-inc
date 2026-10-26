@@ -11,6 +11,31 @@
 use serde_json::{json, Value};
 
 use crate::flow_lifecycle::{Emulator, REGION};
+use crate::flow_vpc_interfaces::{vpc_interface_request, SUBNET_ID};
+
+/// The VPC interfaces the fixture flows below hold, named by the outputs that attach to
+/// one and by the destination configurations that send a media stream out over one. A VPC
+/// interface reference is a name within the flow's own `VpcInterfaces`, so a flow whose
+/// output carries such a reference has to hold the interface it names.
+///
+/// `pub(crate)` because the suites that attach an output of their own flow to a VPC
+/// interface — `tests/all/remove_flow_output.rs`,
+/// `tests/all/remove_flow_media_stream.rs` — fill their flows with the same ones.
+pub(crate) fn attached_vpc_interfaces() -> Value {
+    json!([
+        vpc_interface_request("vpc-1", None, &["sg-0123456789abcdef0"], SUBNET_ID, None),
+        vpc_interface_request("vpc-7", None, &["sg-0123456789abcdef0"], SUBNET_ID, None)
+    ])
+}
+
+/// The media streams the fixture flow below holds, named by the outputs that associate
+/// one: a media stream association is a name within the flow's own `MediaStreams`.
+pub(crate) fn held_media_streams() -> Value {
+    json!([
+        { "mediaStreamId": 1, "mediaStreamName": "vid", "mediaStreamType": "video" },
+        { "mediaStreamId": 2, "mediaStreamName": "aud", "mediaStreamType": "audio" }
+    ])
+}
 
 /// The ARN of a flow in this Region that this service never minted — well formed enough
 /// to pass the modelled `FlowArn` label pattern, so the request reaches the handler.
@@ -38,6 +63,10 @@ pub(crate) async fn add_flow_outputs(
 
 /// Create the flow a case adds outputs to, with `initial` outputs already on it, and
 /// return its ARN.
+///
+/// The flow holds the media streams and VPC interfaces its outputs reference by name
+/// ([`held_media_streams`], [`attached_vpc_interfaces`]), because an output can only
+/// associate a media stream or attach a VPC interface its own flow holds.
 pub(crate) async fn create_flow_with_outputs(
     emulator: &Emulator,
     case: &str,
@@ -49,6 +78,8 @@ pub(crate) async fn create_flow_with_outputs(
             "name": name,
             "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" },
             "outputs": initial,
+            "mediaStreams": held_media_streams(),
+            "vpcInterfaces": attached_vpc_interfaces(),
         }))
         .await;
     assert_eq!(
@@ -535,6 +566,7 @@ async fn an_added_output_persists_its_media_stream_and_router_integration_settin
                 { "mediaStreamId": 1, "mediaStreamName": "ms-1", "mediaStreamType": "video" },
                 { "mediaStreamId": 2, "mediaStreamName": "ms-2", "mediaStreamType": "audio" }
             ],
+            "vpcInterfaces": attached_vpc_interfaces(),
             "outputs": [{
                 "name": "created",
                 "protocol": "st2110-jpegxs",
