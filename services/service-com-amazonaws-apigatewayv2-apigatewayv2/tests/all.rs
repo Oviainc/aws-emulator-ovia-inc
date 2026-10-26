@@ -45,6 +45,8 @@ mod deployment_stage_release;
 mod domain_name_endpoint_required;
 #[path = "all/domain_name_lifecycle.rs"]
 mod domain_name_lifecycle;
+#[path = "all/http_api_integration_fault_status.rs"]
+mod http_api_integration_fault_status;
 #[path = "all/http_api_jwt_data_plane.rs"]
 mod http_api_jwt_data_plane;
 #[path = "all/http_api_route_precedence.rs"]

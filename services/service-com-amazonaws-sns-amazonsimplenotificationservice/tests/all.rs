@@ -17,6 +17,9 @@ mod account_subscriptions_listing;
 #[path = "all/data_protection_policy.rs"]
 mod data_protection_policy;
 
+#[path = "all/delivery_policy_and_message_branches.rs"]
+mod delivery_policy_and_message_branches;
+
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 

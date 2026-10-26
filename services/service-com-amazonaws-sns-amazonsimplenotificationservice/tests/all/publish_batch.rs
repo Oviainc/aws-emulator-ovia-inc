@@ -499,8 +499,8 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
         ("a plain entry", Entry::new("ok-first", "first body"), true),
         ("an empty body", Entry::new("empty", ""), false),
         (
-            "a message structure other than json",
-            Entry::new("structure", "body").structure("xml"),
+            "a json structure whose body is not JSON",
+            Entry::new("structure", "not json").structure("json"),
         false),
         (
             "a json body with no default member",

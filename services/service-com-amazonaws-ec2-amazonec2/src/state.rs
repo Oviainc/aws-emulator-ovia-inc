@@ -557,7 +557,12 @@
 //! that due instant is a fact the modelled [`IpamPool`] carries no member for, so it lives
 //! beside the pool under the same id in
 //! [`ComAmazonawsEc2Amazonec2State::ipam_pool_create_complete_at`], the way a `pending`
-//! VPC's does.
+//! VPC's does. A scope `CreateIpamScope` creates is the same story one level up: it is
+//! answered in the non-terminal `create-in-progress` `IpamScopeState` and its due instant
+//! lives in [`ComAmazonawsEc2Amazonec2State::ipam_scope_create_complete_at`] — the two
+//! DEFAULT scopes an IPAM comes up with are not listed there, because the one entry
+//! [`ComAmazonawsEc2Amazonec2State::ipam_create_complete_at`] holds for the IPAM already
+//! covers them.
 //!
 //! ## Network Access Scopes and their analyses
 //!
@@ -2814,10 +2819,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     ///
     /// A fresh account holds none: a scope belongs to an IPAM, so the two default scopes of
     /// an IPAM are written by [`Self::insert_ipam`] when `CreateIpam` creates it, and
-    /// `CreateIpamScope` (still a scaffold) is what would add a further one. Until an IPAM
+    /// `CreateIpamScope` adds a further one through
+    /// [`Self::insert_created_ipam_scope`]. Until an IPAM
     /// exists, every scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] —
     /// exactly as the real service does for a scope that does not exist.
     pub ipam_scopes: BTreeMap<String, IpamScope>,
+    /// When a `create-in-progress` IPAM scope's move to `create-complete` falls due, by
+    /// `IpamScopeId` — the fact the modelled [`IpamScope`] shape carries no member for,
+    /// stored beside the scope for the same reason, and on the same monotonic clock, as
+    /// [`Self::ipam_pool_create_complete_at`].
+    ///
+    /// Only a scope `CreateIpamScope` created is listed: the two DEFAULT scopes of an IPAM
+    /// are completed by the ONE entry [`Self::ipam_create_complete_at`] holds for that
+    /// IPAM, which covers everything that create made at once.
+    pub ipam_scope_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamScope` `ClientToken` and the `IpamScopeId` that call minted, so a replay
+    /// of the same request answers with that scope instead of creating a second one: "a
+    /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateIpamScopeRequest$ClientToken`).
+    pub ipam_scope_client_tokens: HashMap<String, String>,
     /// When a `create-in-progress` IPAM pool's move to `create-complete` falls due, by
     /// `IpamPoolId` — the fact the modelled [`IpamPool`] shape carries no member for, stored
     /// beside the pool under the same id the way [`Self::vpc_available_at`] holds a
@@ -3128,6 +3148,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             asn_association_moves: BTreeMap::new(),
             ipam_policies: BTreeMap::new(),
             ipam_scopes: BTreeMap::new(),
+            ipam_scope_create_complete_at: BTreeMap::new(),
+            ipam_scope_client_tokens: HashMap::new(),
             ipam_pool_create_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
@@ -5750,6 +5772,23 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
             // The transition is applied once; nothing is owed on this pool any more.
+            false
+        });
+        // An IPAM scope `CreateIpamScope` answered as `create-in-progress` reaches
+        // `create-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as the pool above. The two default scopes of an IPAM are not
+        // listed here: `complete_ipam_creation` moves them with the IPAM they came up with.
+        let ipam_scopes = &mut self.ipam_scopes;
+        self.ipam_scope_create_complete_at.retain(|scope_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(scope) = ipam_scopes.get_mut(scope_id) {
+                if scope.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                    scope.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this scope any more.
             false
         });
         // A Verified Access endpoint `CreateVerifiedAccessEndpoint` answered as `pending`
@@ -23038,12 +23077,10 @@ impl ComAmazonawsEc2Amazonec2State {
         let scope_id = self.next_id(IPAM_SCOPE_ID_PREFIX);
         view.ipam_scope_id = Some(scope_id.clone());
         // "The Amazon Resource Name (ARN) of the scope" (`IpamScope$IpamScopeArn`): an EC2
-        // ARN in the IPAM's own Region, under this resource's modelled type.
-        view.ipam_scope_arn = Some(::engine::emulator_arn(
-            "ec2",
-            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
-            &format!("{RESOURCE_TYPE_IPAM_SCOPE}/{scope_id}"),
-        ));
+        // IPAM-family ARN under this resource's modelled type, whose Region segment is empty
+        // for the reason [`ipam_resource_arn`] records — the scope's Region is reported in
+        // `IpamScope$IpamRegion` instead.
+        view.ipam_scope_arn = Some(ipam_resource_arn(RESOURCE_TYPE_IPAM_SCOPE, &scope_id));
         // "The Amazon Web Services account ID of the owner of the scope"
         // (`IpamScope$OwnerId`): this emulator serves one account.
         view.owner_id = Some(::engine::emulator_account_id().to_string());
@@ -23057,6 +23094,71 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         self.ipam_scopes.insert(scope_id.clone(), view);
         Some(scope_id)
+    }
+
+    /// Store an IPAM scope a create has just made in the IPAM `ipam_id` names, and answer
+    /// the `IpamScopeId` it was given — or `None` when the store is at its ceiling and
+    /// nothing was stored.
+    ///
+    /// The ONE way a CREATED scope is stored, the counterpart of
+    /// [`Self::insert_creating_ipam_pool`] for the container a pool lives in: the scope is
+    /// answered in the non-terminal `create-in-progress` state, so the clock owes it
+    /// [`IPAM_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`] later
+    /// ([`Self::ipam_scope_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the scope from here on so
+    /// a replay of the same request answers it instead of creating a second one; the IPAM's
+    /// own count of the scopes in it is recounted; and every caller-chosen byte the record
+    /// retains — the external authority's resource identifier and the token beside what
+    /// [`Self::insert_ipam_scope`] already charges — is charged to the store's budget.
+    pub fn insert_created_ipam_scope(
+        &mut self,
+        ipam_id: &str,
+        client_token: Option<&str>,
+        mut view: IpamScope,
+    ) -> Option<String> {
+        view.state = Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string());
+        // "Defines if the scope is the default scope or not" (`IpamScope$IsDefault`): only
+        // the two scopes an IPAM comes up with are default ones, so a scope a caller asked
+        // for is not.
+        view.is_default = Some(false);
+        let retained = client_token.unwrap_or_default().len()
+            + view
+                .external_authority_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.external_resource_identifier.as_deref())
+                .unwrap_or_default()
+                .len();
+        let scope_id = self.insert_ipam_scope(view)?;
+        self.add_stored_bytes(retained);
+        self.ipam_scope_create_complete_at
+            .insert(scope_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_scope_client_tokens
+                .insert(token.to_string(), scope_id.clone());
+        }
+        self.recount_ipam_scopes(ipam_id);
+        Some(scope_id)
+    }
+
+    /// Set the IPAM's `ScopeCount` to the number of scopes the store now holds in it.
+    ///
+    /// "The number of scopes in the IPAM" (`Ipam$ScopeCount`) is DERIVED from the scopes
+    /// themselves, so it is recounted from them rather than incremented — the same contract
+    /// [`Self::recount_ipam_scope_pools`] has for a scope's pool count. A scope names its
+    /// IPAM by `IpamArn` (the modelled [`IpamScope`] carries no IPAM id at all), which is
+    /// what the scopes of this IPAM are counted by.
+    fn recount_ipam_scopes(&mut self, ipam_id: &str) {
+        let Some(ipam_arn) = self.ipams.get(ipam_id).and_then(|ipam| ipam.ipam_arn.clone()) else {
+            return;
+        };
+        let scopes = self
+            .ipam_scopes
+            .values()
+            .filter(|scope| scope.ipam_arn.as_deref() == Some(ipam_arn.as_str()))
+            .count();
+        if let Some(ipam) = self.ipams.get_mut(ipam_id) {
+            ipam.scope_count = i32::try_from(scopes).ok();
+        }
     }
 
     /// Store an IPAM pool a create has just made in the scope `scope_id` names, and answer
@@ -23216,6 +23318,11 @@ pub const IPAM_LIMIT_EXCEEDED: &str = "IpamLimitExceeded";
 /// `InvalidIpamId.NotFound`: the request named an IPAM id this account holds no IPAM for.
 pub const INVALID_IPAM_ID_NOT_FOUND: &str = "InvalidIpamId.NotFound";
 
+/// `InvalidIpamId.Malformed`: the request named something that is not an IPAM id at all, so
+/// there is nothing to look up — the counterpart of [`INVALID_IPAM_SCOPE_ID_MALFORMED`] for
+/// the IPAM itself.
+pub const INVALID_IPAM_ID_MALFORMED: &str = "InvalidIpamId.Malformed";
+
 /// Refuse a create that would take the store past [`MAX_IPAMS`]: HTTP 400
 /// `IpamLimitExceeded`.
 pub fn ipam_limit_exceeded<E>() -> Scaffolded<E> {
@@ -23228,11 +23335,17 @@ pub fn ipam_limit_exceeded<E>() -> Scaffolded<E> {
 
 /// Refuse a request that named an IPAM the account holds none of: HTTP 400
 /// `InvalidIpamId.NotFound`.
+///
+/// The wording is this resource's own — "The IPAM (…) does not exist.", the sentence AWS
+/// answers a request naming an IPAM that does not exist with, built from the id the REQUEST
+/// named. The parenthesised id is why this resource does not go through [`id_not_found`],
+/// whose sentence quotes the id instead; [`invalid_ipam_scope_id_not_found`] words the
+/// scope's own refusal the same way.
 pub fn invalid_ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_IPAM_ID_NOT_FOUND,
         400,
-        format!("The IPAM ID '{ipam_id}' does not exist"),
+        format!("The IPAM ({ipam_id}) does not exist."),
     )
 }
 

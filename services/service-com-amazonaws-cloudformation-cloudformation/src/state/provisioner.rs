@@ -659,6 +659,12 @@ impl Provisioner {
             // those reaches Amazon Cognito through it — while the two members that make the
             // group's identity are not members of that call at all.
             Self::CognitoUserPoolGroup => update_group(ctx, region, resource, declared).await,
+            // A role's identity is its NAME, and every other property of
+            // `AWS::IAM::Role` has an IAM call that changes it on the role that name
+            // belongs to — the trust policy through `UpdateAssumeRolePolicy` — so a
+            // changed declaration is applied to the role the stack created rather than
+            // replacing it ([`update_role`]).
+            Self::IamRole => update_role(ctx, region, resource, declared).await,
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -700,6 +706,10 @@ impl Provisioner {
             Self::CloudWatchDashboard => {
                 retag_dashboard(ctx, region, resource, declared, propagated).await
             }
+            // A role's tags are IAM's own `TagRole`/`UntagRole`, which is also why
+            // [`update_role`] does not carry them: this is the one place the tag set a role
+            // is to end up with is reconciled.
+            Self::IamRole => retag_role(ctx, region, resource, declared, propagated).await,
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the
             // calls that apply it are each service's own.
@@ -2404,7 +2414,7 @@ async fn create_role(
     }
     // "Policies — adds or updates an inline policy document that is embedded in the
     // specified IAM role", each entry a `{PolicyName, PolicyDocument}` pair.
-    for policy in inline_policies(resource) {
+    for policy in inline_policies(&resource.properties) {
         let (Some(name), Some(body)) = (
             policy.get("PolicyName").and_then(scalar_text),
             policy.get("PolicyDocument").and_then(document_text),
@@ -2423,7 +2433,7 @@ async fn create_role(
     // "ManagedPolicyArns — a list of Amazon Resource Names (ARNs) of the IAM managed
     // policies that you want to attach to the role", each applied with the call that
     // attaches one.
-    for policy_arn in managed_policy_arns(resource) {
+    for policy_arn in managed_policy_arns(&resource.properties) {
         client
             .attach_role_policy()
             .role_name(role_name)
@@ -2433,6 +2443,332 @@ async fn create_role(
             .map_err(|error| refusal_of(&error))?;
     }
     Ok(Created::attributes(attributes))
+}
+
+/// The properties of `AWS::IAM::Role` a deployment can change on the role the stack
+/// already has, each through the IAM call that changes that one thing on an existing role.
+///
+/// These are the type's no-interruption properties: the role keeps its name, and so its
+/// `RoleId`, its ARN and its physical id, and everything that trusts or assumes it.
+/// `Tags` is one of them, applied in [`retag_role`] rather than in [`update_role`] —
+/// where every tag a role is to carry is reconciled at once.
+///
+/// Three properties are deliberately NOT here, so a deployment that changes one is reported
+/// as not applied rather than as a success that dropped it:
+///
+/// * `RoleName`, which this emulator replaces the role over rather than updating: the name
+///   IS the resource's physical id, so a changed one is a different resource to
+///   [`super::provisioning::is_same_resource`] and never reaches [`update_role`] at all;
+/// * `Path`, which decides the role's ARN and which no IAM call moves on an existing role;
+/// * `PermissionsBoundary`, which [`create_role`] does not apply either, so claiming to
+///   apply a change to it would record a configuration nothing put in force.
+const ROLE_IN_PLACE_PROPERTIES: &[&str] = &[
+    "AssumeRolePolicyDocument",
+    "Description",
+    "ManagedPolicyArns",
+    "MaxSessionDuration",
+    "Policies",
+    "Tags",
+];
+
+/// IAM's own default for a role's maximum session length, which is what a role goes back
+/// to when a deployment stops declaring `MaxSessionDuration`: `UpdateRole`'s own
+/// documentation of that member — "If you do not specify a value for this setting, the
+/// default value of one hour is applied".
+///
+/// Read from the IAM crate, which owns that default and applies it to every role it
+/// creates, so the two cannot drift apart.
+const DEFAULT_MAX_SESSION_DURATION: i32 =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::DEFAULT_MAX_SESSION_DURATION_SECONDS;
+
+/// Apply a CHANGED `AWS::IAM::Role` declaration to the role the stack already has, through
+/// the IAM call that changes each property on an existing role — the trust policy with
+/// `UpdateAssumeRolePolicy`, the description and the session length with `UpdateRole`, the
+/// inline policies with `PutRolePolicy`/`DeleteRolePolicy`, the attached managed policies
+/// with `AttachRolePolicy`/`DetachRolePolicy`, and the tags with `TagRole`/`UntagRole`.
+///
+/// The role therefore keeps its identity: the same name, the same `RoleId` and the same
+/// ARN, so every attribute the stack published for it still resolves and nothing that
+/// trusts the role has to be re-pointed. Only what the two revisions state differently is
+/// sent, so a property neither of them changed reaches IAM not at all.
+///
+/// `Ok(None)` is a change no IAM call makes to an existing role — a property outside
+/// [`ROLE_IN_PLACE_PROPERTIES`] — which the deployment then reports as not applied rather
+/// than as a success that dropped the caller's change.
+///
+/// The role's `Tags` are the one property this does NOT carry: they travel in
+/// [`retag_role`] with the ones CloudFormation gives the resource, which change
+/// independently of any declaration.
+async fn update_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let held = &resource.properties;
+    // A declaration that spells out the name the role ALREADY has is no change to the name:
+    // this call is reached only for a resource that kept its physical id, which for this
+    // type IS the role's name, so one revision merely wrote down what the other left to
+    // CloudFormation.
+    let changed: Vec<String> = changed_properties(held, declared)
+        .into_iter()
+        .filter(|property| {
+            property != "RoleName"
+                || declared.get("RoleName").and_then(scalar_text).as_deref()
+                    != Some(resource.physical_resource_id.as_str())
+        })
+        .collect();
+    if changed
+        .iter()
+        .any(|property| !ROLE_IN_PLACE_PROPERTIES.contains(&property.as_str()))
+    {
+        return Ok(None);
+    }
+    let client = iam_client(ctx, region);
+    let role_name = &resource.physical_resource_id;
+    let is_changed = |property: &str| changed.iter().any(|name| name == property);
+
+    // "Updates the policy that grants an IAM entity permission to assume a role": the
+    // declared document REPLACES the one the role holds. The property is required on this
+    // resource type, so a declaration that drops it describes no role IAM would accept —
+    // refused naming the property, exactly as the create refuses it.
+    if is_changed("AssumeRolePolicyDocument") {
+        let Some(trust_policy) = declared
+            .get("AssumeRolePolicyDocument")
+            .and_then(document_text)
+        else {
+            return Err(Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "Property AssumeRolePolicyDocument cannot be empty for resource of type {}",
+                    resource.resource_type
+                ),
+            });
+        };
+        client
+            .update_assume_role_policy()
+            .role_name(role_name)
+            .policy_document(trust_policy)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+
+    // "Updates the description or maximum session duration setting of a role" — one call
+    // for the two, carrying only the member this deployment states differently. A
+    // description the deployment no longer declares is sent as the empty string
+    // (`roleDescriptionType` admits it), and a session length it no longer declares goes
+    // back to IAM's documented default ([`DEFAULT_MAX_SESSION_DURATION`]), so a dropped
+    // property is reset rather than silently kept.
+    if is_changed("Description") || is_changed("MaxSessionDuration") {
+        let mut call = client.update_role().role_name(role_name);
+        if is_changed("Description") {
+            call = call.description(
+                declared
+                    .get("Description")
+                    .and_then(scalar_text)
+                    .unwrap_or_default(),
+            );
+        }
+        if is_changed("MaxSessionDuration") {
+            // A declaration that states the property but not as a whole number states no
+            // session length IAM could be asked for, and is refused as the malformed
+            // property it is rather than quietly resetting the role to the default.
+            let duration = match declared.get("MaxSessionDuration") {
+                None => DEFAULT_MAX_SESSION_DURATION,
+                Some(value) => whole_number(Some(value))
+                    .ok_or_else(|| malformed_property("MaxSessionDuration"))?,
+            };
+            call = call.max_session_duration(duration);
+        }
+        call.send().await.map_err(|error| refusal_of(&error))?;
+    }
+
+    // "Policies — adds or updates an inline policy document that is embedded in the
+    // specified IAM role": a policy this deployment declares with a new document is put
+    // again under the same name, and one it no longer declares is deleted off the role.
+    if is_changed("Policies") {
+        let held_policies = inline_policies(held);
+        let declared_policies = inline_policies(declared);
+        for policy in declared_policies {
+            let (Some(name), Some(body)) = (
+                policy.get("PolicyName").and_then(scalar_text),
+                policy.get("PolicyDocument").and_then(document_text),
+            ) else {
+                continue;
+            };
+            if held_policies.iter().any(|held| held == policy) {
+                continue;
+            }
+            client
+                .put_role_policy()
+                .role_name(role_name)
+                .policy_name(name)
+                .policy_document(body)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+        for name in dropped_policy_names(held_policies, declared_policies) {
+            client
+                .delete_role_policy()
+                .role_name(role_name)
+                .policy_name(name)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+    }
+
+    // "ManagedPolicyArns — a list of Amazon Resource Names (ARNs) of the IAM managed
+    // policies that you want to attach to the role": one the deployment adds is attached,
+    // one it no longer lists is detached.
+    if is_changed("ManagedPolicyArns") {
+        let held_arns = managed_policy_arns(held);
+        let declared_arns = managed_policy_arns(declared);
+        for policy_arn in declared_arns.iter().filter(|arn| !held_arns.contains(arn)) {
+            client
+                .attach_role_policy()
+                .role_name(role_name)
+                .policy_arn(policy_arn)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+        for policy_arn in held_arns
+            .iter()
+            .filter(|arn| !declared_arns.contains(arn))
+        {
+            client
+                .detach_role_policy()
+                .role_name(role_name)
+                .policy_arn(policy_arn)
+                .send()
+                .await
+                .map_err(|error| refusal_of(&error))?;
+        }
+    }
+
+    // The role is the one the stack created, under the same name: its ARN and its `RoleId`
+    // are the ones the create already recorded, so this reports no attribute of its own.
+    Ok(Some(Created::default()))
+}
+
+/// Bring the tags of the role a resource record names to the ones this deployment gives it,
+/// through IAM's own `TagRole` and `UntagRole`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set [`create_role`] applied — so a key outside it is one this
+/// deployment no longer gives the role and is removed, and a key in it with another value is
+/// re-valued ("adds or updates the specified tags", `TagRole`). A key the declaration stops
+/// stating while the STACK still states it therefore keeps the stack's value rather than
+/// being removed. Where the two sets already agree nothing is called at all, which is what
+/// makes this safe to ask on every deployment.
+///
+/// The role's tags are read from `GetRole`, which reports them on the role itself. A role
+/// IAM no longer holds has no tags to reconcile.
+async fn retag_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let desired = tags_of(declared, propagated);
+    let client = iam_client(ctx, region);
+    let role_name = &resource.physical_resource_id;
+    let held: Vec<(String, String)> = match client.get_role().role_name(role_name).send().await {
+        Ok(answer) => answer
+            .role()
+            .map(|role| {
+                role.tags()
+                    .iter()
+                    .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            let refusal = refusal_of(&error);
+            if refusal.code == NO_SUCH_ENTITY {
+                return Ok(());
+            }
+            return Err(refusal);
+        }
+    };
+    let mut added = Vec::new();
+    for (key, value) in desired.iter().filter(|(key, value)| {
+        held.iter()
+            .find(|(held_key, _)| held_key == key)
+            .is_none_or(|(_, held_value)| held_value != value)
+    }) {
+        added.push(
+            ::aws_sdk_iam::types::Tag::builder()
+                .key(key)
+                .value(value)
+                .build()
+                .map_err(|error| Refusal {
+                    code: UNIDENTIFIED_FAILURE.to_string(),
+                    message: format!("the tag {key} cannot be sent to IAM: {error}"),
+                })?,
+        );
+    }
+    let removed: Vec<String> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    if !added.is_empty() {
+        client
+            .tag_role()
+            .role_name(role_name)
+            .set_tags(Some(added))
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    if !removed.is_empty() {
+        client
+            .untag_role()
+            .role_name(role_name)
+            .set_tag_keys(Some(removed))
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    Ok(())
+}
+
+/// The `PolicyName`s a declaration stated and the new one no longer does — the inline
+/// policies to delete off the role. A declaration whose entry carries no name states no
+/// policy, so there is nothing to delete for it.
+fn dropped_policy_names(held: &[Value], declared: &[Value]) -> Vec<String> {
+    let declared_names: Vec<String> = declared
+        .iter()
+        .filter_map(|policy| policy.get("PolicyName").and_then(scalar_text))
+        .collect();
+    held.iter()
+        .filter_map(|policy| policy.get("PolicyName").and_then(scalar_text))
+        .filter(|name| !declared_names.contains(name))
+        .collect()
+}
+
+/// The top-level properties two revisions of one declaration state DIFFERENTLY: a property
+/// one of them adds, one it drops, and one both state with another value. The union of
+/// both documents' keys, so a property the new revision no longer declares is a change
+/// too, in the order the held revision wrote them and then the declared one.
+fn changed_properties(held: &Value, declared: &Value) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    for (property, value) in held.as_object().into_iter().flatten() {
+        if declared.get(property) != Some(value) {
+            changed.push(property.clone());
+        }
+    }
+    for (property, value) in declared.as_object().into_iter().flatten() {
+        if held.get(property) != Some(value) && !changed.contains(property) {
+            changed.push(property.clone());
+        }
+    }
+    changed
 }
 
 /// Delete the role a stack created. "You must delete the policies that are associated
@@ -2446,7 +2782,7 @@ async fn delete_role(
 ) -> Result<(), Refusal> {
     let client = iam_client(ctx, region);
     let role_name = &resource.physical_resource_id;
-    for policy_arn in managed_policy_arns(resource) {
+    for policy_arn in managed_policy_arns(&resource.properties) {
         if let Err(error) = client
             .detach_role_policy()
             .role_name(role_name)
@@ -2460,7 +2796,7 @@ async fn delete_role(
             }
         }
     }
-    for policy in inline_policies(resource) {
+    for policy in inline_policies(&resource.properties) {
         let Some(name) = policy.get("PolicyName").and_then(scalar_text) else {
             continue;
         };
@@ -2532,25 +2868,28 @@ async fn describe_role(
 }
 
 /// The `Policies` entries a role declaration carries, as a slice — empty for a role that
-/// declares none, so the create and the delete walk them the same way.
-fn inline_policies(resource: &StoredResource) -> &[Value] {
-    declared_list(resource, "Policies")
+/// declares none, so the create, the update and the delete walk them the same way.
+///
+/// The property DOCUMENT is what is read, not the stored record, so the same reader serves
+/// the configuration a resource was created with and the one a deployment now declares for
+/// it.
+fn inline_policies(properties: &Value) -> &[Value] {
+    declared_list(properties, "Policies")
 }
 
 /// The `ManagedPolicyArns` a role declaration carries, each as the ARN text
 /// `AttachRolePolicy` takes.
-fn managed_policy_arns(resource: &StoredResource) -> Vec<String> {
-    declared_list(resource, "ManagedPolicyArns")
+fn managed_policy_arns(properties: &Value) -> Vec<String> {
+    declared_list(properties, "ManagedPolicyArns")
         .iter()
         .filter_map(scalar_text)
         .collect()
 }
 
-/// One list-valued property of a resource, as a slice — empty for a property the template
-/// does not declare or declares as something other than a list.
-fn declared_list<'a>(resource: &'a StoredResource, property: &str) -> &'a [Value] {
-    resource
-        .properties
+/// One list-valued property of a declaration, as a slice — empty for a property the
+/// template does not declare or declares as something other than a list.
+fn declared_list<'a>(properties: &'a Value, property: &str) -> &'a [Value] {
+    properties
         .get(property)
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice)

@@ -194,14 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location: set.location.clone(),
             expected_bucket_owner: set.expected_bucket_owner.clone(),
             status: set.status.clone(),
-            // An entity set always reports a tag map, EMPTY when nothing tagged it:
-            // `Tags` is a `TagMap`, so a client iterates it without a null guard.
-            tags: Some(
-                set.tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the set.
+            tags: crate::state::reported_tags(&set.tags),
             created_at: Some(::aws_smithy_types::DateTime::from_millis(
                 set.created_at_millis,
             )),

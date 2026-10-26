@@ -33,6 +33,17 @@
 //! created validation is `VALIDATING` until the transition the clock owes it falls due,
 //! exactly as a freshly created endpoint is `CREATING`.
 //!
+//! Beside them, one [`AcmeExternalAccountBindingRecord`] per external account binding an
+//! endpoint holds, keyed by its own ARN — which is, like a domain validation's, a PATH
+//! under the endpoint's ARN ([`acme_external_account_binding_arn`]), so one endpoint's
+//! bindings are a contiguous range
+//! ([`ComAmazonawsAcmCertificatemanagerState::acme_external_account_bindings_of`]) and
+//! deleting the endpoint drops them with it. `DescribeAcmeExternalAccountBinding`
+//! projects that record through [`acme_external_account_binding_detail`], and the
+//! credentials it carries — the key id an ACME client presents and the MAC key it signs
+//! with ([`mint_acme_external_account_binding_mac_key`]) — are minted when the binding is
+//! created and never rewritten, so every later read reports the same pair.
+//!
 //! Every URL those two records carry is minted here, on the Region's ACME enrollment
 //! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id as the first path
 //! segment ([`acme_endpoint_url`], [`acme_account_url`]) — and read back by
@@ -61,9 +72,11 @@ use crate::ops::types::{
     AcmCertificateMetadata, AcmeAccountSummary, AcmeDomainValidation, AcmeDomainValidationSummary,
     AcmeEndpoint,
     AcmeEndpointSummary,
+    AcmeExternalAccountBinding,
     CertificateAuthority,
     CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
     CertificateSummary, DistinguishedName, DnsPrevalidationDetails, DomainScope, DomainValidation,
+    Expiration,
     ExpiryEventsConfiguration,
     ExtendedKeyUsage, FailureDetails, GeneralName, HttpRedirect, KeyUsage, PrevalidationDetails,
     ResourceRecord, Tag, X509Attributes,
@@ -448,6 +461,60 @@ pub const ACME_DOMAIN_VALIDATION_LIMIT: usize = 500;
 /// [`ComAmazonawsAcmCertificatemanagerState::acme_domain_validations`] (nor the
 /// per-request `materialize_due` pass over those records).
 pub const ACME_DOMAIN_VALIDATION_STORE_LIMIT: usize = 10_000;
+
+/// The number of external account bindings one ACME endpoint may hold.
+///
+/// Neither the model nor ACM's documentation states this quota, so the NUMBER is
+/// chosen — generously, since a bound that is too low refuses a request ACM would
+/// accept. What it encodes is that an endpoint's bindings are a bounded resource and
+/// that past the bound `CreateAcmeExternalAccountBinding` answers the quota error it
+/// models, exactly as [`ACME_DOMAIN_VALIDATION_LIMIT`] does for the other resource an
+/// endpoint holds.
+pub const ACME_EXTERNAL_ACCOUNT_BINDING_LIMIT: usize = 500;
+
+/// The most ACME external-account-binding records this emulator stores, across every
+/// endpoint.
+///
+/// The safety bound, for the same reason [`ACME_DOMAIN_VALIDATION_STORE_LIMIT`] is one:
+/// the per-endpoint quota above is keyed on a parent the caller can create more of, so
+/// it alone would not bound
+/// [`ComAmazonawsAcmCertificatemanagerState::acme_external_account_bindings`].
+pub const ACME_EXTERNAL_ACCOUNT_BINDING_STORE_LIMIT: usize = 10_000;
+
+/// `TimeType=MINUTES`, as `Expiration$Type` spells the unit of a minute
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#TimeType")` declares
+/// `MINUTES | HOURS | DAYS`).
+pub const TIME_TYPE_MINUTES: &str = "MINUTES";
+
+/// `TimeType=HOURS`.
+pub const TIME_TYPE_HOURS: &str = "HOURS";
+
+/// `TimeType=DAYS`.
+pub const TIME_TYPE_DAYS: &str = "DAYS";
+
+/// The span one `Expiration` names, or `None` when it names none this clock can
+/// represent.
+///
+/// `Expiration` is a `Value` counted in a `Type` unit (`Expiration$Value` "the numeric
+/// value of the expiration", `$Type` "the time unit for the expiration value"), so the
+/// span is the product of the two and the instant a resource configured with it expires
+/// is that span after it was created. The unit set is [`TIME_TYPE_MINUTES`],
+/// [`TIME_TYPE_HOURS`] and [`TIME_TYPE_DAYS`]; the boundary validator has already
+/// refused any other `TimeType` and any `Value` below the member's `@range(min: 1)`
+/// before a handler runs, so a `None` here is a product no `SystemTime` can hold rather
+/// than a value a caller could correct.
+pub fn expiration_span(expiration: &Expiration) -> Option<Duration> {
+    let unit = match expiration.r#type.as_str() {
+        TIME_TYPE_MINUTES => 60,
+        TIME_TYPE_HOURS => 60 * 60,
+        TIME_TYPE_DAYS => 24 * 60 * 60,
+        _ => return None,
+    };
+    u64::try_from(expiration.value)
+        .ok()?
+        .checked_mul(unit)
+        .map(Duration::from_secs)
+}
 
 /// `AcmeAccountStatus` of a registered ACME account that may request and revoke
 /// certificates: the status an account carries until it is deactivated or revoked
@@ -1067,6 +1134,133 @@ pub struct AcmeDomainValidationIdempotency {
     pub acme_domain_validation_arn: String,
 }
 
+/// One stored ACME external account binding: the credentials "that authorize an ACME
+/// client to register an account with the endpoint", bound to "an IAM role that controls
+/// what certificate operations the ACME client can perform"
+/// (`CreateAcmeExternalAccountBinding` doc).
+///
+/// Every field `DescribeAcmeExternalAccountBinding` reports is read from here, so no
+/// response echoes its own request — including the credentials, which are minted by the
+/// service ([`mint_acme_external_account_binding_mac_key`]) and are not members of any
+/// request.
+#[derive(Clone)]
+pub struct AcmeExternalAccountBindingRecord {
+    /// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint>/acme-external-account-binding/<id>`
+    /// ([`acme_external_account_binding_arn`]).
+    pub arn: String,
+    /// The ACME endpoint this binding registers accounts with — the ARN prefix of
+    /// [`Self::arn`], carried so the record reports it without re-parsing.
+    pub acme_endpoint_arn: String,
+    /// "The Amazon Resource Name (ARN) of the IAM role associated with the external
+    /// account binding" (`AcmeExternalAccountBinding$RoleArn` doc), exactly as the create
+    /// named it.
+    pub role_arn: String,
+    /// The `kid` an ACME client presents in the external-account-binding JWS (RFC 8555
+    /// §7.3.4), as `GetAcmeExternalAccountBindingCredentials` reports it. Server-minted:
+    /// it is this binding's own id, so it is unique per binding, identical on every later
+    /// read and carries nothing the caller sent.
+    pub key_id: String,
+    /// The HMAC key that JWS is signed with, as
+    /// `GetAcmeExternalAccountBindingCredentials` reports it. Server-minted and
+    /// immutable: no request carries one, and nothing rewrites it once the binding
+    /// exists.
+    pub mac_key: String,
+    /// "The time at which the external account binding expires"
+    /// (`AcmeExternalAccountBinding$ExpiresAt` doc) — the span the create's `Expiration`
+    /// named after the instant it created the binding ([`expiration_span`]), and `None`
+    /// for a create that named no expiration.
+    pub expires_at: Option<SystemTime>,
+    /// "The time at which the external account binding was revoked" (`$RevokedAt` doc),
+    /// so it is set only for a binding that has been revoked.
+    pub revoked_at: Option<SystemTime>,
+    /// "The time at which the external account binding was last used" (`$LastUsedAt`
+    /// doc) — set when an ACME client registers an account with these credentials, and
+    /// `None` until one has.
+    pub last_used_at: Option<SystemTime>,
+    /// Tag key -> value on the binding resource itself, as `ListTagsForResource`
+    /// reports them.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+/// Written by hand rather than derived, so the MAC key cannot travel into a formatter:
+/// it is the secret an ACME client signs with, and a derived `Debug` would carry it into
+/// anything that renders this record or the store holding it.
+impl ::std::fmt::Debug for AcmeExternalAccountBindingRecord {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("AcmeExternalAccountBindingRecord")
+            .field("arn", &self.arn)
+            .field("acme_endpoint_arn", &self.acme_endpoint_arn)
+            .field("role_arn", &self.role_arn)
+            .field("key_id", &self.key_id)
+            .field("mac_key", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("revoked_at", &self.revoked_at)
+            .field("last_used_at", &self.last_used_at)
+            .field("tags", &self.tags)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// What one `CreateAcmeExternalAccountBinding` idempotency token has already created.
+#[derive(Debug, Clone)]
+pub struct AcmeExternalAccountBindingIdempotency {
+    /// A canonical rendering of every parameter the binding was created from, so a
+    /// re-sent token can be told apart from a changed request carrying the same token.
+    pub fingerprint: String,
+    /// The ARN the first call answered with.
+    pub acme_external_account_binding_arn: String,
+}
+
+/// The number of characters an external account binding's MAC key carries.
+///
+/// 44 characters of the base64 alphabet are the encoding of exactly 33 bytes
+/// (44 * 6 == 33 * 8), so the key needs no padding and has no trailing bits: a client
+/// that decodes it reads those 33 bytes back, and re-encoding them answers the same 44
+/// characters.
+pub const ACME_MAC_KEY_LEN: usize = 44;
+
+/// A fresh MAC key for one external account binding.
+///
+/// The value is a secret handed to an ACME client — it signs the external-account-binding
+/// JWS of its registration with it (RFC 8555 §7.3.4) — but it is NOT a credential of this
+/// emulator and must never be accepted as one. Nothing in a service may construct a
+/// secret itself, so the key material is cut from a secret minted by the one component
+/// that generates secrets, the emulator's credential store, which is then removed from
+/// that store again: the client gets the key, the emulator keeps no credential it would
+/// accept, and nothing accumulates per call.
+///
+/// Only the ASCII alphanumeric characters of that secret are kept, which are the
+/// characters the standard and URL-safe base64 alphabets SHARE (RFC 4648 §§4-5 differ
+/// only in the last two), so an ACME client decoding the key under either alphabet reads
+/// the same [`ACME_MAC_KEY_LEN`]-character encoding of the same key bytes.
+///
+/// `None` when the store minted no secret, or one with fewer than [`ACME_MAC_KEY_LEN`]
+/// usable characters, which leaves the operation to refuse rather than report a value it
+/// made up.
+pub fn mint_acme_external_account_binding_mac_key(
+    store: &::emulator_server::CredentialStore,
+) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let key: String = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(ACME_MAC_KEY_LEN)
+        .collect();
+    // The MAC key is not a credential of this emulator; see above. A store that could
+    // not drop the minted credential would leave one it DOES accept behind, whose secret
+    // this key was cut from, so that is a failure to mint rather than a key to hand over.
+    if store.delete(&minted.id).is_err() {
+        return None;
+    }
+    (key.chars().count() == ACME_MAC_KEY_LEN).then_some(key)
+}
+
 /// One ACME account registered with one of this account's ACME endpoints.
 ///
 /// "ACME accounts are created when clients use external account binding credentials
@@ -1182,6 +1376,17 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
     /// token indexes because the three resolve to different resources.
     pub acme_domain_validation_idempotency:
         HashMap<(String, String), AcmeDomainValidationIdempotency>,
+    /// ACME external-account-binding ARN -> record. A `BTreeMap`, and every binding's
+    /// ARN begins with its endpoint's ARN ([`acme_external_account_binding_arn`]), so one
+    /// endpoint's bindings are a contiguous range walked in one deterministic order
+    /// ([`Self::acme_external_account_bindings_of`]) — which is the order
+    /// `ListAcmeExternalAccountBindings` pages through.
+    pub acme_external_account_bindings: BTreeMap<String, AcmeExternalAccountBindingRecord>,
+    /// (ACME endpoint ARN, `CreateAcmeExternalAccountBinding` idempotency token) -> what
+    /// that token created, keyed by the PAIR for the same reason
+    /// [`Self::acme_domain_validation_idempotency`] is.
+    pub acme_external_account_binding_idempotency:
+        HashMap<(String, String), AcmeExternalAccountBindingIdempotency>,
     /// The account's expiry-events configuration, as the last successful
     /// `PutAccountConfiguration` wrote it, and `None` until one has — when ACM is
     /// running the account on the documented default,
@@ -1272,6 +1477,11 @@ impl ComAmazonawsAcmCertificatemanagerState {
                     .get(arn)
                     .map(|validation| &validation.tags)
             })
+            .or_else(|| {
+                self.acme_external_account_bindings
+                    .get(arn)
+                    .map(|binding| &binding.tags)
+            })
     }
 
     /// [`Self::resource_tags`] for a caller that writes the map.
@@ -1279,9 +1489,12 @@ impl ComAmazonawsAcmCertificatemanagerState {
         if let Some(endpoint) = self.acme_endpoints.get_mut(arn) {
             return Some(&mut endpoint.tags);
         }
-        self.acme_domain_validations
+        if let Some(validation) = self.acme_domain_validations.get_mut(arn) {
+            return Some(&mut validation.tags);
+        }
+        self.acme_external_account_bindings
             .get_mut(arn)
-            .map(|validation| &mut validation.tags)
+            .map(|binding| &mut binding.tags)
     }
 
     /// Drop `arn`'s ACME endpoint record and every idempotency token that resolves to
@@ -1306,6 +1519,15 @@ impl ComAmazonawsAcmCertificatemanagerState {
             .collect();
         for validation_arn in validations {
             self.remove_acme_domain_validation(&validation_arn);
+        }
+        // An external account binding registers accounts with ONE endpoint and its ARN is
+        // a path under that endpoint's, so it cannot outlive the endpoint either.
+        let bindings: Vec<String> = self
+            .acme_external_account_bindings_of(arn)
+            .map(|binding| binding.arn.clone())
+            .collect();
+        for binding_arn in bindings {
+            self.remove_acme_external_account_binding(&binding_arn);
         }
         Some(removed)
     }
@@ -1368,6 +1590,36 @@ impl ComAmazonawsAcmCertificatemanagerState {
             .range((acme_endpoint_arn.to_string(), String::new())..)
             .take_while(move |((endpoint_arn, _), _)| endpoint_arn == acme_endpoint_arn)
             .map(|(_, account)| account)
+    }
+
+    /// Every external account binding of `acme_endpoint_arn`, in the order
+    /// `ListAcmeExternalAccountBindings` pages through them (by binding ARN).
+    ///
+    /// A range scan over the key prefix every one of that endpoint's binding ARNs begins
+    /// with, so the walk touches only that endpoint's bindings however many other
+    /// endpoints the store holds.
+    pub fn acme_external_account_bindings_of<'a>(
+        &'a self,
+        acme_endpoint_arn: &'a str,
+    ) -> impl Iterator<Item = &'a AcmeExternalAccountBindingRecord> + 'a {
+        let prefix = acme_external_account_binding_arn_prefix(acme_endpoint_arn);
+        self.acme_external_account_bindings
+            .range(prefix.clone()..)
+            .take_while(move |(arn, _)| arn.starts_with(&prefix))
+            .map(|(_, binding)| binding)
+    }
+
+    /// Drop `arn`'s external-account-binding record and every idempotency token that
+    /// resolves to it, so a replayed `CreateAcmeExternalAccountBinding` can never answer
+    /// with an ARN that has no record behind it.
+    pub fn remove_acme_external_account_binding(
+        &mut self,
+        arn: &str,
+    ) -> Option<AcmeExternalAccountBindingRecord> {
+        let removed = self.acme_external_account_bindings.remove(arn)?;
+        self.acme_external_account_binding_idempotency
+            .retain(|_, seen| seen.acme_external_account_binding_arn != arn);
+        Some(removed)
     }
 
     /// Drop `arn`'s record and every idempotency entry that resolves to it, so a
@@ -1463,6 +1715,49 @@ pub fn acme_domain_validation_arn_prefix(acme_endpoint_arn: &str) -> String {
 /// sentence naming the requested ARN and terminated by a period.
 pub fn acme_domain_validation_not_found_message(acme_domain_validation_arn: &str) -> String {
     format!("Could not find ACME domain validation {acme_domain_validation_arn}.")
+}
+
+/// The `acme-external-account-binding` segment every ACME external-account-binding ARN
+/// carries between its endpoint's ARN and its own id, as
+/// `AcmeExternalAccountBindingArn`'s `@pattern` requires
+/// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+/acme-external-account-binding/[a-zA-Z0-9-]+$`).
+pub const ACME_EXTERNAL_ACCOUNT_BINDING_SEGMENT: &str = "acme-external-account-binding";
+
+/// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint>/acme-external-account-binding/<id>`.
+///
+/// Built by extending the ENDPOINT's own ARN, which is what the pattern above says the
+/// ARN of an external account binding is: a path under the endpoint it registers
+/// accounts with. So the two ARNs cannot disagree about the Region or the account, and
+/// the store keyed by this ARN groups one endpoint's bindings into one contiguous range
+/// ([`acme_external_account_binding_arn_prefix`]).
+pub fn acme_external_account_binding_arn(acme_endpoint_arn: &str, binding_id: &str) -> String {
+    format!(
+        "{}{binding_id}",
+        acme_external_account_binding_arn_prefix(acme_endpoint_arn)
+    )
+}
+
+/// The prefix every external-account-binding ARN of `acme_endpoint_arn` begins with, and
+/// nothing else does: the endpoint's ARN plus the
+/// [`ACME_EXTERNAL_ACCOUNT_BINDING_SEGMENT`] path. An endpoint id admits no `/`
+/// (`[a-zA-Z0-9-]+`), so one endpoint's prefix is never a prefix of another's.
+pub fn acme_external_account_binding_arn_prefix(acme_endpoint_arn: &str) -> String {
+    format!("{acme_endpoint_arn}/{ACME_EXTERNAL_ACCOUNT_BINDING_SEGMENT}/")
+}
+
+/// The `ResourceNotFoundException` message for an ACME external-account-binding ARN that
+/// no stored record answers to, built from the ARN the request asked for.
+///
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence follows the template every other
+/// lookup in this service renders ([`certificate_not_found_message`]): one complete
+/// sentence naming the requested ARN and terminated by a period.
+pub fn acme_external_account_binding_not_found_message(
+    acme_external_account_binding_arn: &str,
+) -> String {
+    format!(
+        "Could not find ACME external account binding {acme_external_account_binding_arn}."
+    )
 }
 
 /// The leading label of the host ACM serves its managed ACME endpoints on.
@@ -2652,6 +2947,32 @@ pub fn acme_domain_validation_summary(
         failure_details: detail.failure_details,
         created_at: detail.created_at,
         updated_at: detail.updated_at,
+    }
+}
+
+/// A stored ACME external account binding as
+/// `DescribeAcmeExternalAccountBinding`'s `AcmeExternalAccountBinding`.
+///
+/// Every member is read off the record. The three instant members exist only for a
+/// binding that has reached them: `ExpiresAt` for one the create gave an `Expiration`,
+/// `RevokedAt` only "the time at which the external account binding was revoked"
+/// (`AcmeExternalAccountBinding$RevokedAt` doc) and `LastUsedAt` only once an ACME client
+/// has registered with the binding's credentials ("the time at which the external
+/// account binding was last used", `$LastUsedAt` doc). The credentials themselves are
+/// NOT members of this shape: `GetAcmeExternalAccountBindingCredentials` is the operation
+/// that reports them.
+pub fn acme_external_account_binding_detail(
+    binding: &AcmeExternalAccountBindingRecord,
+) -> AcmeExternalAccountBinding {
+    AcmeExternalAccountBinding {
+        acme_external_account_binding_arn: Some(binding.arn.clone()),
+        acme_endpoint_arn: Some(binding.acme_endpoint_arn.clone()),
+        role_arn: Some(binding.role_arn.clone()),
+        expires_at: binding.expires_at.map(to_date_time),
+        revoked_at: binding.revoked_at.map(to_date_time),
+        last_used_at: binding.last_used_at.map(to_date_time),
+        created_at: Some(to_date_time(binding.created_at)),
+        updated_at: Some(to_date_time(binding.updated_at)),
     }
 }
 

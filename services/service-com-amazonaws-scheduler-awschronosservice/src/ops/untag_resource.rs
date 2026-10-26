@@ -49,7 +49,7 @@
 //! ## Input
 //!
 //! * `ResourceArn` (TagResourceArn, len 1..1011, pattern
-//!   ^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
+//!   ^arn:aws[a-z-]*:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$)
 //!   **required** — The Amazon Resource Name (ARN) of the schedule group from which you are
 //!   removing tags.
 //! * `TagKeys` (TagKeyList, len 0..200) **required** — The list of tag keys to remove from
@@ -151,18 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A reserved key cannot be removed any more than it can be set: AWS owns
-        // the `aws:` namespace, so a request naming one is refused before the
-        // resource is looked up.
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(input.tag_keys.iter().map(String::as_str))
-        {
+        // A reserved key cannot be removed any more than it can be set: the keys
+        // in that namespace are the service's own, so a request naming one is
+        // refused as a modification of system tags before the resource is looked
+        // up — in the same words TagResource refuses it with.
+        if crate::state::names_system_tag(input.tag_keys.iter().map(String::as_str)) {
             return Err(UntagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Tag key {reserved} is reserved: keys must not begin with {}.",
-                        crate::state::RESERVED_TAG_KEY_PREFIX
-                    ),
+                    message: crate::state::SYSTEM_TAG_REFUSAL_MESSAGE.to_string(),
                 },
             )
             .into());

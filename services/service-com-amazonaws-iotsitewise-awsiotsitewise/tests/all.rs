@@ -367,3 +367,10 @@ mod computation_model_data_binding_usages;
 #[path = "all/describe_workspace_reads.rs"]
 mod describe_workspace_reads;
 
+// Declared at the very end, after every suite above, for the reason the notes
+// higher up give: both stretches above are where every concurrent iotsitewise
+// change inserts a declaration of its own. Fold it into the sorted list once the
+// churn settles.
+#[path = "all/application_delete.rs"]
+mod application_delete;
+

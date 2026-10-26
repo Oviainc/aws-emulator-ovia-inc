@@ -3742,6 +3742,9 @@ pub const ADDONS_LISTING: &str = "addons";
 /// The scope `ListNodegroups`'s tokens carry, over one cluster's node group
 /// names. See [`CLUSTERS_LISTING`].
 pub const NODEGROUPS_LISTING: &str = "node-groups";
+/// The scope `ListCertificateAuthorities`'s tokens carry, over one cluster's
+/// certificate-authority ids. See [`CLUSTERS_LISTING`].
+pub const CERTIFICATE_AUTHORITIES_LISTING: &str = "certificate-authorities";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///

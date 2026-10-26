@@ -75,12 +75,24 @@
 //! than the gateway opening a connection of its own. An `AWS_PROXY` integration has no such
 //! answer, because an invocation is not a URI a client can fetch: it is answered the way
 //! API Gateway answers an integration that produced no response, `500`
-//! `{"message":"Internal Server Error"}`, with the reason logged. WHICH status each kind of
-//! backend FAULT maps to (a `503` on an integration timeout, a `500` on a handler
-//! exception, a `500` rather than a `502` on a malformed proxy response) is the open issue
-//! `20261023T151412Z-apigatewayv2-lambda-all-four-http-api-error-propagation.md`, and
-//! becomes observable once a function can run at all
-//! (`20261024T055421Z-lambda-opensearch-s3-lambda-invoke-cannot-execute-a-deployment-package-so.md`).
+//! `{"message":"Internal Server Error"}`, with the reason logged.
+//!
+//! That `500` is this data plane's mapping for the whole class "the integration produced no
+//! response", which is the class every backend fault an HTTP api can meet falls into — a
+//! handler that raised, a function the gateway may not invoke, a proxy response the gateway
+//! cannot map — and it is NOT the `502` the REST data plane answers for a malformed proxy
+//! response, nor the scaffold channel's `501`
+//! (`tests/all/http_api_integration_fault_status.rs` pins the mapping across the
+//! configurations and fault classes it holds for). The one class that maps elsewhere is an
+//! integration that RAN and did not answer within its `TimeoutInMillis`, which an HTTP api
+//! answers `503`: it needs a backend that actually ran, so it becomes reachable only once a
+//! deployment package can execute
+//! (`20261024T055421Z-lambda-opensearch-s3-lambda-invoke-cannot-execute-a-deployment-package-so.md`
+//! and `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`
+//! own the runtime, and
+//! `20261025T030504Z-apigatewayv2-lambda-an-aws-proxy-route-cannot-answer-200-until-a.md`
+//! the dispatch that maps a function's answer back onto the response). Nothing here times a
+//! call that was never made.
 //!
 //! Nor is a `REQUEST` authorizer's own ALLOW/DENY decision computed: that decision is the
 //! answer of the Lambda function its `AuthorizerUri` names, and no deployment package runs
@@ -810,9 +822,10 @@ fn authorization_refusal(
 ///   own `Invoke` has no in-process runtime for a deployment package), and no redirect can
 ///   stand in for it: an invocation is not a URI a client can fetch. It is answered the way
 ///   API Gateway answers an integration that produced no response, `500`
-///   `{"message":"Internal Server Error"}`, and the reason is logged so a developer reading
-///   the emulator's output learns which backend was not called. See the module docs for
-///   which open issue owns the fault-to-status mapping.
+///   `{"message":"Internal Server Error"}` — the status an HTTP api maps every integration
+///   fault to except an integration that overran its `TimeoutInMillis` — and the reason is
+///   logged so a developer reading the emulator's output learns which backend was not
+///   called. See the module docs for the whole mapping and for what the `503` class needs.
 ///
 /// A route that targets no integration, or one whose target names none this api holds, is
 /// the same `500` for a different reason: a route with nothing behind it cannot answer at

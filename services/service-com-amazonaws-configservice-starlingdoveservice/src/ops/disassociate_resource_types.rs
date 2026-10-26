@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResourceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResourceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResourceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes resource types from what one configuration recorder records, and answers the
+//! recorder as it now stands.
+//!
+//! The change is expressed in the recording strategy the recorder RECORDS UNDER, which
+//! is the ONE rule both this operation and `AssociateResourceTypes` apply
+//! ([`crate::state::change_recorded_resource_types`]): an inclusion group lists the
+//! types it records, an exclusion group lists the types it does not, and a recorder that
+//! records every supported type enumerates nothing — so there is no list to change and
+//! the request is refused 400 `ValidationException`, as is a request naming a type the
+//! recorder already does not record.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResourceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResourceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResourceTypes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let mut store = state.lock();
+
+        // `ConfigurationRecorderArn` names ONE recorder, so an ARN that matches none is
+        // the same failure a lookup by name answers, stated for the member the request
+        // carried.
+        let Some(recorder) = store
+            .recorders
+            .values_mut()
+            .find(|entry| entry.arn == input.configuration_recorder_arn)
+        else {
+            return Err(
+                DisassociateResourceTypesErrorModeled::NoSuchConfigurationRecorderException(
+                    NoSuchConfigurationRecorderException {
+                        message: Some(crate::state::no_such_configuration_recorder_message(
+                            crate::state::RecorderSelector::Arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The group is changed on a COPY and written back only once the change is
+        // accepted, so a refused request leaves the recorder recording exactly what it
+        // recorded before. A recorder stored without a recording group records what
+        // Config records by default, which is the group the rule judges it by.
+        let mut group = recorder
+            .recording_group
+            .clone()
+            .unwrap_or_else(crate::state::default_recording_group);
+        crate::state::change_recorded_resource_types(
+            &mut group,
+            crate::state::ResourceTypeAssociation::Disassociate,
+            &input.resource_types,
+        )
+        .map_err(|message| {
+            DisassociateResourceTypesError::from(
+                DisassociateResourceTypesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                }),
+            )
+        })?;
+        recorder.recording_group = Some(group);
+
+        // "Records configuration changes to the resource types in scope": the recorder
+        // as it now stands, read back out of the store that just took the change.
+        Ok(DisassociateResourceTypesOutput {
+            configuration_recorder: recorder.to_shape(),
+        })
     }
 }

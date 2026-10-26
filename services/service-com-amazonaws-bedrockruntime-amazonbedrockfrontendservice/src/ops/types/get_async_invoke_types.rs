@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-bedrockruntime-amazonbedrockfrontendservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockruntime#GetAsyncInvokeRequest")]
+// `invocationArn` is the reference this operation RESOLVES itself
+// (`crate::state::resolve_invocation_arn`), so its modelled constraints are not
+// checked at the request boundary: the recorded refusals answer an ARN's OWNER
+// (403) and its REGION before its form, which a boundary check of the member's
+// `@pattern` would pre-empt with a form refusal for every one of them.
+// `skip_validation` drops only this member's constraint traits; the member is
+// still required and still bound to the URI label.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.bedrockruntime#GetAsyncInvokeRequest",
+    skip_validation = ["invocationArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetAsyncInvokeInput {
     pub invocation_arn: String,

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `DomainName` record
+//! the `domainName` (and, for a private one, the `domainNameId`) addresses, in request
+//! order, and reports the patched record — the same one a later `GetDomainName` reads
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +144,331 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    edge_distribution_domain_name, invalid_patch_path, patch_enum_string, patch_optional_string,
+    patch_string_set, regional_endpoint_domain_name, DomainNameEntry, Patch, PatchFailure,
+    PatchOpKind, DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
+    MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE,
+    REGIONAL_ENDPOINT_TYPE,
+};
+// The edge-optimized endpoint type, under the name this file reads it by: the crate holds
+// that one value as the type a create takes when the request names none.
+use crate::state::DEFAULT_ENDPOINT_TYPE as EDGE_ENDPOINT_TYPE;
+
+// The `path` values `UpdateDomainName` accepts are the ones `apply_patch` below has an
+// arm for: one per updateable member of the `DomainName` shape, the
+// `mutualTlsAuthentication` and `endpointConfiguration` sub-members included.
+//
+// `domainName`, `domainNameId`, `domainNameArn`, `certificateUploadDate`,
+// `distributionDomainName`, `distributionHostedZoneId`, `regionalDomainName`,
+// `regionalHostedZoneId`, `domainNameStatus` and `domainNameStatusMessage` are the
+// SERVICE's own — the name and the id address the record, the ARN spells that address,
+// the endpoint names are assigned with the endpoint, and the status is the one the clock
+// owes — and `tags` are changed through `TagResource`/`UntagResource`, so none of them is
+// patchable.
+
+/// The endpoint types a stored record's configuration names.
+fn endpoint_types(entry: &DomainNameEntry) -> Vec<String> {
+    entry
+        .endpoint_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.types.clone())
+        .unwrap_or_default()
+}
+
+/// Apply one patch to a COPY of a stored domain name.
+fn apply_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        "certificateName" => {
+            patch_optional_string(&mut entry.certificate_name, patch, MAX_STRING_CHARS)
+        }
+        "certificateArn" => {
+            patch_optional_string(&mut entry.certificate_arn, patch, MAX_STRING_CHARS)?;
+            // `certificateUploadDate` is "the timestamp when the certificate that was
+            // used by edge-optimized endpoint or private endpoint for this domain name
+            // was uploaded". It therefore STAMPS the instant such a certificate is
+            // supplied — the rule the create stamps it by, applied to the certificate
+            // this patch supplies, for the endpoint types the member speaks of — and is
+            // always CLEARED with the certificate it dates, whatever endpoint the record
+            // is served by, so no record reports the upload date of a certificate it no
+            // longer carries.
+            entry.certificate_upload_date = match &entry.certificate_arn {
+                None => None,
+                Some(_)
+                    if endpoint_types(entry)
+                        .iter()
+                        .any(|kind| kind == EDGE_ENDPOINT_TYPE || kind == PRIVATE_ENDPOINT_TYPE) =>
+                {
+                    Some(crate::state::now())
+                }
+                Some(_) => entry.certificate_upload_date,
+            };
+            Ok(())
+        }
+        "regionalCertificateName" => {
+            patch_optional_string(&mut entry.regional_certificate_name, patch, MAX_STRING_CHARS)
+        }
+        "regionalCertificateArn" => {
+            patch_optional_string(&mut entry.regional_certificate_arn, patch, MAX_STRING_CHARS)
+        }
+        "ownershipVerificationCertificateArn" => patch_optional_string(
+            &mut entry.ownership_verification_certificate_arn,
+            patch,
+            MAX_STRING_CHARS,
+        ),
+        // A patch `value` is a bare string on the wire, so an enum-typed member's value
+        // set is checked here rather than by the boundary validator.
+        "securityPolicy" => {
+            patch_enum_string(&mut entry.security_policy, patch, SECURITY_POLICY_VALUES)
+        }
+        "endpointAccessMode" => patch_enum_string(
+            &mut entry.endpoint_access_mode,
+            patch,
+            ENDPOINT_ACCESS_MODE_VALUES,
+        ),
+        "routingMode" => patch_enum_string(&mut entry.routing_mode, patch, ROUTING_MODE_VALUES),
+        "policy" => patch_optional_string(&mut entry.policy, patch, MAX_POLICY_CHARS),
+        "managementPolicy" => {
+            patch_optional_string(&mut entry.management_policy, patch, MAX_POLICY_CHARS)
+        }
+        "mutualTlsAuthentication" => apply_mutual_tls_patch(entry, patch),
+        "endpointConfiguration" => apply_endpoint_patch(entry, patch),
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
+/// Apply one patch that reaches into the `mutualTlsAuthentication` structure.
+///
+/// `truststoreWarnings` is not among its patchable members: the warnings are what the
+/// service reports about the certificates in the truststore, not a setting a caller
+/// writes.
+fn apply_mutual_tls_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    let mut authentication = entry.mutual_tls_authentication.clone().unwrap_or_default();
+    // The structure's own members are addressed the way a top-level member is, with the
+    // `mutualTlsAuthentication` token dropped.
+    let nested = patch.rebased(1);
+    match nested.member() {
+        "truststoreUri" => {
+            patch_optional_string(&mut authentication.truststore_uri, &nested, MAX_STRING_CHARS)?;
+        }
+        "truststoreVersion" => {
+            patch_optional_string(
+                &mut authentication.truststore_version,
+                &nested,
+                MAX_STRING_CHARS,
+            )?;
+        }
+        _ => return Err(patch.unsupported_path()),
+    }
+    // A structure with no member set is no configuration at all: a record that carried no
+    // mutual TLS authentication and whose only patch CLEARED a member of it reports none,
+    // rather than an empty structure a create could never have stored.
+    entry.mutual_tls_authentication = (authentication.truststore_uri.is_some()
+        || authentication.truststore_version.is_some()
+        || authentication.truststore_warnings.is_some())
+    .then_some(authentication);
+    Ok(())
+}
+
+/// Apply one patch that reaches into the `endpointConfiguration` structure.
+fn apply_endpoint_patch(entry: &mut DomainNameEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    let mut configuration = entry.endpoint_configuration.clone().unwrap_or_default();
+    let nested = patch.rebased(1);
+    match nested.member() {
+        "types" => apply_endpoint_type_patch(&mut configuration, patch, &nested)?,
+        "vpcEndpointIds" => {
+            let vpc_endpoint_id = nested.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &vpc_endpoint_id, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            let mut ids = configuration.vpc_endpoint_ids.unwrap_or_default();
+            patch_string_set(&mut ids, &nested, &vpc_endpoint_id, MAX_COLLECTION_ENTRIES)?;
+            configuration.vpc_endpoint_ids = Some(ids);
+        }
+        "ipAddressType" => {
+            patch_enum_string(
+                &mut configuration.ip_address_type,
+                &nested,
+                IP_ADDRESS_TYPE_VALUES,
+            )?;
+        }
+        _ => return Err(patch.unsupported_path()),
+    }
+    entry.endpoint_configuration = Some(configuration);
+    Ok(())
+}
+
+/// Apply one patch of `endpointConfiguration.types`: the endpoint type the domain name is
+/// served by.
+///
+/// A custom domain name is reached at exactly ONE endpoint — the `types` member documents
+/// `EDGE` for "an edge-optimized API and its custom domain name", `REGIONAL` for a
+/// regional one and `PRIVATE` for a private one, and the endpoint members a record
+/// reports are that endpoint's — so the set is neither added to nor emptied here: the one
+/// type it holds is REPLACED, which is the migration from one endpoint type to another.
+/// The path may name the type being migrated from (`/endpointConfiguration/types/EDGE`)
+/// or the set itself; either way the op's `value` names the type being migrated to.
+///
+/// `PRIVATE` is not among the types that can be migrated to or from: a private custom
+/// domain name carries the `domainNameId` the create minted for it ("supported only for
+/// private custom domain names"), which is part of how the record is addressed, so
+/// changing a record's endpoint type across `PRIVATE` would change which record it is.
+fn apply_endpoint_type_patch(
+    configuration: &mut EndpointConfiguration,
+    patch: &Patch,
+    nested: &Patch,
+) -> Result<(), PatchFailure> {
+    if patch.op != PatchOpKind::Replace {
+        return Err(PatchFailure::BadRequest(format!(
+            "{} takes a replace of the endpoint type the custom domain name is served by, \
+             which is exactly one endpoint type",
+            patch.path
+        )));
+    }
+    let held = configuration.types.clone().unwrap_or_default();
+    // The reference token beyond `types`, when the path carries one, names the endpoint
+    // type being migrated FROM, so it must be the one the record is served by.
+    if let Some(migrated_from) = nested.tokens.get(1) {
+        if !held.iter().any(|kind| kind == migrated_from) {
+            return Err(PatchFailure::BadRequest(invalid_patch_path(&patch.path)));
+        }
+    }
+    let value = patch.require_value()?;
+    if !ENDPOINT_TYPE_VALUES.contains(&value) {
+        return Err(PatchFailure::BadRequest(format!(
+            "{} takes one of {}, got {value:?}",
+            patch.path,
+            ENDPOINT_TYPE_VALUES.join(", ")
+        )));
+    }
+    if value == PRIVATE_ENDPOINT_TYPE || held.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE) {
+        return Err(PatchFailure::BadRequest(format!(
+            "{} cannot migrate a custom domain name to or from the \
+             {PRIVATE_ENDPOINT_TYPE} endpoint type",
+            patch.path
+        )));
+    }
+    configuration.types = Some(vec![value.to_string()]);
+    Ok(())
+}
+
+/// Reassign the endpoint members of a record an update moved to another endpoint type.
+///
+/// The members a domain name reports are its endpoint's: an edge-optimized one is served
+/// by the CloudFront distribution API Gateway puts in front of it and a regional one by
+/// the Region's API Gateway endpoint, so the migrated record carries the names of the
+/// endpoint it is served by NOW and none of the one it left. The new endpoint's host label
+/// is minted from the store's own id bijection, as the create mints it, and stored, so
+/// every later read reports the same name. The migration itself is a transition the CLOCK
+/// owes: until it is due the record reports [`DOMAIN_NAME_UPDATING`], and
+/// `AVAILABLE` after it.
+fn migrate_endpoint(entry: &mut DomainNameEntry, endpoint_id: &str, region: &str) {
+    if endpoint_types(entry)
+        .iter()
+        .any(|kind| kind == REGIONAL_ENDPOINT_TYPE)
+    {
+        entry.regional_domain_name = Some(regional_endpoint_domain_name(endpoint_id, region));
+        entry.distribution_domain_name = None;
+        entry.distribution_hosted_zone_id = None;
+        // The upload date dates "the certificate that was used by edge-optimized endpoint
+        // or private endpoint", which a regional record is not served by, so the record
+        // the migration leaves behind reports none.
+        entry.certificate_upload_date = None;
+    } else {
+        entry.distribution_domain_name = Some(edge_distribution_domain_name(endpoint_id));
+        entry.distribution_hosted_zone_id = Some(EDGE_DISTRIBUTION_HOSTED_ZONE_ID.to_string());
+        entry.regional_domain_name = None;
+    }
+    // The record is no longer waiting for the endpoint it was created with: what it waits
+    // for now is this migration.
+    entry.available_at = None;
+    entry.updating_until = Some(::std::time::Instant::now() + DOMAIN_NAME_MIGRATION_SPAN);
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateDomainNameError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateDomainNameErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateDomainNameErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// The same `DomainName` body the create and the read report, as THIS operation's output
+/// shape.
+///
+/// All three shapes are the model's `DomainName` (`smithy_query(query="operation",
+/// operation="CreateDomainName,GetDomainName,UpdateDomainName")`: one output shape,
+/// generated once per operation), so the conversion is member for member and lives in ONE
+/// place — a member added to the modelled shape fails to compile here instead of being
+/// quietly dropped from the update's answer.
+impl From<CreateDomainNameOutput> for UpdateDomainNameOutput {
+    fn from(body: CreateDomainNameOutput) -> Self {
+        let CreateDomainNameOutput {
+            domain_name,
+            domain_name_id,
+            domain_name_arn,
+            certificate_name,
+            certificate_arn,
+            certificate_upload_date,
+            regional_domain_name,
+            regional_hosted_zone_id,
+            regional_certificate_name,
+            regional_certificate_arn,
+            distribution_domain_name,
+            distribution_hosted_zone_id,
+            endpoint_configuration,
+            domain_name_status,
+            domain_name_status_message,
+            security_policy,
+            endpoint_access_mode,
+            tags,
+            mutual_tls_authentication,
+            ownership_verification_certificate_arn,
+            management_policy,
+            policy,
+            routing_mode,
+        } = body;
+        Self {
+            domain_name,
+            domain_name_id,
+            domain_name_arn,
+            certificate_name,
+            certificate_arn,
+            certificate_upload_date,
+            regional_domain_name,
+            regional_hosted_zone_id,
+            regional_certificate_name,
+            regional_certificate_arn,
+            distribution_domain_name,
+            distribution_hosted_zone_id,
+            endpoint_configuration,
+            domain_name_status,
+            domain_name_status_message,
+            security_policy,
+            endpoint_access_mode,
+            tags,
+            mutual_tls_authentication,
+            ownership_verification_certificate_arn,
+            management_policy,
+            policy,
+            routing_mode,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -222,18 +542,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomainName"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+        let region = crate::state::request_region(ctx.parts());
+        // The two members together address one record: a `domainNameId` is "supported
+        // only for private custom domain names", and a private one needs it because
+        // several may carry one name. See `crate::state::domain_name_key`.
+        let key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+
+        let mut store = state.lock();
+        // Patched on a COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        let mut updated = store
+            .domain_names
+            .get(&key)
+            .ok_or_else(|| {
+                UpdateDomainNameErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+                })
+            })?
+            .clone();
+
+        // "If the status is UPDATING, the domain cannot be modified further until the
+        // existing operation is complete" (`DomainName$domainNameStatus`): a record whose
+        // endpoint migration is still running takes no further edit. API Gateway states no
+        // fixed sentence for that refusal, so it is built from the record it names.
+        if updated.status() == DOMAIN_NAME_UPDATING {
+            return Err(UpdateDomainNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The domain name {} is {DOMAIN_NAME_UPDATING} and cannot be \
+                         modified until the existing operation is complete",
+                        updated.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let served_by = endpoint_types(&updated);
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+        // An update that moved the record to another endpoint type migrates it to that
+        // endpoint, which is what assigns the endpoint names it reports from now on. The
+        // id the new endpoint's host label is minted from is taken only when there IS a
+        // migration, so an update that changes something else consumes none.
+        if endpoint_types(&updated) != served_by {
+            let endpoint_id = store.mint_id();
+            migrate_endpoint(&mut updated, &endpoint_id, &region);
+        }
+
+        // Reading the record back means what the caller is told is what a later
+        // `GetDomainName` will report, rendered by the one `DomainName` renderer the
+        // create and the read use.
+        store.domain_names.insert(key.clone(), updated);
+        let stored = store
+            .domain_names
+            .get(&key)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = Self::Output::from(CreateDomainNameOutput::from(stored));
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never a patch value or a certificate ARN.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?key,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "domain name updated",
+        );
+        Ok(output)
     }
 }

@@ -49,6 +49,8 @@ mod db_parameters;
 mod db_shard_groups;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
+#[path = "all/db_subnet_group_not_found_wording.rs"]
+mod db_subnet_group_not_found_wording;
 #[path = "all/db_subnet_group_resolution.rs"]
 mod db_subnet_group_resolution;
 #[path = "all/docdb_query_surface.rs"]

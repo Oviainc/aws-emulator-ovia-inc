@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: this operation removes one application from
+//! [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::applications`], so
+//! nothing can read it back afterwards: neither `DescribeApplication` nor the
+//! tagging operations, whose tag set lives on the record this call drops. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An application is addressed by the workspace it was created in AND its own id
+//! ("Deletes an application by ID"), so a workspace this store does not hold, and
+//! an id that resolves to no application of that workspace, are both the modelled
+//! not-found refusal, and a refused delete removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +150,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationError::Modeled(
+                DeleteApplicationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The delete is scoped to a workspace, so a workspace this store does not
+        // hold is the same absence every other workspace-scoped operation in this
+        // service reports, named as the workspace the request supplied.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+
+        // An application lives in the workspace its create named, and this operation
+        // addresses one by that workspace AND its id, so an id addressed from
+        // another workspace names no application this store holds — the same scoping
+        // `DescribeApplication` reads through. Resolved BEFORE anything is removed,
+        // so a refused delete leaves every stored application exactly as it was.
+        let holds = store
+            .applications
+            .get(&input.id)
+            .is_some_and(|record| record.workspace_name == input.workspace_name);
+        if !holds {
+            return Err(not_found(crate::state::RESOURCE_APPLICATION, &input.id));
+        }
+
+        // The application goes, its ARN and the tags that record owns with it: the
+        // tag set lives on the record, so dropping it is what makes the tagging
+        // operations stop resolving the application's ARN. An id that resolves to no
+        // stored application — never created, or already deleted — is the modelled
+        // 404 above rather than a silent success.
+        store.applications.remove(&input.id);
+
+        Ok(DeleteApplicationOutput {})
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the request
+/// addressed and the identifier it supplied, in the one wording every not-found
+/// refusal in this service carries.
+fn not_found(resource: &str, requested: &str) -> DeleteApplicationError {
+    DeleteApplicationError::Modeled(
+        DeleteApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        }),
+    )
 }

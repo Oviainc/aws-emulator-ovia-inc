@@ -7,16 +7,18 @@
 //! so nothing but persisted state carries information between calls.
 //!
 //! The rule under test: `SetSubscriptionAttributes` stores the new value of ONE
-//! documented attribute of the subscription its ARN names — accepting it only when the
-//! value satisfies the constraint SNS documents for that attribute AND the
-//! subscription's delivery protocol is one SNS documents the attribute for, clearing the
-//! attribute when the request carries no value, and refusing anything else with HTTP
-//! 400 / `InvalidParameter` (a subscription that does not exist: HTTP 404 / `NotFound`)
-//! without writing anything.
+//! documented attribute of the subscription its ARN names — accepting it when the value
+//! satisfies the constraint SNS documents for that attribute and, for the attributes the
+//! model scopes to a delivery protocol, the subscription delivers over one of those —
+//! holding the canonical form of the value (a flag in lower case, a delivery policy with
+//! its retry members filled in), clearing the attribute when the request carries no
+//! value, and refusing anything else with HTTP 400 / `InvalidParameter` (a subscription
+//! that does not exist: HTTP 404 / `NotFound`) without writing anything.
 //!
 //! The rows differ in attribute, value form (flag, enumerated word, policy document,
-//! ARN), delivery protocol and confirmation state, which is what the rule generalises
-//! over; the recorded `RawMessageDelivery` write is one row of it.
+//! ARN), the case the value arrived in, delivery protocol and confirmation state, which
+//! is what the rule generalises over; the recorded `RawMessageDelivery` write is one row
+//! of it.
 
 use std::collections::HashSet;
 
@@ -32,8 +34,43 @@ const FILTER_POLICY: &str = r#"{"kind":["alert"]}"#;
 /// A dead-letter queue, as the `RedrivePolicy` attribute names one.
 const REDRIVE_POLICY: &str = r#"{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}"#;
 
-/// A delivery policy that overrides one member of SNS's own.
-const DELIVERY_POLICY: &str = r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":7}}}"#;
+/// A delivery policy that overrides one retry member, in the shape a SUBSCRIPTION's
+/// `DeliveryPolicy` carries: the retry policy at the top level, as the document the
+/// `GetSubscriptionAttributesResponse$Attributes` doc calls "the JSON serialization of
+/// the subscription's delivery policy".
+const DELIVERY_POLICY: &str = r#"{"healthyRetryPolicy":{"numRetries":7}}"#;
+
+/// The same policy as SNS reports it BACK: the retry members the caller did not name
+/// filled from the account system defaults (numRetries 3, minDelayTarget and
+/// maxDelayTarget 20, backoffFunction linear — SNS Developer Guide, "Amazon SNS message
+/// delivery retries"), beside the members of the document a subscription has no value
+/// for.
+const NORMALIZED_DELIVERY_POLICY: &str = r#"{"healthyRetryPolicy":{
+    "minDelayTarget":20,"maxDelayTarget":20,"numRetries":7,"numMaxDelayRetries":0,
+    "numNoDelayRetries":0,"numMinDelayRetries":0,"backoffFunction":"linear"},
+    "sicklyRetryPolicy":null,"throttlePolicy":null,"guaranteed":false}"#;
+
+/// A delivery policy that names no retry member at all, and the document it reads back
+/// as: the member it does name is kept and the retry policy is the defaults whole.
+const THROTTLE_DELIVERY_POLICY: &str = r#"{"throttlePolicy":{"maxReceivesPerSecond":2}}"#;
+const NORMALIZED_THROTTLE_DELIVERY_POLICY: &str = r#"{"healthyRetryPolicy":{
+    "minDelayTarget":20,"maxDelayTarget":20,"numRetries":3,"numMaxDelayRetries":0,
+    "numNoDelayRetries":0,"numMinDelayRetries":0,"backoffFunction":"linear"},
+    "sicklyRetryPolicy":null,"throttlePolicy":{"maxReceivesPerSecond":2},
+    "guaranteed":false}"#;
+
+/// Whether the attribute value SNS reported is the one expected: the same DOCUMENT when
+/// both are JSON, because the order a policy's members serialize in is not part of its
+/// meaning, and the same text otherwise.
+fn same_value(reported: &str, expected: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(reported),
+        serde_json::from_str::<serde_json::Value>(expected),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => reported == expected,
+    }
+}
 
 /// An endpoint of the documented form for `protocol`
 /// (`SubscribeInput$Endpoint` doc), so a row names only the protocol it varies.
@@ -62,22 +99,25 @@ async fn set(sns: &Sns, arn: &str, name: &str, value: Option<&str>) -> Answer {
     sns.call("SetSubscriptionAttributes", &params).await
 }
 
-/// One accepted write: the case, the subscription's protocol, the attribute and the
-/// value set on it.
-type WriteCase<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// One accepted write: the case, the subscription's protocol, the attribute, the value
+/// set on it and the value the read reports back (the canonical form of what was
+/// written: a flag in lower case, a delivery policy normalized).
+type WriteCase<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
 
 /// One refused write: the case, the subscription's protocol, the attribute and the
 /// value.
 type RefusalCase<'a> = (&'a str, &'a str, &'a str, &'a str);
 
 /// A write of a documented attribute with a documented value persists it, the read
-/// reports exactly it, a repeat is idempotent, and a request carrying no value clears
-/// the attribute — leaving the subscription reporting what it reported before the write.
+/// reports the canonical form of it, a repeat is idempotent, and a request carrying no
+/// value clears the attribute — leaving the subscription reporting what it reported
+/// before the write.
 ///
 /// The attribute names are the catalog of
 /// `SetSubscriptionAttributesInput$AttributeName` (the crate's
 /// `SUBSCRIPTION_ATTRIBUTE_NAMES`, asserted covered below); the values are the forms
-/// that doc gives for each.
+/// that doc gives for each, in the cases SNS accepts them in — a flag in either case, a
+/// delivery policy naming as few of its members as the caller likes.
 #[tokio::test]
 async fn setting_a_documented_subscription_attribute_persists_and_round_trips() {
     let sns = Sns::new();
@@ -87,11 +127,36 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "sqs",
             "RawMessageDelivery",
             "true",
+            "true",
         ),
         (
             "raw delivery enabled on an https subscription",
             "https",
             "RawMessageDelivery",
+            "true",
+            "true",
+        ),
+        (
+            "raw delivery enabled on a firehose subscription",
+            "firehose",
+            "RawMessageDelivery",
+            "true",
+            "true",
+        ),
+        // A flag is a boolean carried as a word, so the word is read in any case and
+        // reported in the canonical one.
+        (
+            "raw delivery enabled in capitals",
+            "sqs",
+            "RawMessageDelivery",
+            "TRUE",
+            "true",
+        ),
+        (
+            "raw delivery enabled in mixed case",
+            "https",
+            "RawMessageDelivery",
+            "True",
             "true",
         ),
         (
@@ -99,11 +164,20 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "lambda",
             "RawMessageDelivery",
             "false",
+            "false",
+        ),
+        (
+            "raw delivery disabled in capitals",
+            "sqs",
+            "RawMessageDelivery",
+            "FALSE",
+            "false",
         ),
         (
             "a filter policy on a lambda subscription",
             "lambda",
             "FilterPolicy",
+            FILTER_POLICY,
             FILTER_POLICY,
         ),
         (
@@ -111,11 +185,13 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "sqs",
             "FilterPolicy",
             r#"{"kind":["alert"],"severity":["high","critical"]}"#,
+            r#"{"kind":["alert"],"severity":["high","critical"]}"#,
         ),
         (
             "a filter policy on an email subscription awaiting confirmation",
             "email",
             "FilterPolicy",
+            FILTER_POLICY,
             FILTER_POLICY,
         ),
         (
@@ -123,11 +199,13 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "application",
             "FilterPolicy",
             FILTER_POLICY,
+            FILTER_POLICY,
         ),
         (
             "the message-body filtering scope",
             "sqs",
             "FilterPolicyScope",
+            "MessageBody",
             "MessageBody",
         ),
         (
@@ -135,23 +213,50 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "sqs",
             "FilterPolicyScope",
             "MessageAttributes",
+            "MessageAttributes",
         ),
+        // A delivery policy is a document every subscription carries, whatever it
+        // delivers over, and it reads back with its retry members filled in.
         (
             "a delivery policy on an https subscription",
             "https",
             "DeliveryPolicy",
             DELIVERY_POLICY,
+            NORMALIZED_DELIVERY_POLICY,
+        ),
+        (
+            "a delivery policy on an sqs subscription",
+            "sqs",
+            "DeliveryPolicy",
+            DELIVERY_POLICY,
+            NORMALIZED_DELIVERY_POLICY,
+        ),
+        (
+            "a delivery policy on a lambda subscription",
+            "lambda",
+            "DeliveryPolicy",
+            DELIVERY_POLICY,
+            NORMALIZED_DELIVERY_POLICY,
+        ),
+        (
+            "a delivery policy naming no retry member at all",
+            "sqs",
+            "DeliveryPolicy",
+            THROTTLE_DELIVERY_POLICY,
+            NORMALIZED_THROTTLE_DELIVERY_POLICY,
         ),
         (
             "a delivery policy on an http subscription",
             "http",
             "DeliveryPolicy",
             DELIVERY_POLICY,
+            NORMALIZED_DELIVERY_POLICY,
         ),
         (
             "a dead-letter queue on a lambda subscription",
             "lambda",
             "RedrivePolicy",
+            REDRIVE_POLICY,
             REDRIVE_POLICY,
         ),
         (
@@ -159,11 +264,13 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "sms",
             "RedrivePolicy",
             REDRIVE_POLICY,
+            REDRIVE_POLICY,
         ),
         (
             "a replay policy on an sqs subscription",
             "sqs",
             "ReplayPolicy",
+            r#"{"PointType":"Timestamp","StartingPoint":"2026-01-01T00:00:00Z"}"#,
             r#"{"PointType":"Timestamp","StartingPoint":"2026-01-01T00:00:00Z"}"#,
         ),
         (
@@ -171,11 +278,12 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
             "firehose",
             "SubscriptionRoleArn",
             "arn:aws:iam::000000000000:role/sns-firehose",
+            "arn:aws:iam::000000000000:role/sns-firehose",
         ),
     ];
 
     // Every settable attribute SNS defines is a row of the table above.
-    let covered: HashSet<&str> = cases.iter().map(|(_, _, name, _)| *name).collect();
+    let covered: HashSet<&str> = cases.iter().map(|(_, _, name, _, _)| *name).collect();
     for name in SUBSCRIPTION_ATTRIBUTE_NAMES {
         assert!(
             covered.contains(name),
@@ -183,7 +291,7 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
         );
     }
 
-    for (index, (case, protocol, name, value)) in cases.iter().enumerate() {
+    for (index, (case, protocol, name, value, reads_back)) in cases.iter().enumerate() {
         let topic = sns.topic(&format!("set-sub-attr-{index:02}")).await;
         let arn = subscribe(
             &sns,
@@ -205,10 +313,10 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
 
         let written = read(&sns, case, &arn).await;
         let held = attribute_map(&written);
-        assert_eq!(
-            held.get(*name).map(String::as_str),
-            Some(*value),
-            "case {case:?}: {name} must report the value just set, got {held:?}"
+        let reported = held.get(*name).cloned().unwrap_or_default();
+        assert!(
+            same_value(&reported, reads_back),
+            "case {case:?}: {name} must report {reads_back:?}, got {reported:?}"
         );
         // A filter policy is applied under a scope, so a policy set with no explicit
         // scope is reported with the documented default.
@@ -266,10 +374,9 @@ async fn setting_a_documented_subscription_attribute_persists_and_round_trips() 
 /// for the subscription's delivery protocol, is refused with HTTP 400 /
 /// `InvalidParameter` — and nothing is written.
 ///
-/// The protocol rows come from the doc's own scoping: raw message delivery is enabled
-/// "to Amazon SQS or HTTP/S endpoints", a delivery policy governs "failed deliveries to
-/// HTTP/S endpoints", and `SubscriptionRoleArn` "applies only to Amazon Data Firehose
-/// delivery stream subscriptions"
+/// The protocol rows come from the scoping the model states: raw message delivery is
+/// asked for on the endpoints that take bare message bodies, and `SubscriptionRoleArn`
+/// "applies only to Amazon Data Firehose delivery stream subscriptions"
 /// (`SetSubscriptionAttributesInput$AttributeName` doc).
 #[tokio::test]
 async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
@@ -287,11 +394,11 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
         ),
         ("a topic attribute", "sqs", "DisplayName", "orders"),
         ("the owning account", "sqs", "Owner", "000000000000"),
-        // A flag takes the two words and nothing else.
-        ("raw delivery in capitals", "sqs", "RawMessageDelivery", "TRUE"),
+        // A flag takes the two words, in any case, and nothing else.
         ("raw delivery as a word of its own", "sqs", "RawMessageDelivery", "yes"),
         ("raw delivery as a number", "sqs", "RawMessageDelivery", "1"),
-        // Raw delivery is enabled for Amazon SQS and HTTP/S endpoints alone — the
+        // Raw delivery is asked for on the endpoints that take the bare bodies — a
+        // queue, an HTTP/S endpoint, a delivery stream — and refused on the rest; the
         // recorded case is the lambda row.
         (
             "raw delivery on a lambda subscription",
@@ -301,12 +408,6 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
         ),
         ("raw delivery on an email subscription", "email", "RawMessageDelivery", "true"),
         ("raw delivery on an sms subscription", "sms", "RawMessageDelivery", "true"),
-        (
-            "raw delivery on a firehose subscription",
-            "firehose",
-            "RawMessageDelivery",
-            "true",
-        ),
         (
             "raw delivery on an application subscription",
             "application",
@@ -320,21 +421,21 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
         // The filtering scope is one of two words.
         ("a filtering scope that is not one of the two", "sqs", "FilterPolicyScope", "MessageBodies"),
         ("a filtering scope in the wrong case", "sqs", "FilterPolicyScope", "messagebody"),
-        // A delivery policy has to be a document the effective policy can be computed
-        // from, and governs HTTP/S endpoints alone.
+        // A delivery policy has to be a document the stored, normalized policy can be
+        // computed from — whichever protocol the subscription delivers over.
         ("a delivery policy that is a bare number", "https", "DeliveryPolicy", "7"),
+        ("a delivery policy that is a list", "sqs", "DeliveryPolicy", "[]"),
         (
             "a delivery policy whose member is of the wrong type",
             "https",
             "DeliveryPolicy",
-            r#"{"http":{"defaultHealthyRetryPolicy":{"numRetries":"many"}}}"#,
+            r#"{"healthyRetryPolicy":{"numRetries":"many"}}"#,
         ),
-        ("a delivery policy on an sqs subscription", "sqs", "DeliveryPolicy", DELIVERY_POLICY),
         (
-            "a delivery policy on a lambda subscription",
-            "lambda",
+            "a delivery policy whose retry policy is not a document",
+            "sqs",
             "DeliveryPolicy",
-            DELIVERY_POLICY,
+            r#"{"healthyRetryPolicy":7}"#,
         ),
         // A redrive policy names an Amazon SQS dead-letter queue.
         ("a redrive policy naming no queue", "sqs", "RedrivePolicy", "{}"),
@@ -422,9 +523,9 @@ async fn setting_a_subscription_attribute_sns_does_not_accept_is_refused() {
 /// The rows differ in the protocol refused, the attribute and so the feature, and the
 /// writing operation, which is what the rule generalises over; the recorded
 /// `RawMessageDelivery` write on a `lambda` subscription is one row of it. The feature
-/// phrase per attribute comes from the doc's scoping sentences quoted on the crate's
-/// `RAW_MESSAGE_DELIVERY_PROTOCOLS`, `DELIVERY_POLICY_PROTOCOLS` and
-/// `SUBSCRIPTION_ROLE_ARN_PROTOCOLS`.
+/// phrase per attribute comes from the scoping sentences quoted on the crate's
+/// `RAW_MESSAGE_DELIVERY_PROTOCOLS` and `SUBSCRIPTION_ROLE_ARN_PROTOCOLS` — the two
+/// attributes the model scopes to a protocol.
 #[tokio::test]
 async fn a_protocol_scoped_attribute_is_refused_with_the_whole_sentence() {
     let sns = Sns::new();
@@ -459,32 +560,20 @@ async fn a_protocol_scoped_attribute_is_refused_with_the_whole_sentence() {
             "raw message delivery",
         ),
         (
-            "raw delivery on a firehose subscription",
-            "firehose",
-            "RawMessageDelivery",
-            "true",
-            "raw message delivery",
-        ),
-        (
             "raw delivery on an application subscription",
             "application",
             "RawMessageDelivery",
             "true",
             "raw message delivery",
         ),
+        // The case the flag arrived in does not change the sentence: it is the
+        // subscription that refuses the attribute, not its value.
         (
-            "a delivery policy on an sqs subscription",
-            "sqs",
-            "DeliveryPolicy",
-            DELIVERY_POLICY,
-            "a delivery policy",
-        ),
-        (
-            "a delivery policy on an application subscription",
-            "application",
-            "DeliveryPolicy",
-            DELIVERY_POLICY,
-            "a delivery policy",
+            "raw delivery in capitals on a lambda subscription",
+            "lambda",
+            "RawMessageDelivery",
+            "TRUE",
+            "raw message delivery",
         ),
         (
             "a subscription role on an https subscription",
@@ -688,6 +777,34 @@ async fn subscribe_holds_its_attributes_to_the_same_rules() {
             "lambda",
             "SubscriptionRoleArn",
             "arn:aws:iam::000000000000:role/sns-firehose",
+            false,
+        ),
+        (
+            "raw delivery in capitals on an sqs subscription",
+            "sqs",
+            "RawMessageDelivery",
+            "TRUE",
+            true,
+        ),
+        (
+            "raw delivery on a firehose subscription",
+            "firehose",
+            "RawMessageDelivery",
+            "true",
+            true,
+        ),
+        (
+            "a delivery policy on an sqs subscription",
+            "sqs",
+            "DeliveryPolicy",
+            DELIVERY_POLICY,
+            true,
+        ),
+        (
+            "a delivery policy that is a bare number",
+            "sqs",
+            "DeliveryPolicy",
+            "7",
             false,
         ),
     ];

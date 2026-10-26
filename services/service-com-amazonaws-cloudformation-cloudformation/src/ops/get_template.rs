@@ -266,10 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A stack a `CREATE` change set created carries no template until that change set
         // is executed, and "if the template doesn't exist, a ValidationError is returned".
         let template_body = stack.template_body.clone().ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(format!(
-                "Template does not exist for stack [{name_or_id}] in {} state",
-                stack.status
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::template_does_not_exist(name_or_id, &stack.status),
+            )
         })?;
 
         // The one processed stage this read has: bound ONCE, so the stage advertised and

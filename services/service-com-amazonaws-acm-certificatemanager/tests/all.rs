@@ -31,6 +31,8 @@ mod acme_endpoint_lifecycle;
 mod acme_endpoint_list;
 #[path = "all/acme_endpoint_update.rs"]
 mod acme_endpoint_update;
+#[path = "all/acme_external_account_binding_lifecycle.rs"]
+mod acme_external_account_binding_lifecycle;
 #[path = "all/acme_surface_wire_values.rs"]
 mod acme_surface_wire_values;
 #[path = "all/certificate_detail_projection.rs"]

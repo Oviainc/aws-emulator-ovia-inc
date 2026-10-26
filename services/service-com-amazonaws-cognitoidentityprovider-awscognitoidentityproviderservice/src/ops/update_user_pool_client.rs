@@ -325,6 +325,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
 
+        // An app client configured for machine-to-machine authorization carries
+        // ONE authentication flow: `ALLOW_CLIENT_TOKEN_AUTH` "is mutually
+        // exclusive with user authentication flows" (`GetClientToken` in this
+        // service's model). The rule lives in `state.rs` so this path and the
+        // create path enforce the same one, and it is asked BEFORE anything is
+        // stored, so a refused update leaves the app client as it was. A request
+        // whose parameters contradict themselves is a parameter error whatever
+        // resource it names, so this precedes the pool and client lookup, the way
+        // the framework's own constraint checks precede this handler at all.
+        if let Some(message) = input
+            .explicit_auth_flows
+            .as_deref()
+            .and_then(crate::state::exclusive_auth_flow_violation)
+        {
+            return Err(invalid_parameter(message.to_string()));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let pool = guard
@@ -410,6 +427,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolClientError {
     UpdateUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> UpdateUserPoolClientError {
+    UpdateUserPoolClientErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
     })
     .into()
 }
