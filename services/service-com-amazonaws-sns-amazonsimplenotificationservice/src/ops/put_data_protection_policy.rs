@@ -64,10 +64,18 @@
 //! * `InvalidSecurityException` (HTTP 403) — The credential signature isn't valid. You must
 //!   use an HTTPS endpoint and sign your request using Signature Version 4.
 //! * `NotFoundException` (HTTP 404) — Indicates that the requested resource does not exist.
+//!
+//! ## The refusal this operation actually answers
+//!
+//! None of the errors above: SNS message data protection is no longer available to new
+//! customers (the sentence the model opens this operation's own documentation with), so
+//! the regional endpoints do not serve this action, and the refusal comes from the
+//! action gate in front of the service rather than from the service's own model — HTTP
+//! 400 with the awsQuery code `InvalidAction`. The gate is why the modelled errors below
+//! are unreachable here: no payload ever gets past it to be judged.
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -99,6 +107,13 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutDataProtectionPolicyO
 // here — hence the `PutDataProtectionPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// NONE of these variants is reachable from this operation's handler, and that is not
+// an omission: the action gate below refuses the call before the service judges the
+// request, so there is no path on which the service's own errors could be raised. The
+// enum stays because the generated `impl Operation` names this operation's error
+// channel and `#[operation_error]` is what produces it — not because a write path is
+// waiting to be restored here.
 #[smithy_macros::operation_error("com.amazonaws.sns#PutDataProtectionPolicy")]
 #[derive(Debug)]
 pub enum PutDataProtectionPolicyErrorModeled {
@@ -109,10 +124,165 @@ pub enum PutDataProtectionPolicyErrorModeled {
     NotFoundException(NotFoundException),
 }
 
+/// The `message` member of the action gate's refusal, named `Message` on the wire
+/// the way the awsQuery error envelope spells it — the same member spelling
+/// `crate::scaffolded`'s synthetic shapes use.
+static UNSUPPORTED_OPERATION_MESSAGE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#UnsupportedOperation$message",
+            "smithy.framework",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    )
+    .with_xml_name("Message");
+
+/// Schema for the refusal the action gate answers with.
+///
+/// RECORDED behaviour, not modelled: no shape of this name is in the model, and the
+/// refusal's code is not one of this operation's modelled errors either — it is the
+/// front door's answer for an action the regional endpoint does not serve, raised
+/// before the service looks at the request at all. Deliberately in the
+/// `smithy.framework` namespace, as `crate::scaffolded`'s synthetic shapes are, so it
+/// cannot collide with a modelled shape; the wire `<Code>` comes from
+/// [`PutDataProtectionPolicyError::shape_name`], not from here.
+static UNSUPPORTED_OPERATION_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "smithy.framework#UnsupportedOperation",
+            "smithy.framework",
+            "UnsupportedOperation",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&UNSUPPORTED_OPERATION_MESSAGE],
+    );
+
+/// The wire error code the query protocols name an action the endpoint does not serve
+/// by. It is a property of the ACTION GATE, not of this operation's model, which is
+/// why it is a literal here rather than a variant of the generated error enum.
+const UNSUPPORTED_OPERATION_CODE: &str = "InvalidAction";
+
+/// The HTTP status the action gate answers with. The query protocols have no 404
+/// semantics — an action they do not serve is a bad request, like any other value of
+/// the `Action` field they cannot honour.
+const UNSUPPORTED_OPERATION_STATUS: u16 = 400;
+
+/// The refusal of an operation the service's regional endpoints no longer serve.
+///
+/// The sentence is fixed except for the parenthesised operation name, which is the
+/// operation the request named: nothing in it comes from the account, the resource or
+/// the clock.
+#[derive(Debug, Clone)]
+pub struct UnsupportedOperation {
+    pub message: String,
+}
+
+impl UnsupportedOperation {
+    /// The refusal naming `operation`.
+    pub fn new(operation: &str) -> Self {
+        Self {
+            message: format!("Operation ({operation}) is not supported in this region"),
+        }
+    }
+}
+
+impl ::std::fmt::Display for UnsupportedOperation {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "{UNSUPPORTED_OPERATION_CODE}: {}", self.message)
+    }
+}
+
+impl ::std::error::Error for UnsupportedOperation {}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UnsupportedOperation {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&UNSUPPORTED_OPERATION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::put_data_protection_policy::PutDataProtectionPolicyError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type PutDataProtectionPolicyError = crate::scaffolded::Scaffolded<PutDataProtectionPolicyErrorModeled>;
+/// (`crate::ops::put_data_protection_policy::PutDataProtectionPolicyError`).
+///
+/// Two channels, not one: the scaffold wrapper (this operation's modelled errors, plus
+/// the 501 and the refusal a handler needs for something its model cannot express), and
+/// the action gate's [`UnsupportedOperation`], which is neither a modelled error of
+/// this operation nor a framework signal.
+#[derive(Debug)]
+pub enum PutDataProtectionPolicyError {
+    /// A modelled error, the scaffold 501, or a handler refusal.
+    Scaffolded(crate::scaffolded::Scaffolded<PutDataProtectionPolicyErrorModeled>),
+    /// The action gate's refusal of an operation this endpoint does not serve.
+    Unsupported(UnsupportedOperation),
+}
+
+impl ::std::fmt::Display for PutDataProtectionPolicyError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::Unsupported(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for PutDataProtectionPolicyError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::Unsupported(error) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the channel the active variant belongs to, so the scaffold
+/// wrapper keeps rendering exactly as it does for every other operation and only the
+/// gate's variant answers its own code and status.
+impl smithy_server_runtime::OperationError for PutDataProtectionPolicyError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::Unsupported(error) => error,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::Unsupported(_) => &UNSUPPORTED_OPERATION_SCHEMA,
+        }
+    }
+
+    /// The wire error code (the awsQuery `<Code>` element). Keep the literal as it is:
+    /// it is what a client branches on.
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::Unsupported(_) => UNSUPPORTED_OPERATION_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::Unsupported(_) => UNSUPPORTED_OPERATION_STATUS,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            // No `awsQueryError` trait to honour: the shape is in no model, so the
+            // `<Code>` falls back to [`Self::shape_name`], which is the gate's code.
+            Self::Unsupported(_) => None,
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -120,7 +290,16 @@ pub type PutDataProtectionPolicyError = crate::scaffolded::Scaffolded<PutDataPro
 /// this operation is implemented.
 impl From<PutDataProtectionPolicyErrorModeled> for PutDataProtectionPolicyError {
     fn from(modeled: PutDataProtectionPolicyErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<PutDataProtectionPolicyErrorModeled>>
+    for PutDataProtectionPolicyError
+{
+    fn from(scaffolded: crate::scaffolded::Scaffolded<PutDataProtectionPolicyErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -157,72 +336,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
-        // not an ARN at all is bad input, not a topic that does not exist. Only the
-        // SHAPE is judged here — the same rule `GetDataProtectionPolicy` holds its own
-        // `ResourceArn` to, because this member is modelled as a `topicARN` too. An
-        // ARN-shaped value that names no topic of this account is left to the lookup
-        // below, which is this operation's modelled miss.
-        if let Some(message) = state::arn_refusal("ResourceArn", &input.resource_arn) {
-            return Err(
-                PutDataProtectionPolicyErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // The document's one documented bound, held through the shared rule every write
-        // of a topic's data protection policy uses, so this write and the one
-        // `CreateTopic` carries cannot disagree about which documents fit. The model
-        // declares no constraint on the member, so the boundary validator does not judge
-        // it and the handler has to.
-        if let Some(message) = state::data_protection_policy_refusal(&input.data_protection_policy)
-        {
-            return Err(
-                PutDataProtectionPolicyErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let Some(store) = state::service_state(&*self.engine) else {
-            return Err(PutDataProtectionPolicyErrorModeled::InternalErrorException(
-                InternalErrorException {
-                    message: Some("the SNS store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let mut store = store.lock();
-
-        // The policy is held BY the topic, so an ARN this account holds no topic under
-        // has nothing to write it to — the same 404 every other call that looks a topic
-        // up answers, and the store is left untouched on that path.
-        let Some(topic) = store.topics.get_mut(&input.resource_arn) else {
-            return Err(PutDataProtectionPolicyErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
-                },
-            )
-            .into());
-        };
-
-        // "Adds or updates an inline policy document that is stored in the specified
-        // Amazon SNS topic": the document the request carries REPLACES whatever the topic
-        // held, byte for byte, so a later read reports the LAST write — including the
-        // empty document, which is one a caller chose rather than an absent one.
-        topic.data_protection_policy = Some(input.data_protection_policy);
-
-        // The modelled output is `Unit`: the acknowledgement is the 200 itself.
-        Ok(PutDataProtectionPolicyOutput)
+        // The ACTION GATE, and the whole of this handler: Amazon SNS message data
+        // protection is no longer available to new customers (this operation's own doc
+        // says so), so the regional endpoints do not serve this action at all. The gate
+        // sits in front of the service, so it refuses the call before anything about the
+        // request is examined — the `ResourceArn`'s shape, whether it names a topic of
+        // this account, the document's length and whether the document is even parseable
+        // JSON all make no difference, and every one of them is answered with this one
+        // refusal rather than with a payload-specific modelled error.
+        //
+        // Nothing is read and nothing is written: the request's members are never
+        // looked at (hence `_input`) and the store is never reached, so the topic the
+        // request named acquires no policy. The engine is bound only because this
+        // operation owns it through the constructor seam every operation shares. The
+        // READ path (`GetDataProtectionPolicy`) is served and is not gated, so a topic
+        // that never acquired a document keeps reporting an empty one.
+        let _ = &self.engine;
+        Err(PutDataProtectionPolicyError::Unsupported(
+            UnsupportedOperation::new(Self::NAME),
+        ))
     }
 }

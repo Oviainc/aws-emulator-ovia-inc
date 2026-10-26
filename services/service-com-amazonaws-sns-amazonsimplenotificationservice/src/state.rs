@@ -141,10 +141,9 @@ pub const MAX_DATA_PROTECTION_POLICY_LEN: usize = 30_720;
 /// The message a `DataProtectionPolicy` past [`MAX_DATA_PROTECTION_POLICY_LEN`] is
 /// refused with, or `None` when the document fits.
 ///
-/// Shared by every operation that WRITES a topic's inline data protection policy, so
-/// the one documented bound is the same whichever call carried the document: a
-/// document one write path accepts cannot be one the other refuses. The sentence names
-/// the member, the bound and the length sent, and never reproduces the document.
+/// Held by every operation that WRITES a topic's inline data protection policy, so the
+/// one documented bound is the same whichever call carried the document. The sentence
+/// names the member, the bound and the length sent, and never reproduces the document.
 ///
 /// The length is counted in CHARACTERS, not bytes: "Maximum length of 30,720" is the
 /// constraint on a string member, which Smithy measures in Unicode code points, so a

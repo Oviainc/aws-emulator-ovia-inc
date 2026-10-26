@@ -255,9 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .filter(|(name, value)| !state::clears_attribute(name, value))
             .collect();
-        // The document's one documented bound, held through the shared rule every
-        // write of a topic's data protection policy uses, so this create and
-        // `PutDataProtectionPolicy` cannot disagree about which documents fit.
+        // The document's one documented bound, held through the shared rule in
+        // `state`, so the bound a create is judged against is the published one
+        // ("Maximum length of 30,720") and not this handler's own idea of it.
         if let Some(message) = input
             .data_protection_policy
             .as_deref()
@@ -327,11 +327,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // What the re-create carries beyond the conflict check is APPLIED to the
             // topic that already exists — an attribute it does not hold yet, a tag, a
-            // data-protection policy — the way Set*Attributes/TagResource/
-            // PutDataProtectionPolicy would apply it, so no caller input is dropped
-            // under a success status. The merged maps are measured BEFORE they are
-            // stored, so a repeated re-create cannot grow this one record past the
-            // per-record ceilings.
+            // data-protection policy — the way Set*Attributes/TagResource would apply
+            // it, so no caller input is dropped under a success status. The merged maps
+            // are measured BEFORE they are stored, so a repeated re-create cannot grow
+            // this one record past the per-record ceilings.
             let mut merged_attributes = existing.attributes.clone();
             for (name, value) in &attributes {
                 merged_attributes.insert(name.clone(), value.clone());
