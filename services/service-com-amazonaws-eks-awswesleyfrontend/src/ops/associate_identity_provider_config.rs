@@ -78,7 +78,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, IdentityProviderConfigRecord, UpdateRecord, CONFIG_STATUS_CREATING,
+    self, IdentityProviderConfigRecord, UpdateRecord, UpdateScope, CONFIG_STATUS_CREATING,
     IDENTITY_PROVIDER_CONFIG_TYPE_OIDC, MAX_IDENTITY_PROVIDER_CONFIGS_PER_CLUSTER, STATUS_ACTIVE,
     UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_IDENTITY_PROVIDER_CONFIG,
     UPDATE_TYPE_ASSOCIATE_IDENTITY_PROVIDER_CONFIG,
@@ -405,6 +405,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // An identity provider is associated with the cluster itself, so this
+            // is an update of the cluster rather than of a resource inside it.
+            scope: UpdateScope::Cluster,
         };
         let answered_update = update.to_update();
 
