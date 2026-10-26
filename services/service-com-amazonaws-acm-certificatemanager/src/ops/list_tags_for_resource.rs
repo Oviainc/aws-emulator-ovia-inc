@@ -150,6 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::certificate_id_from_arn(&input.resource_arn).is_some() {
             return Err(validation_exception(
                 crate::state::certificate_resource_message(
+                    Self::NAME,
                     &input.resource_arn,
                     "ListTagsForCertificate",
                 ),

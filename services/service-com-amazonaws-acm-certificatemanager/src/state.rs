@@ -2159,11 +2159,23 @@ const UNTYPED_RESOURCE_NOUN: &str = "resource";
 /// `RemoveTagsFromCertificate`, `ListTagsForResource` -> `ListTagsForCertificate`), so
 /// a certificate ARN is input the operation's own constraints do not admit — which is
 /// what `ValidationException` ("the supplied input failed to satisfy constraints")
-/// names. Rendered here so all three refusals read the same.
-pub fn certificate_resource_message(resource_arn: &str, certificate_operation: &str) -> String {
+/// names.
+///
+/// `ValidationException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentences come from ACM's recorded behaviour: three
+/// of them, stating in turn which resource types the CALLED operation supports, that the
+/// resource the request named is a certificate, and the certificate-specific operation
+/// to call instead. The variable parts are the called operation, the requested ARN and
+/// that counterpart operation; everything else is fixed. Rendered here so all three
+/// refusals read the same.
+pub fn certificate_resource_message(
+    operation: &str,
+    resource_arn: &str,
+    certificate_operation: &str,
+) -> String {
     format!(
-        "{resource_arn} names a certificate, which this operation does not apply to; \
-         use {certificate_operation} instead"
+        "{operation} only supports non-certificate resource types. Resource {resource_arn} is a \
+         certificate resource. Use {certificate_operation} API instead."
     )
 }
 
