@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: revises the profile the `ProfileArn` names in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profiles`]
+//! — the description it carries and the answer of each question it names — and, when the
+//! revision changes what the profile records, moves the profile to the next version of the
+//! service's counter and records the instant, so `GetProfile` reads back exactly what was
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProfile"))
+        // The profile is named by the ARN the request carries, and nothing here is minted
+        // or Region-scoped, so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // What the request answers, normalized and refused by the rules both operations
+        // that record a profile's answers share
+        // (`crate::state::recorded_profile_questions`): one entry per `QuestionId`, each
+        // carrying the choices selected for it as a set. Judged before the store is
+        // touched, so a request that cannot be recorded revises nothing.
+        let answered = match input.profile_questions.as_deref() {
+            Some(updates) => crate::state::recorded_profile_questions(updates)
+                .map_err(UpdateProfileErrorModeled::ValidationException)?,
+            None => std::collections::BTreeMap::new(),
+        };
+
+        let mut store = state.lock();
+        let profile = store.profiles.get_mut(&input.profile_arn).ok_or_else(|| {
+            UpdateProfileErrorModeled::ResourceNotFoundException(crate::state::profile_not_found(
+                &input.profile_arn,
+            ))
+        })?;
+
+        // Each entry is "an update to a profile question" (`ProfileQuestionUpdate`), so it
+        // replaces the answer recorded for the QUESTION it names — the selected choices
+        // are the set in force for that question — and a question the request does not
+        // name keeps the answer the profile already records.
+        let mut questions = profile.questions.clone();
+        questions.extend(answered);
+
+        // The question count one profile records is bounded by this emulator's own ceiling
+        // ([`crate::state::MAX_QUESTIONS_PER_PROFILE`]), which is what keeps a STORED
+        // profile's question map bounded by something other than the request body size.
+        // This operation models no quota error, so a revision that would carry the profile
+        // past the ceiling is answered with the modelled `ConflictException` — "The
+        // resource has already been processed, was deleted, or is too large" — rather than
+        // telling the caller the model refused a list the model allows.
+        if questions.len() > crate::state::MAX_QUESTIONS_PER_PROFILE {
+            return Err(UpdateProfileErrorModeled::ConflictException(crate::state::conflict(
+                crate::state::PROFILE_RESOURCE_TYPE,
+                input.profile_arn.clone(),
+                &format!(
+                    "Profile with ARN {} cannot record more than {} questions.",
+                    input.profile_arn,
+                    crate::state::MAX_QUESTIONS_PER_PROFILE
+                ),
+            ))
+            .into());
+        }
+
+        // Every writable member is optional, so one the request leaves out asks for no
+        // change to it and the stored value stands.
+        let description = input
+            .profile_description
+            .unwrap_or_else(|| profile.profile_description.clone());
+
+        // A revision is what moves the profile's version: the version is the service's own
+        // counter over a profile's revisions, which a workload reviewed against the
+        // earlier version is then behind by. A request that records nothing new — one that
+        // supplies no writable member, names no question, or carries exactly what the
+        // profile already holds — revises nothing, so it moves neither the version nor
+        // `Profile$UpdatedAt` ("the date and time when the profile was last updated") and
+        // reports the profile exactly as it stands.
+        if description != profile.profile_description || questions != profile.questions {
+            profile.profile_description = description;
+            profile.questions = questions;
+            profile.profile_version = crate::state::next_profile_version(&profile.profile_version);
+            profile.updated_at = ::std::time::SystemTime::now();
+        }
+
+        Ok(UpdateProfileOutput {
+            // The profile as STORED, through the one projection every read of a profile is
+            // built by, so this answer cannot disagree with a later `GetProfile`.
+            profile: Some(profile.to_profile()),
+        })
     }
 }

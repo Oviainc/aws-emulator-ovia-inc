@@ -13,11 +13,12 @@
 //! the upgrade once.
 //!
 //! Every workload, profile and association here is made over HTTP (`CreateWorkload`,
-//! `CreateProfile`, `AssociateProfiles`). One half of the starting situation has no HTTP
-//! path yet: a profile REVISION, which is what puts a profile ahead of the version an
-//! association pinned — associating pins the version the profile is at, and minting a
-//! profile's next version belongs to `UpdateProfile`, still a stub with its own issue — so
-//! that revision is seeded through the shared state by the harness's
+//! `CreateProfile`, `AssociateProfiles`). One half of the starting situation is seeded: a
+//! profile REVISION at a version spelling of this suite's own choosing, which is what puts
+//! a profile ahead of the version an association pinned — associating pins the version the
+//! profile is at, and `UpdateProfile` moves a profile along the service's own counter
+//! rather than to a spelling a caller picks — so that revision is seeded through the shared
+//! state by the harness's
 //! `Client::revise_profile_version`, exactly as this crate's suites seed a stored answer
 //! whose writer is a stub. Everything asserted crosses the HTTP boundary: requests go
 //! through the real `MultiServiceRouter`, so routing, restJson1 (de)serialization, boundary
