@@ -104,6 +104,9 @@ mod deleted_resource_mutation;
 #[path = "all/describe_node_reporting.rs"]
 mod describe_node_reporting;
 
+#[path = "all/describe_reservation_reporting.rs"]
+mod describe_reservation_reporting;
+
 #[path = "all/engine_version_catalog.rs"]
 mod engine_version_catalog;
 

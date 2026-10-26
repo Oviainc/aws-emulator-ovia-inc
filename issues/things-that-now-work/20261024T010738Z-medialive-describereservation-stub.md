@@ -23,8 +23,13 @@ must be provable by reading the resource back, and this was the reader. The hand
 answers 501 and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone, so nothing here is
 left to implement; `tests/all/reservation_purchase.rs` exercises it end to end.
 
-This report stays here only because the fix for another issue cannot move a report it does not
-own — the next scan of this operation will find it implemented and can retire this record.
+This record is retired here, by the owner of this issue: the handler was re-read against the
+current code base (no census line, every member answered from the store), and
+`tests/all/describe_reservation_reporting.rs` was added to pin the read as a KEYED REPORT — each
+of several held reservations read back out of purchase order reports its own stored members, a
+repeated read reports the same thing, and an id the account holds no reservation for is the
+modelled 404 — so a regression to a scaffold is caught by a test this operation owns rather than
+by the purchase suite's round trip.
 
 ## Evidence
 

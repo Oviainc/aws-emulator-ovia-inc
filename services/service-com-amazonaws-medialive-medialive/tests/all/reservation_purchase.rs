@@ -64,7 +64,7 @@ const RESERVATIONS: &str = "/prod/reservations";
 /// Every member `Reservation` declares, by its wire name
 /// (`smithy_query(query="shape", shape="Reservation")`), which is member for
 /// member what `DescribeReservationResponse` reports flat.
-const RESERVATION_MEMBERS: [&str; 19] = [
+pub(crate) const RESERVATION_MEMBERS: [&str; 19] = [
     "arn",
     "count",
     "currencyCode",
@@ -119,7 +119,10 @@ const DISABLED: &str = "DISABLED";
 const ENABLED: &str = "ENABLED";
 
 /// `PurchaseOffering` for `offering_id`, signed for `region`.
-async fn purchase(
+///
+/// Shared with [`crate::describe_reservation_reporting`], so the two reservation
+/// suites cannot disagree about how a purchase reaches the emulator.
+pub(crate) async fn purchase(
     router: &MultiServiceRouter,
     region: &str,
     offering_id: &str,
@@ -129,8 +132,14 @@ async fn purchase(
     call_in_region(router, region, "POST", &uri, Some(body)).await
 }
 
-/// `DescribeReservation` for `reservation_id`, signed for `region`.
-async fn describe(router: &MultiServiceRouter, region: &str, reservation_id: &str) -> (u16, Value) {
+/// `DescribeReservation` for `reservation_id`, signed for `region`. Shared with
+/// [`crate::describe_reservation_reporting`] for the same reason as
+/// [`purchase`].
+pub(crate) async fn describe(
+    router: &MultiServiceRouter,
+    region: &str,
+    reservation_id: &str,
+) -> (u16, Value) {
     let uri = format!("{RESERVATIONS}/{reservation_id}");
     call_in_region(router, region, "GET", &uri, None).await
 }
@@ -149,7 +158,11 @@ async fn describe_offering(router: &MultiServiceRouter, region: &str, offering_i
 
 /// The id of the first offering `filters` admits, read off `ListOfferings` — so
 /// every row of the tables below names a configuration the catalog really holds.
-async fn first_offering(router: &MultiServiceRouter, case: &str, filters: &str) -> String {
+pub(crate) async fn first_offering(
+    router: &MultiServiceRouter,
+    case: &str,
+    filters: &str,
+) -> String {
     let uri = format!("{OFFERINGS}?{filters}&maxResults=1");
     let (status, body) = call(router, "GET", &uri, None).await;
     assert_eq!(
@@ -218,7 +231,7 @@ fn months_on(at: DateTime<Utc>, months: u32) -> DateTime<Utc> {
 }
 
 /// The reservation a purchase answered with.
-fn reservation(case: &str, body: &Value) -> Value {
+pub(crate) fn reservation(case: &str, body: &Value) -> Value {
     body.get("reservation")
         .cloned()
         .filter(|reservation| !reservation.is_null())
