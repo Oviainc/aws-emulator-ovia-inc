@@ -6206,9 +6206,13 @@ pub const DISASSOCIATE_MEMBER_ACTION: &str = "disassociate";
 /// The action `StopMonitoringMembers` attempts, as the refusal below names it.
 pub const STOP_MONITORING_MEMBER_ACTION: &str = "stop monitoring";
 
+/// The action `DeleteMembers` attempts, as the refusal below names it.
+pub const DELETE_MEMBER_ACTION: &str = "delete";
+
 /// The message a call that would end or suspend a member relationship the
 /// ORGANIZATION manages is refused with, naming the `action` it attempted — one of
-/// [`DISASSOCIATE_MEMBER_ACTION`] and [`STOP_MONITORING_MEMBER_ACTION`].
+/// [`DISASSOCIATE_MEMBER_ACTION`], [`STOP_MONITORING_MEMBER_ACTION`] and
+/// [`DELETE_MEMBER_ACTION`].
 ///
 /// "With `autoEnableOrganizationMembers` configuration for your organization set to
 /// `ALL`, you'll receive an error if you attempt to disassociate a member account
