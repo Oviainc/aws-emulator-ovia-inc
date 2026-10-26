@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.key_value_store(&input.name) else {
             return Err(DescribeKeyValueStoreErrorModeled::EntityNotFound(
-                crate::state::key_value_store_not_found(&input.name),
+                crate::state::key_value_store_not_found(),
             )
             .into());
         };

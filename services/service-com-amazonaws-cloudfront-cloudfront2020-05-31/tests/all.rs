@@ -17,6 +17,8 @@ mod alias_viewer_certificate;
 mod anycast_ip_list_lifecycle;
 #[path = "all/anycast_ip_list_list.rs"]
 mod anycast_ip_list_list;
+#[path = "all/anycast_ip_list_update.rs"]
+mod anycast_ip_list_update;
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
 #[path = "all/cache_policy_list.rs"]
@@ -133,6 +135,8 @@ mod public_key_lifecycle;
 mod realtime_log_config_lifecycle;
 #[path = "all/realtime_log_config_list.rs"]
 mod realtime_log_config_list;
+#[path = "all/refusal_contract.rs"]
+mod refusal_contract;
 #[path = "all/response_headers_policy_config_read.rs"]
 mod response_headers_policy_config_read;
 #[path = "all/response_headers_policy_lifecycle.rs"]
@@ -145,6 +149,8 @@ mod state_roundtrip;
 mod streaming_distribution_list;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tagging_resource_types.rs"]
+mod tagging_resource_types;
 #[path = "all/tenant_distribution_and_method_order.rs"]
 mod tenant_distribution_and_method_order;
 #[path = "all/tenant_domain_admission.rs"]

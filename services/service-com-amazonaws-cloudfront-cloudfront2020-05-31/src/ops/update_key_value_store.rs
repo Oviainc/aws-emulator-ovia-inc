@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| stored.etag.clone())
         else {
             return Err(UpdateKeyValueStoreErrorModeled::EntityNotFound(
-                crate::state::key_value_store_not_found(&input.name),
+                crate::state::key_value_store_not_found(),
             )
             .into());
         };
@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.apply_key_value_store_comment(&input.name, input.comment, now)
         else {
             return Err(UpdateKeyValueStoreErrorModeled::EntityNotFound(
-                crate::state::key_value_store_not_found(&input.name),
+                crate::state::key_value_store_not_found(),
             )
             .into());
         };

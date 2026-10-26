@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can't be associated") says.
         let Some(distribution) = store.distribution(&input.distribution_id) else {
             return Err(CreateDistributionTenantErrorModeled::EntityNotFound(
-                crate::state::distribution_not_found(&input.distribution_id),
+                crate::state::distribution_not_found(),
             )
             .into());
         };
@@ -334,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(connection_group_id) = &input.connection_group_id {
             if !store.holds_connection_group(connection_group_id) {
                 return Err(CreateDistributionTenantErrorModeled::EntityNotFound(
-                    crate::state::connection_group_not_found(connection_group_id),
+                    crate::state::connection_group_not_found(),
                 )
                 .into());
             }

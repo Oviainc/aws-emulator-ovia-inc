@@ -183,10 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still describes a key set and is not a refusal.
         let keys = input.tag_keys.items.as_deref().unwrap_or_default();
 
-        // The resource is named by ARN. `ResourceARN`'s pattern is already enforced
-        // before this handler runs, so what is left to decide is whether the store holds
-        // a resource carrying that exact ARN — and an ARN it does not is
-        // `NoSuchResource`, not an invalid argument.
+        // The resource is named by ARN, under the same resource-type rule the other two
+        // tagging operations run: a type the tagging surface does not accept is a bad
+        // parameter, decided before any lookup, and `NoSuchResource` is what an accepted
+        // type whose resource the store does not hold answers with.
+        if let Some(invalid) = crate::state::untaggable_resource_type(&input.resource) {
+            return Err(UntagResourceErrorModeled::InvalidArgument(invalid).into());
+        }
         let Some(tags) = store.tags_for_resource_mut(&input.resource) else {
             return Err(UntagResourceErrorModeled::NoSuchResource(
                 crate::state::no_such_resource(),

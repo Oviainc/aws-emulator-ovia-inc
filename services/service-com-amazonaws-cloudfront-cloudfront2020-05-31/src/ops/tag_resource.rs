@@ -181,9 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The resource is named by ARN. `ResourceARN`'s pattern is already enforced
-        // before this handler runs, so what is left to decide is whether the store holds
-        // a resource carrying that exact ARN — and an ARN it does not is
-        // `NoSuchResource`, not an invalid argument.
+        // before this handler runs, so what is left to decide is whether the resource TYPE
+        // the ARN names is one the tagging surface accepts at all — a type it does not is a
+        // bad parameter, decided before any lookup — and then whether the store holds a
+        // resource carrying that exact ARN, which an accepted type's absent resource is
+        // `NoSuchResource` for.
+        if let Some(invalid) = crate::state::untaggable_resource_type(&input.resource) {
+            return Err(TagResourceErrorModeled::InvalidArgument(invalid).into());
+        }
         let Some(tags) = store.tags_for_resource_mut(&input.resource) else {
             return Err(TagResourceErrorModeled::NoSuchResource(
                 crate::state::no_such_resource(),

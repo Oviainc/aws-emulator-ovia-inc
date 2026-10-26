@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| (stored.etag.clone(), stored.config.clone()))
         else {
             return Err(AssociateDistributionWebACLErrorModeled::EntityNotFound(
-                crate::state::distribution_not_found(&input.id),
+                crate::state::distribution_not_found(),
             )
             .into());
         };
@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not.
         let Some(stored) = store.apply_config(&input.id, config, now) else {
             return Err(AssociateDistributionWebACLErrorModeled::EntityNotFound(
-                crate::state::distribution_not_found(&input.id),
+                crate::state::distribution_not_found(),
             )
             .into());
         };

@@ -320,6 +320,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Stored whole: a later read answers from this record — the configuration the
             // distribution actually runs under — never from the request that was served.
             config,
+            // `CreateStreamingDistribution` carries no tag set, so the distribution starts
+            // out carrying none; a later tagging call writes into this very set.
+            tags: crate::state::TagSet::new(),
         };
         let streaming_distribution = stored.to_streaming_distribution();
         let location =

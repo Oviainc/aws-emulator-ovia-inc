@@ -52,7 +52,10 @@ use crate::tag_resource::{create_key_value_store, tag_resource};
 /// The ARN travels in the query exactly as the reader's and the tagging call's do: every
 /// character a CloudFront ARN uses is legal in a query value, and none of them is `&`,
 /// `=` or `%`.
-async fn untag_resource(
+///
+/// `pub(crate)` so the sibling suite that asserts the resource-TYPE rule over all three
+/// tagging operations drives the same wire path rather than growing a copy of this.
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     named: Option<&[String]>,
@@ -72,7 +75,7 @@ async fn untag_resource(
 /// `None` is a request that names no `Items` at all (`<TagKeys/>`), which is a different
 /// document from one carrying an empty `Items` list — both name no key, and the rule has
 /// to hold for each.
-fn tag_keys_xml(named: Option<&[String]>) -> String {
+pub(crate) fn tag_keys_xml(named: Option<&[String]>) -> String {
     let Some(items) = named else {
         return "<TagKeys/>".to_string();
     };

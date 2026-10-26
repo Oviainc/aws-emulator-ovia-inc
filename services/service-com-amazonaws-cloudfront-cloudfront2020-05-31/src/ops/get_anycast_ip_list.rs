@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.anycast_ip_list(&input.id) else {
             return Err(GetAnycastIpListErrorModeled::EntityNotFound(
-                crate::state::anycast_ip_list_not_found(&input.id),
+                crate::state::anycast_ip_list_not_found(),
             )
             .into());
         };

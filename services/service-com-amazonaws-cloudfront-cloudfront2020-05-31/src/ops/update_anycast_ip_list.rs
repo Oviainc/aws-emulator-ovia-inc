@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAnycastIpList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAnycastIpList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAnycastIpList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the Anycast static IP list `Id` names: the address type and the IPAM CIDR
+//! ranges it runs under become the ones submitted, the list re-enters its transient status
+//! while they reach the edge locations, and a fresh version token is minted. An id no
+//! stored list carries is `EntityNotFound`; an `If-Match` that is not the list's current
+//! version is refused before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +79,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +157,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAnycastIpList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAnycastIpListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAnycastIpList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the deployment the clock already owes, so the precondition below is
+        // checked against the record as it stands at this instant.
+        store.settle(now);
+
+        // An id no list carries names nothing to update — "the entity was not found" — and
+        // is answered BEFORE the precondition, which can only be checked against a stored
+        // version.
+        let Some(current_etag) = store
+            .anycast_ip_list(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(UpdateAnycastIpListErrorModeled::EntityNotFound(
+                crate::state::anycast_ip_list_not_found(),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the list its caller actually read: a token that is no version token at all is
+        // "missing or not valid", and a well-formed token that is not the current one is a
+        // failed precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateAnycastIpListErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateAnycastIpListErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // The members this update submits are both optional and are applied by the one
+        // mutator the store owns, so what an omitted member leaves alone is decided in one
+        // place. The address type's own value set is a modelled constraint, already
+        // refused before this handler runs.
+        let Some(stored) = store.apply_anycast_ip_list_update(
+            &input.id,
+            input.ip_address_type,
+            input.ipam_cidr_configs,
+            now,
+        ) else {
+            return Err(UpdateAnycastIpListErrorModeled::EntityNotFound(
+                crate::state::anycast_ip_list_not_found(),
+            )
+            .into());
+        };
+
+        Ok(UpdateAnycastIpListOutput {
+            // "An Anycast static IP list" — read back from the one stored record, so the
+            // answer is the list as it now stands rather than the request that was served.
+            anycast_ip_list: Some(stored.to_anycast_ip_list()),
+            // "The current version of the Anycast static IP list": the freshly minted
+            // token, so the version this caller just replaced no longer satisfies an
+            // `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

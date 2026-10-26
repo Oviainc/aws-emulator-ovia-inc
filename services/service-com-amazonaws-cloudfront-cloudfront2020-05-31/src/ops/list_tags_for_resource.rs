@@ -149,10 +149,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a transition the store was due behind it.
         store.settle(SystemTime::now());
 
-        // The resource is named by ARN. `ResourceARN`'s pattern is already enforced
-        // before this handler runs, so what is left to decide is whether the store holds
-        // a resource carrying that exact ARN — and an ARN it does not is
-        // `NoSuchResource`, not an invalid argument.
+        // The resource is named by ARN, under the same resource-type rule the two tagging
+        // writes run: a type the tagging surface does not accept is a bad parameter,
+        // decided before any lookup, and `NoSuchResource` is what an accepted type whose
+        // resource the store does not hold answers with.
+        if let Some(invalid) = crate::state::untaggable_resource_type(&input.resource) {
+            return Err(ListTagsForResourceErrorModeled::InvalidArgument(invalid).into());
+        }
         let Some(stored) = store.tags_for_resource(&input.resource) else {
             return Err(ListTagsForResourceErrorModeled::NoSuchResource(
                 crate::state::no_such_resource(),

@@ -258,7 +258,10 @@ fn is_anycast_ip_list_id(value: &str) -> bool {
 /// Whether `address` belongs to a family `ip_address_type` admits: an IPv4 address is
 /// written in dotted quads and an IPv6 address in colon-separated groups, and `dualstack`
 /// is "a list of both IPv4 and IPv6 addresses", so it admits either.
-fn admits_family(ip_address_type: &str, address: &str) -> bool {
+///
+/// `pub(crate)` so the sibling suite that drives the UPDATE of a list's address type
+/// decides the families the same way rather than growing a copy of this.
+pub(crate) fn admits_family(ip_address_type: &str, address: &str) -> bool {
     match ip_address_type {
         IP_ADDRESS_TYPE_IPV6 => address.contains(':'),
         IP_ADDRESS_TYPE_DUALSTACK => address.contains(':') || address.contains('.'),

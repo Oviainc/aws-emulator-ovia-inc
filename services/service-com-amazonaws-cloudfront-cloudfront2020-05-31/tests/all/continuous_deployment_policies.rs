@@ -855,11 +855,12 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
         (
             // The request boundary refuses a value outside `ContinuousDeploymentPolicyType`
             // before the handler runs, so this row pins the MODELLED constraint rather
-            // than the handler's own fallback for it.
+            // than the handler's own fallback for it — under the error the operation
+            // models for an argument it cannot take, as the two rows above it are.
             "a Type the enum does not admit",
             unknown_type,
             400,
-            "ValidationException",
+            "InvalidArgument",
         ),
         (
             "a weight one step past the published maximum",

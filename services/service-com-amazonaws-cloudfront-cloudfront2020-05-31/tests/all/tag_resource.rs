@@ -560,8 +560,10 @@ async fn a_tag_set_no_resource_can_carry_is_refused_and_changes_nothing() {
 async fn tag_resource_refuses_an_arn_no_resource_carries() {
     let router = emulator();
 
-    // Every row is a well-formed CloudFront ARN (`ResourceARN`'s pattern is satisfied),
-    // so what makes each a refusal is that the store holds no resource carrying it.
+    // Every row is a well-formed CloudFront ARN (`ResourceARN`'s pattern is satisfied)
+    // naming a resource TYPE the tagging surface accepts, so what makes each a refusal is
+    // that the store holds no resource carrying it. An ARN whose type the surface does not
+    // accept at all is a different refusal, asserted by `tagging_resource_types`.
     let unknown = [
         (
             "distribution-that-was-never-created",
@@ -572,11 +574,9 @@ async fn tag_resource_refuses_an_arn_no_resource_carries() {
             format!("arn:aws:cloudfront::{ACCOUNT_ID}:key-value-store/absent-store"),
         ),
         (
-            // A resource kind this emulator holds none of at all.
-            "cache-policy",
-            format!(
-                "arn:aws:cloudfront::{ACCOUNT_ID}:cache-policy/11111111-2222-3333-4444-555555555555"
-            ),
+            // A taggable resource kind this emulator holds none of at all.
+            "anycast-ip-list-that-was-never-created",
+            format!("arn:aws:cloudfront::{ACCOUNT_ID}:anycast-ip-list/aip_absent"),
         ),
         (
             "function",

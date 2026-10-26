@@ -215,9 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::IP_ADDRESS_TYPE_IPV4.to_string());
 
         // "The static IP addresses that are allocated to the Anycast static IP list":
-        // allocated once, here, and stable for the list's whole life. A pool that cannot
+        // allocated once, here, and held by the list for its whole life. A pool that cannot
         // serve this many more addresses is the entity limit this emulator has.
-        let Some(anycast_ips) = store.allocate_anycast_ips(&ip_address_type, input.ip_count) else {
+        let Some(anycast_ip_hosts) = store.allocate_anycast_ip_hosts(input.ip_count) else {
             return Err(CreateAnycastIpListErrorModeled::EntityLimitExceeded(
                 crate::state::anycast_ip_pool_exhausted(),
             )
@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The number of IP addresses in the Anycast static IP list" — as many as were
             // allocated for it.
             ip_count: input.ip_count,
-            anycast_ips,
+            anycast_ip_hosts,
             ipam_cidr_configs,
             last_modified_time: now,
             etag: etag.clone(),

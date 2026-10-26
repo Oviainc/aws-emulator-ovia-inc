@@ -984,6 +984,69 @@ pub fn no_such_resource() -> NoSuchResource {
     }
 }
 
+/// The CloudFront resource TYPES the tagging surface accepts, as the resource part of an
+/// ARN spells each of them.
+///
+/// Read off the model: a resource type is taggable exactly where the operation that
+/// creates it takes tags — `CreateDistributionWithTags` and
+/// `CreateStreamingDistributionWithTags` through their `…ConfigWithTags` payload, and
+/// `CreateFunction`, `CreateConnectionFunction`, `CreateKeyValueStore`,
+/// `CreateAnycastIpList`, `CreateConnectionGroup` and `CreateDistributionTenant` through
+/// their `Tags` member (`smithy_query(query="operation", operation="…")`). Every other
+/// kind of CloudFront resource — a cache policy, an origin request policy, a response
+/// headers policy, an origin access control, a public key, a real-time log configuration,
+/// a continuous deployment policy, an origin access identity — is created by an operation
+/// that takes no tags at all, so its ARN names no taggable type.
+///
+/// Sorted, so the list reads as the SET it is.
+pub const TAGGABLE_RESOURCE_TYPES: [&str; 8] = [
+    "anycast-ip-list",
+    "connection-function",
+    "connection-group",
+    "distribution",
+    "distribution-tenant",
+    "function",
+    "key-value-store",
+    "streaming-distribution",
+];
+
+/// The resource TYPE an ARN names — the token its resource part opens with — or `None`
+/// where the ARN carries no resource part at all.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and this service's
+/// resources spell their resource part `<type>/<id>`, so the type is the token up to the
+/// first separator. `ResourceARN`'s pattern is already enforced before any handler runs,
+/// so what is read here is the one part of the ARN the pattern leaves open.
+pub fn arn_resource_type(arn: &str) -> Option<&str> {
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let end = resource.find(['/', ':']).unwrap_or(resource.len());
+    let kind = &resource[..end];
+    (!kind.is_empty()).then_some(kind)
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) a tagging call naming a resource type the
+/// tagging surface does not accept is refused with, or `None` when the type is one it
+/// accepts (so the question becomes whether the store holds that resource).
+///
+/// What the refusal states is the CONSTRAINT on the parameter — the resource type the
+/// submitted ARN names is not one the tagging surface takes — so the one variable part of
+/// the sentence is that type, read out of the request's own ARN. It is decided BEFORE any
+/// lookup: a type the surface does not accept is a parameter the caller has to fix,
+/// whether or not a resource of that type exists, which is what keeps `NoSuchResource` for
+/// an accepted type whose resource is absent.
+///
+/// An ARN carrying no resource part names no type for the sentence to state, so it is left
+/// to the existence lookup the accepted types go through.
+pub fn untaggable_resource_type(arn: &str) -> Option<crate::ops::types::InvalidArgument> {
+    let kind = arn_resource_type(arn)?;
+    if TAGGABLE_RESOURCE_TYPES.contains(&kind) {
+        return None;
+    }
+    Some(crate::ops::types::InvalidArgument {
+        message: Some(format!("The parameter resource type: {kind} is invalid.")),
+    })
+}
+
 /// One invalidation batch submitted against one distribution or one distribution tenant.
 #[derive(Debug, Clone)]
 pub struct StoredInvalidation {
@@ -1446,6 +1509,11 @@ pub struct StoredStreamingDistribution {
     /// resolved into it ([`resolve_streaming_distribution_config`]), stored whole so a
     /// later read returns the configuration the distribution actually runs under.
     pub config: StreamingDistributionConfig,
+    /// The tags associated with this distribution. A streaming distribution is one of the
+    /// resource types the tagging surface accepts ([`TAGGABLE_RESOURCE_TYPES`]), so the
+    /// set lives on the record the rest of the distribution is read from — the same place
+    /// [`StoredDistribution::tags`] lives.
+    pub tags: TagSet,
 }
 
 impl StoredStreamingDistribution {
@@ -1681,12 +1749,17 @@ pub struct StoredAnycastIpList {
     /// from, [`IP_ADDRESS_TYPE_IPV4`] when the create named none.
     pub ip_address_type: String,
     /// `AnycastIpList$IpCount` — "The number of IP addresses in the Anycast static IP
-    /// list", so it is the length of [`StoredAnycastIpList::anycast_ips`].
+    /// list", so it is the length of [`StoredAnycastIpList::anycast_ip_hosts`].
     pub ip_count: i32,
+    /// The address SLOTS allocated to this list out of the service's pool: allocated ONCE,
+    /// by the create, and held for the list's whole life, so no address is ever allocated
+    /// to two lists.
+    ///
     /// `AnycastIpList$AnycastIps` — "The static IP addresses that are allocated to the
-    /// Anycast static IP list": allocated ONCE, by the create, and stable for the list's
-    /// whole life, so every later read reports the same addresses.
-    pub anycast_ips: Vec<String>,
+    /// Anycast static IP list" — is these slots rendered in the families the list's
+    /// `IpAddressType` admits ([`anycast_ips_of`]), so a list that changes its address type
+    /// reports the SAME allocation in the new families rather than taking a second one.
+    pub anycast_ip_hosts: Vec<u32>,
     /// The IPAM CIDR configurations this list was created or updated with, each carrying
     /// the status the SERVICE put on it. Empty when none were named, which is what makes
     /// `AnycastIpList$IpamConfig` absent rather than an element describing nothing.
@@ -1751,7 +1824,7 @@ impl StoredAnycastIpList {
             arn: self.arn.clone(),
             ip_address_type: Some(self.ip_address_type.clone()),
             ipam_config: self.to_ipam_config(),
-            anycast_ips: self.anycast_ips.clone(),
+            anycast_ips: anycast_ips_of(&self.anycast_ip_hosts, &self.ip_address_type),
             ip_count: self.ip_count,
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
         }
@@ -4145,6 +4218,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if let Some(function) = self.connection_function_by_arn(arn) {
             return Some(&function.tags);
         }
+        if let Some(distribution) = self
+            .streaming_distributions
+            .values()
+            .find(|distribution| distribution.arn == arn)
+        {
+            return Some(&distribution.tags);
+        }
         if let Some(list) = self.anycast_ip_lists.values().find(|list| list.arn == arn) {
             return Some(&list.tags);
         }
@@ -4201,6 +4281,15 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|function| function.arn == arn)
         {
             return Some(&mut function.tags);
+        }
+        // The streaming distribution arm, resolved against the STORED ARN exactly as the
+        // tag read resolves it, and against the field for the same borrow reason as above.
+        if let Some(distribution) = self
+            .streaming_distributions
+            .values_mut()
+            .find(|distribution| distribution.arn == arn)
+        {
+            return Some(&mut distribution.tags);
         }
         // The Anycast static IP list arm: a list carries the tags its create submitted, so
         // it is one of the resource kinds a tagging call addresses by ARN.
@@ -4424,17 +4513,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
-    /// Allocate `ip_count` Anycast static IP addresses of `ip_address_type`, or `None` when
-    /// the pool cannot serve that many more.
+    /// Allocate `ip_count` Anycast static IP address SLOTS, or `None` when the pool cannot
+    /// serve that many more.
     ///
     /// "The static IP addresses that are allocated to the Anycast static IP list": the
-    /// addresses are allocated ONCE, here, and the list reports exactly as many of them as
-    /// its `IpCount` — "The number of IP addresses in the Anycast static IP list". The
-    /// families follow the address type: `ipv4` allocates IPv4 addresses, `ipv6` allocates
-    /// IPv6 ones, and `dualstack` is "a list of both IPv4 and IPv6 addresses", so it draws
-    /// alternately from the two blocks and holds at least one of each.
+    /// slots are allocated ONCE, here, and the list holds exactly as many of them as its
+    /// `IpCount` — "The number of IP addresses in the Anycast static IP list". Which
+    /// FAMILY each slot is reported in follows the list's address type and is decided where
+    /// the list is read ([`anycast_ips_of`]), so a list that changes its address type keeps
+    /// the allocation it already holds.
     ///
-    /// Each address comes off [`ComAmazonawsCloudfrontCloudfront20200531State::next_anycast_ip`],
+    /// Each slot comes off [`ComAmazonawsCloudfrontCloudfront20200531State::next_anycast_ip`],
     /// so no address is allocated to two lists; `None` once that counter has walked the
     /// whole of [`ANYCAST_IP_POOL`], which the caller reports as the modelled
     /// `EntityLimitExceeded`.
@@ -4443,32 +4532,18 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// below runs BEFORE anything is allocated, so the loop that follows runs at most
     /// [`ANYCAST_IP_POOL`] times whatever the request named, and a count that does not even
     /// fit the counter is refused there rather than allocated for.
-    pub fn allocate_anycast_ips(
-        &mut self,
-        ip_address_type: &str,
-        ip_count: i32,
-    ) -> Option<Vec<String>> {
+    pub fn allocate_anycast_ip_hosts(&mut self, ip_count: i32) -> Option<Vec<u32>> {
         let wanted = u32::try_from(ip_count).ok()?;
         if self.next_anycast_ip.checked_add(wanted)? > ANYCAST_IP_POOL {
             return None;
         }
-        let addresses = (0..wanted)
-            .map(|offset| {
+        let hosts = (0..wanted)
+            .map(|_| {
                 self.next_anycast_ip += 1;
-                let host = self.next_anycast_ip;
-                let ipv6 = match ip_address_type {
-                    IP_ADDRESS_TYPE_IPV6 => true,
-                    IP_ADDRESS_TYPE_DUALSTACK => offset % 2 == 1,
-                    _ => false,
-                };
-                if ipv6 {
-                    format!("{ANYCAST_IPV6_PREFIX}{host:x}")
-                } else {
-                    format!("{ANYCAST_IPV4_PREFIX}{host}")
-                }
+                self.next_anycast_ip
             })
             .collect();
-        Some(addresses)
+        Some(hosts)
     }
 
     /// Allocate a continuous deployment policy id no stored policy holds.
@@ -4965,6 +5040,63 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Apply an `UpdateAnycastIpList` to the list `id` names, and report the record as it
+    /// now stands.
+    ///
+    /// `IpAddressType` ("The IP address type for the Anycast static IP list") and
+    /// `IpamCidrConfigs` ("A list of IPAM CIDR configurations … for updating the Anycast
+    /// static IP list") are the only members the update submits, and each is optional, so a
+    /// member the request leaves out is left exactly as it was. What the update changes:
+    ///
+    /// * the address type becomes the one submitted, and the list's own address SLOTS are
+    ///   re-reported in the families that type admits ([`anycast_ips_of`]) — the allocation
+    ///   is the list's for its whole life, so nothing more is taken out of the pool and no
+    ///   address can land on two lists;
+    /// * the IPAM CIDR configurations become the ones submitted, each carrying the status
+    ///   the SERVICE puts on a range it has just been asked for, which the clock then owes
+    ///   the provisioned one;
+    /// * the list re-enters the transient status, since the addresses and ranges it now
+    ///   runs under have to reach the edge locations before they are in effect, and the
+    ///   CLOCK owes it the terminal status again;
+    /// * `LastModifiedTime` becomes `now` and the version token is freshly minted, so the
+    ///   token the caller matched on no longer satisfies an `If-Match` against this list.
+    ///
+    /// The list's identity (id, ARN, name), its `IpCount` and its tag set are untouched: an
+    /// update submits none of them.
+    ///
+    /// `None` when the store holds no such list, checked BEFORE the mint so a version token
+    /// is never spent on a list that is not there.
+    pub fn apply_anycast_ip_list_update(
+        &mut self,
+        id: &str,
+        ip_address_type: Option<String>,
+        ipam_cidr_configs: Option<Vec<IpamCidrConfig>>,
+        now: SystemTime,
+    ) -> Option<&StoredAnycastIpList> {
+        if !self.anycast_ip_lists.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.anycast_ip_lists.get_mut(id)?;
+        if let Some(ip_address_type) = ip_address_type {
+            stored.ip_address_type = ip_address_type;
+        }
+        if let Some(configs) = ipam_cidr_configs {
+            stored.ipam_cidr_configs = configs
+                .into_iter()
+                .map(|config| IpamCidrConfig {
+                    status: Some(IPAM_CIDR_STATUS_PROVISIONING.to_string()),
+                    ..config
+                })
+                .collect();
+        }
+        stored.status = ANYCAST_IP_LIST_STATUS_DEPLOYING.to_string();
+        stored.deployed_due = now + PROPAGATION_DELAY;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the configuration of the origin access identity `id` names, and report the
     /// record as it now stands.
     ///
@@ -5437,6 +5569,34 @@ pub fn key_value_store_path(identifier: &str) -> String {
 /// resource type this service's own `/anycast-ip-list` routes name.
 pub fn anycast_ip_list_arn(id: &str) -> String {
     ::engine::emulator_arn("cloudfront", "", &format!("anycast-ip-list/{id}"))
+}
+
+/// "The static IP addresses that are allocated to the Anycast static IP list": the slots
+/// `hosts` holds, rendered in the families `ip_address_type` admits.
+///
+/// `ipv4` reports IPv4 addresses, `ipv6` reports IPv6 ones, and `dualstack` is "a list of
+/// both IPv4 and IPv6 addresses", so it renders alternate slots from the two blocks and
+/// holds at least one of each. The ALLOCATION is the list's own
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_anycast_ip_hosts`]) and is
+/// untouched here, so a list whose address type changes reports the same slots in the new
+/// families rather than taking a second allocation out of the pool.
+pub fn anycast_ips_of(hosts: &[u32], ip_address_type: &str) -> Vec<String> {
+    hosts
+        .iter()
+        .enumerate()
+        .map(|(offset, host)| {
+            let ipv6 = match ip_address_type {
+                IP_ADDRESS_TYPE_IPV6 => true,
+                IP_ADDRESS_TYPE_DUALSTACK => offset % 2 == 1,
+                _ => false,
+            };
+            if ipv6 {
+                format!("{ANYCAST_IPV6_PREFIX}{host:x}")
+            } else {
+                format!("{ANYCAST_IPV4_PREFIX}{host}")
+            }
+        })
+        .collect()
 }
 
 /// The path of a continuous deployment policy resource under this service's API version.
@@ -7315,13 +7475,21 @@ pub fn invalid_max_items() -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// The sentence a read of a key value store the store does not hold answers with: the
+/// CONDITION, carrying nothing from the request, as every other not-found sentence of this
+/// service states its own condition.
+pub const KEY_VALUE_STORE_NOT_FOUND_MESSAGE: &str =
+    "The specified key value store does not exist.";
+
 /// The modelled `EntityNotFound` (HTTP 404) for a key value store name the store does
 /// not hold — "The entity was not found."
-pub fn key_value_store_not_found(name: &str) -> EntityNotFound {
+///
+/// Takes no identifier: what the refusal states is that the store holds no such resource,
+/// which is a property of the store rather than of the value submitted, so the name asked
+/// about is no part of the sentence.
+pub fn key_value_store_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!(
-            "The specified key value store does not exist: {name}"
-        )),
+        message: Some(KEY_VALUE_STORE_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
@@ -7357,9 +7525,12 @@ pub const INVALID_KEY_VALUE_STORE_MARKER_MESSAGE: &str =
 /// The modelled `EntityNotFound` (HTTP 404) for a distribution id no stored distribution
 /// carries, for the operations whose model names `EntityNotFound` rather than
 /// `NoSuchDistribution` for that condition.
-pub fn distribution_not_found(id: &str) -> EntityNotFound {
+///
+/// The same sentence [`NO_SUCH_DISTRIBUTION_MESSAGE`] states, and for the same reason: the
+/// condition is the one both codes report, and it carries no part of the request.
+pub fn distribution_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!("The specified distribution does not exist: {id}")),
+        message: Some(NO_SUCH_DISTRIBUTION_MESSAGE.to_string()),
     }
 }
 
@@ -7423,11 +7594,20 @@ pub fn managed_certificate_not_found() -> EntityNotFound {
     }
 }
 
-/// The modelled `EntityNotFound` (HTTP 404) for a connection group id no connection group
-/// this store holds carries.
-pub fn connection_group_not_found(id: &str) -> EntityNotFound {
+/// The sentence a read of a connection group this store does not hold answers with, as the
+/// recorded `GetConnectionGroupByRoutingEndpoint` contract carries it: the whole sentence
+/// is fixed, and no identifier of the group asked about appears in it.
+pub const CONNECTION_GROUP_NOT_FOUND_MESSAGE: &str =
+    "The specified connection group does not exist.";
+
+/// The modelled `EntityNotFound` (HTTP 404) for an identifier — an id, a name, an ARN or a
+/// routing endpoint — no connection group this store holds answers to.
+///
+/// Takes no identifier, so the same sentence answers every form the lookup admits: what
+/// the refusal states is that the store holds no such group.
+pub fn connection_group_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!("The specified connection group does not exist: {id}")),
+        message: Some(CONNECTION_GROUP_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
@@ -7473,13 +7653,20 @@ pub fn invalid_anycast_ip_list(id: &str) -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// The sentence a read of an Anycast IP list this store does not hold answers with, as the
+/// recorded `GetAnycastIpList` contract carries it — down to the resource's wording in it
+/// and to the absent full stop: the whole sentence is fixed, and the id asked about is no
+/// part of it.
+pub const ANYCAST_IP_LIST_NOT_FOUND_MESSAGE: &str = "The specified Anycast IP list does not exist";
+
 /// The modelled `EntityNotFound` (HTTP 404) for an Anycast static IP list id no stored
 /// list carries — "The entity was not found."
-pub fn anycast_ip_list_not_found(id: &str) -> EntityNotFound {
+///
+/// Takes no id: what the refusal states is that the store holds no such list, which is a
+/// property of the store rather than of the value submitted.
+pub fn anycast_ip_list_not_found() -> EntityNotFound {
     EntityNotFound {
-        message: Some(format!(
-            "The specified Anycast static IP list does not exist: {id}"
-        )),
+        message: Some(ANYCAST_IP_LIST_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 

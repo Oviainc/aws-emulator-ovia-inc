@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if !store.holds_connection_group(marker) {
                 return Err(ListConnectionGroupsErrorModeled::EntityNotFound(
-                    crate::state::connection_group_not_found(marker),
+                    crate::state::connection_group_not_found(),
                 )
                 .into());
             }

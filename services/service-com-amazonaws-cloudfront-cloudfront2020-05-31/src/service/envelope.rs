@@ -38,7 +38,7 @@
 //! operation's input with `400 ValidationException` and the codec's own text;
 //! `ValidationException` is not a shape this service's model declares at all, so a client
 //! branching on the error code falls through to a generic failure and never reaches its
-//! input-correction path. Three such refusals have a modelled CloudFront answer, and each
+//! input-correction path. Four such refusals have a modelled CloudFront answer, and each
 //! is read off the REQUEST and the refusal rather than off the operation:
 //!
 //! * a `MaxItems` the parameter's integer type cannot take is `InvalidArgument` (400),
@@ -52,13 +52,17 @@
 //!   cannot read: the answer is `MalformedXML` (400), under the sentence the boundary
 //!   already wrote, which names the parameter and the value set it broke. A member bound
 //!   anywhere else keeps the boundary's wording;
+//! * a value the model's ENUM does not admit for a member of the request's DOCUMENT is an
+//!   argument the operation cannot take: the answer is `InvalidArgument` (400), the error
+//!   every operation that takes an argument models for one it cannot take, again under the
+//!   sentence the boundary already wrote;
 //! * a body-bearing request that carries NO body cannot have a payload at all, so the
 //!   null member the boundary reports is one nested inside that payload and the member
 //!   that is really absent is the payload itself: the answer is `MalformedXML` (400)
 //!   naming that payload member. A refusal naming a member nested in nothing is about a
 //!   member bound outside the body, and keeps the boundary's own wording.
 //!
-//! All three leave every other refusal exactly as the framework rendered it: the
+//! All four leave every other refusal exactly as the framework rendered it: the
 //! restatement runs only when the boundary actually refused the request, so a request the
 //! boundary read is never second-guessed here.
 
@@ -336,6 +340,37 @@ fn query_names(req: &RtRequest, member: &str) -> bool {
     query_pairs(request_query(req.uri())).any(|(key, _)| key.eq_ignore_ascii_case(member))
 }
 
+/// Whether the request carries a document at all: a buffered body holding something other
+/// than whitespace.
+///
+/// A body the transport has not buffered reads as UNKNOWN, for the same reason
+/// [`body_is_blank`] reads it that way: a document nobody looked at is no evidence about
+/// where a value came from.
+fn carries_a_document(req: &RtRequest) -> bool {
+    req.body()
+        .bytes()
+        .is_some_and(|bytes| bytes.iter().any(|byte| !byte.is_ascii_whitespace()))
+}
+
+/// Whether `refusal` is the boundary refusing the request over a value an enum-constrained
+/// member of the request's DOCUMENT carries.
+///
+/// Read off the request and the refusal, as the query-parameter condition beside it is: the
+/// refusal reports the enum value set as the constraint that failed, the request carries a
+/// document for the value to have been read out of, and the member it names is given a
+/// value by no query parameter of the request — so the value travelled in that document.
+/// A request that carries no document at all gives no member of one a value, and keeps the
+/// wording the boundary gave it.
+fn refused_over_enum_document_value(req: &RtRequest, refusal: &str) -> bool {
+    let Some(message) = element_text(refusal, "Message") else {
+        return false;
+    };
+    if !message.contains(ENUM_VALUE_SET_MARKER) || !carries_a_document(req) {
+        return false;
+    }
+    refused_member_path(message).is_some_and(|member| !query_names(req, member))
+}
+
 /// `refusal` with the enum's admitted values stated in ONE canonical order.
 ///
 /// What the refusal reports is a SET of admitted values, so the order the model happens to
@@ -428,10 +463,10 @@ fn framework_refusal(resp: &RtResponse) -> Option<&str> {
 /// This service's own answer to a refusal the boundary stated in the framework's
 /// vocabulary, or `None` to keep the framework's rendering.
 ///
-/// Reads the REQUEST, not the operation: both conditions are properties of the request
-/// (the value it gives a modelled query parameter, and whether it carries a body at
-/// all), so they hold for every operation that binds them rather than for a list of
-/// operations named here.
+/// Reads the REQUEST, not the operation: every condition is a property of the request
+/// (the value it gives a modelled query parameter, the value a member of the document it
+/// carries holds, and whether it carries a body at all), so they hold for every operation
+/// that binds them rather than for a list of operations named here.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     let refusal = framework_refusal(resp)?;
 
@@ -451,6 +486,14 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // so only the code is restated.
     if refused_over_enum_query_value(req, refusal) {
         return Some(recoded(&with_sorted_enum_values(refusal), MALFORMED_XML));
+    }
+
+    // A value the model's enum does not admit for a member of the request's DOCUMENT is an
+    // argument the operation cannot take, so it is refused with the error every operation
+    // that takes one models for that — `InvalidArgument` (400). The member and the values
+    // it admits are what the boundary's own sentence states, so only the code is restated.
+    if refused_over_enum_document_value(req, refusal) {
+        return Some(recoded(&with_sorted_enum_values(refusal), INVALID_ARGUMENT));
     }
 
     // A request with a body to give carried none, so the whole payload is null. The

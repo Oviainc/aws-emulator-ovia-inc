@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.connection_group_by_routing_endpoint(&input.routing_endpoint)
         else {
             return Err(GetConnectionGroupByRoutingEndpointErrorModeled::EntityNotFound(
-                crate::state::connection_group_not_found(&input.routing_endpoint),
+                crate::state::connection_group_not_found(),
             )
             .into());
         };

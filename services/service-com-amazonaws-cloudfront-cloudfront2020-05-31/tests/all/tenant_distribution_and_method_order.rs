@@ -500,6 +500,10 @@ impl TenancyCase {
 /// The method lists this rule reorders are the MODELLED ones: `MethodsList`'s member
 /// targets the `Method` enum, so a value outside it is refused before any reordering —
 /// which is why the reordering can treat the set as a permutation of what was submitted.
+///
+/// The code is the one the operation MODELS for an argument it cannot take
+/// (`InvalidArgument`, 400): a value outside an enum's value set is such an argument, and
+/// the refusal names the member and the value set it broke.
 #[tokio::test]
 async fn a_method_outside_the_modelled_set_is_refused() {
     let router = emulator();
@@ -522,8 +526,8 @@ async fn a_method_outside_the_modelled_set_is_refused() {
         );
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "case method={value:?}: expected ValidationException, got {:?}",
+            "InvalidArgument",
+            "case method={value:?}: expected InvalidArgument, got {:?}",
             answer.error_code()
         );
     }
