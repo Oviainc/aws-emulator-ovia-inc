@@ -557,9 +557,10 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
         )
         .await;
         assert_eq!(
-            disabled["TableDescription"]["StreamSpecification"],
-            json!({"StreamEnabled": false}),
-            "case {case:?}: a disabled stream reports the flag alone, got {disabled}"
+            disabled["TableDescription"].get("StreamSpecification"),
+            None,
+            "case {case:?}: a table whose stream is off reports no StreamSpecification at \
+             all, got {disabled}"
         );
         assert_eq!(
             text(&disabled, "/TableDescription/LatestStreamArn"),

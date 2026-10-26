@@ -10,6 +10,12 @@
 //! asynchronous enable is still pending — which exposes no shards — has no shard to
 //! iterate and the request is `ResourceNotFoundException`.
 //!
+//! The two refusals a `SequenceNumber` can draw are different claims and are decided
+//! apart: a number the addressed shard's own range does not cover, or a position the
+//! request leaves out altogether, is a bad argument (`ValidationException`), while
+//! `TrimmedDataAccessException` is reserved for a position inside that range which
+//! has fallen behind the shard's retention trim point.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -223,38 +229,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "LATEST" => shard.appended(),
                 kind @ ("AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER") => {
                     let Some(sequence_number) = input.sequence_number.as_deref() else {
-                        return Err(crate::scaffolded::Scaffolded::validation(format!(
-                            "SequenceNumber is required when ShardIteratorType is {kind}"
-                        )));
+                        return Err(missing_member("SequenceNumber"));
                     };
                     if !crate::state::is_sequence_number(sequence_number) {
                         return Err(crate::scaffolded::Scaffolded::validation(
                             "SequenceNumber must contain numeric characters only",
                         ));
                     }
-                    position_at_sequence_number(
+                    match position_at_sequence_number(
                         shard,
                         sequence_number,
                         kind == "AFTER_SEQUENCE_NUMBER",
-                    )
-                    .ok_or_else(|| {
-                        GetShardIteratorErrorModeled::TrimmedDataAccessException(
-                            TrimmedDataAccessException {
-                                message: Some(format!(
-                                    "SequenceNumber {sequence_number} is older than the trim \
-                                     point of shard {}",
-                                    input.shard_id
-                                )),
-                            },
-                        )
-                    })?
+                    ) {
+                        ShardPosition::At(position) => position,
+                        // A number the shard's own range does not cover names no
+                        // position in it: a bad argument, not a checkpoint that fell
+                        // behind retention.
+                        ShardPosition::OutsideShardRange => {
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                INVALID_SEQUENCE_NUMBER,
+                            ))
+                        }
+                        ShardPosition::BeforeTrimPoint => {
+                            return Err(GetShardIteratorErrorModeled::TrimmedDataAccessException(
+                                TrimmedDataAccessException {
+                                    message: Some(format!(
+                                        "SequenceNumber {sequence_number} is older than the trim \
+                                         point of shard {}",
+                                        input.shard_id
+                                    )),
+                                },
+                            )
+                            .into())
+                        }
+                    }
                 }
                 // "Start reading from the position denoted by a specific timestamp."
                 "AT_TIMESTAMP" => {
                     let Some(timestamp) = input.timestamp else {
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            "Timestamp is required when ShardIteratorType is AT_TIMESTAMP",
-                        ));
+                        return Err(missing_member("Timestamp"));
                     };
                     let target_millis = timestamp.secs().saturating_mul(1000).saturating_add(
                         i64::from(timestamp.subsec_nanos() / 1_000_000),
@@ -291,30 +304,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The refusal a sequence number the addressed shard does not cover draws: it names
+/// no position in that shard, so the request can never work however long the caller
+/// waits. Fixed text — a bad argument is reported as what was wrong with it, and the
+/// caller already holds the shard id and the number it sent.
+const INVALID_SEQUENCE_NUMBER: &str = "Invalid SequenceNumber for the shard";
+
+/// The refusal a request that leaves out the member its `ShardIteratorType` needs
+/// draws: the type decides which member is required (`SequenceNumber` for the two
+/// sequence-number positions, `Timestamp` for `AT_TIMESTAMP`), and the member the
+/// request omitted is the only variable part of the wording.
+fn missing_member(member: &str) -> GetShardIteratorError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "One or more parameter values were invalid: {member} cannot be null"
+    ))
+}
+
+/// Where a well-formed sequence number lands in the addressed shard.
+///
+/// The two refusals are different claims: one says the request is wrong, the other
+/// says it is too late. Deciding them in one place is what keeps them from drifting
+/// apart.
+enum ShardPosition {
+    /// The absolute record position the iterator is placed at.
+    At(u64),
+    /// The number falls outside the shard's own `SequenceNumberRange`, so it names no
+    /// position in this shard at all — the number of another shard, or of no record.
+    OutsideShardRange,
+    /// Inside the shard's range, but before the oldest record the shard still
+    /// retains: the position the caller named has been trimmed.
+    BeforeTrimPoint,
+}
+
 /// The absolute position `AT_SEQUENCE_NUMBER` / `AFTER_SEQUENCE_NUMBER` names.
 ///
-/// `None` when the sequence number is older than the shard's trim point, which is
-/// the `TrimmedDataAccessException` case. A sequence number past the newest record
+/// A sequence number belongs to a shard only inside the range the shard itself
+/// advertises (`Shard$SequenceNumberRange`): at or after its
+/// `StartingSequenceNumber`, and at or before its `EndingSequenceNumber` where the
+/// shard is closed — an OPEN shard advertises none, so nothing beyond its newest
+/// record is outside it. A number past the newest record of an open shard therefore
 /// positions just past the end of the shard, the same place `LATEST` does.
 fn position_at_sequence_number(
     shard: &crate::state::StoredShard,
     sequence_number: &str,
     after: bool,
-) -> Option<u64> {
+) -> ShardPosition {
     use std::cmp::Ordering;
 
     if crate::state::compare_sequence_numbers(sequence_number, &shard.starting_sequence_number)
         == Ordering::Less
     {
-        return None;
+        return ShardPosition::OutsideShardRange;
     }
+    if shard.ending_sequence_number.as_deref().is_some_and(|ending| {
+        crate::state::compare_sequence_numbers(sequence_number, ending) == Ordering::Greater
+    }) {
+        return ShardPosition::OutsideShardRange;
+    }
+    // Inside the range the shard advertises, but the records that far back are gone:
+    // a shard that has trimmed anything retains nothing older than its oldest
+    // remaining record, and one that has trimmed everything retains nothing at all.
     if shard.trim_horizon() > 0
-        && shard.records.front().is_some_and(|oldest| {
+        && shard.records.front().is_none_or(|oldest| {
             crate::state::compare_sequence_numbers(sequence_number, &oldest.sequence_number)
                 == Ordering::Less
         })
     {
-        return None;
+        return ShardPosition::BeforeTrimPoint;
     }
     let hit = shard.records.iter().position(|record| {
         let ordering =
@@ -325,7 +381,7 @@ fn position_at_sequence_number(
             ordering != Ordering::Less
         }
     });
-    Some(hit.map_or_else(
+    ShardPosition::At(hit.map_or_else(
         || shard.appended(),
         |offset| shard.trim_horizon() + offset as u64,
     ))

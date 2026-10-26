@@ -366,6 +366,8 @@ pub struct StoredRecord {
     pub event_source: String,
     pub aws_region: String,
     pub sequence_number: String,
+    /// When the change was published, floored to a whole second by
+    /// [`floor_to_second`] — the granularity the member it feeds is reported at.
     pub approximate_creation_date_time: SystemTime,
     pub keys: AttributeMap,
     pub new_image: Option<AttributeMap>,
@@ -860,7 +862,10 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
             event_source: EVENT_SOURCE.to_string(),
             aws_region,
             sequence_number: sequence_number.clone(),
-            approximate_creation_date_time: at,
+            // Floored where it is stamped: the member it feeds is reported "rounded
+            // down to the closest second" ([`floor_to_second`]), and the stamp is the
+            // instant of the WRITE rather than of a later read.
+            approximate_creation_date_time: floor_to_second(at),
             keys: event.keys.clone(),
             new_image,
             old_image,
@@ -993,6 +998,23 @@ pub fn epoch_millis(at: SystemTime) -> i64 {
         .ok()
         .and_then(|since| i64::try_from(since.as_millis()).ok())
         .unwrap_or_default()
+}
+
+/// `at` with its sub-second component dropped: the whole second at or before it, so
+/// the value never names a moment that has not happened yet.
+///
+/// A record's creation instant is reported through
+/// `StreamRecord.ApproximateCreationDateTime`, which the model documents as "in UNIX
+/// epoch time format and rounded down to the closest second": the member carries
+/// whole seconds and nothing finer, so the instant is floored where it is STAMPED and
+/// every later read of it agrees.
+///
+/// An instant BEFORE the epoch is returned unchanged — epoch time does not reach it,
+/// and this service stamps a record from the clock, which is long past it.
+#[must_use]
+pub fn floor_to_second(at: SystemTime) -> SystemTime {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(at, |since| UNIX_EPOCH + Duration::from_secs(since.as_secs()))
 }
 
 /// Every stream ARN of one table starts with this prefix — `.../table/<name>/

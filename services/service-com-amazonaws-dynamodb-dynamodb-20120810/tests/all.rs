@@ -94,6 +94,9 @@ mod stream_identity_is_minted_once;
 #[path = "all/stream_record_images.rs"]
 mod stream_record_images;
 
+#[path = "all/stream_specification_presence.rs"]
+mod stream_specification_presence;
+
 #[path = "all/stream_specification_with_other_members.rs"]
 mod stream_specification_with_other_members;
 

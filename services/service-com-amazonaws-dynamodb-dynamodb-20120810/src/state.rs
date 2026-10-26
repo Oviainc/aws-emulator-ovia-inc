@@ -1482,6 +1482,24 @@ pub struct TableStream {
     pub enabled: bool,
 }
 
+impl TableStream {
+    /// The `StreamSpecification` a description reports for this stream, or `None`
+    /// where the stream is OFF.
+    ///
+    /// A specification describes a stream that EXISTS, so it is reported only while
+    /// the table's stream is on: a table whose stream has been turned off carries no
+    /// specification member at all, rather than one with the flag false. That
+    /// presence is how a client tells a streaming table from a quiet one — the member
+    /// is there or it is not — and a table that never enabled a stream reports none
+    /// for the same reason.
+    pub fn specification(&self) -> Option<StreamSpecification> {
+        self.enabled.then(|| StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(self.view_type.clone()),
+        })
+    }
+}
+
 /// One item-level change a landed write owes the table's stream.
 ///
 /// The data plane writes items while holding THIS service's store lock, and the
@@ -4325,13 +4343,11 @@ impl Table {
             }),
             deletion_protection_enabled: Some(self.deletion_protection_enabled),
             // "The current DynamoDB Streams configuration for the table": reported
-            // only for a table that has a stream, which is what DescribeTable does
-            // for a table that never enabled one. A disabled stream reports the flag
-            // alone, since no view type is in force.
-            stream_specification: self.stream.as_ref().map(|stream| StreamSpecification {
-                stream_enabled: stream.enabled,
-                stream_view_type: stream.enabled.then(|| stream.view_type.clone()),
-            }),
+            // only for a table whose stream is ON ([`TableStream::specification`]),
+            // which is what DescribeTable does both for a table that never enabled
+            // one and for one whose stream has been turned off. The table keeps
+            // naming its LATEST stream either way.
+            stream_specification: self.stream.as_ref().and_then(TableStream::specification),
             latest_stream_arn: self.stream.as_ref().map(|stream| stream.arn.clone()),
             latest_stream_label: self.stream.as_ref().map(|stream| stream.label.clone()),
             // "Contains details for the restore": reported only for a table a restore
@@ -4401,12 +4417,10 @@ impl Table {
                     distance_function: Some(index.distance_function.clone()),
                 })
                 .collect(),
-            // Reported for a table that has a stream, disabled or not, exactly as the
-            // table's own description reports it.
-            stream_specification: self.stream.as_ref().map(|stream| StreamSpecification {
-                stream_enabled: stream.enabled,
-                stream_view_type: stream.enabled.then(|| stream.view_type.clone()),
-            }),
+            // The stream settings the table had when the backup was taken, by the same
+            // rule its own description reports them: a stream that was OFF then is no
+            // setting to carry, so the member is absent.
+            stream_specification: self.stream.as_ref().and_then(TableStream::specification),
             // The TTL setting in force at this instant, projected exactly as the TTL
             // reader projects it, so the backup records what the table reported then.
             time_to_live_description: self.time_to_live.describe(now),
