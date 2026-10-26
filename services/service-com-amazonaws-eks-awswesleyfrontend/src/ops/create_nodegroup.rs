@@ -20,7 +20,11 @@
 //! same 404 every other cluster-scoped operation of this service gives (see the
 //! `extra_errors` widening below) — never a complaint about a sibling member; only the
 //! pass-role authorization (403), which is decided from the value alone and names no
-//! resource of this service, precedes it.
+//! resource of this service, precedes it. Once the cluster resolves, what the REQUEST
+//! alone decides comes first (an empty `subnets` list names no subnet whichever cluster
+//! was named) and the facts about the CLUSTER — the Amazon EKS-managed-plane gate, the
+//! cluster's Kubernetes version — follow, because Amazon EKS validates the payload it
+//! was sent before it reports on the cluster that payload would create in.
 //!
 //! ## Shape of an operation
 //!
@@ -366,23 +370,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The lock is taken only to resolve it and is released again, because the EC2
         // call below is an `await` and this store's guard is not held across one.
         let cluster_key = (region.clone(), input.cluster_name.clone());
-        {
+        let cluster_is_connected = {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
             let Some(cluster) = guard.clusters.get(&cluster_key) else {
                 return Err(cluster_not_found(&input.cluster_name));
             };
-            // A managed node group is a resource of the Amazon EKS-managed plane, and a
-            // cluster `RegisterCluster` connected has none of that plane: EKS does not
-            // manage its nodes, so this operation does not apply to it at all. The gate
-            // is a fact about the CLUSTER, so it is answered as soon as the cluster is
-            // resolved, before anything in the body is judged against it.
-            if cluster.is_connected() {
-                return Err(CreateNodegroupErrorModeled::ClientException(
-                    state::connected_cluster_refusal(&input.cluster_name),
-                )
-                .into());
-            }
+            // Read here, acted on below: whether Amazon EKS manages this cluster's nodes
+            // is settled when the cluster is created and a cluster never changes kind, so
+            // one resolution answers both this and the gate past the payload rules.
+            cluster.is_connected()
+        };
+
+        // THE PAYLOAD BEFORE THE CLUSTER'S OWN FACTS: `subnets` is a required member,
+        // but the model bounds no length, so an empty list reaches this handler — and it
+        // names no subnet for "the Auto Scaling group that is created for your node
+        // group" (`CreateNodegroupRequest$subnets`), whichever cluster the request named.
+        // A request Amazon EKS could not serve against ANY cluster is reported as the bad
+        // parameter it is, before the gate below asks what kind of cluster this one is.
+        if input.subnets.is_empty() {
+            return Err(invalid_parameter(
+                &input.cluster_name,
+                &input.nodegroup_name,
+                "subnets must name at least 1 subnet, got 0".to_string(),
+            ));
+        }
+
+        // A managed node group is a resource of the Amazon EKS-managed plane, and a
+        // cluster `RegisterCluster` connected has none of that plane: EKS does not
+        // manage its nodes, so this operation does not apply to it at all. The gate is a
+        // fact about the CLUSTER, so it is answered as soon as the cluster is resolved,
+        // before anything the body says about the cluster is judged.
+        if cluster_is_connected {
+            return Err(CreateNodegroupErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
         }
 
         // The cluster resolved, so the resources the body names can be resolved too: the
@@ -432,17 +455,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let cluster_name = input.cluster_name.as_str();
         let nodegroup_name = input.nodegroup_name.as_str();
-
-        // `subnets` is a required member, but the model bounds no length: an
-        // empty list names no subnet for "the Auto Scaling group that is created
-        // for your node group" (`CreateNodegroupRequest$subnets`).
-        if input.subnets.is_empty() {
-            return Err(invalid_parameter(
-                cluster_name,
-                nodegroup_name,
-                "subnets must name at least 1 subnet, got 0".to_string(),
-            ));
-        }
 
         // "The root device disk size (in GiB) for your node group instances"
         // (`CreateNodegroupRequest$diskSize`) — a disk is at least one GiB. The

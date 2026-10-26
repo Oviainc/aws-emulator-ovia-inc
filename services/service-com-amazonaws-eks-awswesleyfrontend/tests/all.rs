@@ -55,6 +55,8 @@ mod connected_clusters;
 mod encryption_config_association;
 #[path = "all/error_class_selection.rs"]
 mod error_class_selection;
+#[path = "all/fargate_profiles.rs"]
+mod fargate_profiles;
 #[path = "all/identity_provider_config.rs"]
 mod identity_provider_config;
 #[path = "all/identity_provider_config_not_found.rs"]

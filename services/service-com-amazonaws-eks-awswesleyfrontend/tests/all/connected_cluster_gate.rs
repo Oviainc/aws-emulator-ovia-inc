@@ -82,9 +82,8 @@ struct Probe {
 /// capability, certificate authority, control-plane update, cluster insights) and
 /// along the shape of the call (create, read, list, update, delete), because the
 /// rule is about the cluster, not about one operation. The scaffolded operations
-/// of the same plane (`ListAddons`, `ListNodegroups`, `CreateFargateProfile`,
-/// `UpdateAccessEntry`, … — each with its own open stub issue) still answer 501
-/// and so are not probed here.
+/// of the same plane (`ListAddons`, `ListNodegroups`, `UpdateAccessEntry`, … — each
+/// with its own open stub issue) still answer 501 and so are not probed here.
 ///
 /// Every body satisfies the modelled constraints, so what the emulator answers
 /// comes from the handler and not from the boundary validator — with ONE
@@ -128,6 +127,28 @@ fn probes(cluster: &str) -> Vec<Probe> {
             "DescribeNodegroup",
             "GET",
             format!("/clusters/{label}/node-groups/probe-nodegroup"),
+            String::new(),
+        ),
+        probe(
+            // Its payload is SOUND — one selector with a namespace — because the
+            // selectors a Fargate profile declares with are judged from the request
+            // alone and so are reported before this gate (pinned by
+            // `fargate_profiles`); the gate is what answers a request there is
+            // nothing wrong with.
+            "CreateFargateProfile",
+            "POST",
+            format!("/clusters/{label}/fargate-profiles"),
+            serde_json::json!({
+                "fargateProfileName": "probe-fargate-profile",
+                "podExecutionRoleArn": role_arn("eksFargatePodExecutionRole"),
+                "selectors": [{ "namespace": "default" }],
+            })
+            .to_string(),
+        ),
+        probe(
+            "DescribeFargateProfile",
+            "GET",
+            format!("/clusters/{label}/fargate-profiles/probe-fargate-profile"),
             String::new(),
         ),
         probe(

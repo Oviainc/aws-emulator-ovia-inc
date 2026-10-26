@@ -12,6 +12,13 @@
 //! from that record, so a node group's server-generated parts (its ARN,
 //! `createdAt`, defaults) are written once and read back unchanged.
 //!
+//! It also holds the Fargate profile slice: `CreateFargateProfile` writes a
+//! [`FargateProfileRecord`] here and `DescribeFargateProfile` computes its whole
+//! response from that record, so a profile's server-generated parts (its ARN and
+//! `createdAt`) are written once and read back unchanged. A profile lives INSIDE
+//! a cluster, so its key carries the cluster's key and `DeleteCluster` drops the
+//! profiles of the cluster it removes.
+//!
 //! One record covers both kinds of cluster this API knows: an Amazon EKS cluster
 //! `CreateCluster` provisions a control plane for, and an external Kubernetes
 //! cluster `RegisterCluster` connects. The members only a provisioned control
@@ -78,7 +85,8 @@ use crate::ops::types::{
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
     Certificate, ClientException, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
-    ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
+    ControlPlaneScalingConfig, EncryptionConfig, FargateProfile, FargateProfileHealth,
+    FargateProfileSelector, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, NodeRepairConfig,
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
@@ -640,6 +648,55 @@ pub fn default_disk_size_gib(ami_type: &str) -> i32 {
         DEFAULT_DISK_SIZE_GIB
     }
 }
+
+/// The `FargateProfileStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="FargateProfileStatus"`) is
+/// `CREATING | ACTIVE | DELETING | CREATE_FAILED | DELETE_FAILED`;
+/// `FargateProfile$status` carries that enum and this slice stores the wire
+/// token.
+///
+/// Its own constants rather than the cluster slice's [`STATUS_CREATING`]:
+/// `FargateProfileStatus` and `ClusterStatus` are different enums that only
+/// happen to share these two tokens, so a change to one must not silently
+/// change the other — the same reasoning as [`ADDON_STATUS_CREATING`].
+pub const FARGATE_PROFILE_STATUS_CREATING: &str = "CREATING";
+/// See [`FARGATE_PROFILE_STATUS_CREATING`].
+pub const FARGATE_PROFILE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a newly created Fargate profile reports `CREATING` before the clock
+/// owes it `ACTIVE`.
+///
+/// `CreateFargateProfile` publishes no duration for the provisioning, so this
+/// span is CHOSEN rather than cited — the same reasoning as
+/// [`CLUSTER_ACTIVATION_DELAY`]: long enough that a caller which describes the
+/// profile straight after creating it still observes `CREATING`, short enough to
+/// be worth waiting for. The due instant is stored on the record; nothing sleeps
+/// for it.
+pub const FARGATE_PROFILE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The number of selectors one Fargate profile may carry.
+///
+/// "Each profile can have up to five selectors that contain a namespace and
+/// labels" (`CreateFargateProfile`), restated on the member itself: "You may
+/// specify up to five selectors in a Fargate profile"
+/// (`CreateFargateProfileRequest$selectors`). The model expresses no length
+/// bound for the list, so the handler is what enforces it.
+pub const MAX_SELECTORS_PER_FARGATE_PROFILE: usize = 5;
+
+/// The number of Fargate profiles one cluster holds before
+/// `CreateFargateProfile` answers `ResourceLimitExceededException`.
+///
+/// AWS publishes an adjustable EKS service quota of 10 Fargate profiles per
+/// cluster, and exceeding a service limit is exactly what that error reports —
+/// the same reading as [`MAX_NODEGROUPS_PER_CLUSTER`].
+pub const MAX_FARGATE_PROFILES_PER_CLUSTER: usize = 10;
+
+/// The number of Fargate profiles this store holds ACROSS EVERY CLUSTER AND
+/// REGION before `CreateFargateProfile` answers
+/// `ResourceLimitExceededException`, for the reason
+/// [`MAX_STORED_NODEGROUPS`] spells out: the caller decides how many clusters
+/// and regions exist, so the per-cluster quota alone does not bound the store.
+pub const MAX_STORED_FARGATE_PROFILES: usize = MAX_FARGATE_PROFILES_PER_CLUSTER * 100;
 
 /// The number of capabilities one cluster can hold.
 ///
@@ -2019,6 +2076,74 @@ impl NodegroupRecord {
     }
 }
 
+/// One Fargate profile, as this service stores it.
+///
+/// Everything a `FargateProfile` reports is held here — including the
+/// server-generated `fargateProfileArn` and `createdAt` — so
+/// `DescribeFargateProfile` returns exactly what the create wrote rather than
+/// recomputing anything per request. A profile is IMMUTABLE ("Fargate profiles
+/// are immutable", `CreateFargateProfile`), so nothing but the clock-owed status
+/// move ever changes a stored record.
+#[derive(Debug, Clone)]
+pub struct FargateProfileRecord {
+    pub fargate_profile_name: String,
+    pub cluster_name: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    pub pod_execution_role_arn: String,
+    /// The subnets the request named, as it named them. Amazon EKS launches the
+    /// profile's Pods into these ("The IDs of subnets to launch a Pod into",
+    /// `FargateProfile$subnets`); a request that named none carries an empty
+    /// list, because this emulator cannot tell a private subnet of the cluster's
+    /// VPC from a public one and so has none to choose on the caller's behalf.
+    pub subnets: Vec<String>,
+    pub selectors: Vec<FargateProfileSelector>,
+    pub status: String,
+    /// When set, the instant at which the clock owes this profile the move from
+    /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub tags: BTreeMap<String, String>,
+    pub client_request_token: Option<String>,
+}
+
+impl FargateProfileRecord {
+    /// Materialise the status move the clock already owes at `now`. See
+    /// [`ClusterRecord::materialize_due_transitions`].
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = FARGATE_PROFILE_STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `FargateProfile` shape.
+    pub fn to_fargate_profile(&self) -> FargateProfile {
+        FargateProfile {
+            fargate_profile_name: Some(self.fargate_profile_name.clone()),
+            fargate_profile_arn: Some(self.arn.clone()),
+            cluster_name: Some(self.cluster_name.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            pod_execution_role_arn: Some(self.pod_execution_role_arn.clone()),
+            subnets: Some(self.subnets.clone()),
+            selectors: Some(self.selectors.clone()),
+            status: Some(self.status.clone()),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            // Nothing in this emulator reports a Fargate profile issue, so the
+            // health block is present and empty rather than absent: "Any issues
+            // that are associated with the Fargate profile"
+            // (`FargateProfileHealth$issues`).
+            health: Some(FargateProfileHealth {
+                issues: Some(Vec::new()),
+            }),
+        }
+    }
+}
+
 /// The `AddonStatus` members this slice uses. The model's enum
 /// (`smithy_query query="shape" shape="AddonStatus"`) is
 /// `CREATING | ACTIVE | CREATE_FAILED | UPDATING | DELETING | DELETE_FAILED |
@@ -3079,6 +3204,17 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// and tagging a node group through `TagResource` belongs to the tag slice's
     /// own gap issue.
     pub nodegroups: BTreeMap<(String, String, String), NodegroupRecord>,
+    /// Fargate profiles by `(region, cluster name, Fargate profile name)`.
+    ///
+    /// A Fargate profile is a resource INSIDE one cluster — it is addressed as
+    /// `/clusters/{clusterName}/fargate-profiles/{fargateProfileName}` — and a
+    /// cluster name identifies a cluster only within one region (see
+    /// [`Self::clusters`]), so the key is the whole triple: the same profile name
+    /// may exist in another cluster or another region. A `BTreeMap` so a listing
+    /// walks one cluster's profiles as a contiguous, name-sorted range. Its size
+    /// is bounded by [`MAX_STORED_FARGATE_PROFILES`], which
+    /// `CreateFargateProfile` enforces.
+    pub fargate_profiles: BTreeMap<(String, String, String), FargateProfileRecord>,
     /// Add-ons by `(region, cluster name, add-on name)`.
     ///
     /// An add-on is a resource INSIDE one cluster — `CreateAddon`'s `clusterName`
@@ -3143,6 +3279,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
             clusters: BTreeMap::new(),
             arn_index: BTreeMap::new(),
             nodegroups: BTreeMap::new(),
+            fargate_profiles: BTreeMap::new(),
             addons: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             pod_identity_associations: BTreeMap::new(),
@@ -3172,6 +3309,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         }
         for nodegroup in self.nodegroups.values_mut() {
             nodegroup.materialize_due_transitions(now);
+        }
+        for profile in self.fargate_profiles.values_mut() {
+            profile.materialize_due_transitions(now);
         }
         for addon in self.addons.values_mut() {
             addon.materialize_due_transitions(now);
@@ -3420,6 +3560,44 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 key_region != region || key_cluster != cluster_name
             });
     }
+
+    /// The Fargate profiles this store holds in `cluster_name` in `region`, in
+    /// profile-name order.
+    ///
+    /// The map is keyed `(region, cluster, profile)`, so one cluster's profiles
+    /// are a contiguous, name-sorted RANGE of it — the same walk
+    /// [`Self::nodegroups_of`] makes over its own child resource.
+    pub fn fargate_profiles_of<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a FargateProfileRecord> + 'a {
+        self.fargate_profiles
+            .range((
+                std::ops::Bound::Included((
+                    region.to_string(),
+                    cluster_name.to_string(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, key_cluster, _), _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, record)| record)
+    }
+
+    /// Drop every Fargate profile of one cluster.
+    ///
+    /// A Fargate profile is a child of its cluster, so once the cluster is gone
+    /// its profiles are gone with it, and a cluster later created with the same
+    /// name in the same Region does not inherit them.
+    pub fn remove_fargate_profiles_for_cluster(&mut self, region: &str, cluster_name: &str) {
+        self.fargate_profiles
+            .retain(|(key_region, key_cluster, _), _| {
+                key_region != region || key_cluster != cluster_name
+            });
+    }
 }
 
 /// The region a request is signed for, read from its SigV4 credential scope.
@@ -3622,6 +3800,31 @@ pub fn derive_nodegroup_id(
 /// recomputes it.
 pub fn derive_addon_resource_id(region: &str, cluster_name: &str, addon_name: &str) -> String {
     derive_uuid_from_seed(&format!("{region}/{cluster_name}/{addon_name}"))
+}
+
+/// The Fargate profile's own identifier, the last segment of its
+/// `fargateProfileArn`.
+///
+/// An EKS Fargate profile ARN is
+/// `arn:aws:eks:<region>:<account>:fargateprofile/<cluster>/<profile>/<id>`,
+/// where the trailing id distinguishes two profiles that carried the same name
+/// at different times. It is derived from the region, the two names and the
+/// creation instant — so it is distinct per creation and stable — through
+/// [`derive_uuid_from_seed`], the one renderer for this service's UUID-shaped
+/// identifiers. It is computed once, when the profile is created, and stored on
+/// the record; no read recomputes it.
+pub fn derive_fargate_profile_id(
+    region: &str,
+    cluster_name: &str,
+    fargate_profile_name: &str,
+    created_at: SystemTime,
+) -> String {
+    let created_nanos = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    derive_uuid_from_seed(&format!(
+        "{region}/{cluster_name}/{fargate_profile_name}/{created_nanos}"
+    ))
 }
 
 /// The add-on's ARN, in the form EKS publishes:

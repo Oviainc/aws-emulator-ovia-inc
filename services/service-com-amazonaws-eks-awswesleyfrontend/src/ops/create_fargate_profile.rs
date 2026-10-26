@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFargateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFargateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a Fargate profile for an Amazon EKS cluster and persists it in this
+//! service's state, so `DescribeFargateProfile` reads back exactly what was
+//! written. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFargateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ORDER: the pass-role authorization `podExecutionRoleArn` earns comes first — it
+//! names no resource of this service — then `clusterName`, this operation's
+//! `@httpLabel`, is resolved (404 for a cluster this region does not hold). What
+//! follows is decided from the REQUEST ALONE: the selectors a Fargate profile
+//! cannot work without, their count and their namespaces. Only then is the request
+//! judged against the CLUSTER it named — the Amazon EKS-managed-plane gate, the
+//! name the cluster already holds, the quota — because Amazon EKS validates the
+//! payload it was sent before it asks what kind of cluster the profile would hang
+//! off. The subnets go last of all: resolving them is a call out to EC2.
 //!
 //! ## Shape of an operation
 //!
@@ -113,9 +117,22 @@
 //!   cluster subnets is in an Availability Zone that does not support Amazon EKS. The
 //!   exception output specifies the supported Availability Zones for your account, from which
 //!   you can choose subnets for your cluster.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   model's `errors` list for this operation omits it, but the SERVICE models it and it is
+//!   what a pass-role this caller may not perform is refused with.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the model's `errors` list for this operation omits it, but the SERVICE models it and it
+//!   is this API's 404 for a `clusterName` that resolves to no cluster.
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    self, FargateProfileRecord, FARGATE_PROFILE_ACTIVATION_DELAY,
+    FARGATE_PROFILE_STATUS_CREATING, MAX_FARGATE_PROFILES_PER_CLUSTER,
+    MAX_SELECTORS_PER_FARGATE_PROFILE, MAX_STORED_FARGATE_PROFILES,
+};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -128,13 +145,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `CreateFargateProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#CreateFargateProfile")]
+// `AccessDeniedException` and `ResourceNotFoundException` are widened in through
+// `extra_errors` for the reasons `CreateNodegroup` spells out, and they hold here for
+// the same two members: `podExecutionRoleArn` is a role Amazon EKS passes to the
+// Fargate infrastructure, so a role this caller may not pass is a PERMISSION failure
+// (403); and `clusterName` is an `@httpLabel`, so a request can name a cluster that
+// does not exist, which is ABSENCE (404) — the one answer every cluster-scoped
+// operation of this service gives it — rather than a bad parameter.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#CreateFargateProfile",
+    extra_errors = ["AccessDeniedException", "ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateFargateProfileErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceLimitExceededException(ResourceLimitExceededException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServerException(ServerException),
     UnsupportedAvailabilityZoneException(UnsupportedAvailabilityZoneException),
 }
@@ -173,6 +202,215 @@ impl<Eng> CreateFargateProfile<Eng> {
     }
 }
 
+/// A 400 `InvalidParameterException` naming the cluster, the Fargate profile and
+/// the constraint the request broke.
+///
+/// Every rule it reports is one `CreateFargateProfile`'s own documentation states
+/// but the model does not express as a constraint, so none of them is refused
+/// before this handler runs: "The specified parameter is invalid. Review the
+/// available parameters for the API request" is exactly what reports them.
+fn invalid_parameter(
+    cluster_name: &str,
+    fargate_profile_name: &str,
+    message: String,
+) -> CreateFargateProfileError {
+    CreateFargateProfileErrorModeled::InvalidParameterException(InvalidParameterException {
+        cluster_name: Some(cluster_name.to_string()),
+        fargate_profile_name: Some(fargate_profile_name.to_string()),
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The 404 this operation answers for a `clusterName` that resolves to nothing.
+///
+/// The cluster is the resource whose absence is reported, so the payload names only
+/// it and never the profile the request asked for: see
+/// [`crate::state::cluster_not_found`] for the one rule this service's not-found
+/// payloads follow.
+fn cluster_not_found(cluster_name: &str) -> CreateFargateProfileError {
+    CreateFargateProfileErrorModeled::ResourceNotFoundException(state::cluster_not_found(
+        cluster_name,
+    ))
+    .into()
+}
+
+/// Why the request's `selectors` are not selectors a Fargate profile can be built
+/// from, or `None` when they are.
+///
+/// This is decided from the REQUEST ALONE — it consults no cluster and no store —
+/// which is why it runs before anything about the cluster is judged.
+fn selector_refusal(selectors: &[FargateProfileSelector]) -> Option<String> {
+    // "You must have at least one Fargate profile in a cluster to be able to run
+    // pods on Fargate... This declaration is done through the profile's selectors"
+    // (`CreateFargateProfile`): a profile with no selector matches no Pod, so it
+    // declares nothing. The member is optional in the model, so an absent or empty
+    // list reaches this handler.
+    if selectors.is_empty() {
+        return Some("Fargate Profile must have at least one selector".to_string());
+    }
+    // "Each profile can have up to five selectors"
+    // (`CreateFargateProfileRequest$selectors`).
+    if selectors.len() > MAX_SELECTORS_PER_FARGATE_PROFILE {
+        return Some(format!(
+            "Fargate Profile must have no more than {MAX_SELECTORS_PER_FARGATE_PROFILE} \
+             selectors, got {}",
+            selectors.len()
+        ));
+    }
+    // "A namespace is required for every selector" (`CreateFargateProfile`), and
+    // "Each selector must have an associated Kubernetes namespace"
+    // (`CreateFargateProfileRequest$selectors`). `FargateProfileSelector$namespace`
+    // is modelled optional, so a selector without one reaches this handler.
+    if selectors.iter().any(|selector| {
+        selector
+            .namespace
+            .as_deref()
+            .is_none_or(|namespace| namespace.trim().is_empty())
+    }) {
+        return Some("Fargate Profile selector must have a namespace".to_string());
+    }
+    None
+}
+
+/// What judging the request against the cluster it named decides.
+///
+/// A plain enum rather than a `Result`: the refusal travels in a variant, so this
+/// helper's signature does not put the operation's whole error channel — a
+/// multi-variant enum of payload structures — in a `Result` every successful
+/// create would carry too.
+enum Verdict {
+    /// Nothing in the store stands in the way: create the profile.
+    Create,
+    /// An idempotent retry of the call that already created this profile: answer
+    /// with that profile rather than creating a second one.
+    Replay(FargateProfile),
+    /// The store answers this request with a refusal, which this carries.
+    Refuse(CreateFargateProfileError),
+}
+
+/// Judge the request against the cluster it names and the profiles that cluster
+/// already holds.
+///
+/// Everything here needs the STORE, which is why it runs after the rules decided
+/// from the request alone. It is called once before the EC2 resolution below (so a
+/// refusal costs no call out) and once more under the lock that writes, because
+/// the store can move while that call is awaited.
+fn judge_against_cluster(
+    state: &crate::state::ComAmazonawsEksAwswesleyfrontendState,
+    region: &str,
+    input: &CreateFargateProfileInput,
+) -> Verdict {
+    let cluster_name = input.cluster_name.as_str();
+    let profile_name = input.fargate_profile_name.as_str();
+    let Some(cluster) = state
+        .clusters
+        .get(&(region.to_string(), input.cluster_name.clone()))
+    else {
+        return Verdict::Refuse(cluster_not_found(cluster_name));
+    };
+    // Fargate is part of the Amazon EKS-managed plane of a cluster, and a cluster
+    // `RegisterCluster` connected has none of that plane: EKS schedules none of its
+    // Pods, so this operation does not apply to it at all. The gate is a fact about
+    // the CLUSTER, so it is answered as soon as the cluster is consulted.
+    if cluster.is_connected() {
+        return Verdict::Refuse(
+            CreateFargateProfileErrorModeled::ClientException(state::connected_cluster_refusal(
+                cluster_name,
+            ))
+            .into(),
+        );
+    }
+
+    // A Fargate profile name identifies a profile WITHIN its cluster, which is what
+    // the key spells, so the same name in another cluster or region is a different
+    // profile. "Fargate profiles are immutable. However, you can create a new
+    // updated profile to replace an existing profile and then delete the original"
+    // (`CreateFargateProfile`): a second create under a name the cluster already
+    // holds is refused rather than replacing it. This operation models no conflict
+    // error, and what the request is wrong about is what the cluster already holds —
+    // "The request is invalid given the state of the cluster"
+    // (`InvalidRequestException`).
+    if let Some(existing) = state.fargate_profiles.get(&(
+        region.to_string(),
+        input.cluster_name.clone(),
+        input.fargate_profile_name.clone(),
+    )) {
+        // `clientRequestToken` is `@idempotencyToken`: an SDK generates it once per
+        // call and RESENDS the same value when it retries, so a retry of the call
+        // that created this profile is absorbed and answered with that profile
+        // rather than with a conflict. A blank token identifies nothing, so it never
+        // matches. As in `CreateNodegroup`, the comparison is on the token alone.
+        let replayed_token = input
+            .client_request_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty());
+        if let Some(token) = replayed_token {
+            if existing.client_request_token.as_deref() == Some(token) {
+                return Verdict::Replay(existing.to_fargate_profile());
+            }
+        }
+        return Verdict::Refuse(
+            CreateFargateProfileErrorModeled::InvalidRequestException(InvalidRequestException {
+                cluster_name: Some(input.cluster_name.clone()),
+                message: Some(format!(
+                    "Fargate Profile already exists with name: {profile_name} and cluster \
+                     name: {cluster_name}"
+                )),
+                ..Default::default()
+            })
+            .into(),
+        );
+    }
+
+    // The EKS "Fargate profiles per cluster" service quota. Exceeding a service
+    // limit is what `ResourceLimitExceededException` reports.
+    if state.fargate_profiles_of(region, cluster_name).count() >= MAX_FARGATE_PROFILES_PER_CLUSTER {
+        return Verdict::Refuse(limit_exceeded(
+            input,
+            format!(
+                "You have reached the limit of {MAX_FARGATE_PROFILES_PER_CLUSTER} Fargate \
+                 profiles for this cluster"
+            ),
+        ));
+    }
+    // What BOUNDS THE STORE is this ceiling, not the per-cluster quota above: the
+    // caller decides how many clusters and regions exist, so the per-cluster quota
+    // alone would let repeated creates retain an unbounded number of records.
+    if state.fargate_profiles.len() >= MAX_STORED_FARGATE_PROFILES {
+        return Verdict::Refuse(limit_exceeded(
+            input,
+            format!(
+                "You have reached the limit of {MAX_STORED_FARGATE_PROFILES} Fargate profiles \
+                 for this account"
+            ),
+        ));
+    }
+    Verdict::Create
+}
+
+/// The 400 `ResourceLimitExceededException` a create past a limit earns.
+///
+/// The payload names the cluster the limit was reached in and nothing else:
+/// `ResourceLimitExceededException` models no `fargateProfileName` member
+/// (`smithy_query query="shape" shape="ResourceLimitExceededException"`), and the
+/// limit is a fact about the cluster or the account rather than about the profile
+/// the request asked for.
+fn limit_exceeded(
+    input: &CreateFargateProfileInput,
+    message: String,
+) -> CreateFargateProfileError {
+    CreateFargateProfileErrorModeled::ResourceLimitExceededException(
+        ResourceLimitExceededException {
+            cluster_name: Some(input.cluster_name.clone()),
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateFargateProfile<Eng>
 {
@@ -190,18 +428,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFargateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFargateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFargateProfile"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFargateProfileError::from(CreateFargateProfileErrorModeled::ServerException(
+                ServerException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    message: Some("the eks emulator store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            ))
+        })?;
+
+        let region = state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let cluster_name = input.cluster_name.as_str();
+        let profile_name = input.fargate_profile_name.as_str();
+
+        // AUTHORIZATION FIRST, before the store is consulted and before anything is
+        // written: the Pod execution role is "added to the cluster's Kubernetes Role
+        // Based Access Control (RBAC)" and assumed by the Fargate infrastructure, so
+        // the same pass-role rule `CreateCluster` and `CreateNodegroup` apply to their
+        // own roles decides whether this caller may hand it over
+        // ([`state::pass_role_refusal`]).
+        if let Some(why) = state::pass_role_refusal(&input.pod_execution_role_arn) {
+            return Err(CreateFargateProfileErrorModeled::AccessDeniedException(
+                AccessDeniedException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // THE PARENT RESOURCE NEXT: `clusterName` is this operation's `@httpLabel`, a
+        // Fargate profile belongs to one cluster, and a cluster name identifies a
+        // cluster only within one region, so the cluster is resolved in the region the
+        // request is signed for before anything in the body is reported on. A create
+        // against a cluster that does not exist reports the MISSING CLUSTER, so the
+        // caller's recovery (create the parent, retry) is the one the answer points at.
+        let cluster_key = (region.clone(), input.cluster_name.clone());
+        {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(now);
+            if !guard.clusters.contains_key(&cluster_key) {
+                return Err(cluster_not_found(cluster_name));
+            }
+        }
+
+        // THE PAYLOAD, BEFORE THE CLUSTER IT NAMES IS CONSULTED AGAIN: the selectors
+        // are judged from the request alone, so a request that could not be served
+        // against ANY cluster is reported as the bad parameter it is rather than as a
+        // fact about the cluster it happened to name.
+        if let Some(why) = selector_refusal(input.selectors.as_deref().unwrap_or_default()) {
+            return Err(invalid_parameter(cluster_name, profile_name, why));
+        }
+
+        // NOW the request is judged against the cluster. The lock is taken only to
+        // decide this much and is released again, because the EC2 call below is an
+        // `await` and this store's guard is not held across one.
+        match judge_against_cluster(&store.lock(), &region, &input) {
+            Verdict::Refuse(refusal) => return Err(refusal),
+            Verdict::Replay(profile) => {
+                return Ok(CreateFargateProfileOutput {
+                    fargate_profile: Some(profile),
+                })
+            }
+            Verdict::Create => {}
+        }
+
+        // The Pods of this profile are launched into the subnets the request names, so
+        // those subnets have to exist — resolved against EC2, which owns them, exactly
+        // as `CreateCluster` and `CreateNodegroup` resolve their own
+        // ([`state::unresolved_subnet_refusal`]). It runs with no lock held: it is a
+        // call out to another service.
+        let subnets = input.subnets.clone().unwrap_or_default();
+        if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, &subnets).await {
+            return Err(invalid_parameter(cluster_name, profile_name, why));
+        }
+
+        let mut guard = store.lock();
+        guard.materialize_due_transitions(now);
+
+        // The lock was released for that call, so everything that depends on the store
+        // is decided AGAIN, against the store as it is now: a delete or a competing
+        // create that landed in between is answered the same way it would have been
+        // before.
+        match judge_against_cluster(&guard, &region, &input) {
+            Verdict::Refuse(refusal) => return Err(refusal),
+            Verdict::Replay(profile) => {
+                return Ok(CreateFargateProfileOutput {
+                    fargate_profile: Some(profile),
+                })
+            }
+            Verdict::Create => {}
+        }
+
+        let profile_id = state::derive_fargate_profile_id(&region, cluster_name, profile_name, now);
+        let arn = ::engine::emulator_arn(
+            "eks",
+            &region,
+            &format!("fargateprofile/{cluster_name}/{profile_name}/{profile_id}"),
+        );
+
+        let record = FargateProfileRecord {
+            fargate_profile_name: input.fargate_profile_name.clone(),
+            cluster_name: input.cluster_name.clone(),
+            arn,
+            created_at: now,
+            pod_execution_role_arn: input.pod_execution_role_arn.clone(),
+            subnets,
+            selectors: input.selectors.clone().unwrap_or_default(),
+            status: FARGATE_PROFILE_STATUS_CREATING.to_string(),
+            active_at: Some(now + FARGATE_PROFILE_ACTIVATION_DELAY),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            client_request_token: input.client_request_token.clone(),
+        };
+
+        let fargate_profile = record.to_fargate_profile();
+        guard.fargate_profiles.insert(
+            (
+                region,
+                input.cluster_name.clone(),
+                input.fargate_profile_name.clone(),
+            ),
+            record,
+        );
+
+        Ok(CreateFargateProfileOutput {
+            fargate_profile: Some(fargate_profile),
+        })
     }
 }
