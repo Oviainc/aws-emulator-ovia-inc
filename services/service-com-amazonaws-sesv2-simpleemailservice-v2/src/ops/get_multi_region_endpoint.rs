@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMultiRegionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMultiRegionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMultiRegionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored multi-region endpoint (global-endpoint) the request names, when
+//! its primary region is the Region the call executes in. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMultiRegionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMultiRegionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMultiRegionEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetMultiRegionEndpoint without the shared emulator state",
+            ));
+        };
+
+        // "Only multi-region endpoints whose primary region is the AWS-Region where
+        // operation is executed will be displayed."
+        let region = crate::state::request_region(ctx.parts());
+        let name = input.endpoint_name;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting only: the provisioning transition was already due at `now`, so
+        // materialising it changes nothing a later caller would otherwise have seen.
+        store.settle(now);
+        let Some(record) = store.multi_region_endpoints.get(&(region, name)) else {
+            return Err(GetMultiRegionEndpointErrorModeled::NotFoundException(
+                crate::state::multi_region_endpoint_not_found(),
+            )
+            .into());
+        };
+
+        Ok(GetMultiRegionEndpointOutput {
+            endpoint_name: Some(record.name.clone()),
+            endpoint_id: Some(record.endpoint_id.clone()),
+            routes: Some(record.routes()),
+            status: Some(record.status.as_str().to_string()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
+                record.last_updated_at,
+            )),
+        })
     }
 }
