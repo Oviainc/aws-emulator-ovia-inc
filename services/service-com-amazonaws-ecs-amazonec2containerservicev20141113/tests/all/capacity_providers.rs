@@ -56,8 +56,9 @@ fn group_arn(name: &str) -> String {
 
 /// A managed-instances provider configuration, with the members the model requires
 /// (`infrastructureRoleArn`, `instanceLaunchTemplate.ec2InstanceProfileArn` and that
-/// template's `networkConfiguration`).
-fn managed_instances() -> Value {
+/// template's `networkConfiguration`). Shared with the daemon suite, which needs a
+/// MANAGED_INSTANCES provider to create a daemon over.
+pub(crate) fn managed_instances() -> Value {
     json!({
         "infrastructureRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/ecsInfrastructureRole"),
         "instanceLaunchTemplate": {

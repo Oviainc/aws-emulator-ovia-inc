@@ -89,16 +89,6 @@
 use super::types::*;
 use crate::state::template;
 
-/// What a body that is neither valid JSON nor valid YAML — or one past a documented
-/// per-template quota, which [`template::parse`] refuses the same way — is refused with.
-///
-/// "CloudFormation first checks if the template is valid JSON. If it isn't,
-/// CloudFormation checks if the template is valid YAML. If both these checks fail,
-/// CloudFormation returns a template validation error."
-const TEMPLATE_FORMAT_ERROR: &str = "Template format error: the template body is not \
-     well-formed JSON or YAML, or declares more than a template's documented maximum \
-     number of resources, outputs or parameters";
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -200,9 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same verdict the operations that SUBMIT a template for deployment give it.
         crate::state::validate_template_quotas(template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // A body this service's reader will not read at all, refused with the one wording
+        // every operation that reads a body gives it.
         let Some(template) = template::parse(template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                TEMPLATE_FORMAT_ERROR,
+                template::NOT_WELL_FORMED,
             ));
         };
         // "Resources (required): Specifies the stack resources and their properties" is
@@ -211,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is missing, empty or untyped is refused rather than reported as valid.
         if template.resources.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Template format error: At least one Resources member must be defined.",
+                template::NO_RESOURCES_DECLARED,
             ));
         }
         if template

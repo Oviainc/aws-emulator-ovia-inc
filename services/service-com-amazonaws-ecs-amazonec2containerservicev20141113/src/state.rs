@@ -60,6 +60,7 @@ use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
     ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
+    DaemonDeploymentConfiguration, DaemonSummary,
     DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkBinding,
@@ -631,6 +632,29 @@ pub const DAEMON_NAMESPACE_MODE_NONE: &str = "none";
 /// How many daemon task-definition revisions this emulator holds, across every family.
 /// EMULATOR-CHOSEN, for the same reason as [`MAX_TASK_DEFINITIONS`].
 pub const MAX_DAEMON_TASK_DEFINITIONS: usize = MAX_TASK_DEFINITIONS;
+
+/// `DaemonStatus` for a daemon `CreateDaemon` has created. One of the `DaemonStatus`
+/// values (`smithy_query(query="shape", shape="DaemonStatus")`: `ACTIVE`,
+/// `DELETE_IN_PROGRESS`) and the one a create answers with: the daemon is there and
+/// usable from that instant, so no clock-owed transition leads to it.
+pub const DAEMON_ACTIVE: &str = "ACTIVE";
+
+/// Whether `critical` is on for a daemon whose create named nothing. The member's doc:
+/// "The default value is true."
+pub const DAEMON_CRITICAL_DEFAULT: bool = true;
+
+/// How many daemons this emulator holds, across every cluster. EMULATOR-CHOSEN, for the
+/// same reason as [`MAX_SERVICES`].
+pub const MAX_DAEMONS: usize = MAX_SERVICES;
+
+/// `InvalidParameterException$message` for a `capacityProviderArns` that names a capacity
+/// provider whose type is not [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`].
+///
+/// The `CreateDaemon` doc: "ECS Managed Daemons is only supported for Amazon ECS Managed
+/// Instances Capacity Providers" — a condition of the LIST as a whole, so the sentence
+/// states the rule and names neither the entry at fault nor the type it carried.
+pub const DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE: &str =
+    "All capacity providers must be of MANAGED_INSTANCES type for Daemon services";
 
 /// The `SortOrder` value that REVERSES a listing's documented default order — the
 /// `ListTaskDefinitions$sort` doc: "Setting this parameter to `DESC` reverses the sort
@@ -1240,6 +1264,20 @@ pub const TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE: &str = "TaskDefinition not f
 /// request named.
 pub const DAEMON_TASK_DEFINITION_NOT_FOUND_MESSAGE: &str =
     "Unable to describe daemon task definition.";
+
+/// `ClientException$message` for a `daemonTaskDefinitionArn` that names no stored daemon
+/// revision on a call that would PUT that revision to work — create a daemon on it. The
+/// daemon resource's form of [`TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE`]: one fixed
+/// sentence naming neither the family nor the revision the request carried.
+pub const DAEMON_TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE: &str =
+    "DaemonTaskDefinition not found.";
+
+/// `InvalidParameterException$message` for a `daemonTaskDefinitionArn` that names a
+/// revision this store HOLDS in a status that can run no new work — the daemon
+/// resource's form of [`TASK_DEFINITION_INACTIVE_MESSAGE`], for the statuses a requested
+/// delete moves a revision through ([`DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS`],
+/// [`DAEMON_TASK_DEFINITION_DELETED`]).
+pub const DAEMON_TASK_DEFINITION_INACTIVE_MESSAGE: &str = "DaemonTaskDefinition is inactive";
 
 /// `InvalidParameterException$message` for a `taskDefinition` that names a revision this
 /// store holds in a status that cannot run new work — the `DeregisterTaskDefinition` doc:
@@ -2294,6 +2332,67 @@ impl DaemonTaskDefinitionRecord {
     }
 }
 
+/// A DAEMON, as `CreateDaemon` created it.
+///
+/// "A daemon deploys cross-cutting software agents such as security monitoring,
+/// telemetry, and logging independently across your Amazon ECS infrastructure": it is a
+/// resource of its own cluster, built on the daemon task definition it runs and the
+/// capacity providers whose container instances it runs on — which is why those two are
+/// stored as what the create RESOLVED them to rather than as the references it carried.
+#[derive(Debug, Clone)]
+pub struct DaemonRecord {
+    pub name: String,
+    pub arn: String,
+    pub cluster_name: String,
+    pub cluster_arn: String,
+    /// `DaemonStatus`: [`DAEMON_ACTIVE`] for a daemon that was created and not deleted.
+    pub status: String,
+    /// The daemon task-definition REVISION this daemon runs, as its ARN — the revision
+    /// the create resolved, so a later registration in the same family does not move it.
+    pub daemon_task_definition_arn: String,
+    /// The capacity providers the daemon deploys onto, by NAME (the key
+    /// `capacity_providers` holds them under), in the order the request named them.
+    pub capacity_provider_names: Vec<String>,
+    /// `deploymentConfiguration`: "Optional deployment parameters that control how the
+    /// daemon rolls out updates". `None` when the create named none, which is what the
+    /// member being optional means.
+    pub deployment_configuration: Option<DaemonDeploymentConfiguration>,
+    /// `propagateTags`, one of the `DaemonPropagateTags` values. "If you don't specify a
+    /// value, the tags aren't propagated" — the same `NONE` [`PROPAGATE_TAGS_NONE`]
+    /// spells for the service-level member.
+    pub propagate_tags: String,
+    pub enable_ecs_managed_tags: bool,
+    pub enable_execute_command: bool,
+    /// `critical`: "If the critical parameter of a daemon is true, and the daemon task
+    /// fails, stops, or becomes unhealthy, Amazon ECS drains the container instance",
+    /// defaulted at creation ([`DAEMON_CRITICAL_DEFAULT`]) so every read reports it.
+    pub critical: bool,
+    pub tags: Vec<Tag>,
+    /// The `clientToken` the create carried, so a repeat of the SAME create is answered
+    /// with the stored daemon instead of a second one.
+    pub client_token: Option<String>,
+    /// `CreateDaemonResponse$deploymentArn`: "The Amazon Resource Name (ARN) of the
+    /// initial daemon deployment", minted with the daemon.
+    pub deployment_arn: String,
+    pub created_at: DateTime,
+    /// `DaemonSummary$updatedAt`: "when the daemon was last updated" — the creation
+    /// instant until something updates the daemon.
+    pub updated_at: DateTime,
+}
+
+impl DaemonRecord {
+    /// The `DaemonSummary` a listing reports for this daemon — "A summary of a daemon",
+    /// built from the stored record so a listing cannot drift from what was created.
+    pub fn summary(&self) -> DaemonSummary {
+        DaemonSummary {
+            daemon_arn: Some(self.arn.clone()),
+            status: Some(self.status.clone()),
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+        }
+    }
+}
+
 /// A task, as `RunTask` created it and `StopTask`/the clock left it.
 #[derive(Debug, Clone)]
 pub struct TaskRecord {
@@ -2881,6 +2980,10 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// kept beside `task_definitions`: a revision number is never reused, even after the
     /// revision that held it is deleted.
     pub next_daemon_revision: HashMap<String, i32>,
+    /// `daemonArn` -> the daemon. A daemon ARN carries the cluster that hosts it and the
+    /// daemon's own name (`daemon/<cluster>/<name>`), so this one key is what makes a
+    /// daemon name unique within its cluster and free in every other.
+    pub daemons: HashMap<String, DaemonRecord>,
     /// `taskArn` -> the task.
     pub tasks: HashMap<String, TaskRecord>,
     /// `containerInstanceArn` -> the registered container instance.
@@ -2929,6 +3032,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     next_service_event_seq: u64,
     /// Monotonic source of task-set ids, so every task set of every service is distinct.
     next_task_set_seq: u64,
+    /// Monotonic source of daemon-deployment ids, so every deployment of every daemon is
+    /// distinct.
+    next_daemon_deployment_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -3214,6 +3320,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             cluster_name,
             service_name,
             &format!("{:019}", self.next_service_revision_seq),
+        )
+    }
+
+    /// Mint the ARN of the DAEMON DEPLOYMENT that places a daemon's tasks — the
+    /// `CreateDaemon$deploymentArn` doc: "the initial daemon deployment. This deployment
+    /// places daemon tasks on each container instance of the specified capacity
+    /// providers". The counter is what makes every deployment of every daemon distinct,
+    /// and it is fixed-width, so sorting two of these ARNs orders them oldest first.
+    pub fn next_daemon_deployment_arn(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        daemon_name: &str,
+    ) -> String {
+        self.next_daemon_deployment_seq += 1;
+        daemon_deployment_arn(
+            region,
+            cluster_name,
+            daemon_name,
+            &format!("{:019}", self.next_daemon_deployment_seq),
         )
     }
 
@@ -5576,6 +5702,42 @@ pub fn daemon_task_definition_arn(region: &str, family: &str, revision: i32) -> 
         ARN_NAMESPACE,
         region,
         &format!("{DAEMON_TASK_DEFINITION_RESOURCE_TYPE}/{family}:{revision}"),
+    )
+}
+
+/// The ARN resource type a DAEMON is named under, as the resource segment of
+/// [`daemon_arn`] — its own resource, beside the cluster's services and tasks.
+pub const DAEMON_RESOURCE_TYPE: &str = "daemon";
+
+/// The ARN of a daemon: `arn:aws:ecs:<region>:<account>:daemon/<cluster>/<name>`. A
+/// daemon is created IN a cluster, so its ARN carries that cluster the way a service's
+/// does ([`service_arn`]).
+pub fn daemon_arn(region: &str, cluster_name: &str, daemon_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{DAEMON_RESOURCE_TYPE}/{cluster_name}/{daemon_name}"),
+    )
+}
+
+/// The ARN resource type a DAEMON DEPLOYMENT is named under, as the resource segment of
+/// [`daemon_deployment_arn`].
+pub const DAEMON_DEPLOYMENT_RESOURCE_TYPE: &str = "daemon-deployment";
+
+/// The ARN of a daemon deployment:
+/// `arn:aws:ecs:<region>:<account>:daemon-deployment/<cluster>/<daemon>/<id>`.
+pub fn daemon_deployment_arn(
+    region: &str,
+    cluster_name: &str,
+    daemon_name: &str,
+    deployment_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!(
+            "{DAEMON_DEPLOYMENT_RESOURCE_TYPE}/{cluster_name}/{daemon_name}/{deployment_id}"
+        ),
     )
 }
 

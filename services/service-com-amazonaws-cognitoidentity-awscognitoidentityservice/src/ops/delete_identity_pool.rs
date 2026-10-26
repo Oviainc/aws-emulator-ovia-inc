@@ -155,6 +155,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST, before the pool is read or removed: a
+        // developer-credentials operation of this service is served only to a caller whose
+        // identity-based IAM policies allow its own action on the resource the request
+        // names, so a caller holding no grant is told it is not authorized rather than told
+        // whether that pool exists — and the pool survives the refusal.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
+        ) {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteIdentityPoolErrorModeled::InternalErrorException(
                 InternalErrorException {

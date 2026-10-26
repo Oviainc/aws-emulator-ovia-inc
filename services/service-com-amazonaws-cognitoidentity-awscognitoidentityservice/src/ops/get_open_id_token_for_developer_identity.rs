@@ -200,7 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Authorization comes first, before any identity is minted: this is a
+        // developer-credentials operation ("You must use Amazon Web Services developer
+        // credentials to call this operation"), so it is served only to a caller whose
+        // identity-based IAM policies allow its own action on the pool the request names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
+        ) {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetOpenIdTokenForDeveloperIdentityErrorModeled::InternalErrorException(

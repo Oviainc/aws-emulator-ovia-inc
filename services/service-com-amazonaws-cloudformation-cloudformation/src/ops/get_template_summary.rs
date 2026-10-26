@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplateSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTemplateSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! What this operation answers is computed from ONE template body: the one the request
+//! carries, or the one the stack it names holds. It reports what that body
+//! DECLARES — its format version, its `Description`, its `Metadata` section, one
+//! declaration per parameter, the capabilities its resources require, the resource types
+//! it defines and the transforms it declares — and writes nothing, so two callers
+//! summarising the same template get the same answer and neither changes what a later one
+//! sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTemplateSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A stack is summarised at the stage CloudFormation DEPLOYED ("CloudFormation processes
+//! the template fragments" a macro is given and works with what came back), so the
+//! resource types reported for a stack are the types that stack's resources have.
+//! "GetTemplateSummary returns the template information for up to 90 days after the stack
+//! has been deleted", which is as long as this store keeps a deleted stack at all, and "if
+//! the template doesn't exist, a ValidationError is returned".
+//!
+//! Two parts of the surface are NOT summarised here, each for a reason the handler states
+//! where it answers: a `StackSetName`, because this store holds a StackSet's identity and
+//! its stack instances but no template for it, and `ResourceIdentifierSummaries`, whose
+//! identifier properties are a resource type's published primary identifier — something
+//! this emulator's type catalogue deliberately carries none of
+//! ([`crate::state::resource_schema`]).
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +138,104 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{resource_types, template};
+
+/// How a request that does not name exactly ONE template is refused.
+///
+/// "Conditional: You must specify only one of the following parameters: StackName,
+/// StackSetName, TemplateBody, or TemplateURL" (`GetTemplateSummaryInput$TemplateBody` and
+/// each of its three alternatives), so a request naming none of them and one naming two
+/// are refused the same way: neither names the one template a summary is of.
+const ONE_TEMPLATE_ONLY: &str = "You must specify only one of the following parameters: \
+     StackName, StackSetName, TemplateBody, or TemplateURL";
+
+/// Which template the request asks for a summary of.
+enum Summarised<'a> {
+    /// `TemplateBody`: the body the request itself carries.
+    Body(&'a str),
+    /// `StackName`: "the name or the stack ID that's associated with the stack", running or
+    /// deleted.
+    Stack(&'a str),
+    /// `StackSetName`: "the name or unique ID of the StackSet from which the stack was
+    /// created".
+    StackSet(&'a str),
+}
+
+/// One `ParameterDeclaration`: what the `Parameters` section declares for one parameter.
+///
+/// Every member the declaration states is reported, and `NoEcho` for every parameter
+/// (`false` being its documented default). `ParameterConstraints` carries the one
+/// constraint CloudFormation reports — "although other constraints might be defined in the
+/// stack template, CloudFormation returns only the AllowedValues property" — and no
+/// `AllowedValues` for a parameter whose declaration permits any value of its type.
+fn parameter_declaration(declared: &template::DeclaredParameter) -> ParameterDeclaration {
+    ParameterDeclaration {
+        parameter_key: Some(declared.key.clone()),
+        default_value: declared.default.clone(),
+        parameter_type: declared.declared_type.clone(),
+        no_echo: Some(declared.no_echo),
+        description: declared.description.clone(),
+        parameter_constraints: Some(ParameterConstraints {
+            allowed_values: (!declared.allowed_values.is_empty())
+                .then(|| declared.allowed_values.clone()),
+        }),
+    }
+}
+
+/// The summary of one template: every member computed from what that template declares.
+fn summary_of(
+    declared: &template::Template,
+    unrecognized: Vec<String>,
+) -> GetTemplateSummaryOutput {
+    let required = template::required_capabilities(declared);
+    GetTemplateSummaryOutput {
+        // One declaration per declared parameter — "a list of parameter declarations that
+        // describe various properties for each parameter" — and the EMPTY list for a
+        // template declaring no `Parameters` section, because "no parameters" is itself
+        // what a client summarising a template before a stack operation reads.
+        parameters: Some(
+            declared
+                .parameters
+                .iter()
+                .map(parameter_declaration)
+                .collect(),
+        ),
+        // "The value that's defined in the Description property of the template."
+        description: declared.description.clone(),
+        // "The capabilities found within the template", reported only where the template
+        // declares something that has to be acknowledged, together with the resources that
+        // generated them — the same reading `ValidateTemplate` reports.
+        capabilities: (!required.capabilities.is_empty()).then_some(required.capabilities),
+        capabilities_reason: required.reason,
+        resource_types: Some(template::declared_resource_types(declared)),
+        // "The Amazon Web Services template format version, which identifies the
+        // capabilities of the template": the one the template states, and nothing for a
+        // template that states none.
+        version: declared.format_version.clone(),
+        // "The value that's defined for the Metadata property of the template", as the JSON
+        // document it is. `properties_blob` is this crate's one serializer of a template
+        // node into that document, members in key order so the text does not depend on how
+        // the workspace was built.
+        metadata: template::properties_blob(&declared.metadata),
+        // "A list of the transforms that are declared in the template."
+        declared_transforms: (!declared.transforms.is_empty())
+            .then(|| declared.transforms.clone()),
+        // `ResourceIdentifierSummaries` describes "the target resources of an import
+        // operation and the properties you can provide during the import to identify the
+        // target resources" — which property identifies a resource of a type is that type's
+        // published primary identifier, and this emulator's resource-type catalogue
+        // deliberately carries none (`crate::state::resource_schema`). The member is
+        // reported ABSENT rather than filled with a property guessed from the type's name.
+        resource_identifier_summaries: None,
+        // "A list of all of the unrecognized resource types. This is only returned if the
+        // TemplateSummaryConfig parameter has the TreatUnrecognizedResourceTypesAsWarnings
+        // configuration set to True" — the only configuration under which such a template
+        // is summarised at all rather than refused.
+        warnings: (!unrecognized.is_empty()).then_some(Warnings {
+            unrecognized_resource_types: Some(unrecognized),
+        }),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -195,18 +305,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTemplateSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTemplateSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplateSummary"))
+        // Which template this is a summary of. A `TemplateURL` names a template in an
+        // Amazon S3 bucket or a Systems Manager document, which would have to be fetched
+        // over the network — this emulator makes no outbound connections, so it is answered
+        // 501 rather than with a summary of a template nobody read.
+        let summarised = match (
+            input.template_body.as_deref(),
+            input.template_url.as_deref(),
+            input.stack_name.as_deref(),
+            input.stack_set_name.as_deref(),
+        ) {
+            (Some(body), None, None, None) => Summarised::Body(body),
+            (None, Some(_), None, None) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GetTemplateSummary with TemplateURL (fetching a template from Amazon S3)",
+                ))
+            }
+            (None, None, Some(name_or_id), None) => Summarised::Stack(name_or_id),
+            (None, None, None, Some(name_or_id)) => Summarised::StackSet(name_or_id),
+            _ => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    ONE_TEMPLATE_ONLY,
+                ))
+            }
+        };
+
+        // The body summarised below, owned, so nothing holds the store lock while the
+        // template is read: a caller-sized body is parsed outside it.
+        let template_body: String = match summarised {
+            Summarised::Body(body) => {
+                // The documented `TemplateBody` maximum and the documented per-template
+                // quotas, which the model carries no constraint for — the same rules every
+                // operation that takes a body is held to.
+                crate::state::validate_template_body(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                crate::state::validate_template_quotas(body)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                body.to_string()
+            }
+            Summarised::Stack(name_or_id) => {
+                let Some(state) = crate::state::service_state(&*self.engine) else {
+                    // Not the shared in-memory engine: there is no stack store to read, so
+                    // this answers 501 rather than a summary of a template nobody holds.
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "GetTemplateSummary",
+                    ));
+                };
+                let region = crate::state::request_region(ctx.parts());
+                let mut store = state.lock();
+                // Reporting operation: the only write is materialising a status transition
+                // the clock had already made due, which was owed whether or not anyone
+                // called.
+                store.settle(::std::time::SystemTime::now());
+                // "You can get template information for a StackSet, or a running or deleted
+                // stack" — a deleted stack is addressable by its stack id, which is what
+                // `resolve` honours. "If the template doesn't exist, a ValidationError is
+                // returned."
+                let stack = store.resolve(&region, name_or_id).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(name_or_id),
+                    )
+                })?;
+                // The stage CloudFormation DEPLOYED, so the types this summary reports are
+                // the types the stack's resources have. A stack a `CREATE` change set
+                // created carries no template at all, and one whose transforms this service
+                // cannot apply has no processed stage — the condition `GetTemplate` answers
+                // 501 for, for the same reason: there is no processed document to report on.
+                match (stack.processed_stage_body(), &stack.template_body) {
+                    (Some(body), _) => body.to_string(),
+                    (None, Some(_)) => {
+                        let reason = stack
+                            .processed_template
+                            .unavailable_reason()
+                            .unwrap_or_default()
+                            .to_string();
+                        return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                            "GetTemplateSummary for a stack whose template cannot be \
+                             processed here: {reason}"
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::template_does_not_exist(name_or_id, &stack.status),
+                        ))
+                    }
+                }
+            }
+            Summarised::StackSet(name_or_id) => {
+                let Some(state) = crate::state::service_state(&*self.engine) else {
+                    // Not the shared in-memory engine: there is no StackSet store to read.
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "GetTemplateSummary",
+                    ));
+                };
+                let region = crate::state::request_region(ctx.parts());
+                let mut store = state.lock();
+                store.settle(::std::time::SystemTime::now());
+                // A StackSet's summary is the summary of ITS template, and a `StackSetName`
+                // this administrator account and Region holds no StackSet for is the
+                // modelled `StackSetNotFoundException` ("The specified StackSet doesn't
+                // exist"). `CallAs` chooses which administrator account the call is made
+                // from, and this emulator holds one such account's StackSets, so either
+                // value reads the same store.
+                store.resolve_stack_set(&region, name_or_id).ok_or_else(|| {
+                    GetTemplateSummaryErrorModeled::StackSetNotFoundException(
+                        StackSetNotFoundException {
+                            message: Some(crate::state::stack_set_does_not_exist(name_or_id)),
+                        },
+                    )
+                })?;
+                // The store keeps a StackSet's identity and its stack instances, not the
+                // template it deploys: the operations that would put one there
+                // (`CreateStackSet`, `UpdateStackSet`) are scaffold stubs with issues of
+                // their own, so there is no template to summarise and this answers 501
+                // rather than an empty summary.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GetTemplateSummary for a StackSet (this emulator stores no StackSet \
+                     template yet)",
+                ));
+            }
+        };
+
+        // Read by the SAME reader every other operation reads a template with, so the
+        // summary and the deployment cannot disagree about what a body declares, and a body
+        // it will not read is refused with the one wording every such operation gives it.
+        let Some(declared) = crate::state::declared_template(&template_body) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                template::NOT_WELL_FORMED,
+            ));
+        };
+        if declared.resources.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                template::NO_RESOURCES_DECLARED,
+            ));
+        }
+
+        // "If set to True, any unrecognized resource types generate warnings and not an
+        // error. Any unrecognized resource types are returned in the Warnings output
+        // parameter" — so without that configuration a template declaring a type
+        // CloudFormation does not recognise is REFUSED, which is the answer every operation
+        // reading such a template for deployment gives it. Which types those are, and the
+        // rule that a template declaring a transform is held to no catalogue at all, come
+        // from the one place that owns them.
+        let unrecognized = resource_types::unrecognized_in(&declared);
+        let treat_as_warnings = input
+            .template_summary_config
+            .as_ref()
+            .and_then(|config| config.treat_unrecognized_resource_types_as_warnings)
+            .unwrap_or(false);
+        if !unrecognized.is_empty() && !treat_as_warnings {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                resource_types::unrecognized_message(&unrecognized),
+            ));
+        }
+
+        Ok(summary_of(&declared, unrecognized))
     }
 }

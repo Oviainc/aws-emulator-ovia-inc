@@ -143,7 +143,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Authorization comes first: a listing of the account's pools names no single pool,
+        // so it is decided against (and refused about) the account's identity pools in the
+        // region the request is signed for.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListIdentityPoolsErrorModeled::InternalErrorException(
                 InternalErrorException {

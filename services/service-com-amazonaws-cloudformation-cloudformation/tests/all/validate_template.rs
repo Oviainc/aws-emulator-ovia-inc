@@ -30,12 +30,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::TEMPLATE_BODY_MA
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, list_members, member, router, router_with_engine, store, xml_text, xml_unescape,
+    call, list_members, member, outside_parameters, reason_resource_types, router,
+    router_with_engine, store, xml_text, xml_unescape, CAPABILITIES_REASON_PREFIX,
 };
-
-/// The fixed form of `CapabilitiesReason`: "the list of resources that generated the
-/// values in the Capabilities response element".
-const REASON_PREFIX: &str = "The following resource(s) require capabilities: [";
 
 /// One `TemplateParameter` as the response carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,18 +96,6 @@ fn wire_parameters(xml: &str) -> Vec<WireParameter> {
         .collect()
 }
 
-/// The response with its `Parameters` block removed, so reading a top-level element does
-/// not pick up a parameter's own `Description` (the envelope carries `Parameters` first).
-fn outside_parameters(xml: &str) -> String {
-    let close = "</Parameters>";
-    match (xml.find("<Parameters>"), xml.find(close)) {
-        (Some(start), Some(end)) => {
-            format!("{}{}", &xml[..start], &xml[end + close.len()..])
-        }
-        _ => xml.to_string(),
-    }
-}
-
 /// The `Capabilities` the response reports.
 fn wire_capabilities(xml: &str) -> Vec<String> {
     list_members(xml, "Capabilities")
@@ -125,22 +110,6 @@ fn wire_transforms(xml: &str) -> Vec<String> {
         .iter()
         .map(|entry| entry.trim().to_string())
         .collect()
-}
-
-/// The resource types a `CapabilitiesReason` names, sorted — the set matters, the order
-/// the reader happened to walk the `Resources` section in does not.
-fn reason_resource_types(reason: &str) -> Vec<String> {
-    let inner = reason
-        .strip_prefix(REASON_PREFIX)
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or_default();
-    let mut types: Vec<String> = inner
-        .split(", ")
-        .filter(|entry| !entry.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    types.sort();
-    types
 }
 
 async fn validate(router: &MultiServiceRouter, template_body: &str) -> (u16, String) {
@@ -428,9 +397,9 @@ async fn validate_template_reports_what_the_template_body_declares() {
                 panic!("case {label:?}: expected a CapabilitiesReason, got {body}")
             });
             assert!(
-                reason.starts_with(REASON_PREFIX) && reason.ends_with(']'),
+                reason.starts_with(CAPABILITIES_REASON_PREFIX) && reason.ends_with(']'),
                 "case {label:?}: expected a reason of the form \
-                 {REASON_PREFIX}…], got {reason:?}"
+                 {CAPABILITIES_REASON_PREFIX}…], got {reason:?}"
             );
             assert_eq!(
                 reason_resource_types(&reason),
