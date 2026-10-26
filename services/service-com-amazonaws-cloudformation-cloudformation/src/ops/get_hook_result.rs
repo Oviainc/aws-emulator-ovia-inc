@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHookResult
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHookResult`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHookResult::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the ONE Hook invocation result this account and Region persists
+//! ([`crate::state::hook_results`]) under the `HookResultId` the request names, and
+//! refuses with the modelled `HookResultNotFoundException` when it holds none under it.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +98,63 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::hook_results::StoredHookResult;
+
+/// The refusal of a request that names no result to report on. `HookResultId` is "the
+/// unique identifier (ID) of the Hook invocation result that you want details about" and
+/// is the only member this operation takes, so a request without it names nothing — a bad
+/// request, in the same wording this service refuses an absent member with elsewhere
+/// (`CreateStack`: "Either TemplateBody or TemplateURL must be specified"), rather than a
+/// result that does not exist.
+const NO_HOOK_RESULT_ID: &str = "HookResultId must be specified";
+
+/// One stored invocation result as the detailed read reports it: "detailed information and
+/// remediation guidance for a Hook invocation result".
+///
+/// Every member comes off the record. The three a summary does not carry
+/// (`OriginalTypeName`, `Target`, `Annotations`) are reported exactly when the record holds
+/// them, and the two a summary reports under the `ListHookResults` target form
+/// (`TargetType`, `TargetId`) are not members of this output at all — this operation
+/// addresses ONE result by its id, so it has no target form to withhold anything for.
+fn hook_result_detail(stored: &StoredHookResult) -> GetHookResultOutput {
+    GetHookResultOutput {
+        hook_result_id: Some(stored.hook_result_id.clone()),
+        invocation_point: Some(stored.invocation_point.clone()),
+        failure_mode: Some(stored.failure_mode.clone()),
+        type_name: Some(stored.type_name.clone()),
+        original_type_name: stored.original_type_name.clone(),
+        type_version_id: Some(stored.type_version_id.clone()),
+        type_configuration_version_id: stored.type_configuration_version_id.clone(),
+        type_arn: Some(stored.type_arn.clone()),
+        status: Some(stored.status.clone()),
+        hook_status_reason: stored.hook_status_reason.clone(),
+        invoked_at: Some(crate::state::timestamp(stored.invoked_at)),
+        target: stored.target.as_ref().map(|target| HookTarget {
+            target_type: target.target_type.clone(),
+            target_type_name: target.target_type_name.clone(),
+            target_id: target.target_id.clone(),
+            action: target.action.clone(),
+        }),
+        // "A list of objects with additional information and guidance that can help you
+        // resolve a failed Hook invocation": an invocation that produced none reports no
+        // list rather than an empty one, since the list is guidance about a failure and
+        // not this read's own collection.
+        annotations: crate::state::non_empty(
+            stored
+                .annotations
+                .iter()
+                .map(|annotation| Annotation {
+                    annotation_name: annotation.annotation_name.clone(),
+                    status: annotation.status.clone(),
+                    status_message: annotation.status_message.clone(),
+                    remediation_message: annotation.remediation_message.clone(),
+                    remediation_link: annotation.remediation_link.clone(),
+                    severity_level: annotation.severity_level.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +224,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHookResult` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHookResultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHookResult"))
+        // The one member this operation takes is what selects the result to report on, so
+        // a request without it is refused rather than answered.
+        let Some(hook_result_id) = input.hook_result_id.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_HOOK_RESULT_ID,
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no invocation-result store to
+            // read, so this answers 501 rather than a result nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetHookResult",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // The ONE record this Region holds under that id. An id no invocation of this
+        // Region was recorded under names no result to report on, which is the modelled
+        // `HookResultNotFoundException` (HTTP 404, awsQuery code `HookResultNotFound`);
+        // its message is the fixed sentence [`crate::state::HOOK_RESULT_NOT_FOUND`].
+        let stored = store.hook_result(&region, hook_result_id).ok_or_else(|| {
+            GetHookResultErrorModeled::HookResultNotFoundException(HookResultNotFoundException {
+                message: Some(crate::state::HOOK_RESULT_NOT_FOUND.to_string()),
+            })
+        })?;
+
+        Ok(hook_result_detail(stored))
     }
 }

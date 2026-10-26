@@ -61,7 +61,9 @@
 //! that document is caller-sized as well as caller-counted),
 //! [`PAGE_SIZE`] items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`]
 //! resources per `DescribeStackResources` response (the documented cap on that
-//! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results,
+//! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results
+//! each carrying at most [`hook_results::MAX_ANNOTATIONS_PER_RESULT`] annotations (both
+//! oldest-first),
 //! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set,
 //! [`stack_sets::MAX_STACK_SETS`] stack sets with
 //! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first),
@@ -3112,15 +3114,36 @@ impl ComAmazonawsCloudformationCloudformationState {
     }
 
     /// Record one Hook invocation result. The oldest record is reclaimed past
-    /// [`hook_results::MAX_HOOK_RESULTS`], so the store cannot grow without limit.
+    /// [`hook_results::MAX_HOOK_RESULTS`], and the oldest annotation of the record past
+    /// [`hook_results::MAX_ANNOTATIONS_PER_RESULT`], so neither growth site can grow
+    /// without limit.
     ///
     /// This is the ONLY way a record enters the store: a Hook invocation is what produces
     /// one, and [`hook_results`] is where what can and cannot produce one is written down.
-    pub fn record_hook_result(&mut self, result: hook_results::StoredHookResult) {
+    pub fn record_hook_result(&mut self, mut result: hook_results::StoredHookResult) {
+        let excess = result
+            .annotations
+            .len()
+            .saturating_sub(hook_results::MAX_ANNOTATIONS_PER_RESULT);
+        result.annotations.drain(..excess);
         while self.hook_results.len() >= hook_results::MAX_HOOK_RESULTS {
             self.hook_results.remove(0);
         }
         self.hook_results.push(result);
+    }
+
+    /// The ONE recorded Hook invocation result this Region holds under `hook_result_id`,
+    /// or `None` when no record of it carries that id: a result is addressed by "the
+    /// unique identifier (ID) of the Hook invocation result", within the Region the
+    /// reading request was signed for, the way every other read of this service is.
+    pub fn hook_result(
+        &self,
+        region: &str,
+        hook_result_id: &str,
+    ) -> Option<&hook_results::StoredHookResult> {
+        self.hook_results
+            .iter()
+            .find(|result| result.region == region && result.has_id(hook_result_id))
     }
 
     /// Record one resource-handler invocation. The oldest record is reclaimed past
@@ -4013,6 +4036,14 @@ pub fn extension_does_not_exist(identifier: &str) -> String {
 pub fn drift_detection_does_not_exist(detection_id: &str) -> String {
     format!("Drift detection with id {detection_id} does not exist")
 }
+
+/// The `HookResultNotFoundException` message CloudFormation answers when a request names a
+/// Hook invocation result this account and Region does not hold — an id no invocation was
+/// recorded under, one another Region holds, or one this store no longer retains.
+///
+/// A FIXED sentence, unlike the messages above: this refusal states that the result was not
+/// found and names nothing of the request, so there is no member to interpolate.
+pub const HOOK_RESULT_NOT_FOUND: &str = "The hook result was not found.";
 
 /// The message CloudFormation answers when a request names a `PhysicalResourceId` no
 /// stack has deployed: such a request names its stack only through that resource, so what
