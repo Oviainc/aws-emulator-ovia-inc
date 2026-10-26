@@ -20,7 +20,12 @@
 //! * a create whose `RouteServerEndpointId` resolves to no endpoint of the account is
 //!   refused with `InvalidRouteServerEndpointId.NotFound`, and that refusal comes BEFORE
 //!   the BGP options are read, so it is the answer even when those options are themselves
-//!   invalid.
+//!   invalid;
+//! * a DELETE takes the peer the request names DOWN — it answers that stored peer, member
+//!   for member, in the non-terminal `deleting` state the clock then owes `deleted`,
+//!   whatever state the peer was in before the call; an id resolving to no peer of the
+//!   account is refused with `InvalidRouteServerPeerId.NotFound`; and a peer whose deletion
+//!   is already underway is refused with `IncorrectState` rather than deleted twice.
 //!
 //! Every table row is a distinct input along what those rules generalise over — the ASN at
 //! both published bounds and inside both recommended private ranges, each published
@@ -1423,4 +1428,433 @@ async fn describe_route_server_peers_refuses_a_foreign_token_and_performs_no_dry
         reported, stored,
         "case \"DryRun=false\": expected every peer, got {reported:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The delete
+// ---------------------------------------------------------------------------
+
+/// One row of the delete table: a peer to create and the state it must be in when the
+/// delete arrives.
+struct DeleteCase<'a> {
+    case: &'a str,
+    endpoint: &'a Endpoint,
+    peer_address: &'a str,
+    peer_asn: &'a str,
+    liveness: Option<&'a str>,
+    tags: Vec<(&'a str, &'a str)>,
+    /// Whether to wait for the create's own clock-owed move before deleting, so the delete
+    /// is exercised both on a peer still coming up and on one already up.
+    wait_for_available: bool,
+}
+
+/// `DeleteRouteServerPeer` on `peer_id`, as its HTTP status and XML body.
+async fn delete_peer(router: &MultiServiceRouter, peer_id: &str) -> (u16, String) {
+    call(
+        router,
+        "DeleteRouteServerPeer",
+        &[param("RouteServerPeerId", peer_id)],
+    )
+    .await
+}
+
+/// The state `DescribeRouteServerPeers` reports for `peer_id`.
+async fn described_state(case: &str, router: &MultiServiceRouter, peer_id: &str) -> String {
+    let body = call_ok(
+        case,
+        router,
+        "DescribeRouteServerPeers",
+        &indexed("RouteServerPeerId", &[peer_id]),
+    )
+    .await;
+    peer_member(case, &body, "state")
+        .unwrap_or_else(|| panic!("case {case:?}: no <state> in {body}"))
+}
+
+/// The rule: `DeleteRouteServerPeer` takes the stored peer the request names down — it
+/// answers that peer as the store then holds it, in the non-terminal `deleting` state, with
+/// every other member the one the create stored, and the CLOCK (not a later call) owes it
+/// the terminal `deleted` one transition span later.
+///
+/// The rows differ along what the rule generalises over: the state the peer is in when the
+/// delete arrives (still `pending`, so the `available` move it was owed must not happen
+/// after the delete, and `available`), the BGP options and tag count it carries, and which
+/// endpoint — and so which route server, VPC and subnet — it belongs to.
+#[tokio::test]
+async fn delete_route_server_peer_puts_the_peer_into_deleting_and_the_clock_owes_it_deleted() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    assert!(
+        subnets.len() >= 2,
+        "the account must hold at least two subnets to place two endpoints into, got {subnets:?}"
+    );
+    let first_server = create_route_server("the first route server", &router, "64512").await;
+    let second_server = create_route_server("the second route server", &router, "4200000000").await;
+    let first = create_endpoint("the first endpoint", &router, &first_server, &subnets[0]).await;
+    let second = create_endpoint("the second endpoint", &router, &second_server, &subnets[1]).await;
+
+    let cases: Vec<DeleteCase<'_>> = vec![
+        DeleteCase {
+            case: "a peer deleted while it is still coming up",
+            endpoint: &first,
+            peer_address: "10.0.3.11",
+            peer_asn: "1",
+            liveness: None,
+            tags: Vec::new(),
+            wait_for_available: false,
+        },
+        DeleteCase {
+            case: "a tagged BFD peer deleted once it is available",
+            endpoint: &first,
+            peer_address: "172.16.0.201",
+            peer_asn: "65000",
+            liveness: Some(ec2::state::PEER_LIVENESS_BFD),
+            tags: vec![("role", "firewall"), ("tier", "edge")],
+            wait_for_available: true,
+        },
+        DeleteCase {
+            case: "a peer of the second endpoint deleted once it is available",
+            endpoint: &second,
+            peer_address: "203.0.113.19",
+            peer_asn: "4294967295",
+            liveness: Some(ec2::state::PEER_LIVENESS_BGP_KEEPALIVE),
+            tags: vec![("role", "appliance")],
+            wait_for_available: true,
+        },
+    ];
+
+    let mut deleted: Vec<(&str, String)> = Vec::new();
+    for DeleteCase {
+        case,
+        endpoint,
+        peer_address,
+        peer_asn,
+        liveness,
+        tags,
+        wait_for_available,
+    } in cases
+    {
+        let created = call_ok(
+            case,
+            &router,
+            "CreateRouteServerPeer",
+            &peer_params(&endpoint.id, peer_address, peer_asn, liveness, &tags),
+        )
+        .await;
+        let peer_id = peer_member(case, &created, "routeServerPeerId")
+            .unwrap_or_else(|| panic!("case {case:?}: no routeServerPeerId in {created}"));
+
+        if wait_for_available {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        let before = described_state(case, &router, &peer_id).await;
+        if wait_for_available {
+            assert_eq!(
+                before,
+                ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE,
+                "case {case:?}: expected the peer to be available before the delete, \
+                 got {before:?}"
+            );
+        } else {
+            // The create's own move may already have fallen due on a loaded machine, so
+            // what this row fixes is that the peer is still COMING UP OR UP when the
+            // delete arrives — the delete's own answer is asserted below either way.
+            assert!(
+                before == ec2::state::ROUTE_SERVER_PEER_STATE_PENDING
+                    || before == ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE,
+                "case {case:?}: expected the peer to be coming up or up before the delete, \
+                 got {before:?}"
+            );
+        }
+
+        let (status, body) = delete_peer(&router, &peer_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the delete, got {status} with body {body}"
+        );
+        let answered = peer_member(case, &body, "state");
+        assert_eq!(
+            answered.as_deref(),
+            Some(ec2::state::ROUTE_SERVER_PEER_STATE_DELETING),
+            "case {case:?}: expected the delete to answer the deleting state, got {answered:?}"
+        );
+        // The answer is the STORED peer: every member but the state is the one the create
+        // stored, whatever the delete did to it.
+        for name in [
+            "routeServerPeerId",
+            "routeServerEndpointId",
+            "routeServerId",
+            "vpcId",
+            "subnetId",
+            "endpointEniId",
+            "endpointEniAddress",
+            "peerAddress",
+        ] {
+            let from_create = peer_member(case, &created, name);
+            let from_delete = peer_member(case, &body, name);
+            assert_eq!(
+                from_delete, from_create,
+                "case {case:?}: expected <{name}> {from_create:?} from the delete, \
+                 got {from_delete:?}"
+            );
+        }
+        for member in ["peerAsn", "peerLivenessDetection"] {
+            let from_create = peer_nested(case, &created, "bgpOptions", member);
+            let from_delete = peer_nested(case, &body, "bgpOptions", member);
+            assert_eq!(
+                from_delete, from_create,
+                "case {case:?}: expected bgpOptions/{member} {from_create:?} from the \
+                 delete, got {from_delete:?}"
+            );
+        }
+        let created_tags = peer_tags(case, &created);
+        let delete_tags = peer_tags(case, &body);
+        assert_eq!(
+            delete_tags, created_tags,
+            "case {case:?}: expected the tags {created_tags:?} from the delete, \
+             got {delete_tags:?}"
+        );
+
+        // Straight after the call the terminal move is not yet due, so the reader still
+        // reports the transient state a caller acting immediately has to cope with.
+        let reading = described_state(case, &router, &peer_id).await;
+        assert_eq!(
+            reading, ec2::state::ROUTE_SERVER_PEER_STATE_DELETING,
+            "case {case:?}: expected deleting before the terminal move fell due, \
+             got {reading:?}"
+        );
+        deleted.push((case, peer_id));
+    }
+
+    // The clock owes every deleted peer its terminal state, including the one deleted while
+    // it was still coming up: that peer's `available` move is off, not merely late.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    for (case, peer_id) in &deleted {
+        let state = described_state(case, &router, peer_id).await;
+        assert_eq!(
+            state,
+            ec2::state::ROUTE_SERVER_PEER_STATE_DELETED,
+            "case {case:?}: expected deleted once the terminal move fell due, got {state:?}"
+        );
+    }
+
+    // Every peer is still reported, so the delete moved the records rather than losing them.
+    let reported = all_peer_ids("after the deletes", &router).await;
+    let mut expected: Vec<String> = deleted.iter().map(|(_, id)| id.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        reported, expected,
+        "expected every deleted peer to still be reported, got {reported:?}"
+    );
+}
+
+/// The rule: a `DeleteRouteServerPeer` whose `RouteServerPeerId` resolves to no peer of the
+/// account is refused with HTTP 400 `InvalidRouteServerPeerId.NotFound`, naming the id the
+/// request sent, and deletes nothing.
+///
+/// The rows differ in the FORM of the id that names nothing — a well-formed long id, a
+/// short one, a string that is no id at all, the id of another kind of resource, and a
+/// stored peer's id with one character changed.
+#[tokio::test]
+async fn delete_route_server_peer_refuses_an_id_that_names_nothing() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+    let endpoint = create_endpoint("an endpoint", &router, &route_server, &subnets[0]).await;
+    let created = call_ok(
+        "a peer that must survive every refusal",
+        &router,
+        "CreateRouteServerPeer",
+        &peer_params(&endpoint.id, "10.0.4.5", "65000", None, &[]),
+    )
+    .await;
+    let peer_id = peer_member("a peer that must survive every refusal", &created, "routeServerPeerId")
+        .expect("a route server peer id");
+
+    // (case, the id the request names)
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a well-formed long id nothing was created under",
+            "rsp-00000000000000000".to_string(),
+        ),
+        (
+            "another well-formed long id nothing was created under",
+            "rsp-00000000000000099".to_string(),
+        ),
+        (
+            "a short-form id nothing was created under",
+            "rsp-abcd1234".to_string(),
+        ),
+        ("a string that is not an id at all", "not-a-peer".to_string()),
+        (
+            "the id of the endpoint rather than of its peer",
+            endpoint.id.clone(),
+        ),
+        (
+            "the id of the route server rather than of its peer",
+            route_server.clone(),
+        ),
+        (
+            "the stored peer's id with one character changed",
+            format!("{}0", &peer_id[..peer_id.len() - 1]),
+        ),
+    ];
+
+    for (case, id) in cases {
+        let (status, body) = delete_peer(&router, &id).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND,
+            "case {case:?}: expected {expected}, got {code:?} with body {body}",
+            expected = ec2::state::INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND
+        );
+        let message = error_message(&body);
+        let expected = format!(
+            "The {kind} ID '{id}' does not exist",
+            kind = ec2::state::RESOURCE_TYPE_ROUTE_SERVER_PEER,
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
+
+    // Nothing was deleted: the one stored peer is still in the state its create left it in.
+    let state = described_state("after the refusals", &router, &peer_id).await;
+    assert!(
+        state == ec2::state::ROUTE_SERVER_PEER_STATE_PENDING
+            || state == ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE,
+        "expected the stored peer to be untouched by a refused delete, got {state:?}"
+    );
+}
+
+/// The rule: a peer whose deletion has already been asked for has nothing left to delete,
+/// so a second `DeleteRouteServerPeer` is refused with HTTP 400 `IncorrectState` naming the
+/// state the peer is in — in either delete state — and "If you have the required
+/// permissions, the error response is DryRunOperation" (`DryRun`): a dry run of a delete
+/// that would have succeeded reports that outcome with HTTP 412 and deletes nothing, while a
+/// dry run of one that would have been refused is refused with its own reason instead.
+#[tokio::test]
+async fn delete_route_server_peer_refuses_a_second_delete_and_performs_no_dry_run() {
+    let router = emulator();
+    let subnets = subnet_ids(&router).await;
+    let route_server = create_route_server("a route server", &router, "64512").await;
+    let endpoint = create_endpoint("an endpoint", &router, &route_server, &subnets[0]).await;
+
+    // Two peers: one the dry runs probe and then delete, one deleted outright so the second
+    // delete is exercised in both delete states.
+    let mut peers: Vec<String> = Vec::new();
+    for (index, case) in ["the probed peer", "the deleted peer"].iter().enumerate() {
+        let body = call_ok(
+            case,
+            &router,
+            "CreateRouteServerPeer",
+            &peer_params(
+                &endpoint.id,
+                &format!("10.0.5.{}", index + 10),
+                "65000",
+                None,
+                &[],
+            ),
+        )
+        .await;
+        peers.push(peer_member(case, &body, "routeServerPeerId").expect("a peer id"));
+    }
+    let (probed, doomed) = (peers[0].clone(), peers[1].clone());
+
+    // A dry run of a delete that would have succeeded: the outcome, and no deletion.
+    // (case, the id the probe names, the status it must answer, the code it must carry)
+    let probes: Vec<(&str, String, u16, &str)> = vec![
+        (
+            "a dry run of a delete that would have succeeded",
+            probed.clone(),
+            412,
+            ec2::state::DRY_RUN_OPERATION,
+        ),
+        (
+            "a dry run naming an id that resolves to no peer",
+            "rsp-00000000000000000".to_string(),
+            400,
+            ec2::state::INVALID_ROUTE_SERVER_PEER_ID_NOT_FOUND,
+        ),
+    ];
+    for (case, id, expected_status, expected_code) in probes {
+        let (status, body) = call(
+            &router,
+            "DeleteRouteServerPeer",
+            &[param("RouteServerPeerId", &id), param("DryRun", "true")],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, expected_code,
+            "case {case:?}: expected {expected_code}, got {code:?} with body {body}"
+        );
+    }
+    let probed_state = described_state("the probed peer", &router, &probed).await;
+    assert!(
+        probed_state == ec2::state::ROUTE_SERVER_PEER_STATE_PENDING
+            || probed_state == ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE,
+        "a dry run must delete nothing: expected the probed peer to be coming up or up, \
+         got {probed_state:?}"
+    );
+
+    let (status, body) = delete_peer(&router, &doomed).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from the first delete, got {status} with body {body}"
+    );
+
+    // A second delete, while the first is still underway and once it has finished, and a dry
+    // run of one: each is refused for the state the peer is in.
+    // (case, whether to wait for the terminal state first, whether the probe is a dry run)
+    let refusals: [(&str, bool, bool); 3] = [
+        ("a second delete while the first is still underway", false, false),
+        ("a dry run of a second delete, which is refused first", false, true),
+        ("a second delete once the first has finished", true, false),
+    ];
+    for (case, wait, dry_run) in refusals {
+        if wait {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        let mut params = vec![param("RouteServerPeerId", &doomed)];
+        if dry_run {
+            params.push(param("DryRun", "true"));
+        }
+        let (status, body) = call(&router, "DeleteRouteServerPeer", &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code,
+            ec2::state::INCORRECT_STATE,
+            "case {case:?}: expected {expected}, got {code:?} with body {body}",
+            expected = ec2::state::INCORRECT_STATE
+        );
+        let expected_state = if wait {
+            ec2::state::ROUTE_SERVER_PEER_STATE_DELETED
+        } else {
+            ec2::state::ROUTE_SERVER_PEER_STATE_DELETING
+        };
+        let message = error_message(&body);
+        let expected = format!(
+            "{kind} '{doomed}' is in the '{expected_state}' state.",
+            kind = ec2::state::RESOURCE_TYPE_ROUTE_SERVER_PEER,
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+    }
 }

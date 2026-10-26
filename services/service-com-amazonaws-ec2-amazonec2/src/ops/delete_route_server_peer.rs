@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRouteServerPeer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRouteServerPeer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes down the stored BGP peer the request names — refusing an id the
+//! account holds no peer for, and a peer whose deletion is already underway — by putting it
+//! into the non-terminal `deleting` state with the instant the clock owes it `deleted`
+//! recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::begin_route_server_peer_deletion`]), and
+//! answers the peer as that call left it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRouteServerPeer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +137,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRouteServerPeer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRouteServerPeerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRouteServerPeer"))
+        use crate::state;
+
+        // A peer is named by id, so nothing here depends on the Region the request was
+        // signed for; the store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // The state a peer is reported with is the one the clock has reached, so a `pending`
+        // peer whose `available` move was already due — or a `deleting` one whose `deleted`
+        // move was — is moved first: each was owed at its due instant whether or not anybody
+        // called.
+        store.materialize_due_transitions();
+
+        // "The ID of the route server peer to delete" (`RouteServerPeerId`): an id this
+        // account holds no peer for is a refusal and not a no-op, so a caller that deletes
+        // twice can tell the deletion it performed from one it did not.
+        let Some(peer) = store.route_server_peers.get(&input.route_server_peer_id) else {
+            return Err(state::invalid_route_server_peer_id_not_found(
+                &input.route_server_peer_id,
+            ));
+        };
+
+        // A peer whose deletion has already been asked for has nothing left to delete, so a
+        // second delete is refused rather than restarting the clock on it — the state the
+        // request would have to change is the peer's own, which is what the refusal names.
+        let current_state = peer.state.clone().unwrap_or_default();
+        if matches!(
+            current_state.as_str(),
+            state::ROUTE_SERVER_PEER_STATE_DELETING | state::ROUTE_SERVER_PEER_STATE_DELETED
+        ) {
+            return Err(state::incorrect_state_of(
+                state::RESOURCE_TYPE_ROUTE_SERVER_PEER,
+                &input.route_server_peer_id,
+                &current_state,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Information about the deleted route server peer"
+        // (`DeleteRouteServerPeerResult$RouteServerPeer`) as this call leaves it: the record
+        // the store now holds, in the `deleting` state the delete put it into, so
+        // `DeleteRouteServerPeer` and `DescribeRouteServerPeers` cannot drift apart.
+        let Some(deleting_peer) =
+            store.begin_route_server_peer_deletion(&input.route_server_peer_id)
+        else {
+            return Err(state::internal_error(format!(
+                "the route server peer '{peer_id}' resolved a moment ago is not in the \
+                 store any more",
+                peer_id = input.route_server_peer_id,
+            )));
+        };
+        Ok(DeleteRouteServerPeerOutput {
+            route_server_peer: Some(deleting_peer),
+        })
     }
 }

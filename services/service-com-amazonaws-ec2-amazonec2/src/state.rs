@@ -2901,6 +2901,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub route_server_peers: BTreeMap<String, RouteServerPeer>,
     /// When each route server peer's `pending` -> `available` transition falls due.
     pub route_server_peer_available_at: BTreeMap<String, Instant>,
+    /// When each DELETING route server peer's `deleting` -> `deleted` transition falls due.
+    /// One entry per peer a `DeleteRouteServerPeer` has started taking down, written by
+    /// [`Self::begin_route_server_peer_deletion`] and applied by
+    /// [`Self::materialize_due_transitions`]; a peer nobody asked to delete has no entry.
+    pub route_server_peer_deleted_at: BTreeMap<String, Instant>,
     /// Every association between one of the account's route servers and one of its VPCs, by
     /// the (`RouteServerId`, `VpcId`) pair the association IS — see
     /// [`RouteServerAssociationRecord`] and the module docs. One entry per pair, because a
@@ -3370,6 +3375,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             route_server_endpoint_client_tokens: HashMap::new(),
             route_server_peers: BTreeMap::new(),
             route_server_peer_available_at: BTreeMap::new(),
+            route_server_peer_deleted_at: BTreeMap::new(),
             route_server_associations: BTreeMap::new(),
             allowed_images_settings: BTreeMap::new(),
             fpga_images: BTreeMap::new(),
@@ -6252,6 +6258,21 @@ impl ComAmazonawsEc2Amazonec2State {
                 if let Some(peer) = route_server_peers.get_mut(route_server_peer_id) {
                     if peer.state.as_deref() == Some(ROUTE_SERVER_PEER_STATE_PENDING) {
                         peer.state = Some(ROUTE_SERVER_PEER_STATE_AVAILABLE.to_string());
+                    }
+                }
+                false
+            });
+        // A peer goes down the same way it came up: `DeleteRouteServerPeer` answers it in
+        // the non-terminal `deleting` state, so the clock owes it the terminal `deleted`
+        // one TRANSITION_DELAY later whether or not anybody calls again.
+        self.route_server_peer_deleted_at
+            .retain(|route_server_peer_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(peer) = route_server_peers.get_mut(route_server_peer_id) {
+                    if peer.state.as_deref() == Some(ROUTE_SERVER_PEER_STATE_DELETING) {
+                        peer.state = Some(ROUTE_SERVER_PEER_STATE_DELETED.to_string());
                     }
                 }
                 false
@@ -27172,6 +27193,14 @@ pub const ROUTE_SERVER_PEER_STATE_PENDING: &str = "pending";
 /// A route server peer whose session is configured: `RouteServerPeerState`'s `available`.
 pub const ROUTE_SERVER_PEER_STATE_AVAILABLE: &str = "available";
 
+/// A route server peer being taken down: `RouteServerPeerState`'s `deleting`, which is what
+/// `DeleteRouteServerPeer` answers with until [`TRANSITION_DELAY`] has passed.
+pub const ROUTE_SERVER_PEER_STATE_DELETING: &str = "deleting";
+
+/// A route server peer whose deletion is finished: that same enum's terminal `deleted`
+/// member, which the clock owes a `deleting` peer one [`TRANSITION_DELAY`] later.
+pub const ROUTE_SERVER_PEER_STATE_DELETED: &str = "deleted";
+
 /// The liveness detection protocol a peer gets when the request names none: "Defaults to
 /// `bgp-keepalive`" (`RouteServerBgpOptionsRequest$PeerLivenessDetection`).
 pub const PEER_LIVENESS_BGP_KEEPALIVE: &str = "bgp-keepalive";
@@ -27406,6 +27435,37 @@ impl ComAmazonawsEc2Amazonec2State {
             Instant::now() + TRANSITION_DELAY,
         );
         Some(route_server_peer_id)
+    }
+
+    /// Start taking down the route server peer `route_server_peer_id` and answer it as the
+    /// store then holds it — `None` when the account holds no peer of that id.
+    ///
+    /// The deletion is a CLOCK-OWED move, like the creation: the peer is put into the
+    /// non-terminal [`ROUTE_SERVER_PEER_STATE_DELETING`] now and the terminal
+    /// [`ROUTE_SERVER_PEER_STATE_DELETED`] falls due one [`TRANSITION_DELAY`] later, which
+    /// is STORED rather than slept for, so a caller reading straight after the delete still
+    /// sees the peer going down. Any `pending` -> `available` move still owed is dropped
+    /// here: a peer asked to delete while it was coming up must not come up afterwards.
+    ///
+    /// The record STAYS in the store, because a peer in either delete state is still
+    /// reported — `deleting` and `deleted` are both `RouteServerPeerState` members, which
+    /// the `state` filter of `DescribeRouteServerPeers` selects on — so its caller-chosen
+    /// bytes stay charged to the store's budget, which still holds them, and it still counts
+    /// against [`MAX_ROUTE_SERVER_RECORDS`], which bounds the records this process holds.
+    pub fn begin_route_server_peer_deletion(
+        &mut self,
+        route_server_peer_id: &str,
+    ) -> Option<RouteServerPeer> {
+        let peer = self.route_server_peers.get_mut(route_server_peer_id)?;
+        peer.state = Some(ROUTE_SERVER_PEER_STATE_DELETING.to_string());
+        let peer = peer.clone();
+        self.route_server_peer_available_at
+            .remove(route_server_peer_id);
+        self.route_server_peer_deleted_at.insert(
+            route_server_peer_id.to_string(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(peer)
     }
 
     /// The address the next route server endpoint in the subnet `cidr_block` gets for its
