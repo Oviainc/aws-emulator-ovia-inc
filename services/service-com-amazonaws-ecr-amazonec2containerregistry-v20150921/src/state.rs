@@ -450,6 +450,221 @@ pub struct LayerBlob {
     pub digest: String,
     pub size: Option<i64>,
     pub media_type: Option<String>,
+    /// What a basic image scan identifies inside this blob's bytes, read ONCE when
+    /// `CompleteLayerUpload` assembled and registered them ([`scan_layer_filesystem`]).
+    /// The bytes themselves are not retained, so what a later scan of an image built on
+    /// this layer examines is this record of them.
+    ///
+    /// Empty ([`LayerFilesystem::default`]) for a blob whose bytes carry no filesystem
+    /// this scan could read, and for a DESCRIPTOR read out of a manifest document: a
+    /// descriptor states a digest, a size and a media type, and carries none of the
+    /// blob's content.
+    pub filesystem: LayerFilesystem,
+}
+
+/// What a basic image scan identifies in ONE layer's filesystem: the operating system the
+/// layer's release file names, and the package manager whose installed-package database
+/// it carries.
+///
+/// Those two are what basic scanning needs to report on an image — it scans the
+/// operating-system packages of the image's filesystem — so they are what reading a
+/// layer's bytes keeps, rather than the bytes. Both are absent for a layer that carries
+/// neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayerFilesystem {
+    /// The operating system the layer's release file identifies, as that file names it
+    /// (the `ID` of an `os-release` file, e.g. `alpine`), or `None` where the layer
+    /// carries no release file.
+    pub operating_system: Option<String>,
+    /// The package manager whose installed-package database the layer carries (see
+    /// [`PACKAGE_DATABASE_PATHS`]), or `None` where it carries none.
+    pub package_manager: Option<String>,
+}
+
+impl LayerFilesystem {
+    /// Whether this layer carries both of the things a basic scan needs, so that one
+    /// layer alone makes an image scannable.
+    fn is_complete(&self) -> bool {
+        self.operating_system.is_some() && self.package_manager.is_some()
+    }
+
+    /// Take over whatever `other` identified that this one has not: an image's
+    /// filesystem is the union of its layers', so a release file in one layer and a
+    /// package database in another identify the same image between them.
+    fn absorb(&mut self, other: &Self) {
+        if self.operating_system.is_none() {
+            self.operating_system = other.operating_system.clone();
+        }
+        if self.package_manager.is_none() {
+            self.package_manager = other.package_manager.clone();
+        }
+    }
+}
+
+/// The paths an operating-system RELEASE FILE sits at inside an image's filesystem, each
+/// with the operating system that file names when the file itself does not say.
+///
+/// The first two are the `os-release` file of the systemd/freedesktop os-release
+/// specification, which every current distribution ships and which names the operating
+/// system in its own `ID=` field (so there is nothing to supply for them); the rest are
+/// the older per-distribution release files, whose NAME is the file name and whose
+/// content is only a version.
+const OS_RELEASE_PATHS: &[(&str, Option<&str>)] = &[
+    ("etc/os-release", None),
+    ("usr/lib/os-release", None),
+    ("etc/alpine-release", Some("alpine")),
+    ("etc/debian_version", Some("debian")),
+    ("etc/redhat-release", Some("rhel")),
+    ("etc/centos-release", Some("centos")),
+    ("etc/oracle-release", Some("ol")),
+    ("etc/system-release", Some("amzn")),
+    ("etc/SuSE-release", Some("suse")),
+    ("etc/photon-release", Some("photon")),
+];
+
+/// Where a package manager keeps the database of the packages INSTALLED in an image's
+/// filesystem, and the manager that keeps it there: apk (Alpine) keeps its installed set
+/// in one file, dpkg (Debian, Ubuntu) in its status file, and rpm (Red Hat, Amazon Linux,
+/// SUSE) keeps a database directory — at the traditional location, and at the one newer
+/// distributions moved it to — so an entry ending in `/` matches everything under it.
+///
+/// A basic scan reports on the packages such a database lists, so an image whose
+/// filesystem carries none is one it cannot report on.
+const PACKAGE_DATABASE_PATHS: &[(&str, &str)] = &[
+    ("lib/apk/db/installed", "apk"),
+    ("var/lib/dpkg/status", "dpkg"),
+    ("var/lib/rpm/", "rpm"),
+    ("usr/lib/sysimage/rpm/", "rpm"),
+];
+
+/// The most DECOMPRESSED bytes of one layer a scan reads before it stops looking.
+///
+/// A layer is caller-supplied and compressed, so its decompressed size is not bounded by
+/// the bytes the client sent: this is the bound on the work one `CompleteLayerUpload`
+/// can ask for. It is far above the filesystem of any ordinary base image, and a layer
+/// that runs past it is read up to here rather than refused — what was identified in the
+/// part that was read still stands.
+const MAX_SCANNED_LAYER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most archive ENTRIES of one layer a scan looks at, for the same reason as
+/// [`MAX_SCANNED_LAYER_BYTES`]: a small archive can declare a very large number of
+/// members.
+const MAX_SCANNED_LAYER_ENTRIES: usize = 100_000;
+
+/// The most bytes of ONE release file a scan reads. A release file is a handful of
+/// `KEY=value` lines; a member sitting at that path and carrying more than this states
+/// its operating system in the part that is read, or in none of it.
+const MAX_RELEASE_FILE_BYTES: u64 = 64 * 1024;
+
+/// Read the bytes of one registered layer for what a basic image scan identifies in it.
+///
+/// An image layer is a tar archive of the filesystem changes it contributes, gzip
+/// compressed in both media types in common use (`...tar.gzip`, `...tar+gzip`) and plain
+/// where the image declares an uncompressed layer, so the bytes are decompressed when
+/// they carry the gzip magic and then walked as a tar: a release file in them names the
+/// operating system, and a package manager's database in them is the installed-package
+/// set the scan would report on. Bytes that are not a readable archive identify nothing,
+/// which is the answer for anything that is not a filesystem layer at all.
+///
+/// Entry names are compared after their leading `./` or `/` is dropped, because a layer
+/// built by one tool lists `etc/os-release` and one built by another lists
+/// `./etc/os-release` for the same file.
+pub fn scan_layer_filesystem(blob: &[u8]) -> LayerFilesystem {
+    use ::std::io::Read;
+
+    let mut found = LayerFilesystem::default();
+    // The decompressed stream is read through a bound, so a layer whose compressed bytes
+    // expand without limit costs this call a bounded amount of work.
+    let decompressed: Box<dyn Read> = if blob.starts_with(&[0x1f, 0x8b]) {
+        Box::new(::flate2::read::GzDecoder::new(blob))
+    } else {
+        Box::new(blob)
+    };
+    let mut archive = ::tar::Archive::new(decompressed.take(MAX_SCANNED_LAYER_BYTES));
+    let Ok(entries) = archive.entries() else {
+        return found;
+    };
+    for entry in entries.take(MAX_SCANNED_LAYER_ENTRIES) {
+        // A member this archive cannot read is where the archive ends: what was read
+        // before it still stands, and nothing past it is guessed at.
+        let Ok(entry) = entry else {
+            break;
+        };
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        let path = path.to_string_lossy().into_owned();
+        let path = path.trim_start_matches("./").trim_start_matches('/');
+        if found.package_manager.is_none() {
+            found.package_manager = package_manager_of_path(path).map(ToString::to_string);
+        }
+        if found.operating_system.is_none() {
+            if let Some(named) = OS_RELEASE_PATHS
+                .iter()
+                .find(|(release, _)| *release == path)
+                .map(|(_, named)| *named)
+            {
+                let mut content = String::new();
+                // A release file that does not read as text names no operating system;
+                // what it does carry is read through its own bound.
+                let _ = entry
+                    .take(MAX_RELEASE_FILE_BYTES)
+                    .read_to_string(&mut content);
+                found.operating_system =
+                    os_release_id(&content).or_else(|| named.map(ToString::to_string));
+            }
+        }
+        if found.is_complete() {
+            break;
+        }
+    }
+    found
+}
+
+/// The package manager whose installed-package database sits at `path`, or `None` where
+/// nothing does. See [`PACKAGE_DATABASE_PATHS`]: an entry ending in `/` names a database
+/// DIRECTORY, so everything under it is that database.
+fn package_manager_of_path(path: &str) -> Option<&'static str> {
+    PACKAGE_DATABASE_PATHS
+        .iter()
+        .find(|(database, _)| {
+            if let Some(directory) = database.strip_suffix('/') {
+                path.starts_with(database) && path.len() > directory.len() + 1
+            } else {
+                path == *database
+            }
+        })
+        .map(|(_, manager)| *manager)
+}
+
+/// The operating system an `os-release` file names: its `ID` field, or its `NAME` where
+/// it carries no `ID`.
+///
+/// The format is the os-release specification's — newline-separated `KEY=value`, the
+/// value optionally quoted — so a line that is not one of those two fields, a comment and
+/// a blank line are all skipped, and a file that names neither field identifies no
+/// operating system here.
+fn os_release_id(content: &str) -> Option<String> {
+    let mut name: Option<String> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "ID" => return Some(value),
+            "NAME" => name = Some(value),
+            _ => {}
+        }
+    }
+    name
 }
 
 /// The one basic image scan an image carries: the run `StartImageScan` started on it.
@@ -595,75 +810,82 @@ impl ImageScan {
     }
 }
 
-/// What a BASIC scan of `image` finds.
+/// What a BASIC scan of `image` finds, given the repository's records of the blobs it is
+/// built from.
 ///
-/// A basic image scan is a vulnerability scan of the operating-system packages INSIDE the
-/// image's filesystem layers. This registry records a layer's digest, its size and its
-/// media type — `CompleteLayerUpload` registers that record — and deliberately never the
-/// layer's bytes ([`Repo::layer_blobs`]), so no package of the image is observable here
-/// and no vulnerability database is reachable from the emulator: the scan has nothing to
-/// examine and therefore reports nothing. A finding is never invented for content nothing
-/// has read, so the list is empty, and `findingSeverityCounts` counts it rather than
-/// stating a figure of its own.
-///
-/// It takes the stored image so that the one place a registry holding layer content would
-/// read packages from is this function, and so that every caller gets the findings of the
-/// image it scanned rather than a shared constant.
-pub fn basic_scan_findings(image: &ImageRecord) -> Vec<ImageScanFinding> {
-    let _ = image;
+/// A basic image scan is a VULNERABILITY scan of the operating-system packages in the
+/// image's filesystem: a finding is one vulnerability a vulnerability source reports
+/// against one installed package. The packages are identified here — the scan reads the
+/// image's package database ([`scanned_filesystem`]) — but no vulnerability source is
+/// reachable from this process, and a finding is never invented for a package nothing
+/// looked up, so a run reports none and `findingSeverityCounts` counts what it reports
+/// rather than stating a figure of its own. A scan that identified no filesystem at all
+/// reports no findings either, and does not reach the status whose findings are readable
+/// ([`basic_scan_outcome`]).
+pub fn basic_scan_findings(
+    image: &ImageRecord,
+    layers: &BTreeMap<String, LayerBlob>,
+) -> Vec<ImageScanFinding> {
+    let _ = (image, layers);
     Vec::new()
 }
 
 /// Where a basic scan of `image` ENDS: the terminal `ImageScanStatus` the run reports
-/// once the clock has made its completion due.
+/// once the clock has made its completion due, given the repository's records of the
+/// blobs the image is built from.
 ///
 /// A scan is an examination of the image it was started on, so its outcome follows from
-/// that image: a run reaches `COMPLETE`, the status whose findings are a statement about
-/// the image, only where the scan identified the operating system and package manager
-/// whose packages it reports on ([`scanned_operating_system`]); an image it could identify
-/// none for is one basic scanning does not support, and the run ends `FAILED` with
-/// [`UNSUPPORTED_IMAGE_SCAN_DESCRIPTION`]. Success is therefore never the default: an
-/// image nothing examined is reported as the unsupported image it is, rather than as the
-/// clean scan a CI gate would read as a pass.
-pub fn basic_scan_outcome(image: &ImageRecord) -> ImageScanStatus {
-    match scanned_operating_system(image) {
-        Some(_) => ImageScanStatus {
+/// that image's CONTENT: a run reaches `COMPLETE`, the status whose findings are a
+/// statement about the image, exactly where the scan identified in the image's filesystem
+/// both the operating system and the package manager whose installed packages it reports
+/// on ([`scanned_filesystem`]); an image missing either is one basic scanning does not
+/// support, and the run ends `FAILED` with [`UNSUPPORTED_IMAGE_SCAN_DESCRIPTION`] — the
+/// outcome that names the operating system and the package manager as what was not
+/// supported. Neither outcome is the default: each follows from what the layers carry.
+pub fn basic_scan_outcome(
+    image: &ImageRecord,
+    layers: &BTreeMap<String, LayerBlob>,
+) -> ImageScanStatus {
+    if scanned_filesystem(image, layers).is_complete() {
+        ImageScanStatus {
             status: Some(SCAN_STATUS_COMPLETE.to_string()),
             description: Some(SCAN_COMPLETE_DESCRIPTION.to_string()),
-        },
-        None => ImageScanStatus {
+        }
+    } else {
+        ImageScanStatus {
             status: Some(SCAN_STATUS_FAILED.to_string()),
             description: Some(UNSUPPORTED_IMAGE_SCAN_DESCRIPTION.to_string()),
-        },
+        }
     }
 }
 
-/// The operating system a basic scan of `image` identifies, and therefore the package
-/// manager whose installed packages it would report findings for.
+/// The filesystem a basic scan of `image` identifies: the operating system and the
+/// package manager its layers carry between them.
 ///
-/// An image's operating system release and its package database live in the image's
+/// An image's operating-system release file and its package database live in its
 /// FILESYSTEM LAYERS, which is why a basic scan reads them: the layers are what the image
-/// is made of. So the search is over the layers the stored manifest declares — one of them
-/// carries the release file that names the operating system — and
-/// [`operating_system_in_layer`] is what reads one.
-fn scanned_operating_system(image: &ImageRecord) -> Option<String> {
-    manifest_layer_descriptors(&image.manifest)
-        .iter()
-        .find_map(operating_system_in_layer)
-}
-
-/// The operating system identified inside ONE filesystem layer.
-///
-/// `None` for every layer this registry holds. A layer's record is its digest, its size
-/// and its media type — what `CompleteLayerUpload` registers ([`Repo::layer_blobs`]) — and
-/// the registry deliberately keeps none of the layer's bytes, so the operating-system
-/// release file and the package database inside it are not observable here: nothing has
-/// read the layer's content, and an operating system is never assumed for content nothing
-/// read. This is the one place a registry that held layer content would read them from,
-/// and the one place to change when it does.
-fn operating_system_in_layer(layer: &LayerBlob) -> Option<String> {
-    let _ = layer;
-    None
+/// is made of. So the walk is over the layers the stored manifest declares, in the order
+/// it declares them, resolved to this repository's own record of each blob — a manifest
+/// descriptor states only a digest, a size and a media type, while the record carries what
+/// reading the registered bytes identified ([`scan_layer_filesystem`]) — and an image
+/// whose release file and package database sit in different layers is identified by both
+/// of them together, which is how a multi-layer image carries them.
+fn scanned_filesystem(
+    image: &ImageRecord,
+    layers: &BTreeMap<String, LayerBlob>,
+) -> LayerFilesystem {
+    let mut identified = LayerFilesystem::default();
+    for descriptor in manifest_layer_descriptors(&image.manifest) {
+        // A digest the repository holds no blob for contributes no content: only a
+        // registered layer has bytes this registry has read.
+        if let Some(held) = layers.get(&descriptor.digest) {
+            identified.absorb(&held.filesystem);
+        }
+        if identified.is_complete() {
+            break;
+        }
+    }
+    identified
 }
 
 /// Whether `manifest` describes something a basic scan can examine: a container image
@@ -2008,7 +2230,8 @@ pub struct Repo {
     /// `BatchCheckLayerAvailability` reads a layer's availability from. Blobs are
     /// per-repository: a layer uploaded to one repository is not a layer of another.
     /// The bytes themselves are not kept — nothing serves them yet — only the
-    /// registry's record of the blob.
+    /// registry's record of the blob, which carries what reading those bytes identified
+    /// in them ([`LayerBlob::filesystem`]).
     pub layer_blobs: BTreeMap<String, LayerBlob>,
     /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
     /// `StartLifecyclePolicyPreview` evaluates when the start call names none, and the
@@ -2259,6 +2482,35 @@ impl Repo {
             }
         }
         missing
+    }
+
+    /// Record the basic image scan a `StartImageScan` at `now` starts on the image `id`
+    /// names, answering the `ImageScanStatus` that start reports.
+    ///
+    /// Where the run ENDS is decided here, once, from the image it was started on and
+    /// this repository's own records of the blobs that image is built from
+    /// ([`basic_scan_outcome`]), and stored on the image together with what the run found:
+    /// reading the scan back afterwards reports THIS run rather than evaluating a fresh
+    /// one, so every reader derives the same answer and no read has to write. The status
+    /// answered is the stored record's own projection, so the start and a read straight
+    /// after it report the same scan.
+    pub fn start_basic_scan(
+        &mut self,
+        id: &ImageIdentifier,
+        now: SystemTime,
+    ) -> Result<ImageScanStatus, Fault> {
+        let image = self.resolve_image(id)?;
+        let terminal = basic_scan_outcome(image, &self.layer_blobs);
+        let findings = basic_scan_findings(image, &self.layer_blobs);
+        let scan = ImageScan {
+            started_at: now,
+            complete_due_at: now + IMAGE_SCAN_DELAY,
+            terminal,
+            findings,
+        };
+        let status = scan.to_status(now);
+        self.resolve_image_mut(id)?.scan = Some(scan);
+        Ok(status)
     }
 
     /// Materialise every image's clock-owed storage-class transition at `now` (see
@@ -4030,6 +4282,7 @@ pub fn manifest_layer_descriptors(manifest: &str) -> Vec<LayerBlob> {
                 digest: entry.get("blobSum")?.as_str()?.to_string(),
                 size: None,
                 media_type: None,
+                filesystem: LayerFilesystem::default(),
             })
         }));
     }
@@ -4045,6 +4298,9 @@ fn blob_descriptor(descriptor: &serde_json::Value) -> Option<LayerBlob> {
             .get("mediaType")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string),
+        // A descriptor carries no blob content: what reading the registered bytes
+        // identified lives on the repository's own record of the blob.
+        filesystem: LayerFilesystem::default(),
     })
 }
 

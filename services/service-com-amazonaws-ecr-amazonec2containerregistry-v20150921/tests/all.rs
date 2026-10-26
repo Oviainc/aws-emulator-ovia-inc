@@ -27,6 +27,8 @@ mod image_metadata;
 mod image_replication_status;
 #[path = "all/image_scan.rs"]
 mod image_scan;
+#[path = "all/image_scan_filesystem.rs"]
+mod image_scan_filesystem;
 #[path = "all/image_scan_outcome.rs"]
 mod image_scan_outcome;
 #[path = "all/image_storage_class_identification.rs"]

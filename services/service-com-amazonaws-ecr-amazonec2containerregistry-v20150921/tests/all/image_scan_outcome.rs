@@ -8,10 +8,11 @@
 //! 1. A scan's terminal status is the outcome of examining the image it was started on: it
 //!    reaches `COMPLETE`, the status whose findings are a statement about the image, only
 //!    where the run identified the operating system and package manager whose packages it
-//!    reports on, and otherwise ends `FAILED` with the unsupported-image description. This
-//!    registry records a layer's digest, size and media type and never its bytes, so no
-//!    stored image's operating system is identifiable and no scan of one ends in a clean
-//!    success a CI gate would read as a pass.
+//!    reports on, and otherwise ends `FAILED` with the unsupported-image description. The
+//!    images here are built on layers whose bytes are no filesystem archive, so no
+//!    operating system is identifiable in them and no scan of one ends in a clean success
+//!    a CI gate would read as a pass. (The other direction — a filesystem a scan does
+//!    identify — is `crate::image_scan_filesystem`'s.)
 //! 2. `ImageArchivedException` and `ScanNotFoundException` interpolate the request: the
 //!    `imageId` as it was sent, the repository it named and the registry that holds it.
 //!
@@ -283,10 +284,10 @@ async fn a_scan_ends_at_the_outcome_of_examining_its_image() {
 /// The other direction of the same rule: a run that DID examine its image reports the
 /// status whose findings are readable, and the read reports the findings of that run.
 ///
-/// A run that examined an image is a record the start path cannot produce from a stored
-/// image whose layer bytes nothing holds, so it is placed in the same store the handlers
-/// read — which is also what shows the status is the RECORD's and not a constant either
-/// way.
+/// The findings of a run are placed in the same store the handlers read, because no
+/// vulnerability source is reachable from this process and so no started run reports a
+/// finding of its own — which is also what shows the status and the findings are the
+/// RECORD's and not a constant either way.
 #[tokio::test]
 async fn a_run_that_examined_its_image_reports_the_status_whose_findings_are_readable() {
     let (router, engine) = emulator_with_engine();

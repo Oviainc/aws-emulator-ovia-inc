@@ -317,21 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The scan examines the image as it stands now, and what it came to is stored:
         // reading it back reports this run rather than computing a fresh one. Where the run
-        // ENDS follows from the image it was started on, so an image basic scanning cannot
+        // ENDS follows from the content of the image it was started on — the layers this
+        // repository holds for it — so an image whose filesystem basic scanning cannot
         // examine settles at the status that says so rather than at a success.
-        let findings = crate::state::basic_scan_findings(image);
-        let terminal = crate::state::basic_scan_outcome(image);
-
-        let scan = crate::state::ImageScan {
-            started_at: now,
-            complete_due_at: now + crate::state::IMAGE_SCAN_DELAY,
-            terminal,
-            findings,
-        };
-        // The status answered is the record's own projection, so the start and a read
-        // straight after it report the same scan.
-        let image_scan_status = scan.to_status(now);
-        image.scan = Some(scan);
+        let image_scan_status = repo
+            .start_basic_scan(&input.image_id, now)
+            .map_err(fault_error)?;
 
         Ok(StartImageScanOutput {
             registry_id: Some(registry_id),

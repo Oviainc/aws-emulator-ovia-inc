@@ -6,7 +6,7 @@
 //! identifier resolves to, which answers `IN_PROGRESS` until the clock makes its
 //! completion due ([`state::IMAGE_SCAN_DELAY`]) and the TERMINAL status that run came to
 //! afterwards — the outcome of examining that image (`state::basic_scan_outcome`), which
-//! for an image whose operating system nothing identified is `FAILED` with the
+//! for an image whose layers carry no operating system to identify is `FAILED` with the
 //! unsupported-image description and never a clean `COMPLETE`;
 //! `DescribeImageScanFindings` derives its whole answer from that one record and changes
 //! nothing, the findings (and the severity counts over them) are reported once a scan that
@@ -373,9 +373,10 @@ async fn a_started_scan_is_reported_until_the_clock_completes_it() {
             "case {case:?}: the read reports the image it scanned, got {:?}",
             at(&completed, "/imageId")
         );
-        // The registry holds no layer CONTENT, so a basic scan of a stored image
-        // identified no operating system to examine: the run reports that outcome and no
-        // findings block, which would state a scan of content nothing read.
+        // The layers these images are built on are no filesystem archive, so a basic
+        // scan of them identified no operating system to examine: the run reports that
+        // outcome and no findings block, which would state a scan of content nothing
+        // read.
         assert_eq!(
             at(&completed, "/imageScanFindings"),
             Value::Null,
@@ -777,11 +778,11 @@ fn finding(index: usize, severity: &str) -> ImageScanFinding {
 /// Seed `findings` as the completed scan of one stored image, straight into the store the
 /// handlers read.
 ///
-/// A basic scan of a stored image identifies no operating system to examine — this registry
-/// holds no layer CONTENT (`state::basic_scan_outcome`) — so a run that EXAMINED the image
-/// and carries findings is a record the start path cannot produce, and the paging and the
-/// severity counting over it are exercised from the same store instead. Every other case
-/// here goes through the wire.
+/// A basic scan of these images identifies no operating system to examine — their layers
+/// carry no filesystem archive (`state::basic_scan_outcome`) — and no vulnerability
+/// source is reachable from this process, so a run that carries FINDINGS is a record the
+/// start path does not produce, and the paging and the severity counting over it are
+/// exercised from the same store instead. Every other case here goes through the wire.
 fn seed_findings(
     engine: &engine::InMemoryEngine,
     repository: &str,

@@ -356,13 +356,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The blob joins the repository, addressed by the digest the registry computed,
         // and the upload it came from is closed: its id resolves to nothing afterwards.
         // The media type stays unset — a blob's media type is what a manifest
-        // referencing it declares, which this call carries nothing of.
+        // referencing it declares, which this call carries nothing of. What the assembled
+        // bytes are a filesystem OF is read here, while they are in hand: the bytes are
+        // not retained, so a later basic scan of an image built on this layer examines
+        // this record of them.
+        let filesystem = crate::state::scan_layer_filesystem(&assembled);
         repo.layer_blobs.insert(
             digest.clone(),
             crate::state::LayerBlob {
                 digest: digest.clone(),
                 size: Some(layer_size),
                 media_type: None,
+                filesystem,
             },
         );
         store.uploads.remove(&input.upload_id);

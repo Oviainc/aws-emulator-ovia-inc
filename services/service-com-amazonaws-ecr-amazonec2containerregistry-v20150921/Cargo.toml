@@ -24,6 +24,11 @@ tracing = { workspace = true }
 # The content digest of an image manifest (`sha256:<hex>`) and its hex rendering.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Reading a registered image layer's filesystem: a layer blob is a tar archive, usually
+# gzip-compressed, and a basic image scan has to look inside it for the operating-system
+# release file and the package database it carries.
+tar = "0.4"
+flate2 = "1"
 # `arn::parse_of` / `iam_role::role_name`: the tree's ONE resource-ARN parse and its one
 # IAM role-ARN reading, which this service's `resourceArn`, `credentialArn` and
 # `customRoleArn` readings go through rather than splitting an ARN of their own.
