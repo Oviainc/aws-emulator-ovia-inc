@@ -31,10 +31,12 @@
 //!   namespace and is selected by no `namespace` filter.
 //! * `isAbstract` — the stored component types whose abstractness matches, read
 //!   off [`crate::state::ComponentType::is_abstract`], the same field
-//!   `GetComponentType` reports from. `CreateComponentType` offers no way to
-//!   declare one abstract, so the abstract ones are exactly the service's
-//!   built-ins, which every workspace is provisioned with
-//!   ([`crate::state::built_in_component_types`]).
+//!   `GetComponentType` reports from, so the filter and the read cannot select
+//!   different sets. A component type is abstract when it cannot be
+//!   instantiated: the service's own built-ins that exist to be extended, and a
+//!   created type that declares an externally stored property no data connector
+//!   of its own or of a parent can serve
+//!   ([`crate::state::component_type_is_abstract`]).
 //!
 //! `maxResults` caps the page: its documented default is 25 and its documented
 //! minimum 1, so an omitted value serves 25 rows and an explicit zero is refused.
@@ -373,8 +375,9 @@ fn matches_filter(
             .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1),
         // The abstractness the record carries, read through the same field
         // `GetComponentType` reports from, so the filter and the read cannot
-        // drift apart: a component type created through this API is concrete,
-        // and the service's built-ins are abstract.
+        // drift apart: the writers decide it from what the component type
+        // holds (`crate::state::component_type_is_abstract`), and a built-in
+        // carries the abstractness the service publishes for it.
         Some(ListComponentTypesFilter::isAbstract(is_abstract)) => {
             component_type.is_abstract == *is_abstract
         }

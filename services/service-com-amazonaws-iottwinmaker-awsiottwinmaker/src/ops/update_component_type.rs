@@ -403,12 +403,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // component type reports the non-terminal state an update in flight is
         // in; the clock, not a caller, settles it back in `ACTIVE`.
         updated.begin_update(now);
-        // Abstractness is decided from the definitions, functions and
-        // inheritance the record holds, so a patch that changes any of them
-        // changes the answer: it is recomputed over the PATCHED record, exactly
-        // as the create computes it over the created one. See
-        // `crate::state::component_type_is_abstract`.
-        updated.is_abstract = crate::state::component_type_is_abstract(workspace, &updated);
         let output = UpdateComponentTypeOutput {
             workspace_id: updated.workspace_id.clone(),
             component_type_id: updated.component_type_id.clone(),
@@ -420,25 +414,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that validated the request held the workspace immutably, so the
         // references above could be resolved against its other component types
         // — and nothing past this point can fail.
-        let Some(stored) = state
-            .workspaces
-            .get_mut(&input.workspace_id)
-            .and_then(|workspace| workspace.component_types.get_mut(&input.component_type_id))
-        else {
-            return Err(UpdateComponentTypeErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(format!(
-                        "component type {} of workspace {} vanished",
-                        input.component_type_id, input.workspace_id
-                    )),
-                },
-            )
-            .into());
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(vanished(&input.workspace_id, &input.component_type_id));
+        };
+        let Some(stored) = workspace.component_types.get_mut(&input.component_type_id) else {
+            return Err(vanished(&input.workspace_id, &input.component_type_id));
         };
         *stored = updated;
+        // Abstractness is decided from the definitions, functions and
+        // inheritance a record holds, so this patch changes the answer for the
+        // record it landed on AND for every component type whose inheritance
+        // reaches it — a connector this patch added or dropped serves, or stops
+        // serving, an externally stored property of each of them. Re-decided
+        // over the committed records for that reason, rather than over the
+        // patched copy alone. See
+        // `crate::state::redecide_component_type_abstractness`.
+        crate::state::redecide_component_type_abstractness(workspace, &input.component_type_id);
 
         Ok(output)
     }
+}
+
+/// The server error for a record the validated patch resolved against but the
+/// commit below could no longer find.
+///
+/// Unreachable in practice — the store is held under one lock for the whole call
+/// — so it exists to keep the commit from having to unwrap, and names the
+/// component type and workspace the call addressed.
+fn vanished(workspace_id: &str, component_type_id: &str) -> UpdateComponentTypeError {
+    UpdateComponentTypeErrorModeled::InternalServerException(InternalServerException {
+        message: Some(format!(
+            "component type {component_type_id} of workspace {workspace_id} vanished"
+        )),
+    })
+    .into()
 }
 
 /// One refusal of this operation's `ValidationException`, with the message the

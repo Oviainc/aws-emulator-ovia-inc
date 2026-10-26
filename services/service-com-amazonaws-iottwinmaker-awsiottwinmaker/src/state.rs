@@ -2360,6 +2360,48 @@ pub fn component_type_is_abstract(workspace: &Workspace, record: &ComponentType)
     stores_externally && !has_connector
 }
 
+/// Re-decide the stored abstractness of the component type `component_type_id`
+/// of `workspace` and of every component type that INHERITS from it
+/// ([`component_type_is_abstract`]).
+///
+/// Abstractness is decided over a record AND the inheritance it declares, so a
+/// write that changes one component type's properties, functions or parents
+/// changes the answer for every component type whose chain reaches it, not only
+/// for the one addressed: a parent that gains a data connector makes each of its
+/// descendants servable, and one that loses it makes them abstract again. Those
+/// descendants are exactly the ids
+/// [`component_type_instance_ids`](Workspace::component_type_instance_ids)
+/// resolves, in the one reverse-edge pass that method already makes, so a write
+/// re-decides the records it can have moved and leaves the rest of the workspace
+/// untouched. Each answer is computed from the OTHER records' definitions,
+/// functions and parents rather than from their stored abstractness, so the pass
+/// needs no ordering and one sweep settles a chain of any depth.
+///
+/// A BUILT-IN is skipped: it carries the abstractness the service publishes for
+/// it ([`built_in_component_types`]), which is not derived from its definitions,
+/// and no caller's write reaches one.
+pub fn redecide_component_type_abstractness(workspace: &mut Workspace, component_type_id: &str) {
+    let affected: Vec<String> = workspace
+        .component_type_instance_ids(component_type_id)
+        .into_iter()
+        .filter(|id| !built_in_component_type_id(id))
+        .map(str::to_string)
+        .collect();
+    let decided: Vec<(String, bool)> = affected
+        .into_iter()
+        .filter_map(|id| {
+            let record = workspace.component_types.get(&id)?;
+            let is_abstract = component_type_is_abstract(workspace, record);
+            Some((id, is_abstract))
+        })
+        .collect();
+    for (component_type_id, is_abstract) in decided {
+        if let Some(record) = workspace.component_types.get_mut(&component_type_id) {
+            record.is_abstract = is_abstract;
+        }
+    }
+}
+
 /// Why a component of the component type `component_type_id` cannot be created,
 /// as the message a `ValidationException` carries: the component type is
 /// ABSTRACT ([`component_type_is_abstract`]), so it is extended rather than

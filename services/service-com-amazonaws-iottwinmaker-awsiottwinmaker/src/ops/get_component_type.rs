@@ -268,9 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             update_date_time: crate::state::timestamp(component_type.update_date_time),
             // `isAbstract` is read off the stored record, which is also what a
             // `ListComponentTypes` `isAbstract` filter selects on, so the read
-            // and the listing cannot disagree: no component type created
-            // through this API is abstract, and the abstract ones are the
-            // service's own built-ins.
+            // and the listing cannot disagree: the writers decide it from what
+            // the component type holds
+            // (`crate::state::component_type_is_abstract`), and a built-in
+            // carries the abstractness the service publishes for it.
             is_abstract: Some(component_type.is_abstract),
             // "Whether the component type has a schema initializer and that the
             // schema initializer has run" — of the functions it EFFECTIVELY

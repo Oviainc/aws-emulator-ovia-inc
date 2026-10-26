@@ -629,8 +629,9 @@ async fn one_filter_object_selects_the_component_types_it_names() {
     every_id.sort();
     // The ids the workspace was PROVISIONED with, split by the abstractness the
     // single-resource read reports for each of them, so the two `isAbstract`
-    // rows below cannot drift from what the service seeds: no component type a
-    // caller creates is abstract, so every other id is concrete.
+    // rows below cannot drift from what the service seeds: no component type
+    // this case creates declares a property no connector can serve, so every
+    // other id is concrete.
     let mut abstract_ids: Vec<String> = Vec::new();
     let built_in_ids = crate::harness::built_in_component_type_ids();
     for component_type_id in built_in_ids.clone() {
@@ -731,16 +732,18 @@ async fn one_filter_object_selects_the_component_types_it_names() {
             ids(&[]),
         ),
         (
-            // Every component type created through this API is concrete, which
-            // is what `GetComponentType` reports for each of them — as is the
-            // one built-in an entity instantiates directly.
+            // Every component type this case creates is concrete, which is what
+            // `GetComponentType` reports for each of them — as is the one
+            // built-in an entity instantiates directly.
             "isAbstractFalse",
             json!({"isAbstract": false}),
             concrete_ids.clone(),
         ),
         (
-            // The abstract ones are the service's own: provisioned with the
-            // workspace, never created through this API.
+            // The abstract ones here are the service's own base types,
+            // provisioned with the workspace; the abstractness of a CREATED
+            // component type is its own suite
+            // (`abstract_component_type_listing`).
             "isAbstractTrue",
             json!({"isAbstract": true}),
             abstract_ids.clone(),
