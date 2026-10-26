@@ -9,8 +9,8 @@
 //! generalises over, not one recorded request:
 //!
 //! 1. A created notification, and the subscribers created with it, are PERSISTED on
-//!    the budget that owns it and read back as supplied, with only the member the
-//!    service owns (`NotificationState`) defaulted.
+//!    the budget that owns it and read back as supplied, with the member the
+//!    service owns (`NotificationState`) computed by the service.
 //! 2. A notification is identified by what it alerts on — `NotificationType`,
 //!    `ComparisonOperator`, `Threshold`, `ThresholdType` — so a repeat is a duplicate
 //!    and a difference in any one of them is a different notification.
@@ -118,7 +118,9 @@ struct Row {
     case: &'static str,
     notification: Value,
     subscribers: Value,
-    /// `NotificationState` as the read reports it: `"OK"` where the caller set none.
+    /// `NotificationState` as the read reports it: the state the SERVICE computes for the
+    /// notification, which is `"OK"` for every row here (nothing spends behind a budget
+    /// in this emulator, so no `GREATER_THAN` threshold is passed).
     state: &'static str,
 }
 
@@ -190,8 +192,10 @@ fn persistence_rows() -> Vec<Row> {
                 "NotificationState": "ALARM"
             }),
             subscribers: json!([email_subscriber(5)]),
-            // Supplied by the caller, so it is kept rather than defaulted.
-            state: "ALARM",
+            // The alarm state is the SERVICE's, not the caller's: nothing has been spent
+            // over this budget's limit, so the read reports the state it computed.
+            // `tests/all/notification_alarm_state.rs` asserts that rule over the class.
+            state: "OK",
         },
         Row {
             case: "the full subscriber set: one SNS and ten email, the length maximum",
@@ -208,8 +212,8 @@ fn persistence_rows() -> Vec<Row> {
 
 /// RULE 1: a created notification is persisted on the budget that owns it and read
 /// back exactly as supplied — with `NotificationState`, the one member the service
-/// owns, defaulted to `OK` where the caller set none — and so are its subscribers, in
-/// the order they were supplied.
+/// owns, reported as the service computes it rather than as the caller sent it — and so
+/// are its subscribers, in the order they were supplied.
 #[tokio::test]
 async fn a_created_notification_and_its_subscribers_read_back() {
     let router = router();

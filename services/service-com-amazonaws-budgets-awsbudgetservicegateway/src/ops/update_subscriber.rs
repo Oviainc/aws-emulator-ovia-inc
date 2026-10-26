@@ -233,9 +233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )),
                     })
                 })?;
-            // The budget an alert for one of its notifications names, read before the
-            // notification inside it is reached mutably below.
-            let source = crate::state::alerts::source(&input.account_id, &stored.budget);
+            // The budget an alert for one of its notifications names, as a read reports it
+            // (the figures that decide whether such a notification is in alarm), read
+            // before the notification inside it is reached mutably below.
+            let source = crate::state::alerts::source(
+                &input.account_id,
+                &crate::state::budget_as_read(&stored.budget, now),
+            );
             // A notification carries no id either: the caller names the one holding the
             // subscriber by value, and `crate::state::same_notification` holds which
             // members that identity is made of (the service-owned alarm state is not one
