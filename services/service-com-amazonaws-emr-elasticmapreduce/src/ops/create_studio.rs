@@ -10,8 +10,12 @@
 //! one of them cannot name an existing resource: a `VpcId`, `SubnetIds` entry or
 //! security group id outside the form Amazon EC2 gives those resources
 //! ([`crate::state::is_ec2_resource_id`]), more subnets than a Studio may have, a
-//! `DefaultS3Location` that is not an Amazon S3 URI, an empty `ServiceRole`, or IAM
-//! authentication with no `UserRole` to log users in as.
+//! `DefaultS3Location` that is not an Amazon S3 URI, or an empty `ServiceRole`.
+//!
+//! Every OTHER member the model leaves optional is optional here too — a `UserRole`
+//! above all, which "only specify … when you use IAM Identity Center authentication"
+//! (`CreateStudio$UserRole` doc) makes meaningful for one authentication mode and
+//! required by none.
 //!
 //! ## Shape of an operation
 //!
@@ -208,9 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{
-            auth_mode, is_ec2_resource_id, is_s3_location, MAX_STUDIOS, MAX_STUDIO_SUBNETS,
-        };
+        use crate::state::{is_ec2_resource_id, is_s3_location, MAX_STUDIOS, MAX_STUDIO_SUBNETS};
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
@@ -275,15 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "A Studio only requires a UserRole when you use IAM authentication."
-        // (`Studio$UserRole` doc.)
+        // "Only specify a UserRole when you use IAM Identity Center authentication."
+        // (`CreateStudio$UserRole` doc, which the model leaves OPTIONAL.) So a
+        // `UserRole` is not a precondition of any authentication mode: a request that
+        // omits it is well formed, and one that carries it is stored as given.
         let user_role = input.user_role.filter(|role| !role.trim().is_empty());
-        if input.auth_mode == auth_mode::IAM && user_role.is_none() {
-            return Err(refuse(
-                "AuthMode IAM requires a UserRole for users logged in to the Studio"
-                    .to_string(),
-            ));
-        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateStudioErrorModeled::InternalServerException(

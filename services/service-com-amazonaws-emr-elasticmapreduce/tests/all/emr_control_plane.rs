@@ -928,6 +928,36 @@ async fn studios_are_created_read_back_updated_and_deleted() {
     let cases = vec![
         ("the smallest request", studio_request("minimal")),
         (
+            // "Only specify a UserRole when you use IAM Identity Center
+            // authentication." (`CreateStudio$UserRole` doc.) The model leaves UserRole
+            // optional, so an IAM-authenticated Studio that names none is a well-formed
+            // create.
+            "IAM auth with no user role",
+            json!({
+                "Name": "iam studio, no user role",
+                "AuthMode": "IAM",
+                "VpcId": "vpc-0a1b2c3d",
+                "SubnetIds": ["subnet-0a1b2c3d"],
+                "ServiceRole": "arn:aws:iam::000000000000:role/EMRStudio_Service",
+                "WorkspaceSecurityGroupId": "sg-0a1b2c3d",
+                "EngineSecurityGroupId": "sg-1a2b3c4d",
+                "DefaultS3Location": "s3://emr-studio/iam/",
+            }),
+        ),
+        (
+            "IAM Identity Center auth with no user role",
+            json!({
+                "Name": "sso studio, no user role",
+                "AuthMode": "SSO",
+                "VpcId": "vpc-00000000000000003",
+                "SubnetIds": ["subnet-00000000000000003"],
+                "ServiceRole": "EMR_Studio_ServiceRole",
+                "WorkspaceSecurityGroupId": "sg-00000000000000003",
+                "EngineSecurityGroupId": "sg-00000000000000004",
+                "DefaultS3Location": "s3://emr-studio/sso/",
+            }),
+        ),
+        (
             "IAM auth with a user role, description and tags",
             json!({
                 "Name": "iam studio",
@@ -1167,7 +1197,6 @@ async fn create_studio_refuses_an_unresolvable_network_role_or_location() {
             json!({ "DefaultS3Location": "s3://" }),
         ),
         ("an empty service role", json!({ "ServiceRole": "" })),
-        ("IAM auth with no user role", json!({ "AuthMode": "IAM" })),
     ] {
         let mut body = studio_request("refused");
         for (member, value) in override_members.as_object().expect("an override object") {
@@ -1412,6 +1441,215 @@ async fn session_mappings_are_created_read_back_updated_and_deleted() {
             );
         }
     }
+}
+
+/// `ListStudios` reports the Studios the account holds, as the summary the model
+/// declares, and `ListStudioSessionMappings` reports the mappings of a Studio — both
+/// paginated on `Marker`, both projections of what the create, update and delete
+/// operations persisted.
+///
+/// The rows differ along what the listing generalises over: how many resources are held,
+/// which Studio is asked for, and which `IdentityType` the mapping listing filters on.
+#[tokio::test]
+async fn the_studio_listings_report_what_the_studio_operations_persisted() {
+    let emr = Emr::new();
+
+    // An account that holds no Studio lists none, and reports no marker.
+    let empty = emr.ok("ListStudios", json!({})).await;
+    assert_eq!(
+        at(&empty, &["Studios"]),
+        &json!([]),
+        "an account with no Studio lists none, got {empty}"
+    );
+    assert!(
+        empty.get("Marker").is_none(),
+        "a last page carries no marker, got {empty}"
+    );
+
+    // Three Studios, each with its own name, VPC and auth mode.
+    let mut created: Vec<(String, Value)> = Vec::new();
+    for (index, (name, auth_mode)) in [
+        ("first studio", "IAM"),
+        ("second studio", "SSO"),
+        ("third studio", "IAM"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = studio_request(name);
+        request["AuthMode"] = json!(auth_mode);
+        request["Description"] = json!(format!("studio number {index}"));
+        request["VpcId"] = json!(format!("vpc-0000000{index}"));
+        let out = emr.ok("CreateStudio", request.clone()).await;
+        created.push((
+            out["StudioId"].as_str().expect("a StudioId").to_string(),
+            request,
+        ));
+    }
+
+    let listed = emr.ok("ListStudios", json!({})).await;
+    let summaries = at(&listed, &["Studios"])
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("Studios must be a list, got {listed}"));
+    assert_eq!(
+        summaries.len(),
+        created.len(),
+        "every created Studio must be listed once, got {listed}"
+    );
+    for (studio_id, request) in &created {
+        let summary = summaries
+            .iter()
+            .find(|summary| summary["StudioId"].as_str() == Some(studio_id.as_str()))
+            .unwrap_or_else(|| panic!("case {studio_id:?}: must be listed, got {listed}"));
+        // The summary is the stored Studio's own members, and the detail members the
+        // model keeps for DescribeStudio are not in it.
+        for member in ["Name", "Description", "VpcId", "AuthMode"] {
+            assert_eq!(
+                summary.get(member),
+                request.get(member),
+                "case {studio_id:?}: {member} must be the stored one, got {summary}"
+            );
+        }
+        let described = emr
+            .ok("DescribeStudio", json!({ "StudioId": studio_id }))
+            .await["Studio"]
+            .clone();
+        for member in ["Url", "CreationTime"] {
+            assert_eq!(
+                summary.get(member),
+                described.get(member),
+                "case {studio_id:?}: {member} must agree with DescribeStudio, got {summary}"
+            );
+        }
+        for member in ["SubnetIds", "ServiceRole", "StudioArn"] {
+            assert!(
+                summary.get(member).is_none(),
+                "case {studio_id:?}: a summary carries no {member}, got {summary}"
+            );
+        }
+    }
+
+    // A deleted Studio leaves the listing, and the others stay.
+    let (removed, _) = created.remove(1);
+    emr.ok("DeleteStudio", json!({ "StudioId": &removed })).await;
+    let after = emr.ok("ListStudios", json!({})).await;
+    let remaining: Vec<&str> = at(&after, &["Studios"])
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["StudioId"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        remaining.len(),
+        created.len(),
+        "a deleted Studio leaves the listing, got {after}"
+    );
+    assert!(
+        !remaining.contains(&removed.as_str()),
+        "the deleted Studio must be gone, got {after}"
+    );
+
+    // A marker that names no listed Studio is refused rather than read as a resume point.
+    for marker in ["es-NOPE", "", &removed] {
+        let (status, payload) = emr.call("ListStudios", json!({ "Marker": marker })).await;
+        assert_refused(
+            &format!("ListStudios with marker {marker:?}"),
+            status,
+            &payload,
+            "InvalidRequestException",
+        );
+    }
+
+    // Session mappings: two Studios, each with mappings of both identity types.
+    let studio_id = created[0].0.clone();
+    let other_studio = created[1].0.clone();
+    for (studio, identity, identity_type) in [
+        (&studio_id, "analyst", "USER"),
+        (&studio_id, "engineer", "USER"),
+        (&studio_id, "data-science", "GROUP"),
+        (&other_studio, "auditor", "USER"),
+    ] {
+        emr.ok(
+            "CreateStudioSessionMapping",
+            json!({
+                "StudioId": studio,
+                "IdentityName": identity,
+                "IdentityType": identity_type,
+                "SessionPolicyArn": "arn:aws:iam::aws:policy/EMRStudioBasic",
+            }),
+        )
+        .await;
+    }
+
+    // (case, request, the identity names the listing must report)
+    for (case, body, expected) in [
+        (
+            "one studio, no filter",
+            json!({ "StudioId": &studio_id }),
+            vec!["analyst", "data-science", "engineer"],
+        ),
+        (
+            "one studio, users only",
+            json!({ "StudioId": &studio_id, "IdentityType": "USER" }),
+            vec!["analyst", "engineer"],
+        ),
+        (
+            "one studio, groups only",
+            json!({ "StudioId": &studio_id, "IdentityType": "GROUP" }),
+            vec!["data-science"],
+        ),
+        (
+            "the other studio",
+            json!({ "StudioId": &other_studio }),
+            vec!["auditor"],
+        ),
+        (
+            "every studio",
+            json!({}),
+            vec!["analyst", "auditor", "data-science", "engineer"],
+        ),
+        (
+            "every studio, groups only",
+            json!({ "IdentityType": "GROUP" }),
+            vec!["data-science"],
+        ),
+    ] {
+        let listed = emr.ok("ListStudioSessionMappings", body.clone()).await;
+        let mut reported: Vec<String> = at(&listed, &["SessionMappings"])
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["IdentityName"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        reported.sort();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {listed}"
+        );
+        // Two reads of one listing report the same page: a listing changes nothing.
+        assert_eq!(
+            emr.ok("ListStudioSessionMappings", body).await,
+            listed,
+            "case {case:?}: a repeated listing must report the same page"
+        );
+    }
+
+    // A `StudioId` no Studio carries is refused, the way every Studio-scoped operation
+    // refuses it.
+    let (status, payload) = emr
+        .call("ListStudioSessionMappings", json!({ "StudioId": &removed }))
+        .await;
+    assert_refused(
+        "ListStudioSessionMappings for a deleted studio",
+        status,
+        &payload,
+        "InvalidRequestException",
+    );
 }
 
 // ---------------------------------------------------------------------------

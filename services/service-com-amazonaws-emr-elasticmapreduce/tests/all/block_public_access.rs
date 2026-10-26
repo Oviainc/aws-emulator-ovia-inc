@@ -70,6 +70,18 @@ fn parts(output: &Value) -> (&Value, &Value) {
     )
 }
 
+/// The configuration a put of `configuration` leaves stored: what was put, with the
+/// exception list it omitted canonicalized to the empty list — "no public-port
+/// exception" has ONE representation, so the omitted-member and the explicit-`[]` cases
+/// read back the same.
+fn canonical(configuration: &Value) -> Value {
+    let mut canonical = configuration.clone();
+    if canonical.get("PermittedPublicSecurityGroupRuleRanges").is_none() {
+        canonical["PermittedPublicSecurityGroupRuleRanges"] = json!([]);
+    }
+    canonical
+}
+
 /// `BlockPublicAccessConfigurationMetadata` names an IAM principal and an instant no
 /// later than `at_most`.
 fn assert_metadata(case: &str, metadata: &Value, at_least: f64, at_most: f64) {
@@ -194,8 +206,8 @@ fn configurations() -> Vec<(&'static str, Value)> {
 
 /// THE RULE: `PutBlockPublicAccessConfiguration` replaces the account's single block
 /// public access configuration whole, and `GetBlockPublicAccessConfiguration` reports
-/// that stored configuration verbatim — every member the caller supplied, and no member
-/// it did not.
+/// that stored configuration — every member the caller supplied, no member it did not,
+/// and the exception list it left out as the empty list that means the same thing.
 #[tokio::test]
 async fn a_put_configuration_is_what_a_later_get_reports() {
     let emr = Emr::new();
@@ -208,7 +220,8 @@ async fn a_put_configuration_is_what_a_later_get_reports() {
         let output = get(&emr, case).await;
         let (reported, metadata) = parts(&output);
         assert_eq!(
-            reported, &configuration,
+            reported,
+            &canonical(&configuration),
             "case {case:?}: the reported configuration must be the one that was put, \
              got {reported}"
         );
@@ -217,7 +230,8 @@ async fn a_put_configuration_is_what_a_later_get_reports() {
 }
 
 /// THE RULE: a put REPLACES the stored configuration rather than merging into it, so a
-/// member the new configuration leaves out is absent afterwards.
+/// member the new configuration leaves out is absent afterwards — the exception list it
+/// leaves out being the empty list, which is what "no exception" reads back as.
 #[tokio::test]
 async fn a_put_replaces_the_stored_configuration_rather_than_merging_into_it() {
     let emr = Emr::new();
@@ -266,8 +280,74 @@ async fn a_put_replaces_the_stored_configuration_rather_than_merging_into_it() {
         let output = get(&emr, case).await;
         let (reported, _) = parts(&output);
         assert_eq!(
-            reported, &configuration,
+            reported,
+            &canonical(&configuration),
             "case {case:?}: a put replaces the configuration whole, got {reported}"
+        );
+    }
+}
+
+/// THE RULE: once a configuration has been put, the account HAS an exception list: a put
+/// that omits `PermittedPublicSecurityGroupRuleRanges` clears the ranges and reads back
+/// as the empty list — the same canonical representation an explicit `[]` reads back as —
+/// never as an absent member a client cannot tell from "unknown".
+#[tokio::test]
+async fn an_omitted_exception_list_reads_back_as_the_empty_list() {
+    // Each row is the exception list a FIRST put establishes; the second put of every row
+    // omits the member, and the stored list must then be empty whatever it held before.
+    for (case, established) in [
+        (
+            "the recorded pair of ranges",
+            json!([{ "MinRange": 22, "MaxRange": 22 }, { "MinRange": 8000, "MaxRange": 8010 }]),
+        ),
+        ("one single-port range", json!([{ "MinRange": 443, "MaxRange": 443 }])),
+        ("a range with no MaxRange", json!([{ "MinRange": 9000 }])),
+        (
+            "the whole published port space",
+            json!([{ "MinRange": PORT_MIN, "MaxRange": PORT_MAX }]),
+        ),
+        ("an explicitly empty list", json!([])),
+    ] {
+        let emr = Emr::new();
+        put(
+            &emr,
+            case,
+            &json!({
+                "BlockPublicSecurityGroupRules": true,
+                "PermittedPublicSecurityGroupRuleRanges": established,
+            }),
+        )
+        .await;
+        assert_eq!(
+            at(parts(&get(&emr, case).await).0, &["PermittedPublicSecurityGroupRuleRanges"]),
+            &established,
+            "case {case:?}: the first put must establish the ranges"
+        );
+
+        // The same configuration again with the member left out: a full replace.
+        put(&emr, case, &json!({ "BlockPublicSecurityGroupRules": true })).await;
+        let reported = parts(&get(&emr, case).await).0.clone();
+        assert_eq!(
+            at(&reported, &["PermittedPublicSecurityGroupRuleRanges"]),
+            &json!([]),
+            "case {case:?}: omitting the list clears it to the empty list, got {reported}"
+        );
+
+        // And an explicit empty list afterwards reports the very same configuration, so
+        // the two forms are ONE representation.
+        put(
+            &emr,
+            case,
+            &json!({
+                "BlockPublicSecurityGroupRules": true,
+                "PermittedPublicSecurityGroupRuleRanges": [],
+            }),
+        )
+        .await;
+        assert_eq!(
+            parts(&get(&emr, case).await).0,
+            &reported,
+            "case {case:?}: the omitted and the explicitly empty list must read back alike"
         );
     }
 }

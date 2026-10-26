@@ -284,15 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports it. "For reserved queues, specify the number of jobs you can
             // process concurrently in your reservation plan instead" — so a reserved
             // queue's concurrency is the slot count it reserved, and an on-demand one's
-            // is the account default.
-            concurrent_jobs: input.concurrent_jobs.unwrap_or_else(|| {
-                input
-                    .reservation_plan_settings
-                    .as_ref()
-                    .map_or(crate::state::DEFAULT_CONCURRENT_JOBS, |settings| {
-                        settings.reserved_slots
-                    })
-            }),
+            // is the account default. `UpdateQueue` stores it by the same rule, from the
+            // same place, so a plan and the concurrency beside it cannot drift apart.
+            concurrent_jobs: crate::state::concurrent_jobs_for(
+                input.concurrent_jobs,
+                input.reservation_plan_settings.as_ref(),
+                crate::state::DEFAULT_CONCURRENT_JOBS,
+            ),
             maximum_concurrent_feeds: input
                 .maximum_concurrent_feeds
                 .unwrap_or(crate::state::DEFAULT_MAXIMUM_CONCURRENT_FEEDS),

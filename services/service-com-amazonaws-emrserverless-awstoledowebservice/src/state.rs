@@ -443,6 +443,19 @@ pub fn started_update_refusal_message() -> String {
     )
 }
 
+/// The `ValidationException` message the auto-start gate refuses a submit with: the
+/// service's own fixed sentence, which states the gate — the application is not running
+/// and will not start itself — and names no application id, state or remedy call.
+///
+/// `work_item` is what could not be started ("Job run", "Session"): the sentence is
+/// otherwise the same for every submit the gate stops.
+pub fn auto_start_disabled_message(work_item: &str) -> String {
+    format!(
+        "{work_item} cannot be started as Application is not in \
+         {STARTED_APPLICATION_STATE} state and auto-start is disabled"
+    )
+}
+
 /// The prefix a pagination cursor carries, so a token this service did not mint is
 /// refused rather than read as a resume point.
 const PAGE_TOKEN_PREFIX: &str = "v1_";

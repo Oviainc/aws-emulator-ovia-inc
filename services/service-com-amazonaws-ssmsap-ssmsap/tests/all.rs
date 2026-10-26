@@ -33,6 +33,8 @@ mod configuration_check_rules;
 mod configuration_checks;
 #[path = "all/deregistration_window.rs"]
 mod deregistration_window;
+#[path = "all/filter_validation.rs"]
+mod filter_validation;
 #[path = "all/get_database.rs"]
 mod get_database;
 #[path = "all/list_configuration_check_definitions.rs"]
