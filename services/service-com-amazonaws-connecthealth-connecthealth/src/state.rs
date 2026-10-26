@@ -136,8 +136,12 @@ pub const PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE: &str =
      for this job, so no output was written to the configured output location.";
 
 /// The most tag entries one resource ARN carries — AWS's standard tagging limit of 50,
-/// which also bounds what one request can add to the tag store. `TagMap` itself declares
+/// which bounds the set a request may leave a resource holding. `TagMap` itself declares
 /// no `@length`, so this count is the SERVICE's own rule.
+///
+/// Stated here, compared in [`crate::service::tag_bounds::merged_within_cap`] — the one
+/// place every operation that accepts a `TagMap` bounds a resource's tag set, so a
+/// create and a merge cannot bound different counts.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The MODELLED length bounds of one tag entry, both ends of each: `TagKey` is
@@ -647,8 +651,8 @@ pub struct ComAmazonawsConnecthealthConnecthealthState {
     /// separate inventory per Region.
     pub domains: BTreeMap<String, Domain>,
     /// The ONE tag store, keyed by resource ARN so domain and subscription ARNs both
-    /// work. `CreateDomain` seeds it and `TagResource` merges into it;
-    /// `UntagResource`/`ListTagsForResource` (still scaffolded) share it.
+    /// work. `CreateDomain` seeds it and `TagResource` merges into it, both through
+    /// [`Self::set_tags`]; `UntagResource`/`ListTagsForResource` share it.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
     /// Every `domainId` this service has allocated and still remembers, whether or not
     /// the domain itself is still held — the ALLOCATION HISTORY a delete consults to
@@ -879,26 +883,10 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         })
     }
 
-    /// The tag set `arn` would carry once `tags` were merged into it, without writing
-    /// anything: the entries already recorded, with every key `tags` names taking the
-    /// value `tags` gives it.
-    ///
-    /// Separate from [`Self::merge_tags`] so a caller can bound the RESULT of a merge —
-    /// the limit is on the resource's tag set, not on one request — and refuse before
-    /// the store has been touched.
-    pub fn tags_after_merge(
-        &self,
-        arn: &str,
-        tags: impl IntoIterator<Item = (String, String)>,
-    ) -> BTreeMap<String, String> {
-        let mut merged = self.tags_for(arn);
-        merged.extend(tags);
-        merged
-    }
-
     /// Record `tags` as the tag set of `arn`.
     ///
-    /// The caller passes the already-merged set ([`Self::tags_after_merge`]). An EMPTY
+    /// The caller passes the already-merged set, bounded by
+    /// [`crate::service::tag_bounds::merged_within_cap`]. An EMPTY
     /// set is stored as no entry at all, so "no tags" has one representation in the
     /// store whether the resource was never tagged or had every tag removed.
     pub fn set_tags(&mut self, arn: &str, tags: BTreeMap<String, String>) {

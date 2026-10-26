@@ -43,5 +43,7 @@ mod start_patient_insights_job_write_discipline;
 mod state_roundtrip;
 #[path = "all/tag_bound_unit.rs"]
 mod tag_bound_unit;
+#[path = "all/tag_count_cap.rs"]
+mod tag_count_cap;
 #[path = "all/tag_map_bounds.rs"]
 mod tag_map_bounds;

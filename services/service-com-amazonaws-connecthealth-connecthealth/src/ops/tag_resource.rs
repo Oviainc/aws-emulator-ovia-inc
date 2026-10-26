@@ -65,7 +65,10 @@
 //!   service, exactly as `GetDomain` answers a `domainId` that names no domain.
 //! * `ServiceQuotaExceededException` (HTTP 402) — the merged tag set would exceed
 //!   [`crate::state::MAX_TAGS_PER_RESOURCE`], the same condition and the same channel
-//!   `CreateDomain` uses for a create carrying more tags than a resource may hold.
+//!   `CreateDomain` uses for a create carrying more tags than a resource may hold — and
+//!   the condition is COMPARED in one place for both
+//!   ([`crate::service::tag_bounds::merged_within_cap`]), which merges first and bounds
+//!   the result, so neither operation can count a different set.
 //!
 //! A tag entry this service does not accept — a key or value outside its modelled length,
 //! or a key in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace — is refused
@@ -225,21 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The limit is on the resource's tag SET, so it is the merged set that is
         // bounded: re-tagging keys the resource already carries is always accepted,
-        // while new keys that would carry it past the cap are refused.
-        let merged = store.tags_after_merge(&input.resource_arn, input.tags);
-        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+        // while new keys that would carry it past the cap are refused. The merge and the
+        // bound are the ONE shared path `CreateDomain` bounds its create's set through,
+        // so the two cannot drift apart in what they count; a refusal writes nothing,
+        // because the set is only computed here.
+        let merged = crate::service::tag_bounds::merged_within_cap(
+            store.tags_for(&input.resource_arn),
+            input.tags,
+        )
+        .map_err(|count| {
+            TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
-                        "resource {} would carry {} tags, more than the maximum of {}",
+                        "resource {} would carry {count} tags, more than the maximum of {}",
                         input.resource_arn,
-                        merged.len(),
                         crate::state::MAX_TAGS_PER_RESOURCE
                     )),
                 },
             )
-            .into());
-        }
+        })?;
 
         // `@idempotent`: the merged set is what is stored, so repeating the call writes
         // the same set again and changes nothing.

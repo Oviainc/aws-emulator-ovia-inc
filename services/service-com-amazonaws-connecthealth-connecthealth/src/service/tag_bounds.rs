@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What ONE `TagMap` entry has to satisfy — the modelled lengths of its key and its
-//! value, and the reserved key namespace the service keeps for itself — enforced where
-//! the request boundary cannot reach them.
+//! What a `TagMap` has to satisfy — the modelled lengths of ONE entry's key and value,
+//! the reserved key namespace the service keeps for itself, and how many entries one
+//! resource may end up holding — enforced where the request boundary cannot reach them.
+//!
+//! Both halves live here: [`violation`] is the per-ENTRY rule and [`merged_within_cap`]
+//! the per-RESOURCE count, each stated once so no two operations that accept a `TagMap`
+//! can enforce different halves — or different readings — of one bound.
 //!
 //! `TagMap`'s key targets `TagKey` (`@length` min 1, max 128) and its value targets
 //! `TagValue` (`@length` min 0, max 256)
@@ -34,7 +38,16 @@
 //! text is [`envelope`]'s. A refusal of a LENGTH made here therefore reads exactly like
 //! one made at the boundary; the reserved-namespace refusal is the service's own sentence,
 //! because no modelled constraint states that rule for it to borrow.
+//!
+//! How many entries one resource may hold is the service's own rule too — `TagMap`
+//! declares no `@length`, so the count is [`crate::state::MAX_TAGS_PER_RESOURCE`] — and
+//! it is likewise compared in one place, [`merged_within_cap`]. What each operation
+//! ANSWERS with stays its own: the count is refused through each operation's modelled
+//! `ServiceQuotaExceededException`, which only that operation's error channel can
+//! construct, so this module decides the condition and the handler words its own
+//! sentence.
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
@@ -43,8 +56,8 @@ use ::aws_smithy_schema_server::constraints::{path, validate, LengthTrait, Viola
 use ::aws_smithy_schema_server::envelope;
 
 use crate::state::{
-    MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MIN_TAG_KEY_LEN, MIN_TAG_VALUE_LEN,
-    RESERVED_TAG_KEY_PREFIX,
+    MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MIN_TAG_KEY_LEN,
+    MIN_TAG_VALUE_LEN, RESERVED_TAG_KEY_PREFIX,
 };
 
 /// This service's Smithy namespace, for the member schemas below.
@@ -184,6 +197,37 @@ pub fn violation<'t>(
         violation.path = format!("{TAG_MAP_MEMBER}.{}", path::entry(key));
         envelope(&[violation])
     })
+}
+
+/// The tag set a request would leave a resource holding, or — when that set would be
+/// larger than one resource may hold ([`MAX_TAGS_PER_RESOURCE`]) — how many entries it
+/// would have carried.
+///
+/// `held` is the set the resource carries TODAY (empty for a resource that does not
+/// exist yet, which is what a create addresses) and `requested` is the request's
+/// entries, every key it names taking the value it gives and every key it does not name
+/// keeping the value it had.
+///
+/// The cap is on the SET a resource ends up holding, not on one request's entry count,
+/// so the merge happens first and its RESULT is what is bounded: re-stating keys the
+/// resource already carries never exceeds the cap however many entries the request
+/// carries, and the count reported back is the count the resource would have held. ONE
+/// comparison, counted on one set, for every operation of this service that accepts a
+/// `TagMap` — so a create and a later merge cannot bound different numbers.
+///
+/// Nothing is written here: a caller that is refused stores nothing, and one that is not
+/// stores the set it gets back
+/// ([`crate::state::ComAmazonawsConnecthealthConnecthealthState::set_tags`]).
+pub fn merged_within_cap(
+    held: BTreeMap<String, String>,
+    requested: impl IntoIterator<Item = (String, String)>,
+) -> Result<BTreeMap<String, String>, usize> {
+    let mut merged = held;
+    merged.extend(requested);
+    if merged.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(merged.len());
+    }
+    Ok(merged)
 }
 
 #[cfg(test)]

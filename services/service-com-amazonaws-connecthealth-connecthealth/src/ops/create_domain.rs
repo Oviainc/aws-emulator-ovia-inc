@@ -70,7 +70,13 @@
 //!
 //! ## Errors
 //!
-//! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
+//! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota:
+//!   this store's own ceiling on the domains it holds, or a `tags` map that would leave
+//!   the new domain holding more entries than one resource may
+//!   ([`crate::state::MAX_TAGS_PER_RESOURCE`]). The tag count is compared in the one
+//!   place every operation that accepts a `TagMap` compares it
+//!   ([`crate::service::tag_bounds::merged_within_cap`]), so a create and a later
+//!   `TagResource` bound the same count on the same set.
 //! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below):
 //!   this SERVICE models the shape, this operation's own `errors` list does not name it,
 //!   and it is the error the account-wide Domain cap is surfaced as.
@@ -261,28 +267,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(tags) = input.tags.as_ref() {
-            if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-                return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "tags carries {} entries, more than the maximum of {}",
-                            tags.len(),
-                            crate::state::MAX_TAGS_PER_RESOURCE
-                        )),
-                    },
-                )
-                .into());
-            }
-            // What an entry has to satisfy — the modelled `TagKey`/`TagValue` lengths at
-            // BOTH ends, and a key outside the reserved namespace — through the one check
-            // every operation that accepts a `TagMap` shares: neither a constraint on a
-            // map's key or value nor a rule the model does not state is one the boundary
-            // walk refuses, so the handler is what refuses it. A refusal here writes
-            // nothing: it is raised before any id is minted.
-            if let Some(violation) = crate::service::tag_bounds::violation(tags.iter()) {
-                return Err(crate::scaffolded::Scaffolded::validation(violation));
-            }
+        // The tag set this create would leave the domain holding, bounded by the most
+        // tags one resource may hold — the ONE comparison `TagResource` bounds its own
+        // merge with (`crate::service::tag_bounds::merged_within_cap`), so the two cannot
+        // count a different set or compare it against a different number. A domain being
+        // created holds no tags yet, so the set bounded here is the entries the request
+        // carried. A refusal writes nothing: it is raised before any id is minted.
+        let tags = crate::service::tag_bounds::merged_within_cap(
+            ::std::collections::BTreeMap::new(),
+            input.tags.unwrap_or_default(),
+        )
+        .map_err(|count| {
+            CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "tags carries {count} entries, more than the maximum of {}",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+        })?;
+        // What an entry has to satisfy — the modelled `TagKey`/`TagValue` lengths at
+        // BOTH ends, and a key outside the reserved namespace — through the one check
+        // every operation that accepts a `TagMap` shares: neither a constraint on a
+        // map's key or value nor a rule the model does not state is one the boundary
+        // walk refuses, so the handler is what refuses it. A refusal here writes
+        // nothing either, for the same reason.
+        if let Some(violation) = crate::service::tag_bounds::violation(tags.iter()) {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
         let domain_id = store.mint_domain_id();
@@ -348,14 +360,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Tags go to the one ARN-keyed tag store, so `GetDomain` and
-        // `ListTagsForResource` cannot disagree about a domain's tags.
-        if let Some(tags) = input.tags {
-            if !tags.is_empty() {
-                store
-                    .tags_by_arn
-                    .insert(arn.clone(), tags.into_iter().collect());
-            }
-        }
+        // `ListTagsForResource` cannot disagree about a domain's tags. `set_tags` is the
+        // one writer of a resource's tag set, and records an empty set as no entry at
+        // all — the same path `TagResource` stores its merge through.
+        store.set_tags(&arn, tags);
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.
         let stored = store.domains.entry(domain_id).or_insert(domain);
