@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkerConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkerConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkerConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `WorkerConfigurationSummary` per stored worker configuration of the
+//! call's region, filtered by `namePrefix`, paged by `maxResults` with an opaque
+//! `nextToken`, so paging through them returns each one exactly once. A token this
+//! service did not emit is a `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkerConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkerConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListWorkerConfigurationsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the kafkaconnect store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        let prefix = input.name_prefix.unwrap_or_default();
+        // kafkaconnect is a regional service, so the listing covers the worker
+        // configurations of the region this call was signed for and no other
+        // region's.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkerConfigurations"))
+        // Keyed by ARN and paged BEFORE the summaries are built, so a page costs
+        // one `WorkerConfigurationSummary` per configuration it returns rather
+        // than one per configuration stored.
+        let keyed: Vec<(String, &crate::state::WorkerConfigurationRecord)> = state
+            .worker_configurations_in(&region)
+            .filter(|worker| worker.name.starts_with(&prefix))
+            .map(|worker| (worker.arn.clone(), worker))
+            .collect();
+
+        let Ok(page) = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
+        else {
+            // Same rejected member, same message form, as in every other
+            // kafkaconnect parameter rejection.
+            return Err(ListWorkerConfigurationsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_parameter("nextToken")),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListWorkerConfigurationsOutput {
+            next_token: page.next_token,
+            worker_configurations: Some(
+                page.items
+                    .into_iter()
+                    .map(crate::state::WorkerConfigurationRecord::summary)
+                    .collect(),
+            ),
+        })
     }
 }
