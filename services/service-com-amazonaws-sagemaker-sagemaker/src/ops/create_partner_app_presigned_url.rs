@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the modelled `ResourceNotFound`, and no URL is minted.
             return Err(CreatePartnerAppPresignedUrlErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!("Partner app {} does not exist.", input.arn)),
+                    message: Some(crate::state::partner_app_does_not_exist(&input.arn)),
                 },
             )
             .into());
