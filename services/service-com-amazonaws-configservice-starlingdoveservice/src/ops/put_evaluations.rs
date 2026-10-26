@@ -275,16 +275,13 @@ fn invalid_parameter(message: String) -> PutEvaluationsError {
 /// Refuse the request with the modelled `InvalidResultTokenException` ("The specified
 /// ResultToken is not valid").
 ///
-/// The message quotes NOTHING of the token: the token is opaque to its holder, so
-/// echoing it back says nothing a caller can act on, and the member it names is the one
-/// to fix.
+/// RECORDED behaviour: this is the sentence AWS answers for this refusal class. It
+/// quotes NOTHING of the token — the token is opaque to its holder, so echoing it back
+/// says nothing a caller can act on — and it reads the same whichever rule and
+/// invocation the token failed to name.
 fn invalid_result_token() -> PutEvaluationsError {
     PutEvaluationsErrorModeled::InvalidResultTokenException(InvalidResultTokenException {
-        message: Some(
-            "The specified ResultToken is not valid. Use the ResultToken Config \
-             delivered with the evaluation event for the rule you are evaluating."
-                .to_string(),
-        ),
+        message: Some("Result Token provided is invalid".to_string()),
     })
     .into()
 }

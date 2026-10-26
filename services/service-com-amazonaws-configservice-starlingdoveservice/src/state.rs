@@ -50,6 +50,10 @@ use crate::ops::types::{AggregateResourceIdentifier, ConfigurationItem};
 // of stored queries reports each one as.
 use crate::ops::types::StoredQueryMetadata;
 
+// `RemediationException` is named separately for the same reason: it is how one
+// resource Config does not remediate under one rule is REPORTED.
+use crate::ops::types::RemediationException;
+
 // `AggregatedSourceStatus` is named separately for the same reason: it is the sync
 // status an aggregator read reports one of its aggregation sources as.
 use crate::ops::types::AggregatedSourceStatus;
@@ -2009,6 +2013,58 @@ impl RemediationConfigurationEntry {
     }
 }
 
+/// What identifies ONE remediation exception: the Config rule it exempts a resource
+/// from, and the resource it exempts — the resource type and the resource id, which is
+/// what `RemediationExceptionResourceKey` names a resource by.
+pub type RemediationExceptionKey = (String, String, String);
+
+/// One persisted remediation exception: one resource Config does not remediate under
+/// one rule ("An object that represents the details about the remediation exception …
+/// the rule name, an explanation of an exception, the time when the exception will be
+/// deleted, the resource ID, and resource type").
+#[derive(Debug, Clone, Default)]
+pub struct RemediationExceptionEntry {
+    pub config_rule_name: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    /// "An explanation of an remediation exception" (`RemediationException$Message`),
+    /// optional because the request that creates the exception may carry none.
+    pub message: Option<String>,
+    /// When set, the instant this exception falls due for deletion
+    /// (`RemediationException$ExpirationTime`: "The time when the remediation
+    /// exception will be deleted"). An exception the clock has already taken past that
+    /// instant is gone, which is what [`Self::expired_by`] decides.
+    pub expires_at: Option<SystemTime>,
+}
+
+impl RemediationExceptionEntry {
+    /// What identifies this exception in the store.
+    pub fn key(&self) -> RemediationExceptionKey {
+        (
+            self.config_rule_name.clone(),
+            self.resource_type.clone(),
+            self.resource_id.clone(),
+        )
+    }
+
+    /// Whether the clock has already taken this exception past the instant it falls due
+    /// for deletion, so it exempts nothing any more.
+    pub fn expired_by(&self, now: SystemTime) -> bool {
+        self.expires_at.is_some_and(|due| now >= due)
+    }
+
+    /// The modelled `RemediationException`, read back out of state.
+    pub fn to_shape(&self) -> RemediationException {
+        RemediationException {
+            config_rule_name: self.config_rule_name.clone(),
+            resource_type: self.resource_type.clone(),
+            resource_id: self.resource_id.clone(),
+            message: self.message.clone(),
+            expiration_time: self.expires_at.map(timestamp),
+        }
+    }
+}
+
 /// One state of a resource's configuration that the resource has since LEFT, as the
 /// configuration item Config recorded for it.
 ///
@@ -3066,6 +3122,19 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Remediation configurations, keyed by the `ConfigRuleName` they remediate —
     /// Config holds at most one per rule.
     pub remediation_configurations: BTreeMap<String, RemediationConfigurationEntry>,
+    /// Remediation exceptions, keyed by [`RemediationExceptionKey`] — the rule they
+    /// exempt a resource from and the resource they exempt. A `BTreeMap` so a read of
+    /// them pages over a stable ordering and a page token survives exceptions added or
+    /// removed between pages. Config holds at most one exception per rule and resource,
+    /// so writing another for the same pair revises it in place.
+    ///
+    /// `PutRemediationExceptions`, the operation that WRITES one, is still a scaffold
+    /// with a stub issue of its own, so the bound on how far this map can grow is the
+    /// one that writer will enforce — the quota Config publishes for remediation
+    /// exceptions. `DeleteRemediationExceptions` only REMOVES from it, as does the
+    /// expiry each entry carries ([`RemediationExceptionEntry::expired_by`]), so no call
+    /// served today grows it at all.
+    pub remediation_exceptions: BTreeMap<RemediationExceptionKey, RemediationExceptionEntry>,
     /// Remediation executions `StartRemediationExecution` invoked, keyed by
     /// [`RemediationExecutionKey`] — the rule they remediate and the resource they ran
     /// for. A `BTreeMap` so `DescribeRemediationExecutionStatus` pages over a stable
@@ -3459,6 +3528,26 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .collect();
         counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         counts
+    }
+
+    /// Drop every remediation exception the clock has already taken past the instant it
+    /// falls due for deletion (`RemediationException$ExpirationTime`: "The time when the
+    /// remediation exception will be deleted"), and answer how many went.
+    ///
+    /// This is the one write a READING path may perform on this map: the deletion was
+    /// owed at that instant whether or not anybody looked, so materialising it is what
+    /// keeps a read from reporting an exception that no longer exempts anything.
+    pub fn expire_remediation_exceptions(&mut self, now: SystemTime) -> usize {
+        let expired: Vec<RemediationExceptionKey> = self
+            .remediation_exceptions
+            .iter()
+            .filter(|(_, entry)| entry.expired_by(now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired {
+            self.remediation_exceptions.remove(key);
+        }
+        expired.len()
     }
 
     /// The tags of the resource `arn` identifies, or `None` when this store holds no
@@ -4370,6 +4459,122 @@ pub fn materialised_recording_group(requested: Option<RecordingGroup>) -> Record
         });
     }
     group
+}
+
+/// Which way a request changes the resource types a configuration recorder records:
+/// `AssociateResourceTypes` adds types to what it records, `DisassociateResourceTypes`
+/// removes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTypeAssociation {
+    /// The types are to be RECORDED after the call ("Adds all resource types specified
+    /// in the ResourceTypes list to the RecordingGroup of specified configuration
+    /// recorder and includes those resource types when recording").
+    Associate,
+    /// The types are NOT to be recorded after the call ("Removes all resource types
+    /// specified in the ResourceTypes list from the RecordingGroup of configuration
+    /// recorder and excludes these resource types when recording").
+    Disassociate,
+}
+
+impl ResourceTypeAssociation {
+    /// Whether the recorder records a type this change names once the change is
+    /// applied.
+    fn records_after(self) -> bool {
+        matches!(self, Self::Associate)
+    }
+}
+
+/// How Config words `ValidationException` for a resource type the recorder already
+/// treats the way the request asks for.
+///
+/// The MODEL STATES THIS MESSAGE for exactly these two operations
+/// (`ValidationException`: "For AssociateResourceTypes and DisassociateResourceTypes,
+/// one of the following errors: … One or more of the specified resource types are
+/// already associated or disassociated with the configuration recorder"), so the text is
+/// part of the contract: ONE sentence covering both directions, which is why neither
+/// direction words its own and why no resource type of the request is quoted into it.
+pub const RESOURCE_TYPES_ALREADY_SETTLED: &str =
+    "One or more of the specified resource types are already associated or disassociated \
+     with the configuration recorder.";
+
+/// How Config words `ValidationException` for an association or disassociation of
+/// resource types on a recorder whose recording strategy has no place for one.
+///
+/// The MODEL STATES THIS MESSAGE for exactly these two operations
+/// (`ValidationException`: "For AssociateResourceTypes and DisassociateResourceTypes,
+/// one of the following errors: Your configuraiton recorder has a recording strategy
+/// that does not allow the association or disassociation of resource types"), so the
+/// text is part of the contract — including the service's own spelling of
+/// "configuraiton", which is how the sentence reads in the API reference.
+pub const RECORDING_STRATEGY_FORBIDS_ASSOCIATION: &str =
+    "Your configuraiton recorder has a recording strategy that does not allow the \
+     association or disassociation of resource types.";
+
+/// Apply `change` to the resource types `group` records, or refuse it with the message
+/// Config words for the rule it breaks.
+///
+/// ONE rule, written once for both operations that change a recorder's recorded
+/// resource types: the change is expressed in the recording strategy the recorder
+/// RECORDS UNDER — an inclusion group lists the types it records, so a type joins or
+/// leaves that list; an exclusion group records every type it does not list, so a type
+/// LEAVES the exclusion list to become recorded and joins it to stop being recorded —
+/// and a strategy that enumerates nothing (`ALL_SUPPORTED_RESOURCE_TYPES`) records
+/// every type there is, so no list expresses the change and it is refused. A type the
+/// recorder already treats the way the request asks for is refused too: there is no
+/// change to make.
+///
+/// `group` is left UNTOUCHED when the change is refused — every type is checked before
+/// any is applied — so a refused call changes nothing about what the recorder records.
+///
+/// The strategy's list is BOUNDED by the resource types there are: a type the recorder
+/// already treats the way the request asks for is refused, so the list holds at most one
+/// entry per distinct type a request can name, and `ResourceTypeList`'s member is the
+/// modelled `ResourceType` enum, which the request boundary holds a request to. No
+/// sequence of calls can grow a recorder's recording group further.
+pub fn change_recorded_resource_types(
+    group: &mut RecordingGroup,
+    change: ResourceTypeAssociation,
+    resource_types: &[String],
+) -> Result<(), String> {
+    let strategy = recording_strategy_of(group).to_string();
+    if strategy != RECORDING_STRATEGY_INCLUSION && strategy != RECORDING_STRATEGY_EXCLUSION {
+        return Err(RECORDING_STRATEGY_FORBIDS_ASSOCIATION.to_string());
+    }
+
+    // Every named type is judged against what the recorder records NOW, so a request
+    // naming the same type twice is refused for the same reason one naming an
+    // already-recorded type is: the second mention asks for a change the first already
+    // made.
+    let mut named: Vec<&str> = Vec::with_capacity(resource_types.len());
+    for resource_type in resource_types {
+        let settled = group_records_resource_type(group, resource_type) == change.records_after();
+        if settled || named.contains(&resource_type.as_str()) {
+            return Err(RESOURCE_TYPES_ALREADY_SETTLED.to_string());
+        }
+        named.push(resource_type.as_str());
+    }
+
+    // The list the change is expressed in, and whether the named types belong to it
+    // afterwards: an inclusion group lists what it RECORDS, an exclusion group lists
+    // what it does NOT.
+    let listed_types = if strategy == RECORDING_STRATEGY_INCLUSION {
+        group.resource_types.get_or_insert_with(Vec::new)
+    } else {
+        group
+            .exclusion_by_resource_types
+            .get_or_insert_with(ExclusionByResourceTypes::default)
+            .resource_types
+            .get_or_insert_with(Vec::new)
+    };
+    let belongs = (strategy == RECORDING_STRATEGY_INCLUSION) == change.records_after();
+    for resource_type in resource_types {
+        if belongs {
+            listed_types.push(resource_type.clone());
+        } else {
+            listed_types.retain(|listed| listed != resource_type);
+        }
+    }
+    Ok(())
 }
 
 /// The recording mode a recorder RECORDS WITH, derived from the one a request
@@ -5407,6 +5612,15 @@ pub fn resource_not_discovered_message(identifier: &AggregateResourceIdentifier)
 pub const NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE: &str =
     "The configuration aggregator does not exist. Check the configuration aggregator \
      name and try again.";
+
+/// How Config words `NoSuchRemediationExceptionException` ("You tried to delete a
+/// remediation exception that does not exist").
+///
+/// RECORDED behaviour, and it carries no part of the request: the refusal names the
+/// resource class rather than echoing the rule and resource keys the caller sent, which
+/// is what the recorded refusal of a delete of an exception no rule holds answers.
+pub const NO_SUCH_REMEDIATION_EXCEPTION_MESSAGE: &str =
+    "Specified RemediationException could not be found.";
 
 #[cfg(test)]
 mod tests {
