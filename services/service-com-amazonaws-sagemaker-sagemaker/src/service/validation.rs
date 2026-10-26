@@ -6,7 +6,7 @@
 //! required member, `constraints::validate` for a value outside a declared bound) and
 //! words them in its own conventional envelope — `1 validation error detected: Value
 //! '<value>' at '<member path>' failed to satisfy constraint: <requirement>`. SageMaker
-//! words the same facts differently in three ways, each a property of the shape that was
+//! words the same facts differently in four ways, each a property of the shape that was
 //! violated rather than of one request, so each belongs here rather than in a handler:
 //!
 //! 1. **A `@pattern` is stated WITHOUT the `^`/`$` anchors.** Smithy's `@pattern` is an
@@ -20,7 +20,10 @@
 //!    check still runs the model's own expression ([`unanchored`]).
 //! 2. **An enum value set is listed in the order the SERVICE declares the enum**, which
 //!    is not always the order the public model lists (see [`MODEL_APPROVAL_STATUS`]).
-//! 3. **A violation of a MAP member's values is stated against the map**, echoing the
+//! 3. **A value outside the TRAINING instance types is told the CONDITION it failed**
+//!    rather than handed that value set
+//!    ([`SUPPORTED_INSTANCE_TYPE_REQUIREMENT`]).
+//! 4. **A violation of a MAP member's values is stated against the map**, echoing the
 //!    whole map and listing the value shape's complete constraint set
 //!    ([`map_value_message`]); that one is reached from the handler that enforces such a
 //!    constraint, because the framework's own walk reports the offending entry instead.
@@ -69,19 +72,87 @@ const MAP_VALUE_REQUIREMENT: &str = "Map value must satisfy constraint: ";
 /// instead the moment the framework carries one on `Violation`.
 const MODEL_APPROVAL_STATUS: [&str; 3] = ["PendingManualApproval", "Approved", "Rejected"];
 
+/// What a member whose value must be one of the TRAINING instance types is told it failed:
+/// the CONDITION the value did not meet, in place of the value set that would meet it.
+///
+/// A property of that value SET — not of one member, one operation or one request — so
+/// every member targeting it states this, wherever it sits in a request:
+/// `ResourceConfig$InstanceType` and its `InstanceGroups` entries, the tuning resource
+/// configuration's instance configurations, and an algorithm's supported training instance
+/// types. The listing of [`as_rendered`] stands for every OTHER enum of this service,
+/// the hosting instance types (`ProductionVariantInstanceType`) among them, whose recorded
+/// refusal does list its set.
+///
+/// The value set is recognised by its MEMBERS, from the generated
+/// `TRAINING_INSTANCE_TYPE_VALUES` — the model's own values, so the recognition follows the
+/// model rather than a list written out here — on the same terms, and with the same
+/// fragility, as [`MODEL_APPROVAL_STATUS`]: a runtime [`Violation`] carries the set and not
+/// the shape it came from.
+const SUPPORTED_INSTANCE_TYPE_REQUIREMENT: &str = "Member must be a supported instance type";
+
 /// This service's wording for the violations the framework found on one request, or
 /// `None` when there are none to word.
 pub(super) fn refusal(violations: &[Violation]) -> Option<Refused> {
-    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
-    // The envelope — `1 validation error detected: <clause>` / `N validation errors
-    // detected: <clause>; <clause>` — and each clause's own frame are the framework's,
-    // reached through the same `Violation` the walk produced, so a constraint class this
-    // service does not reword cannot drift from the framework's own sentence.
-    let message = aws_smithy_schema_server::envelope(&stated)?;
+    let clauses: Vec<String> = violations.iter().map(stated_clause).collect();
+    let message = stated_message(&clauses)?;
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message,
     })
+}
+
+/// One violation as this service states it.
+///
+/// The whole sentence is the FRAMEWORK's — the echoed value, the member path, the frame
+/// around them and the requirement itself — reached through the same [`Violation`] the
+/// walk produced, so a constraint class this service does not reword cannot drift from the
+/// framework's own clause. Where the service states the CONDITION a value failed instead
+/// of the framework's rendering of the constraint ([`restated_requirement`]), only the
+/// requirement half is replaced, so the clause's subject stays the framework's.
+fn stated_clause(violation: &Violation) -> String {
+    let clause = as_stated(violation).message();
+    let Some(requirement) = restated_requirement(&violation.kind) else {
+        return clause;
+    };
+    match clause.rsplit_once(CONSTRAINT_SEPARATOR) {
+        Some((subject, _)) => format!("{subject}{CONSTRAINT_SEPARATOR}{requirement}"),
+        None => clause,
+    }
+}
+
+/// The requirement this service words ITSELF, for a constraint whose failure it states as
+/// a condition rather than as the framework's rendering of the constraint — or `None`,
+/// which is every other class, where the framework's requirement stands.
+///
+/// [`ViolationKind`] carries the constraint that was broken, so a sentence that is not a
+/// rendering OF one cannot travel on it: it is chosen here, from the violated constraint,
+/// and nowhere else.
+fn restated_requirement(kind: &ViolationKind) -> Option<&'static str> {
+    match kind {
+        ViolationKind::EnumValue(values)
+            if is_set_of(values, crate::ops::types::TRAINING_INSTANCE_TYPE_VALUES) =>
+        {
+            Some(SUPPORTED_INSTANCE_TYPE_REQUIREMENT)
+        }
+        _ => None,
+    }
+}
+
+/// The `ValidationException` message around the clauses this service stated.
+///
+/// Spelled exactly as [`aws_smithy_schema_server::envelope`] spells it, and not reached
+/// through it, because a clause this module states is not always one the framework can
+/// build from a [`Violation`] (see [`restated_requirement`] and [`map_value_message`]).
+fn stated_message(clauses: &[String]) -> Option<String> {
+    match clauses {
+        [] => None,
+        [one] => Some(envelope_of(one)),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        )),
+    }
 }
 
 /// One violation as this service states it: the framework's path and echoed value, with
@@ -120,6 +191,9 @@ fn as_rendered(kind: &ViolationKind) -> ViolationKind {
 /// It has no shared helper yet, so this is the local reading until that lands — and is to
 /// be deleted in favour of it rather than copied into a third service.
 fn requirement_text(kind: &ViolationKind) -> String {
+    if let Some(requirement) = restated_requirement(kind) {
+        return requirement.to_string();
+    }
     let rendered = Violation {
         path: String::new(),
         kind: as_rendered(kind),
@@ -202,13 +276,14 @@ pub(crate) fn map_value_message<'entries>(
     ))
 }
 
-/// The `ValidationException` envelope around one clause this service built itself.
+/// The `ValidationException` envelope around one clause this service stated itself.
 ///
 /// Spelled exactly as [`aws_smithy_schema_server::envelope`] spells a single-violation
-/// message, so a hand-built clause is framed the way a walked one is; it cannot go
-/// through that function because the clause this module builds is not one the framework
-/// can state from a [`Violation`] (a map-value clause reports the map, not the entry the
-/// walk found).
+/// message, so a stated clause is framed the way a walked one is; it cannot go
+/// through that function because the clause this module states is not always one the
+/// framework can build from a [`Violation`] (a map-value clause reports the map, not the
+/// entry the walk found, and a restated requirement is no rendering of a
+/// [`ViolationKind`]).
 fn envelope_of(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
@@ -348,6 +423,160 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A value outside the TRAINING instance types is told the condition it failed, and no
+    /// other value set is: the generic listing stands for the rest, the hosting instance
+    /// types included.
+    #[test]
+    fn only_the_training_instance_types_are_stated_as_a_condition() {
+        // (case, the value set the walk reported, the requirement this service states)
+        let listed = |values: &[&str]| {
+            format!(
+                "Member must satisfy enum value set: [{}]",
+                values.join(", ")
+            )
+        };
+        let training: Vec<&str> = crate::ops::types::TRAINING_INSTANCE_TYPE_VALUES.to_vec();
+        // Source: `smithy_query(query="shape",shape="ProductionVariantInstanceType")` and
+        // the other value sets of this model, through their generated constants.
+        let hosting: Vec<&str> = crate::ops::types::PRODUCTION_VARIANT_INSTANCE_TYPE_VALUES.to_vec();
+        let transform: Vec<&str> = crate::ops::types::TRANSFORM_INSTANCE_TYPE_VALUES.to_vec();
+        let processing: Vec<&str> = crate::ops::types::PROCESSING_INSTANCE_TYPE_VALUES.to_vec();
+        // The recognition is by MEMBERS, so a set that merely overlaps the training one —
+        // here every training type but the first — is not it.
+        let short_of_the_set: Vec<&str> = training.iter().skip(1).copied().collect();
+
+        let rows: [(&str, &[&str], String); 6] = [
+            (
+                "the training instance types",
+                &training,
+                SUPPORTED_INSTANCE_TYPE_REQUIREMENT.to_string(),
+            ),
+            ("the hosting instance types", &hosting, listed(&hosting)),
+            (
+                "the transform instance types",
+                &transform,
+                listed(&transform),
+            ),
+            (
+                "the processing instance types",
+                &processing,
+                listed(&processing),
+            ),
+            (
+                "one short of the training set",
+                &short_of_the_set,
+                listed(&short_of_the_set),
+            ),
+            (
+                "a two-value set of another enum",
+                &["All", "None"],
+                listed(&["All", "None"]),
+            ),
+        ];
+
+        for (case, values, expected) in rows {
+            let found = Violation {
+                path: "resourceConfig.instanceType".to_string(),
+                kind: ViolationKind::EnumValue(
+                    values.iter().map(|value| (*value).to_string()).collect(),
+                ),
+                value: Some("ml.totally.bogus".to_string()),
+            };
+            let stated = refusal(std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            let whole = format!(
+                "1 validation error detected: Value 'ml.totally.bogus' at \
+                 'resourceConfig.instanceType'{CONSTRAINT_SEPARATOR}{expected}"
+            );
+            assert_eq!(
+                stated.message, whole,
+                "case {case:?}: expected {whole:?}, got {:?}",
+                stated.message
+            );
+        }
+    }
+
+    /// The requirement is replaced for EVERY member carrying the set, whatever the clause's
+    /// subject, and the envelope still counts and joins the clauses the framework's way.
+    #[test]
+    fn a_restated_requirement_leaves_the_clauses_subject_and_the_envelope_alone() {
+        let instance_type = |path: &str, value: &str| Violation {
+            path: path.to_string(),
+            kind: ViolationKind::EnumValue(
+                crate::ops::types::TRAINING_INSTANCE_TYPE_VALUES
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            ),
+            value: Some(value.to_string()),
+        };
+
+        // Rows differ along the member's depth in the request, the echoed value's shape
+        // (including one that spells the clause separator itself) and the clause count.
+        let rows: [(&str, Vec<Violation>, String); 4] = [
+            (
+                "a top-level resource configuration",
+                vec![instance_type("resourceConfig.instanceType", "ml.t2.medium")],
+                format!(
+                    "1 validation error detected: Value 'ml.t2.medium' at \
+                     'resourceConfig.instanceType'{CONSTRAINT_SEPARATOR}\
+                     {SUPPORTED_INSTANCE_TYPE_REQUIREMENT}"
+                ),
+            ),
+            (
+                "an instance group inside a list",
+                vec![instance_type(
+                    "resourceConfig.instanceGroups.1.member.instanceType",
+                    "",
+                )],
+                format!(
+                    "1 validation error detected: Value '' at \
+                     'resourceConfig.instanceGroups.1.member.instanceType'\
+                     {CONSTRAINT_SEPARATOR}{SUPPORTED_INSTANCE_TYPE_REQUIREMENT}"
+                ),
+            ),
+            (
+                "a value spelling the clause separator",
+                vec![instance_type(
+                    "resourceConfig.instanceType",
+                    "x failed to satisfy constraint: y",
+                )],
+                format!(
+                    "1 validation error detected: Value 'x failed to satisfy constraint: y' \
+                     at 'resourceConfig.instanceType'{CONSTRAINT_SEPARATOR}\
+                     {SUPPORTED_INSTANCE_TYPE_REQUIREMENT}"
+                ),
+            ),
+            (
+                "two members of one request",
+                vec![
+                    instance_type("resourceConfig.instanceType", "ml.bogus.one"),
+                    instance_type(
+                        "resourceConfig.instanceGroups.1.member.instanceType",
+                        "ml.bogus.two",
+                    ),
+                ],
+                format!(
+                    "2 validation errors detected: Value 'ml.bogus.one' at \
+                     'resourceConfig.instanceType'{CONSTRAINT_SEPARATOR}\
+                     {SUPPORTED_INSTANCE_TYPE_REQUIREMENT}; Value 'ml.bogus.two' at \
+                     'resourceConfig.instanceGroups.1.member.instanceType'\
+                     {CONSTRAINT_SEPARATOR}{SUPPORTED_INSTANCE_TYPE_REQUIREMENT}"
+                ),
+            ),
+        ];
+
+        for (case, found, expected) in rows {
+            let stated = refusal(&found)
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
             );
         }
     }

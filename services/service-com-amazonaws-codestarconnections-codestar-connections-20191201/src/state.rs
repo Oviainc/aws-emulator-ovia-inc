@@ -3,7 +3,7 @@
 //! Engine state for the com-amazonaws-codestarconnections-codestar-connections-20191201 service.
 //!
 //! This module owns the service's persisted resources (connections, repository links,
-//! hosts, sync blockers and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
+//! hosts, sync blockers, the sync state recorded per resource, and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
 //! region the caller signed for, and the `NextToken` codec the paginated list
 //! operations share. `src/lib.rs` is generated, so a helper several handlers reach
 //! lives here rather than in a module of its own.
@@ -15,8 +15,8 @@ use std::hash::BuildHasher;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncBlockerSummary, Tag,
-    VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, ResourceSyncAttempt, Revision, SyncBlocker,
+    SyncBlockerContext, SyncBlockerSummary, Tag, VpcConfiguration,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
@@ -368,6 +368,34 @@ impl StoredSyncBlocker {
     }
 }
 
+/// The sync state this service has recorded for one `(SyncType, ResourceName)` pair:
+/// what `GetResourceSyncStatus` reports.
+///
+/// Only the SERVICE records a sync attempt, when its Git-sync component drives a
+/// resource from the repository the pair is configured against — never a caller: this
+/// API models no operation that reports a sync. Driving a resource means fetching that
+/// remote repository's commits, which this emulator does not do, so nothing puts a row
+/// here and every lookup misses — exactly like [`StoredSyncBlocker`]. That is why the
+/// reader reports no sync state rather than inventing a revision, a commit sha and an
+/// event list for work nothing ran.
+#[derive(Debug, Clone, Default)]
+pub struct StoredResourceSyncState {
+    /// The revision the resource is being driven TO, when a sync has set one.
+    pub desired_state: Option<Revision>,
+    /// The latest attempt, successful or not.
+    pub latest_sync: Option<ResourceSyncAttempt>,
+    /// The latest attempt that succeeded.
+    pub latest_successful_sync: Option<ResourceSyncAttempt>,
+}
+
+/// The key the sync state of a resource is stored under: the `(SyncType, ResourceName)`
+/// pair every sync operation of this service addresses one by.
+///
+/// One function, so a writer and a reader can never disagree about the field order.
+pub fn resource_sync_key(sync_type: &str, resource_name: &str) -> (String, String) {
+    (sync_type.to_string(), resource_name.to_string())
+}
+
 /// Per-service state for com-amazonaws-codestarconnections-codestar-connections-20191201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
@@ -392,6 +420,11 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// side of the service has put there and an id naming no entry is the modeled
     /// `SyncBlockerDoesNotExistException`.
     pub sync_blockers: BTreeMap<String, StoredSyncBlocker>,
+    /// The sync state recorded against each `(SyncType, ResourceName)` pair, keyed by
+    /// [`resource_sync_key`] — the same pair `GetResourceSyncStatus` addresses.
+    ///
+    /// Only a sync the service performed writes here; see [`StoredResourceSyncState`].
+    pub resource_sync_states: BTreeMap<(String, String), StoredResourceSyncState>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
     /// `ListTagsForResource` and populated from `CreateConnection.Tags` /
     /// `CreateHost.Tags`.

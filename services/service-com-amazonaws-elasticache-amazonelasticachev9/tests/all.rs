@@ -172,3 +172,8 @@ mod access_string_refusal_wording;
 // say, and what the user takes after one.
 #[path = "all/access_string_refusal_message.rs"]
 mod access_string_refusal_message;
+
+// Appended for the same reason: the suite about the sentence a user group without the
+// service's own user is refused with, at both writers of a membership.
+#[path = "all/default_user_required_wording.rs"]
+mod default_user_required_wording;

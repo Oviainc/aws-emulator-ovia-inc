@@ -209,10 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than absence, so sending a blank one clears the member rather than storing a
         // value a later read would echo back blank.
         if let Some(category) = input.category {
-            record.category = Some(category).filter(|value| !value.trim().is_empty());
+            record.category = crate::state::optional_free_text(Some(category));
         }
         if let Some(description) = input.description {
-            record.description = Some(description).filter(|value| !value.trim().is_empty());
+            record.description = crate::state::optional_free_text(Some(description));
         }
         // `Settings` is "Settings for preset": the whole encoder-settings graph, replaced
         // as a unit when it is sent, since the API models no partial-settings patch.

@@ -280,12 +280,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each member is "the new <member> for the job template, if you are changing it":
         // a member the caller sent replaces the stored one, and a member it left out
-        // leaves the stored one exactly as it was.
+        // leaves the stored one exactly as it was. `Category` and `Description` are free
+        // text, where — as on create — a value carrying no characters carries no more
+        // information than absence, so sending a blank one CLEARS the member rather than
+        // storing a value a later read would echo back blank.
         if let Some(category) = input.category {
-            template.category = Some(category);
+            template.category = crate::state::optional_free_text(Some(category));
         }
         if let Some(description) = input.description {
-            template.description = Some(description);
+            template.description = crate::state::optional_free_text(Some(description));
         }
         if let Some(settings) = input.settings {
             template.settings = settings;

@@ -818,7 +818,7 @@ impl SourceApiAssociationRecord {
     pub fn start_merge(&mut self, now: SystemTime) -> Result<String, AssociationRefusal> {
         if self.deletion_pending() {
             return Err(AssociationRefusal::ConcurrentModification(
-                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+                associations_being_updated_message(&self.merged_api_id),
             ));
         }
         if self.merge_due_at.is_none() {
@@ -853,7 +853,7 @@ impl SourceApiAssociationRecord {
     ) -> Result<(), AssociationRefusal> {
         if self.deletion_pending() {
             return Err(AssociationRefusal::ConcurrentModification(
-                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+                associations_being_updated_message(&self.merged_api_id),
             ));
         }
         self.description = description;
@@ -1054,22 +1054,22 @@ pub fn create_source_api_association(
     // (`SourceApiAssociation`). An API on the wrong side of that sentence exists and is
     // named well, so the request is a bad one rather than a not-found.
     if merged_api_type != MERGED_API_TYPE {
-        return Err(AssociationRefusal::BadRequest(format!(
-            "API {merged_api_id} is not a Merged API; only an API of type {MERGED_API_TYPE} can \
-             be associated with source APIs"
+        return Err(AssociationRefusal::BadRequest(invalid_api_type_message(
+            MERGED_API_TYPE,
+            &merged_api_id,
         )));
     }
     if source_api_type != GRAPHQL_API_TYPE {
-        return Err(AssociationRefusal::BadRequest(format!(
-            "API {source_api_id} is not a source API; only an API of type {GRAPHQL_API_TYPE} can \
-             be associated with a Merged API"
+        return Err(AssociationRefusal::BadRequest(invalid_api_type_message(
+            GRAPHQL_API_TYPE,
+            &source_api_id,
         )));
     }
 
     if let Some(existing) = state.association_for_pair(&merged_api_id, &source_api_id) {
         if existing.modification_pending() {
             return Err(AssociationRefusal::ConcurrentModification(
-                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+                associations_being_updated_message(&merged_api_id),
             ));
         }
         return Err(AssociationRefusal::BadRequest(format!(
@@ -1633,14 +1633,33 @@ pub fn invalid_association_id_message(association_id: &str) -> String {
     format!("Invalid SourceApi Association ID {association_id}")
 }
 
-/// The text `ConcurrentModificationException` (HTTP 409) carries, which the MODEL
-/// states for the shape itself: "Another modification is in progress at this time and
-/// it must complete before you can make your change." It is the error's own
-/// documentation rather than a per-request detail, so it is request-independent and
-/// names nothing of the call that met it.
-pub const CONCURRENT_MODIFICATION_MESSAGE: &str =
-    "Another modification is in progress at this time and it must complete before you can make \
-     your change.";
+/// The text `ConcurrentModificationException` (HTTP 409) carries when the modification
+/// already in progress is one of a Merged API's SOURCE-API ASSOCIATIONS.
+///
+/// AppSync scopes this conflict to the contended resource rather than reporting it as an
+/// account-wide one: the refusal names the Merged API whose associations are being
+/// updated and asks the caller to retry, so a caller racing on one Merged API can tell
+/// which one is busy. Every association operation that can meet the conflict addresses
+/// exactly one Merged API, so the Merged API's own `apiId` is what fills the template —
+/// whichever identifier form the request named it by.
+pub fn associations_being_updated_message(merged_api_id: &str) -> String {
+    format!(
+        "SourceApiAssociations for Merged API {merged_api_id} are currently being updated, please \
+         wait and try again."
+    )
+}
+
+/// AppSync's refusal text for an API that is on a side of an association its
+/// `GraphQLApiType` cannot take: the type that side requires and the API that was
+/// refused.
+///
+/// One template for both sides — an association links a source API of type
+/// [`GRAPHQL_API_TYPE`] to a Merged API of type [`MERGED_API_TYPE`]
+/// (`GraphqlApi$apiType`, `SourceApiAssociation`) — so the refusal states the type the
+/// addressed side had to have rather than wording each side separately.
+pub fn invalid_api_type_message(expected_api_type: &str, api_id: &str) -> String {
+    format!("Invalid API type, expected api to be type {expected_api_type} for api : {api_id}")
+}
 
 /// The ARN namespace (and endpoint prefix) this service's resources carry.
 pub const ARN_SERVICE: &str = "appsync";

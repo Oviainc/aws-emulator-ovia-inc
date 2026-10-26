@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContainerService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContainerService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the configuration change a request asks of one stored container
+//! service and answers the record it left.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContainerService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +178,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContainerService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContainerServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContainerService"))
+        // A container service is a REGIONAL resource whose name is unique within
+        // one region of the account, so the region the request is signed for is
+        // what that name is resolved in.
+        let region = crate::state::request_region(ctx.parts());
+        // The URL the answered record announces must be the endpoint the caller
+        // reached this emulator on, so it is read off THIS request.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
+
+        // `serviceName` is a modelled `@required` member carrying the modelled
+        // length and pattern, and `scale` carries the modelled 1..20 range, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the power must
+        // name one this service serves, and the caller-sized collection of
+        // public domain names must be within its bound. Both are resolved
+        // BEFORE the store is reached, so a request with one bad member changes
+        // none of the others either.
+        let power = input
+            .power
+            .as_deref()
+            .map(|requested| {
+                crate::state::container_service_power(requested).ok_or_else(|| {
+                    invalid(format!(
+                        "power must be one of [{}], got '{requested}'",
+                        crate::state::container_service_power_names()
+                    ))
+                })
+            })
+            .transpose()?;
+        // Whether a public domain name is backed by a validated certificate is
+        // `CreateCertificate`'s business, which this emulator does not hold yet,
+        // so the names are kept as asked for and only their COUNT is bounded.
+        let public_domain_names = input
+            .public_domain_names
+            .as_ref()
+            .map(|requested| {
+                crate::state::public_domain_names_from_request(Some(requested)).map_err(invalid)
+            })
+            .transpose()?;
+        // The one member of `privateRegistryAccess` a request can ask for: a
+        // request that carries the wrapper but names no `isActive` asks for no
+        // change to the role at all.
+        let ecr_image_puller_role_active = input
+            .private_registry_access
+            .as_ref()
+            .and_then(|access| access.ecr_image_puller_role.as_ref())
+            .and_then(|role| role.is_active);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A service is UPDATED here, never created, so a name that names
+            // none in this region is the service's `DoesNotExist` rejection.
+            let service = store
+                .container_service_mut(&region, &input.service_name)
+                .ok_or_else(|| not_found(&input.service_name))?;
+
+            // Every member but `serviceName` is optional: one the request
+            // leaves out asks for no change to it, and one that asks for the
+            // value the service already carries changes nothing either.
+            //
+            // `power` and `scale` are the service's configured capacity ("the
+            // power and scale of a container service makes up its configured
+            // capacity") and `publicDomainNames` its custom domains, which is
+            // what the modelled `ContainerService$state` documentation says
+            // `UPDATING` covers — so a change to any of them is what moves the
+            // service through that state.
+            let mut capacity_or_domains_changed = false;
+            if let Some(power) = power.filter(|power| power.name != service.power) {
+                service.power = power.name.to_string();
+                service.power_id = power.power_id.to_string();
+                capacity_or_domains_changed = true;
+            }
+            if let Some(scale) = input.scale.filter(|scale| *scale != service.scale) {
+                service.scale = scale;
+                capacity_or_domains_changed = true;
+            }
+            if let Some(names) =
+                public_domain_names.filter(|names| *names != service.public_domain_names)
+            {
+                service.public_domain_names = names;
+                capacity_or_domains_changed = true;
+            }
+            // Activating or deactivating the image puller role grants or
+            // withdraws an access the service holds; it is neither capacity nor
+            // a custom domain, so it takes effect without moving the service
+            // out of the state it is in.
+            if let Some(active) = ecr_image_puller_role_active {
+                service.ecr_image_puller_role_active = active;
+            }
+            let disabled_changed = input
+                .is_disabled
+                .is_some_and(|disabled| disabled != service.is_disabled);
+            if let Some(disabled) = input.is_disabled {
+                service.is_disabled = disabled;
+            }
+
+            if capacity_or_domains_changed || disabled_changed {
+                // Where the service settles once the change is applied: a
+                // disabled one is `DISABLED` ("the container service is
+                // disabled, and its active deployment and containers, if any,
+                // are shut down"), and an enabled one is `RUNNING` when it has
+                // a deployment to serve — the one running, or the one still
+                // waiting — and `READY` when it has none.
+                //
+                // A deployment record is left exactly as it stands: the model
+                // carries no way to report a deployment whose containers are
+                // shut down, and re-enabling the service brings the same
+                // deployment back, so nothing here retires one.
+                let settles_into = if service.is_disabled {
+                    crate::state::CONTAINER_SERVICE_DISABLED
+                } else if service.current_deployment.is_some() || service.next_deployment.is_some() {
+                    crate::state::CONTAINER_SERVICE_RUNNING
+                } else {
+                    crate::state::CONTAINER_SERVICE_READY
+                };
+                // Applying the change is the service's own work, so a read
+                // straight after this call still sees `UPDATING` and the clock
+                // is what settles it. That makes the phase this call owes the
+                // only one outstanding: whatever walk the service was on is
+                // superseded by this update's.
+                service.state = crate::state::CONTAINER_SERVICE_UPDATING;
+                service.owed.clear();
+                service.owed.push_back(crate::state::OwedPhase {
+                    at_ms: now.saturating_add(crate::state::STATE_TRANSITION_MILLIS),
+                    state: settles_into,
+                    // A deployment that was still waiting becomes the active
+                    // one as the service starts serving again; a service being
+                    // disabled activates nothing.
+                    activates_next_deployment: !service.is_disabled
+                        && service.next_deployment.is_some(),
+                });
+            }
+
+            Ok(UpdateContainerServiceOutput {
+                container_service: Some(service.view(endpoint.as_deref())),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> UpdateContainerServiceError {
+    UpdateContainerServiceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No container service of that name is stored in that region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// identifier the request carried.
+fn not_found(name: &str) -> UpdateContainerServiceError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateContainerServiceError {
+    UpdateContainerServiceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

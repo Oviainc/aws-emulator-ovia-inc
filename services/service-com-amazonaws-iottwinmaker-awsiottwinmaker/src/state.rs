@@ -1503,6 +1503,51 @@ impl Workspace {
         property_names
     }
 
+    /// Every property group a component HAS: the ones it declares itself, plus
+    /// the ones the component type it instantiates — or a type that type
+    /// extends — declares and it never restated.
+    ///
+    /// The same resolution [`component_property_names`](Self::component_property_names)
+    /// makes for a component's properties, applied to its groups, so a reader
+    /// that enumerates either reports the component's EFFECTIVE schema rather
+    /// than only the part its entity's create restated. In group-name order.
+    pub fn component_property_group_names(
+        &self,
+        component_type_id: Option<&str>,
+        property_groups: &BTreeMap<String, PropertyGroupRecord>,
+    ) -> BTreeSet<String> {
+        let mut group_names: BTreeSet<String> = property_groups.keys().cloned().collect();
+        if let Some(component_type_id) = component_type_id {
+            for component_type in self.component_type_chain(component_type_id) {
+                group_names.extend(component_type.property_groups.keys().cloned());
+            }
+        }
+        group_names
+    }
+
+    /// Where the definition set a component's inherited schema comes from: the
+    /// component type the component instantiates, when this workspace holds it.
+    ///
+    /// Reported as `definedIn` ("the name of the property definition set"),
+    /// which is what tells a caller that the definitions it is being shown were
+    /// not declared on the entity. The INSTANTIATED type is the name, not
+    /// whichever type on its `extendsFrom` chain happens to declare a given
+    /// definition: `definedIn` is one string per component while the component's
+    /// definitions may come from several types at once, and the instantiated
+    /// type is the definition set the component was given — the chain behind it
+    /// is that type's own structure, which `GetComponentType` reports. It is
+    /// named whenever it resolves, including for a type that declares nothing:
+    /// what resolved is a definition set, not a non-empty one. `None` when the
+    /// component instantiates no component type, or names one this workspace
+    /// does not hold — then nothing was resolved and there is no definition set
+    /// to name.
+    pub fn component_defined_in(&self, component_type_id: Option<&str>) -> Option<String> {
+        let component_type_id = component_type_id?;
+        self.component_types
+            .get(component_type_id)
+            .map(|component_type| component_type.component_type_id.clone())
+    }
+
     /// The external ids a component carries: the value of every property of it
     /// whose EFFECTIVE definition marks the property as the external id — "the
     /// primary key of an external storage system".
@@ -2115,12 +2160,16 @@ pub const TABULAR_GROUP_TYPE: &str = "TABULAR";
 /// Shared by every reader of a component's property groups (`GetEntity`,
 /// `ListComponents`), so one group is reported the same way wherever it is read.
 /// `groupType` is required on the response but optional on the request, so a
-/// group stored without one reports [`TABULAR_GROUP_TYPE`]; nothing is inherited
-/// here, which is why `isInherited` is false (see [`property_definition_response`]).
-/// A component TYPE's own groups are a different modelled shape
-/// (`PropertyGroupResponse`), which `GetComponentType` builds.
+/// group stored without one reports [`TABULAR_GROUP_TYPE`].
+///
+/// `is_inherited` is what the caller resolved the group through
+/// ([`property_group_is_inherited`]): a group the component declares itself is
+/// its own, and one that reaches it only because of the component type it
+/// instantiates is inherited. A component TYPE's own groups are a different
+/// modelled shape (`PropertyGroupResponse`), which `GetComponentType` builds.
 pub fn component_property_group_response(
     group: &PropertyGroupRecord,
+    is_inherited: bool,
 ) -> crate::ops::types::ComponentPropertyGroupResponse {
     crate::ops::types::ComponentPropertyGroupResponse {
         group_type: group
@@ -2128,8 +2177,70 @@ pub fn component_property_group_response(
             .clone()
             .unwrap_or_else(|| TABULAR_GROUP_TYPE.to_string()),
         property_names: group.property_names.clone(),
-        is_inherited: false,
+        is_inherited,
     }
+}
+
+/// Every property group one component HAS, as the modelled map a reader of a
+/// component reports: the groups the component declares itself plus the ones
+/// the component type it instantiates — or a type that type extends — declares
+/// and it never restated
+/// ([`Workspace::component_property_group_names`]), each resolved through
+/// [`Workspace::effective_property_group`] and projected by
+/// [`component_property_group_response`].
+///
+/// The ONE projection every reader of a component's property groups shares
+/// (`GetEntity` for a component and for a composite component,
+/// `ListComponents` for both), so the readers cannot drift on which groups a
+/// component has or on which of them is inherited.
+pub fn component_property_groups_response(
+    workspace: &Workspace,
+    component_type_id: Option<&str>,
+    property_groups: &BTreeMap<String, PropertyGroupRecord>,
+) -> std::collections::HashMap<String, crate::ops::types::ComponentPropertyGroupResponse> {
+    workspace
+        .component_property_group_names(component_type_id, property_groups)
+        .into_iter()
+        .filter_map(|group_name| {
+            let group =
+                workspace.effective_property_group(component_type_id, property_groups, &group_name)?;
+            let response = component_property_group_response(
+                group,
+                property_group_is_inherited(property_groups, &group_name),
+            );
+            Some((group_name, response))
+        })
+        .collect()
+}
+
+/// Whether the definition [`Workspace::effective_property_definition`] resolves
+/// for `property_name` is INHERITED: it came from the component type the
+/// component instantiates rather than from the component itself.
+///
+/// A component's own record carries a definition only for a property its
+/// entity's create or update DECLARED inline; every other property of the
+/// component reaches it through the component type, which is exactly what
+/// `isInherited` reports. A property record that carries a value but no
+/// definition is one of those: the value is the component's, the definition
+/// giving it meaning is the type's.
+pub fn property_definition_is_inherited(
+    properties: &BTreeMap<String, PropertyRecord>,
+    property_name: &str,
+) -> bool {
+    properties
+        .get(property_name)
+        .is_none_or(|property| property.definition.is_none())
+}
+
+/// Whether the group [`Workspace::effective_property_group`] resolves for
+/// `group_name` is INHERITED — the same question
+/// [`property_definition_is_inherited`] answers for a definition, asked of a
+/// component's property groups.
+pub fn property_group_is_inherited(
+    property_groups: &BTreeMap<String, PropertyGroupRecord>,
+    group_name: &str,
+) -> bool {
+    !property_groups.contains_key(group_name)
 }
 
 /// Whether storing this property definition would leave a component type that
@@ -2628,12 +2739,17 @@ pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) 
 /// `None` when the stored definition carries no `dataType`, which the response
 /// shape requires: the writers refuse a new definition without one, so this
 /// stays fallible rather than inventing a `Type` the model does not define.
-/// Nothing imports, finalises or inherits a definition yet: `isImported`,
-/// `isFinal` and `isInherited` all describe a definition that came from
-/// somewhere else, and every definition stored here was written by the create
-/// that declared it.
+///
+/// `is_inherited` is what the caller resolved this definition through: a
+/// definition the component or component type declared itself is its own, and
+/// one that reaches a component only because of the component type it
+/// instantiates is inherited ([`property_definition_is_inherited`]). Nothing
+/// imports or finalises a definition yet: `isImported` and `isFinal` describe a
+/// definition projected from an external data store and one that cannot be
+/// updated, neither of which this service produces.
 pub fn property_definition_response(
     definition: &crate::ops::types::PropertyDefinitionRequest,
+    is_inherited: bool,
 ) -> Option<crate::ops::types::PropertyDefinitionResponse> {
     let Some(data_type) = definition.data_type.clone() else {
         // Logged rather than dropped silently so a regression in a writer that
@@ -2650,7 +2766,7 @@ pub fn property_definition_response(
         is_stored_externally: definition.is_stored_externally.unwrap_or(false),
         is_imported: false,
         is_final: false,
-        is_inherited: false,
+        is_inherited,
         default_value: definition.default_value.clone(),
         configuration: definition.configuration.clone(),
         display_name: definition.display_name.clone(),
@@ -2968,11 +3084,13 @@ pub struct TimeSeriesValue {
 /// One component of an entity.
 ///
 /// A component's properties and property groups are stored as the modelled
-/// request shapes the caller supplied, so `GetEntity` reports back exactly the
+/// request shapes the caller supplied, so a read reports back exactly the
 /// definition and value that were persisted rather than a lossy projection of
-/// them. Inheritance from a component *type* is not resolved: every definition
-/// stored here is the entity-local one, which is why every `isInherited` this
-/// service reports is `false`.
+/// them. Only what the entity DECLARED is stored here: the rest of the
+/// component's schema lives on the component type it instantiates and is
+/// resolved against the workspace when a component is read
+/// ([`Workspace::component_property_names`],
+/// [`Workspace::effective_property_definition`]).
 #[derive(Debug, Clone, Default)]
 pub struct ComponentRecord {
     pub component_name: String,
@@ -3066,8 +3184,7 @@ pub struct ResolvedComponentPath {
 /// component types. A path of a single segment names a top-level component and
 /// no composite component, so it does not resolve; and resolution walks only
 /// the component type's OWN `compositeComponentTypes`, because this service
-/// resolves no inheritance (every `isInherited` it reports is `false`) and does
-/// not model every built-in component type a real workspace carries — so a
+/// does not model every built-in component type a real workspace carries — so a
 /// path through a component type this workspace does not hold cannot be
 /// resolved, and is refused rather than guessed at.
 pub fn resolve_composite_component_path(

@@ -13,11 +13,15 @@
 //! * CREATE (`Policy.PolicyId` absent) — the service mints the `PolicyId` and the
 //!   first `PolicyUpdateToken`, builds the policy ARN, and stores the whole
 //!   modelled `Policy` plus the request's `TagList`.
-//! * UPDATE (`Policy.PolicyId` present) — the request's `PolicyUpdateToken` must
+//! * UPDATE (`Policy.PolicyId` present) — the policy must be one the
+//!   administrative scope governing it covers (a policy reported
+//!   `OUT_OF_ADMIN_SCOPE` is one the administrator "can view … but they can't
+//!   edit or delete"), and the request's `PolicyUpdateToken` must
 //!   equal the stored one (the model: "the `PolicyUpdateToken` in the request
 //!   must match the `PolicyUpdateToken` of the current policy version"), and a
 //!   successful update rotates it. An unknown id is `ResourceNotFoundException`;
-//!   a stale or absent token is `InvalidOperationException`.
+//!   an out-of-scope policy or a stale or absent token is
+//!   `InvalidOperationException`.
 //!
 //! Either way the SERVICE-OWNED members of the document are not the caller's to
 //! set: the `PolicyId` and `PolicyUpdateToken` the service mints, and the
@@ -546,6 +550,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 };
+                // Editing a stored policy is the administrator's to do only
+                // while the administrative scope governing it covers it: a
+                // policy reported `OUT_OF_ADMIN_SCOPE` is one "the administrator
+                // can view … but they can't edit or delete"
+                // ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_mutation_refusal`]),
+                // so the edit is refused before the token is judged — a caller
+                // that may not edit this policy at all learns that, rather than
+                // being invited to fetch a fresher token and try again — and
+                // before anything is written, so the stored document and its
+                // token are left exactly as they were.
+                if let Some(refusal) = store.policy_mutation_refusal(existing) {
+                    return Err(PutPolicyErrorModeled::InvalidOperationException(refusal).into());
+                }
                 if requested_token.as_deref() != Some(existing.update_token.as_str()) {
                     return Err(PutPolicyErrorModeled::InvalidOperationException(
                         InvalidOperationException {

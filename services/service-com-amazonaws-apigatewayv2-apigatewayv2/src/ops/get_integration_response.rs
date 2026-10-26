@@ -165,10 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A reporting operation: it reads the store and writes nothing.
         let store = state.lock();
         let Some(api) = store.apis.get(&input.api_id) else {
-            return Err(not_found("API", &input.api_id));
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
         };
         let Some(integration) = api.integrations.get(&input.integration_id) else {
-            return Err(not_found("Integration", &input.integration_id));
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::INTEGRATION_RESOURCE,
+            )));
         };
         // An integration response is resolvable only through the integration that owns
         // it, so an id another integration minted names nothing here.
@@ -176,10 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .integration_responses
             .get(&input.integration_response_id)
         else {
-            return Err(not_found(
-                "IntegrationResponse",
-                &input.integration_response_id,
-            ));
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::INTEGRATION_RESPONSE_RESOURCE,
+            )));
         };
 
         let stored = record.to_wire();
@@ -196,10 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// This operation's refusal of a request naming a resource no record holds: the modelled
 /// `NotFoundException` ("The resource specified in the request was not found"), whose
-/// message names the resource and the identifier the request carried.
-fn not_found(resource: &str, id: &str) -> GetIntegrationResponseError {
+/// message names the KIND of resource that resolved to nothing.
+fn not_found(message: String) -> GetIntegrationResponseError {
     GetIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::invalid_identifier_message(resource, id)),
+        message: Some(message),
         resource_type: ::std::option::Option::None,
     })
     .into()
