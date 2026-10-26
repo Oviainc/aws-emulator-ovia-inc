@@ -42,10 +42,10 @@ fn put_request(name: &str, output_format: &str) -> Value {
 
 /// Put the stored stream `name` into the `stopped` state.
 ///
-/// `PutMetricStream` creates a stream running and the operation that stops one is still a
-/// scaffold stub in this emulator (`cloudwatch-stopmetricstreams-stub`), so the only way a
-/// test can set up a stopped stream today is through the shared store every handler reads —
-/// the seam `build_router_with_engine` exists for.
+/// `PutMetricStream` creates a stream running, so the row's STARTING state is set up through
+/// the shared store every handler reads — the seam `build_router_with_engine` exists for —
+/// rather than by calling another operation, which keeps what this suite asserts about
+/// `StartMetricStreams` resting on `StartMetricStreams` alone.
 fn force_stopped(engine: &engine::InMemoryEngine, name: &str) {
     let state = cloudwatch::state::service_state(engine).expect("the CloudWatch store exists");
     let mut store = state.lock();

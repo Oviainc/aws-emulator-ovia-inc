@@ -101,6 +101,15 @@
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
 //!
+//! The code-signing association is one value on the same record:
+//! `PutFunctionCodeSigningConfig` "Update[s] the code signing configuration for the
+//! function", and a function has one such configuration at a time, so what it persists is
+//! the single [`FunctionRecord::code_signing_config_arn`] of the function it addressed —
+//! the ARN of a configuration this store already holds, never one the request invented.
+//! `CreateFunction` sets the same value from its own `CodeSigningConfigArn` member, and
+//! `GetFunctionCodeSigningConfig` reports exactly what is stored there, so one function
+//! has ONE association however it was set.
+//!
 //! The capacity-provider slice is the account's other top-level resource:
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::capacity_providers`] holds one
 //! [`CapacityProviderRecord`] per provider, keyed by its bare name, so every operation
@@ -343,6 +352,21 @@ pub const DEFAULT_CODE_SIGNING_POLICY: &str = "Warn";
 /// The most code-signing configurations this emulator keeps, from AWS's published Lambda
 /// quota "Code signing configurations: 20 per account".
 pub const MAX_CODE_SIGNING_CONFIGS: usize = 20;
+
+/// The refusal an operation naming a code-signing configuration this account holds none
+/// of answers with: the sentence AWS words `CodeSigningConfigNotFoundException` as, with
+/// the ARN the request named as its variable part.
+///
+/// Every operation that takes a `CodeSigningConfigArn` naming a configuration that has to
+/// already exist — `PutFunctionCodeSigningConfig` and `CreateFunction` — refuses with this
+/// one sentence, so the association surface states the same thing wherever it is set.
+#[must_use]
+pub fn code_signing_config_not_found_message(arn: &str) -> String {
+    format!(
+        "The code signing configuration cannot be found. Check that the provided \
+         configuration is not deleted: {arn}."
+    )
+}
 
 /// The most published versions this emulator keeps for one function.
 ///
@@ -1698,6 +1722,14 @@ pub struct FunctionRecord {
     pub tags: BTreeMap<String, String>,
     /// The reserved concurrency, when `PutFunctionConcurrency` has set one.
     pub reserved_concurrent_executions: Option<i32>,
+    /// The ARN of the code signing configuration this function deploys under, when one
+    /// has been associated with it. It is a function-level setting — the association is
+    /// addressed by a `FunctionName` alone, with no qualifier member anywhere on
+    /// `PutFunctionCodeSigningConfig`, `GetFunctionCodeSigningConfig` or
+    /// `DeleteFunctionCodeSigningConfig` — so it lives on the record beside the
+    /// function's other function-level settings, and a function nothing has associated a
+    /// configuration with holds none at all.
+    pub code_signing_config_arn: Option<String>,
     /// The function's recursive loop detection configuration, one of the model's
     /// `RecursiveLoop` values. It is a function-level setting rather than a
     /// version-specific one — `GetFunctionRecursionConfig` and

@@ -1667,6 +1667,11 @@ pub fn schedule_expression_error(expression: &str) -> Option<String> {
 /// stream in this state, and only `StopMetricStreams` moves it out of it.
 pub const METRIC_STREAM_RUNNING: &str = "running";
 
+/// A stopped metric stream: the other of the two values
+/// (`GetMetricStreamOutput$State`) — `StopMetricStreams` moves a stream into this state and
+/// `StartMetricStreams` moves it back.
+pub const METRIC_STREAM_STOPPED: &str = "stopped";
+
 /// Encode a pagination cursor — the key the NEXT page starts at — as an opaque token.
 ///
 /// Hex keeps the token opaque to the caller and, unlike the bare key, makes a token the

@@ -45,6 +45,16 @@ pub const INGESTION_STATE_ENABLED: &str = "enabled";
 /// The other one — see [`INGESTION_STATE_ENABLED`].
 pub const INGESTION_STATE_DISABLED: &str = "disabled";
 
+/// How long after an enabled ingestion loses a destination association the
+/// disable AppFabric documents for it falls due.
+///
+/// A CHOSEN span, not an AWS-published duration: the model documents only that
+/// such an ingestion fails and is EVENTUALLY disabled, with no figure. It is
+/// non-zero on purpose — a caller reading the ingestion straight after the
+/// delete still sees it `enabled`, and still gets the state refusals that go
+/// with that, the way it would against AppFabric.
+pub const INGESTION_DISABLE_AFTER_DESTINATION_LOSS: Duration = Duration::from_millis(500);
+
 /// The largest page any `List*` operation returns, which is also the upper bound
 /// the model puts on `maxResults` (`@range(min: 1, max: 100)`), and the page size
 /// used when a caller names none.
@@ -555,6 +565,9 @@ pub struct IngestionRecord {
     pub app: String,
     pub tenant_id: String,
     pub ingestion_type: String,
+    /// The `IngestionState` the last call that moved this ingestion wrote. What a
+    /// read REPORTS is [`IngestionRecord::state_at`], which also accounts for a
+    /// disable the clock owes but no call has written.
     pub state: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -564,30 +577,76 @@ pub struct IngestionRecord {
     /// `CreateIngestionDestination` writes them and
     /// `UpdateIngestionDestination` rewrites their configuration in place.
     pub destinations: HashMap<String, IngestionDestinationRecord>,
+    /// The instant from which this ingestion reads `disabled` because the clock
+    /// owes it the disable that follows losing a destination association while it
+    /// was enabled ([`INGESTION_DISABLE_AFTER_DESTINATION_LOSS`] past the call
+    /// that broke the association). `None` when nothing is owed. Stored rather
+    /// than slept for, so a read reports the state the clock already owes.
+    pub disables_at: Option<SystemTime>,
 }
 
 impl IngestionRecord {
-    /// The modelled `Ingestion` for this record.
-    pub fn to_ingestion(&self) -> Ingestion {
+    /// This ingestion's `IngestionState` at `now`: the value the last start or
+    /// stop call wrote, until a disable the clock owes falls due, and `disabled`
+    /// from then on.
+    pub fn state_at(&self, now: SystemTime) -> &str {
+        match self.disables_at {
+            Some(due) if now >= due => INGESTION_STATE_DISABLED,
+            _ => &self.state,
+        }
+    }
+
+    /// When this ingestion last changed, as `now` sees it: a disable the clock has
+    /// already made due is a change to the record, so from that instant on it is
+    /// what `updatedAt` reports.
+    pub fn changed_at(&self, now: SystemTime) -> SystemTime {
+        match self.disables_at {
+            Some(due) if now >= due && due > self.updated_at => due,
+            _ => self.updated_at,
+        }
+    }
+
+    /// Write `state` as this ingestion's state as of `now` — the move a start or
+    /// stop call makes. It also drops any disable the clock still owed: the
+    /// caller has just decided this ingestion's state itself.
+    pub fn set_state(&mut self, state: &str, now: SystemTime) {
+        self.state = state.to_string();
+        self.updated_at = now;
+        self.disables_at = None;
+    }
+
+    /// Record that losing a destination association at `now` leaves this ingestion
+    /// with a disable owed, which is what an ENABLED ingestion gets: it has lost a
+    /// destination to deliver to, so it fails and the service disables it shortly
+    /// after. An ingestion that is not enabled at `now` has no such failure and
+    /// nothing is owed.
+    pub fn lost_destination(&mut self, now: SystemTime) {
+        if self.state_at(now) == INGESTION_STATE_ENABLED {
+            self.disables_at = Some(now + INGESTION_DISABLE_AFTER_DESTINATION_LOSS);
+        }
+    }
+
+    /// The modelled `Ingestion` for this record, as `now` reads it.
+    pub fn to_ingestion(&self, now: SystemTime) -> Ingestion {
         Ingestion {
             arn: self.arn.clone(),
             app_bundle_arn: self.app_bundle_arn.clone(),
             app: self.app.clone(),
             tenant_id: self.tenant_id.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
-            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
-            state: self.state.clone(),
+            updated_at: ::aws_smithy_types::DateTime::from(self.changed_at(now)),
+            state: self.state_at(now).to_string(),
             ingestion_type: self.ingestion_type.clone(),
         }
     }
 
-    /// The modelled `IngestionSummary` for this record.
-    pub fn to_summary(&self) -> IngestionSummary {
+    /// The modelled `IngestionSummary` for this record, as `now` reads it.
+    pub fn to_summary(&self, now: SystemTime) -> IngestionSummary {
         IngestionSummary {
             arn: self.arn.clone(),
             app: self.app.clone(),
             tenant_id: self.tenant_id.clone(),
-            state: self.state.clone(),
+            state: self.state_at(now).to_string(),
         }
     }
 

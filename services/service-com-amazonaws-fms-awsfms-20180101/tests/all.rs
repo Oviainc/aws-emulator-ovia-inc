@@ -26,6 +26,11 @@ mod third_party_firewall_firewall_policies;
 #[path = "all/third_party_firewall_association.rs"]
 mod third_party_firewall_association;
 
+// Declared beside them, for the same reason: this suite's name sorts into the
+// contended region of the list below.
+#[path = "all/tag_index_single_writer.rs"]
+mod tag_index_single_writer;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

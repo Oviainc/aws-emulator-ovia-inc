@@ -5181,6 +5181,22 @@ pub fn invalid_next_token() -> ValidationException {
     }
 }
 
+/// The `ValidationException` payload for a page size outside the range the listing's
+/// `MaxResults` publishes.
+///
+/// `MaxResults` is `@range(max: 100)` with `@default(0)`: a page size past the maximum
+/// is a malformed request, and a NEGATIVE one is malformed for the same reason — it is
+/// not a page size at all — while the default zero is the request that asks for no
+/// particular page size. `limit` is the maximum the ASKING operation publishes, because
+/// a listing may bound its page below what the shape allows.
+pub fn max_results_out_of_range(max_results: i32, limit: i32) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "MaxResults must be between 0 and {limit}: {max_results}"
+        )),
+    }
+}
+
 /// The number of colon-separated fields an ARN carries:
 /// `arn:<partition>:<service>:<region>:<account-id>:<resource>`. The resource field
 /// may itself contain colons, so it is the LAST field and is not split further.

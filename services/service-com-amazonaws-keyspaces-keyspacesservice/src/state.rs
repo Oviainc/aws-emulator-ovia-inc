@@ -2487,13 +2487,18 @@ pub fn resolve_replication(
             }
         }
     }
+    // "`regionList` - if the `replicationStrategy` is `MULTI_REGION`, the `regionList`
+    // requires the current Region and at least one additional Amazon Web Services Region"
+    // (`CreateKeyspaceRequest$replicationSpecification`): the list names the Regions a
+    // keyspace is replicated in only under that strategy. Under any other strategy the
+    // keyspace is replicated in exactly the Region of the call, so a supplied list widens
+    // nothing and is not what gets stored — storing it would record Regions the keyspace
+    // is not replicated in, which no reader reports and which `UpdateKeyspace` would then
+    // refuse to let a widening omit.
     if specification.replication_strategy != MULTI_REGION_STRATEGY {
         return Ok((
             specification.replication_strategy.clone(),
-            specification
-                .region_list
-                .clone()
-                .unwrap_or_else(|| vec![region.to_string()]),
+            vec![region.to_string()],
         ));
     }
     let Some(regions) = specification.region_list.clone() else {
