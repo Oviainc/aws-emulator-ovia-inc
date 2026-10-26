@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUsagePlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUsagePlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUsagePlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `UsagePlan` record
+//! the `usagePlanId` names, in request order, and reports the patched record — the same
+//! one a later `GetUsagePlan` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +84,304 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::{
+    patch_enum_string, patch_f64_checked, patch_i32_checked, patch_optional_string,
+    patch_required_string, Patch, PatchFailure, PatchOpKind, RestApiEntry, UsagePlanEntry,
+    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+};
+
+// The `path` values `UpdateUsagePlan` accepts are the ones `apply_patch` below has an arm
+// for: one per member of the `UsagePlan` shape a CALLER owns — its name, description and
+// Marketplace product code, its own throttle and quota settings, and the API stage
+// associations its limits apply to, including the per-method throttle map each
+// association carries.
+//
+// `id` is not patchable: it is minted by the create. `tags` are not either: they are
+// changed through `TagResource`/`UntagResource`, which read and write the same stored map.
+
+/// The `{apiId}:{stage}` one `apiStages` entry is addressed by — the spelling a patch
+/// path and an op's `value` both name one association with, so the entry a request names
+/// is matched against the stored list in ONE place.
+fn api_stage_key(stage: &ApiStage) -> String {
+    format!(
+        "{}:{}",
+        stage.api_id.as_deref().unwrap_or_default(),
+        stage.stage.as_deref().unwrap_or_default()
+    )
+}
+
+/// The API and stage an `apiStages` key names, refusing a key that names neither.
+///
+/// An association covers one stage of one API — both members of `ApiStage` are needed for
+/// it to name anything, the same rule `CreateUsagePlan` applies to the entries it stores —
+/// so a key missing either half is refused rather than stored as a dangling association.
+fn split_api_stage(patch: &Patch, key: &str) -> Result<(String, String), PatchFailure> {
+    match key.split_once(':') {
+        Some((api_id, stage))
+            if !api_id.is_empty() && !stage.is_empty() && !stage.contains(':') =>
+        {
+            Ok((api_id.to_string(), stage.to_string()))
+        }
+        _ => Err(PatchFailure::BadRequest(format!(
+            "{} takes an API stage as <apiId>:<stageName>, got {key:?}",
+            patch.path
+        ))),
+    }
+}
+
+/// Refuse an association that names no stored stage of a stored API.
+///
+/// The plan's limits apply to that stage, so an association naming no stage meters
+/// nothing; either identifier unresolvable is the modelled not-found, exactly as it is on
+/// the create.
+fn require_stage(
+    apis: &BTreeMap<String, RestApiEntry>,
+    api_id: &str,
+    stage: &str,
+) -> Result<(), PatchFailure> {
+    let api = apis
+        .get(api_id)
+        .ok_or_else(|| PatchFailure::NotFound(crate::state::no_such_rest_api(api_id)))?;
+    if !api.stages.contains_key(stage) {
+        return Err(PatchFailure::NotFound(
+            crate::state::NO_SUCH_STAGE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply one patch to a `ThrottleSettings`, whether it is the plan's own or the one an
+/// `apiStages` entry holds for a single method.
+///
+/// Both limits are checked by the SAME checker the create runs over this shape, applied to
+/// the patched settings, so a limit this service refuses on one path cannot be stored
+/// through the other. Neither member can be removed: the model declares both with a
+/// default, so each always has a value.
+fn patch_throttle_member(limits: &mut ThrottleSettings, nested: &Patch) -> Result<(), PatchFailure> {
+    match nested.member() {
+        "burstLimit" => patch_i32_checked(&mut limits.burst_limit, nested, Ok)?,
+        "rateLimit" => patch_f64_checked(&mut limits.rate_limit, nested, Ok)?,
+        _ => return Err(nested.unsupported_path()),
+    }
+    crate::state::bound_throttle_settings(limits).map_err(PatchFailure::BadRequest)
+}
+
+/// Apply one patch that names the plan's own `throttle` structure or reaches into it.
+fn apply_throttle_patch(entry: &mut UsagePlanEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    // The path naming the structure itself removes the whole throttle configuration, which
+    // puts the plan back in the state one created without a throttle is in; there is no
+    // value a single op could set every member of it to.
+    if patch.tokens.len() == 1 {
+        return match patch.op {
+            PatchOpKind::Remove => {
+                entry.throttle = None;
+                Ok(())
+            }
+            _ => Err(patch.unsupported_path()),
+        };
+    }
+    // A plan that had no throttle gets one carrying the modelled defaults for the members
+    // the patch does not name.
+    let mut throttle = entry.throttle.clone().unwrap_or_default();
+    patch_throttle_member(&mut throttle, &patch.rebased(1))?;
+    entry.throttle = Some(throttle);
+    Ok(())
+}
+
+/// Apply one patch that names the plan's `quota` structure or reaches into it; see
+/// [`apply_throttle_patch`] for why the structure's own path takes only a `remove`.
+fn apply_quota_patch(entry: &mut UsagePlanEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    if patch.tokens.len() == 1 {
+        return match patch.op {
+            PatchOpKind::Remove => {
+                entry.quota = None;
+                Ok(())
+            }
+            _ => Err(patch.unsupported_path()),
+        };
+    }
+    let mut quota = entry.quota.clone().unwrap_or_default();
+    let nested = patch.rebased(1);
+    match nested.member() {
+        // Both counts are checked by the create's own checker, over the patched settings.
+        "limit" => patch_i32_checked(&mut quota.limit, &nested, Ok)?,
+        "offset" => patch_i32_checked(&mut quota.offset, &nested, Ok)?,
+        // `period` targets the modelled `QuotaPeriodType`, but a patch value is a bare
+        // string on the wire, so the declared set is checked here.
+        "period" => patch_enum_string(&mut quota.period, &nested, QUOTA_PERIOD_TYPE_VALUES)?,
+        _ => return Err(patch.unsupported_path()),
+    }
+    crate::state::bound_quota_settings(&quota).map_err(PatchFailure::BadRequest)?;
+    entry.quota = Some(quota);
+    Ok(())
+}
+
+/// Apply one patch that names the per-method `throttle` map of ONE `apiStages` entry:
+/// `/apiStages/{apiId}:{stage}/throttle/{method}` and
+/// `/apiStages/{apiId}:{stage}/throttle/{method}/{limit}`.
+///
+/// The method is what the path carries between `throttle` and the limit it names, joined
+/// back into the one reference the map is keyed by — the same key the create stores, so a
+/// map entry written by either operation is read by both.
+fn apply_api_stage_throttle_patch(
+    entry: &mut UsagePlanEntry,
+    patch: &Patch,
+    key: &str,
+) -> Result<(), PatchFailure> {
+    let association = entry
+        .api_stages
+        .iter_mut()
+        .find(|held| api_stage_key(held) == key)
+        .ok_or_else(|| PatchFailure::NotFound(crate::state::NO_SUCH_STAGE.to_string()))?;
+    // The path naming the map itself drops every per-method limit of this association.
+    if patch.tokens.len() == 3 {
+        return match patch.op {
+            PatchOpKind::Remove => {
+                association.throttle = None;
+                Ok(())
+            }
+            _ => Err(patch.unsupported_path()),
+        };
+    }
+    let mut throttle = crate::state::ordered_map(association.throttle.clone());
+    match patch.tokens.last().map_or("", String::as_str) {
+        // The tail names one limit of one method, so everything between the map and the
+        // tail is the method.
+        "burstLimit" | "rateLimit" => {
+            let method = patch
+                .tokens
+                .get(3..patch.tokens.len().saturating_sub(1))
+                .unwrap_or_default()
+                .join("/");
+            if method.is_empty() {
+                return Err(patch.unsupported_path());
+            }
+            crate::state::bound_chars(&patch.path, &method, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            let mut limits = throttle.get(&method).cloned().unwrap_or_default();
+            if !throttle.contains_key(&method) {
+                // The map is caller-sized, so a patch that grows it is bounded like every
+                // other caller-sized collection.
+                crate::state::bound_entries(
+                    &patch.path,
+                    throttle.len() + 1,
+                    MAX_COLLECTION_ENTRIES,
+                )
+                .map_err(PatchFailure::BadRequest)?;
+            }
+            patch_throttle_member(
+                &mut limits,
+                &patch.rebased(patch.tokens.len().saturating_sub(1)),
+            )?;
+            throttle.insert(method, limits);
+        }
+        // A path ending at the method names that method's whole entry, which only a
+        // `remove` addresses: there is no single value both its limits could take.
+        _ => match patch.op {
+            PatchOpKind::Remove => {
+                throttle.remove(&patch.tokens.get(3..).unwrap_or_default().join("/"));
+            }
+            _ => return Err(patch.unsupported_path()),
+        },
+    }
+    association.throttle = crate::state::stored_map(throttle);
+    Ok(())
+}
+
+/// Apply one patch that names the `apiStages` list or reaches into one of its entries.
+fn apply_api_stage_patch(
+    entry: &mut UsagePlanEntry,
+    patch: &Patch,
+    apis: &BTreeMap<String, RestApiEntry>,
+) -> Result<(), PatchFailure> {
+    // One association is addressed either by the op's own `value` (`op=add,
+    // path=/apiStages, value=<apiId>:<stage>`) or by the path
+    // (`/apiStages/<apiId>:<stage>`) — the two spellings a client names one entry of a
+    // collection with.
+    let addresses_one_entry = patch.tokens.len() <= 2;
+    let key = if addresses_one_entry {
+        patch.collection_entry(1)?
+    } else {
+        // Anything deeper names a member of one entry, which the path's second reference
+        // token identifies.
+        match patch.tokens.get(1) {
+            Some(key) => key.clone(),
+            None => return Err(patch.unsupported_path()),
+        }
+    };
+    crate::state::bound_chars(&patch.path, &key, MAX_STRING_CHARS)
+        .map_err(PatchFailure::BadRequest)?;
+    let (api_id, stage) = split_api_stage(patch, &key)?;
+    if !addresses_one_entry {
+        // `throttle` is the one member of an `ApiStage` that is neither of its two
+        // identifiers, so it is the only one a deeper path can name.
+        if patch.tokens.get(2).map_or("", String::as_str) != "throttle" {
+            return Err(patch.unsupported_path());
+        }
+        return apply_api_stage_throttle_patch(entry, patch, &key);
+    }
+    match patch.op {
+        // `add` associates the plan with that stage; associating it twice is the same as
+        // associating it once, so the entry is added only when the list does not hold it.
+        PatchOpKind::Add => {
+            require_stage(apis, &api_id, &stage)?;
+            if !entry.api_stages.iter().any(|held| api_stage_key(held) == key) {
+                crate::state::bound_entries(
+                    &patch.path,
+                    entry.api_stages.len() + 1,
+                    MAX_COLLECTION_ENTRIES,
+                )
+                .map_err(PatchFailure::BadRequest)?;
+                entry.api_stages.push(ApiStage {
+                    api_id: Some(api_id),
+                    stage: Some(stage),
+                    // A stage is associated metering every method alike: a per-method
+                    // limit is set by a later patch of this entry's `throttle`.
+                    throttle: None,
+                });
+            }
+            Ok(())
+        }
+        // Dropping an association needs no stored stage: the association is what goes
+        // away, so a stage deleted since it was added can still be disassociated.
+        PatchOpKind::Remove => {
+            entry.api_stages.retain(|held| api_stage_key(held) != key);
+            Ok(())
+        }
+        // The path names ONE entry of the list, not the whole list, so there is nothing a
+        // `replace` of it would mean.
+        _ => Err(patch.unsupported_op()),
+    }
+}
+
+/// Apply one patch to a COPY of a stored plan.
+///
+/// `apis` is the account's stored APIs, so an API stage can only be associated with a
+/// stage that exists — the same rule `CreateUsagePlan` applies to the entries it stores.
+fn apply_patch(
+    entry: &mut UsagePlanEntry,
+    patch: &Patch,
+    apis: &BTreeMap<String, RestApiEntry>,
+) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // A plan always reports a name — `CreateUsagePlanRequest$name` is `@required` —
+        // so the member can be replaced but neither removed nor emptied.
+        "name" => patch_required_string(&mut entry.name, patch, MAX_STRING_CHARS),
+        // The description is optional, so a `remove` clears it back to the state a plan
+        // created without one is in.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        // The Marketplace product code is a member of the `UsagePlan` shape that no create
+        // input carries, so an update is what associates one and what clears it again.
+        "productCode" => patch_optional_string(&mut entry.product_code, patch, MAX_STRING_CHARS),
+        "throttle" => apply_throttle_patch(entry, patch),
+        "quota" => apply_quota_patch(entry, patch),
+        "apiStages" => apply_api_stage_patch(entry, patch, apis),
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +455,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUsagePlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUsagePlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUsagePlan"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        // A usage plan belongs to the account, so the id is resolved against the account's
+        // plans; one that names no stored plan is the modelled not-found.
+        let mut updated = store
+            .usage_plans
+            .get(&input.usage_plan_id)
+            .ok_or_else(|| {
+                UpdateUsagePlanErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
+                })
+            })?
+            .clone();
+
+        // Applied to the COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        {
+            let apis = &store.rest_apis;
+            for patch in &patches {
+                apply_patch(&mut updated, patch, apis).map_err(patch_failure)?;
+            }
+        }
+
+        // The answer is rendered from the record that is about to be stored, by the one
+        // `UsagePlan` renderer the create and the read use, so what the caller is told is
+        // what the store holds.
+        let body: Self::Output = CreateUsagePlanOutput::from(&updated).into();
+        store
+            .usage_plans
+            .insert(input.usage_plan_id.clone(), updated);
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never a patch value.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            usage_plan = ?input.usage_plan_id,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "usage plan updated",
+        );
+        Ok(body)
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateUsagePlanError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateUsagePlanErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateUsagePlanErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateUsagePlanErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// The same `UsagePlan` the create reports, as THIS operation's output shape.
+///
+/// Both shapes are the model's `UsagePlan` (`smithy_query(query="operation",
+/// operation="CreateUsagePlan,UpdateUsagePlan")`: one output shape, generated once per
+/// operation), so the conversion is member for member and lives in ONE place — a member
+/// added to the modelled shape fails to compile here instead of being quietly dropped
+/// from the update's answer.
+impl From<CreateUsagePlanOutput> for UpdateUsagePlanOutput {
+    fn from(body: CreateUsagePlanOutput) -> Self {
+        let CreateUsagePlanOutput {
+            id,
+            name,
+            description,
+            api_stages,
+            throttle,
+            quota,
+            product_code,
+            tags,
+        } = body;
+        Self {
+            id,
+            name,
+            description,
+            api_stages,
+            throttle,
+            quota,
+            product_code,
+            tags,
+        }
     }
 }

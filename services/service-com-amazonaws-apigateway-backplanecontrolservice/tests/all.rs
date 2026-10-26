@@ -216,3 +216,5 @@ mod invalid_security_policy;
 mod base_path_mapping;
 #[path = "all/delete_gateway_response.rs"]
 mod delete_gateway_response;
+#[path = "all/update_usage_plan.rs"]
+mod update_usage_plan;

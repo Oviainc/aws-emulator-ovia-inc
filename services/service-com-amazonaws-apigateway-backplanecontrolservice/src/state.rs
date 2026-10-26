@@ -657,10 +657,10 @@ pub struct ApiKeyEntry {
 /// `Option` because a usage plan need not have one: a plan created without a `quota` has
 /// no quota at all, which is what distinguishes it from a plan whose quota limit is zero.
 ///
-/// `product_code` is the Amazon Web Services Marketplace product a plan is sold as. No
-/// operation of this service sets it — it is not a member of `CreateUsagePlan`'s input —
-/// so it stays absent until one does, and a read reports none rather than a code this
-/// emulator would have to invent.
+/// `product_code` is the Amazon Web Services Marketplace product a plan is sold as. It is
+/// not a member of `CreateUsagePlan`'s input, so a created plan carries none and a read
+/// reports none rather than a code this emulator would have to invent; `UpdateUsagePlan`
+/// is what associates one, through a patch of the plan's `productCode`.
 #[derive(Debug, Clone, Default)]
 pub struct UsagePlanEntry {
     pub id: String,
@@ -672,7 +672,7 @@ pub struct UsagePlanEntry {
     pub api_stages: Vec<ApiStage>,
     pub throttle: Option<ThrottleSettings>,
     pub quota: Option<QuotaSettings>,
-    /// See the struct docs: absent, because nothing writes it.
+    /// See the struct docs: absent on a created plan, written by `UpdateUsagePlan`.
     pub product_code: Option<String>,
     pub tags: BTreeMap<String, String>,
     /// The API keys metered against this plan, keyed by the API key id each one names —
