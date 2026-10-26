@@ -20,7 +20,9 @@
 //! A queue also HOLDS its messages: [`Queue::messages`] is the arrival-order deque
 //! `SendMessage` appends to and `ReceiveMessage` hands out of, and [`Queue::handles`]
 //! maps the receipt handle a receive minted to the message it names, which is what
-//! `DeleteMessage` resolves. Visibility and retention are evaluated against the clock
+//! `DeleteMessage` resolves — and [`Queue::deleted_handles`] remembers the handles a
+//! delete has already consumed, so repeating a delete that succeeded is idempotent
+//! rather than refused. Visibility and retention are evaluated against the clock
 //! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
 //! attributes are counts over real state rather than made-up values. A message carries
 //! the visibility timeout it was RECEIVED under, so a later change to the queue's
@@ -666,6 +668,16 @@ pub fn max_results_refusal(parameter: &str, (min, max): (i32, i32), requested: i
 /// can have up to 10 attributes."
 pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 
+/// How many receipt handles one queue remembers as deleted (see
+/// [`Queue::deleted_handles`]).
+///
+/// A delete is idempotent, so the handle a delete consumed outlives the message it named;
+/// past this bound the queue forgets the handles it retired first. Like a deduplication
+/// token, a retired handle is derived data whose only effect is answering a repeat of a
+/// delete that already succeeded, so forgetting one loses nothing a client was told had
+/// been accepted.
+pub const MAX_DELETED_HANDLES_PER_QUEUE: usize = MAX_MESSAGES_PER_QUEUE;
+
 /// How many deduplication tokens one queue remembers. A token outlives the message it
 /// suppressed ("Amazon SQS continues to keep track of the message deduplication ID even
 /// after the message is received and deleted"), so the message count does not bound it:
@@ -874,6 +886,13 @@ pub struct Queue {
     /// handle is dropped with its message — so this map never holds more entries than
     /// [`messages`](Self::messages), whatever the receive count.
     pub handles: HashMap<String, String>,
+    /// The receipt handles this queue minted and a delete has since CONSUMED, in the
+    /// order they were retired. A delete is idempotent — "the request succeeds, but the
+    /// message might not be deleted" — so a handle whose message a delete already removed
+    /// still names a deletion this queue has performed, which is what makes a repeat of
+    /// that delete succeed instead of being refused. Bounded by
+    /// [`MAX_DELETED_HANDLES_PER_QUEUE`]; a purge empties it with the message plane.
+    pub deleted_handles: VecDeque<String>,
     /// The deduplication tokens this queue has accepted, keyed by
     /// `(deduplication scope, token)` — see [`Queue::deduplication_key`]. Only a FIFO
     /// queue writes here; entries lapse with [`DEDUPLICATION_INTERVAL`] and are bounded
@@ -1221,6 +1240,7 @@ impl Queue {
     pub fn purge(&mut self, at: SystemTime) {
         self.messages.clear();
         self.handles.clear();
+        self.deleted_handles.clear();
         self.receive_attempts.clear();
         self.deduplication.clear();
         self.purged_at = Some(at);
@@ -1233,11 +1253,44 @@ impl Queue {
             .is_some_and(|at| !lapsed(at, PURGE_QUEUE_INTERVAL, now))
     }
 
-    /// Drop a message and every receipt handle that referred to it.
+    /// Drop a message and every receipt handle that referred to it, remembering those
+    /// handles as handles this queue has already deleted under — which is what makes a
+    /// repeat of the same delete idempotent.
     pub fn remove_message(&mut self, message_id: &str) {
         self.messages
             .retain(|message| message.message_id != message_id);
+        let retired: Vec<String> = self
+            .handles
+            .iter()
+            .filter(|(_, id)| id.as_str() == message_id)
+            .map(|(handle, _)| handle.clone())
+            .collect();
         self.handles.retain(|_, id| id != message_id);
+        for handle in retired {
+            self.remember_deleted_handle(handle);
+        }
+    }
+
+    /// Remember `receipt_handle` as one whose message is gone, bounded by
+    /// [`MAX_DELETED_HANDLES_PER_QUEUE`]: past the bound the handles retired earliest are
+    /// forgotten first.
+    fn remember_deleted_handle(&mut self, receipt_handle: String) {
+        if self.deleted_handle(&receipt_handle) {
+            return;
+        }
+        self.deleted_handles.push_back(receipt_handle);
+        while self.deleted_handles.len() > MAX_DELETED_HANDLES_PER_QUEUE {
+            self.deleted_handles.pop_front();
+        }
+    }
+
+    /// Whether `receipt_handle` is one this queue minted and a delete has already
+    /// consumed: it names a message this queue no longer holds, so there is nothing left
+    /// for a further delete to do.
+    pub fn deleted_handle(&self, receipt_handle: &str) -> bool {
+        self.deleted_handles
+            .iter()
+            .any(|handle| handle == receipt_handle)
     }
 
     /// Give the message a receipt handle names a new visibility timeout, counted from `now`:
@@ -1529,6 +1582,27 @@ impl ComAmazonawsSqsAmazonsqsState {
     pub fn queue_by_url_mut(&mut self, queue_url: &str) -> Option<&mut Queue> {
         let name = queue_name_from_url(queue_url)?.to_string();
         self.queues.get_mut(&name)
+    }
+
+    /// Where `receipt_handle` came from, for the queue at `queue_url` that cannot resolve
+    /// it: another queue of this store minted it, or no queue did and it is not a receipt
+    /// handle at all. A handle a delete has already consumed still counts as minted by
+    /// the queue that issued it.
+    pub fn receipt_handle_origin<'a>(
+        &self,
+        queue_url: &str,
+        receipt_handle: &'a str,
+    ) -> ReceiptHandleOrigin<'a> {
+        let elsewhere = self.queues.values().any(|queue| {
+            queue.url != queue_url
+                && (queue.handles.contains_key(receipt_handle)
+                    || queue.deleted_handle(receipt_handle))
+        });
+        if elsewhere {
+            ReceiptHandleOrigin::AnotherQueue(receipt_handle)
+        } else {
+            ReceiptHandleOrigin::Unrecognised
+        }
     }
 
     /// Remove the queue a `QueueUrl` addresses, with every message and handle it held,
@@ -2515,17 +2589,41 @@ pub fn purge_queue_in_progress_message(name: &str) -> String {
     )
 }
 
-/// The modelled refusal for a receipt handle this queue did not mint, or whose message
-/// is gone.
+/// What Amazon SQS answers for a value supplied where a receipt handle was expected that
+/// is not a receipt handle at all: ONE fixed sentence, with nothing of the request in it,
+/// so a client can match on it and no caller is handed its own value back.
+pub const RECEIPT_HANDLE_IS_INVALID_MESSAGE: &str = "The input receipt handle is invalid.";
+
+/// How the same refusal is worded for a handle that IS a receipt handle, minted by
+/// another queue: the handle is named, because what the caller has to fix is which queue
+/// it sent it to rather than the handle itself.
+pub fn receipt_handle_of_another_queue_message(receipt_handle: &str) -> String {
+    format!("The receipt handle {receipt_handle:?} is not valid for this queue.")
+}
+
+/// Where a receipt handle a queue cannot resolve came from, which is what decides how the
+/// refusal is worded.
+#[derive(Debug, Clone, Copy)]
+pub enum ReceiptHandleOrigin<'a> {
+    /// No queue minted it, so it is not a receipt handle at all.
+    Unrecognised,
+    /// Another queue minted it: it is a receipt handle, just not one of this queue's.
+    AnotherQueue(&'a str),
+}
+
+/// The modelled refusal for a receipt handle this queue cannot resolve.
 ///
 /// A handle is replaced by the next receive of the same message, so a superseded one is
 /// invalid too: "You must provide the most recently received receipt handle when you
 /// request to delete the message."
-pub fn receipt_handle_is_invalid(receipt_handle: &str) -> ReceiptHandleIsInvalid {
+pub fn receipt_handle_is_invalid(origin: ReceiptHandleOrigin<'_>) -> ReceiptHandleIsInvalid {
     ReceiptHandleIsInvalid {
-        message: Some(format!(
-            "The input receipt handle {receipt_handle:?} is not a valid receipt handle for this queue."
-        )),
+        message: Some(match origin {
+            ReceiptHandleOrigin::Unrecognised => RECEIPT_HANDLE_IS_INVALID_MESSAGE.to_string(),
+            ReceiptHandleOrigin::AnotherQueue(receipt_handle) => {
+                receipt_handle_of_another_queue_message(receipt_handle)
+            }
+        }),
     }
 }
 
@@ -2563,6 +2661,35 @@ pub fn is_valid_batch_entry_id(id: &str) -> bool {
         && id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+}
+
+/// The per-entry error code for a batch entry that carries a required member with no
+/// value at all: the member is there, so nothing is missing, but it holds nothing the
+/// operation can act on.
+pub const EMPTY_VALUE: &str = "EmptyValue";
+
+/// How a batch result entry states that `member` of one entry carried no value: the
+/// member is named by its PATH in the request — the operation's request-entry shape, the
+/// entry's position in `Entries` counted from one, and the member — because a batch
+/// carries several entries and the caller has to know which one to repair.
+///
+/// One wording for every batch operation, so two of them cannot drift on how they state
+/// the same defect; `operation` is the operation's name, whose request entry shape is
+/// `<operation>RequestEntry`, and `position` is one-based.
+pub fn empty_batch_entry_value_message(operation: &str, position: usize, member: &str) -> String {
+    format!("No Value Found for {operation}RequestEntry.{position}.{member}.")
+}
+
+/// The largest payload one batch request may carry, in bytes.
+///
+/// `SendMessageBatch`'s own documentation gives it as a FIXED service limit — "the
+/// maximum allowed individual message size and the maximum total payload size (the sum
+/// of the individual lengths of all of the batched messages)" — which is the largest
+/// value [`MAXIMUM_MESSAGE_SIZE`] admits, so it is read from that attribute's documented
+/// range rather than written twice. A queue's own (possibly lowered)
+/// `MaximumMessageSize` bounds EACH message, not the sum of a batch's entries.
+pub fn maximum_batch_payload_bytes() -> i64 {
+    integer_bounds(MAXIMUM_MESSAGE_SIZE).1
 }
 
 // ---------------------------------------------------------------------------
@@ -2606,6 +2733,20 @@ pub fn invalid_parameters_message(reason: &str) -> String {
     format!("One or more parameters are invalid. Reason: {reason}")
 }
 
+/// The same class of fault as [`invalid_parameters_message`], as a batch RESULT ENTRY
+/// states it: the entry's own members could not be validated, so the sentence is about
+/// the entry rather than about the request.
+pub fn unvalidated_parameters_message(reason: &str) -> String {
+    format!("One or more parameters cannot be validated. Reason: {reason}")
+}
+
+/// Why a message is larger than the queue will carry, as the reason of either sentence
+/// above: the bound is the queue's own `MaximumMessageSize`, which applies to ONE message
+/// whether it was sent on its own or as one entry of a batch.
+pub fn message_too_long_reason(maximum: i64) -> String {
+    format!("Message must be shorter than {maximum} bytes.")
+}
+
 /// The message system attribute names in the order the model DECLARES them, which is the
 /// order a refusal lists the accepted set in.
 ///
@@ -2639,6 +2780,15 @@ pub const MESSAGE_SYSTEM_ATTRIBUTE_NAMES: &[&str] = &[
 pub const DEAD_LETTER_SOURCE_REQUIRED: &str =
     "This action is currently limited to supporting message redrive from queues that are \
      configured as dead-letter queues (DLQs) of other Amazon SQS queues only.";
+
+/// How a refusal states that the source queue a message movement task names already has
+/// one running: "only one active message movement task is supported per queue at any
+/// given time", so the request is refused for the source arn it named rather than for the
+/// kind of queue that arn is. Fixed text — the condition clears on its own, and nothing of
+/// the request tells the caller anything the sentence does not.
+pub const TASK_ALREADY_RUNNING: &str =
+    "There is already a task running. Only one active task is allowed for a source queue \
+     arn at a given time.";
 
 /// The reason a refusal gives for a parameter that does not apply to the KIND of queue
 /// the call addresses: a FIFO-only member supplied to a standard queue, or a

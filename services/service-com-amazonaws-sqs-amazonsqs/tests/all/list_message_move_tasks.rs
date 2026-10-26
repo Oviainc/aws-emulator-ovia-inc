@@ -436,9 +436,9 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
             .await;
             assert_eq!(
                 (refused, error_code(&parsed).as_str()),
-                (400, "UnsupportedOperation"),
+                (400, "InvalidParameterValue"),
                 "case a start while the listed task runs: expected HTTP 400 \
-                 UnsupportedOperation, got {refused} with {parsed}"
+                 InvalidParameterValue, got {refused} with {parsed}"
             );
         } else {
             assert_eq!(

@@ -187,6 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         let now = SystemTime::now();
+        // Where a handle this queue cannot resolve came from is read before the queue is
+        // borrowed for writing: it is a property of the OTHER queues of this store.
+        let origin = state.receipt_handle_origin(&input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
             return Err(DeleteMessageErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
@@ -208,17 +211,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // Only a handle this queue currently holds names a message; anything else — a
-        // superseded handle, or one for an already-deleted message — is invalid.
-        let Some(message_id) = queue.handles.get(&input.receipt_handle).cloned() else {
-            return Err(DeleteMessageErrorModeled::ReceiptHandleIsInvalid(
-                sqs::receipt_handle_is_invalid(&input.receipt_handle),
-            )
-            .into());
-        };
-        // The message goes for good, so the lapsing visibility timeout cannot bring it
-        // back; every other handle minted for it goes with it.
-        queue.remove_message(&message_id);
+        // A handle this queue currently holds names the message to delete. A handle whose
+        // message a delete has ALREADY removed names a deletion this queue has performed,
+        // so repeating it changes nothing and succeeds: "the request succeeds, but the
+        // message might not be deleted". Anything else — a superseded handle, or a value
+        // no queue ever minted — is invalid.
+        match queue.handles.get(&input.receipt_handle).cloned() {
+            Some(message_id) => {
+                // The message goes for good, so the lapsing visibility timeout cannot
+                // bring it back; every other handle minted for it goes with it.
+                queue.remove_message(&message_id);
+            }
+            None if queue.deleted_handle(&input.receipt_handle) => {}
+            None => {
+                return Err(DeleteMessageErrorModeled::ReceiptHandleIsInvalid(
+                    sqs::receipt_handle_is_invalid(origin),
+                )
+                .into())
+            }
+        }
 
         Ok(DeleteMessageOutput)
     }

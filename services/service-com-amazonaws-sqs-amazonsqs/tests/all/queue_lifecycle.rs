@@ -20,7 +20,8 @@
 //! - a tag key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace is refused, by
 //!   `TagQueue` and by the create's own `tags` member, and the queue keeps its tags;
 //! - a send whose `MessageBody` holds no character is refused `MissingParameter` and
-//!   enqueues nothing, one entry of a batch at a time.
+//!   enqueues nothing, while one entry of a batch carrying no body is the entry's own
+//!   `EmptyValue` fault.
 //!
 //! Nothing here reaches into `crate::state` for an assertion: every claim is read back
 //! through `GetQueueAttributes`, `GetQueueUrl`, `ListQueueTags` or `ReceiveMessage`.
@@ -559,8 +560,10 @@ async fn a_send_with_an_empty_message_body_is_refused() {
     }
 }
 
-/// In a batch the same rule is applied per ENTRY: the entry with no body fails alone,
-/// under its own `Id`, and its siblings are still enqueued.
+/// In a batch the same body rule is applied per ENTRY: the entry with no body fails
+/// alone, under its own `Id`, and its siblings are still enqueued. The entry's `Code` is
+/// the empty-value one and its `Message` names the member by its place in the request,
+/// because the member WAS supplied — with nothing in it.
 #[tokio::test]
 async fn a_batch_entry_with_an_empty_message_body_fails_alone() {
     let router = emulator();
@@ -604,9 +607,16 @@ async fn a_batch_entry_with_an_empty_message_body_fails_alone() {
             failed[0]["Id"].as_str(),
             failed[0]["Code"].as_str(),
             failed[0]["SenderFault"].as_bool(),
+            failed[0]["Message"].as_str(),
         ),
-        (Some("empty"), Some("MissingParameter"), Some(true)),
-        "case a batch holding one entry with no body: expected the sender's MissingParameter for that entry, got {answer}"
+        (
+            Some("empty"),
+            Some("EmptyValue"),
+            Some(true),
+            Some("No Value Found for SendMessageBatchRequestEntry.2.MessageBody."),
+        ),
+        "case a batch holding one entry with no body: expected the sender's EmptyValue for \
+         that entry, naming it by its place in the request, got {answer}"
     );
     assert_eq!(
         held(&router, &url).await,

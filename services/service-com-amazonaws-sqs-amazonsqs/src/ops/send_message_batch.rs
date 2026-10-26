@@ -11,18 +11,20 @@
 //! `Id` is not one the specification admits (`InvalidBatchEntryId`), two entries sharing
 //! an `Id` (`BatchEntryIdsNotDistinct`), a `QueueUrl` no queue answers to
 //! (`QueueDoesNotExist`) and a batch whose entries together carry more bytes than the
-//! queue's `MaximumMessageSize` (`BatchRequestTooLong`) — "the maximum allowed
-//! individual message size and the maximum total payload size (the sum of the individual
-//! lengths of all of the batched messages)" are the same bound, so an oversized single
-//! entry is refused by it too. So is a queue whose customer managed KMS key cannot be
+//! service's fixed payload ceiling ([`crate::state::maximum_batch_payload_bytes`],
+//! `BatchRequestTooLong`) — "the maximum allowed individual message size and the maximum
+//! total payload size (the sum of the individual lengths of all of the batched messages)"
+//! are that one service limit, which is NOT the queue's own (possibly lowered)
+//! `MaximumMessageSize`: that attribute bounds each message, so an oversized ENTRY is
+//! refused on its own. So is a queue whose customer managed KMS key cannot be
 //! used for this caller: the key belongs to the queue, so it refuses the whole request
 //! with the `Kms*` error of its class rather than failing an entry at a time
 //! ([`crate::state::encryption::authorize_queue_key`]), and it is asked about only once
 //! the request's own shape is one AWS would act on.
 //!
 //! Past those, each entry is judged on its own against the queue, by exactly the rules
-//! `SendMessage` applies to one message — the body's character set, the FIFO members
-//! (`MessageGroupId`, `MessageDeduplicationId`), `DelaySeconds` and the message
+//! `SendMessage` applies to one message — the body's character set and size, the FIFO
+//! members (`MessageGroupId`, `MessageDeduplicationId`), `DelaySeconds` and the message
 //! attributes — because "the result of sending each message is reported individually in
 //! the response. Because the batch request can result in a combination of successful and
 //! unsuccessful actions, you should check for batch errors even when the call returns an
@@ -30,7 +32,10 @@
 //! its id and content digests; one it does not is reported in `Failed` with the sender's
 //! fault, the code AWS answers that condition with and the reason. Entries are enqueued
 //! in request order, so "for a FIFO queue, multiple messages within a single batch are
-//! enqueued in the order they are sent".
+//! enqueued in the order they are sent" — and on a FIFO queue that order is what makes
+//! the batch all-or-nothing: an entry it will not take refuses the whole request, with
+//! nothing enqueued, so a caller retrying that entry cannot append it after the siblings
+//! of its message group.
 //!
 //! ## Shape of an operation
 //!
@@ -165,7 +170,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sqs-amazonsqs.json");
 // specified action violates a limit" — when a queue is already holding as much as
 // `crate::state`'s message bounds allow. A batch is judged against those bounds as a
 // whole, so it is accepted entirely or refused entirely.
-#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessageBatch", extra_errors = ["OverLimit"])]
+// `InvalidMessageContents` is widened in for the same kind of reason: it is the shape
+// this SERVICE models for a body outside the allowed character set (`SendMessage`
+// declares it), and a FIFO queue refuses such an entry at the REQUEST level, where the
+// code has to be carried by a modelled error rather than by a result entry's `Code`.
+#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessageBatch", extra_errors = ["OverLimit", "InvalidMessageContents"])]
 #[derive(Debug)]
 pub enum SendMessageBatchErrorModeled {
     BatchEntryIdsNotDistinct(BatchEntryIdsNotDistinct),
@@ -173,6 +182,7 @@ pub enum SendMessageBatchErrorModeled {
     EmptyBatchRequest(EmptyBatchRequest),
     InvalidAddress(InvalidAddress),
     InvalidBatchEntryId(InvalidBatchEntryId),
+    InvalidMessageContents(InvalidMessageContents),
     InvalidSecurity(InvalidSecurity),
     KmsAccessDenied(KmsAccessDenied),
     KmsDisabled(KmsDisabled),
@@ -399,17 +409,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sized.push(MeasuredEntry {
                 attributes,
                 system_attributes,
+                bytes,
                 retained,
             });
         }
-        // The sum of the batched messages is bounded by the same `MaximumMessageSize` as
-        // one message, so a single entry over that bound is refused here as well.
-        let maximum = queue.integer(sqs::MAXIMUM_MESSAGE_SIZE);
-        if i64::try_from(total_bytes).unwrap_or(i64::MAX) > maximum {
+        // What `BatchRequestTooLong` refuses is "the length of all the messages put
+        // together" against the service's own FIXED ceiling — "the maximum allowed
+        // individual message size and the maximum total payload size (the sum of the
+        // individual lengths of all of the batched messages)". The queue's configured
+        // `MaximumMessageSize` is NOT that ceiling: it bounds ONE message, so it is
+        // applied to each entry on its own by `prepare` below, and a batch whose entries
+        // each fit is acceptable however many of them there are.
+        let ceiling = sqs::maximum_batch_payload_bytes();
+        if i64::try_from(total_bytes).unwrap_or(i64::MAX) > ceiling {
             return Err(SendMessageBatchErrorModeled::BatchRequestTooLong(
                 BatchRequestTooLong {
                     message: Some(format!(
-                        "Batch requests cannot be longer than {maximum} bytes. \
+                        "Batch requests cannot be longer than {ceiling} bytes. \
                          You have sent {total_bytes} bytes."
                     )),
                 },
@@ -419,12 +435,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each entry judged on its own against the queue, nothing stored yet: an entry
         // the queue will not take fails ALONE.
-        let outcomes: Vec<Result<Prepared, BatchResultErrorEntry>> = input
+        let outcomes: Vec<Result<Prepared, EntryRefusal>> = input
             .entries
             .iter()
             .zip(sized)
-            .map(|(entry, sized)| prepare(queue, entry, sized))
+            .enumerate()
+            .map(|(index, (entry, sized))| prepare(queue, entry, Self::NAME, index + 1, sized))
             .collect();
+
+        // On a FIFO queue the batch is all or nothing: an entry the queue will not take
+        // refuses the whole REQUEST, before anything is enqueued, because enqueuing its
+        // siblings would place the caller's retry of that one entry AFTER them and
+        // reorder the message group — the guarantee a FIFO queue exists to provide. A
+        // standard queue promises no order, so there the same fault fails that entry
+        // alone. Reported for the first entry the request order reaches, so a batch with
+        // two faults is always refused for the same one.
+        if fifo {
+            if let Some(refusal) = outcomes.iter().find_map(|outcome| outcome.as_ref().err()) {
+                return Err(refusal.whole_request());
+            }
+        }
 
         // What this in-memory store can be made to hold is bounded, and the batch is
         // judged against those bounds as a whole: it is enqueued entirely or refused
@@ -450,7 +480,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let prepared = match outcome {
                 Ok(prepared) => prepared,
                 Err(refusal) => {
-                    failed.push(refusal);
+                    failed.push(refusal.reported());
                     continue;
                 }
             };
@@ -561,12 +591,61 @@ fn kms_refusal(refusal: sqs::encryption::KeyRefusal) -> SendMessageBatchError {
     .into()
 }
 
-/// One batch entry's attribute maps and the bytes it retains, measured once for the
-/// batch's payload bound and reused by [`prepare`].
+/// One batch entry's attribute maps and the bytes it carries, measured once for the
+/// request's payload bound and reused by [`prepare`].
 struct MeasuredEntry {
     attributes: BTreeMap<String, MessageAttributeValue>,
     system_attributes: BTreeMap<String, MessageSystemAttributeValue>,
+    /// What this entry's message weighs against the queue's `MaximumMessageSize`: its
+    /// body and its message attributes, the system attributes excluded.
+    bytes: usize,
     retained: usize,
+}
+
+/// Why one entry cannot be taken: the code Amazon SQS reports the condition under, and
+/// the sentence the caller has to repair that entry from.
+///
+/// The same refusal is reported two ways, because the queue type decides whether it is
+/// about the entry or about the request: [`reported`](Self::reported) on a standard
+/// queue, [`whole_request`](Self::whole_request) on a FIFO one.
+struct EntryRefusal {
+    id: String,
+    code: &'static str,
+    message: String,
+}
+
+impl EntryRefusal {
+    /// This refusal as the result entry reporting it: the caller supplied what the queue
+    /// refused, so the fault is the sender's.
+    fn reported(self) -> BatchResultErrorEntry {
+        BatchResultErrorEntry {
+            id: self.id,
+            sender_fault: true,
+            code: self.code.to_string(),
+            message: Some(self.message),
+        }
+    }
+
+    /// This refusal as the refusal of the whole request, which is how a FIFO queue
+    /// answers it. The sentence is the same one; only the channel differs, so the code is
+    /// the request-level spelling of the same condition: the service's two documented
+    /// parameter codes, or the modelled error for a body outside the allowed character
+    /// set. A value that is there but holds nothing is a value the service does not
+    /// accept, which is `InvalidParameterValue`.
+    fn whole_request(&self) -> SendMessageBatchError {
+        match self.code {
+            MISSING_PARAMETER => Scaffolded::MissingParameter(crate::scaffolded::MissingParameter {
+                message: self.message.clone(),
+            }),
+            INVALID_MESSAGE_CONTENTS => SendMessageBatchErrorModeled::InvalidMessageContents(
+                InvalidMessageContents {
+                    message: Some(self.message.clone()),
+                },
+            )
+            .into(),
+            _ => Scaffolded::invalid_parameter_value(self.message.clone()),
+        }
+    }
 }
 
 /// A batch entry the queue will take, with everything the store and the result entry
@@ -587,32 +666,35 @@ struct Prepared {
 }
 
 /// Judge one entry against `queue` by the rules `SendMessage` applies to one message,
-/// answering either what the store needs or the result entry reporting why this entry
-/// alone was not taken.
+/// answering either what the store needs or why this entry alone was not taken.
 ///
-/// `sized` carries the entry's attribute maps and the bytes it retains, already measured
-/// for the batch's payload bound.
+/// `sized` carries the entry's attribute maps and the bytes it weighs, already measured
+/// for the request's payload bound. `operation` and `position` are what a refusal names
+/// an absent value by: the entry's one-based place in the request's `Entries` list.
 fn prepare(
     queue: &sqs::Queue,
     entry: &SendMessageBatchRequestEntry,
+    operation: &str,
+    position: usize,
     sized: MeasuredEntry,
-) -> Result<Prepared, BatchResultErrorEntry> {
+) -> Result<Prepared, EntryRefusal> {
     let MeasuredEntry {
         mut attributes,
         system_attributes,
+        bytes,
         retained,
     } = sized;
     let fifo = queue.is_fifo();
 
-    // An entry whose `MessageBody` holds no character leaves out a member it had to
-    // carry — "the minimum size is one character" for the body of a message
-    // (`SendMessageRequest$MessageBody`) — and fails ALONE under its own `Id`, exactly
-    // as the other missing-member refusals here do.
+    // An entry whose `MessageBody` holds no character carries a member it had to carry
+    // with nothing in it — "the minimum size is one character" for the body of a message
+    // (`SendMessageRequest$MessageBody`) — so the value is EMPTY rather than absent, and
+    // the refusal names the member by its place in the request.
     if entry.message_body.is_empty() {
         return Err(refused(
             entry,
-            MISSING_PARAMETER,
-            sqs::missing_parameter_message("MessageBody"),
+            sqs::EMPTY_VALUE,
+            sqs::empty_batch_entry_value_message(operation, position, "MessageBody"),
         ));
     }
 
@@ -732,6 +814,21 @@ fn prepare(
     // the text the entry wrote it as — exactly as `SendMessage` holds it.
     sqs::store_message_attributes_canonically(&mut attributes);
 
+    // The queue's `MaximumMessageSize` bounds ONE message, so it is this ENTRY that is
+    // judged against it, exactly as `SendMessage` judges the message it carries:
+    // "everything the message carries counts toward it" — "all parts of the message
+    // attribute, including Name, Type, and Value, are part of the message size
+    // restriction" — while the system attributes do not. An entry over the queue's bound
+    // fails on its own; its siblings that fit are still taken.
+    let maximum = queue.integer(sqs::MAXIMUM_MESSAGE_SIZE);
+    if i64::try_from(bytes).unwrap_or(i64::MAX) > maximum {
+        return Err(refused(
+            entry,
+            INVALID_PARAMETER_VALUE,
+            sqs::unvalidated_parameters_message(&sqs::message_too_long_reason(maximum)),
+        ));
+    }
+
     Ok(Prepared {
         id: entry.id.clone(),
         md5_of_body: sqs::md5_hex(entry.message_body.as_bytes()),
@@ -747,18 +844,16 @@ fn prepare(
     })
 }
 
-/// Report `entry` as not taken, under its own `Id`: the caller supplied what the queue
-/// refused, so the fault is the sender's.
+/// Report `entry` as not taken, under its own `Id`.
 fn refused(
     entry: &SendMessageBatchRequestEntry,
-    code: &str,
+    code: &'static str,
     message: String,
-) -> BatchResultErrorEntry {
-    BatchResultErrorEntry {
+) -> EntryRefusal {
+    EntryRefusal {
         id: entry.id.clone(),
-        sender_fault: true,
-        code: code.to_string(),
-        message: Some(message),
+        code,
+        message,
     }
 }
 

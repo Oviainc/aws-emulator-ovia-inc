@@ -232,6 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
+        // Where a handle this queue cannot resolve came from is read before the queue is
+        // borrowed for writing: it is a property of the OTHER queues of this store.
+        let origin = state.receipt_handle_origin(&input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
             return Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
@@ -260,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(()) => Ok(ChangeMessageVisibilityOutput),
             Err(sqs::VisibilityRefusal::UnknownHandle) => {
                 Err(ChangeMessageVisibilityErrorModeled::ReceiptHandleIsInvalid(
-                    sqs::receipt_handle_is_invalid(&input.receipt_handle),
+                    sqs::receipt_handle_is_invalid(origin),
                 )
                 .into())
             }

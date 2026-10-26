@@ -555,9 +555,9 @@ async fn a_cancelled_task_frees_its_source_queue_for_another_task() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "UnsupportedOperation"),
-        "case a second start while the first task runs: expected HTTP 400 UnsupportedOperation, \
-         got {status} with {parsed}"
+        (400, "InvalidParameterValue"),
+        "case a second start while the first task runs: expected HTTP 400 \
+         InvalidParameterValue, got {status} with {parsed}"
     );
 
     ok(

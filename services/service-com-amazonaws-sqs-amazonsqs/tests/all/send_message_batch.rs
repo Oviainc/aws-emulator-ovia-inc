@@ -12,10 +12,11 @@
 //! * a batch that is not one AWS would act on is refused WHOLE and enqueues nothing: no
 //!   entries, more than ten entries, an entry `Id` outside the specification, two entries
 //!   sharing an `Id`, a `QueueUrl` no queue answers to, and entries whose bytes together
-//!   pass the queue's `MaximumMessageSize` (asserted on that bound and one byte past it);
+//!   pass the service's fixed payload ceiling;
 //! * past those, each entry is judged on its own against the queue by the rules
-//!   `SendMessage` applies to one message, so an entry the queue will not take is reported
-//!   in `Failed` with the sender's fault while the rest of the batch is still enqueued;
+//!   `SendMessage` applies to one message, so an entry a STANDARD queue will not take is
+//!   reported in `Failed` with the sender's fault while the rest of the batch is still
+//!   enqueued;
 //! * on a FIFO queue a batch is enqueued in the order it was sent, each entry is
 //!   sequenced, and an entry repeating a deduplication token already accepted is reported
 //!   successful for the message that token admitted without delivering a second copy.
@@ -24,7 +25,9 @@ use std::collections::BTreeSet;
 
 use md5::{Digest, Md5};
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::{MAX_BATCH_ENTRIES, MAX_BATCH_ENTRY_ID_LEN};
+use service_com_amazonaws_sqs_amazonsqs::state::{
+    maximum_batch_payload_bytes, MAX_BATCH_ENTRIES, MAX_BATCH_ENTRY_ID_LEN,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support;
@@ -244,13 +247,14 @@ async fn an_entry_reports_the_digest_of_the_attributes_it_carries() {
 }
 
 /// A batch AWS would not act on is refused WHOLE, with the error for WHY, and enqueues
-/// nothing. Rows differ along what makes the batch unacceptable, including the payload
-/// bound itself — at the bound, and one byte past it.
+/// nothing. Rows differ along what makes the batch unacceptable, including the service's
+/// own payload ceiling — which is NOT the queue's `MaximumMessageSize`: that attribute
+/// bounds each entry, as the per-entry rows of the sibling tests show.
 #[tokio::test]
 async fn a_batch_that_is_not_acceptable_is_refused_whole() {
     /// The smallest `MaximumMessageSize` the attribute's documentation admits — "an
     /// integer from 1,024 bytes (1 KiB) to 1,048,576 bytes (1 MiB)" — so a row can reach
-    /// the payload bound without a megabyte of body.
+    /// the per-message bound without a megabyte of body.
     const SMALL_MAXIMUM: usize = 1_024;
 
     struct Case {
@@ -327,20 +331,22 @@ async fn a_batch_that_is_not_acceptable_is_refused_whole() {
             code: "QueueDoesNotExist",
         },
         Case {
-            label: "one entry one byte past the queue's maximum message size",
-            attributes: json!({ "MaximumMessageSize": SMALL_MAXIMUM.to_string() }),
-            entries: json!([{ "Id": "e0", "MessageBody": "x".repeat(SMALL_MAXIMUM + 1) }]),
-            real_queue: true,
-            status: 400,
-            code: "BatchRequestTooLong",
-        },
-        Case {
-            label: "entries whose bodies together pass the queue's maximum message size",
-            attributes: json!({ "MaximumMessageSize": SMALL_MAXIMUM.to_string() }),
-            entries: json!([
-                { "Id": "e0", "MessageBody": "x".repeat(SMALL_MAXIMUM / 2) },
-                { "Id": "e1", "MessageBody": "y".repeat(SMALL_MAXIMUM / 2 + 1) },
-            ]),
+            label: "entries whose bodies together pass the service's payload ceiling",
+            attributes: json!({}),
+            entries: Value::Array(
+                (0..MAX_BATCH_ENTRIES)
+                    .map(|index| {
+                        json!({
+                            "Id": format!("e{index}"),
+                            "MessageBody": "x".repeat(
+                                usize::try_from(maximum_batch_payload_bytes()).unwrap_or_default()
+                                    / MAX_BATCH_ENTRIES
+                                    + 1,
+                            ),
+                        })
+                    })
+                    .collect(),
+            ),
             real_queue: true,
             status: 400,
             code: "BatchRequestTooLong",
@@ -381,8 +387,9 @@ async fn a_batch_that_is_not_acceptable_is_refused_whole() {
         );
     }
 
-    // The published bound is a BOUNDARY: entries filling it exactly are accepted, while
-    // the rows above show one byte more is not.
+    // The published bound is a BOUNDARY: entries filling the queue's own
+    // `MaximumMessageSize` exactly are accepted, and so is their SUM — that attribute
+    // bounds each message, not the request's payload.
     let router = support::emulator();
     let url = support::create_ok(
         &router,
@@ -396,8 +403,8 @@ async fn a_batch_that_is_not_acceptable_is_refused_whole() {
         json!({
             "QueueUrl": url,
             "Entries": [
-                { "Id": "e0", "MessageBody": "x".repeat(SMALL_MAXIMUM / 2) },
-                { "Id": "e1", "MessageBody": "y".repeat(SMALL_MAXIMUM / 2) },
+                { "Id": "e0", "MessageBody": "x".repeat(SMALL_MAXIMUM) },
+                { "Id": "e1", "MessageBody": "y".repeat(SMALL_MAXIMUM) },
             ],
         }),
     )
@@ -405,19 +412,20 @@ async fn a_batch_that_is_not_acceptable_is_refused_whole() {
     assert_eq!(
         successful(&answer).len(),
         2,
-        "case exactly at the payload bound: expected both entries accepted, got {answer}"
+        "case exactly at the per-message bound: expected both entries accepted, got {answer}"
     );
     assert_eq!(
         held(&router, &url).await,
         (2, 0),
-        "case exactly at the payload bound: both messages must be held"
+        "case exactly at the per-message bound: both messages must be held"
     );
 }
 
-/// An entry the queue will not take fails ALONE: it is reported in `Failed` with the
-/// sender's fault and the code for its condition, and the other entries of the same batch
-/// are still enqueued. Rows differ along WHY the entry is not acceptable, and along where
-/// it sits in the batch.
+/// An entry the queue will not take fails ALONE on a STANDARD queue: it is reported in
+/// `Failed` with the sender's fault and the code for its condition, and the other entries
+/// of the same batch are still enqueued. Rows differ along WHY the entry is not
+/// acceptable, and along where it sits in the batch. (A FIFO queue answers the same
+/// faults at the request level — see `send_message_batch_entry_rules`.)
 #[tokio::test]
 async fn an_entry_the_queue_will_not_take_fails_on_its_own() {
     // `(label, the queue's attributes, the entries, the id -> expected code per failure)`
@@ -440,18 +448,6 @@ async fn an_entry_the_queue_will_not_take_fails_on_its_own() {
             enqueued: &["good"],
         },
         Case {
-            label: "an entry whose MessageDeduplicationId is not a token",
-            attributes: json!({ "FifoQueue": "true" }),
-            entries: json!([
-                { "Id": "good", "MessageBody": "one", "MessageGroupId": "g",
-                  "MessageDeduplicationId": "token" },
-                { "Id": "bad", "MessageBody": "two", "MessageGroupId": "g",
-                  "MessageDeduplicationId": "not a token" },
-            ]),
-            failures: &[("bad", "InvalidParameterValue")],
-            enqueued: &["good"],
-        },
-        Case {
             label: "a DelaySeconds past the range the attribute documents",
             attributes: json!({}),
             entries: json!([
@@ -459,16 +455,6 @@ async fn an_entry_the_queue_will_not_take_fails_on_its_own() {
                 { "Id": "good", "MessageBody": "two" },
             ]),
             failures: &[("bad", "InvalidParameterValue")],
-            enqueued: &["good"],
-        },
-        Case {
-            label: "an entry with no MessageGroupId on a FIFO queue",
-            attributes: json!({ "FifoQueue": "true", "ContentBasedDeduplication": "true" }),
-            entries: json!([
-                { "Id": "bad", "MessageBody": "one" },
-                { "Id": "good", "MessageBody": "two", "MessageGroupId": "g" },
-            ]),
-            failures: &[("bad", "MissingParameter")],
             enqueued: &["good"],
         },
         Case {

@@ -10,10 +10,11 @@
 //!   entries, more than ten entries, an entry `Id` outside the specification, two entries
 //!   sharing an `Id`, and a `QueueUrl` no queue answers to;
 //! * past those, each entry is resolved on its own: a live receipt handle deletes its
-//!   message and is reported in `Successful`, a handle the queue does not hold is reported
-//!   in `Failed` with `SenderFault` and the `ReceiptHandleIsInvalid` code, and the two
-//!   outcomes may appear in the same answer — "the result of the action on each message is
-//!   reported individually in the response";
+//!   message and is reported in `Successful`, a handle whose message a delete already
+//!   consumed is reported there too (a delete is idempotent), a handle the queue never
+//!   minted is reported in `Failed` with `SenderFault` and the `ReceiptHandleIsInvalid`
+//!   code, and the two outcomes may appear in the same answer — "the result of the action
+//!   on each message is reported individually in the response";
 //! * what the batch deleted is gone for good, which is read back through the queue's own
 //!   counters rather than from the response.
 
@@ -142,7 +143,9 @@ async fn a_bad_handle_fails_on_its_own_entry() {
     given_messages(&router, &url, 3).await;
     let receipts = handles(&router, &url, 3).await;
 
-    // A handle that was never minted, and an empty one: neither names a live message.
+    // A handle that was never minted, and an empty one: neither names a live message, and
+    // they are two different faults — one is not a receipt handle, the other is no value
+    // at all.
     let never_minted = "00000000-0000-4000-8000-000000000000".to_string();
 
     let entries = json!([
@@ -180,20 +183,38 @@ async fn a_bad_handle_fails_on_its_own_entry() {
         vec!["bad-first".to_string(), "bad-last".to_string()],
         "expected both bad handles reported per entry, got {answer}"
     );
-    for entry in &failed {
+    // (the entry's id, its code, its message)
+    let expected: &[(&str, &str, &str)] = &[
+        (
+            "bad-first",
+            RECEIPT_HANDLE_IS_INVALID,
+            "The input receipt handle is invalid.",
+        ),
+        (
+            "bad-last",
+            "EmptyValue",
+            "No Value Found for DeleteMessageBatchRequestEntry.3.ReceiptHandle.",
+        ),
+    ];
+    for (id, code, message) in expected {
+        let entry = failed
+            .iter()
+            .find(|entry| entry["Id"] == json!(id))
+            .unwrap_or_else(|| panic!("case {id}: no entry in {answer}"));
         assert_eq!(
             entry["Code"],
-            json!(RECEIPT_HANDLE_IS_INVALID),
-            "expected the {RECEIPT_HANDLE_IS_INVALID} code, got {entry}"
+            json!(code),
+            "case {id}: expected the {code} code, got {entry}"
         );
         assert_eq!(
             entry["SenderFault"],
             json!(true),
-            "a caller-supplied handle is the sender's fault, got {entry}"
+            "case {id}: a caller-supplied handle is the sender's fault, got {entry}"
         );
-        assert!(
-            entry["Message"].as_str().is_some_and(|text| !text.is_empty()),
-            "expected a message saying why the entry failed, got {entry}"
+        assert_eq!(
+            entry["Message"],
+            json!(message),
+            "case {id}: expected the message {message:?}, got {entry}"
         );
     }
 }

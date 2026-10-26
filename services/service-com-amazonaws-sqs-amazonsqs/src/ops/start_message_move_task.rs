@@ -327,22 +327,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Only one active message movement task is supported per queue at any given
-        // time."
-        if let Some(running) = state.active_message_move_task(&source_name, now) {
-            let task_handle = running.task_handle.clone();
-            let outstanding = running.messages_to_move(now);
-            let message_count = running.message_count;
-            return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
-                UnsupportedOperation {
-                    message: Some(format!(
-                        "A message movement task is already running for this source queue \
-                         ({task_handle}), with {outstanding} of its {message_count} messages \
-                         still to deliver; only one active message movement task is supported \
-                         per queue at any given time."
-                    )),
-                },
-            )
-            .into());
+        // time." A source whose task is still running is a PARAMETER this call cannot be
+        // served for — the condition clears on its own, so the caller is told to wait
+        // rather than told the source is unsupported.
+        if state.active_message_move_task(&source_name, now).is_some() {
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::TASK_ALREADY_RUNNING,
+            ));
         }
 
         // The task takes the messages the source queue can hand out at the instant it

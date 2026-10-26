@@ -16,8 +16,9 @@
 //! others: "the result of the action on each message is reported individually in the
 //! response. Because the batch request can result in a combination of successful and
 //! unsuccessful actions, you should check for batch errors even when the call returns an
-//! HTTP status code of 200." A deleted message's id is reported in `Successful`; an entry
-//! whose handle this queue does not hold is reported in `Failed` with the sender's fault
+//! HTTP status code of 200." A deleted message's id is reported in `Successful`; so is an
+//! entry whose handle a delete already consumed, because a delete is idempotent; an entry
+//! whose handle this queue never minted is reported in `Failed` with the sender's fault
 //! and the `ReceiptHandleIsInvalid` code.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -236,6 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = store.lock();
         let now = SystemTime::now();
+        // Where a handle this queue cannot resolve came from is read before the queue is
+        // borrowed for writing: it is a property of the OTHER queues of this store.
+        let origins: Vec<sqs::ReceiptHandleOrigin<'_>> = input
+            .entries
+            .iter()
+            .map(|entry| state.receipt_handle_origin(&input.queue_url, &entry.receipt_handle))
+            .collect();
         let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
             return Err(DeleteMessageBatchErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
@@ -260,10 +268,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut successful = Vec::with_capacity(input.entries.len());
         let mut failed = Vec::new();
-        for entry in &input.entries {
-            // Only a handle this queue currently holds names a message; anything else —
-            // a superseded handle, or one for an already-deleted message — is invalid,
-            // and invalid for THAT ENTRY alone.
+        for (index, (entry, origin)) in input.entries.iter().zip(origins).enumerate() {
+            // An entry whose `ReceiptHandle` holds nothing supplied no value for a member
+            // it had to carry, which is that entry's own fault and names the member by its
+            // position in the request.
+            if entry.receipt_handle.is_empty() {
+                failed.push(BatchResultErrorEntry {
+                    id: entry.id.clone(),
+                    sender_fault: true,
+                    code: sqs::EMPTY_VALUE.to_string(),
+                    message: Some(sqs::empty_batch_entry_value_message(
+                        Self::NAME,
+                        index + 1,
+                        "ReceiptHandle",
+                    )),
+                });
+                continue;
+            }
+            // A handle this queue currently holds names the message this entry deletes. A
+            // handle whose message a delete has ALREADY removed names a deletion this
+            // queue has performed, so this entry asks for nothing more and succeeds —
+            // which is what makes two entries naming the SAME handle both successful.
+            // Anything else — a superseded handle, or a value no queue ever minted — is
+            // invalid, and invalid for THAT ENTRY alone.
             match queue.handles.get(&entry.receipt_handle).cloned() {
                 Some(message_id) => {
                     // The message goes for good, so the lapsing visibility timeout
@@ -274,12 +301,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         id: entry.id.clone(),
                     });
                 }
+                None if queue.deleted_handle(&entry.receipt_handle) => {
+                    successful.push(DeleteMessageBatchResultEntry {
+                        id: entry.id.clone(),
+                    });
+                }
                 None => failed.push(BatchResultErrorEntry {
                     id: entry.id.clone(),
                     // The caller supplied the handle, so the fault is the sender's.
                     sender_fault: true,
                     code: RECEIPT_HANDLE_IS_INVALID.to_string(),
-                    message: sqs::receipt_handle_is_invalid(&entry.receipt_handle).message,
+                    message: sqs::receipt_handle_is_invalid(origin).message,
                 }),
             }
         }

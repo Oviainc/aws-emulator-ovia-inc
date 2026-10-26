@@ -453,7 +453,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let size = input.message_body.len().saturating_add(attribute_bytes);
         if i64::try_from(size).unwrap_or(i64::MAX) > maximum {
             return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameters_message(
-                &format!("Message must be shorter than {maximum} bytes."),
+                &sqs::message_too_long_reason(maximum),
             )));
         }
         let retained = size

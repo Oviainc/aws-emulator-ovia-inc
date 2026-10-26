@@ -333,8 +333,10 @@ async fn an_unknown_queue_url_is_queue_does_not_exist_everywhere() {
     );
 }
 
-/// A receipt handle the queue never minted is `ReceiptHandleIsInvalid` (404) — and so is
-/// one whose message has already been deleted.
+/// A receipt handle the queue never minted is `ReceiptHandleIsInvalid` (404), with the
+/// service's one fixed sentence for a value that is not a receipt handle — while
+/// repeating the delete the queue DID mint a handle for succeeds, because a delete is
+/// idempotent ("the request succeeds, but the message might not be deleted").
 #[tokio::test]
 async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
     let sqs = Emulator::new();
@@ -352,17 +354,26 @@ async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
         .expect("a receipt handle")
         .to_string();
 
-    // The genuine handle works exactly once.
-    let (status, answer) = sqs
-        .call(
-            "DeleteMessage",
-            &json!({ "QueueUrl": url, "ReceiptHandle": real_handle }),
-        )
-        .await;
-    assert_eq!(status, 200, "case the minted handle: got {answer:?}");
+    // The genuine handle deletes the message, and repeating it changes nothing.
+    for round in 0..3 {
+        let (status, answer) = sqs
+            .call(
+                "DeleteMessage",
+                &json!({ "QueueUrl": url, "ReceiptHandle": real_handle }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case the minted handle, round {round}: a delete is idempotent, got {answer:?}"
+        );
+    }
+    assert_eq!(
+        sqs.count(&url, "ApproximateNumberOfMessages").await,
+        "0",
+        "case after the repeated deletes: the message must be gone"
+    );
 
     for handle in [
-        real_handle.as_str(),
         "garbage",
         "",
         "00000000-0000-4000-8000-000000000000",
@@ -378,6 +389,12 @@ async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
             (status, error_code(&answer).as_str()),
             (404, "ReceiptHandleIsInvalid"),
             "case handle {handle:?}: got {status} {answer:?}"
+        );
+        assert_eq!(
+            answer["message"].as_str(),
+            Some("The input receipt handle is invalid."),
+            "case handle {handle:?}: expected the fixed sentence, with nothing of the \
+             request in it, got {answer:?}"
         );
     }
 }

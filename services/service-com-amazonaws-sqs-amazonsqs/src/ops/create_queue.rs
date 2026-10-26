@@ -358,6 +358,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: tags.unwrap_or_default(),
             messages: ::std::collections::VecDeque::new(),
             handles: ::std::collections::HashMap::new(),
+            // A queue nobody has deleted a message from yet has retired no receipt
+            // handle.
+            deleted_handles: ::std::collections::VecDeque::new(),
             deduplication: ::std::collections::BTreeMap::new(),
             receive_attempts: ::std::collections::BTreeMap::new(),
             // Nothing has been sequenced yet, so the first message this queue

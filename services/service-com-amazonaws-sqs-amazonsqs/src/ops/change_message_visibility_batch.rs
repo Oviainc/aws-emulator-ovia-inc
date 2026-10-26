@@ -226,6 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
+        // Where a handle this queue cannot resolve came from is read before the queue is
+        // borrowed for writing: it is a property of the OTHER queues of this store.
+        let origins: Vec<sqs::ReceiptHandleOrigin<'_>> = input
+            .entries
+            .iter()
+            .map(|entry| state.receipt_handle_origin(&input.queue_url, &entry.receipt_handle))
+            .collect();
         let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
             return Err(ChangeMessageVisibilityBatchErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
@@ -251,7 +258,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (min, max) = sqs::integer_bounds(sqs::VISIBILITY_TIMEOUT);
         let mut successful = Vec::with_capacity(input.entries.len());
         let mut failed = Vec::new();
-        for entry in &input.entries {
+        for ((index, entry), origin) in input.entries.iter().enumerate().zip(origins) {
+            // An entry whose `ReceiptHandle` holds nothing supplied no value for a member
+            // it had to carry, which is that entry's own fault and names the member by its
+            // position in the request.
+            if entry.receipt_handle.is_empty() {
+                failed.push(BatchResultErrorEntry {
+                    id: entry.id.clone(),
+                    sender_fault: true,
+                    code: sqs::EMPTY_VALUE.to_string(),
+                    message: Some(sqs::empty_batch_entry_value_message(
+                        Self::NAME,
+                        index + 1,
+                        "ReceiptHandle",
+                    )),
+                });
+                continue;
+            }
             // An entry's own value is that entry's fault alone: "the default visibility
             // timeout for a message is 30 seconds" is the queue's value, which applies when
             // the entry names none.
@@ -284,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // The caller supplied the handle, so the fault is the sender's.
                         sender_fault: true,
                         code: RECEIPT_HANDLE_IS_INVALID.to_string(),
-                        message: sqs::receipt_handle_is_invalid(&entry.receipt_handle).message,
+                        message: sqs::receipt_handle_is_invalid(origin).message,
                     })
                 }
                 Err(sqs::VisibilityRefusal::NotInFlight) => {

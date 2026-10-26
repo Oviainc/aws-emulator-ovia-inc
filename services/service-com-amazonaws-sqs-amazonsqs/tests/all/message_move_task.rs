@@ -337,9 +337,21 @@ async fn only_one_message_movement_task_runs_per_source_queue_at_a_time() {
     let (status, parsed) = call(&router, "StartMessageMoveTask", &request).await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "UnsupportedOperation"),
+        (400, "InvalidParameterValue"),
         "case a second start while the first task runs: expected HTTP 400 \
-         UnsupportedOperation, got {status} with {parsed}"
+         InvalidParameterValue, got {status} with {parsed}"
+    );
+    // The refusal is the service's own sentence for a busy source arn: the condition
+    // clears on its own, so the caller is told to wait rather than that the source is one
+    // this action does not support.
+    assert_eq!(
+        parsed["message"].as_str(),
+        Some(
+            "There is already a task running. Only one active task is allowed for a \
+             source queue arn at a given time."
+        ),
+        "case a second start while the first task runs: expected the busy-source sentence, \
+         got {parsed}"
     );
 
     // Once the task has delivered everything it took, the source queue is free again.

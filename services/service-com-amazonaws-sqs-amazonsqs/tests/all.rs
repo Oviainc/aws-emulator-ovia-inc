@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/batch_entry_faults.rs"]
+mod batch_entry_faults;
 #[path = "all/cancel_message_move_task.rs"]
 mod cancel_message_move_task;
 #[path = "all/delete_message_batch.rs"]
@@ -53,6 +55,8 @@ mod queue_tags;
 mod receive_message_attribute_names;
 #[path = "all/refusal_taxonomy.rs"]
 mod refusal_taxonomy;
+#[path = "all/scratch_probe.rs"]
+mod scratch_probe;
 #[path = "all/send_message_batch.rs"]
 mod send_message_batch;
 #[path = "all/state_roundtrip.rs"]
