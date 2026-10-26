@@ -1134,6 +1134,17 @@ impl ComplianceInquiry {
             .collect()
     }
 
+    /// The optional `tags` member every inquiry operation answers with — the create, the
+    /// metadata read and the export.
+    ///
+    /// An untagged resource reports no `tags` member at all, rather than an empty map.
+    /// One rule, applied in one place, so those operations cannot disagree about what an
+    /// untagged inquiry reports. (`ListTagsForResource` is NOT this projection: there the
+    /// member IS the listing, so it is present and empty for an untagged resource.)
+    pub fn reported_tags(&self) -> Option<::std::collections::HashMap<String, String>> {
+        (!self.tags.is_empty()).then(|| self.tags_map())
+    }
+
     /// The DOCUMENT `ExportComplianceInquiry` exports: this inquiry, and the queries
     /// `covered` names, as the bytes a caller downloads from the URL that export
     /// published.

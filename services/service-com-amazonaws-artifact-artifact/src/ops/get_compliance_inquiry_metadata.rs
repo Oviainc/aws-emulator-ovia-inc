@@ -185,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetComplianceInquiryMetadataOutput {
             compliance_inquiry_detail: Some(inquiry.to_detail()),
-            // An untagged resource reports no `tags` member at all, rather than an empty
-            // map — the same projection `CreateComplianceInquiry` returns.
-            tags: (!inquiry.tags.is_empty()).then(|| inquiry.tags_map()),
+            // The one tags projection every inquiry operation answers with
+            // ([`crate::state::ComplianceInquiry::reported_tags`]), so this read and
+            // `CreateComplianceInquiry` cannot disagree.
+            tags: inquiry.reported_tags(),
         })
     }
 }

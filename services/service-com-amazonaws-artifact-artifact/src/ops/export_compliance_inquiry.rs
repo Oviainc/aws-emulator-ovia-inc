@@ -205,9 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|query| query.identifier)
             .collect();
-        // Read off the one stored record, so the tags this answers with are the tags the
-        // create and the metadata read report.
-        let tags = (!inquiry.tags.is_empty()).then(|| inquiry.tags_map());
+        // Read off the one stored record through the one tags projection every inquiry
+        // operation answers with ([`crate::state::ComplianceInquiry::reported_tags`]), so
+        // the tags this answers with are the tags the create and the metadata read report.
+        let tags = inquiry.reported_tags();
 
         // "List of query identifiers to include in the export": the export covers the
         // queries the request named, or every query the inquiry owns when it named none.
@@ -267,8 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.compliance_inquiry_id,
                 &export_id,
             )),
-            // An untagged resource reports no `tags` member at all, rather than an empty
-            // map — the same projection every other inquiry operation returns.
+            // The projection every other inquiry operation returns, computed above off
+            // the stored record.
             tags,
         })
     }
