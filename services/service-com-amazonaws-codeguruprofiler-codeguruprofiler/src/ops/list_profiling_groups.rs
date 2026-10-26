@@ -163,42 +163,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The page token is this service's own opaque cursor: the index into the
-        // name-ordered group list at which the next page starts. It satisfies the
-        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`) for any number
-        // of groups, which a token built out of a group name (len 1..255) would not.
-        let start = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => token.parse::<usize>().map_err(|_| {
-                crate::scaffolded::Scaffolded::validation(format!(
-                    "nextToken is not a token this service issued: {token}"
-                ))
-            })?,
-        };
+        // The cursor into the name-ordered group list, read before any lookup:
+        // [`crate::state::ListCursor`] holds this service's pagination rule for every
+        // listing, so a group listing pages exactly the way its report listings do.
+        let cursor = crate::state::ListCursor::parse(input.next_token.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let guard = state.lock();
         let names = guard.sorted_group_names();
-        // A token that points past the end of the list is one this service never
-        // issued: it is refused rather than answered with an empty page.
-        if start > names.len() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "nextToken is not a token this service issued",
-            ));
-        }
-        // Without `maxResults` the page is this service's default size, so one
-        // unparameterised request cannot materialise a response that grows with the
-        // number of stored groups.
-        let limit = input.max_results.map_or(
-            crate::state::DEFAULT_LIST_PAGE_SIZE,
-            |max| usize::try_from(max).unwrap_or(0),
-        );
-        let end = start.saturating_add(limit).min(names.len());
-        let page = names.get(start..end).unwrap_or_default();
+        let page = cursor
+            .page_of(&names, input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let include_description = input.include_description.unwrap_or(false);
         let descriptions = if include_description {
             Some(
-                page.iter()
+                page.items
+                    .iter()
                     .filter_map(|name| guard.groups.get(name))
                     .map(crate::state::ProfilingGroup::description)
                     .collect(),
@@ -214,9 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `profilingGroupNames` is "returned only if includeDescription is false". So
             // exactly one of the two keys is present, and a client branching on which it
             // got is never shown both.
-            profiling_group_names: (!include_description).then(|| page.to_vec()),
+            profiling_group_names: (!include_description).then(|| page.items.to_vec()),
             profiling_groups: descriptions,
-            next_token: (end < names.len()).then(|| end.to_string()),
+            next_token: page.next_token,
         })
     }
 }

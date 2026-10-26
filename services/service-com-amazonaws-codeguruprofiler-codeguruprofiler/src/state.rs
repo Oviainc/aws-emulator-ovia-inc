@@ -159,9 +159,9 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// enforcing it here.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
-/// The page size `ListProfilingGroups` uses when the caller gives no `maxResults`, so
-/// one unparameterised request cannot materialise a response that grows with the
-/// stored group count. Inside the modelled `maxResults` range (1..1000).
+/// The page size a listing uses when the caller gives no `maxResults`, so one
+/// unparameterised request cannot materialise a response that grows with the number of
+/// stored elements. Inside the modelled `maxResults` range (1..1000).
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
 /// How many anomaly-notification channels one profiling group holds. NOT an
@@ -1765,6 +1765,85 @@ pub fn validate_interval(start: DateTime, end: DateTime) -> Result<(), String> {
         iso8601(start),
         iso8601(end)
     ))
+}
+
+/// What every listing of this service says when the `nextToken` it was handed is not a
+/// cursor it could have issued: it names no position in the listing, so the request is
+/// refused rather than answered with a page. Each handler lifts this sentence into its
+/// OWN modelled client-input error (HTTP 400), so the code a client matches on is still
+/// the one that operation declares.
+const UNISSUED_TOKEN_MESSAGE: &str = "nextToken is not a token this service issued";
+
+/// One page of an already-ordered listing, as [`ListCursor::page_of`] computes it.
+#[derive(Debug)]
+pub struct ListPage<'a, T> {
+    /// The elements this page reports, in the listing's own order.
+    pub items: &'a [T],
+    /// The cursor the caller continues from, present only while elements remain past
+    /// this page — so a listing that reached its end carries no token, the way the
+    /// modelled `nextToken` members document ("This value is null when there are no
+    /// more results to return").
+    pub next_token: Option<String>,
+}
+
+/// This service's PAGINATION rule, in one place for every operation that reports an
+/// already-ordered sequence a page at a time — the way [`validate_interval`] holds its
+/// interval rule and [`validate_tags`] its tag rules.
+///
+/// The cursor is this service's own opaque token: the INDEX into the listing at which
+/// the next page starts, which satisfies the modelled `PaginationToken` constraints
+/// (len 1..64, `^[\w-]+$`) for a listing of any length. Anything else — a token that
+/// does not read as an index, or one past the end of the listing — is a token this
+/// service never issued and is refused with [`UNISSUED_TOKEN_MESSAGE`]; an index at
+/// exactly the end is one it DOES issue (the page before it ended at the last element),
+/// so it answers a final empty page.
+///
+/// Parsing the token is separate from cutting the page so each handler can refuse a
+/// malformed cursor BEFORE it resolves the resource the listing is about, the way it
+/// refuses the rest of its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListCursor {
+    /// The position in the listing this page starts at; no `nextToken` means the first.
+    start: usize,
+}
+
+impl ListCursor {
+    /// The cursor `next_token` names, or the message for a token that is not one of
+    /// this service's — which repeats the offending token, since the caller sent it.
+    pub fn parse(next_token: Option<&str>) -> Result<Self, String> {
+        let start = match next_token {
+            None => 0usize,
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| format!("{UNISSUED_TOKEN_MESSAGE}: {token}"))?,
+        };
+        Ok(Self { start })
+    }
+
+    /// The page of `items` this cursor starts, at most `max_results` long, plus the
+    /// token to continue from; or the message for a cursor past the end of `items`.
+    ///
+    /// Without `max_results` the page is [`DEFAULT_LIST_PAGE_SIZE`] long, so one
+    /// unparameterised request cannot materialise a response that grows with the number
+    /// of stored elements. The boundary validator has already held `max_results` to the
+    /// modelled range by the time a handler calls this.
+    pub fn page_of<'a, T>(
+        self,
+        items: &'a [T],
+        max_results: Option<i32>,
+    ) -> Result<ListPage<'a, T>, String> {
+        if self.start > items.len() {
+            return Err(UNISSUED_TOKEN_MESSAGE.to_string());
+        }
+        let limit = max_results.map_or(DEFAULT_LIST_PAGE_SIZE, |max| {
+            usize::try_from(max).unwrap_or(0)
+        });
+        let end = self.start.saturating_add(limit).min(items.len());
+        Ok(ListPage {
+            items: items.get(self.start..end).unwrap_or_default(),
+            next_token: (end < items.len()).then(|| end.to_string()),
+        })
+    }
 }
 
 /// The ARN of a profiling group:

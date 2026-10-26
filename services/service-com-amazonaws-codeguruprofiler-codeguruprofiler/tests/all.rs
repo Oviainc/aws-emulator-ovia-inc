@@ -21,6 +21,8 @@ mod findings_reports_listing;
 mod interval_resolution;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
+#[path = "all/list_pagination.rs"]
+mod list_pagination;
 #[path = "all/not_found_surfaces.rs"]
 mod not_found_surfaces;
 #[path = "all/notification_channels.rs"]

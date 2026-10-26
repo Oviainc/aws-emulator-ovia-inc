@@ -191,18 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The page token is this service's own opaque cursor: the index into the
-        // group's stable report order at which the next page starts. It satisfies the
-        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`) for any number
-        // of reports.
-        let start = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => token.parse::<usize>().map_err(|_| {
-                ListFindingsReportsErrorModeled::ValidationException(ValidationException {
-                    message: format!("nextToken is not a token this service issued: {token}"),
-                })
-            })?,
-        };
+        // The cursor into the group's stable report order, read BEFORE the group is
+        // resolved — like the interval above, a cursor this service could not have
+        // issued is refused on the input. [`crate::state::ListCursor`] holds this
+        // service's pagination rule for every listing.
+        let cursor = crate::state::ListCursor::parse(input.next_token.as_deref()).map_err(
+            |message| {
+                ListFindingsReportsErrorModeled::ValidationException(ValidationException { message })
+            },
+        )?;
 
         let guard = state.lock();
         let Some(group) = guard.groups.get(&input.profiling_group_name) else {
@@ -223,34 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.daily_reports_only.unwrap_or(false),
         );
 
-        // A token that points past the end of the listing is one this service never
-        // issued: it is refused rather than answered with an empty page.
-        if start > reports.len() {
-            return Err(ListFindingsReportsErrorModeled::ValidationException(
-                ValidationException {
-                    message: "nextToken is not a token this service issued".to_string(),
-                },
-            )
-            .into());
-        }
-        // Without `maxResults` the page is this service's default size, so one
-        // unparameterised request cannot materialise a response that grows with the
-        // number of stored reports.
-        let limit = input
-            .max_results
-            .map_or(crate::state::DEFAULT_LIST_PAGE_SIZE, |max| {
-                usize::try_from(max).unwrap_or(0)
-            });
-        let end = start.saturating_add(limit).min(reports.len());
-        let page = reports.get(start..end).unwrap_or_default();
+        let page = cursor
+            .page_of(&reports, input.max_results)
+            .map_err(|message| {
+                ListFindingsReportsErrorModeled::ValidationException(ValidationException { message })
+            })?;
 
         Ok(ListFindingsReportsOutput {
             // The group name reported is the STORED group's, not the request's.
             findings_report_summaries: page
+                .items
                 .iter()
                 .map(|report| report.summary(&group.name))
                 .collect(),
-            next_token: (end < reports.len()).then(|| end.to_string()),
+            next_token: page.next_token,
         })
     }
 }

@@ -176,20 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The page token is this service's own opaque cursor: the index into the
-        // account-wide report order at which the next page starts. It satisfies the
-        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`) for any number
-        // of reports.
-        let start = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => token.parse::<usize>().map_err(|_| {
+        // The cursor into the account-wide report order, read before any lookup:
+        // [`crate::state::ListCursor`] holds this service's pagination rule for every
+        // listing, so the account summary pages exactly the way a group's own listing
+        // does.
+        let cursor = crate::state::ListCursor::parse(input.next_token.as_deref()).map_err(
+            |message| {
                 GetFindingsReportAccountSummaryErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!("nextToken is not a token this service issued: {token}"),
-                    },
+                    ValidationException { message },
                 )
-            })?,
-        };
+            },
+        )?;
 
         let guard = state.lock();
         // `dailyReportsOnly` restricts the summary to reports over daily profiles when
@@ -198,31 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let summaries =
             guard.account_findings_report_summaries(input.daily_reports_only.unwrap_or(false));
 
-        // A token that points past the end of the summary is one this service never
-        // issued: it is refused rather than answered with an empty page.
-        if start > summaries.len() {
-            return Err(
+        let page = cursor
+            .page_of(&summaries, input.max_results)
+            .map_err(|message| {
                 GetFindingsReportAccountSummaryErrorModeled::ValidationException(
-                    ValidationException {
-                        message: "nextToken is not a token this service issued".to_string(),
-                    },
+                    ValidationException { message },
                 )
-                .into(),
-            );
-        }
-        // Without `maxResults` the page is this service's default size, so one
-        // unparameterised request cannot materialise a response that grows with the
-        // number of stored reports.
-        let limit = input
-            .max_results
-            .map_or(crate::state::DEFAULT_LIST_PAGE_SIZE, |max| {
-                usize::try_from(max).unwrap_or(0)
-            });
-        let end = start.saturating_add(limit).min(summaries.len());
+            })?;
 
         Ok(GetFindingsReportAccountSummaryOutput {
-            report_summaries: summaries.get(start..end).unwrap_or_default().to_vec(),
-            next_token: (end < summaries.len()).then(|| end.to_string()),
+            report_summaries: page.items.to_vec(),
+            next_token: page.next_token,
         })
     }
 }
