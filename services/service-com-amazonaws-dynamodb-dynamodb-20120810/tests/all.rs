@@ -70,6 +70,9 @@ mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
 
+#[path = "all/resource_policy_not_found_messages.rs"]
+mod resource_policy_not_found_messages;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

@@ -204,18 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, the request will fail and return a PolicyNotFoundException"
         // (`DeleteResourcePolicy$ExpectedRevisionId`).
         if let Some(expected) = input.expected_revision_id.as_deref() {
-            let matches = table
+            let attached_revision_id = table
                 .resource_policy
                 .as_ref()
-                .is_some_and(|policy| policy.revision_id == expected);
-            if !matches {
+                .map(|policy| policy.revision_id.as_str());
+            if attached_revision_id != Some(expected) {
+                // The refusal names the revision the request asked for and what the
+                // target carries instead, so the two situations the modelled error
+                // covers are told apart.
                 return Err(
                     DeleteResourcePolicyErrorModeled::PolicyNotFoundException(
                         PolicyNotFoundException {
-                            message: Some(format!(
-                                "No resource-based policy with the expected revision id is \
-                                 attached to {}",
-                                input.resource_arn
+                            message: Some(crate::state::policy_revision_mismatch_message(
+                                expected,
+                                &resource.table,
+                                attached_revision_id,
                             )),
                         },
                     )

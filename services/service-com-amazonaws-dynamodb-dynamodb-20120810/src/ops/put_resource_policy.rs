@@ -249,14 +249,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, your request will be rejected with a PolicyNotFoundException. To
         // conditionally attach a policy when no policy exists for the resource, specify
         // NO_POLICY for the revision ID" (`PutResourcePolicy$ExpectedRevisionId`).
-        let attached = table.resource_policy.as_ref();
-        let matches_expectation = match input.expected_revision_id.as_deref() {
-            None => true,
-            Some("NO_POLICY") => attached.is_none(),
-            Some(expected) => attached.is_some_and(|policy| policy.revision_id == expected),
+        let attached_revision_id = table
+            .resource_policy
+            .as_ref()
+            .map(|policy| policy.revision_id.as_str());
+        let unmet_expectation = match input.expected_revision_id.as_deref() {
+            None => None,
+            // `NO_POLICY` asks for the ABSENCE of a policy, so it is satisfied by that
+            // and never by a stored revision id that happens to spell it.
+            Some(expected @ "NO_POLICY") => attached_revision_id.is_some().then_some(expected),
+            Some(expected) if attached_revision_id == Some(expected) => None,
+            Some(expected) => Some(expected),
         };
-        if !matches_expectation {
-            return Err(policy_not_found(&input.resource_arn));
+        if let Some(expected) = unmet_expectation {
+            // The refusal names the revision the request asked for and what the table
+            // carries instead, so a stale revision is told apart from a policy that is
+            // not there — the two situations the modelled error covers.
+            return Err(policy_not_found(
+                expected,
+                &resource.table,
+                attached_revision_id,
+            ));
         }
 
         let revision_id = policy.revision_id.clone();
@@ -303,11 +316,16 @@ fn lift(error: crate::state::RequestError) -> PutResourcePolicyError {
 }
 
 /// The modelled refusal for an `ExpectedRevisionId` the attached policy does not match.
-fn policy_not_found(resource_arn: &str) -> PutResourcePolicyError {
+fn policy_not_found(
+    expected_revision_id: &str,
+    table: &str,
+    attached_revision_id: Option<&str>,
+) -> PutResourcePolicyError {
     PutResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {
-        message: Some(format!(
-            "No resource-based policy with the expected revision id is attached to \
-             {resource_arn}"
+        message: Some(crate::state::policy_revision_mismatch_message(
+            expected_revision_id,
+            table,
+            attached_revision_id,
         )),
     })
     .into()

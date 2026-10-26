@@ -184,9 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy = table.resource_policy.as_ref().ok_or_else(|| {
             GetResourcePolicyError::from(
                 GetResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {
-                    message: Some(format!(
-                        "No resource-based policy is attached to {}",
-                        input.resource_arn
+                    message: Some(crate::state::policy_not_found_message(
+                        &input.resource_arn,
                     )),
                 }),
             )

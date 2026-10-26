@@ -8199,6 +8199,45 @@ impl AttachedPolicy {
     }
 }
 
+/// The fixed opening of every `PolicyNotFoundException` message, whichever
+/// resource-policy operation raises it and whichever of the two situations the
+/// modelled error covers ("tried to access a nonexistent resource-based policy" and
+/// "a policy is present for the resource but its revision ID didn't match the
+/// expected value"). What follows it is the detail built from the request and from
+/// this store: see [`policy_not_found_message`] and
+/// [`policy_revision_mismatch_message`].
+pub const POLICY_NOT_FOUND_PREFIX: &str =
+    "Resource-based policy not found for the provided ResourceArn: ";
+
+/// The refusal of an UNCONDITIONED request for a policy that is not there: the fixed
+/// prefix and the `ResourceArn` the request sent, spelled as the request spelled it.
+pub fn policy_not_found_message(resource_arn: &str) -> String {
+    format!("{POLICY_NOT_FOUND_PREFIX}{resource_arn}")
+}
+
+/// The refusal of a request whose `ExpectedRevisionId` the target does not satisfy:
+/// the fixed prefix, the revision id the request asked for, and what the target
+/// actually carries — the revision id of the policy attached to it, or that it
+/// carries no policy at all. The two tails are what lets a client doing optimistic
+/// concurrency tell a stale revision apart from a policy that is gone.
+pub fn policy_revision_mismatch_message(
+    expected_revision_id: &str,
+    table: &str,
+    attached_revision_id: Option<&str>,
+) -> String {
+    match attached_revision_id {
+        Some(current) => format!(
+            "{POLICY_NOT_FOUND_PREFIX}Requested update for policy with revision id \
+             {expected_revision_id}, but the policy associated to target table {table} has \
+             revision id {current}."
+        ),
+        None => format!(
+            "{POLICY_NOT_FOUND_PREFIX}Requested update for policy with revision id \
+             {expected_revision_id}, but table {table} has no associated policy."
+        ),
+    }
+}
+
 /// The revision id of a policy document: a digest of the document, so the same
 /// document always gets the same id and a different one never does.
 fn policy_revision_id(document: &str) -> String {
