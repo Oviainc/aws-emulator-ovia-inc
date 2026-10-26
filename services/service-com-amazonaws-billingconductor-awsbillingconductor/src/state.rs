@@ -1378,8 +1378,9 @@ pub struct ResourceAssociationRecord {
     /// The FULL ARN of the associated billing group or custom line item.
     pub arn: String,
     /// The billing periods this association is in effect in — see
-    /// [`BillingPeriodSpan`]. An association made with no range at all is the one
-    /// fully open span. The spans are disjoint and ascending, and there are at most
+    /// [`BillingPeriodSpan`]. An association made with no range at all is the one span
+    /// that runs from the period it was made in on ([`Self::new`]). The spans are
+    /// disjoint and ascending, and there are at most
     /// [`MAX_BILLING_PERIOD_SPANS`] of them: a caller decides how many
     /// bounded calls to make, and each one can carve one more stretch, so the list is
     /// capped like every other store here.
@@ -1402,8 +1403,23 @@ pub enum PeriodsRemoval {
 
 impl ResourceAssociationRecord {
     /// An association of `arn` in effect over `span` — the billing period range the
-    /// associating call named, which is fully open when it named none.
+    /// associating call named.
+    ///
+    /// An association is in effect no EARLIER than the billing period the call that made
+    /// it was made in, because it did not exist before that period: a call that named no
+    /// inclusive start begins in the CURRENT billing period rather than in the unbounded
+    /// past, which is the bound every other association this service stores carries too
+    /// ([`PricingRuleAssociationRecord::started_now`]). An inclusive start the call did
+    /// name is kept as the call spelled it, and an absent END is still open: an
+    /// association with nothing to end it stands in every later period.
     pub fn new(arn: String, span: BillingPeriodSpan) -> Self {
+        let span = BillingPeriodSpan::new(
+            Some(
+                span.inclusive_start
+                    .unwrap_or_else(current_billing_period),
+            ),
+            span.exclusive_end,
+        );
         Self {
             arn,
             spans: vec![span],
@@ -1418,8 +1434,9 @@ impl ResourceAssociationRecord {
 
     /// Is this association in effect during `billing_period`? The start is
     /// inclusive and the end exclusive, as the member names say
-    /// (`InclusiveStartBillingPeriod` / `ExclusiveEndBillingPeriod`); an absent
-    /// bound is open, so an association made without a range covers every period.
+    /// (`InclusiveStartBillingPeriod` / `ExclusiveEndBillingPeriod`); an absent end is
+    /// open, so an association nothing has ended covers every period from the one it
+    /// was made in on ([`Self::new`]).
     pub fn covers(&self, billing_period: &str) -> bool {
         self.spans.iter().any(|span| span.covers(billing_period))
     }
@@ -1427,22 +1444,15 @@ impl ResourceAssociationRecord {
     /// `EndBillingPeriod`: the billing period this association stops applying at,
     /// EXCLUSIVE, absent when it does not stop.
     ///
-    /// A read that names a billing period is asking about the association as it stands
-    /// IN that period, so the span covering it is the one that ends; a read that names
-    /// none is asking about the association as a whole, which ends where its LAST span
-    /// does.
-    pub fn end_billing_period(&self, billing_period: Option<&str>) -> Option<String> {
-        match billing_period {
-            Some(period) => self
-                .spans
-                .iter()
-                .find(|span| span.covers(period))
-                .and_then(|span| span.exclusive_end.clone()),
-            None => self
-                .spans
-                .last()
-                .and_then(|span| span.exclusive_end.clone()),
-        }
+    /// Every read of an association is scoped to ONE billing period, and it asks about
+    /// the association as it stands IN that period — so the stretch covering that period
+    /// is the one that ends, and a period no stretch covers has no association to report
+    /// an end for.
+    pub fn end_billing_period(&self, billing_period: &str) -> Option<String> {
+        self.spans
+            .iter()
+            .find(|span| span.covers(billing_period))
+            .and_then(|span| span.exclusive_end.clone())
     }
 
     /// Take the billing periods `removed` names out of this association, and report

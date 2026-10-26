@@ -272,6 +272,37 @@ fn bare_id(arn: &str) -> String {
     arn.rsplit('/').next().unwrap_or(arn).to_string()
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// An association made with no billing period range of its own is in effect from the
+/// period the associating call landed in, and a read that names no billing period is
+/// scoped to the current one, so both are decided by the wall clock rather than by a
+/// fixed month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// Every class of resource an association can name, in both the forms the member
 /// admits: what is persisted and read back is the resource, not the spelling.
 #[tokio::test]
@@ -660,7 +691,12 @@ async fn a_request_level_fault_is_the_calls_own_modelled_error() {
 
 /// A read reports the associations in effect for the billing period it asks for, and
 /// only the relationship its filter names: the start is inclusive, the end exclusive,
-/// and an absent bound is open.
+/// and an association with no end of its own is in effect in every later period.
+///
+/// The periods are named relative to the CURRENT billing period ([`period`]): a read
+/// that names none is scoped to that period, and an association made with no range of
+/// its own is in effect from the period the associating call landed in —
+/// `tests/all/resource_association_billing_periods.rs` is the suite about that scoping.
 #[tokio::test]
 async fn a_read_reports_the_associations_the_request_asks_for() {
     let emulator = Emulator::new();
@@ -671,14 +707,15 @@ async fn a_read_reports_the_associations_the_request_asks_for() {
     let bounded = home.clone();
     let open = emulator.percentage_item(&home, "open").await;
 
-    // One association bounded to 2026-1..2026-4, one with no range at all.
+    // One association bounded to the three billing periods from the current one on, one
+    // with no range at all.
     let (status, body) = emulator
         .associate(
             &target,
             std::slice::from_ref(&bounded),
             Some(json!({
-                "InclusiveStartBillingPeriod": "2026-1",
-                "ExclusiveEndBillingPeriod": "2026-4",
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(3),
             })),
         )
         .await;
@@ -719,40 +756,75 @@ async fn a_read_reports_the_associations_the_request_asks_for() {
         })
         .collect();
     assert!(
-        ends.contains(&(bounded.clone(), Some("2026-4".to_string())))
+        ends.contains(&(bounded.clone(), Some(period(3))))
             && ends.contains(&(open.clone(), None)),
         "case EndBillingPeriod: expected the bounded association to report its exclusive end \
          and the open one none, got {ends:?}"
     );
 
-    // Each published bound of the bounded range, and one period past each: the open
-    // association is in effect in every period.
-    let periods: [(&str, bool); 5] = [
-        ("2025-12", false),
-        ("2026-1", true),
-        ("2026-01", true),
-        ("2026-3", true),
-        ("2026-4", false),
+    // Each published bound of the bounded range, and one period past each — plus a month
+    // long before either association was made.
+    // (case, the billing period the read asks for, is the bounded association in effect
+    // there, is the one with no range of its own)
+    let probes: [(&str, String, bool, bool); 6] = [
+        (
+            "the period before both associations",
+            period(-1),
+            false,
+            false,
+        ),
+        (
+            "a period long before either association",
+            "2020-01".to_string(),
+            false,
+            false,
+        ),
+        (
+            "the bounded range's inclusive start",
+            period(0),
+            true,
+            true,
+        ),
+        (
+            "the same period with a one-digit month",
+            one_digit_month(&period(0)),
+            true,
+            true,
+        ),
+        (
+            "the last period of the bounded range",
+            period(2),
+            true,
+            true,
+        ),
+        (
+            "the bounded range's exclusive end",
+            period(3),
+            false,
+            true,
+        ),
     ];
-    for (period, covered) in periods {
+    for (case, billing_period, bounded_in_effect, open_in_effect) in probes {
         let reported_back = emulator
-            .association_pairs(&target, json!({ "BillingPeriod": period }))
+            .association_pairs(&target, json!({ "BillingPeriod": billing_period }))
             .await;
         let arns: Vec<String> = reported_back
             .iter()
             .map(|(arn, _)| arn.clone())
             .collect();
-        assert!(
+        assert_eq!(
             arns.contains(&open),
-            "case billing period {period:?}: an association with no range covers every \
-             period, got {arns:?}"
+            open_in_effect,
+            "case {case:?} ({billing_period}): expected the association with no range of its \
+             own to be {}, got {arns:?}",
+            if open_in_effect { "reported" } else { "left out" }
         );
         assert_eq!(
             arns.contains(&bounded),
-            covered,
-            "case billing period {period:?}: expected the 2026-1..2026-4 association to be \
-             {}, got {arns:?}",
-            if covered { "reported" } else { "left out" }
+            bounded_in_effect,
+            "case {case:?} ({billing_period}): expected the bounded association to be {}, got \
+             {arns:?}",
+            if bounded_in_effect { "reported" } else { "left out" }
         );
     }
 

@@ -21,6 +21,13 @@
 //! What is left is what `ListResourcesAssociatedToCustomLineItem` reports back, with the
 //! `EndBillingPeriod` of the association as it stands in the period the read asks about.
 //!
+//! Every read of an association is scoped to ONE billing period, so what is left of an
+//! association is asked about in a billing period it applied in; an association made
+//! with NO range of its own is in effect from the period the associating call landed in,
+//! so the periods of those rows are named relative to the CURRENT billing period
+//! ([`period`]), while a row whose associating call named its own range keeps the periods
+//! that call named.
+//!
 //! The rows differ along the class of the resource (billing group / custom line item),
 //! the form the caller names it in (full ARN / bare id), the number of resources in one
 //! request, the way a resource fails, and where the disassociation's billing period
@@ -209,6 +216,32 @@ impl Emulator {
         .await
     }
 
+    /// The `AssociationSize` the target custom line item reports: the number of
+    /// association RECORDS it holds, whatever billing periods each of them is in effect
+    /// in — so this is what says whether a bounded disassociation DROPPED a record,
+    /// which a read scoped to one billing period cannot.
+    async fn association_size(&self, case: &str, target: &str) -> i64 {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/list-custom-line-items",
+                &json!({ "Filters": { "Arns": [target] } }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the item read to answer HTTP 200, got {status} with {body}"
+        );
+        body.get("CustomLineItems")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("AssociationSize"))
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected the item's AssociationSize, got {body}")
+            })
+    }
+
     /// The `(Arn, Relationship)` pairs a read reports, sorted.
     async fn association_pairs(&self, target: &str, extra: Value) -> Vec<(String, String)> {
         let (status, body) = self.associated(target, extra).await;
@@ -222,12 +255,6 @@ impl Emulator {
             .collect();
         pairs.sort();
         pairs
-    }
-
-    /// The `EndBillingPeriod` a read reports for one associated resource, and whether
-    /// the association is reported at all.
-    async fn end_billing_period(&self, target: &str, resource: &str) -> Option<Option<String>> {
-        self.in_period(target, resource, json!({})).await
     }
 
     /// Whether a read of `target` for one billing period reports `resource` at all —
@@ -702,13 +729,17 @@ struct RangeRow {
     /// The `BillingPeriodRange` of the ASSOCIATING call, if any.
     associated: Option<Value>,
     /// `InclusiveStartBillingPeriod` of the DISASSOCIATING call.
-    disassociated_from: &'static str,
-    /// The association the read reports afterwards: `None` when it was dropped,
-    /// `Some(end)` with the `EndBillingPeriod` it now carries.
-    left: Option<Option<&'static str>>,
+    disassociated_from: String,
+    /// The billing period the `left` expectation is read for: a read is scoped to ONE
+    /// billing period, so what is left of the association is asked about in a period it
+    /// applied in.
+    left_in: String,
+    /// The association a read of `left_in` reports afterwards: `None` when it was
+    /// dropped, `Some(end)` with the `EndBillingPeriod` it now carries.
+    left: Option<Option<String>>,
     /// Billing periods a read asks for, and whether the association is in effect in
     /// each: each published bound of what is left, and one period past it.
-    probes: &'static [(&'static str, bool)],
+    probes: Vec<(String, bool)>,
 }
 
 /// A disassociation bounded to a billing period range takes effect FROM its inclusive
@@ -716,24 +747,30 @@ struct RangeRow {
 /// is dropped only when it would otherwise cover no period at all.
 #[tokio::test]
 async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
-    let rows: [RangeRow; 7] = [
+    let rows: Vec<RangeRow> = vec![
         RangeRow {
             case: "an association with no range at all",
             associated: None,
-            disassociated_from: "2026-6",
-            left: Some(Some("2026-6")),
-            probes: &[("2026-5", true), ("2026-6", false), ("2026-7", false)],
+            disassociated_from: period(1),
+            left_in: period(0),
+            left: Some(Some(period(1))),
+            probes: vec![
+                (period(0), true),
+                (period(1), false),
+                (period(2), false),
+            ],
         },
         RangeRow {
             case: "an open-ended association ended later",
-            associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-1" })),
-            disassociated_from: "2026-4",
-            left: Some(Some("2026-4")),
-            probes: &[
-                ("2025-12", false),
-                ("2026-1", true),
-                ("2026-3", true),
-                ("2026-4", false),
+            associated: Some(json!({ "InclusiveStartBillingPeriod": period(-6) })),
+            disassociated_from: one_digit_month(&period(-3)),
+            left_in: period(-6),
+            left: Some(Some(one_digit_month(&period(-3)))),
+            probes: vec![
+                (period(-7), false),
+                (period(-6), true),
+                (period(-4), true),
+                (period(-3), false),
             ],
         },
         RangeRow {
@@ -742,30 +779,48 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                 "InclusiveStartBillingPeriod": "2026-1",
                 "ExclusiveEndBillingPeriod": "2026-6",
             })),
-            disassociated_from: "2026-3",
-            left: Some(Some("2026-3")),
-            probes: &[("2026-2", true), ("2026-3", false), ("2026-5", false)],
+            disassociated_from: "2026-3".to_string(),
+            left_in: "2026-2".to_string(),
+            left: Some(Some("2026-3".to_string())),
+            probes: vec![
+                ("2026-2".to_string(), true),
+                ("2026-3".to_string(), false),
+                ("2026-5".to_string(), false),
+            ],
         },
         RangeRow {
             case: "a disassociation in the padded spelling of a month",
             associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-1" })),
-            disassociated_from: "2026-04",
-            left: Some(Some("2026-04")),
-            probes: &[("2026-3", true), ("2026-4", false), ("2026-04", false)],
+            disassociated_from: "2026-04".to_string(),
+            left_in: "2026-1".to_string(),
+            left: Some(Some("2026-04".to_string())),
+            probes: vec![
+                ("2026-3".to_string(), true),
+                ("2026-4".to_string(), false),
+                ("2026-04".to_string(), false),
+            ],
         },
         RangeRow {
             case: "a disassociation at the association's own start",
             associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-4" })),
-            disassociated_from: "2026-4",
+            disassociated_from: "2026-4".to_string(),
+            left_in: "2026-4".to_string(),
             left: None,
-            probes: &[("2026-4", false), ("2026-5", false)],
+            probes: vec![
+                ("2026-4".to_string(), false),
+                ("2026-5".to_string(), false),
+            ],
         },
         RangeRow {
             case: "a disassociation before the association's start",
             associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-5" })),
-            disassociated_from: "2026-2",
+            disassociated_from: "2026-2".to_string(),
+            left_in: "2026-5".to_string(),
             left: None,
-            probes: &[("2026-5", false), ("2026-6", false)],
+            probes: vec![
+                ("2026-5".to_string(), false),
+                ("2026-6".to_string(), false),
+            ],
         },
         RangeRow {
             case: "a disassociation after the association already ends",
@@ -773,9 +828,14 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                 "InclusiveStartBillingPeriod": "2026-1",
                 "ExclusiveEndBillingPeriod": "2026-3",
             })),
-            disassociated_from: "2026-6",
-            left: Some(Some("2026-3")),
-            probes: &[("2026-2", true), ("2026-3", false), ("2026-6", false)],
+            disassociated_from: "2026-6".to_string(),
+            left_in: "2026-2".to_string(),
+            left: Some(Some("2026-3".to_string())),
+            probes: vec![
+                ("2026-2".to_string(), true),
+                ("2026-3".to_string(), false),
+                ("2026-6".to_string(), false),
+            ],
         },
     ];
 
@@ -813,17 +873,29 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                 "case {case:?}: expected the resource reported disassociated, got {body}"
             );
 
-            let end = emulator.end_billing_period(&target, &resource).await;
+            let end = emulator
+                .in_billing_period(&target, &resource, &row.left_in)
+                .await;
             assert_eq!(
-                end,
-                row.left.map(|end| end.map(str::to_string)),
-                "case {case:?}: expected the association left as {:?}, got {end:?}",
-                row.left
+                end, row.left,
+                "case {case:?}: expected a read of {} to report the association left as {:?}, \
+                 got {end:?}",
+                row.left_in, row.left
+            );
+            // `AssociationSize` counts the association RECORDS whatever period each
+            // covers, so it is what says the record was dropped rather than only ended.
+            let size = emulator.association_size(&case, &target).await;
+            assert_eq!(
+                size,
+                i64::from(row.left.is_some()),
+                "case {case:?}: expected the association record to be {}, got AssociationSize \
+                 {size}",
+                if row.left.is_some() { "kept" } else { "dropped" }
             );
 
-            for (period, in_effect) in row.probes {
+            for (billing_period, in_effect) in &row.probes {
                 let reported_back = emulator
-                    .association_pairs(&target, json!({ "BillingPeriod": period }))
+                    .association_pairs(&target, json!({ "BillingPeriod": billing_period }))
                     .await;
                 let arns: Vec<String> = reported_back
                     .iter()
@@ -832,12 +904,26 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                 assert_eq!(
                     arns.contains(&resource),
                     *in_effect,
-                    "case {case:?}: expected the association to be {} in {period}, got {arns:?}",
+                    "case {case:?}: expected the association to be {} in {billing_period}, got \
+                     {arns:?}",
                     if *in_effect { "in effect" } else { "gone" }
                 );
             }
         }
     }
+}
+
+/// One probe of the bounded-range table: the billing period a read asks for, and what
+/// that read must report — `None` for a period it does not report the resource in,
+/// `Some(end)` for one it does, carrying that `EndBillingPeriod`.
+fn probe(
+    billing_period: &str,
+    expected: Option<Option<&str>>,
+) -> (String, Option<Option<String>>) {
+    (
+        billing_period.to_string(),
+        expected.map(|end| end.map(str::to_string)),
+    )
 }
 
 /// One row of the bounded-range table: the billing periods the association was made
@@ -846,18 +932,19 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
 struct BoundedRow {
     case: &'static str,
     /// The `BillingPeriodRange` of the ASSOCIATING call, if any — `None` associates the
-    /// resource in every billing period.
+    /// resource from the billing period that call landed in on.
     associated: Option<Value>,
     /// `InclusiveStartBillingPeriod` of the DISASSOCIATING call.
-    disassociated_from: &'static str,
+    disassociated_from: String,
     /// `ExclusiveEndBillingPeriod` of the DISASSOCIATING call — the bound this table is
     /// about.
-    disassociated_until: &'static str,
-    /// Per billing period: `None` when a read of that period does not report the
-    /// resource at all, `Some(end)` when it does, carrying that `EndBillingPeriod`.
-    probes: &'static [(&'static str, Option<Option<&'static str>>)],
-    /// Is the resource still associated AT ALL, i.e. does a read that names no billing
-    /// period report it?
+    disassociated_until: String,
+    /// Per billing period, what a read of it reports ([`probe`]). Every read is scoped
+    /// to one billing period, so these say where the association is in effect.
+    probes: Vec<(String, Option<Option<String>>)>,
+    /// Are the two association RECORDS still there, i.e. is each resource left in effect
+    /// in some billing period? Asserted through `AssociationSize`, which counts the
+    /// records whatever period each covers.
     left: bool,
 }
 
@@ -868,40 +955,41 @@ struct BoundedRow {
 ///
 /// The rows differ along where the request's window falls relative to the association's
 /// own range — strictly inside it, overlapping either end, covering it, disjoint on
-/// either side — along the association's own bounds (open, open-ended, bounded), along
-/// the width of the window (one period, several, across the turn of a year) and along
-/// the spelling of the months (`2026-4` / `2026-04`), with each row run for a billing
-/// group named by full ARN and a custom line item named by bare id in ONE request.
+/// either side — along the association's own bounds (none of its own, open-ended,
+/// bounded), along the width of the window (one period, several, across the turn of a
+/// year) and along the spelling of the months (`2026-4` / `2026-04`), with each row run
+/// for a billing group named by full ARN and a custom line item named by bare id in ONE
+/// request.
 #[tokio::test]
 async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
-    let rows: [BoundedRow; 11] = [
+    let rows: Vec<BoundedRow> = vec![
         BoundedRow {
-            case: "an open association, a window inside it",
+            case: "an association with no range of its own, a window inside it",
             associated: None,
-            disassociated_from: "2026-1",
-            disassociated_until: "2026-3",
-            probes: &[
-                ("2025-12", Some(Some("2026-1"))),
-                ("2026-1", None),
-                ("2026-2", None),
-                ("2026-3", Some(None)),
-                ("2026-4", Some(None)),
+            disassociated_from: period(1),
+            disassociated_until: period(3),
+            probes: vec![
+                probe(&period(0), Some(Some(&period(1)))),
+                probe(&period(1), None),
+                probe(&period(2), None),
+                probe(&period(3), Some(None)),
+                probe(&period(4), Some(None)),
             ],
             left: true,
         },
         BoundedRow {
             case: "an open-ended association, a window inside it",
             associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-1" })),
-            disassociated_from: "2026-3",
-            disassociated_until: "2026-5",
-            probes: &[
-                ("2025-12", None),
-                ("2026-1", Some(Some("2026-3"))),
-                ("2026-2", Some(Some("2026-3"))),
-                ("2026-3", None),
-                ("2026-4", None),
-                ("2026-5", Some(None)),
-                ("2026-11", Some(None)),
+            disassociated_from: "2026-3".to_string(),
+            disassociated_until: "2026-5".to_string(),
+            probes: vec![
+                probe("2025-12", None),
+                probe("2026-1", Some(Some("2026-3"))),
+                probe("2026-2", Some(Some("2026-3"))),
+                probe("2026-3", None),
+                probe("2026-4", None),
+                probe("2026-5", Some(None)),
+                probe("2026-11", Some(None)),
             ],
             left: true,
         },
@@ -911,15 +999,15 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                 "InclusiveStartBillingPeriod": "2026-1",
                 "ExclusiveEndBillingPeriod": "2026-6",
             })),
-            disassociated_from: "2026-2",
-            disassociated_until: "2026-4",
-            probes: &[
-                ("2026-1", Some(Some("2026-2"))),
-                ("2026-2", None),
-                ("2026-3", None),
-                ("2026-4", Some(Some("2026-6"))),
-                ("2026-5", Some(Some("2026-6"))),
-                ("2026-6", None),
+            disassociated_from: "2026-2".to_string(),
+            disassociated_until: "2026-4".to_string(),
+            probes: vec![
+                probe("2026-1", Some(Some("2026-2"))),
+                probe("2026-2", None),
+                probe("2026-3", None),
+                probe("2026-4", Some(Some("2026-6"))),
+                probe("2026-5", Some(Some("2026-6"))),
+                probe("2026-6", None),
             ],
             left: true,
         },
@@ -929,15 +1017,15 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                 "InclusiveStartBillingPeriod": "2026-3",
                 "ExclusiveEndBillingPeriod": "2026-9",
             })),
-            disassociated_from: "2026-1",
-            disassociated_until: "2026-5",
-            probes: &[
-                ("2026-2", None),
-                ("2026-3", None),
-                ("2026-4", None),
-                ("2026-5", Some(Some("2026-9"))),
-                ("2026-8", Some(Some("2026-9"))),
-                ("2026-9", None),
+            disassociated_from: "2026-1".to_string(),
+            disassociated_until: "2026-5".to_string(),
+            probes: vec![
+                probe("2026-2", None),
+                probe("2026-3", None),
+                probe("2026-4", None),
+                probe("2026-5", Some(Some("2026-9"))),
+                probe("2026-8", Some(Some("2026-9"))),
+                probe("2026-9", None),
             ],
             left: true,
         },
@@ -947,14 +1035,14 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                 "InclusiveStartBillingPeriod": "2026-3",
                 "ExclusiveEndBillingPeriod": "2026-9",
             })),
-            disassociated_from: "2026-7",
-            disassociated_until: "2026-12",
-            probes: &[
-                ("2026-3", Some(Some("2026-7"))),
-                ("2026-6", Some(Some("2026-7"))),
-                ("2026-7", None),
-                ("2026-8", None),
-                ("2026-11", None),
+            disassociated_from: "2026-7".to_string(),
+            disassociated_until: "2026-12".to_string(),
+            probes: vec![
+                probe("2026-3", Some(Some("2026-7"))),
+                probe("2026-6", Some(Some("2026-7"))),
+                probe("2026-7", None),
+                probe("2026-8", None),
+                probe("2026-11", None),
             ],
             left: true,
         },
@@ -964,26 +1052,26 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                 "InclusiveStartBillingPeriod": "2026-3",
                 "ExclusiveEndBillingPeriod": "2026-5",
             })),
-            disassociated_from: "2026-1",
-            disassociated_until: "2026-9",
-            probes: &[
-                ("2026-1", None),
-                ("2026-3", None),
-                ("2026-4", None),
-                ("2026-9", None),
+            disassociated_from: "2026-1".to_string(),
+            disassociated_until: "2026-9".to_string(),
+            probes: vec![
+                probe("2026-1", None),
+                probe("2026-3", None),
+                probe("2026-4", None),
+                probe("2026-9", None),
             ],
             left: false,
         },
         BoundedRow {
             case: "a window entirely before the association",
             associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-5" })),
-            disassociated_from: "2026-1",
-            disassociated_until: "2026-3",
-            probes: &[
-                ("2026-1", None),
-                ("2026-4", None),
-                ("2026-5", Some(None)),
-                ("2026-9", Some(None)),
+            disassociated_from: "2026-1".to_string(),
+            disassociated_until: "2026-3".to_string(),
+            probes: vec![
+                probe("2026-1", None),
+                probe("2026-4", None),
+                probe("2026-5", Some(None)),
+                probe("2026-9", Some(None)),
             ],
             left: true,
         },
@@ -993,54 +1081,56 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                 "InclusiveStartBillingPeriod": "2026-1",
                 "ExclusiveEndBillingPeriod": "2026-3",
             })),
-            disassociated_from: "2026-6",
-            disassociated_until: "2026-8",
-            probes: &[
-                ("2026-1", Some(Some("2026-3"))),
-                ("2026-2", Some(Some("2026-3"))),
-                ("2026-3", None),
-                ("2026-6", None),
+            disassociated_from: "2026-6".to_string(),
+            disassociated_until: "2026-8".to_string(),
+            probes: vec![
+                probe("2026-1", Some(Some("2026-3"))),
+                probe("2026-2", Some(Some("2026-3"))),
+                probe("2026-3", None),
+                probe("2026-6", None),
             ],
             left: true,
         },
         BoundedRow {
             case: "a window in the padded spelling of its months",
             associated: None,
-            disassociated_from: "2026-04",
-            disassociated_until: "2026-06",
-            probes: &[
-                ("2026-3", Some(Some("2026-04"))),
-                ("2026-03", Some(Some("2026-04"))),
-                ("2026-4", None),
-                ("2026-04", None),
-                ("2026-5", None),
-                ("2026-6", Some(None)),
-                ("2026-06", Some(None)),
+            disassociated_from: period(2),
+            disassociated_until: period(4),
+            probes: vec![
+                probe(&period(1), Some(Some(&period(2)))),
+                probe(&one_digit_month(&period(1)), Some(Some(&period(2)))),
+                probe(&period(2), None),
+                probe(&one_digit_month(&period(2)), None),
+                probe(&period(3), None),
+                probe(&period(4), Some(None)),
+                probe(&one_digit_month(&period(4)), Some(None)),
             ],
             left: true,
         },
         BoundedRow {
             case: "a window of one billing period",
             associated: None,
-            disassociated_from: "2026-5",
-            disassociated_until: "2026-6",
-            probes: &[
-                ("2026-4", Some(Some("2026-5"))),
-                ("2026-5", None),
-                ("2026-6", Some(None)),
+            disassociated_from: period(2),
+            disassociated_until: period(3),
+            probes: vec![
+                probe(&period(1), Some(Some(&period(2)))),
+                probe(&period(2), None),
+                probe(&period(3), Some(None)),
             ],
             left: true,
         },
         BoundedRow {
+            // The association names its own start here, so the window can sit on the
+            // turn of a year whatever month the clock is in.
             case: "a window across the turn of the year",
-            associated: None,
-            disassociated_from: "2025-12",
-            disassociated_until: "2026-2",
-            probes: &[
-                ("2025-11", Some(Some("2025-12"))),
-                ("2025-12", None),
-                ("2026-1", None),
-                ("2026-2", Some(None)),
+            associated: Some(json!({ "InclusiveStartBillingPeriod": "2025-11" })),
+            disassociated_from: "2025-12".to_string(),
+            disassociated_until: "2026-2".to_string(),
+            probes: vec![
+                probe("2025-11", Some(Some("2025-12"))),
+                probe("2025-12", None),
+                probe("2026-1", None),
+                probe("2026-2", Some(None)),
             ],
             left: true,
         },
@@ -1085,36 +1175,62 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
             );
 
             for resource in [&group, &child] {
-                let whole = emulator.end_billing_period(&target, resource).await;
-                assert_eq!(
-                    whole.is_some(),
-                    row.left,
-                    "case {case:?} ({resource}): expected the association to be {} after the \
-                     bounded disassociation, got {whole:?}",
-                    if row.left { "left" } else { "dropped" }
-                );
-
-                for (period, expected) in row.probes {
+                for (billing_period, expected) in &row.probes {
                     let reported_back = emulator
-                        .in_billing_period(&target, resource, period)
+                        .in_billing_period(&target, resource, billing_period)
                         .await;
                     assert_eq!(
-                        reported_back,
-                        expected.map(|end| end.map(str::to_string)),
-                        "case {case:?} ({resource}) in {period}: expected {expected:?}, got \
-                         {reported_back:?}"
+                        &reported_back, expected,
+                        "case {case:?} ({resource}) in {billing_period}: expected \
+                         {expected:?}, got {reported_back:?}"
                     );
                 }
             }
+            // `AssociationSize` counts the association RECORDS whatever period each
+            // covers, so it is what says a record was dropped rather than only ended in
+            // some periods.
+            let size = emulator.association_size(&case, &target).await;
+            assert_eq!(
+                size,
+                if row.left { 2 } else { 0 },
+                "case {case:?}: expected the two association records to be {}, got \
+                 AssociationSize {size}",
+                if row.left { "kept" } else { "dropped" }
+            );
         }
     }
 }
 
-/// The `BillingPeriod` a month index names, in the form the modelled pattern admits
-/// (`^\d{4}-(0?[1-9]|1[012])$`): consecutive indices are consecutive months, so a
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows: consecutive offsets are consecutive months, so a
 /// window `[period(k), period(k + 1))` is exactly one billing period.
-fn period(month_index: usize) -> String {
-    format!("{}-{}", 2000 + month_index / 12, month_index % 12 + 1)
+///
+/// An association made with no `BillingPeriodRange` of its own is in effect from the
+/// billing period the associating call landed in, which the wall clock decides, so the
+/// periods of such a case are named relative to the current period rather than by a
+/// fixed month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
 }
 
 /// Each bounded disassociation can carve one more separate stretch of billing periods
@@ -1131,18 +1247,20 @@ async fn the_separate_ranges_of_one_association_are_bounded() {
     let home = emulator.billing_group("home").await;
     let target = emulator.percentage_item(&home, "target").await;
     let resource = home.clone();
-    // Open-ended, so it starts as ONE stretch of billing periods.
+    // No range of its own, so it starts as ONE stretch of billing periods: every period
+    // from the current one on.
     emulator
         .associate(&target, std::slice::from_ref(&resource), None)
         .await;
 
-    // Every other month is removed, so each call punches a hole strictly inside a
-    // stretch the association already has and splits it in two: the call made while the
-    // association is in effect over `n` stretches would leave it in `n + 1`, so the one
-    // that would take it past `MAX_RANGES` is refused.
+    // Every other month from the one after the current period is removed, so each call
+    // punches a hole strictly inside a stretch the association already has and splits it
+    // in two: the call made while the association is in effect over `n` stretches would
+    // leave it in `n + 1`, so the one that would take it past `MAX_RANGES` is refused.
     for hole in 0..MAX_RANGES {
-        let start = period(hole * 2);
-        let end = period(hole * 2 + 1);
+        let offset = i64::try_from(hole).expect("a stretch index fits in i64");
+        let start = period(1 + offset * 2);
+        let end = period(2 + offset * 2);
         let at_limit = hole + 2 > MAX_RANGES;
         let case = format!("hole {hole} ({start}..{end})");
         let (status, body) = emulator

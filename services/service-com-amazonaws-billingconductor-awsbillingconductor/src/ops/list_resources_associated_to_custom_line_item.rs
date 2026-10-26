@@ -3,8 +3,9 @@
 //! @op ListResourcesAssociatedToCustomLineItem
 //! REPORTS the resources associated to a custom line item, as
 //! `CreateCustomLineItem`'s `AssociatedValues` and
-//! `BatchAssociateResourcesToCustomLineItem` persisted them. A pure read: it writes
-//! nothing.
+//! `BatchAssociateResourcesToCustomLineItem` persisted them, for ONE billing period —
+//! the one the request names, or the current one when it names none. A pure read: it
+//! writes nothing.
 //!
 //! `Relationship` is DERIVED from the resource the association names (see
 //! `crate::state::association_relationship`) and `EndBillingPeriod` from the billing
@@ -197,16 +198,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filters
             .as_ref()
             .and_then(|filters| filters.relationship.clone());
+        // "The billing period for which the resource associations will be listed": this
+        // read is scoped to ONE billing period, and the period-scoped reads of this
+        // service fall back to the current one when the request names none ("If you
+        // don't provide a billing period, the current billing period is used"), so the
+        // default read reports the associations in effect right now. The modelled
+        // `@pattern` on the member is enforced before this handler runs.
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
         let mut selected: Vec<(String, ListResourcesAssociatedToCustomLineItemResponseElement)> =
             Vec::new();
         for association in &item.associated_resources {
-            // "The billing period for which the resource associations will be
-            // listed": an association is listed for a period its range covers, the
-            // start inclusive and the end exclusive.
-            if let Some(billing_period) = &input.billing_period {
-                if !association.covers(billing_period) {
-                    continue;
-                }
+            // An association is listed for a period its range covers, the start
+            // inclusive and the end exclusive.
+            if !association.covers(&billing_period) {
+                continue;
             }
             // The filter names "the types of resource associations that should be
             // retrieved", so an association of another relationship is left out.
@@ -221,9 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: Some(association.arn.clone()),
                     relationship: Some(association.relationship().to_string()),
                     // "The end billing period of the custom line item association" —
-                    // of the period the request asks about, when it names one.
-                    end_billing_period: association
-                        .end_billing_period(input.billing_period.as_deref()),
+                    // of the period the read is scoped to.
+                    end_billing_period: association.end_billing_period(&billing_period),
                 },
             ));
         }
