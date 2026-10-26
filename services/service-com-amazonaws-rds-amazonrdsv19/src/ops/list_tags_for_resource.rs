@@ -98,7 +98,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-rds-amazonrdsv19.json")
 
 // The operation's MODELED errors, widened with the not-found faults of the other
 // resource families whose ARNs `ResourceName` accepts — for the reason
-// `AddTagsToResource` widens the same eight in: an ARN naming a resource that does not
+// `AddTagsToResource` widens the same families in: an ARN naming a resource that does not
 // exist is that family's own not-found fault, and this operation's `errors` list names
 // only some of the families it resolves. Every one is a shape THIS SERVICE models.
 #[smithy_macros::operation_error(
@@ -108,6 +108,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-rds-amazonrdsv19.json")
         "DBClusterParameterGroupNotFoundFault",
         "DBClusterSnapshotNotFoundFault",
         "DBParameterGroupNotFoundFault",
+        "DBSecurityGroupNotFoundFault",
         "DBSubnetGroupNotFoundFault",
         "GlobalClusterNotFoundFault",
         "OptionGroupNotFoundFault",
@@ -127,6 +128,7 @@ pub enum ListTagsForResourceErrorModeled {
     DBProxyEndpointNotFoundFault(DBProxyEndpointNotFoundFault),
     DBProxyNotFoundFault(DBProxyNotFoundFault),
     DBProxyTargetGroupNotFoundFault(DBProxyTargetGroupNotFoundFault),
+    DBSecurityGroupNotFoundFault(DBSecurityGroupNotFoundFault),
     DBShardGroupNotFoundFault(DBShardGroupNotFoundFault),
     DBSnapshotNotFoundFault(DBSnapshotNotFoundFault),
     DBSnapshotTenantDatabaseNotFoundFault(DBSnapshotTenantDatabaseNotFoundFault),

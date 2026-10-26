@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a new DB security group in this service's store
+//! and answers from the stored record. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled `DBSecurityGroup` wire shape live
+//! in [`crate::state`], shared with `DescribeDBSecurityGroups` and with the tag
+//! operations that resolve the group's ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBSecurityGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBSecurityGroupError::validation)?;
+        // "This value is stored as a lowercase string" — so the name is folded before it
+        // is validated, stored or echoed, and every later lookup folds the same way.
+        let name = input.db_security_group_name.to_ascii_lowercase();
+        // "Must be 1 to 255 letters, numbers, or hyphens. First character must be a
+        // letter. Can't end with a hyphen or contain two consecutive hyphens" — the rule
+        // the identifier members of this service share, at this member's own length bound.
+        crate::state::check_identifier("DBSecurityGroupName", &name, MAX_NAME_LEN)
+            .map_err(CreateDBSecurityGroupError::invalid_parameter_value)?;
+        if name == RESERVED_NAME {
+            return Err(CreateDBSecurityGroupError::invalid_parameter_value(format!(
+                "DBSecurityGroupName must not be {RESERVED_NAME}: that name is reserved for \
+                 the account's own default DB security group"
+            )));
+        }
+        // Nothing caller-sized reaches the store unchecked: the description is
+        // length-bounded and the tag list is count- and length-bounded (see the
+        // store-bounds paragraph in `src/state.rs`).
+        crate::state::check_free_form(
+            "DBSecurityGroupDescription",
+            &input.db_security_group_description,
+        )
+        .map_err(CreateDBSecurityGroupError::validation)?;
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(CreateDBSecurityGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope, so
+        // one name can be a different DB security group in each region.
+        let key = (region.clone(), name.clone());
+        if store.db_security_groups.contains_key(&key) {
+            return Err(
+                CreateDBSecurityGroupErrorModeled::DBSecurityGroupAlreadyExistsFault(
+                    DBSecurityGroupAlreadyExistsFault {
+                        message: Some(format!("DB Security Group already exists: {name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's DB security group quota, and the number of regions this store keeps
+        // records for at all: the store cannot be grown without bound, and the modelled
+        // fault says exactly this.
+        if store.db_security_groups_in(&region).len()
+            >= crate::state::DB_SECURITY_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateDBSecurityGroupErrorModeled::DBSecurityGroupQuotaExceededFault(
+                    DBSecurityGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of DB security groups \
+                             ({} per region, in at most {} regions)",
+                            crate::state::DB_SECURITY_GROUP_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::DbSecurityGroupRecord {
+            name,
+            region,
+            description: input.db_security_group_description,
+            // A group is created holding no ingress rule: a rule exists only once one is
+            // authorized on the group, which is its own operation.
+            ip_ranges: Vec::new(),
+            ec2_security_groups: Vec::new(),
+            tags,
+        };
+        let db_security_group = record.to_wire();
+        store.db_security_groups.insert(key, record);
+
+        Ok(CreateDBSecurityGroupOutput {
+            db_security_group: Some(db_security_group),
+        })
     }
 }
+
+/// The longest `DBSecurityGroupName` this operation accepts, as its member documents
+/// ("Must be 1 to 255 letters, numbers, or hyphens").
+const MAX_NAME_LEN: usize = 255;
+
+/// The name `DBSecurityGroupName` refuses ("Must not be `Default`"), compared after the
+/// value is folded the way that member documents it is stored. Amazon RDS keeps the name
+/// for the account's own default DB security group, so a request naming it is refused
+/// rather than shadowing that group.
+const RESERVED_NAME: &str = "default";

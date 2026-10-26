@@ -190,15 +190,6 @@ const MANUAL_SNAPSHOT: &str = "manual";
 /// operation enforces a total, so the published allowance is what is reported.
 const TOTAL_ALLOCATED_STORAGE_GIB: i64 = 100_000;
 
-/// How many DB security groups one account may hold: Amazon RDS's published default
-/// quota ("DB security groups": 25), which covers EC2-Classic only. This service stores
-/// no DB security group, so nothing is used toward it.
-const DB_SECURITY_GROUP_QUOTA: i64 = 25;
-
-/// How many ingress rules ONE DB security group may hold: Amazon RDS's published default
-/// quota ("Authorizations per DB security group": 20).
-const AUTHORIZATIONS_PER_DB_SECURITY_GROUP_QUOTA: i64 = 20;
-
 /// How many custom endpoints ONE DB cluster may hold: Amazon Aurora's published default
 /// quota ("Custom endpoints per DB cluster": 5).
 const CUSTOM_ENDPOINTS_PER_DB_CLUSTER_QUOTA: i64 = 5;
@@ -231,7 +222,7 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
     // number of ingress rules in a DB security group in the account."
     Quota {
         name: "AuthorizationsPerDBSecurityGroup",
-        max: AUTHORIZATIONS_PER_DB_SECURITY_GROUP_QUOTA,
+        max: crate::state::MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP as i64,
         used: db_security_group_ingress_used,
     },
     // "The number of custom endpoints per DB cluster. The used value is the highest
@@ -286,7 +277,7 @@ const ACCOUNT_QUOTAS: &[Quota] = &[
     // the default security group."
     Quota {
         name: "DBSecurityGroups",
-        max: DB_SECURITY_GROUP_QUOTA,
+        max: crate::state::DB_SECURITY_GROUP_QUOTA_PER_REGION as i64,
         used: db_security_groups_used,
     },
     // "The number of DB subnet groups per account."
@@ -360,17 +351,23 @@ fn allocated_storage_used(store: &Store, region: &str) -> i64 {
         .sum()
 }
 
-/// The ingress rules of the fullest DB security group. No implemented operation creates
-/// a DB security group (they are EC2-Classic, which RDS retired), so the region holds
-/// none and none of them holds a rule.
-fn db_security_group_ingress_used(_store: &Store, _region: &str) -> i64 {
-    0
+/// The ingress rules of the fullest DB security group, read off the stored groups
+/// themselves so this count cannot disagree with `DescribeDBSecurityGroups`. A region
+/// holding no group holds no rule either.
+fn db_security_group_ingress_used(store: &Store, region: &str) -> i64 {
+    count(
+        store
+            .db_security_groups_in(region)
+            .into_iter()
+            .map(|record| record.authorization_count())
+            .max()
+            .unwrap_or(0),
+    )
 }
 
-/// The DB security groups the region holds — none, for the reason
-/// [`db_security_group_ingress_used`] gives.
-fn db_security_groups_used(_store: &Store, _region: &str) -> i64 {
-    0
+/// The DB security groups the region holds — the ones `CreateDBSecurityGroup` stored.
+fn db_security_groups_used(store: &Store, region: &str) -> i64 {
+    count(store.db_security_groups_in(region).len())
 }
 
 /// The custom endpoints of the DB cluster that has the most of them, read off the

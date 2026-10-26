@@ -67,7 +67,8 @@ struct FamilyCase {
 /// decides which store holds the tags and which ARN resource type addresses it — a DB
 /// instance (`db`), a DB cluster (`cluster`), a DB snapshot (`snapshot`), both parameter
 /// group namespaces (`pg` and `cluster-pg`, different resources of the same name), an
-/// option group (`og`), a DB subnet group (`subgrp`), an event subscription (`es`) and an
+/// option group (`og`), a DB subnet group (`subgrp`), a DB security group (`secgrp`), an
+/// event subscription (`es`) and an
 /// account-scoped global cluster (`global-cluster`), whose ARN carries no region at all.
 /// The snapshot row also differs in that its resource is derived from another row's.
 const FAMILIES: &[FamilyCase] = &[
@@ -154,6 +155,17 @@ const FAMILIES: &[FamilyCase] = &[
         arn_element: "DBSubnetGroupArn",
         absent_arn: "arn:aws:rds:us-west-2:000000000000:subgrp:no-such-group",
         not_found_code: "DBSubnetGroupNotFoundFault",
+    },
+    FamilyCase {
+        case: "DB security group",
+        action: "CreateDBSecurityGroup",
+        params: &[
+            ("DBSecurityGroupName", "tagged-secgrp"),
+            ("DBSecurityGroupDescription", "a group under test"),
+        ],
+        arn_element: "DBSecurityGroupArn",
+        absent_arn: "arn:aws:rds:us-west-2:000000000000:secgrp:no-such-group",
+        not_found_code: "DBSecurityGroupNotFound",
     },
     FamilyCase {
         case: "event subscription",
@@ -558,10 +570,6 @@ async fn a_resource_name_this_service_could_not_hold_is_a_bad_parameter_value() 
         (
             "a reserved DB instance, a type this service stores none of",
             "arn:aws:rds:us-west-2:000000000000:ri:reserved-1",
-        ),
-        (
-            "a DB security group, a type this service stores none of",
-            "arn:aws:rds:us-west-2:000000000000:secgrp:default",
         ),
     ];
 

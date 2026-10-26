@@ -43,6 +43,8 @@ pub enum TaggedKind {
     OptionGroup,
     /// `subgrp` — a DB subnet group.
     DbSubnetGroup,
+    /// `secgrp` — a DB security group.
+    DbSecurityGroup,
     /// `es` — an event subscription.
     EventSubscription,
     /// `global-cluster` — an Aurora global database cluster.
@@ -74,6 +76,7 @@ impl TaggedKind {
             "cluster-pg" => Self::DbClusterParameterGroup,
             "og" => Self::OptionGroup,
             "subgrp" => Self::DbSubnetGroup,
+            "secgrp" => Self::DbSecurityGroup,
             "es" => Self::EventSubscription,
             "global-cluster" => Self::GlobalCluster,
             "shard-group" => Self::DbShardGroup,
@@ -92,9 +95,10 @@ impl TaggedKind {
 /// this store keeps records of. Reference data for a reader of this module — it is not put
 /// in a client-visible message, which carries AWS's own wording instead.
 pub const TAGGABLE_ARN_RESOURCE_TYPES: &str = "db, cluster, snapshot, cluster-snapshot, pg, \
-                                               cluster-pg, og, subgrp, es, global-cluster, \
-                                               shard-group, blue-green-deployment, integration, \
-                                               db-proxy, tenant-database, cev";
+                                               cluster-pg, og, subgrp, secgrp, es, \
+                                               global-cluster, shard-group, \
+                                               blue-green-deployment, integration, db-proxy, \
+                                               tenant-database, cev";
 
 /// The stored resource a `ResourceName` resolved to: which family it belongs to, and its
 /// key within that family's store.
@@ -313,6 +317,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                     record.arn()
                 })
             }
+            TaggedKind::DbSecurityGroup => {
+                key_in(&self.db_security_groups, region, resource_name, |record| {
+                    record.arn()
+                })
+            }
             TaggedKind::EventSubscription => {
                 key_in(&self.event_subscriptions, region, resource_name, |record| {
                     record.arn()
@@ -387,6 +396,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 .map(|r| &r.tags),
             TaggedKind::OptionGroup => self.option_groups.get(&target.key).map(|r| &r.tags),
             TaggedKind::DbSubnetGroup => self.db_subnet_groups.get(&target.key).map(|r| &r.tags),
+            TaggedKind::DbSecurityGroup => {
+                self.db_security_groups.get(&target.key).map(|r| &r.tags)
+            }
             TaggedKind::EventSubscription => {
                 self.event_subscriptions.get(&target.key).map(|r| &r.tags)
             }
@@ -427,6 +439,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             TaggedKind::OptionGroup => self.option_groups.get_mut(&target.key).map(|r| &mut r.tags),
             TaggedKind::DbSubnetGroup => self
                 .db_subnet_groups
+                .get_mut(&target.key)
+                .map(|r| &mut r.tags),
+            TaggedKind::DbSecurityGroup => self
+                .db_security_groups
                 .get_mut(&target.key)
                 .map(|r| &mut r.tags),
             TaggedKind::EventSubscription => self
@@ -474,6 +490,7 @@ fn not_found_message(kind: TaggedKind, identifier: &str) -> String {
         }
         TaggedKind::OptionGroup => format!("Specified OptionGroupName: {identifier} not found."),
         TaggedKind::DbSubnetGroup => super::db_subnet_group_not_found_message(identifier),
+        TaggedKind::DbSecurityGroup => super::db_security_group_not_found_message(identifier),
         TaggedKind::EventSubscription => format!("Event Subscription {identifier} not found."),
         TaggedKind::GlobalCluster => format!("Global cluster '{identifier}' not found"),
         TaggedKind::DbShardGroup => format!("DBShardGroup {identifier} not found."),
@@ -530,6 +547,9 @@ macro_rules! tag_target_refusal {
                     ),
                     TaggedKind::DbSubnetGroup => $modeled::DBSubnetGroupNotFoundFault(
                         $crate::ops::types::DBSubnetGroupNotFoundFault { message },
+                    ),
+                    TaggedKind::DbSecurityGroup => $modeled::DBSecurityGroupNotFoundFault(
+                        $crate::ops::types::DBSecurityGroupNotFoundFault { message },
                     ),
                     TaggedKind::EventSubscription => $modeled::SubscriptionNotFoundFault(
                         $crate::ops::types::SubscriptionNotFoundFault { message },

@@ -22,7 +22,8 @@
 //! `DeleteDBParameterGroup`,
 //! `CreateEventSubscription`,
 //! `DescribeEventSubscriptions`, `AddSourceIdentifierToSubscription`,
-//! `CreateGlobalCluster` and `DescribeGlobalClusters` all
+//! `CreateGlobalCluster`, `DescribeGlobalClusters`,
+//! `CreateDBSecurityGroup` and `DescribeDBSecurityGroups` all
 //! project the same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
@@ -53,6 +54,9 @@
 //! [`MAX_PARAMETERS_PER_GROUP`] parameters of at most [`MAX_FREE_FORM_LEN`] characters and
 //! the same bounded tag list, at most
 //! `MAX_REGIONS * CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION` custom engine versions,
+//! at most `MAX_REGIONS * DB_SECURITY_GROUP_QUOTA_PER_REGION` DB security groups — each
+//! carrying at most [`MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP`] ingress rules and the
+//! same bounded tag list —
 //! and at most one CA certificate override per region,
 //! whatever sequence of requests arrives, and every
 //! per-request scan reads one region's ordered range rather than the whole map.
@@ -65,10 +69,10 @@ use crate::ops::types::{
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
     DBClusterSnapshotAttributesResult, DBInstance, DBParameterGroup, DBParameterGroupStatus,
-    DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
-    DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
-    GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
-    PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
+    DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
+    DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
+    GlobalCluster, GlobalClusterMember, IPRange, Option2, OptionGroup, OptionGroupMembership,
+    OptionSetting, Parameter, PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
     ServerlessV2ScalingConfigurationInfo, SourceNotFoundFault, Subnet, Tag,
     VpcSecurityGroupMembership,
 };
@@ -286,6 +290,21 @@ pub const DB_SUBNET_GROUP_QUOTA_PER_REGION: usize = 50;
 /// `DBSubnetQuotaExceededFault` — "The request would result in the user exceeding the
 /// allowed number of subnets in a DB subnet groups".
 pub const MAX_SUBNETS_PER_DB_SUBNET_GROUP: usize = 20;
+
+/// How many DB security groups one region may hold: Amazon RDS's published default quota
+/// ("DB security groups": 25), the one `DescribeAccountAttributes` reports as
+/// `DBSecurityGroups`. Reaching it is the modelled `DBSecurityGroupQuotaExceededFault` —
+/// "The request would result in the user exceeding the allowed number of DB security
+/// groups". AWS counts that allowance per account and Region; this store is keyed by
+/// region, so it is enforced per region.
+pub const DB_SECURITY_GROUP_QUOTA_PER_REGION: usize = 25;
+
+/// How many ingress rules ONE DB security group may hold: Amazon RDS's published default
+/// quota ("Authorizations per DB security group": 20), the one
+/// `DescribeAccountAttributes` reports as `AuthorizationsPerDBSecurityGroup`. It bounds
+/// the two ingress lists a stored group carries together, so one group's rules are capped
+/// whichever form they take.
+pub const MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP: usize = 20;
 
 /// How many event notification subscriptions one region may hold: Amazon RDS's published
 /// default quota ("Event subscriptions": 20 per Region). Reaching it is the modelled
@@ -1011,6 +1030,16 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// against, so a name no group was created under is a not-found rather than a
     /// silently accepted reference.
     pub db_subnet_groups: BTreeMap<RegionalKey, DbSubnetGroupRecord>,
+    /// DB security groups by `(region, DBSecurityGroupName)` — the name always stored
+    /// lowercased, as `CreateDBSecurityGroup$DBSecurityGroupName` documents ("This value
+    /// is stored as a lowercase string"). Ordered, so `DescribeDBSecurityGroups` pages
+    /// deterministically within a region.
+    ///
+    /// `CreateDBSecurityGroup` inserts here — bounded by
+    /// [`DB_SECURITY_GROUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`] regions,
+    /// each group carrying at most [`MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP`] ingress
+    /// rules — and `DescribeDBSecurityGroups` reports what is here.
+    pub db_security_groups: BTreeMap<RegionalKey, DbSecurityGroupRecord>,
     /// Blue/green deployments by `(region, BlueGreenDeploymentIdentifier)` — the
     /// identifier being the one this service MINTED, so a caller cannot choose a key.
     /// Ordered, so `DescribeBlueGreenDeployments` pages deterministically within a region.
@@ -1680,6 +1709,26 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_subnet_groups, region)
     }
 
+    /// The DB security groups stored in `region`, in name order.
+    pub fn db_security_groups_in(&self, region: &str) -> Vec<&DbSecurityGroupRecord> {
+        range_in(&self.db_security_groups, region)
+    }
+
+    /// The DB security group `name` resolves to in `region`, or `None` when nothing of
+    /// that name is stored there.
+    ///
+    /// `DBSecurityGroupName` "is stored as a lowercase string", so a lookup folds the
+    /// name the same way the create that stored it did and one spelling cannot hide a
+    /// group another spelling created.
+    pub fn resolve_db_security_group(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> Option<&DbSecurityGroupRecord> {
+        self.db_security_groups
+            .get(&(region.to_string(), name.to_ascii_lowercase()))
+    }
+
     /// The blue/green deployments stored in `region`, in identifier order.
     pub fn blue_green_deployments_in(&self, region: &str) -> Vec<&BlueGreenDeploymentRecord> {
         range_in(&self.blue_green_deployments, region)
@@ -1852,6 +1901,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
+            .chain(self.db_security_groups.keys())
             .chain(self.db_shard_groups.keys())
             .chain(self.blue_green_deployments.keys())
             .chain(self.integrations.keys())
@@ -3659,6 +3709,87 @@ impl DbSubnetGroupRecord {
             // `VpcId` and `SupportedNetworkTypes` are read off the subnets too, for the
             // same reason.
             ..DBSubnetGroup::default()
+        }
+    }
+}
+
+/// The message a `DBSecurityGroupNotFoundFault` carries for `name`: the fault reports
+/// "`DBSecurityGroupName` doesn't refer to an existing DB security group", naming the
+/// group the request could not resolve in the folded spelling it would be stored under.
+///
+/// It lives here rather than in one handler because every operation that resolves a
+/// `DBSecurityGroupName` answers the same one fault, and the wording is what a caller
+/// reads to tell which group was missing.
+pub fn db_security_group_not_found_message(name: &str) -> String {
+    format!("DBSecurityGroup not found: {name}")
+}
+
+/// A stored DB security group: the name and description a create gave it, and the ingress
+/// rules authorized on it.
+///
+/// `CreateDBSecurityGroup` inserts the record and `DescribeDBSecurityGroups` reports it,
+/// both through [`Self::to_wire`], so one group reads the same way whichever call reports
+/// it. The ARN is computed from the stored region and name, like the other records', so it
+/// cannot drift from the record.
+#[derive(Debug, Clone, Default)]
+pub struct DbSecurityGroupRecord {
+    /// `DBSecurityGroupName`, folded to lowercase — the record's key within its region.
+    pub name: String,
+    /// The region the group was created in; the scope of its ARN.
+    pub region: String,
+    /// `DBSecurityGroupDescription`.
+    pub description: String,
+    /// The CIDR ranges authorized on the group, in the order they were authorized.
+    ///
+    /// Written by the operations that authorize and revoke a CIDR rule, which are still
+    /// scaffolded in this crate (each its own stub issue); a group a create just stored
+    /// holds none, and [`Self::to_wire`] reports exactly what is here rather than a canned
+    /// list.
+    pub ip_ranges: Vec<IPRange>,
+    /// The EC2 security groups authorized on the group, in the order they were
+    /// authorized — written by the same operations as [`Self::ip_ranges`].
+    pub ec2_security_groups: Vec<EC2SecurityGroup>,
+    /// The tags the group carries: the ones its create assigned, plus whatever the tag
+    /// operations have written since.
+    pub tags: Vec<Tag>,
+}
+
+impl DbSecurityGroupRecord {
+    /// `arn:aws:rds:<region>:<account>:secgrp:<name>` — `secgrp` is the resource type RDS
+    /// gives a DB security group in its ARN format.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("secgrp:{}", self.name),
+        )
+    }
+
+    /// How many ingress rules the group holds: both forms an authorization can take count
+    /// toward the one published allowance,
+    /// [`MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP`].
+    pub fn authorization_count(&self) -> usize {
+        self.ip_ranges.len() + self.ec2_security_groups.len()
+    }
+
+    /// Project the stored record onto the modelled `DBSecurityGroup` output shape.
+    pub fn to_wire(&self) -> DBSecurityGroup {
+        DBSecurityGroup {
+            // "Provides the Amazon Web Services ID of the owner of a specific DB security
+            // group" — the account every resource of this emulator belongs to.
+            owner_id: Some(emulator_server::emulator_account_id().to_string()),
+            db_security_group_name: Some(self.name.clone()),
+            db_security_group_description: Some(self.description.clone()),
+            // The VPC a DB security group belongs to is an EC2 fact this service does not
+            // hold, so it is reported ABSENT rather than carrying a made-up VPC id a
+            // caller that placed an instance by VPC would be misled by.
+            vpc_id: None,
+            // Both rule lists are reported even when empty: a group really holds no
+            // ingress rule until one is authorized, which is a different statement from
+            // "this service does not know its rules".
+            ec2_security_groups: Some(self.ec2_security_groups.clone()),
+            ip_ranges: Some(self.ip_ranges.clone()),
+            db_security_group_arn: Some(self.arn()),
         }
     }
 }
