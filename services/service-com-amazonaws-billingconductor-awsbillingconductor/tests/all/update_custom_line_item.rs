@@ -6,13 +6,14 @@
 //! RULE: `UpdateCustomLineItem` REPLACES, on the stored custom line item its `Arn`
 //! names (in either form the `CustomLineItemArn` pattern admits), exactly the
 //! attributes the request carries — `Name`, `Description`, the charge value of the
-//! item's own charge kind, the charge details' `LineItemFilters`, and the
-//! billing-period range the updated item applies in — keeps every attribute the
-//! request omits, advances `LastModifiedTime`, and reports the item as stored; it
-//! refuses an `Arn` that names no stored item with 404 `ResourceNotFoundException`,
-//! and charge details naming both kinds or the kind the item is not, or a
-//! billing-period range that covers no period, with 400 `ValidationException` while
-//! leaving the stored item untouched.
+//! item's own charge kind and the charge details' `LineItemFilters` — keeps every
+//! attribute the request omits, advances `LastModifiedTime`, and reports the item as
+//! stored. The values it leaves apply in the billing periods its `BillingPeriodRange`
+//! names, as a new VERSION of the item, so every period before the one the update is
+//! applied from still reports the version the item had there. It refuses an `Arn` that
+//! names no stored item with 404 `ResourceNotFoundException`, and charge details naming
+//! both kinds or the kind the item is not, or a billing-period range that covers no
+//! period, with 400 `ValidationException` while leaving the stored item untouched.
 //!
 //! The rows span what the rule generalises over rather than one recorded call: which
 //! members the request sets (each alone, in combination, and none at all), the charge
@@ -603,14 +604,29 @@ async fn charge_details_naming_both_kinds_or_the_wrong_one_are_refused_and_chang
     }
 }
 
-/// The billing-period range the request names is the range the updated item applies
-/// in: a read of a period inside it reports the item with its new values, and a read
-/// outside it reports no such item. A range that covers no billing period at all is
-/// refused and changes nothing.
+/// One row of the billing-period table: the case, the range the update names, the
+/// periods that must report the updated version, the periods that must still report the
+/// version the item had, and the periods that must report no item at all.
+type RangeRow = (
+    &'static str,
+    Value,
+    Vec<&'static str>,
+    Vec<&'static str>,
+    Vec<&'static str>,
+);
+
+/// The billing-period range the request names is the range the NEW version of the item
+/// applies in: a read of a period inside it reports the item with its new values, a read
+/// of a period BEFORE the one the update is applied from still reports the version the
+/// item had there, and a read of a period the update's own range ends before reports no
+/// item at all. A range that covers no billing period at all is refused and changes
+/// nothing.
 #[tokio::test]
 async fn the_billing_period_range_decides_which_periods_report_the_updated_item() {
-    // (case, the range, the periods that must report the item, the periods that must not)
-    let rows: Vec<(&str, Value, Vec<&str>, Vec<&str>)> = vec![
+    // (case, the range, the periods that must report the updated version, the periods
+    // that must still report the version the item had, the periods that must report no
+    // item at all)
+    let rows: Vec<RangeRow> = vec![
         (
             "a half-open range of three months",
             json!({
@@ -618,13 +634,15 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
                 "ExclusiveEndBillingPeriod": "2026-08",
             }),
             vec!["2026-05", "2026-5", "2026-06", "2026-07"],
-            vec!["2026-04", "2026-08", "2027-01"],
+            vec!["2026-04", "2025-12", "2019-01"],
+            vec!["2026-08", "2027-01"],
         ),
         (
             "an open-ended range",
             json!({ "InclusiveStartBillingPeriod": "2026-10" }),
             vec!["2026-10", "2026-11", "2030-12"],
             vec!["2026-09", "2025-10"],
+            vec![],
         ),
         (
             "a one-month range",
@@ -633,11 +651,12 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
                 "ExclusiveEndBillingPeriod": "2026-2",
             }),
             vec!["2026-1", "2026-01"],
-            vec!["2025-12", "2026-02"],
+            vec!["2025-12", "2019-07"],
+            vec!["2026-02"],
         ),
     ];
 
-    for (case, range, inside, outside) in rows {
+    for (case, range, updated, kept, absent) in rows {
         let (emulator, _group, item) = fixture("ranged", json!({})).await;
         emulator
             .update_ok(
@@ -647,7 +666,7 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
             )
             .await;
 
-        for period in inside {
+        for period in updated {
             let read = emulator
                 .read_back(case, &item, Some(period))
                 .await
@@ -660,7 +679,23 @@ async fn the_billing_period_range_decides_which_periods_report_the_updated_item(
                 "case {case:?}: expected the updated Name for {period}, got {read}"
             );
         }
-        for period in outside {
+        for period in kept {
+            let read = emulator
+                .read_back(case, &item, Some(period))
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the pre-update version to still be reported for \
+                         {period}"
+                    )
+                });
+            assert_eq!(
+                read.get("Name").and_then(Value::as_str),
+                Some("ranged"),
+                "case {case:?}: expected the Name the item had for {period}, got {read}"
+            );
+        }
+        for period in absent {
             let read = emulator.read_back(case, &item, Some(period)).await;
             assert!(
                 read.is_none(),

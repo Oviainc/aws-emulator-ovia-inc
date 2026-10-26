@@ -6,9 +6,13 @@
 //!
 //! It REPLACES, on the stored custom line item the `Arn` names, exactly the attributes
 //! the request carries — `Name`, `Description`, the charge value of the item's own
-//! charge kind, the charge details' `LineItemFilters`, and the billing-period range the
-//! update is to apply in — keeps every attribute the request omits, advances
-//! `LastModifiedTime`, and reports the item as it now stands.
+//! charge kind and the charge details' `LineItemFilters` — keeps every attribute the
+//! request omits, advances `LastModifiedTime`, and reports the item as it now stands.
+//!
+//! The values it leaves take effect in the billing periods the request's
+//! `BillingPeriodRange` names, as a new VERSION of the item: every billing period before
+//! the one the update is applied from keeps the version the item had there, which is
+//! what a read of such a period — and `ListCustomLineItemVersions` — reports.
 //!
 //! ## Shape of an operation
 //!
@@ -201,13 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated = merge(stored, &input)?;
         let output = render(&updated);
-        // One state method writes the item and keeps the generations
-        // `ListCustomLineItemVersions` reports: an update that takes effect in a new
-        // billing period opens a new version of the item and freezes the one it
-        // replaces, and an update inside the current version's billing period replaces
-        // that version.
+        // One state method writes the item and keeps the generations a read of an
+        // earlier billing period reports: the update takes over the billing period it is
+        // applied from and every later one, so the generation it replaces is frozen
+        // holding exactly the periods before that — and an update that names no billing
+        // period range takes over wherever the item applies, so it replaces the current
+        // generation outright.
+        let takes_effect_from = input
+            .billing_period_range
+            .as_ref()
+            .map(|range| range.inclusive_start_billing_period.clone());
         let now = updated.last_modified_time_millis;
-        state.put_custom_line_item(updated, now);
+        state.put_custom_line_item(updated, now, takes_effect_from.as_deref());
 
         // The audit record for a state-changing call: who asked, what it addressed and
         // that it succeeded. Never a `@sensitive` member — the item's name and its
@@ -298,15 +307,16 @@ fn merge(
     }
 
     // "The billing period range in which the custom line item request will be
-    // applied": the periods the updated item is in effect for. The start is inclusive
-    // and the end exclusive, so an end at or before the start would cover no billing
-    // period at all.
+    // applied": the periods the version this update leaves is in effect for. The start
+    // is inclusive and the end exclusive, so an end at or before the start would cover
+    // no billing period at all.
     //
-    // AWS keeps one VERSION of the item per billing period it is in effect in, readable
-    // through `ListCustomLineItemVersions`: the range the request names becomes the
-    // range the item — with the values this update leaves on it — applies in, and the
-    // generation it replaces is kept as a version (see
-    // [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
+    // One VERSION of the item applies per billing period, readable through
+    // `ListCustomLineItemVersions`: the range the request names is the stretch the
+    // version this update leaves applies in, and the version it takes those periods
+    // from keeps the periods before them (see
+    // [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]),
+    // so a read of an earlier period still reports the item as it stood there.
     if let Some(range) = input.billing_period_range.as_ref() {
         if !crate::state::billing_period_range_is_ordered(range) {
             return Err(validation(
