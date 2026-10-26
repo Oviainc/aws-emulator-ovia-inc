@@ -6,16 +6,21 @@
 //! service registered — so routing, deserialization, the handler and serialization are
 //! all exercised.
 //!
-//! The rule these cases pin: `CreateTenantResourceAssociation` resolves the request's
-//! `TenantName` against the account's tenants BEFORE it writes anything — a name the
-//! account does not hold is refused with the modelled terminal 404 and stores nothing —
-//! and an accepted call records the association, so `ListResourceTenants` for that
-//! `ResourceArn` reports the tenant it was made for, with the tenant's own id and the
-//! instant it was associated. The tables below span what the rule generalises over: the
-//! kind of resource the ARN names, the region it carries, the form of the tenant name,
-//! how many tenants share one resource and how many resources one tenant holds, the
-//! order associations are made in, the page size a listing asks for, and each refusal
-//! leg.
+//! The rule these cases pin: `CreateTenantResourceAssociation` reads the request's
+//! `ResourceArn` against the resource kinds a tenant can hold and resolves its
+//! `TenantName` against the account's tenants BEFORE it writes anything — an ARN
+//! naming no such resource is refused as malformed input, a name the account does not
+//! hold is refused with the modelled terminal 404, and neither stores anything — and
+//! an accepted call records the association, so both views of the one record agree:
+//! `ListResourceTenants` for that `ResourceArn` reports the tenant it was made for,
+//! with the tenant's own id and the instant it was associated, and
+//! `ListTenantResources` for that `TenantName` reports the resource, under the
+//! `ResourceType` its ARN names. The tables below span what the rule generalises
+//! over: the kind of resource the ARN names, the partition, region, account and
+//! separator it carries, the form of the tenant name, how many tenants share one
+//! resource and how many resources one tenant holds, the order associations are made
+//! in, the resource type a listing filters on, the page size a listing asks for, and
+//! each refusal leg.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -111,6 +116,39 @@ impl Reply {
             .and_then(Value::as_str)
             .map(str::to_string)
     }
+
+    /// The `TenantResources` rows a listing reported, in the order reported.
+    fn tenant_resources(&self) -> Vec<Value> {
+        self.body
+            .get("TenantResources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The `ResourceArn` of every reported resource, in the order reported.
+    fn listed_resources(&self) -> Vec<String> {
+        self.tenant_resources()
+            .iter()
+            .map(|row| {
+                row.get("ResourceArn")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The `ResourceType` the listing reported for `resource_arn`, or `""` when it
+    /// reported no such resource.
+    fn listed_resource_type(&self, resource_arn: &str) -> String {
+        self.tenant_resources()
+            .iter()
+            .find(|row| row.get("ResourceArn").and_then(Value::as_str) == Some(resource_arn))
+            .and_then(|row| row.get("ResourceType").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 /// The emulated service behind its router.
@@ -194,6 +232,20 @@ impl Ses {
 
     async fn list_resource_tenants_page(&self, body: Value) -> Reply {
         self.call("/v2/email/resources/tenants/list", "us-east-1", body)
+            .await
+    }
+
+    async fn list_tenant_resources(&self, tenant_name: &str) -> Reply {
+        self.call(
+            "/v2/email/tenants/resources/list",
+            "us-east-1",
+            json!({"TenantName": tenant_name}),
+        )
+        .await
+    }
+
+    async fn list_tenant_resources_page(&self, body: Value) -> Reply {
+        self.call("/v2/email/tenants/resources/list", "us-east-1", body)
             .await
     }
 }
@@ -885,4 +937,646 @@ async fn the_association_table_stops_growing_at_its_ceiling() {
         repeated.error_code(),
         repeated.body
     );
+}
+
+/// What the association surface admits as a `ResourceArn`, and the modelled
+/// `ResourceType` an admitted one is reported as.
+struct ResourceArnCase {
+    /// What this row varies, named in every assertion.
+    case: &'static str,
+    /// The `ResourceArn` the association is asked for.
+    resource_arn: String,
+    /// The `ResourceType` the resource is listed as, or `None` when the ARN names no
+    /// resource a tenant can hold and the association is refused.
+    resource_type: Option<&'static str>,
+}
+
+/// The fixed sentence SES refuses a `ResourceArn` naming no resource a tenant can
+/// hold with. It carries no part of the request: the refusal is about the form of the
+/// value.
+const NOT_AN_SES_RESOURCE: &str = "Provided ARN is not in SES resource ARN format";
+
+/// The resource-ARN table.
+///
+/// The admitted kinds are the three `ResourceType` values the model names
+/// (`smithy_query(query="shape",shape="ResourceType")`: `EMAIL_IDENTITY`,
+/// `CONFIGURATION_SET` and `EMAIL_TEMPLATE`), each written as the ARN SES addresses
+/// that kind with, and spanning what varies between two ARNs of one kind — the
+/// partition, the Region, the account, the separator before the resource id, and the
+/// id itself. Every other row names something a tenant cannot hold: another vendor's
+/// resource, an SES resource of another kind, an ARN naming no resource at all, and a
+/// value that is no ARN.
+fn resource_arn_cases() -> Vec<ResourceArnCase> {
+    vec![
+        ResourceArnCase {
+            case: "a configuration set",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/nightly"),
+            resource_type: Some("CONFIGURATION_SET"),
+        },
+        ResourceArnCase {
+            case: "an email identity that is an address",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:identity/sender@example.com"),
+            resource_type: Some("EMAIL_IDENTITY"),
+        },
+        ResourceArnCase {
+            case: "an email identity that is a domain, in another Region",
+            resource_arn: format!("arn:aws:ses:eu-west-1:{ACCOUNT_ID}:identity/example.com"),
+            resource_type: Some("EMAIL_IDENTITY"),
+        },
+        ResourceArnCase {
+            case: "an email template",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/welcome"),
+            resource_type: Some("EMAIL_TEMPLATE"),
+        },
+        ResourceArnCase {
+            case: "an email template in another partition, under another account",
+            resource_arn: "arn:aws-us-gov:ses:us-gov-west-1:111122223333:template/welcome"
+                .to_string(),
+            resource_type: Some("EMAIL_TEMPLATE"),
+        },
+        ResourceArnCase {
+            // AWS writes a resource field in either form, `<type>/<id>` and
+            // `<type>:<id>`, so both name the same kind of resource.
+            case: "a configuration set whose id follows a colon",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set:colon"),
+            resource_type: Some("CONFIGURATION_SET"),
+        },
+        ResourceArnCase {
+            case: "another vendor's resource",
+            resource_arn: format!("arn:aws:sns:us-east-1:{ACCOUNT_ID}:alerts-topic"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an SES resource of a kind a tenant cannot hold",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:dedicated-ip-pool/pool-1"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an SES contact list",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:contact-list/news"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an SES tenant",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:tenant/other/t-1"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "a kind whose name only starts like an admitted one",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:identity-pool/example.com"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an admitted kind naming no resource",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an admitted kind whose id is empty",
+            resource_arn: format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "a vendor field in another case",
+            resource_arn: format!("arn:aws:SES:us-east-1:{ACCOUNT_ID}:configuration-set/nightly"),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "an ARN missing a field",
+            resource_arn: "arn:aws:ses:us-east-1:configuration-set/nightly".to_string(),
+            resource_type: None,
+        },
+        ResourceArnCase {
+            case: "the resource name alone",
+            resource_arn: "nightly".to_string(),
+            resource_type: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn only_an_arn_naming_a_resource_a_tenant_can_hold_is_associated() {
+    let ses = Ses::new();
+    let created = ses.create_tenant("holder").await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+        "holder", created.status, created.body
+    );
+
+    for case in resource_arn_cases() {
+        let reply = ses.associate("holder", &case.resource_arn).await;
+        let listed = ses.list_tenant_resources("holder").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {:?}: expected HTTP 200 from ListTenantResources, got {} {:?}",
+            case.case, listed.status, listed.body
+        );
+
+        match case.resource_type {
+            Some(resource_type) => {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {:?}: expected HTTP 200 from CreateTenantResourceAssociation, \
+                     got {} {:?}",
+                    case.case, reply.status, reply.body
+                );
+                // The tenant's own view reports the resource, under the kind its ARN
+                // names.
+                assert!(
+                    listed.listed_resources().contains(&case.resource_arn),
+                    "case {:?}: the tenant must report the resource it now holds, got {:?}",
+                    case.case,
+                    listed.body
+                );
+                assert_eq!(
+                    listed.listed_resource_type(&case.resource_arn),
+                    resource_type,
+                    "case {:?}: expected the resource to be listed as {resource_type}, got {:?}",
+                    case.case,
+                    listed.body
+                );
+                // And the resource's own view reports the tenant: the two views are
+                // two readings of one record, so they agree.
+                let tenants = ses.list_resource_tenants(&case.resource_arn).await;
+                assert_eq!(
+                    tenants.listed_tenants(),
+                    vec!["holder".to_string()],
+                    "case {:?}: the resource must report the tenant holding it, got {:?}",
+                    case.case,
+                    tenants.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    reply.status, 400,
+                    "case {:?}: expected HTTP 400 from CreateTenantResourceAssociation, \
+                     got {} {:?}",
+                    case.case, reply.status, reply.body
+                );
+                assert_eq!(
+                    reply.error_code(),
+                    "BadRequestException",
+                    "case {:?}: expected BadRequestException, got {:?} {:?}",
+                    case.case,
+                    reply.error_code(),
+                    reply.body
+                );
+                assert_eq!(
+                    reply.message(),
+                    NOT_AN_SES_RESOURCE,
+                    "case {:?}: expected the refusal to read {NOT_AN_SES_RESOURCE:?}, got {:?}",
+                    case.case,
+                    reply.message()
+                );
+                // The refusal stored nothing: neither view knows the resource.
+                assert!(
+                    !listed.listed_resources().contains(&case.resource_arn),
+                    "case {:?}: a refused association must store nothing, got {:?}",
+                    case.case,
+                    listed.body
+                );
+                let tenants = ses.list_resource_tenants(&case.resource_arn).await;
+                assert!(
+                    tenants.resource_tenants().is_empty(),
+                    "case {:?}: a refused association leaves the resource with no tenants, \
+                     got {:?}",
+                    case.case,
+                    tenants.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tenants_resources_are_reported_in_arn_order_and_narrowed_by_resource_type() {
+    let ses = Ses::new();
+    let created = ses.create_tenant("mixed").await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+        "mixed", created.status, created.body
+    );
+    // One resource of each admitted kind, plus a second of one kind, associated in an
+    // order that is not the ARN order.
+    let admitted: Vec<(&str, String)> = vec![
+        (
+            "EMAIL_TEMPLATE",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/welcome"),
+        ),
+        (
+            "CONFIGURATION_SET",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/nightly"),
+        ),
+        (
+            "EMAIL_IDENTITY",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:identity/example.com"),
+        ),
+        (
+            "CONFIGURATION_SET",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/alerts"),
+        ),
+    ];
+    for (kind, arn) in &admitted {
+        let associated = ses.associate("mixed", arn).await;
+        assert_eq!(
+            associated.status, 200,
+            "case {kind:?}: expected HTTP 200 from CreateTenantResourceAssociation, got {} {:?}",
+            associated.status, associated.body
+        );
+    }
+
+    let mut every_arn: Vec<String> = admitted.iter().map(|(_, arn)| arn.clone()).collect();
+    every_arn.sort();
+    let listed = ses.list_tenant_resources("mixed").await;
+    assert_eq!(
+        listed.listed_resources(),
+        every_arn,
+        "case {:?}: the tenant reports every resource it holds, in ARN order, got {:?}",
+        "an unfiltered listing",
+        listed.body
+    );
+
+    // Reading does not change what a later caller sees.
+    let again = ses.list_tenant_resources("mixed").await;
+    assert_eq!(
+        again.tenant_resources(),
+        listed.tenant_resources(),
+        "case {:?}: two reads of one tenant's resources must agree, got {:?} then {:?}",
+        "an unfiltered listing",
+        listed.body,
+        again.body
+    );
+
+    // `RESOURCE_TYPE` is the one filter key the model names, and a filtered listing
+    // reports exactly the resources of that kind. The fourth row is a kind the tenant
+    // holds nothing of, so the filter is what empties the page.
+    for (case, filter_value) in [
+        ("every configuration set", "CONFIGURATION_SET"),
+        ("every email identity", "EMAIL_IDENTITY"),
+        ("every email template", "EMAIL_TEMPLATE"),
+    ] {
+        let filtered = ses
+            .list_tenant_resources_page(json!({
+                "TenantName": "mixed",
+                "Filter": {"RESOURCE_TYPE": filter_value}
+            }))
+            .await;
+        assert_eq!(
+            filtered.status, 200,
+            "case {case:?}: expected HTTP 200 from ListTenantResources, got {} {:?}",
+            filtered.status, filtered.body
+        );
+        let mut expected: Vec<String> = admitted
+            .iter()
+            .filter(|(kind, _)| *kind == filter_value)
+            .map(|(_, arn)| arn.clone())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            filtered.listed_resources(),
+            expected,
+            "case {case:?}: a filtered listing reports only resources of that kind, got {:?}",
+            filtered.body
+        );
+    }
+
+    // A tenant holding nothing of the filtered kind reports an empty page rather than
+    // the rows it does hold.
+    let created = ses.create_tenant("templates-only").await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+        "templates-only", created.status, created.body
+    );
+    let associated = ses
+        .associate(
+            "templates-only",
+            &format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/receipt"),
+        )
+        .await;
+    assert_eq!(
+        associated.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenantResourceAssociation, got {} {:?}",
+        "templates-only", associated.status, associated.body
+    );
+    let filtered = ses
+        .list_tenant_resources_page(json!({
+            "TenantName": "templates-only",
+            "Filter": {"RESOURCE_TYPE": "EMAIL_IDENTITY"}
+        }))
+        .await;
+    assert!(
+        filtered.tenant_resources().is_empty(),
+        "case {:?}: a tenant holding no resource of that kind reports none, got {:?}",
+        "a kind the tenant holds nothing of",
+        filtered.body
+    );
+    // And each tenant reports only its own resources.
+    let listed = ses.list_tenant_resources("templates-only").await;
+    assert_eq!(
+        listed.listed_resources(),
+        vec![format!(
+            "arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/receipt"
+        )],
+        "case {:?}: a tenant reports only the resources associated with it, got {:?}",
+        "two tenants",
+        listed.body
+    );
+}
+
+#[tokio::test]
+async fn a_walk_of_a_tenants_resources_reports_each_one_exactly_once() {
+    // The pagination rule spans the row count and the page size independently, exactly
+    // as the resource's own listing does.
+    for (case, stored, page_size) in [
+        ("nothing associated, no page size", 0usize, None),
+        ("nothing associated, page size 1", 0, Some(1)),
+        ("one resource, page size 1", 1, Some(1)),
+        ("one resource, no page size", 1, None),
+        ("two resources, page size 1", 2, Some(1)),
+        ("seven resources, page size 1", 7, Some(1)),
+        ("seven resources, page size 7", 7, Some(7)),
+        ("seven resources, page size 3", 7, Some(3)),
+        ("seven resources, page size 100", 7, Some(100)),
+        ("seven resources, no page size", 7, None),
+        // A non-positive page size cannot truncate, or a walk would never advance.
+        ("seven resources, page size 0", 7, Some(0)),
+    ] {
+        let ses = Ses::new();
+        let created = ses.create_tenant("walker").await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+            created.status, created.body
+        );
+        let mut expected = Vec::new();
+        for index in 0..stored {
+            let arn =
+                format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/set-{index:02}");
+            let associated = ses.associate("walker", &arn).await;
+            assert_eq!(
+                associated.status, 200,
+                "case {case:?}: expected HTTP 200 from CreateTenantResourceAssociation, \
+                 got {} {:?}",
+                associated.status, associated.body
+            );
+            expected.push(arn);
+        }
+        expected.sort();
+
+        let mut walked = Vec::new();
+        let mut token: Option<String> = None;
+        // A walk may not outlive its rows: one request per row plus one for the final
+        // page is the most any page size can need.
+        let budget = stored + 2;
+        for request in 0..=budget {
+            assert!(
+                request < budget,
+                "case {case:?}: the walk did not terminate within {budget} requests, \
+                 got {walked:?}"
+            );
+            let mut body = json!({"TenantName": "walker"});
+            if let Some(size) = page_size {
+                body["PageSize"] = json!(size);
+            }
+            if let Some(resume) = &token {
+                body["NextToken"] = json!(resume);
+            }
+            let page = ses.list_tenant_resources_page(body).await;
+            assert_eq!(
+                page.status, 200,
+                "case {case:?}: expected HTTP 200 from ListTenantResources, got {} {:?}",
+                page.status, page.body
+            );
+            if let Some(size) = page_size.filter(|size| *size > 0) {
+                assert!(
+                    page.tenant_resources().len() <= size,
+                    "case {case:?}: a page may not exceed the page size, got {:?}",
+                    page.body
+                );
+            }
+            walked.extend(page.listed_resources());
+            token = page.next_token();
+            if token.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            walked, expected,
+            "case {case:?}: the walk must report every associated resource exactly once, \
+             in ARN order, got {walked:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tenants_resource_listing_refuses_what_it_cannot_read() {
+    let ses = Ses::new();
+    let created = ses.create_tenant("reader").await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+        "reader", created.status, created.body
+    );
+    let resource_arn = format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/nightly");
+    let associated = ses.associate("reader", &resource_arn).await;
+    assert_eq!(
+        associated.status, 200,
+        "case {:?}: expected HTTP 200 from CreateTenantResourceAssociation, got {} {:?}",
+        "reader", associated.status, associated.body
+    );
+
+    // A tenant the account does not hold is reported missing rather than answered with
+    // an empty page, in the words the association surface uses for that tenant.
+    for (case, name) in [
+        ("a tenant nothing ever created", "never-created".to_string()),
+        ("the same name in another case", "Reader".to_string()),
+        (
+            "a name at the documented bound that was never created",
+            "z".repeat(MAX_TENANT_NAME_CHARS),
+        ),
+    ] {
+        let refused = ses.list_tenant_resources(&name).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404 from ListTenantResources, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {:?} {:?}",
+            refused.error_code(),
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            format!("The requested tenant <{name}> does not exist."),
+            "case {case:?}: the refusal must name the tenant it did not find, got {:?}",
+            refused.message()
+        );
+    }
+
+    // A name no tenant could carry is malformed input, not a missing tenant.
+    for (case, name) in [
+        (
+            "one character past the documented bound",
+            "x".repeat(MAX_TENANT_NAME_CHARS + 1),
+        ),
+        ("a dot", "dot.name".to_string()),
+        ("a space", "has space".to_string()),
+    ] {
+        let refused = ses.list_tenant_resources(&name).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 from ListTenantResources, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?} {:?}",
+            refused.error_code(),
+            refused.body
+        );
+    }
+
+    // The filter is read, not ignored: a key the enum does not name, a value outside
+    // `ResourceType`, and a token this listing never issued are each refused.
+    for (case, body) in [
+        (
+            "a filter key the model does not name",
+            json!({"TenantName": "reader", "Filter": {"RESOURCE_ARN": "nightly"}}),
+        ),
+        (
+            "a RESOURCE_TYPE value outside the enum",
+            json!({"TenantName": "reader", "Filter": {"RESOURCE_TYPE": "CONTACT_LIST"}}),
+        ),
+        (
+            "a RESOURCE_TYPE value in another case",
+            json!({"TenantName": "reader", "Filter": {"RESOURCE_TYPE": "configuration_set"}}),
+        ),
+        (
+            "a token that is not base64 at all",
+            json!({"TenantName": "reader", "NextToken": "not-a-token"}),
+        ),
+        (
+            "a token another listing of this service issued",
+            json!({
+                "TenantName": "reader",
+                "NextToken": service_com_amazonaws_sesv2_simpleemailservice_v2::state::encode_tagged_page_token(
+                    service_com_amazonaws_sesv2_simpleemailservice_v2::state::RESOURCE_TENANTS_PAGE_TOKEN_TAG,
+                    &resource_arn,
+                )
+            }),
+        ),
+    ] {
+        let refused = ses.list_tenant_resources_page(body).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 from ListTenantResources, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?} {:?}",
+            refused.error_code(),
+            refused.body
+        );
+    }
+
+    // This listing's own token is accepted, and resumes after the row it names.
+    let resumed = ses
+        .list_tenant_resources_page(json!({
+            "TenantName": "reader",
+            "NextToken": service_com_amazonaws_sesv2_simpleemailservice_v2::state::encode_tagged_page_token(
+                service_com_amazonaws_sesv2_simpleemailservice_v2::state::TENANT_RESOURCES_PAGE_TOKEN_TAG,
+                &resource_arn,
+            )
+        }))
+        .await;
+    assert_eq!(
+        resumed.status, 200,
+        "case {:?}: expected HTTP 200 from ListTenantResources, got {} {:?}",
+        "this listing's own token", resumed.status, resumed.body
+    );
+    assert!(
+        resumed.tenant_resources().is_empty(),
+        "case {:?}: resuming after the last row reports nothing more, got {:?}",
+        "this listing's own token",
+        resumed.body
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_association_is_refused_in_the_sentence_ses_words_it_with() {
+    let ses = Ses::new();
+    // One row per admitted resource kind, so the sentence is pinned over the class and
+    // not over one resource.
+    for (case, tenant_name, resource_arn) in [
+        (
+            "a configuration set",
+            "repeat-cfg",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:configuration-set/nightly"),
+        ),
+        (
+            "an email identity",
+            "repeat_identity",
+            format!("arn:aws:ses:eu-west-1:{ACCOUNT_ID}:identity/sender@example.com"),
+        ),
+        (
+            "an email template",
+            "r",
+            format!("arn:aws:ses:us-east-1:{ACCOUNT_ID}:template/welcome"),
+        ),
+    ] {
+        let created = ses.create_tenant(tenant_name).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateTenant, got {} {:?}",
+            created.status, created.body
+        );
+        let first = ses.associate(tenant_name, &resource_arn).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: expected HTTP 200 from the first association, got {} {:?}",
+            first.status, first.body
+        );
+        let again = ses.associate(tenant_name, &resource_arn).await;
+        assert_eq!(
+            again.error_code(),
+            "AlreadyExistsException",
+            "case {case:?}: expected AlreadyExistsException, got {:?} {:?}",
+            again.error_code(),
+            again.body
+        );
+        assert_eq!(
+            again.message(),
+            format!(
+                "Resources {resource_arn} has already been associated with tenant {tenant_name}"
+            ),
+            "case {case:?}: the refusal must name the resource and the tenant as SES does, \
+             got {:?}",
+            again.message()
+        );
+        // The repeat stored no second row in either view.
+        let listed = ses.list_tenant_resources(tenant_name).await;
+        assert_eq!(
+            listed.listed_resources(),
+            vec![resource_arn.clone()],
+            "case {case:?}: a refused repeat leaves exactly one row, got {:?}",
+            listed.body
+        );
+        let tenants = ses.list_resource_tenants(&resource_arn).await;
+        assert_eq!(
+            tenants.listed_tenants(),
+            vec![tenant_name.to_string()],
+            "case {case:?}: and the resource still reports exactly one tenant, got {:?}",
+            tenants.body
+        );
+    }
 }

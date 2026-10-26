@@ -390,10 +390,63 @@ pub fn requested_tenant_not_found(tenant_name: &str) -> String {
 
 /// How this service words `AlreadyExistsException` for a resource already associated
 /// with the named tenant, stated once for every operation that creates an
-/// association.
+/// association. The resource ARN and the tenant name are the only variable parts,
+/// both taken from the request.
 pub fn tenant_resource_association_exists(tenant_name: &str, resource_arn: &str) -> String {
-    format!("The resource <{resource_arn}> is already associated with tenant <{tenant_name}>.")
+    format!("Resources {resource_arn} has already been associated with tenant {tenant_name}")
 }
+
+/// The resource kinds a tenant association may name, as (the resource-type token the
+/// resource's own SES ARN carries, the modelled `ResourceType` value that kind is
+/// reported as).
+///
+/// `ResourceType` binds exactly these three values —
+/// `smithy_query(query="shape",shape="ResourceType")`: `EMAIL_IDENTITY` ("an email
+/// address or domain that you use to send email"), `CONFIGURATION_SET` ("a set of
+/// rules that you can apply to emails you send") and `EMAIL_TEMPLATE` ("a template
+/// that defines the content of an email message") — and SES addresses each of them
+/// with `identity/<identity>`, `configuration-set/<name>` and `template/<name>` in
+/// the resource field of its ARN.
+pub const TENANT_RESOURCE_TYPES: [(&str, &str); 3] = [
+    ("identity", "EMAIL_IDENTITY"),
+    ("configuration-set", "CONFIGURATION_SET"),
+    ("template", "EMAIL_TEMPLATE"),
+];
+
+/// The modelled `ResourceType` the ARN `resource_arn` names, or `None` when it names
+/// no kind of resource a tenant may hold.
+///
+/// `CreateTenantResourceAssociation` documents that "resources can be email
+/// identities, configuration sets, or email templates", so a value naming anything
+/// else — another vendor's resource, an SES resource of another kind, or no ARN at
+/// all — addresses nothing this surface can associate. The ARN's six fields come
+/// from the shared caller-supplied-ARN parse, and the id must be present: a bare
+/// type names no resource.
+pub fn tenant_resource_type(resource_arn: &str) -> Option<&'static str> {
+    let arn = ::service_common::arn::parse_of(resource_arn, ARN_NAMESPACE)?;
+    TENANT_RESOURCE_TYPES
+        .iter()
+        .find(|(token, _)| {
+            arn.resource_type() == *token
+                && ::service_common::arn::resource_id_of_type(resource_arn, token)
+                    .is_some_and(|id| !id.is_empty())
+        })
+        .map(|(_, resource_type)| *resource_type)
+}
+
+/// How the tenant-resource association surface words `BadRequestException` for a
+/// `ResourceArn` naming no resource kind a tenant may hold.
+///
+/// The sentence is fixed text with no variable part: the refusal is about the FORM of
+/// the value — SES reads the ARN against the resource-ARN forms it addresses, and a
+/// value matching none of them (another vendor's resource, an SES resource of a kind
+/// a tenant cannot hold, or no ARN at all) names nothing it can associate.
+pub const UNSUPPORTED_TENANT_RESOURCE: &str = "Provided ARN is not in SES resource ARN format";
+
+/// The keys `ListTenantResourcesFilterKey` names: "currently, the only supported
+/// filter key is RESOURCE_TYPE". The filter arrives as a map of plain strings, so
+/// the handler is what refuses a key the enum does not name.
+pub const LIST_TENANT_RESOURCES_FILTER_KEYS: [&str; 1] = ["RESOURCE_TYPE"];
 
 /// Configuration sets the account may hold: SES's documented quota is 10,000
 /// configuration sets per account per Region, and `CreateConfigurationSet` refuses
@@ -432,7 +485,8 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// the `TenantName` it is associated with: one resource may be associated with
     /// several tenants and one tenant with several resources, so the pair is the
     /// identity of an association. Ordered, so `ListResourceTenants` enumerates and
-    /// pages one resource's tenants deterministically.
+    /// pages one resource's tenants, and `ListTenantResources` one tenant's
+    /// resources, deterministically.
     pub tenant_resource_associations: BTreeMap<(String, String), TenantResourceAssociationRecord>,
     /// Contact lists, keyed by the `ContactListName` they were created with — an
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
@@ -1401,6 +1455,17 @@ impl TenantResourceAssociationRecord {
             tenant_id: Some(self.tenant_id.clone()),
             resource_arn: Some(self.resource_arn.clone()),
             associated_timestamp: Some(::aws_smithy_types::DateTime::from(self.associated_at)),
+        }
+    }
+
+    /// The modelled `TenantResource` view of this association, as
+    /// `ListTenantResources` reports it: the resource's ARN and the `ResourceType`
+    /// that ARN names, which is read off the ARN rather than stored beside it so one
+    /// record cannot disagree with itself about what it points at.
+    pub fn tenant_resource_view(&self) -> crate::ops::types::TenantResource {
+        crate::ops::types::TenantResource {
+            resource_type: tenant_resource_type(&self.resource_arn).map(ToString::to_string),
+            resource_arn: Some(self.resource_arn.clone()),
         }
     }
 }
@@ -2393,6 +2458,9 @@ pub const REPUTATION_ENTITIES_PAGE_TOKEN_TAG: &str = "sesv2:reputation-entities:
 
 /// The tag `ListResourceTenants`'s own tokens carry.
 pub const RESOURCE_TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:resource-tenants:";
+
+/// The tag `ListTenantResources`'s own tokens carry.
+pub const TENANT_RESOURCES_PAGE_TOKEN_TAG: &str = "sesv2:tenant-resources:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

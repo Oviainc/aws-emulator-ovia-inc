@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTenantResourceAssociation
-//! Associates the resource the request names with the tenant it names: the tenant is
-//! resolved against the tenant store first, and the association is recorded so the
-//! resource's own listing reports it. This is the ONLY file to touch for this operation.
+//! Associates the resource the request names with the tenant it names: the ARN is read
+//! against the resource kinds a tenant can hold and the tenant is resolved against the
+//! tenant store first, and the association is recorded so both the resource's own
+//! listing and the tenant's report it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +164,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::invalid_tenant_name(&tenant_name)),
+                },
+            )
+            .into());
+        }
+
+        // "Resources can be email identities, configuration sets, or email templates":
+        // the kind of resource a tenant may hold is fixed, so a `ResourceArn` naming
+        // anything else addresses nothing this surface can associate and is refused on
+        // the input — before any lookup and before any write — with the
+        // `BadRequestException` the model binds for "the input you provided is invalid".
+        if crate::state::tenant_resource_type(&resource_arn).is_none() {
+            return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::UNSUPPORTED_TENANT_RESOURCE.to_string()),
                 },
             )
             .into());

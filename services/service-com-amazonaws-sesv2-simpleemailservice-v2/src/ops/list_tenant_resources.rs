@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTenantResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTenantResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTenantResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources associated with the tenant the request names — the
+//! associations `CreateTenantResourceAssociation` stored, read back under the tenant
+//! instead of under the resource — narrowed by the resource type the request's filter
+//! names and paged by its own token. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTenantResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTenantResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTenantResources"))
+        // The listing is identified by the tenant the request names, so no request
+        // metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTenantResources without the shared emulator state",
+            ));
+        };
+
+        let tenant_name = input.tenant_name;
+        // The model binds only `length 1..` on `TenantName`; the documented form is the
+        // handler's to enforce, so a name no tenant could carry is refused as malformed
+        // rather than reported missing — the same check every operation taking a
+        // `TenantName` applies.
+        if !crate::state::tenant_name_is_well_formed(&tenant_name) {
+            return Err(bad_request(crate::state::invalid_tenant_name(&tenant_name)));
+        }
+
+        // "You can optionally filter the results by resource type": the filter arrives
+        // as a map of plain strings, so the key and the value are both read here, and a
+        // key the enum does not name is a bad request rather than a filter that quietly
+        // does nothing. Read in key order, so a filter naming several unmodelled keys is
+        // refused the same way every time.
+        let mut filter: Vec<(String, String)> = input.filter.unwrap_or_default().into_iter().collect();
+        filter.sort();
+        let mut resource_type = None;
+        for (key, value) in filter {
+            let key = crate::state::modelled_enum_value(
+                "Filter key",
+                key,
+                &crate::state::LIST_TENANT_RESOURCES_FILTER_KEYS,
+            )
+            .map_err(bad_request)?;
+            match key.as_str() {
+                // The only key the check above leaves. Named rather than taken as a
+                // fallthrough, so a key added to the enum without a branch here is a
+                // compile-time-visible gap instead of a silent resource-type filter.
+                "RESOURCE_TYPE" => {
+                    resource_type = Some(
+                        crate::state::modelled_enum_value(
+                            "RESOURCE_TYPE filter value",
+                            value,
+                            RESOURCE_TYPE_VALUES,
+                        )
+                        .map_err(bad_request)?,
+                    );
+                }
+                other => {
+                    return Err(bad_request(format!(
+                        "Filter key {other} is not one of {}.",
+                        crate::state::LIST_TENANT_RESOURCES_FILTER_KEYS.join(", ")
+                    )));
+                }
+            }
+        }
+
+        // "The number of results to show in a single call": `PageSize` targets
+        // `MaxItems`, on which the model puts no bound, so only a positive count
+        // truncates a page; a non-positive one is read as no truncation, which keeps a
+        // caller that sends 0 from being stuck on an empty page forever. The same
+        // reading as this service's other listings.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last resource the previous
+        // page reported, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::TENANT_RESOURCES_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
+        let store = state.lock();
+        // Resolution comes before the listing: a tenant the account does not hold is
+        // reported missing rather than answered with an empty page, which is what tells
+        // a client "no such tenant" from "that tenant holds nothing".
+        if !store.tenants.contains_key(&tenant_name) {
+            return Err(ListTenantResourcesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
+                },
+            )
+            .into());
+        }
+
+        // The association table is keyed by the resource ARN and then the tenant name,
+        // so one tenant's associations come out in resource-ARN order: a page is a
+        // window over that order and the resume point is a position in it, which keeps a
+        // token valid even if the resource it names has since been disassociated. The
+        // filter narrows the sequence a page is a window over, so a token is a position
+        // in the NARROWED listing.
+        let associated: Vec<TenantResource> = store
+            .tenant_resource_associations
+            .values()
+            .filter(|record| record.tenant_name == tenant_name)
+            .map(crate::state::TenantResourceAssociationRecord::tenant_resource_view)
+            .filter(|resource| {
+                resource_type
+                    .as_deref()
+                    .is_none_or(|wanted| resource.resource_type.as_deref() == Some(wanted))
+            })
+            .collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => associated.partition_point(|resource| {
+                resource.resource_arn.as_deref().unwrap_or_default() <= last
+            }),
+        };
+        let remaining = &associated[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        // A token only when resources remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last()
+                    .and_then(|resource| resource.resource_arn.as_deref())
+                    .map(|resource_arn| {
+                        crate::state::encode_tagged_page_token(
+                            crate::state::TENANT_RESOURCES_PAGE_TOKEN_TAG,
+                            resource_arn,
+                        )
+                    })
+            })
+            .flatten();
+
+        Ok(ListTenantResourcesOutput {
+            tenant_resources: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> ListTenantResourcesError {
+    ListTenantResourcesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
