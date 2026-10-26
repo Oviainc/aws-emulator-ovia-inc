@@ -26,6 +26,7 @@ use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpost
 use service_com_amazonaws_s3outposts_s3outposts::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::arn_patterns::{legal_or_absent, optional_member, outpost_arn_members};
 use crate::endpoint_lifecycle::{
     create, delete_endpoint, list_endpoints, list_outposts, list_shared, minimal_create, string_at,
     unprovisioned_emulator, Answer,
@@ -329,20 +330,32 @@ async fn only_what_was_provisioned_is_reported() {
         );
 
         // The ARNs are built from the record's own ids and owner, for the Region the
-        // request was signed for.
+        // request was signed for — and only where the member's own pattern admits that
+        // id, since the two patterns admit different branches of `OutpostId`
+        // (`arn_patterns.rs` covers that branch by branch).
         for outpost in answer.outposts() {
             let id = string_at(outpost, "OutpostId");
             let owner = string_at(outpost, "OwnerId");
-            assert_eq!(
-                string_at(outpost, "OutpostArn"),
+            let (outpost_arn_legal, s3_arn_legal) = outpost_arn_members(&id);
+            let expected_outpost_arn = legal_or_absent(
+                outpost_arn_legal,
                 format!("arn:aws:outposts:us-east-1:{owner}:outpost/{id}"),
-                "case {case:?}: the OutpostArn must name the record's owner and id, got {outpost:?}"
             );
             assert_eq!(
-                string_at(outpost, "S3OutpostArn"),
+                optional_member(outpost, "OutpostArn"),
+                expected_outpost_arn,
+                "case {case:?}: the OutpostArn must name the record's owner and id where its \
+                 pattern admits that id ({expected_outpost_arn:?}), got {outpost:?}"
+            );
+            let expected_s3_arn = legal_or_absent(
+                s3_arn_legal,
                 format!("arn:aws:s3-outposts:us-east-1:{owner}:outpost/{id}/s3"),
-                "case {case:?}: the S3OutpostArn must name the record's owner and id, got \
-                 {outpost:?}"
+            );
+            assert_eq!(
+                optional_member(outpost, "S3OutpostArn"),
+                expected_s3_arn,
+                "case {case:?}: the S3OutpostArn must name the record's owner and id where its \
+                 pattern admits that id ({expected_s3_arn:?}), got {outpost:?}"
             );
         }
     }

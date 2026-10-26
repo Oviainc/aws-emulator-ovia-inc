@@ -15,6 +15,8 @@
 mod access_type_coip_pool_pairing;
 #[path = "all/arn_partitions.rs"]
 mod arn_partitions;
+#[path = "all/arn_patterns.rs"]
+mod arn_patterns;
 #[path = "all/endpoint_commitment_conflict.rs"]
 mod endpoint_commitment_conflict;
 #[path = "all/endpoint_lifecycle.rs"]

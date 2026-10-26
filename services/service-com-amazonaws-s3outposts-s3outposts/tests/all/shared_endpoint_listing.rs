@@ -53,7 +53,14 @@ fn stored_arns(engine: &Arc<engine::InMemoryEngine>, outpost: &str) -> Vec<Strin
         .endpoints
         .values()
         .filter(|record| record.outpost_id == outpost)
-        .map(|record| record.endpoint_arn(REGION))
+        .map(|record| {
+            record.endpoint_arn(REGION).unwrap_or_else(|| {
+                panic!(
+                    "an endpoint on Outpost {} must have an EndpointArn",
+                    record.outpost_id
+                )
+            })
+        })
         .collect()
 }
 

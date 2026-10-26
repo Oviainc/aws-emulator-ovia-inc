@@ -36,6 +36,17 @@
 //! to. The store holds one set of resources rather than one per Region, so
 //! storing a Region on the record would let an endpoint's ARN name a different
 //! Region from its own parent Outpost's ARN.
+//!
+//! ## Why an ARN member can be ABSENT
+//!
+//! An id has to be one an ARN member's own pattern admits before that member
+//! can name it. `OutpostId` admits three branches
+//! (`op-[a-f0-9]{17}`, `\d{12}` and `ec2`) and the ARN shapes admit DIFFERENT
+//! subsets of them — [`OUTPOST_ARN_BRANCHES`], [`S3_OUTPOST_ARN_BRANCHES`] and
+//! [`ENDPOINT_ARN_BRANCHES`] — so for some Outposts there is no legal value for
+//! one of the ARNs at all. Each ARN member is optional, so the projection leaves
+//! out the member it cannot form instead of reporting a string the member's own
+//! pattern rejects; everything else about the resource is reported as usual.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -165,32 +176,39 @@ impl OutpostRecord {
 
     /// `arn:<partition>:outposts:<region>:<owner>:outpost/<id>`, as
     /// `OutpostArn`'s pattern spells it, in the partition `region` belongs to
-    /// ([`arn_partition`]).
-    pub fn outpost_arn(&self, region: &str) -> String {
-        format!(
-            "arn:{}:outposts:{region}:{}:outpost/{}",
-            arn_partition(region),
-            self.owner_id,
-            self.outpost_id
-        )
+    /// ([`arn_partition`]) — or `None` for an Outpost whose id that pattern
+    /// does not admit ([`OUTPOST_ARN_BRANCHES`]).
+    pub fn outpost_arn(&self, region: &str) -> Option<String> {
+        arn_admits_outpost(OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
+            format!(
+                "arn:{}:outposts:{region}:{}:outpost/{}",
+                arn_partition(region),
+                self.owner_id,
+                self.outpost_id
+            )
+        })
     }
 
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<id>/s3`, as
-    /// `S3OutpostArn`'s pattern spells it: the name RAM shares.
-    pub fn s3_outpost_arn(&self, region: &str) -> String {
-        format!(
-            "arn:{}:s3-outposts:{region}:{}:outpost/{}/s3",
-            arn_partition(region),
-            self.owner_id,
-            self.outpost_id
-        )
+    /// `S3OutpostArn`'s pattern spells it: the name RAM shares — or `None` for
+    /// an Outpost whose id that pattern does not admit
+    /// ([`S3_OUTPOST_ARN_BRANCHES`]).
+    pub fn s3_outpost_arn(&self, region: &str) -> Option<String> {
+        arn_admits_outpost(S3_OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
+            format!(
+                "arn:{}:s3-outposts:{region}:{}:outpost/{}/s3",
+                arn_partition(region),
+                self.owner_id,
+                self.outpost_id
+            )
+        })
     }
 
     /// The `Outpost` projection `ListOutpostsWithS3` returns.
     pub fn to_outpost(&self, region: &str) -> Outpost {
         Outpost {
-            outpost_arn: Some(self.outpost_arn(region)),
-            s3_outpost_arn: Some(self.s3_outpost_arn(region)),
+            outpost_arn: self.outpost_arn(region),
+            s3_outpost_arn: self.s3_outpost_arn(region),
             outpost_id: Some(self.outpost_id.clone()),
             owner_id: Some(self.owner_id.clone()),
             capacity_in_bytes: self.capacity_in_bytes,
@@ -229,15 +247,18 @@ pub struct EndpointRecord {
 impl EndpointRecord {
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<outpost>/endpoint/<id>`,
     /// as `EndpointArn`'s pattern spells it, in the partition `region` belongs
-    /// to ([`arn_partition`]).
-    pub fn endpoint_arn(&self, region: &str) -> String {
-        format!(
-            "arn:{}:s3-outposts:{region}:{}:outpost/{}/endpoint/{}",
-            arn_partition(region),
-            self.owner_account,
-            self.outpost_id,
-            self.endpoint_id
-        )
+    /// to ([`arn_partition`]) — or `None` for an endpoint whose Outpost's id
+    /// that pattern does not admit ([`ENDPOINT_ARN_BRANCHES`]).
+    pub fn endpoint_arn(&self, region: &str) -> Option<String> {
+        arn_admits_outpost(ENDPOINT_ARN_BRANCHES, &self.outpost_id).then(|| {
+            format!(
+                "arn:{}:s3-outposts:{region}:{}:outpost/{}/endpoint/{}",
+                arn_partition(region),
+                self.owner_account,
+                self.outpost_id,
+                self.endpoint_id
+            )
+        })
     }
 
     /// Materialise the status change the clock owes this endpoint, if `now` is
@@ -259,7 +280,7 @@ impl EndpointRecord {
     /// The `Endpoint` structure every list operation reports.
     pub fn to_endpoint(&self, region: &str) -> Endpoint {
         Endpoint {
-            endpoint_arn: Some(self.endpoint_arn(region)),
+            endpoint_arn: self.endpoint_arn(region),
             outposts_id: Some(self.outpost_id.clone()),
             cidr_block: Some(self.cidr_block.clone()),
             status: Some(self.status.clone()),
@@ -552,19 +573,69 @@ pub fn page_size(max_results: i32) -> usize {
     usize::try_from(requested.clamp(1, PAGE_LIMIT)).expect("a page size in 1..=100 fits in usize")
 }
 
+/// Which branch of `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$` a value lies
+/// in.
+///
+/// The branch is more than "is this an Outpost id": the ARN shapes this service
+/// reports admit DIFFERENT subsets of the three branches
+/// ([`OUTPOST_ARN_BRANCHES`], [`S3_OUTPOST_ARN_BRANCHES`],
+/// [`ENDPOINT_ARN_BRANCHES`]), so the branch an Outpost's id lies in is what
+/// decides which ARN members can name it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutpostIdBranch {
+    /// `op-[a-f0-9]{17}`: the Outpost's own id.
+    Op,
+    /// `\d{12}`: the account-id form.
+    AccountId,
+    /// The literal `ec2`.
+    Ec2,
+}
+
+/// The branch of `OutpostId` `value` lies in, or `None` when `value` is no
+/// Outpost id at all.
+pub fn outpost_id_branch(value: &str) -> Option<OutpostIdBranch> {
+    if value == "ec2" {
+        return Some(OutpostIdBranch::Ec2);
+    }
+    if let Some(hex) = value.strip_prefix("op-") {
+        return (hex.len() == 17 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then_some(OutpostIdBranch::Op);
+    }
+    is_account_outpost_id(value).then_some(OutpostIdBranch::AccountId)
+}
+
+/// The branches of `OutpostId` that `OutpostArn`'s
+/// `…:outposts:<region>:<account>:outpost/(op-[a-f0-9]{17}|ec2)$` admits: the
+/// account-id form is not one of them, so no `OutpostArn` can name an Outpost
+/// identified that way.
+pub const OUTPOST_ARN_BRANCHES: &[OutpostIdBranch] = &[OutpostIdBranch::Op, OutpostIdBranch::Ec2];
+
+/// The branches of `OutpostId` that `S3OutpostArn`'s
+/// `…:s3-outposts:<region>:<account>:outpost/(op-[a-f0-9]{17}|\d{12})/s3$`
+/// admits: `ec2` is not one of them.
+pub const S3_OUTPOST_ARN_BRANCHES: &[OutpostIdBranch] =
+    &[OutpostIdBranch::Op, OutpostIdBranch::AccountId];
+
+/// The branches of `OutpostId` that `EndpointArn`'s
+/// `…:outpost/(op-[a-f0-9]{17}|ec2)/endpoint/[a-zA-Z0-9]{19}$` admits: as with
+/// `OutpostArn`, the account-id form is not one of them. Spelled out rather than
+/// aliased, because this is its own pattern and nothing ties the two together.
+pub const ENDPOINT_ARN_BRANCHES: &[OutpostIdBranch] = &[OutpostIdBranch::Op, OutpostIdBranch::Ec2];
+
+/// True when an ARN member whose pattern admits the `admitted` branches can
+/// name the Outpost `outpost_id` — that is, when there is a legal value of that
+/// member for this Outpost at all.
+pub fn arn_admits_outpost(admitted: &[OutpostIdBranch], outpost_id: &str) -> bool {
+    outpost_id_branch(outpost_id).is_some_and(|branch| admitted.contains(&branch))
+}
+
 /// True when `value` satisfies `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`.
 ///
 /// The boundary validator already refuses a modelled `OutpostId` member, so this
 /// is for a value the model does not constrain: a `NextToken`, which this
 /// service's pagination carries an Outpost id in.
 pub fn is_outpost_id(value: &str) -> bool {
-    if value == "ec2" {
-        return true;
-    }
-    if let Some(hex) = value.strip_prefix("op-") {
-        return hex.len() == 17 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    }
-    is_account_outpost_id(value)
+    outpost_id_branch(value).is_some()
 }
 
 /// True when `value` satisfies `EndpointId`'s `^[a-zA-Z0-9]{19}$`.

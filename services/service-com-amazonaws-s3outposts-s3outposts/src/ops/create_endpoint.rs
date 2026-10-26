@@ -261,13 +261,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_account: caller,
         };
 
+        // `EndpointArn` is the one member of this answer, and it is optional:
+        // its pattern admits only some of the `OutpostId` branches, so an
+        // endpoint on an Outpost outside them has no legal ARN and the member is
+        // left out rather than filled with a value the pattern rejects. The
+        // endpoint itself is stored either way and the listings report it.
         let endpoint_arn = endpoint.endpoint_arn(&region);
         store
             .endpoints
             .insert((input.outpost_id, endpoint_id), endpoint);
 
-        Ok(CreateEndpointOutput {
-            endpoint_arn: Some(endpoint_arn),
-        })
+        Ok(CreateEndpointOutput { endpoint_arn })
     }
 }

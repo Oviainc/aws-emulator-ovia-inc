@@ -84,7 +84,14 @@ fn stored_arns(engine: &Arc<engine::InMemoryEngine>, listing: &Listing) -> Vec<S
             Listing::Own => record.owner_account == engine::emulator_account_id(),
             Listing::OnOutpost(outpost) => &record.outpost_id == outpost,
         })
-        .map(|record| record.endpoint_arn(REGION))
+        .map(|record| {
+            record.endpoint_arn(REGION).unwrap_or_else(|| {
+                panic!(
+                    "an endpoint on Outpost {} must have an EndpointArn",
+                    record.outpost_id
+                )
+            })
+        })
         .collect()
 }
 
