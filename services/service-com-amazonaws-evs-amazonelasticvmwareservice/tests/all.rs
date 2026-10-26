@@ -82,6 +82,8 @@ mod tagging_not_found;
 mod tagging_resource_arn_resolution;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/vcf_hostname_uniqueness.rs"]
+mod vcf_hostname_uniqueness;
 #[path = "all/versions_catalog.rs"]
 mod versions_catalog;
 #[path = "all/vlan_subnet_propagation.rs"]

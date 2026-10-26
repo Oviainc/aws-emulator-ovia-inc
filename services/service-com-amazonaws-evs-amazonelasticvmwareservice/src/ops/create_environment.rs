@@ -68,7 +68,13 @@
 //!    Services' own, so a caller cannot create a tag in it — the same reservation
 //!    `TagResource` and `UntagResource` enforce, applied here because this operation
 //!    writes the request's tags onto the environment it mints.
-//! 12. Each `serviceAccessSecurityGroups.securityGroups` entry names a security group
+//! 12. No two members of `vcfHostnames` carry the same DNS hostname: "Each hostname
+//!    must be unique" (`VcfHostnames` doc), because the nine members name nine
+//!    separate VCF management appliances and a hostname resolves to one of them — so a
+//!    hostname a member before it already claimed names an appliance that cannot be
+//!    installed, and that member is refused. Judged only where Amazon EVS INSTALLS
+//!    VCF, exactly as rule 10 is: a mode that installs no appliance claims no hostname.
+//! 13. Each `serviceAccessSecurityGroups.securityGroups` entry names a security group
 //!    the account holds IN that same VPC: those groups "allow traffic between the Amazon
 //!    EVS control plane and your VPC for Amazon EVS service access"
 //!    (`ServiceAccessSecurityGroups` doc) and Amazon EVS creates none of them, and a
@@ -386,6 +392,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(String::as_str),
         ));
         failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
+        // "Each hostname must be unique" (`VcfHostnames` doc): the nine members name the
+        // nine separate VMware appliances Amazon EVS installs, so a hostname one member
+        // already claimed cannot name a second appliance, and the member that repeats it
+        // is refused. Asked only where the appliances ARE installed, the same scope rule
+        // 10 is judged at, because a mode that installs none claims no hostname.
+        if installs_vcf {
+            if let Some(hostnames) = input.vcf_hostnames.as_ref() {
+                failures.extend(vcf_hostname_failures(hostnames));
+            }
+        }
         let vlan_plan = plan_vlans(&input.initial_vlans);
         failures.extend(vlan_failures(&input.initial_vlans, &vlan_plan));
         // The network the environment is deployed into, from Amazon EC2's own store,
@@ -960,6 +976,54 @@ fn host_failures(hosts: &[HostInfoForCreate]) -> Vec<ValidationExceptionField> {
         .filter(|(_, host)| host.dedicated_host_id.is_some() && host.placement_group_id.is_some())
         .map(|(index, _)| crate::state::placement_conflict_failure(&format!("hosts[{index}]")))
         .collect()
+}
+
+/// The nine `vcfHostnames` members, in the order `VcfHostnames` models them: the input
+/// member path a refusal names each one by, and the hostname the request gave it.
+///
+/// One table, so the uniqueness rule below covers every member of the shape and cannot
+/// silently miss one.
+fn vcf_hostname_members(hostnames: &VcfHostnames) -> [(&'static str, &str); 9] {
+    [
+        ("vcfHostnames.vCenter", hostnames.v_center.as_str()),
+        ("vcfHostnames.nsx", hostnames.nsx.as_str()),
+        ("vcfHostnames.nsxManager1", hostnames.nsx_manager1.as_str()),
+        ("vcfHostnames.nsxManager2", hostnames.nsx_manager2.as_str()),
+        ("vcfHostnames.nsxManager3", hostnames.nsx_manager3.as_str()),
+        ("vcfHostnames.nsxEdge1", hostnames.nsx_edge1.as_str()),
+        ("vcfHostnames.nsxEdge2", hostnames.nsx_edge2.as_str()),
+        ("vcfHostnames.sddcManager", hostnames.sddc_manager.as_str()),
+        ("vcfHostnames.cloudBuilder", hostnames.cloud_builder.as_str()),
+    ]
+}
+
+/// Every `vcfHostnames` member that repeats a hostname an earlier member of the same
+/// object already carries: "Each hostname must be unique" (`VcfHostnames` doc).
+///
+/// The FIRST member to carry a hostname keeps it and the ones that repeat it are
+/// refused, one `fieldList` entry each naming the member it collides with — so three
+/// members sharing one hostname draw two entries, and the caller is told which member
+/// claimed the name. The comparison is the exact string the request gave, as the
+/// sibling DNS-hostname rule compares host names
+/// ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::host_name_is_taken`]).
+fn vcf_hostname_failures(hostnames: &VcfHostnames) -> Vec<ValidationExceptionField> {
+    let members = vcf_hostname_members(hostnames);
+    let mut failures = Vec::new();
+    for (index, (member, hostname)) in members.iter().enumerate() {
+        if let Some((claimed_by, _)) = members[..index]
+            .iter()
+            .find(|(_, earlier)| earlier == hostname)
+        {
+            failures.push(crate::state::field_failure(
+                member,
+                &format!(
+                    "repeats the hostname given as {claimed_by}; each hostname in \
+                     vcfHostnames must be unique"
+                ),
+            ));
+        }
+    }
+    failures
 }
 
 /// The ten VLAN subnets to materialise, in the order `InitialVlans` models its
