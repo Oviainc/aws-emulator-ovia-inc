@@ -165,21 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(api) = store.apis.get(&input.api_id) else {
             return Err(GetStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid API identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.api_id
-                )),
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
                 resource_type: ::std::option::Option::None,
             })
             .into());
         };
         let Some(record) = api.stages.get(&input.stage_name) else {
             return Err(GetStageErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid stage identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.stage_name
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::STAGE_RESOURCE,
                 )),
                 resource_type: ::std::option::Option::None,
             })

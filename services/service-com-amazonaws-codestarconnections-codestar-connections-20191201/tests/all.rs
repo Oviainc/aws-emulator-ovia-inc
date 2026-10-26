@@ -33,6 +33,8 @@ mod repository_link_lifecycle;
 mod repository_link_listing;
 #[path = "all/repository_link_reads.rs"]
 mod repository_link_reads;
+#[path = "all/resource_sync_status.rs"]
+mod resource_sync_status;
 #[path = "all/sdk_target_dispatch.rs"]
 mod sdk_target_dispatch;
 #[path = "all/state_roundtrip.rs"]

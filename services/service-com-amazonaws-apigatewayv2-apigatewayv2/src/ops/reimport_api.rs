@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — is "the resource specified in the request was not found".
         let Some(existing) = store.apis.get_mut(&input.api_id) else {
             return Err(ReimportApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::invalid_identifier_message("API", &input.api_id)),
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
                 resource_type: ::std::option::Option::None,
             })
             .into());

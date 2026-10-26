@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSharedReportGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSharedReportGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSharedReportGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ARNs of the report groups this account shares: this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,23 +145,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SHARED_REPORT_GROUPS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the ARNs of the report groups that are SHARED, ordered and paged as the
+    /// request asks.
+    ///
+    /// A report group is shared exactly while a resource-based policy is attached to it
+    /// — that attachment is how one is shared with other accounts or users
+    /// (`PutResourcePolicy`: "Stores a resource policy for the ARN of a Project or
+    /// ReportGroup object") — so this listing is the account's report groups filtered by
+    /// the store's resource policies, the way `crate::ops::list_shared_projects` reports
+    /// the other resource kind CodeBuild shares. A policy held for a project's ARN
+    /// resolves no report group, so it is not reported here.
+    ///
+    /// Purely reporting: nothing in the store changes, so a later caller sees exactly
+    /// what this one saw.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSharedReportGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSharedReportGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSharedReportGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListSharedReportGroups (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        let guard = state.lock();
+        // Every shared report group, each with the instant its own record was last
+        // changed — which is what the `MODIFIED_TIME` criterion orders on ("List based on
+        // when information about the shared report group was last changed").
+        let mut shared: Vec<(i64, &str)> = guard
+            .report_groups
+            .values()
+            .filter_map(|stored| {
+                let arn = stored.report_group.arn.as_deref()?;
+                guard
+                    .resource_policies
+                    .contains_key(arn)
+                    .then_some((stored.last_modified_millis, arn))
+            })
+            .collect();
+        match input.sort_by.as_deref() {
+            // The tuple's own order: the modified instant first, the ARN breaking a tie,
+            // so two report groups changed in the same millisecond still have one order.
+            Some(MODIFIED_TIME_SORT_BY) => shared.sort_unstable(),
+            // `ARN`, or absent: the model documents a default for neither `sortBy` nor
+            // `sortOrder`, so this listing takes the one its sibling listing of the same
+            // resource kind takes — of the two criteria the ARN is the one every shared
+            // report group has exactly one of, and it is unique per group, so it is what
+            // an unsorted request resolves to.
+            _ => shared.sort_unstable_by_key(|&(_, arn)| arn),
+        }
+        let mut arns: Vec<String> = shared.into_iter().map(|(_, arn)| arn.to_string()).collect();
+        // Dropped before the page is cut: nothing below reads the store.
+        drop(guard);
+        if input.sort_order.as_deref() == Some(DESCENDING_SORT_ORDER) {
+            arns.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&arns, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListSharedReportGroupsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListSharedReportGroupsOutput {
+            // Serialized whether or not this account shares anything, `[]` when it shares
+            // nothing: the `@length(min: 1)` on `ReportGroupArns` bounds what a request
+            // may carry, not whether the answer states its result.
+            report_groups: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The `SharedResourceSortByType` value that orders the listing by when each shared
+/// report group was last changed rather than by its ARN. That enum's only values are
+/// `ARN` and `MODIFIED_TIME` (`crate::ops::types::SHARED_RESOURCE_SORT_BY_TYPE_VALUES`),
+/// and the sibling listing `crate::ops::list_shared_projects` reads the same pair.
+const MODIFIED_TIME_SORT_BY: &str = "MODIFIED_TIME";
+
+/// The `SortOrderType` value that asks for the reverse of the criterion's natural order;
+/// the only other value is `ASCENDING`.
+const DESCENDING_SORT_ORDER: &str = "DESCENDING";

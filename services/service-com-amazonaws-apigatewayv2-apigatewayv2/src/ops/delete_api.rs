@@ -162,11 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no child map can outlive the parent it belonged to.
         if store.apis.remove(&input.api_id).is_none() {
             return Err(DeleteApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Invalid API identifier specified {}:{}",
-                    ::engine::emulator_account_id(),
-                    input.api_id
-                )),
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
                 resource_type: ::std::option::Option::None,
             })
             .into());

@@ -28,7 +28,7 @@ const MAX_AUTH_TOKEN_VALUE_LENGTH: usize = 8000;
 const AUTH_TOKEN_KEY: &str = "X-aws-proxy-auth";
 
 /// `DELETE /2025-09-09/microvm-images/{imageIdentifier}`.
-async fn delete_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
+pub(crate) async fn delete_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     call(
         router,
         "DELETE",
@@ -39,7 +39,7 @@ async fn delete_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Va
 }
 
 /// `GET /2025-09-09/microvm-images/{imageIdentifier}`.
-async fn get_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
+pub(crate) async fn get_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     call(
         router,
         "GET",

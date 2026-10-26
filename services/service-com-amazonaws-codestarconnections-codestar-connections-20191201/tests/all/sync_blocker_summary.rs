@@ -190,7 +190,7 @@ fn seed(
 
 /// The epoch seconds a wire timestamp carries, whichever of the two forms awsJson may
 /// render it in (a number for `epoch-seconds`, a date-time string otherwise).
-fn epoch_seconds(case: &str, value: &Value) -> f64 {
+pub(crate) fn epoch_seconds(case: &str, value: &Value) -> f64 {
     if let Some(seconds) = value.as_f64() {
         return seconds;
     }

@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceSyncStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceSyncStatus`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the sync state `crate::state` has recorded against the
+//! requested `(SyncType, ResourceName)` pair, and a success carrying none of the
+//! sync-state members when it holds none. A pure report — nothing is written. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceSyncStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pair with no recorded sync state is NOT a refusal: the recorded AWS response for a
+//! `CFN_STACK_SYNC` resource this account never synced is HTTP 200 with none of
+//! `DesiredState`, `LatestSync` and `LatestSuccessfulSync` present, so the operation
+//! reports "never synced" rather than refusing the resource. A client polling for sync
+//! status before — or without — configuring the resource must be able to tell "never
+//! synced" from "bad request", so neither the modeled `ResourceNotFoundException` nor
+//! `InvalidInputException` is the answer to "no sync state".
+//!
+//! A sync attempt is recorded by the service's Git-sync component, which this emulator
+//! does not run (nothing here fetches a remote repository's commits), so no revision,
+//! commit sha or event list is ever synthesised here for work nothing ran: this reader
+//! reports whatever is recorded, however it got there, out of the one
+//! [`crate::state::StoredResourceSyncState`] row for the pair.
+//!
+//! The modeled `AccessDeniedException` is deliberately never returned: the emulator
+//! verifies every request signature up front and models no per-principal policy for a
+//! sync-status read, so there is no authorization decision this handler could make.
 //!
 //! ## Shape of an operation
 //!
@@ -66,8 +79,15 @@
 //!   the sync status with the Git repository.
 //! * `LatestSuccessfulSync` (ResourceSyncAttempt) — The latest successful sync for the sync
 //!   status with the Git repository.
-//! * `LatestSync` (ResourceSyncAttempt) **required** — The latest sync for the sync status
+//! * `LatestSync` (ResourceSyncAttempt) — The latest sync for the sync status
 //!   with the Git repository, whether successful or not.
+//!
+//! AWS's published model marks `LatestSync` `@required`; the service does not honour
+//! that for a `(ResourceName, SyncType)` pair it has recorded no sync state for — it
+//! answers HTTP 200 with none of these members present. Since this crate's codegen
+//! always writes a `@required` member, the trait is off this one output member in
+//! `smithy-model/` so the recorded response can be rendered; see
+//! [`super::types::GetResourceSyncStatusOutput`].
 //!
 //! ## Errors
 //!
@@ -154,20 +174,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Unused: the sync status is addressed entirely by the request body's
+        // `(SyncType, ResourceName)` pair, so no request metadata enters the answer.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceSyncStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceSyncStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceSyncStatusErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        // `SyncType` is a modeled enum, so a value outside `SYNC_CONFIGURATION_TYPE_VALUES`
+        // is refused before this handler runs; the pair below therefore addresses a sync
+        // type this service knows.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceSyncStatus"))
+        // A pure read: the report is the sync state this service has RECORDED for the
+        // addressed pair and nothing else. A pair it holds no row for renders every
+        // member absent, which is what "never synced" looks like on the wire.
+        let key = crate::state::resource_sync_key(&input.sync_type, &input.resource_name);
+        let recorded = state
+            .lock()
+            .resource_sync_states
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(GetResourceSyncStatusOutput {
+            desired_state: recorded.desired_state,
+            latest_sync: recorded.latest_sync,
+            latest_successful_sync: recorded.latest_successful_sync,
+        })
     }
 }
