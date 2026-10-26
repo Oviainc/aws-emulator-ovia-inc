@@ -173,7 +173,7 @@
 use super::types::*;
 use crate::state::{
     non_empty, to_timestamp, BadConnection, ConnectionRequest, ExecutionMode, NoDatabase,
-    Statement, Submission, SubmissionKind,
+    Statement, Submission, SubmissionKind, ABSENT_ENDPOINT_MESSAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -249,7 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(unavailable());
         };
@@ -260,16 +259,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session-reuse form, where a caller that already holds a `SessionId`
         // names neither warehouse, carries its connection on the SESSION, so it
         // is resolved from the session store instead of from the request.
-        let connection = match (ConnectionRequest {
+        let requested = ConnectionRequest {
             cluster_identifier: input.cluster_identifier.as_ref(),
             workgroup_name: input.workgroup_name.as_ref(),
             session_id: input.session_id.as_ref(),
             database: input.database.as_ref(),
             db_user: input.db_user.as_ref(),
             secret_arn: input.secret_arn.as_ref(),
-        })
-        .resolve()
-        {
+        };
+        let connection = match requested.resolve() {
             Ok(connection) => connection,
             Err(BadConnection::SessionOnly) => {
                 let session = non_empty(input.session_id.as_ref()).unwrap_or_default();
@@ -282,7 +280,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => return Err(no_such_session(&session)),
                 }
             }
-            Err(problem) => return Err(validation(problem.message())),
+            Err(problem) => {
+                // The endpoint a request NAMED is resolved before its SELECTION
+                // is judged, exactly as `ExecuteStatement` does it.
+                if problem.is_target_selection()
+                    && crate::state::warehouse::names_absent_warehouse(ctx, requested).await
+                {
+                    return Err(validation(ABSENT_ENDPOINT_MESSAGE));
+                }
+                return Err(validation(problem.message()));
+            }
         };
 
         // `Sqls` holds "one or more SQL statements to run", so every entry has
@@ -295,6 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Sqls[{index}] must contain a SQL statement"
                 )));
             }
+        }
+
+        // Every statement of the batch runs on an ENDPOINT, so the target this
+        // request selected is resolved against the service that owns it before
+        // the batch is admitted — the same gate `ExecuteStatement` applies,
+        // because both operations take the same target selection.
+        if crate::state::warehouse::resolve_target(ctx, &connection.target).await
+            == crate::state::warehouse::TargetResolution::Absent
+        {
+            return Err(validation(ABSENT_ENDPOINT_MESSAGE));
         }
 
         // "If set to TRANSACTION (the default), all SQL statements are run as a

@@ -94,7 +94,10 @@ fn numbered_requests(prefix: &str, count: usize) -> Value {
 
 /// `POST /v1/flows/{FlowArn}/vpcInterfaces` — the AddFlowVpcInterfaces binding
 /// (`smithy_query(query="operation",operation="AddFlowVpcInterfaces")`).
-async fn add_vpc_interfaces(
+///
+/// `pub(crate)` because `tests/all/flow_name_references.rs` gives a flow the VPC interface
+/// one of its references names through the same binding.
+pub(crate) async fn add_vpc_interfaces(
     emulator: &Emulator,
     flow_arn: &str,
     vpc_interfaces: Value,

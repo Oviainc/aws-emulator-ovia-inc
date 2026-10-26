@@ -3075,11 +3075,82 @@ pub struct PipelineDetail {
     pub media_connect_router_output_connection_map: Option<std::collections::HashMap<String, MediaConnectRouterOutputConnection>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#ChannelEngineVersionResponse")]
+/// `ChannelEngineVersionResponse`, with its schema written out instead of derived
+/// because `ExpirationDate` targets `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note at the top of this module says why that
+/// cannot be derived here. Member for member this is the model's shape: same ids, same
+/// order, same indices, and both members are optional exactly as the derive has them.
+///
+/// Like `Thumbnail` it DOES carry a deserializer: it is the element of
+/// `ListVersionsResponse$Versions`, and the derive on the shapes that carry it reads each
+/// one through `DeserializableStruct`.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelEngineVersionResponse {
     pub expiration_date: Option<::aws_smithy_types::DateTime>,
     pub version: Option<String>,
+}
+
+impl ChannelEngineVersionResponse {
+    const M_EXPIRATION_DATE: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "ChannelEngineVersionResponse",
+        "ExpirationDate",
+        "expirationDate",
+        0
+    );
+    const M_VERSION: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ChannelEngineVersionResponse",
+        "Version",
+        "version",
+        String,
+        1
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#ChannelEngineVersionResponse",
+            shared_types::NAMESPACE,
+            "ChannelEngineVersionResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_EXPIRATION_DATE, &Self::M_VERSION],
+    );
+}
+
+pub static CHANNEL_ENGINE_VERSION_RESPONSE_SCHEMA: &::aws_smithy_schema::Schema =
+    &ChannelEngineVersionResponse::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ChannelEngineVersionResponse {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.expiration_date.as_ref() {
+            serializer.write_timestamp(&Self::M_EXPIRATION_DATE, value)?;
+        }
+        if let Some(value) = self.version.as_ref() {
+            serializer.write_string(&Self::M_VERSION, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ChannelEngineVersionResponse {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut version = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => {
+                    version.expiration_date = Some(reader.read_timestamp(&Self::M_EXPIRATION_DATE)?);
+                }
+                Some(1) => version.version = Some(reader.read_string(&Self::M_VERSION)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(version)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.medialive#MediaConnectRouterOutputConnection")]

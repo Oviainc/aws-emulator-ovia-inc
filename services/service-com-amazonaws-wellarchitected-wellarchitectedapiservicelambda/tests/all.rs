@@ -291,3 +291,8 @@ mod workload_integration_sync;
 // Declared last for the same reason as the declaration above.
 #[path = "all/profile_notifications.rs"]
 mod profile_notifications;
+
+// Declared last for the same reason as the declaration above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/review_template_write_instants.rs"]
+mod review_template_write_instants;

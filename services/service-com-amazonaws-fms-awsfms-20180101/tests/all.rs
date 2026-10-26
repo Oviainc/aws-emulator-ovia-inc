@@ -64,6 +64,8 @@ mod policy_document_validation;
 mod policy_identifier_lookup;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
+#[path = "all/policy_mutation_admin_scope.rs"]
+mod policy_mutation_admin_scope;
 #[path = "all/policy_resource_cleanup.rs"]
 mod policy_resource_cleanup;
 #[path = "all/policy_status_derivation.rs"]

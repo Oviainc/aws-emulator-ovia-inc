@@ -166,10 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.apis.get_mut(&input.api_id) else {
             return Err(DeleteCorsConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid API identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.api_id
+                    message: Some(crate::state::invalid_api_identifier_message(
+                        &input.api_id,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

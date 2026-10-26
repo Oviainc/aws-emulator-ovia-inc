@@ -98,8 +98,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    decode_cursor, encode_cursor, BATCH_PARENT_RESULT_MESSAGE, CURSOR_ROWS, NO_RESULT_MESSAGE,
-    RESULT_PAGE_ROWS,
+    decode_cursor, encode_cursor, BATCH_PARENT_RESULT_MESSAGE, CURSOR_ROWS, INVALID_TOKEN_MESSAGE,
+    NO_RESULT_MESSAGE, RESULT_PAGE_ROWS, UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -186,13 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialise_due_transitions();
         let Some(statement) = store.statement(&input.id) else {
-            return Err(GetStatementResultErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Query does not exist: {}", input.id),
-                    resource_id: input.id.clone(),
-                },
-            )
-            .into());
+            return Err(no_such_query(&input.id));
         };
 
         // A batch is not a query: `BatchExecuteStatement` answers with one
@@ -246,13 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .filter(|position| *position <= rows.len());
                 match position {
                     Some(position) => position,
-                    None => {
-                        return Err(validation(
-                            "NextToken is not a continuation token this operation issued for \
-                             this statement"
-                                .to_string(),
-                        ))
-                    }
+                    None => return Err(validation(INVALID_TOKEN_MESSAGE.to_string())),
                 }
             }
         };
@@ -277,4 +265,17 @@ fn validation(message: String) -> GetStatementResultError {
         message: Some(message),
     })
     .into()
+}
+
+/// Refuse an `Id` this service holds no query for — the same refusal, in the
+/// same fixed words and at the same status, as every other reader of a statement
+/// gives (see `describe_statement::no_such_query`).
+fn no_such_query(id: &str) -> GetStatementResultError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        GetStatementResultErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: UNKNOWN_QUERY_MESSAGE.to_string(),
+            resource_id: id.to_string(),
+        }),
+        UNKNOWN_QUERY_STATUS,
+    )
 }

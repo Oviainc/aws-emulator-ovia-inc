@@ -269,6 +269,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An output references the flow's own sub-resources BY NAME: its media stream
+        // associations name media streams of this flow
+        // (`MediaStreamOutputConfigurationRequest$MediaStreamName`) and its VPC interface
+        // attachment names a VPC interface of this flow. Each name is resolved against
+        // what the flow actually holds, through the one place this crate resolves such a
+        // reference (`crate::state`), BEFORE anything is stored — so a refused request
+        // leaves the flow without an association to something it has not got.
+        let held_media_streams = flow.media_stream_names();
+        let held_vpc_interfaces = flow.vpc_interface_names();
+        for (index, output) in input.outputs.iter().enumerate() {
+            if let Some(rejection) = crate::state::output_request_reference_rejection(
+                &format!("Outputs[{index}]"),
+                output,
+                &held_media_streams,
+                &held_vpc_interfaces,
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // An output's name is unique within its flow, so each new output is named
         // against the flow's existing outputs AND against the ones earlier in this
         // request.

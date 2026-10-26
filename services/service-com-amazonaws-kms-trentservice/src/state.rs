@@ -30,7 +30,7 @@
 //! composes the envelope, it does not implement cryptography.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -163,6 +163,15 @@ pub const MAX_ALIASES: usize = 5_000;
 
 /// [`MAX_ALIASES`], for grants.
 pub const MAX_GRANTS: usize = 5_000;
+
+/// [`MAX_ALIASES`], for custom key stores. A custom key store belongs to one Region
+/// and the Region comes from the caller's own credential scope rather than from a
+/// fixed set, so nothing else bounds how many records this store holds.
+/// [`ComAmazonawsKmsTrentserviceState::insert_custom_key_store`] persists nothing
+/// past it, and a create is to refuse past it with the modelled
+/// `LimitExceededException` ("a length constraint or quota was exceeded") rather
+/// than mint an id it cannot persist.
+pub const MAX_CUSTOM_KEY_STORES: usize = 5_000;
 
 /// Per-service state for com-amazonaws-kms-trentservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -381,13 +390,28 @@ impl ComAmazonawsKmsTrentserviceState {
         Some(removed)
     }
 
+    /// Whether the store can hold another custom key store, across every Region,
+    /// which is what a create checks before it mints an id. See
+    /// [`Self::has_room_for_another_alias`] for why a per-Region bound is not enough.
+    pub fn has_room_for_another_custom_key_store(&self) -> bool {
+        self.custom_key_stores.len() < MAX_CUSTOM_KEY_STORES
+    }
+
     /// Persist a freshly created custom key store, remembering its place in
-    /// creation order.
-    pub fn insert_custom_key_store(&mut self, store: CustomKeyStore) {
+    /// creation order, and report whether it was persisted.
+    ///
+    /// `false` means the store already holds [`MAX_CUSTOM_KEY_STORES`] and NOTHING
+    /// was written. The bound is enforced HERE as well as by the caller that refuses
+    /// the request, so no sequence of requests can grow this map without a ceiling.
+    pub fn insert_custom_key_store(&mut self, store: CustomKeyStore) -> bool {
+        if !self.has_room_for_another_custom_key_store() {
+            return false;
+        }
         self.custom_key_store_order
             .push(store.custom_key_store_id.clone());
         self.custom_key_stores
             .insert(store.custom_key_store_id.clone(), store);
+        true
     }
 
     /// The custom key stores `region`'s endpoint serves, in creation order — what a
@@ -405,6 +429,36 @@ impl ComAmazonawsKmsTrentserviceState {
             .filter_map(|id| self.custom_key_stores.get(id))
             .filter(|store| store.region == region)
             .collect()
+    }
+
+    /// The custom key store `region`'s endpoint serves under the id
+    /// `custom_key_store_id`, for an operation that then moves it through its
+    /// connection state.
+    ///
+    /// A custom key store belongs to one Region, so an id minted through another
+    /// Region's endpoint names no key store here: the same Region scoping
+    /// [`Self::custom_key_stores_in`] reports under.
+    pub fn custom_key_store_mut(
+        &mut self,
+        region: &str,
+        custom_key_store_id: &str,
+    ) -> Option<&mut CustomKeyStore> {
+        self.custom_key_stores
+            .get_mut(custom_key_store_id)
+            .filter(|store| store.region == region)
+    }
+
+    /// Materialise every custom-key-store connection change the clock has already
+    /// made due ([`CustomKeyStore::settle`]).
+    ///
+    /// Every operation that reports or moves a connection state does this first, so
+    /// the state it works from is the one the clock owes rather than the transient
+    /// one the call that started the change left behind.
+    pub fn settle_custom_key_stores(&mut self) {
+        let now = SystemTime::now();
+        for store in self.custom_key_stores.values_mut() {
+            store.settle(now);
+        }
     }
 
     /// The key a `KeyId` request member names, accepting every form KMS does:
@@ -910,6 +964,29 @@ pub const CONNECTION_STATE_CONNECTED: &str = "CONNECTED";
 /// of the failure" (the same member's documentation).
 pub const CONNECTION_STATE_FAILED: &str = "FAILED";
 
+/// The `ConnectionStateType` of a custom key store whose connection process is under
+/// way: connecting one "starts the connection process, but it does not wait for it to
+/// complete", and "this response does not indicate that the custom key store is
+/// connected" (`smithy_query(query="doc",shape="ConnectCustomKeyStore")`), so this is
+/// the state the key store is left in until the connection falls due.
+pub const CONNECTION_STATE_CONNECTING: &str = "CONNECTING";
+
+/// The `ConnectionStateType` of a custom key store whose disconnection is under way.
+/// "When you disconnect a custom key store, its `ConnectionState` changes to
+/// `Disconnected`" (`smithy_query(query="doc",shape="DisconnectCustomKeyStore")`),
+/// which it reaches through this transient state.
+pub const CONNECTION_STATE_DISCONNECTING: &str = "DISCONNECTING";
+
+/// How long a custom key store stays in the transient connection state a connect or
+/// disconnect left it in before the change that call started falls due.
+///
+/// "The connection process for a custom key store can take an extended amount of time
+/// to complete" (`smithy_query(query="doc",shape="ConnectCustomKeyStore")`) and the
+/// model names no duration, so the span is this emulator's: short, but never zero, so
+/// a caller that reads the key store straight after the call still observes the
+/// transient state and the refusals that go with it.
+pub const CUSTOM_KEY_STORE_CONNECTION_SPAN: Duration = Duration::from_millis(500);
+
 /// The `CustomKeyStoreType` of a key store backed by a CloudHSM cluster, from
 /// `smithy_query(shape="CustomKeyStoreType")`.
 pub const CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM: &str = "AWS_CLOUDHSM";
@@ -970,6 +1047,9 @@ pub struct CustomKeyStore {
     /// the two are one field, so a key store can never report a type that
     /// disagrees with the configuration it holds.
     pub backing: CustomKeyStoreBacking,
+    /// The connection change a connect or disconnect started and the clock still
+    /// owes, if any — see [`CustomKeyStore::settle`].
+    pub pending_connection: Option<PendingConnectionChange>,
 }
 
 impl CustomKeyStore {
@@ -989,7 +1069,60 @@ impl CustomKeyStore {
             connection_state: CONNECTION_STATE_DISCONNECTED.to_string(),
             connection_error_code: None,
             backing,
+            pending_connection: None,
         }
+    }
+
+    /// Start the connection process: the key store is left
+    /// [`CONNECTION_STATE_CONNECTING`] and owes [`CONNECTION_STATE_CONNECTED`] one
+    /// [`CUSTOM_KEY_STORE_CONNECTION_SPAN`] later, because connecting one "starts
+    /// the connection process, but it does not wait for it to complete"
+    /// (`smithy_query(query="doc",shape="ConnectCustomKeyStore")`).
+    pub fn start_connecting(&mut self) {
+        self.begin(CONNECTION_STATE_CONNECTING, CONNECTION_STATE_CONNECTED);
+    }
+
+    /// Start the disconnection: the key store is left
+    /// [`CONNECTION_STATE_DISCONNECTING`] and owes
+    /// [`CONNECTION_STATE_DISCONNECTED`], the state "its `ConnectionState` changes
+    /// to" when it is disconnected
+    /// (`smithy_query(query="doc",shape="DisconnectCustomKeyStore")`).
+    pub fn start_disconnecting(&mut self) {
+        self.begin(
+            CONNECTION_STATE_DISCONNECTING,
+            CONNECTION_STATE_DISCONNECTED,
+        );
+    }
+
+    /// The one place a connection change is started: the key store enters the
+    /// transient state at once and the settled one is recorded as due, so no caller
+    /// has to wait and no two callers disagree about when it arrives.
+    fn begin(&mut self, transient: &str, settled: &str) {
+        self.connection_state = transient.to_string();
+        self.pending_connection = Some(PendingConnectionChange {
+            connection_state: settled.to_string(),
+            due_at: SystemTime::now()
+                .checked_add(CUSTOM_KEY_STORE_CONNECTION_SPAN)
+                .unwrap_or_else(SystemTime::now),
+        });
+    }
+
+    /// Materialise the connection change the clock has ALREADY made due, so every
+    /// later caller sees the state the key store is owed rather than the transient
+    /// one the call that started it left behind.
+    ///
+    /// Nothing happens before the due instant, and nothing happens at all for a key
+    /// store with no change outstanding, so this is idempotent and never moves a
+    /// state because something was read.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(pending) = &self.pending_connection else {
+            return;
+        };
+        if now < pending.due_at {
+            return;
+        }
+        self.connection_state = pending.connection_state.clone();
+        self.pending_connection = None;
     }
 
     /// This key store's `CustomKeyStoreType`, which follows from what backs it:
@@ -1038,6 +1171,17 @@ impl CustomKeyStore {
             xks_proxy_configuration: proxy.map(XksProxy::configuration),
         }
     }
+}
+
+/// A connection change a connect or disconnect started and the clock owes: the
+/// `ConnectionStateType` the custom key store reaches, and the instant it falls due.
+#[derive(Debug, Clone)]
+pub struct PendingConnectionChange {
+    /// The `ConnectionStateType` the key store takes on at [`Self::due_at`].
+    pub connection_state: String,
+    /// When the change falls due. It is stored rather than waited for, so no
+    /// request sleeps and every reader agrees on when it arrives.
+    pub due_at: SystemTime,
 }
 
 /// What backs a custom key store, and so what it reports about itself.

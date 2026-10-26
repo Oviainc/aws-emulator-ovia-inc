@@ -172,9 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `Category` and `Description` are optional free text; an empty string carries no
         // more information than their absence, so it is stored as absent rather than as a
-        // member a later read would echo back blank.
-        let category = input.category.filter(|value| !value.trim().is_empty());
-        let description = input.description.filter(|value| !value.trim().is_empty());
+        // member a later read would echo back blank. The one rule for every such member in
+        // this service lives in `crate::state::optional_free_text`.
+        let category = crate::state::optional_free_text(input.category);
+        let description = crate::state::optional_free_text(input.description);
 
         // The graph itself takes the test every stored preset's graph takes, on this door
         // as on `UpdatePreset`: a preset is the encoder settings of one output, so a graph

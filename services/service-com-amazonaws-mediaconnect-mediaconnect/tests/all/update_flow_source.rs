@@ -29,7 +29,10 @@ use crate::update_flow_output::{at_path, without_keys};
 
 /// `PUT /v1/flows/{FlowArn}/source/{SourceArn}` — the UpdateFlowSource binding
 /// (`smithy_query(query="operation",operation="UpdateFlowSource")`).
-async fn update_flow_source(
+///
+/// `pub(crate)` because `tests/all/flow_name_references.rs` moves a source's references
+/// through the same binding.
+pub(crate) async fn update_flow_source(
     emulator: &Emulator,
     flow_arn: &str,
     source_arn: &str,
@@ -323,7 +326,11 @@ async fn update_flow_source_applies_only_the_settings_the_request_carries() {
             "sources": [
                 { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16", "ingestPort": 5001 },
                 { "name": "secondary", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16", "ingestPort": 5002 }
-            ]
+            ],
+            // A source's media stream associations and its VPC interface references name
+            // sub-resources of its OWN flow, so the flow under test holds them.
+            "mediaStreams": crate::flow_outputs::held_media_streams(),
+            "vpcInterfaces": crate::flow_outputs::attached_vpc_interfaces(),
         }),
     )
     .await;

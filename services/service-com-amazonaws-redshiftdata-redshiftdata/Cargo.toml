@@ -53,6 +53,17 @@ hex = { workspace = true }
 rusqlite = { version = "0.37", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
 # Mints the `UUID`-shaped statement, query and session identifiers.
 uuid = { version = "1", features = ["v4"] }
+# `state::warehouse`: the clients this service resolves a statement's compute
+# target through, over the in-process callback into this same emulator (no network
+# client feature is enabled: the transport is the emulator's own). A provisioned
+# cluster is a resource of Amazon Redshift and a serverless workgroup one of
+# Amazon Redshift Serverless, so whether the endpoint a statement names exists is
+# a question only those services can answer.
+aws-sdk-redshift = { version = "1", default-features = false }
+aws-sdk-redshiftserverless = { version = "1", default-features = false }
+# `Service::override_refusal`: the wording AWS states a boundary constraint
+# refusal with on the JSON protocols, which every service on one shares.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -60,6 +71,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Data API tests mount the two Redshift control planes beside this service on
+# one engine, because the cluster and the workgroup a statement runs on are THEIR
+# resources: the suites create them there and then submit statements here.
+service-com-amazonaws-redshift-redshiftserviceversion20121201 = { workspace = true }
+service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
 
 [lints]
 workspace = true

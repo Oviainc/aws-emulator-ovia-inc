@@ -409,6 +409,20 @@ pub use reservations::{
     ReservationRefusal, ReservationStartRefusal, DEFAULT_AUTOMATIC_RENEWAL, MAX_RESERVATIONS,
 };
 
+/// The ENGINE VERSION slice: the encoder engine versions available to this
+/// account, which `ListVersions` reports, in one module of its own for the same
+/// reason as the slices above. Its store is the
+/// [`ComAmazonawsMedialiveMedialiveState::channel_engine_versions`] member below,
+/// seeded when the store comes up because an engine version is not a resource a
+/// caller creates, and read through at every call because which of those versions
+/// is still available is a question for the clock.
+pub mod engine_versions;
+
+pub use engine_versions::{
+    channel_engine_version_label, ChannelEngineVersionCatalog, ChannelEngineVersionRecord,
+    CHANNEL_ENGINE_VERSION_COUNT, CHANNEL_ENGINE_VERSION_INTERVAL, CHANNEL_ENGINE_VERSION_LIFETIME,
+};
+
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
 /// CREATING | CREATE_FAILED | IDLE | STARTING | RUNNING | RECOVERING | STOPPING |
@@ -2104,6 +2118,14 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `PurchaseOffering`'s `RequestId` (`@idempotencyToken`) -> the reservation
     /// it purchased. PRIVATE for the same reason as [`Self::channel_tokens`].
     reservation_tokens: IdempotencyTokens,
+    /// The account's encoder engine version catalogue, as `ListVersions` reports
+    /// the available ones out of it.
+    ///
+    /// There is no mint counter and no token map beside it: an engine version is
+    /// not a resource a caller creates, it is one the service publishes, so the
+    /// catalogue is SEEDED when this store comes up (the [`engine_versions`]
+    /// slice's own `Default`) and no request path writes it.
+    pub channel_engine_versions: ChannelEngineVersionCatalog,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {

@@ -97,6 +97,8 @@ mod protocol_type_gating;
 mod quick_create_servable_set;
 #[path = "all/refusal_message_text.rs"]
 mod refusal_message_text;
+#[path = "all/refusal_resource_identity.rs"]
+mod refusal_resource_identity;
 #[path = "all/route_deletion.rs"]
 mod route_deletion;
 #[path = "all/route_request_parameter.rs"]

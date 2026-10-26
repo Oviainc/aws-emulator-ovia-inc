@@ -280,8 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the match below.
         let record = crate::state::JobTemplateRecord {
             name,
-            category: input.category,
-            description: input.description,
+            // `Category` and `Description` are optional free text, stored by the one rule
+            // every such member in this service follows: a value that carries no
+            // characters is stored as absent rather than as a member a later read would
+            // echo back blank. See `crate::state::optional_free_text`.
+            category: crate::state::optional_free_text(input.category),
+            description: crate::state::optional_free_text(input.description),
             settings: input.settings,
             queue,
             // Service-applied when the request omits them, exactly as on a job: the

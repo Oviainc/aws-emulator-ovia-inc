@@ -85,8 +85,14 @@ use super::types::*;
 
 /// The keys `RolesMap` admits, from the modelled `RoleType`'s own pattern
 /// `^(un)?authenticated$` (`smithy_query(query="shape",shape="RolesMap")`), which the
-/// `Roles` doc states as "either \"authenticated\" or \"unauthenticated\"".
-const ROLE_TYPES: &[&str] = &["authenticated", "unauthenticated"];
+/// `Roles` doc states as "either \"authenticated\" or \"unauthenticated\"". The two keys
+/// are the store's own ([`crate::state::AUTHENTICATED_ROLE_TYPE`] /
+/// [`crate::state::UNAUTHENTICATED_ROLE_TYPE`]), so the key written here is the one a vend
+/// reads the pool's role by.
+const ROLE_TYPES: &[&str] = &[
+    crate::state::AUTHENTICATED_ROLE_TYPE,
+    crate::state::UNAUTHENTICATED_ROLE_TYPE,
+];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
