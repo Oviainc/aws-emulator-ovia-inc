@@ -33,7 +33,8 @@
 //! was, rather than reporting a report nothing holds.
 //!
 //! Besides those caller-owned records it holds the service's own data: the built-in FIS
-//! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from, and the TARGET
+//! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` and `ListActions` report from,
+//! and the TARGET
 //! RESOURCE TYPE catalog ([`TARGET_RESOURCE_TYPE_CATALOG`]) of the types those actions
 //! target, which `ListTargetResourceTypes` and `GetTargetResourceType` report from. No
 //! API creates, updates or deletes either, so both are constant tables rather than maps a
@@ -109,7 +110,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, ActionParameter, ActionTarget, ConflictException, CreateExperimentTemplateActionInput,
+    Action, ActionParameter, ActionSummary, ActionTarget, ConflictException,
+    CreateExperimentTemplateActionInput,
     CreateExperimentTemplateExperimentOptionsInput, CreateExperimentTemplateInput,
     CreateExperimentTemplateLogConfigurationInput,
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
@@ -453,6 +455,15 @@ pub const RESOLVED_TARGET_PAGE_TOKEN_PREFIX: &str = "resolvedTarget.";
 /// value this operation never issued is refused as a `ValidationException` instead of
 /// being read as a resume point.
 pub const TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX: &str = "targetResourceType.";
+
+/// The marker every `nextToken` `ListActions` issues starts with.
+///
+/// An action is named by its own published id rather than by an id this service mints, so
+/// the token carries the `ActionId` the next page resumes at behind this marker —
+/// self-describing, exactly as [`TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX`] is, so a value
+/// this operation never issued is refused as a `ValidationException` instead of being read
+/// as a resume point.
+pub const ACTION_PAGE_TOKEN_PREFIX: &str = "action.";
 
 /// The two sources a stop condition may name.
 ///
@@ -2487,6 +2498,27 @@ pub fn target_resource_type_page_token(resource_type: &str) -> String {
 pub fn target_resource_type_page_token_id(token: &str) -> Option<&str> {
     let resource_type = token.strip_prefix(TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX)?;
     target_resource_type_catalog_entry(resource_type).map(|entry| entry.id)
+}
+
+/// The `nextToken` a page of `ListActions` hands back when actions remain: the marker of
+/// [`ACTION_PAGE_TOKEN_PREFIX`] followed by the `ActionId` the next page resumes at.
+///
+/// `NextToken` is modelled `@length(min: 1, max: 1024)`, `pattern ^[\S]+$`: the marker
+/// carries no whitespace, a published action id carries none either, and the two together
+/// are far under the ceiling.
+pub fn action_page_token(id: &str) -> String {
+    format!("{ACTION_PAGE_TOKEN_PREFIX}{id}")
+}
+
+/// The `ActionId` the page token `token` resumes at, or `None` when `token` is not one
+/// [`action_page_token`] could have issued — the marker followed by an id the published
+/// catalog holds.
+///
+/// The catalog is the service's own constant data, so a token this operation issued always
+/// names an entry of it; anything else never was one of its tokens.
+pub fn action_page_token_id(token: &str) -> Option<&'static str> {
+    let id = token.strip_prefix(ACTION_PAGE_TOKEN_PREFIX)?;
+    action_catalog_entry(id).map(|entry| entry.id)
 }
 
 /// What `targets` RESOLVE to: one `ResolvedTarget` per resource a target identifies,
@@ -4789,6 +4821,35 @@ impl ActionCatalogEntry {
                     })
                     .collect(),
             ),
+            targets: Some(
+                self.targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.name.to_string(),
+                            ActionTarget {
+                                resource_type: Some(target.resource_type.to_string()),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            tags: Some(HashMap::new()),
+        }
+    }
+
+    /// The `ActionSummary` a page of `ListActions` reports for this entry, in `region`.
+    ///
+    /// A summary carries the same service-owned facts the full `Action` does, minus the
+    /// parameter contract: `ActionSummary` models `id`, `arn`, `description`, `targets` and
+    /// `tags` and no `parameters`, so a client that needs an action's parameters reads it
+    /// with `GetAction`. `tags` is an empty map for the same reason it is on the full
+    /// action: an action is service-owned, so there is nothing for a caller to have tagged.
+    pub fn to_summary(&self, region: &str) -> ActionSummary {
+        ActionSummary {
+            id: Some(self.id.to_string()),
+            arn: Some(action_arn(region, self.id)),
+            description: Some(self.description.to_string()),
             targets: Some(
                 self.targets
                     .iter()
