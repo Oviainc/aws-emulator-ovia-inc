@@ -42,16 +42,16 @@ use crate::asset_lifecycle::{call, error_code, is_modelled_id, router_with_engin
 
 /// Where every project request goes, as `OPERATIONS.md` reports the routes:
 /// `POST /projects`, `GET /projects/{projectId}`, `PUT /projects/{projectId}`.
-const PROJECTS: &str = "/projects";
+pub(crate) const PROJECTS: &str = "/projects";
 
 /// The modelled `Name` maximum length, which `projectName` targets
 /// (smithy_query query="operation" operation="UpdateProject": `projectName`
 /// (Name, len 1..256)).
-const NAME_MAX_LENGTH: usize = 256;
+pub(crate) const NAME_MAX_LENGTH: usize = 256;
 
 /// The modelled `Description` maximum length, which `projectDescription` targets
 /// (same source: `projectDescription` (Description, len 1..2048)).
-const DESCRIPTION_MAX_LENGTH: usize = 2048;
+pub(crate) const DESCRIPTION_MAX_LENGTH: usize = 2048;
 
 /// Long enough that the clock the handlers read moves between two calls, so a
 /// last-update instant that the update is supposed to advance can be asserted to
@@ -127,7 +127,7 @@ fn update_cases() -> Vec<UpdateCase> {
 }
 
 /// The body a create sends.
-fn create_body(portal_id: &str, name: &str, description: Option<&str>) -> Value {
+pub(crate) fn create_body(portal_id: &str, name: &str, description: Option<&str>) -> Value {
     let mut body = json!({ "portalId": portal_id, "projectName": name });
     if let Some(description) = description {
         body["projectDescription"] = Value::String(description.to_string());
@@ -145,7 +145,7 @@ fn update_body(name: &str, description: Option<&str>) -> Value {
 }
 
 /// `DescribeProject` on `id`.
-async fn describe_project(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe_project(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("{PROJECTS}/{id}"), None).await
 }
 
@@ -170,7 +170,11 @@ fn stored_tags(engine: &engine::InMemoryEngine, id: &str) -> Option<Vec<(String,
 }
 
 /// How many projects the store holds.
-fn stored_project_count(engine: &engine::InMemoryEngine) -> usize {
+///
+/// `pub(crate)` because the sibling `create_project` suite counts them the same
+/// way — no project reader enumerates them — so the two share one definition
+/// rather than drifting apart.
+pub(crate) fn stored_project_count(engine: &engine::InMemoryEngine) -> usize {
     let state = service_state(engine).expect("the iotsitewise store");
     let count = state.lock().projects.len();
     count
@@ -191,7 +195,7 @@ fn stored_project_names(engine: &engine::InMemoryEngine) -> Vec<String> {
 
 /// What a project's description must read back as: the string the write stated, or
 /// nothing at all when it stated none.
-fn assert_description(case: &str, described: &Value, expected: Option<&str>) {
+pub(crate) fn assert_description(case: &str, described: &Value, expected: Option<&str>) {
     match expected {
         Some(expected) => assert_eq!(
             described["projectDescription"].as_str().unwrap_or("<absent>"),
@@ -574,6 +578,13 @@ async fn a_create_naming_a_portal_that_does_not_exist_is_refused() {
             (404, "ResourceNotFoundException"),
             "case {case:?}: a create in an absent portal must be a modelled 404, \
              got {status} {answer}"
+        );
+        // The refusal names the portal the REQUEST supplied, not the one portal
+        // that does exist.
+        let message = answer["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains(case) && !message.contains(&portal_id),
+            "case {case:?}: the refusal must name the requested portal only, got {answer}"
         );
     }
 

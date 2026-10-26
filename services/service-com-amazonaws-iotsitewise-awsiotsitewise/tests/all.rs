@@ -423,6 +423,13 @@ mod describe_workspace_reads;
 #[path = "all/application_delete.rs"]
 mod application_delete;
 
+// Declared beside the suite above, for the reason the notes higher up give: the
+// sorted list and the end of this file are both where every concurrent
+// iotsitewise change puts a declaration of its own. Fold it into the sorted list
+// once the churn settles.
+#[path = "all/create_project.rs"]
+mod create_project;
+
 // Declared last, for the same reason the suites above it are: both stretches
 // higher up are where every concurrent iotsitewise change inserts a declaration
 // of its own. Fold it into the sorted list once the churn settles.
