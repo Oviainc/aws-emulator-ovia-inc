@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDaemon
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDaemon`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDaemon::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a DAEMON in a cluster, across the capacity providers the request names, and
+//! stores it so `ListDaemons` reports it.
+//!
+//! "ECS Managed Daemons is only supported for Amazon ECS Managed Instances Capacity
+//! Providers": every provider a daemon deploys onto has to be one whose
+//! `CapacityProvider$type` is `MANAGED_INSTANCES`, so a request naming any provider of
+//! another kind is refused as the invalid parameter it is and nothing is stored for it.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +209,260 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDaemon` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDaemonErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDaemon"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDaemonErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The name of the daemon. Up to 255 letters (uppercase and lowercase), numbers,
+        // underscores, and hyphens are allowed."
+        if !crate::state::is_valid_name(&input.daemon_name) {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "daemonName must be 1 to {} letters, numbers, underscores or \
+                         hyphens; got {:?}",
+                        crate::state::MAX_NAME_LENGTH,
+                        input.daemon_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "It must be unique and is case sensitive. Up to 36 ASCII characters in the
+        // range of 33-126 (inclusive) are allowed."
+        if let Some(message) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_violation)
+        {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A caller-supplied tag may not write into the namespace Amazon Web Services
+        // keeps for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "Amazon ECS deploys exactly one daemon task on each container instance of the
+        // specified capacity providers": the providers ARE the capacity the daemon runs
+        // on, so a request that names none describes no deployment at all.
+        if input.capacity_provider_arns.is_empty() {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "capacityProviderArns must name at least one capacity provider"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // The list is caller-supplied and every entry costs a lookup, so it is bounded
+        // HERE, before any per-entry work: a daemon's providers all belong to the one
+        // cluster it is created in, which holds at most this many of them.
+        if input.capacity_provider_arns.len() > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "capacity providers",
+                        crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The Amazon Resource Name (ARN) of the cluster to create the daemon in"; a
+        // request that names none takes the default cluster, like every other `cluster`
+        // member of this service.
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster_arn.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(CreateDaemonErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        // Every entry of `capacityProviderArns` is resolved against the providers this
+        // account holds, and each one has to be a MANAGED INSTANCES provider: "ECS
+        // Managed Daemons is only supported for Amazon ECS Managed Instances Capacity
+        // Providers". A provider of any other kind — the Fargate providers Amazon ECS
+        // publishes, or one bound onto a caller's Auto Scaling group — cannot carry a
+        // daemon, so the whole call is refused and nothing is stored.
+        let mut capacity_provider_names = Vec::with_capacity(input.capacity_provider_arns.len());
+        for reference in &input.capacity_provider_arns {
+            let name = crate::state::capacity_provider_name_from_reference(reference);
+            let Some(provider) = guard.capacity_provider(&name, &region) else {
+                return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "capacityProviderArns names capacity provider {name:?}, which \
+                             this account does not hold"
+                        )),
+                    },
+                )
+                .into());
+            };
+            if provider.provider_type.as_deref()
+                != Some(crate::state::CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES)
+            {
+                return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::DAEMON_MANAGED_INSTANCES_REQUIRED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            capacity_provider_names.push(provider.name);
+        }
+
+        // "The Amazon Resource Name (ARN) of the daemon task definition to use for the
+        // daemon": the revision is resolved ONCE, here, so a registration made later in
+        // the same family does not move the daemon onto it.
+        let reference = input.daemon_task_definition_arn.as_str();
+        let Some((family, revision)) =
+            crate::state::parse_daemon_task_definition_reference(reference)
+        else {
+            return Err(CreateDaemonErrorModeled::ClientException(ClientException {
+                message: Some(crate::state::daemon_task_definition_reference_message(
+                    reference,
+                )),
+            })
+            .into());
+        };
+        let resolved = match revision {
+            Some(revision) => guard.daemon_task_definitions.get(&(family, revision)),
+            // A reference that names no revision takes the latest ACTIVE one, as the
+            // family alone does everywhere this resource is read.
+            None => guard.latest_active_daemon_revision(&family),
+        };
+        let Some(resolved) = resolved else {
+            return Err(CreateDaemonErrorModeled::ClientException(ClientException {
+                message: Some(
+                    crate::state::DAEMON_TASK_DEFINITION_NOT_FOUND_TO_RUN_MESSAGE.to_string(),
+                ),
+            })
+            .into());
+        };
+        // A revision whose delete has been requested or carried out is still readable but
+        // can run no new work, so it names an existing resource in a status this call
+        // cannot accept — a bad parameter rather than an unknown identifier.
+        if resolved.status != crate::state::DAEMON_TASK_DEFINITION_ACTIVE {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::DAEMON_TASK_DEFINITION_INACTIVE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let daemon_task_definition_arn = resolved.arn.clone();
+
+        // A daemon ARN carries its cluster and its name, so it is the key a daemon of
+        // this name in this cluster is held under.
+        let arn = crate::state::daemon_arn(&region, &cluster_name, &input.daemon_name);
+        if let Some(existing) = guard.daemons.get(&arn) {
+            // "An identifier that you provide to ensure the idempotency of the request":
+            // the same token on the same daemon is the SAME create, so the stored record
+            // is reported back unchanged and no second deployment is minted.
+            if input.client_token.is_some() && existing.client_token == input.client_token {
+                return Ok(CreateDaemonOutput {
+                    daemon_arn: Some(existing.arn.clone()),
+                    status: Some(existing.status.clone()),
+                    created_at: Some(existing.created_at),
+                    deployment_arn: Some(existing.deployment_arn.clone()),
+                });
+            }
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "daemon {:?} already exists in cluster {cluster_name:?}",
+                        input.daemon_name
+                    )),
+                },
+            )
+            .into());
+        } else if guard.daemons.len() >= crate::state::MAX_DAEMONS {
+            return Err(CreateDaemonErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} daemons; delete one before creating \
+                     another",
+                    crate::state::MAX_DAEMONS
+                )),
+            })
+            .into());
+        }
+
+        let created_at = crate::state::now();
+        // "The Amazon Resource Name (ARN) of the initial daemon deployment": the create
+        // mints it with the daemon, so the daemon and the response name the same one.
+        let deployment_arn =
+            guard.next_daemon_deployment_arn(&region, &cluster_name, &input.daemon_name);
+        let record = crate::state::DaemonRecord {
+            name: input.daemon_name.clone(),
+            arn: arn.clone(),
+            cluster_name: cluster_name.clone(),
+            cluster_arn,
+            // "The status of the daemon": a created daemon is there and usable, so it is
+            // reported ACTIVE from this instant.
+            status: crate::state::DAEMON_ACTIVE.to_string(),
+            daemon_task_definition_arn,
+            capacity_provider_names,
+            deployment_configuration: input.deployment_configuration.clone(),
+            // "If you don't specify a value, the tags aren't propagated."
+            propagate_tags: input
+                .propagate_tags
+                .clone()
+                .unwrap_or_else(|| crate::state::PROPAGATE_TAGS_NONE.to_string()),
+            enable_ecs_managed_tags: input.enable_ecs_managed_tags,
+            enable_execute_command: input.enable_execute_command,
+            // "The default value is true."
+            critical: input
+                .critical
+                .unwrap_or(crate::state::DAEMON_CRITICAL_DEFAULT),
+            tags: input.tags.clone().unwrap_or_default(),
+            client_token: input.client_token.clone(),
+            deployment_arn: deployment_arn.clone(),
+            created_at,
+            // Nothing has updated the daemon yet, so it was last changed when it was
+            // created.
+            updated_at: created_at,
+        };
+        guard.daemons.insert(arn.clone(), record);
+
+        Ok(CreateDaemonOutput {
+            daemon_arn: Some(arn),
+            status: Some(crate::state::DAEMON_ACTIVE.to_string()),
+            created_at: Some(created_at),
+            deployment_arn: Some(deployment_arn),
+        })
     }
 }
