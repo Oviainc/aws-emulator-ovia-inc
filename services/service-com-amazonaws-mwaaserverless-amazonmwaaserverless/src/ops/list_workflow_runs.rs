@@ -257,9 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run.settle(now);
         }
 
-        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
-        // this handler runs, so the value is already a usable page size.
-        let page_size = usize::try_from(input.max_results).unwrap_or(0);
+        // The page size this walk serves, through the one derivation every paginated
+        // listing of this service shares (`crate::state::page_size`).
+        let page_size = crate::state::page_size(input.max_results);
 
         // `WorkflowVersion` is a FILTER, not a resolution: "If not specified, runs for
         // all versions are returned" (`smithy_query(query="operation",

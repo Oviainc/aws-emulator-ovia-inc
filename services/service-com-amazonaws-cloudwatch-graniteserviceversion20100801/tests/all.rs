@@ -27,6 +27,8 @@ mod alarm_history;
 mod alarm_history_data;
 #[path = "all/alarm_reason_datapoints.rs"]
 mod alarm_reason_datapoints;
+#[path = "all/anomaly_detectors.rs"]
+mod anomaly_detectors;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
 #[path = "all/dashboards.rs"]

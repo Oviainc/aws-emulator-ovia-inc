@@ -169,6 +169,49 @@ pub fn malformed_tag_key_message(path: &str) -> String {
     )])
 }
 
+/// The input path a `tags` list's key occupies, in the framework's own input-path form:
+/// the `tags` member, the step into one element (`member`), then that element's `key`.
+const TAGS_MEMBER_KEY_PATH: &str = "tags.member.key";
+
+/// The input path a `tagKeys` list's element occupies: the list holds the keys
+/// themselves, so the path stops at the step into one element.
+const TAG_KEYS_MEMBER_PATH: &str = "tagKeys.member";
+
+/// The refusal a sequence of tag keys carried at input path `path` earns, or `None` when
+/// every one of them satisfies [`TAG_KEY_PATTERN`].
+///
+/// The scan itself — WHICH keys are looked at, and what a malformed one reads as — lives
+/// here once, so the operations that accept a tag key cannot come to disagree about the
+/// rule (whether an empty list is refusable, whether the first offender or every offender
+/// is reported, how the member is named).
+fn malformed_tag_key_refusal_at<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    path: &str,
+) -> Option<String> {
+    keys.into_iter()
+        .any(|key| !tag_key_is_well_formed(key))
+        .then(|| malformed_tag_key_message(path))
+}
+
+/// The refusal a `tags` list earns, or `None` when every key in it is well formed.
+///
+/// The single home of the rule for the operations that accept whole tags
+/// (`InvokeDataAutomationAsync` and `TagResource`), which differ only in whether the
+/// member is optional — an absent list is an empty slice, and carries no key to refuse.
+pub fn malformed_tag_refusal(tags: &[Tag]) -> Option<String> {
+    malformed_tag_key_refusal_at(tags.iter().map(|tag| tag.key.as_str()), TAGS_MEMBER_KEY_PATH)
+}
+
+/// The refusal a `tagKeys` list earns, or `None` when every key in it is well formed:
+/// the same rule as [`malformed_tag_refusal`], for the operation that carries bare keys
+/// (`UntagResource`) and so names a different input path.
+pub fn malformed_tag_key_refusal(tag_keys: &[String]) -> Option<String> {
+    malformed_tag_key_refusal_at(
+        tag_keys.iter().map(String::as_str),
+        TAG_KEYS_MEMBER_PATH,
+    )
+}
+
 /// Why a submission that names neither a data-automation project nor an inline blueprint
 /// is refused.
 ///

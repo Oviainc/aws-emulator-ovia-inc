@@ -755,6 +755,10 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// expiration date either: both are facts about the submitted certificate,
     /// which nothing here reads.
     ///
+    /// The accounts the submission addresses are the ids it names, each once
+    /// ([`distinct_account_ids`]): one record per addressed account, whatever
+    /// number of times the list repeats its id.
+    ///
     /// `accountIds` is caller-supplied (up to 550 ids per call), so a submission
     /// that would ADD records past [`MAX_STORED_EXEMPTIONS`] is refused whole,
     /// before any record is written: a partially applied submission would report
@@ -773,7 +777,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         recorded_at: SystemTime,
     ) -> Result<(), CaseCreationLimitExceededException> {
         let description = exemption_type.1;
-        let distinct: BTreeSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let distinct = distinct_account_ids(account_ids);
         let additional = distinct
             .iter()
             .filter(|account_id| {
@@ -1248,6 +1252,37 @@ fn document_metadatas(
 /// member of this service.
 pub fn resolve_account_id(account_id: Option<String>) -> String {
     account_id.unwrap_or_else(|| ::engine::emulator_account_id().to_string())
+}
+
+/// The accounts an `accountIds` list addresses: each id once, in the order it
+/// first appears in the request.
+///
+/// Every `accountIds` member of this service is documented "List of unique
+/// account identifiers", so an id named more than once names the SAME account
+/// and the SAME single action on it: the caller walking this list acts on each
+/// addressed account once rather than a second time against the record this very
+/// call just wrote or removed — which, for a batch, would report the action it
+/// performed as having failed in the response that performed it.
+///
+/// First-seen order, so a response built while walking the list (the per-account
+/// rows of a batch's `errors` list) reports the accounts in the order the request
+/// named them.
+///
+/// The one place that rule is stated, beside [`resolve_account_id`] — the one
+/// place an addressed account is normalised: every operation whose input carries
+/// an `accountIds` list addresses its accounts through here, as does
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::store_exemptions`], the write one
+/// of them performs, so none of them can disagree about what a repeated id
+/// means.
+pub fn distinct_account_ids(account_ids: &[String]) -> Vec<&str> {
+    let mut addressed: BTreeSet<&str> = BTreeSet::new();
+    let mut distinct: Vec<&str> = Vec::with_capacity(account_ids.len());
+    for account_id in account_ids {
+        if addressed.insert(account_id.as_str()) {
+            distinct.push(account_id.as_str());
+        }
+    }
+    distinct
 }
 
 /// This service's modelled `ValidationException` (HTTP 400) naming the member it

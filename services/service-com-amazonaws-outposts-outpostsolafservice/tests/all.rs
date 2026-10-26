@@ -61,6 +61,8 @@ mod private_connectivity_ownership;
 mod quote_lifecycle;
 #[path = "all/quote_listing.rs"]
 mod quote_listing;
+#[path = "all/quote_store_bound.rs"]
+mod quote_store_bound;
 #[path = "all/quote_update.rs"]
 mod quote_update;
 #[path = "all/regional_scope.rs"]

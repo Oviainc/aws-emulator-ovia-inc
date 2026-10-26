@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDistribution"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE — the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together and says to set the Region to
+        // us-east-1 "to create, view, or edit these resources" — so the Region
+        // the request was signed for decides whether this call is served at all.
+        // Checked through the crate's one owner of that rule, BEFORE anything is
+        // read or written, so a refused request deletes nothing.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `distributionName` carries the modelled `ResourceName` pattern, which
+        // the centralized walk already refused anything outside of, but the
+        // model does not make it `@required`. What is left is what the model
+        // cannot express: this call deletes ONE distribution ("the name of the
+        // distribution to delete"), and it documents no behaviour for an
+        // omitted name — with none there is no distribution to delete, and
+        // removing every distribution of the account is not what was asked.
+        let Some(name) = input.distribution_name else {
+            return Err(invalid(
+                "distributionName is required to delete a distribution".to_string(),
+            ));
+        };
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A distribution is a GLOBAL resource, held by name alone, so the
+            // name addresses the one record this call removes whichever Region
+            // the served request was signed for. Removing the record removes
+            // everything that lives on it — the origin, the cache behaviours and
+            // their settings, the tags, the certificate attachment and the last
+            // reset of its cached content — and leaves the certificate itself,
+            // which is a resource of its own, merely released.
+            //
+            // A well-formed name that names nothing is the service's
+            // `DoesNotExist` rejection, the same one every other reader and
+            // writer of a distribution answers, so a second delete of the same
+            // distribution fails rather than reporting a deletion that did not
+            // happen.
+            let Some(deleted) = store.remove_distribution(&name) else {
+                return Err(not_found(&name));
+            };
+            // The record is gone as this call returns — there is no distribution
+            // left for a status to settle on — so the entry this delete logs is
+            // answered terminal, unlike the create's, which stays outstanding
+            // until the deployment the clock owes the new distribution is due.
+            // The entry is located where the distribution was.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_DISTRIBUTION,
+                crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                &name,
+                &deleted.location,
+                None,
+            );
+            Ok(DeleteDistributionOutput {
+                // This operation's output carries a single `operation`, not a
+                // list: exactly one distribution was deleted.
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message states the
+/// rule the request broke.
+fn invalid(message: String) -> DeleteDistributionError {
+    DeleteDistributionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No distribution of that name is stored, so there is nothing for this delete
+/// to remove: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> DeleteDistributionError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_DISTRIBUTION,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteDistributionError {
+    DeleteDistributionErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

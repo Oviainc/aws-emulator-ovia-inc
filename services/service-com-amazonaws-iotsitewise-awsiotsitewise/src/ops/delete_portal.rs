@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the portal the request names from the store, together with the
+//! projects and dashboards it holds, and reports the `DELETING` state the operation
+//! documents.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +148,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePortalError::Modeled(DeletePortalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> request mapping, so a retry carrying the token of a delete that
+        // already removed the portal is a not-found refusal rather than a replayed
+        // answer. Deliberately left to the idempotency issue rather than half-done
+        // here, exactly as `CreatePortal` leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // The portal goes, and with it everything this service holds only as a part
+        // of it: the projects created in it and those projects' dashboards, so no
+        // later read can still resolve to a Monitor resource whose portal is gone.
+        // The access policies that name the portal or one of its projects are left
+        // alone, as `DeleteProject` leaves the ones naming the project it removes.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePortal"))
+        // A portal is addressed by its own id, so an id this store holds no portal
+        // under is the modelled 404 — and nothing is removed for it, because the
+        // removal is what reports the absence.
+        if store.forget_portal(&input.portal_id).is_none() {
+            return Err(not_found(&input.portal_id));
+        }
+
+        Ok(DeletePortalOutput {
+            // "The status of the portal, which contains a state (DELETING after
+            // successfully calling this operation) and any error message" — and no
+            // error, because nothing about this delete failed.
+            portal_status: PortalStatus {
+                state: crate::state::STATE_DELETING.to_string(),
+                error: None,
+            },
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the portal the request addressed, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(portal_id: &str) -> DeletePortalError {
+    DeletePortalError::Modeled(DeletePortalErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PORTAL, portal_id),
+        },
+    ))
 }

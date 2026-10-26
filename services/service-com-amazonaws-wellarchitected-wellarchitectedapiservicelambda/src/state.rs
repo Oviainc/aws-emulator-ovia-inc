@@ -24,7 +24,7 @@
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
 //! lenses beside the AWS-official lens this emulator ships. The Well-Architected
-//! Tool profiles (`CreateProfile`, `GetProfile`, `ListProfiles`) are backed the same way, each keyed by the
+//! Tool profiles (`CreateProfile`, `GetProfile`, `UpdateProfile`, `ListProfiles`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
@@ -4173,8 +4173,24 @@ pub struct CreateReviewTemplateToken {
 /// is the SERVICE's own counter over a profile's revisions, not a value a request
 /// carries. A profile nothing has revised yet is at its first revision, and `1`
 /// satisfies the modelled `ProfileVersion` (`@length(1, 32)`, `^[A-Za-z0-9-]+$`).
-/// Minting the next one belongs to `UpdateProfile`, still a stub with its own issue.
+/// Minting the next one belongs to `UpdateProfile` ([`next_profile_version`]).
 pub const INITIAL_PROFILE_VERSION: &str = "1";
+
+/// The version a revision of a profile moves it to: the next value of the service's own
+/// counter over that profile's revisions.
+///
+/// A profile's version is that counter — [`INITIAL_PROFILE_VERSION`] for a profile nothing
+/// has revised, and one more for each revision after it — so the next version is the
+/// current count plus one, which is what a workload reviewed against the earlier version
+/// is then behind by (`ProfileNotificationSummary$CurrentProfileVersion` against
+/// `$LatestProfileVersion`). Only this service writes the member, so a stored version that
+/// is not a count has none to advance and the counter starts over at the first revision.
+pub fn next_profile_version(current: &str) -> String {
+    current.parse::<u64>().map_or_else(
+        |_| INITIAL_PROFILE_VERSION.to_string(),
+        |count| count.saturating_add(1).to_string(),
+    )
+}
 
 /// The most Well-Architected Tool profiles this emulator holds for its one account and
 /// Region.
@@ -4201,6 +4217,57 @@ pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
 /// The modelled input member a profile-question finding names
 /// (`CreateProfileInput$ProfileQuestions` / `UpdateProfileInput$ProfileQuestions`).
 pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
+
+/// The question answers a request's `ProfileQuestionUpdates` record, keyed by the question
+/// each update answers — or the modelled `ValidationException` (HTTP 400) for an entry no
+/// profile can record.
+///
+/// The updates are answers to questions, so each one is recorded UNDER the question it
+/// answers (`ProfileQuestionUpdate$QuestionId`): the request's list becomes the map a
+/// profile holds. Two entries the model allows cannot be recorded that way, and both are
+/// refused rather than silently dropped or merged: an update that names no question
+/// (`QuestionId` is optional) answers nothing, and two updates naming the SAME question
+/// disagree about one answer. The selected choices, by contrast, are a SET — "the selected
+/// choices" — so a choice is either selected or not and naming one twice in one update
+/// selects it once.
+///
+/// Shared by the two operations that record a profile's answers from this member
+/// (`CreateProfile` and `UpdateProfile`), so neither can normalise or refuse one
+/// differently; the refusal is worded the way the framework's own constraint walk words a
+/// member failure ([`member_constraint_exception`]), so a handler-enforced rule reads like
+/// a modelled one.
+pub fn recorded_profile_questions(
+    updates: &[crate::ops::types::ProfileQuestionUpdate],
+) -> Result<BTreeMap<String, BTreeSet<String>>, crate::ops::types::ValidationException> {
+    let mut questions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for update in updates {
+        let question_id = update.question_id.as_deref().unwrap_or_default();
+        if question_id.is_empty() {
+            return Err(member_constraint_exception(
+                PROFILE_QUESTIONS_MEMBER,
+                "Member must name the question it answers in QuestionId",
+            ));
+        }
+        if questions.contains_key(question_id) {
+            return Err(member_constraint_exception(
+                PROFILE_QUESTIONS_MEMBER,
+                &format!(
+                    "Member must answer each question at most once, got {question_id} twice"
+                ),
+            ));
+        }
+        questions.insert(
+            question_id.to_string(),
+            update
+                .selected_choice_ids
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        );
+    }
+    Ok(questions)
+}
 
 /// `ProfileOwnerType$SELF`: a profile the CALLING account owns
 /// (`smithy_query(query="shape", shape="ProfileOwnerType")`, which publishes `SELF` and

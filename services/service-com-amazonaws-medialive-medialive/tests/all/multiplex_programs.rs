@@ -729,14 +729,14 @@ async fn naming_a_multiplex_or_program_that_does_not_exist_is_refused() {
             "a program name no program has",
             "",
             "no-such-program",
-            "MultiplexProgram",
+            "Multiplex program",
             "no-such-program",
         ),
         (
             "a program name that is another multiplex's",
             "",
             "other",
-            "MultiplexProgram",
+            "Multiplex program",
             "other",
         ),
     ];
@@ -748,6 +748,14 @@ async fn naming_a_multiplex_or_program_that_does_not_exist_is_refused() {
             multiplex_id.as_str()
         } else {
             named_multiplex
+        };
+        // A program has no identifier of its own, so a refusal about one names
+        // it by the multiplex it would live in together with its name, which is
+        // also how its URI names it.
+        let identifier = if resource_type == "Multiplex program" {
+            format!("{named_multiplex}/{identifier}")
+        } else {
+            identifier.to_string()
         };
 
         let (status, body) = describe_program(&router, named_multiplex, program_name).await;

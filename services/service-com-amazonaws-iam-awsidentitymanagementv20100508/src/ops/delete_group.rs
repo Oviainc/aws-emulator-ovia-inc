@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +156,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: it "deletes the specified IAM group", so the lock is held for
+        // write across the lookup and the removal.
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the delete finds the
+        // group under the case-folded name whatever case the request spelled it in —
+        // the key `CreateGroup` stored it under.
+        let key = crate::state::name_key(&input.group_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before the store changes, and before the answer to the lookup
+        // is given away — a caller that may not delete this group learns that it may
+        // not, never whether the group exists. The decision is made on the ARN of the
+        // group the request addresses: the held group's own ARN, or, for a name the
+        // account holds no group under, the ARN that name would carry at the default
+        // path, since there is no other path to attribute it to. A refusal names the
+        // group as the request named it (`group Admins`) rather than by ARN.
+        let resource = store.groups.get(&key).map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_GROUP,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
+        // Only a group the account holds can be deleted: a name it holds none under
+        // names no group, which is the modelled client error this operation declares.
+        // The stored name is what the audit line below reports, because the request may
+        // have spelled it in another case.
+        let Some(group_name) = store.groups.get(&key).map(|group| group.group_name.clone()) else {
+            return Err(DeleteGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The group must not contain any users or have any attached policies": a group
+        // that still holds a subordinate entity is NOT deleted, and the caller is told
+        // with the modelled `DeleteConflictException` ("attempted to delete a resource
+        // that has attached subordinate entities") so nothing is removed behind its
+        // back. An inline policy embedded by `PutGroupPolicy` is such an entity and is
+        // what the account can hold today; a membership (`AddUserToGroup`) and a
+        // managed-policy attachment (`AttachGroupPolicy`) are still scaffolded and so
+        // persist nothing, and the check for each belongs with whichever of them first
+        // does.
+        let embeds_policies = store
+            .group_inline_policies
+            .get(&key)
+            .is_some_and(|policies| !policies.is_empty());
+        if embeds_policies {
+            return Err(DeleteGroupErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some("Cannot delete entity, must delete policies first.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        store.groups.remove(&key);
+        // The group embedded no policy, so this only drops an empty leftover entry: a
+        // later group of the same name must not look as though it inherited one.
+        store.group_inline_policies.remove(&key);
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // removed, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteGroup",
+            outcome = "deleted",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            group_name = %group_name,
+            "a group was deleted"
+        );
+        Ok(DeleteGroupOutput)
     }
 }

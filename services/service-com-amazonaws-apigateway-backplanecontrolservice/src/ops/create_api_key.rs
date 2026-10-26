@@ -344,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // share one. That is the conflict `ConflictException` states for this operation.
         if store.api_keys.values().any(|key| key.value == value) {
             return Err(CreateApiKeyErrorModeled::ConflictException(ConflictException {
-                message: Some("An API Key already exists for the given value".to_string()),
+                message: Some("API Key already exists".to_string()),
             })
             .into());
         }

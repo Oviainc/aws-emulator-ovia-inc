@@ -19,6 +19,12 @@
 //!   `invalid-configuration`. It is also the answer when there is no routing endpoint to
 //!   compare against.
 //!
+//! The scope is the domains the distribution tenant HOLDS. A `Domain` argument the resolved
+//! tenant does not hold names nothing this tenant has a DNS configuration for, so the whole
+//! call is REFUSED with `InvalidArgument` (HTTP 400) rather than answered with a status for
+//! a name the tenant never carried; a string of no domain shape at all is one such name, so
+//! that single membership check covers it.
+//!
 //! The names this service can resolve are the ones it is authoritative for and MINTED
 //! ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::resolved_cloudfront_endpoint`]):
 //! a name in a customer's own zone is published by DNS this emulator neither runs nor
@@ -125,12 +131,19 @@ impl From<VerifyDnsConfigurationErrorModeled> for VerifyDnsConfigurationError {
     }
 }
 
-/// This operation's modelled refusal for a request whose arguments name no domain this
-/// service can verify — "An argument is invalid." — carrying the reason the argument was
-/// unusable.
-fn invalid_argument(reason: String) -> VerifyDnsConfigurationError {
+/// The message CloudFront answers a `Domain` argument the named distribution tenant does
+/// not hold with. FIXED text: it names neither the domain asked about nor the tenant, so
+/// nothing of the request is interpolated into it.
+const DOMAIN_NOT_ASSOCIATED: &str = "The specified domain name isn't associated with the \
+                                     distribution tenant. Specify another domain name and \
+                                     try again.";
+
+/// This operation's modelled refusal (`InvalidArgument`, HTTP 400) for a `Domain` argument
+/// that is not one of the resolved distribution tenant's domains — a name this tenant has
+/// no DNS configuration to report on, whatever shape that name has.
+fn domain_not_associated() -> VerifyDnsConfigurationError {
     VerifyDnsConfigurationErrorModeled::InvalidArgument(InvalidArgument {
-        message: Some(format!("An argument is invalid: {reason}")),
+        message: Some(DOMAIN_NOT_ASSOCIATED.to_string()),
     })
     .into()
 }
@@ -227,16 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // "The domain name that you're verifying": a name that is no domain name at all
-        // names nothing to verify. Decided BEFORE the store lock is taken — it is a
-        // property of the request alone — under the service's ONE rule for the shape of a
-        // domain name, the same one the calls that associate a domain apply.
-        if let Some(domain) = &input.domain {
-            if let Some(reason) = crate::state::domain_name_refusal(domain) {
-                return Err(invalid_argument(reason));
-            }
-        }
-
         let mut store = state.lock();
         // Materialise the propagation the clock already owes, so the records this read
         // compares are the ones they are at this instant.
@@ -255,7 +258,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::MAX_DOMAINS_PER_TENANT`]) rather than by a length the caller
         // chose, so no request can make this walk — one store lookup per domain — grow.
         let domains: Vec<String> = match &input.domain {
-            Some(domain) => vec![domain.clone()],
+            // "The domain name that you're verifying" is verified against the tenant it is
+            // asked about: a name that tenant does not hold has no DNS configuration under
+            // it to report, so the whole call is refused rather than answered. A name of no
+            // domain shape at all is one such name — no tenant can hold it — so this one
+            // check covers it too. Compared as DNS names are, case-insensitively.
+            Some(domain) => {
+                if !tenant.holds_domain(domain) {
+                    return Err(domain_not_associated());
+                }
+                vec![domain.clone()]
+            }
             None => tenant.domains.clone(),
         };
         // The endpoint every domain in scope is compared against: the routing endpoint of

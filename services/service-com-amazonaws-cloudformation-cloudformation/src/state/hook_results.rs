@@ -6,9 +6,13 @@
 //! A Hook invocation result is a record of its own, not part of a stack: `ListHookResults`
 //! "returns summaries of invoked Hooks" for the whole account and Region, filtered by the
 //! Hook (`TypeArn`, optionally with `Status`) or by the invocation TARGET (`TargetId` with
-//! `TargetType`). Everything either read reports therefore lives on one
+//! `TargetType`), and `GetHookResult` "retrieves detailed information and remediation
+//! guidance for a Hook invocation result" — ONE record, addressed by its
+//! `HookResultId`. Everything either read reports therefore lives on one
 //! [`StoredHookResult`], so a read computes its answer from the record rather than from the
-//! request.
+//! request: the summary members `ListHookResults` reports, plus the ones only the detailed
+//! read carries ([`StoredHookResult::original_type_name`], [`StoredHookResult::target`] and
+//! [`StoredHookResult::annotations`]).
 //!
 //! ## What writes it
 //!
@@ -34,6 +38,15 @@ use std::time::SystemTime;
 /// for an invocation result, so this is a COUNT rather than an age: a bound on the store,
 /// not a claim about how long the real service keeps a result.
 pub const MAX_HOOK_RESULTS: usize = 500;
+
+/// How many annotations ONE invocation result keeps, oldest reclaimed first.
+///
+/// A record's annotations are a growth site of their own — an invocation produces one per
+/// piece of "additional information and guidance" its evaluation reports — so the count is
+/// bounded beside [`MAX_HOOK_RESULTS`]. The model documents no quota on the list
+/// (`AnnotationList` carries no `@length`), so this is a bound on the store rather than a
+/// claim about the real service.
+pub const MAX_ANNOTATIONS_PER_RESULT: usize = 50;
 
 /// The model's `HookStatus` enum: "HOOK_IN_PROGRESS: The Hook is currently running.
 /// HOOK_COMPLETE_SUCCEEDED: The Hook completed successfully. HOOK_COMPLETE_FAILED: The Hook
@@ -71,6 +84,110 @@ pub mod invocation_point {
 pub mod failure_mode {
     pub const FAIL: &str = "FAIL";
     pub const WARN: &str = "WARN";
+}
+
+/// The model's `HookTargetAction` enum: "the action that invoked the Hook"
+/// (`smithy_query(query="shape", shape="HookTargetAction")`).
+pub mod target_action {
+    pub const CREATE: &str = "CREATE";
+    pub const UPDATE: &str = "UPDATE";
+    pub const DELETE: &str = "DELETE";
+    pub const IMPORT: &str = "IMPORT";
+}
+
+/// The model's `AnnotationStatus` enum: "the status of the Hook invocation from the
+/// downstream service" (`smithy_query(query="shape", shape="AnnotationStatus")`).
+pub mod annotation_status {
+    pub const PASSED: &str = "PASSED";
+    pub const FAILED: &str = "FAILED";
+    pub const SKIPPED: &str = "SKIPPED";
+}
+
+/// The model's `AnnotationSeverityLevel` enum: "the relative risk associated with any
+/// violations of this type"
+/// (`smithy_query(query="shape", shape="AnnotationSeverityLevel")`).
+pub mod annotation_severity_level {
+    pub const INFORMATIONAL: &str = "INFORMATIONAL";
+    pub const LOW: &str = "LOW";
+    pub const MEDIUM: &str = "MEDIUM";
+    pub const HIGH: &str = "HIGH";
+    pub const CRITICAL: &str = "CRITICAL";
+}
+
+/// The TARGET one invocation was evaluated against, as the modelled `HookTarget` reports
+/// it: "information about the target of the Hook invocation", whose four members the model
+/// all marks `@required`.
+///
+/// Distinct from [`StoredHookResult::target_type`] / [`StoredHookResult::target_id`], which
+/// are the invocation's `ListHookResultsTargetType` target (the change set or Cloud Control
+/// operation the invocation belongs to): this is the single RESOURCE the Hook's evaluation
+/// ran against, the way a planned invocation's `ResourceTargetDetails` names one
+/// ([`crate::state::change_set_hooks`]).
+#[derive(Debug, Clone)]
+pub struct StoredHookTarget {
+    /// `TargetType`: "the target type", the model's `HookTargetType`
+    /// ([`crate::state::change_set_hooks::target_type`], which is that same enum).
+    pub target_type: String,
+    /// `TargetTypeName`: "the target name, for example, `AWS::S3::Bucket`".
+    pub target_type_name: String,
+    /// `TargetId`: "the unique identifier of the Hook invocation target".
+    pub target_id: String,
+    /// `Action`: [`target_action`].
+    pub action: String,
+}
+
+impl StoredHookTarget {
+    /// The target of one invocation: the resource type and id the Hook was evaluated
+    /// against, and the action that invoked it.
+    pub fn new(
+        target_type_name: impl Into<String>,
+        target_id: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
+        Self {
+            target_type: crate::state::change_set_hooks::target_type::RESOURCE.to_string(),
+            target_type_name: target_type_name.into(),
+            target_id: target_id.into(),
+            action: action.into(),
+        }
+    }
+}
+
+/// ONE annotation of an invocation result, as the modelled `Annotation` reports it: "a
+/// `GetHookResult` call returns detailed information and remediation guidance from Control
+/// Tower, Guard, Lambda, or custom Hooks for a Hook invocation result."
+#[derive(Debug, Clone)]
+pub struct StoredAnnotation {
+    /// `AnnotationName`: "an identifier for the evaluation logic that was used when
+    /// invoking the Hook" — the control id, the rule id, or the Hook's own identifier.
+    pub annotation_name: Option<String>,
+    /// `Status`: [`annotation_status`].
+    pub status: Option<String>,
+    /// `StatusMessage`: "the explanation for the specific status assigned to this Hook
+    /// invocation".
+    pub status_message: Option<String>,
+    /// `RemediationMessage`: "suggests what to change if your Hook returns a `FAILED`
+    /// status".
+    pub remediation_message: Option<String>,
+    /// `RemediationLink`: "a URL that you can access for additional remediation guidance".
+    pub remediation_link: Option<String>,
+    /// `SeverityLevel`: [`annotation_severity_level`].
+    pub severity_level: Option<String>,
+}
+
+impl StoredAnnotation {
+    /// The annotation `annotation_name`'s evaluation produced, in `status`, with the
+    /// guidance members left for a caller to fill in.
+    pub fn new(annotation_name: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            annotation_name: Some(annotation_name.into()),
+            status: Some(status.into()),
+            status_message: None,
+            remediation_message: None,
+            remediation_link: None,
+            severity_level: None,
+        }
+    }
 }
 
 /// ONE recorded Hook invocation, carrying every member `HookResultSummary` reports and the
@@ -111,6 +228,16 @@ pub struct StoredHookResult {
     /// `HookExecutionTarget`: "the Amazon Resource Name (ARN) of the target stack or
     /// request token of the Cloud Control API operation".
     pub hook_execution_target: Option<String>,
+    /// `OriginalTypeName`: "the original public type name of the Hook when an alias is
+    /// used", which only an invocation of an aliased Hook carries.
+    pub original_type_name: Option<String>,
+    /// `Target`: "information about the target of the Hook invocation", reported by the
+    /// detailed read only.
+    pub target: Option<StoredHookTarget>,
+    /// `Annotations`: "a list of objects with additional information and guidance that can
+    /// help you resolve a failed Hook invocation", bounded by
+    /// [`MAX_ANNOTATIONS_PER_RESULT`].
+    pub annotations: Vec<StoredAnnotation>,
 }
 
 impl StoredHookResult {
@@ -143,7 +270,16 @@ impl StoredHookResult {
             target_type: target_type.into(),
             target_id: target_id.into(),
             hook_execution_target: None,
+            original_type_name: None,
+            target: None,
+            annotations: Vec::new(),
         }
+    }
+
+    /// Whether this record is the one `hook_result_id` addresses: "the unique identifier
+    /// (ID) of the Hook invocation result that you want details about."
+    pub fn has_id(&self, hook_result_id: &str) -> bool {
+        self.hook_result_id == hook_result_id
     }
 
     /// Whether this record is one the `TypeArn` filter selects: "Filters results by the ARN

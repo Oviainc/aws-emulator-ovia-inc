@@ -87,6 +87,8 @@ mod distribution_cdn;
 mod distribution_certificate_attachment;
 #[path = "all/distribution_create_certificate_validation.rs"]
 mod distribution_create_certificate_validation;
+#[path = "all/distribution_delete.rs"]
+mod distribution_delete;
 #[path = "all/distribution_listing.rs"]
 mod distribution_listing;
 #[path = "all/distribution_metric_data.rs"]
