@@ -1072,7 +1072,7 @@ mod modify_volume {
 
     use std::time::Duration;
 
-    use ec2::ops::modify_volume::INCORRECT_MODIFICATION_STATE;
+    use ec2::ops::modify_volume::{INCORRECT_MODIFICATION_STATE, SIZE_DECREASE_MESSAGE};
     use ec2::state::{
         INVALID_VOLUME_MODIFICATION_NOT_FOUND, TRANSITION_DELAY, VOLUME_IOPS_RANGES,
         VOLUME_MODIFICATION_PROGRESS_COMPLETE, VOLUME_MODIFICATION_STATE_MODIFYING,
@@ -1081,7 +1081,7 @@ mod modify_volume {
     use service_com_amazonaws_ec2_amazonec2 as ec2;
     use smithy_server_runtime::MultiServiceRouter;
 
-    use crate::ec2_query::{call, element, elements, error_code, indexed};
+    use crate::ec2_query::{call, element, elements, error_code, error_message, indexed};
     use crate::volume_lifecycle::{REGION, is_volume_id, p, required_iops, zone_name};
 
     /// One request's form parameters, as the ec2Query harness takes them.
@@ -1607,6 +1607,101 @@ mod modify_volume {
                 volume_configuration(&before),
                 "case {case:?}: a refused modification left the volume changed"
             );
+            assert_no_modification(&router, case, &volume_id).await;
+        }
+    }
+
+    /// RULE 2, continued, about the WORDING of the one refusal the service words for itself:
+    /// a target size below the size the volume already has is refused with HTTP 400,
+    /// `InvalidParameterValue` and ONE fixed sentence ([`SIZE_DECREASE_MESSAGE`]) that names
+    /// no value of the request and no value of the volume — so a caller classifies any shrink
+    /// by the same text, whatever volume, type or size it asked about.
+    ///
+    /// The rows differ along the source volume type, the size it holds, how far below that the
+    /// request reaches (one GiB, down to the type's own floor, zero, negative), whether the
+    /// request also changes the type, and whether it is a dry run — and the message is
+    /// compared to the constant AND to the other rows' messages, so no row can be the one
+    /// shape the sentence is keyed to. The refused request also leaves the volume's size and
+    /// its empty modification record exactly as they were.
+    #[tokio::test]
+    async fn a_size_decrease_is_refused_with_one_message_that_names_no_value() {
+        // (case, source type, source size, the Size asked for, further modify parameters)
+        let rows: [(&str, &str, i64, i64, Params); 9] = [
+            ("a gp2 volume halved", "gp2", 10, 5, Vec::new()),
+            ("a gp3 volume asked for one GiB", "gp3", 2, 1, Vec::new()),
+            ("an io1 volume one GiB below itself", "io1", 100, 99, Vec::new()),
+            (
+                // Still a shrink even though the target sits at the type's published floor.
+                "an io2 volume down to its published floor",
+                "io2",
+                200,
+                4,
+                Vec::new(),
+            ),
+            ("an st1 volume down to its published floor", "st1", 500, 125, Vec::new()),
+            ("a standard volume asked for no size at all", "standard", 8, 0, Vec::new()),
+            ("an sc1 volume asked for a negative size", "sc1", 200, -1, Vec::new()),
+            (
+                // The shrink is read against the volume's CURRENT size, so a request that also
+                // changes the type is refused for the size — 100 GiB is inside io2's range, so
+                // only the shrink rule can refuse this one.
+                "a gp3 volume shrunk while converting to io2",
+                "gp3",
+                200,
+                100,
+                vec![p("VolumeType", "io2")],
+            ),
+            (
+                // "DryRun ... provides an error response" (`ModifyVolumeRequest$DryRun`): a
+                // request that would have been refused carries the refusal it would have got.
+                "a dry run of a gp2 volume halved",
+                "gp2",
+                40,
+                20,
+                vec![p("DryRun", "true")],
+            ),
+        ];
+
+        for (case, volume_type, size, target_size, modify_extra) in rows {
+            let router = emulator();
+            let volume_id = seed_volume(&router, case, volume_type, size, Vec::new()).await;
+
+            let mut params = vec![
+                p("VolumeId", volume_id.clone()),
+                p("Size", target_size.to_string()),
+            ];
+            params.extend(modify_extra);
+            let (status, body) = modify(&router, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 from a size decrease, got {status} with body \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValue",
+                "case {case:?}: expected error code InvalidParameterValue, got {body}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, SIZE_DECREASE_MESSAGE,
+                "case {case:?}: expected the shrink refusal message \
+                 {SIZE_DECREASE_MESSAGE:?}, got {message:?}"
+            );
+            // The sentence is a CONSTANT: it carries no size, no id and no type, so nothing a
+            // request or a volume could contribute can appear in it.
+            assert!(
+                !message.contains(|character: char| character.is_ascii_digit())
+                    && !message.contains(volume_type)
+                    && !message.contains(volume_id.as_str()),
+                "case {case:?}: expected a message naming no value of the request or the \
+                 volume, got {message:?}"
+            );
+
+            // And the refused shrink moved nothing: the volume still holds the size it was
+            // created at, and it still has no modification to report.
+            let (_, described) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_members(case, &described, &[("size", size.to_string())]);
             assert_no_modification(&router, case, &volume_id).await;
         }
     }

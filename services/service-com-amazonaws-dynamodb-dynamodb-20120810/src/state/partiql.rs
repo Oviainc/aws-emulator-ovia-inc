@@ -83,6 +83,18 @@ fn statement_refused(detail: &str) -> RequestError {
     RequestError::Validation(format!("Invalid Statement: {detail}"))
 }
 
+/// How a WRITE statement whose source is qualified with an index is refused.
+///
+/// An index projects a table's items and is not written through — "attributes that are
+/// copied (projected) from the table into the global secondary index"
+/// (`GlobalSecondaryIndex$Projection`) — so a write that addresses one asks for something
+/// no index does, which AWS states with this fixed sentence rather than as a statement
+/// this dialect cannot spell: the statement parsed, and the source it names is the
+/// problem.
+fn unsupported_on_an_index() -> RequestError {
+    RequestError::Validation("This operation is not supported on an index".to_string())
+}
+
 // ===========================================================================
 // The lexer
 // ===========================================================================
@@ -757,7 +769,7 @@ impl StatementParser<'_> {
         self.expect_word("into")?;
         let (table, index) = self.source()?;
         if index.is_some() {
-            return Err(statement_refused("an INSERT addresses a table, not an index"));
+            return Err(unsupported_on_an_index());
         }
         if !self.accept_word("value") {
             self.expect_word("values")?;
@@ -776,7 +788,7 @@ impl StatementParser<'_> {
     fn update(&mut self) -> Result<UpdateStatement, RequestError> {
         let (table, index) = self.source()?;
         if index.is_some() {
-            return Err(statement_refused("an UPDATE addresses a table, not an index"));
+            return Err(unsupported_on_an_index());
         }
         let mut clauses = Vec::new();
         loop {
@@ -820,7 +832,7 @@ impl StatementParser<'_> {
         self.expect_word("from")?;
         let (table, index) = self.source()?;
         if index.is_some() {
-            return Err(statement_refused("a DELETE addresses a table, not an index"));
+            return Err(unsupported_on_an_index());
         }
         let filter = self.required_where_clause()?;
         let returning = self.returning()?;

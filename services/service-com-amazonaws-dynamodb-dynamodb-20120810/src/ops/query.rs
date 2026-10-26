@@ -398,7 +398,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matched.reverse();
         }
         if let Some(start) = input.exclusive_start_key.as_ref() {
-            let resumed = table.key_of_key_map(start).map_err(lift)?;
+            let resumed = table.key_of_start_key(start).map_err(lift)?;
             if resumed.partition != condition.partition {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     "The provided starting key does not match the key condition's partition key",

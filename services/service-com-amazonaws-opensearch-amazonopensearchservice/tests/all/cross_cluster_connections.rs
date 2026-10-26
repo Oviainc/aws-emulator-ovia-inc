@@ -54,14 +54,14 @@ use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT}
 
 /// The account every emulated resource belongs to, which is what a domain reference
 /// that names no `OwnerId` resolves to.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The Region the test harness signs its requests for, which is what a domain
 /// reference that names no `Region` resolves to.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// `CreateOutboundConnection`: `POST /opensearch/cc/outboundConnection`.
-async fn create_connection(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn create_connection(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -72,7 +72,7 @@ async fn create_connection(emulator: &Emulator, body: Value) -> Answer {
 }
 
 /// `DescribeOutboundConnections`: `POST /opensearch/cc/outboundConnection/search`.
-async fn describe_connections(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn describe_connections(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -84,7 +84,7 @@ async fn describe_connections(emulator: &Emulator, body: Value) -> Answer {
 
 /// A domain to connect, created through `CreateDomain` so the test connects domains
 /// that exist.
-async fn created_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn created_domain(emulator: &Emulator, name: &str) {
     let created = emulator.create(json!({ "DomainName": name })).await;
     assert_eq!(
         created.status, 200,
@@ -95,7 +95,7 @@ async fn created_domain(emulator: &Emulator, name: &str) {
 
 /// `DeleteDomain`, so a test can reach a domain reference the registry no longer
 /// resolves.
-async fn delete_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn delete_domain(emulator: &Emulator, name: &str) {
     let deleted = emulator
         .call("DELETE", &format!("{PREFIX}/opensearch/domain/{name}"), None)
         .await;
@@ -108,7 +108,7 @@ async fn delete_domain(emulator: &Emulator, name: &str) {
 
 /// The `Connections` list of a `DescribeOutboundConnections` answer, with the case
 /// named on failure.
-fn connections(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn connections(answer: &Answer, case: &str) -> Vec<Value> {
     answer.body["Connections"]
         .as_array()
         .unwrap_or_else(|| {
@@ -121,7 +121,7 @@ fn connections(answer: &Answer, case: &str) -> Vec<Value> {
 }
 
 /// The `ConnectionId`s of a report, in the order it reported them.
-fn reported_ids(answer: &Answer, case: &str) -> Vec<String> {
+pub(crate) fn reported_ids(answer: &Answer, case: &str) -> Vec<String> {
     connections(answer, case)
         .iter()
         .map(|connection| {
@@ -137,7 +137,7 @@ fn reported_ids(answer: &Answer, case: &str) -> Vec<String> {
 
 /// The one reported connection carrying `id`, or `None` when the report does not
 /// carry it.
-fn reported(answer: &Answer, case: &str, id: &str) -> Option<Value> {
+pub(crate) fn reported(answer: &Answer, case: &str, id: &str) -> Option<Value> {
     connections(answer, case)
         .into_iter()
         .find(|connection| connection["ConnectionId"] == json!(id))
@@ -145,7 +145,7 @@ fn reported(answer: &Answer, case: &str, id: &str) -> Option<Value> {
 
 /// A `DomainInformationContainer` naming `domain`, and optionally the account that
 /// owns it and the Region it is in.
-fn domain_info(domain: &str, owner: Option<&str>, region: Option<&str>) -> Value {
+pub(crate) fn domain_info(domain: &str, owner: Option<&str>, region: Option<&str>) -> Value {
     let mut info = json!({ "DomainName": domain });
     if let Some(owner) = owner {
         info["OwnerId"] = json!(owner);

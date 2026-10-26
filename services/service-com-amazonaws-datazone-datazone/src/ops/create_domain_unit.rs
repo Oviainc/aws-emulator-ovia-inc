@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused as invalid input, naming the member the caller has to fix. A domain
         // that IS stored but is not available is a conflict, not invalid input, so the
         // lookup takes every stored domain and the status check below decides.
-        let (domain_status, parent_is_stored, unit_count) = store
+        let (domain_status, parent_is_stored, name_clash, unit_count) = store
             .domains
             .get(&input.domain_identifier)
             .map(|domain| {
@@ -228,6 +228,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     domain
                         .domain_units
                         .contains_key(&input.parent_domain_unit_identifier),
+                    domain
+                        .child_domain_unit_named(
+                            &input.parent_domain_unit_identifier,
+                            &input.name,
+                        )
+                        .map(|clash| clash.id.clone()),
                     domain.domain_units.len(),
                 )
             })
@@ -252,6 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateDomainUnitErrorModeled::ValidationException(ValidationException {
                 message: "parentDomainUnitIdentifier does not name a domain unit in this domain"
                     .to_string(),
+            })
+            .into());
+        }
+        // A domain unit's name is unique among the CHILDREN OF ONE PARENT, so a second
+        // unit of the same name under the same parent conflicts while the same name
+        // under another parent, or in another domain, does not. Decided and inserted
+        // under the one store lock this whole handler holds, so concurrent racers for
+        // one name are serialized and exactly one of them wins. The refusal names the
+        // unit that holds the name, not the name itself: `DomainUnitName` is
+        // `@sensitive`.
+        if let Some(clash) = name_clash {
+            return Err(CreateDomainUnitErrorModeled::ConflictException(ConflictException {
+                message: format!("Conflict with domainUnit {clash}"),
             })
             .into());
         }

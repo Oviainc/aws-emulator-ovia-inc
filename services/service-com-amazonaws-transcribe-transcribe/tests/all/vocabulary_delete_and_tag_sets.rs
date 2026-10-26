@@ -78,7 +78,11 @@ pub(crate) fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str) {
 
 /// Assert a delete answered nothing but its empty success body: either no body at all
 /// or the empty JSON object.
-fn empty_body(reply: &Reply, case: &str) {
+///
+/// `pub(crate)` like the refusal assertions above it: the filter-delete suite
+/// (`crate::vocabulary_filter_delete_requires_the_filter`) asserts the same thing about
+/// the same operation, so it reuses this rather than spelling the shape a second time.
+pub(crate) fn empty_body(reply: &Reply, case: &str) {
     let empty = match &reply.body {
         Value::Null => true,
         Value::Object(members) => members.is_empty(),

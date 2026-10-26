@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoleTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRoleTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRoleTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags attached to the IAM role the request names, sorted by tag key and
+//! paged by `Marker`/`MaxItems`. A pure READ — nothing here writes, so a later caller
+//! sees exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRoleTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRoleTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRoleTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRoleTagsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // IAM names "are not distinguished by case", so the request's spelling is folded
+        // to the key the role is held under — the same keying `GetRole` resolves a name
+        // through.
+        let role_key = crate::state::name_key(&input.role_name);
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the tags the role persists and writes nothing.
+        let store = state.lock();
+
+        // The role whose tags the request addresses, if the account holds one. The LOOKUP
+        // comes first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource: a caller that may not read a role's tags learns that it may not, never
+        // whether that role exists.
+        let held = store.roles.get(&role_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is reported. The decision is made on the ARN of the
+        // role the request addresses — the held role's own ARN, or, for a name the account
+        // holds no role under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that role as the
+        // request named it (`role Deployer`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ROLE_TAGS,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
+        // The tags reported are those of an IAM role the account holds: a name the account
+        // does not hold names no role whose tags could be reported, which is the modelled
+        // client error this operation declares.
+        let Some(role) = held else {
+            return Err(ListRoleTagsErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION the marker names in THIS role's tag
+        // order, so a token this service did not issue while paging this role's tags is
+        // refused rather than read as "start from the beginning".
+        let scope = crate::state::entity_tags_marker_scope(&role.arn);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    // Neither modelled error fits a token that is not one this service
+                    // issued, so the refusal goes through the crate's generic client-input
+                    // channel (HTTP 400, `ValidationException`).
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued \
+                         for this role's tags",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        let page = crate::state::tag_page(
+            role.tags.as_ref(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(ListRoleTagsOutput {
+            // "If no tags are attached to the specified resource, the response contains an
+            // empty list" — the member is required, and empty is that answer.
+            tags: page.tags,
+            is_truncated: page.is_truncated,
+            marker: page.marker,
+        })
     }
 }
