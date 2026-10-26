@@ -1121,6 +1121,16 @@ pub const CANCELLATION_STATUS_APPROVED: &str = "APPROVED";
 /// (`RejectAgreementCancellationRequest`).
 pub const CANCELLATION_STATUS_REJECTED: &str = "REJECTED";
 
+/// The `AgreementCancellationRequestStatus` a withdrawn cancellation request
+/// carries: "Once cancelled, the cancellation request transitions to CANCELLED
+/// status and can no longer be approved or rejected by the buyer"
+/// (`CancelAgreementCancellationRequest`).
+///
+/// Terminal in the same way [`CANCELLATION_STATUS_REJECTED`] is: nothing moves a
+/// request out of it, so a second decision on the same request is a conflict
+/// rather than a second transition.
+pub const CANCELLATION_STATUS_CANCELLED: &str = "CANCELLED";
+
 /// `ResourceType` for a cancellation request, reported on a
 /// `ResourceNotFoundException` or a `ConflictException` about one.
 pub const RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST: &str = "AgreementCancellationRequest";
@@ -2515,7 +2525,8 @@ pub struct AgreementCancellationRequest {
     /// "A message providing additional context about the cancellation request
     /// status": the value of whichever call that moved the request supplied one,
     /// which is the buyer's `rejectionReason`
-    /// (`RejectAgreementCancellationRequest`). A status no call carries a
+    /// (`RejectAgreementCancellationRequest`) or the seller's
+    /// `cancellationReason` (`CancelAgreementCancellationRequest`). A status no call carries a
     /// message member for leaves it absent rather than inventing one, exactly as
     /// the sibling [`PaymentRequest::status_message`] does.
     pub status_message: Option<String>,
@@ -2578,6 +2589,25 @@ impl AgreementCancellationRequest {
     /// [`PaymentRequest::reject`] is used.
     pub fn reject(&mut self, now: SystemTime, reason: String) {
         self.status = CANCELLATION_STATUS_REJECTED.to_string();
+        self.status_message = Some(reason);
+        self.updated_at = now;
+    }
+
+    /// Withdraw this cancellation request at `now`: the one transition to
+    /// [`CANCELLATION_STATUS_CANCELLED`], so the status, the status message and
+    /// the `updated_at` that go with it have exactly one writer.
+    ///
+    /// `updatedAt` is "the date and time when the cancellation request was
+    /// cancelled", so it becomes this instant while `created_at` keeps the one
+    /// the send recorded. `reason` is the seller's required cancellation reason —
+    /// "a required message explaining why the cancellation request is being
+    /// withdrawn" — and it becomes the request's `statusMessage`, the same way
+    /// the buyer's reason becomes it in
+    /// [`AgreementCancellationRequest::reject`]. Callers check
+    /// [`AgreementCancellationRequest::is_pending_approval`] first and refuse
+    /// anything else as a conflict.
+    pub fn cancel(&mut self, now: SystemTime, reason: String) {
+        self.status = CANCELLATION_STATUS_CANCELLED.to_string();
         self.status_message = Some(reason);
         self.updated_at = now;
     }

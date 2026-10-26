@@ -31,6 +31,8 @@ mod billing_adjustments;
 mod cancellation_request_decisions;
 #[path = "all/cancellation_request_rejection.rs"]
 mod cancellation_request_rejection;
+#[path = "all/cancellation_request_withdrawal.rs"]
+mod cancellation_request_withdrawal;
 #[path = "all/charge_amounts.rs"]
 mod charge_amounts;
 #[path = "all/error_bodies.rs"]
