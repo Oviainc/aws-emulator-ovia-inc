@@ -51,10 +51,10 @@ const TIME_TYPES: &[(&str, u64)] = &[
 
 /// One `CreateAcmeExternalAccountBinding` case: what it exercises, the `Expiration` to
 /// configure (if any), the `RoleArn` to bind, and the `Tags` to apply (if any).
-type BindingCase = (&'static str, Option<Value>, String, Option<Value>);
+pub(crate) type BindingCase = (&'static str, Option<Value>, String, Option<Value>);
 
 /// One request body for each row of the table.
-fn binding_cases() -> Vec<BindingCase> {
+pub(crate) fn binding_cases() -> Vec<BindingCase> {
     vec![
         (
             "no expiration at all, a plain role, no tags",
@@ -98,7 +98,7 @@ fn binding_cases() -> Vec<BindingCase> {
 }
 
 /// The request body of one row, for `acme_endpoint_arn`.
-fn binding_body(case: &BindingCase, acme_endpoint_arn: &str) -> Value {
+pub(crate) fn binding_body(case: &BindingCase, acme_endpoint_arn: &str) -> Value {
     let (_what, expiration, role_arn, tags) = case;
     let mut body = json!({
         "AcmeEndpointArn": acme_endpoint_arn,
@@ -115,7 +115,11 @@ fn binding_body(case: &BindingCase, acme_endpoint_arn: &str) -> Value {
 
 /// `CreateAcmeExternalAccountBinding`'s `ExternalAccountBinding` member, asserted to
 /// succeed.
-async fn create_binding(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+pub(crate) async fn create_binding(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> Value {
     let (status, response) = call(router, "CreateAcmeExternalAccountBinding", body).await;
     assert_eq!(
         status, 200,
@@ -131,7 +135,11 @@ async fn create_binding(router: &MultiServiceRouter, case: &str, body: &Value) -
 
 /// `DescribeAcmeExternalAccountBinding`'s `ExternalAccountBinding` member, asserted to
 /// succeed.
-async fn describe_binding(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn describe_binding(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Value {
     let (status, response) = call(
         router,
         "DescribeAcmeExternalAccountBinding",
@@ -193,7 +201,10 @@ fn requested_tags(tags: Option<&Value>) -> Vec<(String, String)> {
 
 /// The credentials the service minted for the binding `arn`, read straight off the store
 /// so a test can assert what the create persisted before any operation reports it.
-fn stored_credentials(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> (String, String) {
+pub(crate) fn stored_credentials(
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) -> (String, String) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let store = store.lock();
     let binding = store
@@ -204,7 +215,7 @@ fn stored_credentials(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> (Strin
 }
 
 /// A timestamp member as the epoch seconds the awsJson1_1 wire carries it as.
-fn seconds(binding: &Value, member: &str) -> f64 {
+pub(crate) fn seconds(binding: &Value, member: &str) -> f64 {
     binding[member]
         .as_f64()
         .unwrap_or_else(|| panic!("{member} is not a wire timestamp in {binding}"))

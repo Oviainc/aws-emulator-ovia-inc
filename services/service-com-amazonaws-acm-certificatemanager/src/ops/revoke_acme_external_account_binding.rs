@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeAcmeExternalAccountBinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeAcmeExternalAccountBinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeAcmeExternalAccountBinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the revocation of the external account binding named by
+//! `AcmeExternalAccountBindingArn` on the stored record — the instant it happened — so
+//! `DescribeAcmeExternalAccountBinding` reports it and no later ACME registration is
+//! authorized by those credentials, and answers `ResourceNotFoundException` for an ARN no
+//! stored record answers to. The operation is `@idempotent`: a binding this call finds
+//! already revoked keeps the instant its revocation was first recorded at.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeAcmeExternalAccountBinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeAcmeExternalAccountBindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeAcmeExternalAccountBinding"))
+        // No request metadata is needed: the `AcmeExternalAccountBindingArn` the request
+        // names carries the Region, the account and the endpoint the binding was created
+        // under, so the record is found by ARN alone — as in
+        // `DescribeAcmeExternalAccountBinding`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                RevokeAcmeExternalAccountBindingErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the acm acme external account binding store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes (so the decision is made on the records a caller would see
+        // at this instant) and dates the revocation this call records.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+        let Some(binding) = store
+            .acme_external_account_bindings
+            .get_mut(&input.acme_external_account_binding_arn)
+        else {
+            return Err(
+                RevokeAcmeExternalAccountBindingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::acme_external_account_binding_not_found_message(
+                                &input.acme_external_account_binding_arn,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `RevokedAt` is "the time at which the external account binding was revoked"
+        // (`AcmeExternalAccountBinding$RevokedAt` doc): the instant the revocation that
+        // took effect was recorded, so it is written once. The operation is `@idempotent`,
+        // so a caller may repeat it — a binding already revoked is already in the state
+        // this call asks for, which leaves that instant, and `UpdatedAt` ("the time at
+        // which the external account binding was last updated"), exactly as they stand.
+        // The credentials are not touched either: revocation withdraws the authority to
+        // register with them, it does not re-mint them.
+        if binding.revoked_at.is_none() {
+            binding.revoked_at = Some(now);
+            binding.updated_at = now;
+        }
+
+        // The ACME accounts already registered with the binding are deliberately left
+        // alone: "existing ACME accounts that were previously registered using the binding
+        // are not affected and must be revoked separately"
+        // (`RevokeAcmeExternalAccountBinding` doc).
+        Ok(RevokeAcmeExternalAccountBindingOutput)
     }
 }
