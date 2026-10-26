@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEC2InstanceRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEC2InstanceRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEC2InstanceRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Amazon EC2 instance recommendations Compute Optimizer holds for
+//! an account — for every analysed instance the request selects, the recommendation
+//! [`recommendation`] derives from that instance's stored configuration, observed
+//! utilization and candidate instance types under the preferences in force, one page at a
+//! time. REPORTING only: Compute Optimizer has no API that creates a recommendation, so
+//! this call writes nothing.
+//!
+//! A request narrows the answer four ways, each applied before the page is cut:
+//! `accountIds` (one account id, as the model documents — naming any account other than the
+//! one this emulator presents is refused, see [`foreign_account`]), `instanceArns` (the
+//! instances asked about; one this service holds no recommendation for is reported in
+//! `errors`), `filters` (the `Filters` vocabulary this surface shares with
+//! `GetAutoScalingGroupRecommendations`) and `recommendationPreferences` (which candidate
+//! instance types the reported options consist of).
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +106,8 @@
 //!   failure of the server.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 
+use std::collections::HashSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -178,18 +186,476 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEC2InstanceRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEC2InstanceRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Compute Optimizer is a REGIONAL service: the request addresses one Region's
+        // endpoint, so the instances it asks about are that Region's and the ARNs the answer
+        // carries name it.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetEC2InstanceRecommendationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer recommendation store is unavailable."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers; so is every request that asks about an
+        // account this service cannot answer for (see [`foreign_account`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let requested_arns: Vec<String> = input.instance_arns.clone().unwrap_or_default();
+        let requested_instances = requested_instance_ids(&requested_arns, &account_id, &region)?;
+        if let Some(reason) =
+            crate::state::resource_filter_rejection(input.filters.as_deref().unwrap_or_default())
+        {
+            return Err(invalid_parameter(reason));
+        }
+        // `cpuVendorArchitectures` selects which candidate instance types are reported:
+        // "when you specify AWS_ARM64 with a GetEC2InstanceRecommendations request, Compute
+        // Optimizer returns recommendations that consist of Graviton instance types only".
+        // The model's own `CpuVendorArchitecture` enum is what the request boundary enforces,
+        // so what reaches here is a list of architectures.
+        let requested_architectures: Vec<String> = input
+            .recommendation_preferences
+            .as_ref()
+            .and_then(|preferences| preferences.cpu_vendor_architectures.clone())
+            .unwrap_or_default();
+        // A `nextToken` this service did not issue cannot name a page boundary.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_resource_page_token(token) {
+                Some(instance_arn) => Some(instance_arn),
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+        // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
+        // Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a request
+        // carries can size the response or the allocation that builds it; and a request
+        // naming no size (or naming the range's lower bound `0`, which the service documents
+        // no meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest, as
+        // this service's other paginated readers do.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                GetEC2InstanceRecommendationsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // When these recommendations were last generated: the analysis the account's
+        // enrollment started, which came due one analysis span after the enrollment record
+        // was written. Derived from the store, so every read reports the same instant — the
+        // rule every recommendation reader of this service reports its refresh with.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        // The instances this request asks about: the account's whole analysed inventory in
+        // this Region — which a caller sees only once the analysis its enrollment started is
+        // due — or exactly the ones the named ARNs pick out of it.
+        let selected: Vec<&crate::state::ObservedInstance> = guard
+            .visible_instances()
+            .filter(|instance| instance.account_id == account_id)
+            .filter(|instance| {
+                requested_instances
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&instance.instance_id))
+            })
+            .collect();
+
+        // The instance ids this analysis holds for the selected instances, taken while the
+        // store is read so the `errors` list below can be built without it — one entry per
+        // analysed instance, so this set is bounded by the inventory and not by the request.
+        let held: HashSet<String> = selected
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+
+        // Each surviving instance with its ARN in this Region and the preferences its
+        // recommendation is generated under: the account's stored preferences resolved for
+        // that instance. The filters are applied to the analysis the recommendation is
+        // computed from, so a filter selects on the finding this service derived rather than
+        // on anything the request supplied.
+        let resolved: Vec<(
+            &crate::state::ObservedInstance,
+            String,
+            crate::state::EffectivePreferences,
+        )> = selected
+            .into_iter()
+            .map(|instance| {
+                let arn = instance.instance_arn(&region);
+                let preferences = guard.effective_preferences_for(
+                    &arn,
+                    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+                    &instance.account_id,
+                );
+                (instance, arn, preferences)
+            })
+            .filter(|(instance, _, preferences)| {
+                input
+                    .filters
+                    .iter()
+                    .flatten()
+                    .all(|filter| filter_matches(filter, instance, preferences))
+            })
+            .collect();
+
+        // One page of the selected recommendations, resuming at the instance a `nextToken`
+        // names, plus a token naming the instance the page after this one starts at. A token
+        // this service issued whose instance the current selection does not hold cannot name
+        // a boundary of THIS result set — the request changed its selection, or the analysis
+        // moved on — so it is refused rather than answered with an empty final page a caller
+        // would read as "no more recommendations".
+        let start = match &resume_at {
+            None => 0,
+            Some(arn) => match resolved.iter().position(|(_, held, _)| held == arn) {
+                Some(index) => index,
+                None => {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+        let page = resolved.get(start..).unwrap_or_default();
+        let next_token = page
+            .get(page_size)
+            .map(|(_, arn, _)| crate::state::encode_resource_page_token(arn));
+
+        let instance_recommendations: Vec<InstanceRecommendation> = page
+            .iter()
+            .take(page_size)
+            .map(|(instance, arn, preferences)| {
+                // "Describes if an Amazon EC2 instance is idle": it is exactly when this
+                // service also holds an IDLE recommendation for it, which is the record
+                // `GetIdleRecommendations` reports.
+                let idle = guard.idle_recommendations.get(arn).is_some();
+                recommendation(
+                    instance,
+                    arn,
+                    preferences,
+                    &requested_architectures,
+                    idle,
+                    last_refresh_timestamp,
+                )
+            })
+            .collect();
+        drop(guard);
+
+        // An identifier the request named that this analysis holds no recommendation for is
+        // reported in `errors` — "an error is returned if you request recommendations for an
+        // instance of an unsupported instance family" — rather than silently omitted, so a
+        // caller can tell "no recommendation for this instance" from "not asked about". The
+        // entries are about the REQUEST rather than about the page, so a walk reports them on
+        // every page, and there is one per identifier however many times the request named it,
+        // exactly as the reported recommendations carry one row per instance however often it
+        // was asked for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEC2InstanceRecommendations"))
+        // Whether an identifier is held is decided on the instance it NAMES — the Region and
+        // the instance id [`requested_instance_ids`] selected with — not on the ARN string
+        // this endpoint would render for it, so an ARN of another partition naming an analysed
+        // instance of this Region is reported exactly once: as a recommendation, and not also
+        // as a missing one. The identifiers are bounded
+        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]) and both tests are set lookups, so
+        // neither the list nor the work that builds it grows with the square of what the
+        // request carried. Built after the store guard is released, so no caller's list of
+        // identifiers holds the store against another request.
+        let mut reported: HashSet<&str> = HashSet::with_capacity(requested_arns.len());
+        let mut errors: Vec<GetRecommendationError> = Vec::new();
+        for arn in &requested_arns {
+            let analysed = crate::state::parse_instance_arn(arn).is_some_and(|instance| {
+                instance.region == region && held.contains(instance.instance_id)
+            });
+            if analysed || !reported.insert(arn.as_str()) {
+                continue;
+            }
+            errors.push(GetRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(format!(
+                    "Compute Optimizer has no Amazon EC2 instance recommendation for {arn}.",
+                )),
+            });
+        }
+
+        Ok(GetEC2InstanceRecommendationsOutput {
+            next_token,
+            instance_recommendations: Some(instance_recommendations),
+            errors: Some(errors),
+        })
+    }
+}
+
+/// What this operation answers when an `instanceArns` entry is not an Amazon EC2 instance
+/// ARN: a constant refusal naming the parameter's subject, as this service's other readers
+/// word theirs — it states the member that is wrong, not the value the request carried.
+const INVALID_INSTANCE_ARN_MESSAGE: &str = "Invalid instance ARN.";
+
+/// A 400 `InvalidParameterValueException` — "The value supplied for the input parameter is out
+/// of range or not valid" — carrying why this request's value is not.
+fn invalid_parameter(message: String) -> GetEC2InstanceRecommendationsError {
+    GetEC2InstanceRecommendationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other than
+/// the one this service answers for.
+///
+/// `accountIds` is how a MANAGEMENT account names a member account of its organization: "If
+/// your account is the management account of an organization, use this parameter to specify
+/// the member account for which you want to return instance recommendations." This emulator
+/// presents one standalone account (`::engine::emulator_account_id`) and records no
+/// organization, so no other account is a member account it can be asked about — in
+/// `accountIds`, or through an `instanceArns` entry that names one. The refusal is worded once
+/// for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
+fn foreign_account() -> GetEC2InstanceRecommendationsError {
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
+}
+
+/// The account whose recommendations this request asks for: the one id `accountIds` carries,
+/// or the caller's own account when it carries none.
+///
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID can
+/// be specified per request" (`GetEC2InstanceRecommendations$accountIds`), an `AccountId` is a
+/// 12-digit Amazon Web Services account id (`Scope$value`), and an id that is well-formed but
+/// names another account is refused by [`foreign_account`]. This wrapper only lifts the reason
+/// into this operation's error channel.
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetEC2InstanceRecommendationsError> {
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+}
+
+/// The instances this request asks about, by instance id, or `None` when it names none and so
+/// asks about the account's whole analysed inventory in this Region.
+///
+/// Every ARN has to be an Amazon EC2 instance ARN — `instanceArns` is "the Amazon Resource
+/// Name (ARN) of the instances for which to return recommendations" — so anything else is
+/// refused with [`INVALID_INSTANCE_ARN_MESSAGE`], and one that names another account's
+/// instance with [`foreign_account`]. An ARN of ANOTHER Region names an instance this regional
+/// endpoint does not analyse, so it selects nothing, exactly as an unknown instance of this
+/// Region does — and is reported in `errors` the same way. A list naming more instances than
+/// this service answers for in one request is refused outright
+/// ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]).
+fn requested_instance_ids(
+    instance_arns: &[String],
+    account_id: &str,
+    region: &str,
+) -> Result<Option<Vec<String>>, GetEC2InstanceRecommendationsError> {
+    if instance_arns.is_empty() {
+        return Ok(None);
+    }
+    // The model bounds this list's length nowhere, so the service does: the identifiers a
+    // request carries drive both the selection and the per-identifier `errors` list, and a
+    // request may name at most the crate's ceiling ([`crate::state::MAX_REQUESTED_IDENTIFIERS`])
+    // so neither the response nor the work that builds it can be sized by the length of the
+    // list a caller sent. Refused before anything is read or allocated per identifier.
+    if let Some(reason) =
+        crate::state::too_many_identifiers("instanceArns", instance_arns.len())
+    {
+        return Err(invalid_parameter(reason));
+    }
+    let mut instance_ids = Vec::new();
+    for arn in instance_arns {
+        let Some(instance) = crate::state::parse_instance_arn(arn) else {
+            return Err(invalid_parameter(INVALID_INSTANCE_ARN_MESSAGE.to_string()));
+        };
+        if instance.account_id != account_id {
+            return Err(foreign_account());
+        }
+        if instance.region == region {
+            instance_ids.push(instance.instance_id.to_string());
+        }
+    }
+    Ok(Some(instance_ids))
+}
+
+/// Whether `instance` passes `filter` — the crate's one matcher for this surface's
+/// `Filters` ([`crate::state::resource_filter_matches`]), given what this instance's
+/// recommendation reports: the finding the analysis reached, the reason codes behind it, the
+/// workload types it inferred (none, when the account deactivated the inference) and the
+/// `RecommendationSourceType` of the resource this operation reports.
+fn filter_matches(
+    filter: &Filter,
+    instance: &crate::state::ObservedInstance,
+    preferences: &crate::state::EffectivePreferences,
+) -> bool {
+    let inferred: &[String] = if preferences.infers_workload_types() {
+        &instance.inferred_workload_types
+    } else {
+        &[]
+    };
+    crate::state::resource_filter_matches(
+        filter,
+        instance.finding(),
+        &instance.finding_reason_codes,
+        inferred,
+        crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+    )
+}
+
+/// One instance's recommendation, computed from the stored analysis and the preferences in
+/// force for the instance.
+///
+/// `currentInstanceGpuInfo` and an option's `instanceGpuInfo` are left unreported: no instance
+/// type in this analysis has an attached accelerator, and those members describe "the GPU
+/// accelerator settings" of one that does. `externalMetricStatus` is the integration status of
+/// the external metrics provider the account prefers, which is the crate's one rule for it
+/// ([`crate::state::external_metric_status`]).
+fn recommendation(
+    instance: &crate::state::ObservedInstance,
+    instance_arn: &str,
+    preferences: &crate::state::EffectivePreferences,
+    requested_architectures: &[String],
+    idle: bool,
+    last_refresh_timestamp: Option<::aws_smithy_types::DateTime>,
+) -> InstanceRecommendation {
+    // The candidates the request's CPU vendor architecture preference admits; a request that
+    // states no preference restricts nothing.
+    let options: Vec<&crate::state::InstanceConfiguration> = instance
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            requested_architectures.is_empty()
+                || requested_architectures.contains(&candidate.architecture)
+        })
+        .collect();
+
+    // "Describes the CPU vendor and architecture for an instance or Auto Scaling group
+    // recommendations": the architectures the reported options actually consist of.
+    let mut architectures: Vec<String> = Vec::new();
+    for option in &options {
+        if !architectures.contains(&option.architecture) {
+            architectures.push(option.architecture.clone());
+        }
+    }
+
+    // Whether savings are reported net of Savings Plans and Reserved Instances discounts: the
+    // account activates that by storing the savings-estimation-mode preference — "specify the
+    // `AfterDiscounts` status to activate the preference" — and until it does, the member that
+    // preference activates is reported on no option.
+    let after_discounts = preferences.after_discounts();
+    let recommendation_options = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let (saved, percentage) = instance.savings(option);
+            InstanceRecommendationOption {
+                instance_type: Some(option.instance_type.clone()),
+                instance_gpu_info: None,
+                projected_utilization_metrics: Some(
+                    instance.projected_utilization_metrics(option),
+                ),
+                platform_differences: Some(instance.platform_differences(option)),
+                performance_risk: instance.option_performance_risk(option),
+                // "The top recommendation option is ranked as 1."
+                rank: i32::try_from(index + 1).unwrap_or(i32::MAX),
+                savings_opportunity: Some(SavingsOpportunity {
+                    savings_opportunity_percentage: percentage,
+                    estimated_monthly_savings: Some(EstimatedMonthlySavings {
+                        currency: Some(crate::state::CURRENCY_USD.to_string()),
+                        value: saved,
+                    }),
+                }),
+                // This emulator prices an instance from the public on-demand prices stored
+                // with its own analysis and records no Reserved Instances or Savings Plans
+                // commitment against the account's spend, so the after-discount figures are
+                // those before discounts — which is exactly what the reported
+                // `savingsEstimationMode` source says they came from.
+                savings_opportunity_after_discounts: after_discounts.then(|| {
+                    InstanceSavingsOpportunityAfterDiscounts {
+                        savings_opportunity_percentage: percentage,
+                        estimated_monthly_savings: Some(InstanceEstimatedMonthlySavings {
+                            currency: Some(crate::state::CURRENCY_USD.to_string()),
+                            value: saved,
+                        }),
+                    }
+                }),
+                migration_effort: Some(
+                    instance
+                        .migration_effort(option, preferences.infers_workload_types())
+                        .to_string(),
+                ),
+            }
+        })
+        .collect();
+
+    InstanceRecommendation {
+        instance_arn: Some(instance_arn.to_string()),
+        account_id: Some(instance.account_id.clone()),
+        instance_name: instance.instance_name(),
+        current_instance_type: Some(instance.current.instance_type.clone()),
+        finding: Some(instance.finding().to_string()),
+        finding_reason_codes: Some(instance.finding_reason_codes.clone()),
+        utilization_metrics: Some(instance.utilization_metrics()),
+        // "The number of days for which utilization metrics were analyzed for the instance",
+        // which is the length of the look-back period in force for it.
+        look_back_period_in_days: crate::state::look_back_period_in_days(
+            &preferences.look_back_period,
+        ),
+        recommendation_options: Some(recommendation_options),
+        // "An array of objects that describe the source resource of the recommendation": an
+        // instance recommendation is computed from the analysis of that very instance.
+        recommendation_sources: Some(vec![RecommendationSource {
+            recommendation_source_arn: Some(instance_arn.to_string()),
+            recommendation_source_type: Some(
+                crate::state::RESOURCE_TYPE_EC2_INSTANCE.to_string(),
+            ),
+        }]),
+        last_refresh_timestamp,
+        current_performance_risk: Some(instance.current_performance_risk.clone()),
+        effective_recommendation_preferences: Some(preferences.to_wire(architectures)),
+        // "The applications that might be running on the instance as inferred by Compute
+        // Optimizer" — reported unless the account deactivated the inference with a
+        // recommendation preference.
+        inferred_workload_types: preferences
+            .infers_workload_types()
+            .then(|| instance.inferred_workload_types.clone()),
+        instance_state: Some(instance.instance_state.clone()),
+        tags: instance.tag_list(),
+        external_metric_status: Some(crate::state::external_metric_status(
+            preferences
+                .external_metrics_preference
+                .as_ref()
+                .and_then(|preference| preference.source.as_deref()),
+        )),
+        current_instance_gpu_info: None,
+        idle: Some(
+            if idle {
+                crate::state::IDLE_TRUE
+            } else {
+                crate::state::IDLE_FALSE
+            }
+            .to_string(),
+        ),
     }
 }

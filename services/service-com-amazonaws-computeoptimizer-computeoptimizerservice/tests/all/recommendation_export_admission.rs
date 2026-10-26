@@ -17,6 +17,7 @@
 //! uses, so what is asserted is what a client sees.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
     RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
@@ -261,12 +262,7 @@ async fn every_export_operation_refuses_the_same_malformed_requests() {
             ),
             (
                 json!({"s3DestinationConfig": {"bucket": MISSING_BUCKET}}),
-                format!(
-                    "The value supplied for parameter s3DestinationConfig is not valid: the \
-                     Amazon S3 bucket {MISSING_BUCKET} does not exist. You must create the \
-                     destination Amazon S3 bucket for your recommendations export before you \
-                     create the export job."
-                ),
+                MISSING_DESTINATION_MESSAGE.to_string(),
             ),
             (
                 json!({

@@ -7,7 +7,15 @@
 //! written — selected by the `Status` filter and paged at `maxResults`. A pure report: the
 //! member accounts move only when a client calls `UpdateEnrollmentStatus` including them.
 //!
-//! The account's OWN enrollment is not a row here; `GetEnrollmentStatus` reports it.
+//! Served to an organization's MANAGEMENT account only: "returns the Compute Optimizer
+//! enrollment (opt-in) status of organization member accounts, if your account is an
+//! organization management account. To get the enrollment status of standalone accounts, use
+//! the GetEnrollmentStatus action." A caller that is not one is refused
+//! ([`not_a_management_account`]) rather than answered with an empty list it would read as
+//! "this organization has no member account".
+//!
+//! The account's OWN enrollment is not a row here; `GetEnrollmentStatus` reports it, for a
+//! standalone account as much as for a management one.
 //!
 //! ## Shape of an operation
 //!
@@ -223,16 +231,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .min(crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE);
 
         // The member accounts the request selects, in the store's own account-id order, each
-        // reporting the status its enrollment has reached at this instant. Nothing is
-        // written: the `Pending` a just-enrolled member account reports is DERIVED from when
-        // its enrollment was written.
+        // reporting the status its enrollment has reached at this instant, under ONE guard
+        // with the management-account check below — so the organization this call is answered
+        // for is the organization it was admitted for. Nothing is written: the `Pending` a
+        // just-enrolled member account reports is DERIVED from when its enrollment was
+        // written.
         let now = crate::state::now_secs();
-        let selected: Vec<AccountEnrollmentStatus> = state
-            .lock()
+        let guard = state.lock();
+        // "Returns the Compute Optimizer enrollment (opt-in) status of organization member
+        // accounts, if your account is an organization management account": the rows this
+        // operation reports exist only for a caller that manages an organization, so a caller
+        // that does not is refused rather than answered with an empty list — "to get the
+        // enrollment status of standalone accounts, use the GetEnrollmentStatus action".
+        //
+        // An account MANAGES an organization exactly when this service's store holds member
+        // accounts for it: AWS Organizations is what records an account's membership (see
+        // [`crate::state::OrganizationMemberStore`]), so an emulator that records no
+        // organization presents a standalone account.
+        if guard.organization_members.is_empty() {
+            return Err(not_a_management_account());
+        }
+        let selected: Vec<AccountEnrollmentStatus> = guard
             .organization_enrollment_statuses(now)
             .into_iter()
             .filter(|row| crate::state::account_enrollment_matches_filters(row, &filters))
             .collect();
+        drop(guard);
 
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped:
@@ -269,3 +293,19 @@ fn invalid_parameter(message: String) -> GetEnrollmentStatusesForOrganizationErr
     )
     .into()
 }
+
+/// What this operation answers a caller that does not manage an organization: this surface
+/// reports the member accounts of the CALLER's organization, which only that organization's
+/// management account or delegated administrator can get — "to get the enrollment status of
+/// standalone accounts, use the GetEnrollmentStatus action".
+fn not_a_management_account() -> GetEnrollmentStatusesForOrganizationError {
+    invalid_parameter(NOT_A_MANAGEMENT_ACCOUNT_MESSAGE.to_string())
+}
+
+/// The refusal [`not_a_management_account`] carries: the service's own constant wording for
+/// the condition, which states that the caller cannot get member accounts' statuses and the
+/// account roles that can.
+pub const NOT_A_MANAGEMENT_ACCOUNT_MESSAGE: &str =
+    "You can't get enrollment statuses for member accounts of an organization. This might be \
+     because you aren't a user of an organization account, or you aren't the management \
+     account or delegated administrator of the organization.";

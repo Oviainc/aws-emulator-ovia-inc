@@ -23,6 +23,8 @@ mod cross_account_resource_arns;
 mod ebs_volume_recommendations;
 #[path = "all/ebs_volume_recommendations_export.rs"]
 mod ebs_volume_recommendations_export;
+#[path = "all/ec2_instance_recommendations.rs"]
+mod ec2_instance_recommendations;
 #[path = "all/ec2_instance_recommendations_export.rs"]
 mod ec2_instance_recommendations_export;
 #[path = "all/ec2_recommendation_projected_metrics.rs"]

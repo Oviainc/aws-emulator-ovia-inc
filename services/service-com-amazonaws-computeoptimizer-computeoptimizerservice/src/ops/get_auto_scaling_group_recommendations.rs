@@ -426,39 +426,29 @@ fn foreign_account() -> GetAutoScalingGroupRecommendationsError {
     invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
 }
 
-/// Whether `group` passes `filter`.
-///
-/// A filter with no values constrains nothing. `Finding` matches the group's computed
-/// finding, `RecommendationSourceType` the resource type this operation reports
-/// (`AutoScalingGroup`), and `InferredWorkloadTypes` any workload type the analysis
-/// inferred for the group — none, when the account deactivated the inference.
-/// `FindingReasonCodes` selects nothing: an Auto Scaling group recommendation reports no
-/// finding reason codes.
+/// Whether `group` passes `filter` — the crate's one matcher for this surface's `Filters`
+/// ([`crate::state::resource_filter_matches`]), given what this group's recommendation
+/// reports: the finding the analysis computed, NO finding reason codes (an Auto Scaling group
+/// recommendation reports none, so a `FindingReasonCodes` filter selects nothing), the
+/// workload types the analysis inferred — none, when the account deactivated the inference —
+/// and the `RecommendationSourceType` of the resource this operation reports.
 fn filter_matches(
     filter: &Filter,
     group: &crate::state::AnalyzedAutoScalingGroup,
     preferences: &crate::state::EffectivePreferences,
 ) -> bool {
-    let Some(name) = filter.name.as_deref() else {
-        return true;
+    let inferred: &[String] = if preferences.infers_workload_types() {
+        &group.inferred_workload_types
+    } else {
+        &[]
     };
-    let values = filter.values.as_deref().unwrap_or_default();
-    if values.is_empty() {
-        return true;
-    }
-    match name {
-        "Finding" => values.iter().any(|value| value == group.finding()),
-        "RecommendationSourceType" => values
-            .iter()
-            .any(|value| value == crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP),
-        "InferredWorkloadTypes" => {
-            preferences.infers_workload_types()
-                && values
-                    .iter()
-                    .any(|value| group.inferred_workload_types.contains(value))
-        }
-        _ => false,
-    }
+    crate::state::resource_filter_matches(
+        filter,
+        group.finding(),
+        &[],
+        inferred,
+        crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
+    )
 }
 
 /// One Auto Scaling group's recommendation, computed from the stored analysis and the

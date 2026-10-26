@@ -205,20 +205,26 @@ pub struct DueExport {
 /// you create the export job. Compute Optimizer does not create the S3 bucket for you" — so a
 /// request naming a bucket the object store does not hold is refused rather than accepted
 /// into a job whose file could never appear.
+///
+/// The refusal is the service's own constant wording for the condition
+/// ([`MISSING_DESTINATION_MESSAGE`]): it states that the destination does not exist and what to
+/// do about it, and names neither the bucket nor the member — so no export operation words
+/// this refusal differently.
 pub fn destination_bucket_rejection<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bucket: &str,
 ) -> Option<String> {
     let held = s3::state::service_state(engine)
         .is_some_and(|store| store.lock().bucket(bucket).is_some());
-    (!held).then(|| {
-        format!(
-            "The value supplied for parameter s3DestinationConfig is not valid: the Amazon S3 \
-             bucket {bucket} does not exist. You must create the destination Amazon S3 bucket \
-             for your recommendations export before you create the export job."
-        )
-    })
+    (!held).then(|| MISSING_DESTINATION_MESSAGE.to_string())
 }
+
+/// What every export operation answers when the destination it was given is not a bucket this
+/// emulator's object store holds. ONE spelling for the whole crate, so the eight exports
+/// cannot drift apart on the same refusal.
+pub const MISSING_DESTINATION_MESSAGE: &str =
+    "The Amazon S3 destination provided does not exist. Confirm your S3 destination and try \
+     again.";
 
 /// The columns of an export file: the fields the request asked for, in the order it asked for
 /// them, or — for a request that names none — every field the resource type's

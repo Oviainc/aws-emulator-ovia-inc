@@ -8,9 +8,9 @@
 //! Storage Service (Amazon S3) bucket that you specify", so
 //!
 //! * a request naming a destination bucket that does not exist is REFUSED with
-//!   `InvalidParameterValueException` ("You must create the destination Amazon S3 bucket for
-//!   your recommendations export before you create the export job. Compute Optimizer does not
-//!   create the S3 bucket for you"), and records no job; and
+//!   `InvalidParameterValueException` carrying the service's constant missing-destination
+//!   message ("The Amazon S3 destination provided does not exist. Confirm your S3 destination
+//!   and try again."), and records no job; and
 //! * once the job it created reports `Complete`, the two objects the call answered —
 //!   `s3Destination.key` and `s3Destination.metadataKey` — are in that bucket and carry the
 //!   export and its metadata. Before the job completes neither object is there.
@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES;
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     ANALYSIS_DELAY, EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_FAILED,
     RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
@@ -170,12 +171,10 @@ async fn an_export_to_a_bucket_that_does_not_exist_is_refused() {
                 error_code(&body).contains("InvalidParameterValueException"),
                 "case {case:?}: expected InvalidParameterValueException, got {body}"
             );
-            assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains(bucket),
-                "case {case:?}: the refusal names the bucket it could not find, got {body}"
+            assert_eq!(
+                body["message"].as_str().unwrap_or_default(),
+                MISSING_DESTINATION_MESSAGE,
+                "case {case:?}: expected the service's missing-destination refusal, got {body}"
             );
             assert!(
                 body["jobId"].is_null(),

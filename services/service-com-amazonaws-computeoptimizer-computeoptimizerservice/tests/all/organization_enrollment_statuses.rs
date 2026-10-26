@@ -9,16 +9,18 @@
 //! WHICH accounts an organization holds is recorded by AWS Organizations, and no operation
 //! of THIS API creates one, so the fixtures below record member accounts into the store the
 //! way that service would and then read them back only over the wire. What is asserted is
-//! the RULE the read follows — one row per member account the store holds, each carrying the
-//! `Status` its enrollment has reached, selected by the `Status` filter and paged at
-//! `maxResults` — over a table of inputs, never one recorded call. The one thing this API
-//! does write for a member account is its ENROLLMENT, through an `UpdateEnrollmentStatus`
-//! call that includes member accounts; that write is asserted here too, from both sides.
+//! the RULE the read follows — it is served to an organization's MANAGEMENT account only, and
+//! reports one row per member account the store holds, each carrying the `Status` its
+//! enrollment has reached, selected by the `Status` filter and paged at `maxResults` — over a
+//! table of inputs, never one recorded call. The one thing this API does write for a member
+//! account is its ENROLLMENT, through an `UpdateEnrollmentStatus` call that includes member
+//! accounts; that write is asserted here too, from both sides.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::get_enrollment_statuses_for_organization::NOT_A_MANAGEMENT_ACCOUNT_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::STATUS_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     enrollment_status_reason, service_state, MemberAccountEnrollment,
@@ -171,11 +173,14 @@ async fn get_enrollment(router: &MultiServiceRouter) -> Value {
     body
 }
 
-/// An emulator that records no organization holds no member account, so every read of it —
-/// filtered, paged or bare — reports the empty sequence and no further page, and enrolling
-/// that organization enrolls nothing.
+/// An emulator that records no organization presents a STANDALONE account, and this operation
+/// "returns the Compute Optimizer enrollment (opt-in) status of organization member accounts,
+/// if your account is an organization management account": every read of it — filtered, paged
+/// or bare — is refused with the operation's modelled 400 rather than answered with an empty
+/// sequence, while `GetEnrollmentStatus`, the action that reports a standalone account's own
+/// enrollment, still answers. Enrolling that organization still creates no member account.
 #[tokio::test]
-async fn an_organization_with_no_member_account_reports_an_empty_sequence() {
+async fn a_standalone_account_is_refused_the_organization_s_statuses() {
     let router = emulator();
 
     for (case, request) in [
@@ -186,31 +191,53 @@ async fn an_organization_with_no_member_account_reports_an_empty_sequence() {
         ),
         ("a page size", json!({"maxResults": 1})),
     ] {
-        let body = get_org(&router, case, request).await;
+        let (status, body) = call(
+            &router,
+            "GetEnrollmentStatusesForOrganization",
+            request.clone(),
+        )
+        .await;
         assert_eq!(
-            body["accountEnrollmentStatuses"],
-            json!([]),
-            "case {case:?}: an organization with no member account reports none, got {body}"
+            status, 400,
+            "case {case:?}: expected {request} to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            NOT_A_MANAGEMENT_ACCOUNT_MESSAGE,
+            "case {case:?}: expected the not-a-management-account refusal, got {body}"
         );
         assert!(
-            body["nextToken"].is_null(),
-            "case {case:?}: there is no further page, got {body}"
+            body["accountEnrollmentStatuses"].is_null(),
+            "case {case:?}: a refused read reports no statuses, got {body}"
         );
     }
 
-    update_enrollment(&router, "Active", true).await;
-    settle().await;
-    let body = get_org(&router, "after enrolling an empty organization", json!({})).await;
-    assert_eq!(
-        body["accountEnrollmentStatuses"],
-        json!([]),
-        "enrolling member accounts creates none, got {body}"
-    );
+    // The account's OWN enrollment is readable by the same client throughout: "to get the
+    // enrollment status of standalone accounts, use the GetEnrollmentStatus action."
     let enrollment = get_enrollment(&router).await;
     assert_eq!(
         enrollment["numberOfMemberAccountsOptedIn"],
         json!(0),
-        "no member account exists to be opted in, got {enrollment}"
+        "a standalone account has no member account opted in, got {enrollment}"
+    );
+
+    update_enrollment(&router, "Active", true).await;
+    settle().await;
+    let enrollment = get_enrollment(&router).await;
+    assert_eq!(
+        enrollment["status"],
+        json!("Active"),
+        "the account's own enrollment is readable after enrolling, got {enrollment}"
+    );
+    assert_eq!(
+        enrollment["numberOfMemberAccountsOptedIn"],
+        json!(0),
+        "enrolling member accounts creates none, got {enrollment}"
     );
 }
 

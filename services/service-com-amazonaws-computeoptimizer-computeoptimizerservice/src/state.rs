@@ -35,7 +35,9 @@
 //! recommendation it reports, and so are the licensed Amazon EC2 instances
 //! ([`ObservedLicensedInstance`]), from which `GetLicenseRecommendations` DERIVES every
 //! license recommendation it reports, and the Amazon EC2 instances it analyses
-//! ([`ObservedInstance`]), whose observed utilization
+//! ([`ObservedInstance`]), from which `GetEC2InstanceRecommendations` DERIVES every instance
+//! recommendation it reports — its finding, its utilization, the options its candidate types
+//! offer and what each of them saves — and whose observed utilization
 //! `GetEC2RecommendationProjectedMetrics` projects onto each instance type the analysis
 //! recommends. The Amazon ECS service analysis has its inputs and its sizing rule here too
 //! ([`parse_ecs_service_arn`], [`ecs_service_config`], [`ecs_observed_utilization`],
@@ -63,7 +65,8 @@ use crate::ops::types::{
     ECSServiceProjectedUtilizationMetric, ECSServiceRecommendationFilter,
     EffectivePreferredResource,
     EffectiveRecommendationPreferences, EnrollmentFilter, EstimatedMonthlySavings,
-    ExportDestination, ExternalMetricsPreference, IdleEstimatedMonthlySavings, IdleRecommendation,
+    ExportDestination, ExternalMetricStatus, ExternalMetricsPreference,
+    IdleEstimatedMonthlySavings, IdleRecommendation,
     IdleRecommendationFilter, IdleSavingsOpportunity, IdleSavingsOpportunityAfterDiscounts,
     IdleUtilizationMetric, InstanceSavingsEstimationMode, JobFilter,
     LambdaEffectiveRecommendationPreferences, LambdaEstimatedMonthlySavings,
@@ -77,7 +80,9 @@ use crate::ops::types::{
     RDSDBUtilizationMetric, RecommendationExportJob, RecommendationPreferencesDetail,
     S3Destination, SavingsOpportunity, Scope, Tag, UtilizationMetric, UtilizationPreference,
     VolumeConfiguration, VolumeRecommendation, VolumeRecommendationOption,
-    ENROLLMENT_FILTER_NAME_VALUES, FILTER_NAME_VALUES, FINDING_VALUES,
+    ENROLLMENT_FILTER_NAME_VALUES, EXTERNAL_METRICS_SOURCE_VALUES,
+    EXTERNAL_METRIC_STATUS_CODE_VALUES, FILTER_NAME_VALUES,
+    FINDING_VALUES,
     IDLE_FINDING_VALUES,
     IDLE_RECOMMENDATION_FILTER_NAME_VALUES, IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
     IDLE_VALUES, INFERRED_WORKLOAD_TYPE_VALUES,
@@ -121,6 +126,29 @@ pub const MAX_PAGE_SIZE: usize = 1_000;
 /// no particular size gets one bounded page plus a `nextToken` to walk the rest, rather
 /// than the whole store serialised into one response.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The most resource identifiers one request may name in a reader's ARN list, whatever the
+/// model declares no bound for: a request naming more is REFUSED with that operation's
+/// `InvalidParameterValueException` rather than answered.
+///
+/// The identifiers a request carries drive the selection and the per-identifier `errors` list
+/// of a reader, so without a ceiling the work one request causes, and the response it gets
+/// back, would both grow with the size of the list it sent. The bound is the page ceiling
+/// [`MAX_PAGE_SIZE`]: a request cannot usefully ask about more resources than the largest page
+/// this service will report.
+pub const MAX_REQUESTED_IDENTIFIERS: usize = MAX_PAGE_SIZE;
+
+/// Why an ARN list a request carries is too long to answer ([`MAX_REQUESTED_IDENTIFIERS`]),
+/// naming the member and the bound, or `None` when it is within it. Stated once so no two
+/// readers of this service bound their identifier list differently.
+pub fn too_many_identifiers(member: &str, named: usize) -> Option<String> {
+    (named > MAX_REQUESTED_IDENTIFIERS).then(|| {
+        format!(
+            "The value supplied for parameter {member} is not valid: at most \
+             {MAX_REQUESTED_IDENTIFIERS} resources can be named per request, not {named}."
+        )
+    })
+}
 
 /// The `ScopeName` enum values (`crate::ops::types::SCOPE_NAME_VALUES`), named so the
 /// precedence and validation rules below read as the model's own vocabulary.
@@ -1891,18 +1919,19 @@ impl AnalyzedAutoScalingGroup {
     /// `infers_workload_types` is whether the account leaves the workload-type inference
     /// active: with the inference deactivated no workload type is inferred for the
     /// group, which is the `Medium` case.
+    ///
+    /// The rule itself is the crate's ([`migration_effort`]), shared with the Amazon EC2
+    /// instance analysis, so two recommendations of the same move cannot report different
+    /// effort.
     pub fn migration_effort(
         &self,
         candidate: &GroupConfiguration,
         infers_workload_types: bool,
     ) -> &'static str {
-        if candidate.architecture != CPU_ARCHITECTURE_AWS_ARM64 {
-            "VeryLow"
-        } else if !infers_workload_types || self.inferred_workload_types.is_empty() {
-            "Medium"
-        } else {
-            "Low"
-        }
+        migration_effort(
+            &candidate.architecture,
+            infers_workload_types && !self.inferred_workload_types.is_empty(),
+        )
     }
 
     /// The saving `candidate` offers against the group's own configuration, on the
@@ -3171,6 +3200,48 @@ pub fn resource_filter_rejection(filters: &[Filter]) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether one recommendation of this surface satisfies `filter`.
+///
+/// A filter with no name, or one with no values, constrains nothing. `Finding` matches the
+/// finding the analysis reached, `FindingReasonCodes` any reason code behind it,
+/// `RecommendationSourceType` the `RecommendationSourceType` of the resource the
+/// recommendation is about, and `InferredWorkloadTypes` any workload type the analysis
+/// inferred for it — so a reader passes the EMPTY list for a recommendation that reports none,
+/// whether because its resource type has none (an Auto Scaling group reports no finding reason
+/// codes) or because the account deactivated the inference, and such a filter then selects
+/// nothing rather than matching everything.
+///
+/// The vocabulary itself is checked up front ([`resource_filter_rejection`]), so a filter
+/// reaching here carries a name and values this surface declares. ONE matcher for the whole
+/// surface, so the readers of two resource types cannot drift apart on the same filter.
+pub fn resource_filter_matches(
+    filter: &Filter,
+    finding: &str,
+    finding_reason_codes: &[String],
+    inferred_workload_types: &[String],
+    source_type: &str,
+) -> bool {
+    let Some(name) = filter.name.as_deref() else {
+        return true;
+    };
+    let values = filter.values.as_deref().unwrap_or_default();
+    if values.is_empty() {
+        return true;
+    }
+    let reported: &[String] = match name {
+        FILTER_FINDING => return values.iter().any(|value| value == finding),
+        FILTER_RECOMMENDATION_SOURCE_TYPE => {
+            return values.iter().any(|value| value == source_type)
+        }
+        FILTER_FINDING_REASON_CODES => finding_reason_codes,
+        FILTER_INFERRED_WORKLOAD_TYPES => inferred_workload_types,
+        // A name outside this surface's vocabulary cannot arrive (see
+        // [`resource_filter_rejection`]), and selects nothing if it does.
+        _ => return false,
+    };
+    values.iter().any(|value| reported.contains(value))
 }
 
 /// The value set a `FilterName` selects on, or `None` for a name the model does not declare.
@@ -5604,9 +5675,259 @@ pub struct ObservedInstance {
     /// The `InferredWorkloadType`s the analysis inferred for the instance; empty where it
     /// inferred none.
     pub inferred_workload_types: Vec<String>,
+    /// `instanceState`: "the state of the instance when the recommendation was generated",
+    /// one of the model's `InstanceState` values
+    /// (`crate::ops::types::INSTANCE_STATE_VALUES`).
+    pub instance_state: String,
+    /// The instance's tags, as key/value pairs, in the order Amazon EC2 reports them. The
+    /// `Name` tag is what names the instance ([`Self::instance_name`]).
+    pub tags: Vec<(String, String)>,
+}
+
+/// The `InstanceState` an instance under analysis is in
+/// (`crate::ops::types::INSTANCE_STATE_VALUES`): Compute Optimizer analyses the workload an
+/// instance is RUNNING, so that is the state the observations below were taken in.
+pub const INSTANCE_STATE_RUNNING: &str = "running";
+
+/// The tag key Amazon EC2 names a resource with, and so the tag an instance's `instanceName`
+/// is taken from: "the name of the current instance" (`InstanceRecommendation$instanceName`)
+/// is the value of its `Name` tag.
+pub const NAME_TAG_KEY: &str = "Name";
+
+/// The `PlatformDifference` value a recommendation option of another CPU architecture carries
+/// (`crate::ops::types::PLATFORM_DIFFERENCE_VALUES`).
+pub const PLATFORM_DIFFERENCE_ARCHITECTURE: &str = "Architecture";
+
+/// The `ExternalMetricStatusCode` for an account that prefers no external metrics provider
+/// (`crate::ops::types::EXTERNAL_METRIC_STATUS_CODE_VALUES`).
+pub const EXTERNAL_METRIC_STATUS_NO_METRIC_SET: &str = "NO_EXTERNAL_METRIC_SET";
+
+/// The `ExternalMetricStatus` a recommendation reports: "an object that describes Compute
+/// Optimizer's integration status with your external metrics provider".
+///
+/// WHICH provider the analysis should take metrics from is the account's external-metrics
+/// preference (`ExternalMetricsPreference$source`, one of
+/// `crate::ops::types::EXTERNAL_METRICS_SOURCE_VALUES`), so an account that prefers none has
+/// no integration at all: [`EXTERNAL_METRIC_STATUS_NO_METRIC_SET`]. This emulator derives a
+/// recommendation from the utilization it observes itself and ingests no series from a
+/// third-party provider, so once a provider IS preferred the status is that provider's
+/// "insufficient metrics" code — the condition the service reports while a preferred provider
+/// has published nothing the analysis can use. A source outside the model's own value set
+/// names no provider to integrate with, so it reports no integration either.
+pub fn external_metric_status(source: Option<&str>) -> ExternalMetricStatus {
+    /// Each `ExternalMetricsSource` the model declares
+    /// (`crate::ops::types::EXTERNAL_METRICS_SOURCE_VALUES`) paired with the
+    /// `ExternalMetricStatusCode` that provider's absent metrics are reported under
+    /// (`crate::ops::types::EXTERNAL_METRIC_STATUS_CODE_VALUES`) — one row per provider the
+    /// model names, so neither value set can drift out of step with the other unnoticed.
+    const INSUFFICIENT_METRICS: [(&str, &str); 4] = [
+        ("Datadog", "INSUFFICIENT_DATADOG_METRICS"),
+        ("Dynatrace", "INSUFFICIENT_DYNATRACE_METRICS"),
+        ("Instana", "INSUFFICIENT_INSTANA_METRICS"),
+        ("NewRelic", "INSUFFICIENT_NEWRELIC_METRICS"),
+    ];
+    debug_assert!(
+        INSUFFICIENT_METRICS
+            .iter()
+            .all(|(provider, code)| EXTERNAL_METRICS_SOURCE_VALUES.contains(provider)
+                && EXTERNAL_METRIC_STATUS_CODE_VALUES.contains(code)),
+        "the catalog may only pair modelled ExternalMetricsSource and \
+         ExternalMetricStatusCode values"
+    );
+    let no_metric_set = || ExternalMetricStatus {
+        status_code: Some(EXTERNAL_METRIC_STATUS_NO_METRIC_SET.to_string()),
+        status_reason: None,
+    };
+    let Some(source) = source.filter(|source| !source.is_empty()) else {
+        return no_metric_set();
+    };
+    let code = INSUFFICIENT_METRICS
+        .iter()
+        .find(|(provider, _)| *provider == source)
+        .map(|(_, code)| *code);
+    let Some(code) = code else {
+        return no_metric_set();
+    };
+    ExternalMetricStatus {
+        status_code: Some(code.to_string()),
+        status_reason: Some(format!(
+            "Compute Optimizer has received no utilization metrics from {source}."
+        )),
+    }
+}
+
+/// The `MigrationEffort` of moving a workload onto a candidate of `candidate_architecture`,
+/// given whether the analysis inferred a workload type for it.
+///
+/// `VeryLow` "if both the current and recommended instance types are of the same CPU
+/// architecture", `Low` "if Amazon EMR is the inferred workload type and an Amazon Web
+/// Services Graviton instance type is recommended", and `Medium` "if a workload type couldn't
+/// be inferred but an Amazon Web Services Graviton instance type is recommended"
+/// (`InstanceRecommendationOption$migrationEffort`).
+///
+/// The model names Amazon EMR as the example of an inferred workload and states no rule for
+/// any other, so this generalises its `Low` case to ANY workload type the analysis inferred:
+/// what the two documented Graviton cases differ on is whether a workload type was inferred at
+/// all, and naming one of the nine `InferredWorkloadType` values would make the effort of a
+/// Kafka or a Redis workload depend on a value the rule says nothing about.
+///
+/// The ONE rule in this service, shared by every analysis that ranks a candidate instance
+/// type, so two recommendations of the same move cannot report different effort.
+pub fn migration_effort(candidate_architecture: &str, inferred_workload_type: bool) -> &'static str
+{
+    if candidate_architecture != CPU_ARCHITECTURE_AWS_ARM64 {
+        "VeryLow"
+    } else if inferred_workload_type {
+        "Low"
+    } else {
+        "Medium"
+    }
+}
+
+/// An Amazon EC2 instance ARN — `arn:<partition>:ec2:<region>:<account>:instance/<id>` — split
+/// into the parts the readers need, or `None` for anything that is not one.
+/// `GetEC2InstanceRecommendations$instanceArns` takes "the Amazon Resource Name (ARN) of the
+/// instances for which to return recommendations", so anything else is not an instance ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedInstanceArn<'a> {
+    /// The ARN's account-id field: the account that owns the instance.
+    pub account_id: &'a str,
+    /// The ARN's region field: the Region the instance is in, which a regional service
+    /// answers for only when the request was signed for it.
+    pub region: &'a str,
+    /// The EC2 instance id, which is the inventory's key.
+    pub instance_id: &'a str,
+}
+
+/// Parse an Amazon EC2 instance ARN, or `None` for anything that is not one. Built on the one
+/// place this service decides what an ARN looks like ([`parse_arn`]). See
+/// [`ParsedInstanceArn`].
+pub fn parse_instance_arn(arn: &str) -> Option<ParsedInstanceArn<'_>> {
+    let parsed = parse_arn(arn)?;
+    if parsed.service != "ec2" {
+        return None;
+    }
+    let (resource_kind, instance_id) = parsed.resource.split_once('/')?;
+    if resource_kind != "instance" || instance_id.is_empty() {
+        return None;
+    }
+    Some(ParsedInstanceArn {
+        account_id: parsed.account_id,
+        region: parsed.region,
+        instance_id,
+    })
 }
 
 impl ObservedInstance {
+    /// "The name of the current instance" — the value of its `Name` tag, or `None` for an
+    /// instance that carries none, which Amazon EC2 reports no name for either.
+    pub fn instance_name(&self) -> Option<String> {
+        self.tags
+            .iter()
+            .find(|(key, _)| key == NAME_TAG_KEY)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// The instance's tags as the modelled `Tags` list, or `None` when it carries none.
+    pub fn tag_list(&self) -> Option<Vec<Tag>> {
+        modelled_tags(&self.tags)
+    }
+
+    /// The metrics `InstanceRecommendation$utilizationMetrics` reports: every observation the
+    /// analysis recorded under [`METRIC_STATISTIC_MAXIMUM`], which is the one statistic this
+    /// API reports ("The Compute Optimizer API, Command Line Interface (CLI), and SDKs return
+    /// utilization metrics using only the `Maximum` statistic", `UtilizationMetric$statistic`).
+    pub fn utilization_metrics(&self) -> Vec<UtilizationMetric> {
+        self.utilization
+            .iter()
+            .filter(|metric| metric.statistic == METRIC_STATISTIC_MAXIMUM)
+            .map(|metric| UtilizationMetric {
+                name: Some(metric.name.clone()),
+                statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+                value: round_hundredths(metric.value),
+            })
+            .collect()
+    }
+
+    /// The metrics `InstanceRecommendationOption$projectedUtilizationMetrics` reports for
+    /// `option`: "The `Cpu` and `Memory` metrics are the only projected utilization metrics
+    /// returned", so the observations projected are the ones the instance TYPE sizes
+    /// ([`metric_sized_by_instance_type`]), each through the one projection this service
+    /// projects an instance's utilization with ([`Self::projected_metric_value`]) — so this
+    /// option and the series `GetEC2RecommendationProjectedMetrics` projects for it cannot
+    /// disagree.
+    pub fn projected_utilization_metrics(
+        &self,
+        option: &InstanceConfiguration,
+    ) -> Vec<UtilizationMetric> {
+        self.utilization
+            .iter()
+            .filter(|metric| metric.statistic == METRIC_STATISTIC_MAXIMUM)
+            .filter(|metric| metric_sized_by_instance_type(&metric.name))
+            .map(|metric| UtilizationMetric {
+                name: Some(metric.name.clone()),
+                statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+                value: self.projected_metric_value(&metric.name, metric.value, option),
+            })
+            .collect()
+    }
+
+    /// The `PerformanceRisk` an option carries: how close the utilization projected onto
+    /// `option` comes to the capacity of the type it recommends, on the model's 0..4 scale
+    /// ([`performance_risk_score`]) — "the performance risk of the recommended instance is
+    /// calculated as the maximum performance risk score across the analyzed resource
+    /// specifications", so an option is as risky as its most loaded dimension.
+    pub fn option_performance_risk(&self, option: &InstanceConfiguration) -> f64 {
+        let peak = self
+            .projected_utilization_metrics(option)
+            .iter()
+            .map(|metric| metric.value)
+            .fold(0.0_f64, f64::max);
+        round_hundredths(performance_risk_score(peak, UTILIZATION_PERCENTAGE_CEILING))
+    }
+
+    /// What adopting `option` saves per month, and that saving "as a percentage of monthly
+    /// cost" (`SavingsOpportunity$savingsOpportunityPercentage`). An option that costs the
+    /// same or more saves NOTHING rather than a negative amount — an under-provisioned
+    /// instance is recommended a LARGER type.
+    pub fn savings(&self, option: &InstanceConfiguration) -> (f64, f64) {
+        let current = self.current.monthly_cost();
+        let saved = round_hundredths((current - option.monthly_cost()).max(0.0));
+        (saved, percentage_of(saved, current))
+    }
+
+    /// The `PlatformDifference`s between the type the instance runs and `option`
+    /// (`crate::ops::types::PLATFORM_DIFFERENCE_VALUES`): "the configuration differences
+    /// between the current instance and the recommended instance type".
+    ///
+    /// The analysis records an instance type's CPU vendor and architecture, so the one
+    /// difference it can state is `Architecture` — "the CPU architecture of the recommended
+    /// instance type is different than that of the current instance" — which a candidate of
+    /// another `CpuVendorArchitecture` has. The remaining values of that enum describe a
+    /// hypervisor, a network or storage interface, instance-store availability or a
+    /// virtualization type, none of which this analysis observes.
+    pub fn platform_differences(&self, option: &InstanceConfiguration) -> Vec<String> {
+        if option.architecture == self.current.architecture {
+            Vec::new()
+        } else {
+            vec![PLATFORM_DIFFERENCE_ARCHITECTURE.to_string()]
+        }
+    }
+
+    /// "The level of effort required to migrate from the current instance type to the
+    /// recommended instance type" — the crate's one rule for it ([`migration_effort`]), so an
+    /// instance's effort and an Auto Scaling group's mean the same thing.
+    pub fn migration_effort(
+        &self,
+        option: &InstanceConfiguration,
+        infers_workload_types: bool,
+    ) -> &'static str {
+        migration_effort(
+            &option.architecture,
+            infers_workload_types && !self.inferred_workload_types.is_empty(),
+        )
+    }
+
     /// This instance's identity WITHOUT the region — the resource part of its ARN.
     pub fn arn_resource(&self) -> String {
         format!("instance/{}", self.instance_id)
@@ -5781,6 +6102,11 @@ fn observed_instances() -> Vec<ObservedInstance> {
             finding_reason_codes: vec![METRIC_REASON_MEMORY_OVERPROVISIONED.to_string()],
             current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
             inferred_workload_types: vec!["PostgreSql".to_string()],
+            instance_state: INSTANCE_STATE_RUNNING.to_string(),
+            tags: vec![
+                (NAME_TAG_KEY.to_string(), "reporting-db".to_string()),
+                ("Owner".to_string(), "TeamA".to_string()),
+            ],
         },
         // The workload outgrew the instance: the analysis would move it to twice the
         // capacity, which costs MORE — a recommendation is not always a saving.
@@ -5798,6 +6124,8 @@ fn observed_instances() -> Vec<ObservedInstance> {
             finding_reason_codes: vec![METRIC_REASON_MEMORY_UNDERPROVISIONED.to_string()],
             current_performance_risk: PERFORMANCE_RISK_HIGH.to_string(),
             inferred_workload_types: vec!["Redis".to_string()],
+            instance_state: INSTANCE_STATE_RUNNING.to_string(),
+            tags: vec![(NAME_TAG_KEY.to_string(), "session-cache".to_string())],
         },
         // Already the right size for its workload: no candidate, so nothing to project onto.
         ObservedInstance {
@@ -5814,6 +6142,9 @@ fn observed_instances() -> Vec<ObservedInstance> {
             finding_reason_codes: Vec::new(),
             current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
             inferred_workload_types: Vec::new(),
+            instance_state: INSTANCE_STATE_RUNNING.to_string(),
+            // An instance nobody tagged: it carries no tags, and so no name either.
+            tags: Vec::new(),
         },
     ]
 }

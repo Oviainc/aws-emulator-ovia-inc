@@ -87,12 +87,18 @@ struct ArnMember {
 
 /// Every reader of this service that takes a resource ARN, in each ARN form its member
 /// documents.
-const ARN_MEMBERS: [ArnMember; 6] = [
+const ARN_MEMBERS: [ArnMember; 7] = [
     ArnMember {
         operation: "GetEffectiveRecommendationPreferences",
         member: "resourceArn",
         arn_of: instance_arn_of,
         list: false,
+    },
+    ArnMember {
+        operation: "GetEC2InstanceRecommendations",
+        member: "instanceArns",
+        arn_of: instance_arn_of,
+        list: true,
     },
     ArnMember {
         operation: "GetEffectiveRecommendationPreferences",
@@ -253,12 +259,18 @@ async fn a_malformed_arn_is_refused_for_its_form_whichever_account_it_names() {
     // instance or Auto Scaling group ARN; an EC2 instance ARN is neither an Auto Scaling
     // group's nor a volume's). Each is sent for the caller's OWN account and for another
     // account, so the form check is shown to come first.
-    let rows: [ArnMember; 3] = [
+    let rows: [ArnMember; 4] = [
         ArnMember {
             operation: "GetEffectiveRecommendationPreferences",
             member: "resourceArn",
             arn_of: volume_arn_of,
             list: false,
+        },
+        ArnMember {
+            operation: "GetEC2InstanceRecommendations",
+            member: "instanceArns",
+            arn_of: volume_arn_of,
+            list: true,
         },
         ArnMember {
             operation: "GetAutoScalingGroupRecommendations",

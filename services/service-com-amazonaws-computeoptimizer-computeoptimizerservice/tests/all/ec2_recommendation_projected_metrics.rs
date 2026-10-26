@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     service_state, InstanceConfiguration, ObservedInstance, ObservedInstanceMetric,
-    ANALYSIS_DELAY, CPU_ARCHITECTURE_AWS_ARM64, CPU_ARCHITECTURE_CURRENT,
+    ANALYSIS_DELAY, CPU_ARCHITECTURE_AWS_ARM64, CPU_ARCHITECTURE_CURRENT, INSTANCE_STATE_RUNNING,
     MAX_PROJECTED_METRIC_DATA_POINTS, PERFORMANCE_RISK_VERY_LOW,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -93,6 +93,8 @@ fn instance(
         finding_reason_codes: Vec::new(),
         current_performance_risk: PERFORMANCE_RISK_VERY_LOW.to_string(),
         inferred_workload_types: Vec::new(),
+        instance_state: INSTANCE_STATE_RUNNING.to_string(),
+        tags: Vec::new(),
     }
 }
 
