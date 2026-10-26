@@ -1961,6 +1961,28 @@ pub fn still_held_message(signal_map_ids: &[String], template_ids: &[String]) ->
     }
 }
 
+/// Why a SIGNAL MAP's delete removed nothing. Each variant is one modelled
+/// refusal, and each of them leaves the store exactly as it was.
+///
+/// The two conflicts are the one class the delete of a resource with
+/// asynchronous lifecycle actions refuses on: work on that resource is still in
+/// flight, so there is nothing to delete it out from under yet. Each carries the
+/// id of the signal map and the status it is in, so the handler composes its
+/// message out of STATE rather than out of the request.
+#[derive(Debug)]
+pub enum SignalMapDeleteRefusal {
+    /// No signal map answers to the identifier, by either form `Identifier`
+    /// documents (its id or its current name).
+    NotFound,
+    /// A lifecycle action of the signal map itself is still running, so the
+    /// signal map is not in a state a delete may take it out of.
+    LifecycleRunning { id: String, status: String },
+    /// A monitor deployment of the signal map is still running — the same
+    /// in-flight deployment `StartMonitorDeployment` and
+    /// `StartDeleteMonitorDeployment` refuse a second one over.
+    DeploymentRunning { id: String, status: String },
+}
+
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedialiveMedialiveState {
@@ -3518,6 +3540,58 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.signal_maps.get_mut(&id)
     }
 
+    /// Remove the signal map `identifier` names, answering the record that was
+    /// removed — or refuse.
+    ///
+    /// `DeleteSignalMap` "deletes the specified signal map" and documents no
+    /// precondition, so the only refusals are an identifier that resolves to no
+    /// signal map and a signal map with work of its own still in flight: its own
+    /// lifecycle action, or a monitor deployment of it. Once removed the signal
+    /// map is GONE from the store — `SignalMapStatus` declares no deleted state
+    /// for a reader to go on reporting it in — so every later read of either of
+    /// its identifiers misses, its name is free again, its tags go with it and
+    /// the template groups it named are no longer held by it.
+    ///
+    /// The resolution, the preconditions and the removal live together here, so a
+    /// handler cannot check one of them and write past another; the handler's job
+    /// is only to turn a [`SignalMapDeleteRefusal`] into the operation's own
+    /// modelled error.
+    pub fn delete_signal_map(
+        &mut self,
+        identifier: &str,
+    ) -> Result<SignalMapRecord, SignalMapDeleteRefusal> {
+        let id = self
+            .signal_map_id_for_identifier(identifier)
+            .ok_or(SignalMapDeleteRefusal::NotFound)?
+            .to_string();
+        let map = self
+            .signal_maps
+            .get(&id)
+            .ok_or(SignalMapDeleteRefusal::NotFound)?;
+
+        if map.lifecycle_in_progress() {
+            return Err(SignalMapDeleteRefusal::LifecycleRunning {
+                id,
+                status: map.status().to_string(),
+            });
+        }
+        if map.monitor_deployment_in_progress() {
+            return Err(SignalMapDeleteRefusal::DeploymentRunning {
+                id,
+                status: map.monitor_deployment_status().to_string(),
+            });
+        }
+
+        let removed = self
+            .signal_maps
+            .remove(&id)
+            .ok_or(SignalMapDeleteRefusal::NotFound)?;
+        // A token never outlives the resource it minted, so a retried create
+        // cannot resurrect a deleted signal map.
+        self.signal_map_tokens.forget(&id);
+        Ok(removed)
+    }
+
     /// The input whose ARN is exactly `arn`, if this store holds one — the same
     /// global-identity reading of an ARN as [`Self::channel_by_arn`].
     fn input_by_arn(&self, arn: &str) -> Option<&InputRecord> {
@@ -4335,6 +4409,16 @@ impl SignalMapRecord {
     /// has nothing to deploy yet.
     pub fn discovery_complete(&self) -> bool {
         self.status == signal_map_status::CREATE_COMPLETE
+    }
+
+    /// Whether a lifecycle action of the signal map ITSELF is still running, so
+    /// nothing may take the signal map out from under it. Those are the
+    /// `SignalMapStatus` values whose name ends in `_IN_PROGRESS` — the
+    /// `CREATE_IN_PROGRESS` a discovery runs in and the `UPDATE_IN_PROGRESS` an
+    /// update runs in — read off the stored status, so a status this slice does
+    /// not mint yet counts as soon as something stores it.
+    pub fn lifecycle_in_progress(&self) -> bool {
+        self.status.ends_with("_IN_PROGRESS")
     }
 
     /// Whether a monitor deployment of this signal map is already running, so a

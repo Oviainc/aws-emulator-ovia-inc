@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSignalMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSignalMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSignalMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,18 +157,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSignalMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSignalMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSignalMap"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Materialise what the clock had already made due — a signal map's
+        // discovery, and a monitor deployment's outcome — before deciding what
+        // this call may do, so the decision is made against the state a reader
+        // would already have been shown rather than against a stale one.
+        state.settle(now);
+
+        // "Deletes the specified signal map": `Identifier` is "A signal map's
+        // identifier. Can be either be its id or current name", so both forms
+        // resolve to the same stored signal map, and the record then LEAVES the
+        // store — `SignalMapStatus` models no deleted state for a reader to keep
+        // reporting it in. The resolution, the preconditions and the removal are
+        // one step in state, so a refused call writes nothing.
+        state
+            .delete_signal_map(&input.identifier)
+            .map_err(|refusal| refused(&input.identifier, refusal))?;
+
+        Ok(DeleteSignalMapOutput)
     }
+}
+
+/// Turn the state layer's refusal into this operation's own modelled error: the
+/// modelled 404 for an identifier that resolves to no signal map, and the
+/// modelled 409 for a signal map whose own work is still in flight, whose
+/// message names the signal map and the status it is in.
+fn refused(
+    identifier: &str,
+    refusal: crate::state::SignalMapDeleteRefusal,
+) -> DeleteSignalMapError {
+    match refusal {
+        crate::state::SignalMapDeleteRefusal::NotFound => {
+            DeleteSignalMapErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Signal map", identifier)),
+            })
+        }
+        crate::state::SignalMapDeleteRefusal::LifecycleRunning { id, status } => {
+            DeleteSignalMapErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Signal map {id} is in state {status} and can only be deleted once that \
+                     action has completed"
+                )),
+            })
+        }
+        crate::state::SignalMapDeleteRefusal::DeploymentRunning { id, status } => {
+            DeleteSignalMapErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Signal map {id} has a monitor deployment in progress ({status}) and can \
+                     only be deleted once that deployment has completed"
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the signal map from. A modelled server error,
+/// never a fresh engine (which would drop the deletion when this request
+/// returns).
+fn unavailable() -> DeleteSignalMapError {
+    DeleteSignalMapErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
