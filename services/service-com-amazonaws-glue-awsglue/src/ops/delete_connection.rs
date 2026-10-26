@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the connection definition stored under this name in the addressed
+//! Data Catalog, so a later read of that name reports the miss, and refuses a name that
+//! catalog holds none under with the modelled `EntityNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A mutation: "Deletes a connection from the Data Catalog". The whole record goes, the
+//! tags the create recorded included, and the name it occupied is free for another create.
+//! The response carries no member, so a served delete is an empty 200.
 //!
 //! ## Shape of an operation
 //!
@@ -65,6 +63,10 @@
 //!
 //! * `EntityNotFoundException` (HTTP 400) — A specified entity does not exist
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in: the refusal a request addressed to
+//!   another account's Data Catalog earns, as on `GetConnection` / `UpdateConnection`.
+//! * `InternalServiceException` (HTTP 500) — widened in: an internal service error
+//!   occurred, for a store this process cannot reach, as on `DeleteDatabase`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -80,10 +82,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `DeleteConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#DeleteConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#DeleteConnection",
+    extra_errors = ["AccessDeniedException", "InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum DeleteConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
+    InternalServiceException(InternalServiceException),
     OperationTimeoutException(OperationTimeoutException),
 }
 
@@ -138,18 +145,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteConnectionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // connection lookup, exactly as on the read and the update: any id but this
+        // account's names another account's catalog, reachable only through that catalog's
+        // own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(DeleteConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A delete of a name the catalog holds nothing under is a miss, not a no-op: this
+        // operation models `EntityNotFoundException` and documents no idempotent delete,
+        // unlike the operations whose own documentation states one ("if the job definition
+        // is not found, no exception is thrown" — `DeleteJob`).
+        if store
+            .remove_connection(&catalog_id, &input.connection_name)
+            .is_none()
+        {
+            return Err(DeleteConnectionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::connection_not_found_for_write(
+                        &input.connection_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        ::tracing::info!(
+            operation = "DeleteConnection",
+            catalog_id = %catalog_id,
+            connection = %input.connection_name,
+            "deleted a Glue connection definition"
+        );
+
+        // `DeleteConnectionResponse` carries no member, so a served delete is an empty 200.
+        Ok(DeleteConnectionOutput {})
     }
 }

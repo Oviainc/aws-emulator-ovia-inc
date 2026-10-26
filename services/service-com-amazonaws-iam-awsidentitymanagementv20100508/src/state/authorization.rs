@@ -88,6 +88,17 @@ pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
 /// `iam:UntagPolicy`.
 pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
 
+/// `iam:GetAccountAuthorizationDetails`.
+pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorizationDetails";
+
+/// The resource an account-WIDE call is decided against.
+///
+/// An action that reports the account's whole configuration is not taken on one
+/// entity, and the Service Authorization Reference lists no resource type for such an
+/// IAM action, so a statement permits it only by covering every resource — which is
+/// what this value is matched by.
+pub const ACCOUNT_WIDE_RESOURCE: &str = "*";
+
 /// The decision value for a request the policies in force permit — one of the three
 /// `PolicyEvaluationDecisionType` declares
 /// (`smithy_query(query="shape",shape="PolicyEvaluationDecisionType")`).

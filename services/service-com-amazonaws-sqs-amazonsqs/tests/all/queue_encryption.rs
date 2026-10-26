@@ -1343,3 +1343,60 @@ async fn a_batch_send_is_gated_on_the_queues_key_as_a_single_send_is() {
         );
     }
 }
+
+/// A queue whose `KmsMasterKeyId` is a KMS ARN whose account segment is not an account id
+/// names no key this endpoint can decide the call against: KMS refuses such an identifier
+/// for want of permission, BEFORE the resource it names is looked up, so both calls the
+/// queue's key gates are refused with the KMS access refusal and nothing is enqueued.
+///
+/// The rows differ in the form of the ARN — a key ARN and an alias ARN — and in what
+/// stands where the account id belongs.
+#[tokio::test]
+async fn a_kms_arn_whose_account_segment_is_not_an_account_id_refuses_both_gated_calls() {
+    let emulator = Emulator::new();
+    let caller = emulator.assumed_role_key("account-less-arn", None).await;
+    // (case, the `KmsMasterKeyId` the queue carries)
+    let rows: [(&str, &str); 3] = [
+        (
+            "a key ARN whose account segment is a name",
+            "arn:aws:kms:us-east-1:my-account:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        ),
+        (
+            "a key ARN whose account segment is too short to be an account id",
+            "arn:aws:kms:us-east-1:12345:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        ),
+        (
+            "an alias ARN whose account segment is a name",
+            "arn:aws:kms:us-east-1:tenant-a:alias/aws/sqs",
+        ),
+    ];
+
+    for (index, (case, master_key_id)) in rows.iter().enumerate() {
+        let url = emulator
+            .queue(
+                &format!("account-less-{index}"),
+                &json!({"KmsMasterKeyId": master_key_id}),
+            )
+            .await;
+        let (status, code) = emulator.send(&caller, &url, "never-sealed").await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "KmsAccessDenied"),
+            "case {case}: the send had to be refused as the key refusal KMS answers"
+        );
+        let (status, code, bodies) = emulator.receive(&caller, &url).await;
+        assert_eq!(
+            (status, code.as_str(), bodies.as_slice()),
+            (400, "KmsAccessDenied", &[][..]),
+            "case {case}: the receive had to be refused the same way and hand over nothing"
+        );
+        let reported = emulator.attributes(&url).await;
+        assert_eq!(
+            reported
+                .get("ApproximateNumberOfMessages")
+                .map(String::as_str),
+            Some("0"),
+            "case {case}: a refused send must enqueue nothing, got {reported:?}"
+        );
+    }
+}

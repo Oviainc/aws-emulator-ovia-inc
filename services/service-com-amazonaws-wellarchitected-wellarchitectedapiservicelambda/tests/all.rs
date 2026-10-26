@@ -300,3 +300,8 @@ mod review_template_write_instants;
 // Declared last for the same reason as the declarations above.
 #[path = "all/lens_notifications.rs"]
 mod lens_notifications;
+
+// Declared last for the same reason as the declaration above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/template_share_deletion.rs"]
+mod template_share_deletion;

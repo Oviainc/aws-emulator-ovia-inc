@@ -911,8 +911,10 @@ async fn an_omitted_account_id_is_the_callers_own_account() {
     );
 }
 
-// The tax-inheritance election — what `GetTaxInheritance` reports and who may
-// set it — is covered by `tests/all/fidelity_rules.rs`.
+// The tax-inheritance election — what a write records and what
+// `GetTaxInheritance` then reports — is covered by
+// `tests/all/tax_inheritance_election.rs`; the default it reports while none is
+// recorded, by `tests/all/fidelity_rules.rs`.
 
 /// One refused (or accepted) request: the operation, the body, and the answer it
 /// must get.
@@ -1102,25 +1104,24 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             error_code: "ValidationException",
             modelled_error_code: "",
         },
-        // Both `HeritageStatus` values the model lists reach the handler's own
-        // rule: only an AWS Organizations management account may set the
-        // election, and no caller this emulator serves is one — see
-        // `tests/all/fidelity_rules.rs`.
+        // Both `HeritageStatus` values the model lists are inside the member's
+        // value set, so both are served and recorded — see
+        // `tests/all/tax_inheritance_election.rs` for what the read then reports.
         Refusal {
             name: "heritageStatus OptIn",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptIn" }),
-            status: 400,
-            error_code: "ValidationException",
-            modelled_error_code: "FieldValidationFailed",
+            status: 200,
+            error_code: "",
+            modelled_error_code: "",
         },
         Refusal {
             name: "heritageStatus OptOut",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptOut" }),
-            status: 400,
-            error_code: "ValidationException",
-            modelled_error_code: "FieldValidationFailed",
+            status: 200,
+            error_code: "",
+            modelled_error_code: "",
         },
     ];
 

@@ -2278,13 +2278,89 @@ fn normalized_type_name(value: &str) -> String {
         .collect()
 }
 
-/// The type segment of an ARN's resource field: `firewall` of
-/// `firewall/<name>`, `instance` of `instance/i-0123`. The whole field when it
-/// carries no separator, which is a resource whose ARN names only an id.
-fn arn_resource_type(resource: &str) -> &str {
-    resource
-        .split_once(['/', ':'])
-        .map_or(resource, |(resource_type, _)| resource_type)
+/// Every segment of an ARN's resource field that can NAME its type: each `/`- or
+/// `:`-separated non-empty segment except the LAST, which is the resource's own
+/// id — `firewall` of `firewall/<name>`, `instance` of `instance/i-0123`,
+/// `restapis` and `stages` of `/restapis/<id>/stages/<name>`. The whole field
+/// when it carries no separator, which is a resource whose ARN names only an id.
+///
+/// A service writes its type keyword wherever its own ARN form puts it, which is
+/// not always the first segment (a path-shaped resource field puts it after the
+/// parent resource it hangs off, and may begin with the separator itself), so the
+/// type is looked for in all of them rather than only in the leading one.
+///
+/// What this walks is BOUNDED by the request boundary: an item is one
+/// `IdentifierList` member, whose modelled length is 1..2048
+/// (`smithy_query(query="shape",shape="IdentifierList")`), and a call carries at
+/// most [`MAX_RESOURCE_SET_ITEMS_PER_CALL`] of them.
+fn arn_resource_type_segments(resource: &str) -> impl Iterator<Item = &str> {
+    let mut segments: Vec<&str> = resource
+        .split(['/', ':'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() > 1 {
+        segments.pop();
+    }
+    segments.into_iter()
+}
+
+/// The comparable form of a resource-type keyword: [`normalized_type_name`]
+/// without a trailing plural `s`, so a resource field that writes its type in the
+/// plural (`.../stages/<name>`) names the same type as the singular last segment
+/// of an `AWS::<Service>::<Type>` name (`Stage`).
+///
+/// The `s` is dropped from BOTH sides of the comparison, so a type name that ends
+/// in `s` for its own reasons loses it too: that keeps such a name matching
+/// itself, and the ARN spelling of a type the rule cannot reach this way is what
+/// [`ARN_RESOURCE_TYPE_KEYWORDS`] carries.
+fn type_keyword(value: &str) -> String {
+    let normalized = normalized_type_name(value);
+    normalized.strip_suffix('s').unwrap_or(&normalized).to_string()
+}
+
+/// The keyword an ARN gives a resource type where the owning service spells it
+/// differently from the last segment of the type's `AWS::<Service>::<Type>`
+/// name, so the two cannot be matched by spelling alone.
+///
+/// SOURCE: the ARN form the service that owns the resource writes — Amazon EC2
+/// addresses an Elastic IP by its allocation, `elastic-ip/<AllocationId>`, while
+/// the resource type is named `AWS::EC2::EIP`. One entry per type whose two
+/// spellings differ; a type absent from this table is spelled the same way in
+/// both, so nothing needs to be said about it here.
+const ARN_RESOURCE_TYPE_KEYWORDS: &[(&str, &str)] = &[(RESOURCE_TYPE_EC2_EIP, "elastic-ip")];
+
+/// The type keywords an ARN's resource field names, as
+/// [`arn_resource_type_segments`] reads them and [`type_keyword`] compares them.
+///
+/// Read ONCE per item, so an item is split and normalised once however many
+/// resource types it is weighed against: the per-item work is the length of its
+/// own resource field PLUS the number of declared types, never their product.
+fn arn_type_keywords(resource: &str) -> Vec<String> {
+    arn_resource_type_segments(resource)
+        .map(type_keyword)
+        .collect()
+}
+
+/// Whether `keywords` — the type keywords of an ARN's resource field, from
+/// [`arn_type_keywords`] — name a resource of the type `declared` names, which is
+/// a `Policy$ResourceType` value in the format of the Amazon Web Services
+/// Resource Types Reference (`AWS::<Service>::<Type>`).
+///
+/// The type is read off the ARN the way the service that owns the resource writes
+/// it: the keyword may sit at any segment of the resource field, may be written
+/// in the plural, and may be spelled differently from the resource-type name
+/// ([`ARN_RESOURCE_TYPE_KEYWORDS`]) — so an ARN the discovery inventory reports
+/// for a type matches that type.
+fn keywords_name_resource_type(keywords: &[String], declared: &str) -> bool {
+    let declared_last = declared.rsplit("::").next().unwrap_or(declared);
+    let names = |wanted: &str| keywords.iter().any(|keyword| keyword == wanted);
+    names(&type_keyword(declared_last))
+        || ARN_RESOURCE_TYPE_KEYWORDS
+            .iter()
+            .filter(|(resource_type, _)| {
+                normalized_type_name(resource_type) == normalized_type_name(declared)
+            })
+            .any(|(_, keyword)| names(&type_keyword(keyword)))
 }
 
 /// Why `uri` cannot be a member of a resource set that holds `resource_types`
@@ -2307,6 +2383,17 @@ fn arn_resource_type(resource: &str) -> &str {
 ///   "determines the resources that can be associated to the resource set"
 ///   (`ResourceSet$ResourceTypeList`).
 ///
+/// An ARN field a service LEAVES EMPTY names no value to disagree with, so it is
+/// no reason to refuse the item: a global service's ARN carries no Region and its
+/// resource belongs to every Region, and an account-less service's ARN carries no
+/// account segment to weigh against the organization's accounts. The type is read
+/// off the ARN as the owning service writes it
+/// ([`keywords_name_resource_type`]).
+/// Those are the same readings the discoverable inventory makes
+/// ([`in_region`], [`discovered_resources`]), which is what keeps a resource
+/// reported as "available to be associated with a resource set" one these
+/// operations actually take.
+///
 /// `partition` and `accounts` are derived ONCE by the caller, so classifying a
 /// batch does not rebuild them per item. It is one shared classifier so the
 /// operations that associate and disassociate a resource's membership cannot
@@ -2324,20 +2411,40 @@ pub fn resource_set_item_failure_reason(
     if arn.partition != partition {
         return Some("NOT_VALID_PARTITION");
     }
-    if arn.region != region {
+    if !arn_in_region(&arn, region) {
         return Some("NOT_VALID_REGION");
     }
-    if !accounts.contains(arn.account) {
+    if !arn_in_accounts(&arn, accounts) {
         return Some("NOT_VALID_ACCOUNT_ID");
     }
-    let resource_type = normalized_type_name(arn_resource_type(arn.resource));
-    let in_scope = resource_types.iter().any(|declared| {
-        declared
-            .rsplit("::")
-            .next()
-            .is_some_and(|last| normalized_type_name(last) == resource_type)
-    });
+    // The item's own keywords are read once, before the declared types are walked,
+    // so classifying one item against a set's `ResourceTypeList` costs its ARN
+    // plus that list rather than one times the other.
+    let keywords = arn_type_keywords(arn.resource);
+    let in_scope = resource_types
+        .iter()
+        .any(|declared| keywords_name_resource_type(&keywords, declared));
     (!in_scope).then_some("NOT_VALID_RESOURCE_TYPE")
+}
+
+/// Whether `arn` names a resource of `region`: its Region field is `region`, or
+/// it carries no Region at all — a global service's ARN (CloudFront's, for one)
+/// leaves that field empty and its resource belongs to every Region.
+///
+/// The one Region reading this service makes of an ARN, shared by the
+/// discoverable inventory ([`in_region`]) and by the item classifier
+/// ([`resource_set_item_failure_reason`]) so the two cannot disagree.
+fn arn_in_region(arn: &ParsedArn<'_>, region: &str) -> bool {
+    arn.region.is_empty() || arn.region == region
+}
+
+/// Whether `arn` names a resource of one of `accounts`: its account field names
+/// one of them, or it carries no account at all — an account-less service's ARN
+/// (API Gateway's, for one) leaves that field empty, so it carries no account to
+/// weigh and the resource belongs to whichever account of the organization holds
+/// it.
+fn arn_in_accounts(arn: &ParsedArn<'_>, accounts: &BTreeSet<String>) -> bool {
+    arn.account.is_empty() || accounts.contains(arn.account)
 }
 
 /// The accounts of this organization a resource may belong to: the ones
@@ -2676,12 +2783,13 @@ fn owned_arn(service: &str, region: &str, account: &str, resource: &str) -> Stri
 /// as CloudFront's).
 ///
 /// A value that is not an ARN names no resource that could be associated, so it
-/// is not in any Region's inventory. The check is what keeps the inventory and
-/// `BatchAssociateResource` in agreement: a resource set holds the resources of
-/// the administrator's Region, so a resource reported as discoverable in a
-/// Region is one that Region's resource sets can actually take.
+/// is not in any Region's inventory. The Region reading itself is
+/// [`arn_in_region`], the one the item classifier makes too. The check is what
+/// keeps the inventory and `BatchAssociateResource` in agreement: a resource set
+/// holds the resources of the administrator's Region, so a resource reported as
+/// discoverable in a Region is one that Region's resource sets can actually take.
 fn in_region(uri: &str, region: &str) -> bool {
-    parse_arn(uri).is_some_and(|arn| arn.region.is_empty() || arn.region == region)
+    parse_arn(uri).is_some_and(|arn| arn_in_region(&arn, region))
 }
 
 /// Whether `value` can be carried by the model's `ResourceName`

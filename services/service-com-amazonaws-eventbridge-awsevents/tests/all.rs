@@ -15,6 +15,8 @@
 mod api_destination_delivery;
 #[path = "all/archive_and_api_destination.rs"]
 mod archive_and_api_destination;
+#[path = "all/archive_registry.rs"]
+mod archive_registry;
 #[path = "all/archive_replay.rs"]
 mod archive_replay;
 #[path = "all/connection_lifecycle.rs"]

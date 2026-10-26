@@ -1,21 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFpgaImage
-//! IMPLEMENTED: mints an Amazon FPGA Image (AFI) from the design checkpoint the request
-//! names, persists it in [`crate::state`] and answers with the ids it minted. This is the
-//! ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the request, then reads the design checkpoint the request names out of
+//! Amazon S3 — which this emulator holds no objects for — and so refuses the call with the
+//! modelled `InaccessibleStorageLocation`, minting and persisting nothing. This is the ONLY
+//! file to touch for this operation.
 //!
-//! Two rules this handler keeps, both from the operation's own documentation:
+//! Two rules this handler keeps:
 //!
-//! 1. an Amazon S3 storage location the service cannot read is refused with
-//!    `InaccessibleStorageLocation` — a bucket name outside Amazon S3's published naming
-//!    rules names no bucket at all ([`crate::state::readable_storage_location`]);
-//! 2. "The create operation is asynchronous. To verify that the AFI was successfully created
-//!    and is ready for use, check the output logs" — so the call hands back a `pending` AFI
-//!    and the outcome of the creation is reported in that AFI's own state. This emulator
-//!    stores no Amazon S3 objects, so nothing reads the design checkpoint and no bitstream
-//!    is produced: the creation ends in the modelled `failed` state with a message that says
-//!    so (see [`crate::state::FpgaImageRecord`]), never in an `available` AFI nothing built.
+//! 1. "The location of the encrypted design checkpoint in Amazon S3"
+//!    (`CreateFpgaImageRequest$InputStorageLocation`) is read BY THIS CALL, so a location the
+//!    service cannot access is refused with 400 `InaccessibleStorageLocation` naming that
+//!    location ([`crate::state::inaccessible_s3_resource`]) and nothing is minted. This
+//!    emulator holds no Amazon S3 objects and no operation of this API puts a design
+//!    checkpoint anywhere, so there is no checkpoint for any request to name: the refusal is
+//!    the answer to every one of them, exactly as `CreateRestoreImageTask` answers for the
+//!    stored AMI object it would have to read;
+//! 2. a fact of the REQUEST is answered before that read: a location that names no bucket or
+//!    no key names no object at all, a tag specification may only name the resource this call
+//!    would create, and `DryRun` asks whether the caller may make the request
+//!    ([`crate::state::storage_location_object`]).
+//!
+//! An AFI is still a resource of this service's state: `CopyFpgaImage` mints one from a
+//! stored AFI, `DeleteFpgaImage` removes it and `ResetFpgaImageAttribute` resets it. Nothing
+//! here writes to that store, so no caller sees an AFI this refusal left behind — and, since
+//! a copy needs a source and this is the only call that would have minted a FIRST AFI, an
+//! account of this emulator holds none until something else can read a design checkpoint. That
+//! is a consequence of holding no Amazon S3 objects, not of this refusal: an AFI whose
+//! bitstream nothing built is not an AFI.
 //!
 //! ## Shape of an operation
 //!
@@ -155,34 +167,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            FPGA_IMAGE_GLOBAL_ID_PREFIX, FPGA_IMAGE_ID_PREFIX, FPGA_IMAGE_TAGGABLE_RESOURCE,
-            FpgaImageRecord, MAX_CLIENT_TOKEN_CHARS, MAX_FPGA_IMAGES, MAX_STORED_BYTES,
-            MAX_TAGS_PER_RESOURCE, TRANSITION_DELAY, dry_run_operation, fpga_image_payload_bytes,
-            readable_storage_location, require_service_state, resource_limit_exceeded,
-            system_time_to_date_time, tag_list, validate_tag_size,
+            FPGA_IMAGE_TAGGABLE_RESOURCE, MAX_CLIENT_TOKEN_CHARS, MAX_TAGS_PER_RESOURCE,
+            dry_run_operation, inaccessible_s3_resource, storage_location_object,
+            validate_tag_size,
         };
 
-        // An AFI carries no Region member of its own, so nothing here depends on the Region
-        // the request was signed for.
-        let _ = ctx;
+        // The call is refused below for a reason that does not depend on the Region it was
+        // signed for, and nothing is stored, so neither `ctx` nor the engine is read.
+        let _ = (ctx, &self.engine);
 
         // "The location of the encrypted design checkpoint in Amazon S3"
         // (`CreateFpgaImageRequest$InputStorageLocation`) and "the location in Amazon S3 for
-        // the output logs" (`LogsStorageLocation`): a location this service cannot read is
-        // refused BEFORE anything is stored, and both locations are held to the one rule.
+        // the output logs" (`LogsStorageLocation`): both are read for the object they name
+        // before anything else, so a location that names none is answered as the request
+        // fault it is rather than as a location that could not be read.
         let (input_bucket, input_key) =
-            readable_storage_location(&input.input_storage_location, "inputStorageLocation")?;
-        let logs_location = match input.logs_storage_location.as_ref() {
-            None => None,
-            Some(location) => Some(readable_storage_location(location, "logsStorageLocation")?),
-        };
+            storage_location_object(&input.input_storage_location, "inputStorageLocation")?;
+        if let Some(logs_location) = input.logs_storage_location.as_ref() {
+            storage_location_object(logs_location, "logsStorageLocation")?;
+        }
 
         // "The tags to apply to the FPGA image during creation"
         // (`CreateFpgaImageRequest$TagSpecifications`): the AFI is the only resource this
         // call creates, so a specification naming any other resource type is refused rather
         // than accepted and discarded.
-        let mut tags: ::std::collections::BTreeMap<String, String> =
-            ::std::collections::BTreeMap::new();
+        let mut tags: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
         for specification in input.tag_specifications.iter().flatten() {
             match specification.resource_type.as_deref() {
                 Some(FPGA_IMAGE_TAGGABLE_RESOURCE) | None => {}
@@ -197,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let key = tag.key.clone().unwrap_or_default();
                 let value = tag.value.clone().unwrap_or_default();
                 validate_tag_size(&key, &value)?;
-                tags.insert(key, value);
+                tags.insert(key);
             }
         }
         if tags.len() > MAX_TAGS_PER_RESOURCE {
@@ -216,146 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The caller-chosen bytes this create would retain for the process's lifetime,
-        // counted by the ONE definition of that charge. A COUNT ceiling admits gigabytes on
-        // its own, because each record holds strings the caller chose the length of, so both
-        // are asked below.
-        let locations: Vec<&str> = match logs_location {
-            None => vec![input_bucket, input_key],
-            Some((logs_bucket, logs_key)) => vec![input_bucket, input_key, logs_bucket, logs_key],
-        };
-        let payload_bytes = fpga_image_payload_bytes(
-            &tag_list(&tags),
-            input.name.as_deref(),
-            input.description.as_deref(),
-            &locations,
-            input.client_token.as_deref(),
-        );
-
-        let state = require_service_state(&*self.engine)?;
-        let mut store = state.lock();
-        let now = ::std::time::Instant::now();
-
-        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
-        // idempotency of the request" (`CreateFpgaImageRequest$ClientToken`) — one token
-        // names the one AFI it minted, so a replay reports that AFI and creates nothing.
-        let replayed = input
-            .client_token
-            .as_deref()
-            .and_then(|token| store.fpga_image_client_tokens.get(token).cloned());
-
         // DryRun asks whether the CALLER MAY make this request — "checks whether you have
         // the required permissions for the action, without actually making the request"
-        // (`CreateFpgaImageRequest$DryRun`) — so it is answered once the request itself has
-        // been read and before the first write, and before the store's own ceilings, which
-        // are facts of the store rather than of the request or of the caller.
+        // (`CreateFpgaImageRequest$DryRun`) — so it is answered once the request's own
+        // members have been read and before the design checkpoint is reached for, exactly as
+        // `CreateRestoreImageTask` answers it before reaching for the object it would
+        // restore from.
         if input.dry_run == Some(true) {
             return Err(dry_run_operation());
         }
 
-        if replayed.is_none() && store.fpga_images.len() >= MAX_FPGA_IMAGES {
-            return Err(resource_limit_exceeded(format!(
-                "This emulator holds {MAX_FPGA_IMAGES} Amazon FPGA Images, \
-                 which is as many as it stores"
-            )));
-        }
-        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
-            return Err(resource_limit_exceeded(format!(
-                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
-                 caller-supplied data, so it cannot store {payload_bytes} more",
-                store.stored_bytes()
-            )));
-        }
-
-        if let Some(fpga_image_id) = replayed {
-            return store
-                .fpga_images
-                .get(&fpga_image_id)
-                .map(|record| CreateFpgaImageOutput {
-                    fpga_image_id: record.view.fpga_image_id.clone(),
-                    fpga_image_global_id: record.view.fpga_image_global_id.clone(),
-                })
-                .ok_or_else(|| {
-                    Scaffolded::internal_error(format!(
-                        "a client token names FPGA image '{fpga_image_id}', which is not stored"
-                    ))
-                });
-        }
-
-        let fpga_image_id = store.next_id(FPGA_IMAGE_ID_PREFIX);
-        let fpga_image_global_id = store.next_id(FPGA_IMAGE_GLOBAL_ID_PREFIX);
-        let created_at = system_time_to_date_time(::std::time::SystemTime::now());
-        let record = FpgaImageRecord {
-            view: FpgaImage {
-                fpga_image_id: Some(fpga_image_id.clone()),
-                fpga_image_global_id: Some(fpga_image_global_id),
-                name: input.name.clone(),
-                description: input.description.clone(),
-                create_time: Some(created_at),
-                // "The time of the most recent update to the AFI" (`FpgaImage$UpdateTime`):
-                // nothing has updated it since it was created.
-                update_time: Some(created_at),
-                owner_id: Some(::engine::emulator_account_id().to_string()),
-                // An alias names an image published by Amazon or the Marketplace; this one
-                // is the account's own.
-                owner_alias: None,
-                // "Indicates whether the AFI is public" (`FpgaImage$Public`): an AFI is
-                // private until a load permission is granted to everyone, and this one
-                // carries none.
-                public: Some(false),
-                // Nothing here is a Marketplace or a paid image.
-                product_codes: Some(Vec::new()),
-                tags: Some(tag_list(&tags)),
-                // "Indicates whether data retention support is enabled for the AFI"
-                // (`FpgaImage$DataRetentionSupport`): a property of the bitstream's shell,
-                // of which there is none.
-                data_retention_support: Some(false),
-                // The shell version, the PCI ids and the instance types an AFI supports are
-                // all facts of the bitstream the creation produces. Nothing read the design
-                // checkpoint, so there is no bitstream and none of them is known.
-                shell_version: None,
-                pci_id: None,
-                instance_types: Some(Vec::new()),
-                // Derived from `resolved_at` on every read.
-                state: None,
-            },
-            // An AFI starts loadable by its owner only: nothing has granted a load
-            // permission to another account or group.
-            load_permissions: Vec::new(),
-            // The creation is asynchronous, so its outcome falls due on the clock rather
-            // than during this call: the same span, read off the same monotonic clock, as a
-            // volume's `creating` -> `available` move.
-            resolved_at: now + TRANSITION_DELAY,
-            failure_message: format!(
-                "The design checkpoint 's3://{input_bucket}/{input_key}' could not be read: \
-                 this emulator stores no Amazon S3 objects, so no bitstream was produced"
-            ),
-            payload_bytes,
-        };
-        if let Some(token) = input.client_token.clone() {
-            store
-                .fpga_image_client_tokens
-                .insert(token, fpga_image_id.clone());
-        }
-        // The bytes this record and its token retain are charged against the store's budget
-        // at the insert, so no path can store them uncharged; the delete path gives them
-        // back.
-        store.add_stored_bytes(payload_bytes);
-        store.fpga_images.insert(fpga_image_id.clone(), record);
-
-        // Read the response back OUT of the store, so the caller is told the ids a later
-        // call will resolve rather than values held only in this stack frame.
-        store
-            .fpga_images
-            .get(&fpga_image_id)
-            .map(|record| CreateFpgaImageOutput {
-                fpga_image_id: record.view.fpga_image_id.clone(),
-                fpga_image_global_id: record.view.fpga_image_global_id.clone(),
-            })
-            .ok_or_else(|| {
-                Scaffolded::internal_error(format!(
-                    "the newly created FPGA image '{fpga_image_id}' could not be read back"
-                ))
-            })
+        // The design checkpoint this create is built from is an Amazon S3 object a caller
+        // uploaded, and this emulator holds no Amazon S3 objects — no operation of this API
+        // puts one anywhere — so the location the request names cannot be read and no AFI is
+        // minted from it. The refusal names the location that could not be read, so the
+        // caller is told which bucket and key to check.
+        Err(inaccessible_s3_resource(input_bucket, input_key))
     }
 }
