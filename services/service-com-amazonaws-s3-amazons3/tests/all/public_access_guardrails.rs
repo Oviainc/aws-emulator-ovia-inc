@@ -28,7 +28,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, get_bucket_policy, put_bucket_policy, router, send, Answer};
 use super::bucket_ownership_controls::put_ownership_controls;
-use super::bucket_public_access_block::put_public_access_block;
+use super::bucket_public_access_block::{allow_public_access, put_public_access_block};
 
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -432,6 +432,9 @@ async fn a_create_naming_both_an_acl_and_the_enforced_setting_is_refused() {
         created.status,
         String::from_utf8_lossy(&created.body)
     );
+    // The bucket is created with `IgnorePublicAcls` on, under which S3 keeps a public grant
+    // out of every ACL read, so the guardrail is lifted before the stored ACL is read back.
+    allow_public_access(&router, "ownership-acl-ok").await;
     let read = send(&router, "GET", "/ownership-acl-ok?acl", &[], "").await;
     let body = String::from_utf8_lossy(&read.body);
     assert!(

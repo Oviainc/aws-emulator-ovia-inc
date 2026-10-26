@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::state::MAX_VERSION_ID_CHARS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
@@ -622,33 +623,34 @@ async fn a_version_id_that_is_not_shaped_like_one_is_a_malformed_argument() {
         .await
         .expect("an enabled bucket mints a version id");
 
-    // A `versionId` is either the literal `null` or a token of the form this service mints
-    // — 32 characters of the URL-safe Base64 alphabet — so anything else cannot name a
-    // version of any object in any bucket. That is a malformed ARGUMENT, which S3 answers
-    // `InvalidArgument` with HTTP 400, never the `NoSuchVersion`/404 it reserves for a
-    // well-formed id that names no stored version.
+    // A `versionId` is either the literal `null` or a token of the published shape — a
+    // width between the published bounds, each character an alphanumeric or one of `-`,
+    // `_`, `.` — so anything else cannot name a version of any object in any bucket. That
+    // is a malformed ARGUMENT, which S3 answers `InvalidArgument` with HTTP 400, never the
+    // `NoSuchVersion`/404 it reserves for a well-formed id that names no stored version.
     //
-    // The rows differ along what the shape rule generalises over: LENGTH on both sides of
-    // the published 32 (one character, one short, one long, far too long) and the
-    // ALPHABET at exactly that length (a character outside URL-safe Base64, and the two
-    // characters standard Base64 uses where the URL-safe alphabet does not).
+    // The rows differ along what the shape rule generalises over: LENGTH outside the
+    // published range at both ends (one character, one short of the minimum, one past the
+    // maximum) and the ALPHABET at a width inside it (a character outside the published
+    // class, and the two characters standard Base64 uses, which are not in it).
     let short = minted[..minted.len() - 1].to_string();
-    let long = format!("{minted}A");
     let plus = format!("{}+", &minted[..minted.len() - 1]);
     let slash = format!("{}/", &minted[..minted.len() - 1]);
     let bang = format!("{}!", &minted[..minted.len() - 1]);
-    let rows: [(&str, String); 7] = [
+    let rows: [(&str, String); 6] = [
         ("a one-character id", "x".to_string()),
-        ("one character short of the minted length", short),
-        ("one character past the minted length", long),
-        ("far longer than any minted id", "v".repeat(256)),
+        ("one character short of the minimum width", short),
+        (
+            "one character past the maximum width",
+            "v".repeat(MAX_VERSION_ID_CHARS + 1),
+        ),
         ("a word that is not an id at all", "not-a-version".to_string()),
         (
-            "standard Base64's plus, which the URL-safe alphabet does not use",
+            "standard Base64's plus, which the published class does not hold",
             plus,
         ),
         (
-            "a character outside the Base64 alphabet entirely",
+            "a character outside the published class entirely",
             bang,
         ),
     ];

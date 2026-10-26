@@ -18,10 +18,11 @@
 //!   whether Amazon S3 should block … Setting this element to TRUE causes …",
 //!   `smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`), so a member the
 //!   payload omits names a switch the request does not turn on: it reads back `false`.
-//! * `GetPublicAccessBlock` reports exactly the stored switches, and a bucket with no
-//!   configuration answers `NoSuchPublicAccessBlockConfiguration` with HTTP 404 rather than
-//!   an empty container (the configuration is the whole @httpPayload, so a 200 would report
-//!   a configuration that does not exist).
+//! * `GetPublicAccessBlock` reports exactly the switches in force, and a bucket whose
+//!   configuration was REMOVED answers `NoSuchPublicAccessBlockConfiguration` with HTTP 404
+//!   rather than an empty container (the configuration is the whole @httpPayload, so a 200
+//!   would report a configuration that does not exist). A bucket nothing has configured is
+//!   not in that state: every new bucket is created with all four switches on.
 //! * `DeletePublicAccessBlock` removes the configuration and answers the modelled 204,
 //!   whether the bucket carried one or not, after which the read is not-found again.
 //! * A public-access-block call naming a bucket this emulator does not hold answers the
@@ -103,7 +104,10 @@ pub(crate) async fn put_public_access_block(
 }
 
 /// `GET /<bucket>?publicAccessBlock` — `GetPublicAccessBlock`.
-async fn get_public_access_block(
+///
+/// `pub(crate)`: the default-posture suite ([`super::public_access_guardrails`]) reads the
+/// creation default back through this one helper.
+pub(crate) async fn get_public_access_block(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -134,13 +138,35 @@ async fn delete_public_access_block(
     .await
 }
 
+/// Turn every Block Public Access switch on `bucket` OFF.
+///
+/// Every bucket is created with all four ON, so a suite that is about what a PUBLIC ACL or
+/// a PUBLIC policy does has to lift the guardrail first — exactly as a client of real S3
+/// must. `pub(crate)` so each of those suites lifts it the same way instead of spelling the
+/// payload again.
+pub(crate) async fn allow_public_access(router: &MultiServiceRouter, bucket: &str) -> Answer {
+    let off: Vec<Member> = SETTINGS.iter().map(|setting| (*setting, false)).collect();
+    let answer = put_public_access_block(router, bucket, &off, &[]).await;
+    assert_eq!(
+        answer.status, 200,
+        "the bucket {bucket:?} must take the configuration that lifts Block Public Access, \
+         got {} with body {:?}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    answer
+}
+
 /// The four switches a `GetPublicAccessBlock` body reports, in [`SETTINGS`] order.
 ///
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the
 /// ownership-controls suite beside this one reads its payload, rather than by slicing the
 /// body. A setting the body does not carry is reported as absent, so an under-reporting
 /// response fails loudly instead of defaulting to `false` here.
-fn reported_flags(answer: &Answer) -> [Option<bool>; 4] {
+///
+/// `pub(crate)`: the creation-default suite ([`super::public_access_block_default`]) reads
+/// the switches through this one reader rather than parsing the body a second way.
+pub(crate) fn reported_flags(answer: &Answer) -> [Option<bool>; 4] {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
@@ -369,20 +395,20 @@ async fn a_second_put_replaces_the_whole_configuration() {
 }
 
 #[tokio::test]
-async fn reading_a_bucket_with_no_public_access_block_is_not_found() {
+async fn a_bucket_reports_the_all_on_default_until_a_delete_withdraws_it() {
     let router = router();
 
     // Buckets that have never been configured, one of them in a non-default Region, so the
-    // answer is about the missing subresource rather than about one bucket.
+    // answer is about the creation default rather than about one bucket.
     for (case, bucket, constraint) in [
         (
             "a bucket created with no location constraint",
-            "public-access-block-absent-default",
+            "public-access-block-default-global",
             None,
         ),
         (
             "a bucket created in another Region",
-            "public-access-block-absent-regional",
+            "public-access-block-default-regional",
             Some("eu-west-1"),
         ),
     ] {
@@ -396,10 +422,37 @@ async fn reading_a_bucket_with_no_public_access_block_is_not_found() {
         for attempt in ["the first read", "a second read"] {
             let read = get_public_access_block(&router, bucket, &[]).await;
             assert_eq!(
+                read.status, 200,
+                "case {case:?}/{attempt}: a bucket nothing has configured reports the \
+                 creation default, got {} with body {:?}",
+                read.status,
+                String::from_utf8_lossy(&read.body)
+            );
+            let actual = flags_of(case, &read);
+            assert_eq!(
+                actual,
+                [true; 4],
+                "case {case:?}/{attempt}: a new bucket is created fully blocked, got \
+                 {actual:?}"
+            );
+        }
+
+        // Only a DELETE leaves the bucket with no configuration at all, which is the one
+        // state the documented not-found answers.
+        let deleted = delete_public_access_block(&router, bucket, &[]).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: the delete must succeed, got {} with body {:?}",
+            deleted.status,
+            String::from_utf8_lossy(&deleted.body)
+        );
+        for attempt in ["the first read", "a second read"] {
+            let read = get_public_access_block(&router, bucket, &[]).await;
+            assert_eq!(
                 read.status, 404,
-                "case {case:?}/{attempt}: a bucket with no PublicAccessBlock configuration \
-                 answers the documented not-found rather than an empty container, got {} with \
-                 body {:?}",
+                "case {case:?}/{attempt}: a bucket whose configuration was removed answers \
+                 the documented not-found rather than an empty container, got {} with body \
+                 {:?}",
                 read.status,
                 String::from_utf8_lossy(&read.body)
             );

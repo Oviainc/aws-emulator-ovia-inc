@@ -53,7 +53,7 @@ use super::bucket_acl::{
 };
 use super::bucket_lifecycle::{create_bucket, router, send, send_bytes, Answer};
 use super::bucket_ownership_controls::put_ownership_controls;
-use super::bucket_public_access_block::put_public_access_block;
+use super::bucket_public_access_block::{allow_public_access, put_public_access_block};
 use super::object_and_tagging_roundtrip::put_object;
 use super::object_versioning::set_versioning;
 
@@ -127,6 +127,11 @@ async fn put_bucket_acl(
 /// ACL write DOES, so each of their buckets is switched to `ObjectWriter`, the setting
 /// under which ACLs affect permissions; the tests that are about the disabled posture
 /// switch it back themselves.
+///
+/// Block Public Access is lifted for the same reason: a bucket is created with all four
+/// switches on, so a PUBLIC ACL would be denied by that guardrail before anything about the
+/// ACL write itself could be observed. The tests that are about THAT guardrail turn the
+/// switches back on themselves.
 async fn bucket_holding(router: &MultiServiceRouter, bucket: &str, key: &str) {
     let created = create_bucket(router, bucket, None, None).await;
     assert_eq!(
@@ -143,6 +148,7 @@ async fn bucket_holding(router: &MultiServiceRouter, bucket: &str, key: &str) {
         enabled.status,
         String::from_utf8_lossy(&enabled.body)
     );
+    allow_public_access(router, bucket).await;
     let written = put_object(router, bucket, key, BODY, &[]).await;
     assert_eq!(
         written.status, 200,

@@ -148,6 +148,24 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
         String::from_utf8_lossy(&withdrawn.body)
     );
 
+    // The same for the Block Public Access configuration: a bucket is created with all
+    // four switches on, so the subresource is absent only once a delete has withdrawn it.
+    let removed = send(
+        &router,
+        "DELETE",
+        "/subresource-absent?publicAccessBlock",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        removed.status, 204,
+        "the setup delete of the public access block configuration must succeed, got {} \
+         with body {:?}",
+        removed.status,
+        String::from_utf8_lossy(&removed.body)
+    );
+
     let rows = [
         Row {
             case: "a bucket that was never tagged",
@@ -222,7 +240,7 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
             message: "The bucket ownership controls were not found",
         },
         Row {
-            case: "a bucket with no public access block configuration",
+            case: "a bucket whose public access block configuration was withdrawn",
             bucket: "subresource-absent",
             subresource: "publicAccessBlock",
             status: 404,

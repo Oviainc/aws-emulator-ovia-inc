@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObjectAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObjectAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObjectAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the root-level attributes of one stored object — the fields the request's
+//! `x-amz-object-attributes` header names, and nothing it did not.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +233,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObjectAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObjectAttributes"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`GetObjectAttributesRequest$ExpectedBucketOwner`). This emulator serves one
+        // account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // The SSE-C members are the key an encrypted object would be decrypted with;
+        // `PutObject` refuses to store one, so no object here was encrypted with it and a
+        // read presenting one is asking about something this emulator cannot hold.
+        for (member, present) in [
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                input.sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                input.sse_customer_key.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetObjectAttributes with {member}"
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetObjectAttributes",
+            ));
+        };
+
+        // Read-only: the guard is taken, the object's attributes are copied out, and
+        // nothing is written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let version_id = input.version_id.as_deref();
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version, judged by the one rule
+        // every operation that takes a `versionId` shares.
+        if version_id
+            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::INVALID_VERSION_ID_MESSAGE,
+            ));
+        }
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NOT_FOUND_STATUS,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+        // "To retrieve a specific version, you must be the bucket owner and you must use
+        // the versionId subresource" (the object readers' shared rule): with one the read
+        // is of that stored version, with none it is of the key's current version.
+        let held = match version_id {
+            None => bucket.current_version(&input.key),
+            Some(version_id) => bucket.stored_version(&input.key, version_id),
+        };
+        // "If the specified version is a delete marker, the response returns a 405 Method
+        // Not Allowed error" (`GetObject`, whose options this read shares): a marker holds
+        // no attributes to report.
+        if version_id.is_some() && held.is_some_and(|held| held.as_delete_marker().is_some()) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                405,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        let Some(object) = held.and_then(crate::state::StoredVersion::as_object) else {
+            // A `versionId` the bucket holds no version for is `NoSuchVersion`, because the
+            // key itself may well be there; without one the key has no current object,
+            // which is this operation's own modeled `NoSuchKey`.
+            return Err(match version_id {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    NOT_FOUND_STATUS,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => GetObjectAttributesErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        // "Specifies the fields at the root level that you want returned in the response.
+        // Fields that you do not specify are not returned" (`…Request$ObjectAttributes`),
+        // so each of the four root-level fields is reported exactly when the header named
+        // it. The header's values are the `ObjectAttributes` enum's own
+        // (`crate::state::OBJECT_ATTRIBUTES_*`), and the boundary has already refused a
+        // value outside it.
+        let asked = |attribute: &str| {
+            input
+                .object_attributes
+                .iter()
+                .any(|named| named == attribute)
+        };
+
+        Ok(GetObjectAttributesOutput {
+            // Bound HEADERS rather than fields of the document, so they are reported for
+            // every answer: when the object was written, and the id of the version read.
+            last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+            version_id: object.version_id.clone(),
+            e_tag: asked(crate::state::OBJECT_ATTRIBUTE_ETAG).then(|| object.etag.clone()),
+            object_size: asked(crate::state::OBJECT_ATTRIBUTE_OBJECT_SIZE)
+                .then(|| i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
+            storage_class: asked(crate::state::OBJECT_ATTRIBUTE_STORAGE_CLASS)
+                .then(|| object.storage_class.clone()),
+            // Nothing is reported for either of the two containers, whether or not the
+            // request asked for it, because this emulator holds nothing to report in
+            // them: it computes and stores no checksum for an object's bytes (see
+            // `PutObject`, which neither computes nor verifies one), and an object here is
+            // never assembled from parts — `CompleteMultipartUpload` is scaffolded, so no
+            // stored object has a part structure, which is also what AWS reports for an
+            // object a single `PutObject` wrote.
+            checksum: None,
+            object_parts: None,
+            // "Specifies whether the object retrieved was (true) or was not (false) a
+            // delete marker" (`…Output$DeleteMarker`): a marker is refused above, so
+            // every answer here is about an object that is not one, and S3 reports the
+            // header only when it IS one.
+            delete_marker: None,
+            // Requester Pays is not emulated, so nobody was charged and nothing is
+            // reported.
+            request_charged: None,
+        })
     }
 }
+
+/// The wire error code a request this emulator will not serve for the caller is refused
+/// with, and its status and message: "403 Forbidden (access denied)", the way every other
+/// handler in this crate answers an expected-bucket-owner mismatch.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+/// The status every not-found this read answers carries, the one `NoSuchKey` declares in
+/// the model.
+const NOT_FOUND_STATUS: u16 = 404;

@@ -32,6 +32,7 @@ use service_com_amazonaws_s3_amazons3::state::MAX_BUCKET_POLICY_BYTES;
 use super::bucket_lifecycle::{
     create_bucket, get_bucket_policy, policy_of_size, put_bucket_policy, router,
 };
+use super::bucket_public_access_block::allow_public_access;
 
 /// Accepted policy documents, differing in statement count, action form, principal form,
 /// whitespace and byte size. Each is a row of the table the rule is asserted over.
@@ -126,6 +127,10 @@ async fn a_successful_put_bucket_policy_answers_204_with_an_empty_body() {
             created.status,
             String::from_utf8_lossy(&created.body)
         );
+        // Some of the documents below grant a wildcard principal, which the Block Public
+        // Access configuration every bucket is created with would deny; this suite is about
+        // the put's STATUS, so the guardrail is lifted first.
+        allow_public_access(&router, bucket).await;
     }
 
     let documents = accepted_documents();

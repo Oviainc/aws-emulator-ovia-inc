@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for `GetObjectAttributes`: the root-level attributes of one stored
+//! object, reported for exactly the fields the request asked for.
+//!
+//! The rules under test, with their sources:
+//!
+//! * "Specifies the fields at the root level that you want returned in the response. Fields
+//!   that you do not specify are not returned"
+//!   (`GetObjectAttributesRequest$ObjectAttributes`): the answer carries a field exactly
+//!   when `x-amz-object-attributes` named it, and the values are the stored object's own —
+//!   its entity tag, its size in bytes and its storage class.
+//! * The two CONTAINERS are not reported at all: this emulator computes and stores no
+//!   checksum for an object's bytes, and no object it holds is assembled from parts
+//!   (`CompleteMultipartUpload` is scaffolded), which is also what S3 reports for an object
+//!   a single `PutObject` wrote.
+//! * `LastModified` and `VersionId` are bound HEADERS of the output, so they are reported
+//!   for every answer rather than being asked for.
+//! * The read is a reporting operation: a second read answers exactly what the first did,
+//!   and nothing about the object changes.
+//! * An address this emulator does not hold is refused with the code S3 sends for the part
+//!   that is missing — the operation's own modeled `NoSuchKey` (404) for a key the bucket
+//!   does not hold, `NoSuchBucket` for the bucket, and `NoSuchVersion` for a well-formed
+//!   `versionId` the bucket holds no version of, where one that is not shaped like a
+//!   version id at all is `InvalidArgument` (400).
+
+use smithy_server_runtime::MultiServiceRouter;
+
+use super::bucket_lifecycle::{create_bucket, router, send_bytes, Answer};
+use super::object_and_tagging_roundtrip::{expected_etag, put_object, text};
+use super::object_versioning::set_versioning;
+
+/// Every value the `ObjectAttributes` enum publishes
+/// (`smithy_query(query="shape",shape="ObjectAttributes")`), which is what the header may
+/// name.
+const OBJECT_ATTRIBUTES_VALUES: [&str; 5] =
+    ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"];
+
+/// `GET /<bucket>/<key>?attributes<query>` — `GetObjectAttributes`, asking for `attributes`.
+async fn get_object_attributes(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    query: &str,
+    attributes: &[&str],
+) -> Answer {
+    send_bytes(
+        router,
+        "GET",
+        &format!("/{bucket}/{key}?attributes{query}"),
+        &[("x-amz-object-attributes", &attributes.join(", "))],
+        b"",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_answer_carries_exactly_the_fields_the_request_asked_for() {
+    let router = router();
+    let bucket = "object-attributes";
+    let created = create_bucket(&router, bucket, None, None).await;
+    assert_eq!(
+        created.status, 200,
+        "the bucket must be created first, got {} with body {:?}",
+        created.status,
+        text(&created)
+    );
+
+    // The objects differ along what the answer's values generalise over: the SIZE of the
+    // body (empty, one byte, many bytes) and the STORAGE CLASS the write named (none,
+    // which is the default, and two the enum publishes).
+    let bodies: &[(&str, &[u8], Option<&str>, &str)] = &[
+        ("an empty object", b"", None, "STANDARD"),
+        ("a one-byte object", b"x", Some("STANDARD_IA"), "STANDARD_IA"),
+        (
+            "a many-byte object",
+            b"attributes-subject-bytes-0123456789",
+            Some("GLACIER_IR"),
+            "GLACIER_IR",
+        ),
+    ];
+
+    // Every subset of the three root-level fields this emulator can report, plus the two
+    // containers alongside them: what is asked for decides what comes back.
+    let asked: &[Vec<&str>] = &[
+        vec!["ETag"],
+        vec!["ObjectSize"],
+        vec!["StorageClass"],
+        vec!["ETag", "ObjectSize"],
+        vec!["ObjectSize", "StorageClass"],
+        vec!["ETag", "StorageClass"],
+        vec!["ETag", "ObjectSize", "StorageClass"],
+        vec!["StorageClass", "ObjectSize", "ETag"],
+        vec!["Checksum", "ObjectParts"],
+        OBJECT_ATTRIBUTES_VALUES.to_vec(),
+    ];
+
+    for (index, (case, body, storage_class, expected_class)) in bodies.iter().enumerate() {
+        let key = format!("subject-{index}.bin");
+        let headers: Vec<(&str, &str)> = storage_class
+            .map(|class| vec![("x-amz-storage-class", class)])
+            .unwrap_or_default();
+        let stored = put_object(&router, bucket, &key, body, &headers).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case:?}: the object must be stored first, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+
+        for attributes in asked {
+            let answer = get_object_attributes(&router, bucket, &key, "", attributes).await;
+            let label = format!("{case} asking for {attributes:?}");
+            assert_eq!(
+                answer.status, 200,
+                "case {label:?}: the read must be served, got {} with body {:?}",
+                answer.status,
+                text(&answer)
+            );
+
+            let etag = answer.element("ETag");
+            assert_eq!(
+                etag.as_deref(),
+                attributes
+                    .contains(&"ETag")
+                    .then(|| expected_etag(body))
+                    .as_deref(),
+                "case {label:?}: the ETag is reported exactly when it was asked for, got \
+                 {etag:?} in body {:?}",
+                text(&answer)
+            );
+            let size = answer.element("ObjectSize");
+            assert_eq!(
+                size.as_deref(),
+                attributes
+                    .contains(&"ObjectSize")
+                    .then(|| body.len().to_string())
+                    .as_deref(),
+                "case {label:?}: the size is reported exactly when it was asked for, got \
+                 {size:?} in body {:?}",
+                text(&answer)
+            );
+            let class = answer.element("StorageClass");
+            assert_eq!(
+                class.as_deref(),
+                attributes
+                    .contains(&"StorageClass")
+                    .then_some(*expected_class),
+                "case {label:?}: the storage class is reported exactly when it was asked \
+                 for, got {class:?} in body {:?}",
+                text(&answer)
+            );
+            // The two containers carry nothing this emulator holds, so neither is reported
+            // whether or not it was asked for.
+            for container in ["Checksum", "ObjectParts"] {
+                assert_eq!(
+                    answer.element(container),
+                    None,
+                    "case {label:?}: {container} is not reported, got body {:?}",
+                    text(&answer)
+                );
+            }
+            // Bound headers, reported for every answer.
+            assert!(
+                answer.header("last-modified").is_some(),
+                "case {label:?}: Last-Modified is a bound header of every answer, got none"
+            );
+
+            // Reading again reports exactly the same thing: the read changes nothing.
+            let again = get_object_attributes(&router, bucket, &key, "", attributes).await;
+            assert_eq!(
+                text(&again),
+                text(&answer),
+                "case {label:?}: a second read must answer the same document"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_version_a_read_names_is_the_version_it_reports() {
+    let router = router();
+    let bucket = "object-attributes-versions";
+    create_bucket(&router, bucket, None, None).await;
+    set_versioning(&router, bucket, "Enabled").await;
+    let key = "versioned.bin";
+
+    // Two versions of one key, of different sizes, so what a read reports can only be
+    // right if it read the version it named.
+    let first = put_object(&router, bucket, key, b"first", &[]).await;
+    let second = put_object(&router, bucket, key, b"second-and-longer", &[]).await;
+    let first_id = first
+        .header("x-amz-version-id")
+        .expect("a versioning-enabled bucket mints a version id");
+    let second_id = second
+        .header("x-amz-version-id")
+        .expect("a versioning-enabled bucket mints a version id");
+    assert_ne!(first_id, second_id, "each version gets an id of its own");
+
+    for (case, version_id, body) in [
+        ("the older version", Some(first_id.clone()), b"first".to_vec()),
+        (
+            "the current version",
+            Some(second_id.clone()),
+            b"second-and-longer".to_vec(),
+        ),
+        ("no version at all", None, b"second-and-longer".to_vec()),
+    ] {
+        let query = version_id
+            .as_ref()
+            .map(|id| format!("&versionId={id}"))
+            .unwrap_or_default();
+        let answer = get_object_attributes(
+            &router,
+            bucket,
+            key,
+            &query,
+            &["ETag", "ObjectSize", "StorageClass"],
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the read must be served, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        assert_eq!(
+            answer.element("ObjectSize").as_deref(),
+            Some(body.len().to_string().as_str()),
+            "case {case:?}: the size must be that version's, got body {:?}",
+            text(&answer)
+        );
+        assert_eq!(
+            answer.element("ETag").as_deref(),
+            Some(expected_etag(&body).as_str()),
+            "case {case:?}: the ETag must be that version's, got body {:?}",
+            text(&answer)
+        );
+        // The version id is a bound header of the answer, naming the version that was read.
+        assert_eq!(
+            answer.header("x-amz-version-id"),
+            Some(version_id.unwrap_or(second_id.clone())),
+            "case {case:?}: the answer must name the version it reported"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_address_this_emulator_does_not_hold_is_refused_with_the_code_for_what_is_missing() {
+    let router = router();
+    let bucket = "object-attributes-missing";
+    create_bucket(&router, bucket, None, None).await;
+    set_versioning(&router, bucket, "Enabled").await;
+    let key = "present.bin";
+    let stored = put_object(&router, bucket, key, b"held", &[]).await;
+    assert_eq!(
+        stored.status, 200,
+        "the object must be stored first, got {}",
+        stored.status
+    );
+    let version_id = stored
+        .header("x-amz-version-id")
+        .expect("a versioning-enabled bucket mints a version id");
+    let absent_version = "b".repeat(version_id.chars().count());
+    assert_ne!(
+        absent_version, version_id,
+        "the absent-version row must name an id the store did not mint"
+    );
+
+    // (case, bucket, key, query, status, code) — one row per part of the address that can
+    // be missing, and one for a `versionId` that is not shaped like one.
+    let rows: &[(&str, &str, &str, String, u16, &str)] = &[
+        (
+            "a key the bucket does not hold",
+            bucket,
+            "absent.bin",
+            String::new(),
+            404,
+            "NoSuchKey",
+        ),
+        (
+            "a bucket this emulator does not hold",
+            "object-attributes-no-such-bucket",
+            key,
+            String::new(),
+            404,
+            "NoSuchBucket",
+        ),
+        (
+            "a well-formed version the bucket holds none of",
+            bucket,
+            key,
+            format!("&versionId={absent_version}"),
+            404,
+            "NoSuchVersion",
+        ),
+        (
+            "a version id that is not shaped like one",
+            bucket,
+            key,
+            "&versionId=not-a-version".to_string(),
+            400,
+            "InvalidArgument",
+        ),
+    ];
+
+    for (case, target, subject, query, status, code) in rows {
+        let answer =
+            get_object_attributes(&router, target, subject, query, &["ETag", "ObjectSize"]).await;
+        assert_eq!(
+            answer.status, *status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        assert_eq!(
+            answer.error_code(),
+            *code,
+            "case {case:?}: expected {code:?}, got {:?}",
+            answer.error_code()
+        );
+    }
+
+    // The held object IS served, so every row above failed on the address it named.
+    let served = get_object_attributes(&router, bucket, key, "", &["ObjectSize"]).await;
+    assert_eq!(
+        served.status, 200,
+        "the held object must be served, got {} with body {:?}",
+        served.status,
+        text(&served)
+    );
+}

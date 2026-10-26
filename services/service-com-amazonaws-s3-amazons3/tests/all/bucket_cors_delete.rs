@@ -34,6 +34,7 @@ use super::bucket_cors::{get_cors, payload, put_cors, round_trip_rows, simple_ru
 use super::bucket_lifecycle::{
     create_bucket, get_bucket_policy, put_bucket_policy, router, send, send_bytes, Answer,
 };
+use super::bucket_public_access_block::allow_public_access;
 use super::bucket_website::{content, reported};
 
 /// `DELETE /<bucket>?cors` — `DeleteBucketCors`.
@@ -347,8 +348,11 @@ async fn deleting_the_cors_configuration_leaves_everything_else_alone() {
     }
 
     // The bucket's policy is a DIFFERENT subresource of the same bucket, so withdrawing the
-    // cors configuration must leave it exactly as it was.
+    // cors configuration must leave it exactly as it was. The document grants a wildcard
+    // principal, which the Block Public Access configuration the bucket was created with
+    // would deny, so that guardrail is lifted first.
     let policy = r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"}]}"#;
+    allow_public_access(&router, bucket).await;
     let attached = put_bucket_policy(&router, bucket, policy).await;
     assert_eq!(
         attached.status, 204,

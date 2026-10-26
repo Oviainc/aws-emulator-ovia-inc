@@ -84,6 +84,19 @@ pub enum BucketCreation {
 /// the STANDARD Storage Class to store newly created objects."
 pub const DEFAULT_STORAGE_CLASS: &str = "STANDARD";
 
+/// The `ObjectAttributes` value naming an object's entity tag, as the
+/// `x-amz-object-attributes` header spells it.
+///
+/// The four root-level fields `GetObjectAttributes` reports are each named by one value of
+/// that enum (`smithy_query(query="shape",shape="ObjectAttributes")` publishes `[ETag,
+/// Checksum, ObjectParts, StorageClass, ObjectSize]`); these constants are what the handler
+/// matches the header's values against, so the spelling lives in one place.
+pub const OBJECT_ATTRIBUTE_ETAG: &str = "ETag";
+/// See [`OBJECT_ATTRIBUTE_ETAG`] — the value naming the object's size in bytes.
+pub const OBJECT_ATTRIBUTE_OBJECT_SIZE: &str = "ObjectSize";
+/// See [`OBJECT_ATTRIBUTE_ETAG`] — the value naming the object's storage class.
+pub const OBJECT_ATTRIBUTE_STORAGE_CLASS: &str = "StorageClass";
+
 /// The `StorageClass` values whose objects are ARCHIVED: not readable, not copyable and
 /// not usable until a temporary copy of them has been restored.
 ///
@@ -282,6 +295,27 @@ pub enum ObjectRetentionWrite {
     ByteBudgetReached { would_hold: usize },
     /// Keeping the retention would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
     /// retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
+/// What [`ComAmazonawsS3Amazons3State::replace_object_encryption`] did, so the caller
+/// answers each outcome without re-deriving it — and cannot record an encryption
+/// configuration without having gone through the byte budgets a stored object's members
+/// count against, per bucket AND service-wide. The shape [`ObjectRetentionWrite`] has, for
+/// the same reason: an encryption configuration is a handful of caller-supplied strings
+/// kept beside an object ([`ObjectEncryption::retained_bytes`] counts them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectEncryptionWrite {
+    /// The addressed object version's encryption configuration is now the one that was
+    /// handed in.
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+    /// Keeping the configuration would take the bucket past
+    /// [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the configuration would take the whole store past
+    /// [`MAX_OBJECT_BYTES_TOTAL`] retained bytes; nothing was written.
     TotalByteBudgetReached { would_hold: usize },
 }
 
@@ -641,7 +675,7 @@ pub enum TagSetRejectionCause {
     /// A key or a value carries a character outside the published class every tag set
     /// shares ([`tag_text_is_allowed`]).
     DisallowedCharacter {
-        /// Which half of the tag carries it ("Tag.Key", "Tag.Value").
+        /// Which half of the tag carries it ([`TAG_KEY_FIELD`], [`TAG_VALUE_FIELD`]).
         field: &'static str,
         /// The character the published class does not allow.
         character: char,
@@ -662,39 +696,56 @@ impl std::fmt::Display for TagSetRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let TagSetLimits { max_tags, resource } = self.limits;
         match &self.cause {
-            TagSetRejectionCause::TooManyTags { count } => write!(
-                f,
-                "Tagging.TagSet carries {count} tags, more than the {max_tags} \
-                 tags one {resource} may hold"
-            ),
-            TagSetRejectionCause::EmptyKey => write!(
-                f,
-                "Tagging.TagSet has a Tag with an empty Tag.Key; a {resource} tag key \
-                 holds at least one character"
-            ),
-            TagSetRejectionCause::KeyTooLong { chars } => write!(
-                f,
-                "Tagging.TagSet has a Tag.Key of {chars} characters, more than the \
-                 {MAX_TAG_KEY_CHARS} characters a tag key may hold"
-            ),
-            TagSetRejectionCause::ValueTooLong { key, chars } => write!(
-                f,
-                "Tagging.TagSet has a Tag.Value of {chars} characters for key {key:?}, \
-                 more than the {MAX_TAG_VALUE_CHARS} characters a tag value may hold"
-            ),
-            TagSetRejectionCause::DuplicateKey { key } => write!(
-                f,
-                "Tagging.TagSet names the key {key:?} twice; a {resource} tag set holds \
-                 one value per key"
-            ),
-            TagSetRejectionCause::DisallowedCharacter { field, character } => write!(
-                f,
-                "Tagging.TagSet has a {field} carrying {character:?}, which is not one of \
-                 the letters, numbers, whitespace and {TAG_PUNCTUATION:?} a tag may hold"
-            ),
+            // The resource's noun capitalised, and the published maximum the set was
+            // judged against: both come from the limits, never from the request — the
+            // count the set carried is not in the sentence.
+            TagSetRejectionCause::TooManyTags { .. } => {
+                let mut characters = resource.chars();
+                let noun: String = match characters.next() {
+                    Some(first) => first.to_uppercase().chain(characters).collect(),
+                    None => String::new(),
+                };
+                write!(f, "{noun} tags cannot be greater than {max_tags}")
+            }
+            TagSetRejectionCause::EmptyKey | TagSetRejectionCause::KeyTooLong { .. } => {
+                write!(f, "{INVALID_TAG_KEY_MESSAGE}")
+            }
+            TagSetRejectionCause::ValueTooLong { .. } => {
+                write!(f, "{INVALID_TAG_VALUE_MESSAGE}")
+            }
+            // Which half of the tag carried the character is what decides which of the two
+            // sentences S3 states; the character itself is not in either of them.
+            TagSetRejectionCause::DisallowedCharacter { field, .. } => {
+                let message = if *field == TAG_KEY_FIELD {
+                    INVALID_TAG_KEY_MESSAGE
+                } else {
+                    INVALID_TAG_VALUE_MESSAGE
+                };
+                write!(f, "{message}")
+            }
+            TagSetRejectionCause::DuplicateKey { .. } => {
+                write!(f, "Cannot provide multiple Tags with the same key")
+            }
         }
     }
 }
+
+/// Which half of a tag [`TagSetRejectionCause::DisallowedCharacter`] names, for the KEY.
+pub const TAG_KEY_FIELD: &str = "Tag.Key";
+
+/// Which half of a tag [`TagSetRejectionCause::DisallowedCharacter`] names, for the VALUE.
+pub const TAG_VALUE_FIELD: &str = "Tag.Value";
+
+/// The `<Message>` S3 sends for a tag whose KEY breaks one of the published restrictions —
+/// its length or the character class — and for a tag that carries no key at all.
+///
+/// Fixed text: S3 states which HALF of the tag was not valid and nothing else, interpolating
+/// neither the key, the bound it broke nor the character class.
+const INVALID_TAG_KEY_MESSAGE: &str = "The TagKey you have provided is invalid";
+
+/// The `<Message>` S3 sends for a tag whose VALUE breaks one of those restrictions — the
+/// value half of [`INVALID_TAG_KEY_MESSAGE`], worded the same way.
+const INVALID_TAG_VALUE_MESSAGE: &str = "The TagValue you have provided is invalid";
 
 impl TagSetRejection {
     /// The wire error code S3 answers this rejection with.
@@ -757,7 +808,7 @@ pub fn validate_tag_set(
         }
         if let Some(character) = first_disallowed_tag_char(&tag.key) {
             return refuse(TagSetRejectionCause::DisallowedCharacter {
-                field: "Tag.Key",
+                field: TAG_KEY_FIELD,
                 character,
             });
         }
@@ -770,7 +821,7 @@ pub fn validate_tag_set(
         }
         if let Some(character) = first_disallowed_tag_char(&tag.value) {
             return refuse(TagSetRejectionCause::DisallowedCharacter {
-                field: "Tag.Value",
+                field: TAG_VALUE_FIELD,
                 character,
             });
         }
@@ -1498,9 +1549,37 @@ pub fn caller_principal_arn() -> String {
 /// request called and the resource is the bucket or object it addressed. One place, so the
 /// bucket half and the object half of the same guardrail word it identically.
 pub fn block_public_acls_denial(action: &str, resource: &str) -> String {
+    block_public_access_denial(
+        action,
+        resource,
+        "public ACLs are prevented by the BlockPublicAcls",
+    )
+}
+
+/// The message S3 words an `AccessDenied` the Block Public Access `BlockPublicPolicy`
+/// setting caused — the policy half of the guardrail [`block_public_acls_denial`] states
+/// for an ACL, in the same sentence with the setting that prevented the call.
+///
+/// Every value in it comes from the request and from this emulator's own identity, exactly
+/// as in the ACL half.
+pub fn block_public_policy_denial(action: &str, resource: &str) -> String {
+    block_public_access_denial(
+        action,
+        resource,
+        "public policies are prevented by the BlockPublicPolicy",
+    )
+}
+
+/// The one sentence a Block Public Access refusal is worded in: who was refused, which IAM
+/// `action`, on which `resource`, and the `prevented_by` clause naming what the setting
+/// prevents and which setting it is.
+///
+/// One place, so every switch's refusal reads alike and only the clause that names the
+/// setting differs — which is the only thing that differs about them.
+fn block_public_access_denial(action: &str, resource: &str, prevented_by: &str) -> String {
     format!(
         "User: {} is not authorized to perform: {action} on resource: \"{resource}\" because \
-         public ACLs are prevented by the BlockPublicAcls setting in S3 Block Public Access.",
+         {prevented_by} setting in S3 Block Public Access.",
         caller_principal_arn()
     )
 }
@@ -1524,17 +1603,19 @@ pub struct BucketVersioning {
     pub mfa_delete: Option<String>,
 }
 
-/// The Block Public Access settings a bucket carries once `PutPublicAccessBlock` has set
-/// a `PublicAccessBlockConfiguration` on it.
+/// The Block Public Access settings a bucket carries.
 ///
 /// Four INDEPENDENT switches, not an `Option` each: every member of
 /// `PublicAccessBlockConfiguration` is a `Setting` (a boolean) documented as "Specifies
 /// whether Amazon S3 should block …  Setting this element to TRUE causes …"
 /// (`smithy_query(query="shape",shape="PublicAccessBlockConfiguration")`), so a switch the
 /// configuration does not turn on is off — there is no third state for a member to be in.
-/// A bucket that has never had the subresource set carries NO value of this at all, which
-/// is why [`Bucket::public_access_block`] is an `Option` of it: the same distinction
-/// [`BucketVersioning`] keeps between "never configured" and "configured off".
+///
+/// [`Bucket::public_access_block`] is an `Option` of it because a bucket can carry NO
+/// configuration at all — the state `DeletePublicAccessBlock` leaves it in, and the only
+/// state in which a read of the subresource is not-found. A bucket this store records comes
+/// into being with [`Self::all_enabled`] rather than with nothing, because S3 creates every
+/// new bucket with all four settings on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BucketPublicAccessBlock {
     /// Whether S3 blocks public ACLs for the bucket and its objects.
@@ -1545,6 +1626,24 @@ pub struct BucketPublicAccessBlock {
     pub block_public_policy: bool,
     /// Whether S3 restricts access to the bucket when it has a public policy.
     pub restrict_public_buckets: bool,
+}
+
+impl BucketPublicAccessBlock {
+    /// Every one of the four switches ON — the configuration a bucket comes into being
+    /// carrying.
+    ///
+    /// "Amazon S3 automatically enables S3 Block Public Access … for new buckets" (Amazon
+    /// S3 User Guide, Blocking public access to your Amazon S3 storage): a bucket created
+    /// today starts out fully blocked, so a read of the subresource on a bucket nothing has
+    /// configured reports four `true`s rather than "there is none".
+    pub const fn all_enabled() -> Self {
+        Self {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: true,
+            restrict_public_buckets: true,
+        }
+    }
 }
 
 /// Every value the `Event` enum publishes: the bucket events a notification configuration
@@ -1861,6 +1960,38 @@ fn is_arn_of_service(arn: &str, service: &str) -> bool {
     is_arn_of(arn, service, ArnField::Present, ArnField::Present, "")
 }
 
+/// Why `value` is not an ARN, as AWS states it where a refusal quotes the reason.
+///
+/// The ARN grammar is the published one [`is_arn_of`] reads —
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>` — and the diagnostics are
+/// the ones AWS's own ARN parser publishes for each way a value breaks it, in the order it
+/// checks them: the `arn:` prefix, the six sections, then the three sections that may not
+/// be empty. The last arm is for a value that IS an ARN and still does not name the
+/// resource the member requires.
+///
+/// Nothing here is derived from the recorded request: the reason comes from `value`'s own
+/// shape, and `value` itself is not in any of the sentences.
+pub fn malformed_arn_reason(value: &str) -> &'static str {
+    const PREFIX: &str = "arn:";
+    if !value.starts_with(PREFIX) {
+        return "Malformed ARN - doesn't start with 'arn:'";
+    }
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    if fields.len() < 6 {
+        return "Malformed ARN - doesn't contain enough sections";
+    }
+    if fields[1].is_empty() {
+        return "Malformed ARN - no AWS partition";
+    }
+    if fields[2].is_empty() {
+        return "Malformed ARN - no AWS service";
+    }
+    if fields[5].is_empty() {
+        return "Malformed ARN - no AWS resource";
+    }
+    "Invalid ARN - the ARN does not name the resource this member requires"
+}
+
 /// Whether `configuration` is one S3 applies to a bucket, and what is wrong with it when
 /// it is not.
 ///
@@ -1968,7 +2099,8 @@ pub struct BucketEncryptionRule {
 /// encryption with Amazon S3 managed keys (SSE-S3)" (`GetBucketEncryption`'s own
 /// documentation), and "General purpose buckets - By default, S3 Bucket Key is not
 /// enabled" (`ServerSideEncryptionRule$BucketKeyEnabled`) — so the rule a never-configured
-/// bucket reports is [`DEFAULT_SSE_ALGORITHM`] with the Bucket Key off and nothing blocked.
+/// bucket reports is [`DEFAULT_SSE_ALGORITHM`] with the Bucket Key off and
+/// [`DEFAULT_BLOCKED_ENCRYPTION_TYPES`] blocked.
 ///
 /// COMPUTED rather than stored, so a read of a bucket that was never configured reports
 /// this without writing anything: [`Bucket::encryption`] stays `None` and a later reader
@@ -1978,8 +2110,17 @@ pub fn default_encryption_rule() -> BucketEncryptionRule {
         sse_algorithm: Some(DEFAULT_SSE_ALGORITHM.to_string()),
         kms_master_key_id: None,
         bucket_key_enabled: Some(DEFAULT_BUCKET_KEY_ENABLED),
-        blocked_encryption_types: None,
+        blocked_encryption_types: Some(default_blocked_encryption_types()),
     }
+}
+
+/// The `EncryptionType` values a bucket blocks while no `PutBucketEncryption` has named a
+/// set of its own — [`DEFAULT_BLOCKED_ENCRYPTION_TYPES`], as a stored rule holds them.
+pub fn default_blocked_encryption_types() -> Vec<String> {
+    DEFAULT_BLOCKED_ENCRYPTION_TYPES
+        .iter()
+        .map(|blocked| (*blocked).to_string())
+        .collect()
 }
 
 /// Every value the `Protocol` enum publishes: the two schemes a website redirect may be
@@ -4039,10 +4180,12 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the accessor pair below is the only way in or out.
     abac: Option<String>,
-    /// The Block Public Access settings `PutPublicAccessBlock` last set on the bucket, or
-    /// `None` while no `PublicAccessBlockConfiguration` is associated with it — the state a
-    /// bucket is created in, and what makes `GetPublicAccessBlock` answer
-    /// [`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`] until a put sets one.
+    /// The Block Public Access settings in force on the bucket: the ones
+    /// `PutPublicAccessBlock` last set, the all-on configuration the bucket was created
+    /// with ([`BucketPublicAccessBlock::all_enabled`]) while no put has replaced it, or
+    /// `None` once `DeletePublicAccessBlock` has withdrawn the subresource — the one state
+    /// in which `GetPublicAccessBlock` answers
+    /// [`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`].
     ///
     /// Private, like `tags`, so the accessor trio below is the only way in or out.
     public_access_block: Option<BucketPublicAccessBlock>,
@@ -4521,8 +4664,10 @@ impl Bucket {
     /// it, and report whether the bucket carried one.
     ///
     /// What `DeletePublicAccessBlock` does — "Removes the PublicAccessBlock configuration
-    /// for an Amazon S3 bucket" — which puts the bucket back in the state it was created
-    /// in, so a later `GetPublicAccessBlock` reports no configuration again.
+    /// for an Amazon S3 bucket" — which leaves the bucket with no configuration at all, the
+    /// one state in which a later `GetPublicAccessBlock` reports none. It is NOT the state
+    /// the bucket was created in: a create installs
+    /// [`BucketPublicAccessBlock::all_enabled`].
     pub fn clear_public_access_block(&mut self) -> bool {
         self.public_access_block.take().is_some()
     }
@@ -5056,13 +5201,30 @@ impl Bucket {
     /// `PutBucketEncryption` associated with it, or the single SSE-S3 rule every bucket
     /// carries until one does ([`default_encryption_rule`]).
     ///
+    /// A configured rule that names NO `BlockedEncryptionTypes` leaves the bucket's blocked
+    /// set at [`DEFAULT_BLOCKED_ENCRYPTION_TYPES`], which is what this materialises:
+    /// blocking an encryption type is "a bucket-level setting … used to prevent the upload
+    /// of new objects encrypted with the specified server-side encryption type", one whose
+    /// own enum publishes the value that UNBLOCKS it (`NONE`, beside `SSE-C` —
+    /// `smithy_query(query="shape",shape="EncryptionType")`), so a configuration that says
+    /// nothing about it neither turns the blocking off nor hides it from a reader.
+    ///
     /// COMPUTED, never stored: a bucket that was never configured keeps [`Self::encryption`]
     /// at `None`, so reading this changes nothing a later caller sees. This is what
     /// `GetBucketEncryption` reports and what [`Self::default_object_encryption`] resolves a
     /// write's inherited encryption from, so the two can never disagree.
     pub fn effective_encryption_rules(&self) -> Vec<BucketEncryptionRule> {
         match self.encryption() {
-            Some(configured) => configured.to_vec(),
+            Some(configured) => configured
+                .iter()
+                .map(|rule| BucketEncryptionRule {
+                    blocked_encryption_types: rule
+                        .blocked_encryption_types
+                        .clone()
+                        .or_else(|| Some(default_blocked_encryption_types())),
+                    ..rule.clone()
+                })
+                .collect(),
             None => vec![default_encryption_rule()],
         }
     }
@@ -6640,14 +6802,15 @@ pub fn canonical_user_id() -> String {
 /// length), and the only thing documented about them is that each is unique ("All objects
 /// added to the bucket receive a unique version ID" — `PutBucketVersioning`). So this is
 /// DERIVED rather than drawn from a generator: the SHA-256 of the bucket, the key and the
-/// store's monotonic mint sequence, Base64 encoded to the 32 characters an S3 version id
-/// is shaped like. Two versions of a key — and two versions anywhere in the store —
-/// therefore never collide, and the value stays what it was once stored, because nothing
-/// re-derives it.
+/// store's monotonic mint sequence, rendered as the [`VERSION_ID_CHARS`] characters an S3
+/// version id is shaped like. Two versions of a key — and two versions anywhere in the
+/// store — therefore never collide, and the value stays what it was once stored, because
+/// nothing re-derives it.
 ///
-/// The URL-safe Base64 alphabet (RFC 4648 §5), so the id survives a round trip through the
-/// `versionId` query parameter a client sends it back in: `+` would arrive decoded as a
-/// space and `/` would end the path segment.
+/// Hex, so every character is an ASCII alphanumeric: the id survives a round trip through
+/// the `versionId` query parameter a client sends it back in, where `+` would arrive
+/// decoded as a space and `/` would end the path segment, and it carries only characters
+/// [`version_id_is_well_formed`] accepts.
 pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
     use ::sha2::Digest;
     let mut digest = ::sha2::Sha256::new();
@@ -6657,10 +6820,9 @@ pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
     digest.update(key.as_bytes());
     digest.update([0u8]);
     digest.update(sequence.to_be_bytes());
-    // 24 bytes encode to exactly 32 unpadded Base64 characters.
-    ::aws_smithy_types::base64::encode(&digest.finalize()[..24])
-        .replace('+', "-")
-        .replace('/', "_")
+    // Each byte renders as two hex digits, so half of `VERSION_ID_CHARS` digest bytes
+    // fill the id exactly.
+    ::hex::encode(&digest.finalize()[..VERSION_ID_CHARS / 2])
 }
 
 /// Per-service state for com-amazonaws-s3-amazons3. A handler reaches it through [`service_state`].
@@ -7270,6 +7432,62 @@ impl ComAmazonawsS3Amazons3State {
             })
     }
 
+    /// Record `encryption` as the server-side encryption configuration of the object
+    /// version `version_id` names in `bucket` — the key's current object when it names
+    /// none. Reports what the write did, or `None` when this emulator holds no such bucket
+    /// (so an encryption update refuses a name that is not a bucket instead of creating
+    /// one).
+    ///
+    /// A REPLACEMENT of the object's whole encryption record, the way
+    /// [`Self::replace_object_retention`] replaces a retention: `ObjectEncryption` is "the
+    /// updated server-side encryption type for this object"
+    /// (`UpdateObjectEncryptionRequest$ObjectEncryption`), so what the version carries
+    /// afterwards is exactly what this call carried. Nothing ELSE about the object changes:
+    /// "the UpdateObjectEncryption operation preserves all object metadata properties,
+    /// including the storage class, creation date, last modified date, ETag, and checksum
+    /// properties" (that operation's own documentation).
+    ///
+    /// It is the ONLY way an existing object's encryption is re-recorded, because it is the
+    /// only place that can see BOTH the per-bucket byte budget and the service-wide one: an
+    /// encryption configuration is retained with the object
+    /// ([`ObjectEncryption::retained_bytes`]). Nothing is written unless the answer is
+    /// [`ObjectEncryptionWrite::Applied`].
+    pub fn replace_object_encryption(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        encryption: ObjectEncryption,
+    ) -> Option<ObjectEncryptionWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.addressed_object(key, version_id) else {
+            return Some(ObjectEncryptionWrite::NoSuchObject);
+        };
+
+        // What the bucket and the whole store would retain with this configuration in place
+        // of the object's current one, measured exactly as a retention replacement is.
+        let released = object.encryption.retained_bytes();
+        let taken = encryption.retained_bytes();
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(ObjectEncryptionWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self.caller_retained_bytes().saturating_sub(released) + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectEncryptionWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.addressed_object_mut(key, version_id))
+            .map(|object| {
+                object.encryption = encryption;
+                ObjectEncryptionWrite::Applied
+            })
+    }
+
     /// Record `legal_hold` as the Object Lock legal hold status of the object version
     /// `version_id` names in `bucket` — the key's current object when it names none.
     /// Reports what the write did, or `None` when this emulator holds no such bucket (so a
@@ -7639,11 +7857,19 @@ impl ComAmazonawsS3Amazons3State {
                 // The creation instant is read here, where the bucket comes into being,
                 // so `CreationDate` is the moment the store accepted it.
                 created_at: Some(SystemTime::now()),
-                // A fresh bucket carries no policy, no tags, no ownership controls and no
-                // Block Public Access configuration, and holds no objects;
-                // `PutBucketPolicy`, `PutBucketTagging`, `PutBucketOwnershipControls` and
-                // `PutPublicAccessBlock` are what associate those subresources with it and
-                // `PutObject` what puts an object in it.
+                // "Amazon S3 automatically enables S3 Block Public Access … for new
+                // buckets" (Amazon S3 User Guide, Blocking public access to your Amazon S3
+                // storage): a bucket is fully blocked from the moment it exists, so the
+                // subresource is associated with it here — the same way its Object
+                // Ownership setting is — and a read of it reports four switches rather than
+                // "there is none". A bucket from AWS's published catalog predates that
+                // default and is public, so it carries no configuration.
+                public_access_block: (!aws_published)
+                    .then(BucketPublicAccessBlock::all_enabled),
+                // A fresh bucket carries no policy, no tags and no ownership controls, and
+                // holds no objects; `PutBucketPolicy`, `PutBucketTagging` and
+                // `PutBucketOwnershipControls` are what associate those subresources with
+                // it and `PutObject` what puts an object in it.
                 ..Bucket::default()
             },
         );
@@ -7742,28 +7968,45 @@ pub const NO_SUCH_VERSION_CODE: &str = "NoSuchVersion";
 pub const NO_SUCH_VERSION_MESSAGE: &str =
     "The specified version does not exist.";
 
-/// How many characters a minted version id carries ([`mint_version_id`]): 24 digest bytes
-/// Base64 encoded without padding.
-const VERSION_ID_CHARS: usize = 32;
+/// How many characters a version id this store MINTS carries ([`mint_version_id`]): the
+/// width of the opaque token S3 issues for a version, which is also the SHORTEST a version
+/// id may be ([`version_id_is_well_formed`]).
+pub const VERSION_ID_CHARS: usize = 32;
 
-/// Whether `version_id` is SHAPED like a version id this service can have minted.
+/// The most characters a version id may carry: `ObjectVersionId` is a plain string in the
+/// model (`smithy_query(query="shape",shape="ObjectVersionId")` reports no length), and S3
+/// documents a version id of up to 1024 bytes, so a longer token cannot be one.
+pub const MAX_VERSION_ID_CHARS: usize = 1024;
+
+/// The characters a version id is drawn from, beside the ASCII alphanumerics.
 ///
-/// A `versionId` is one of exactly two things: the literal [`NULL_VERSION_ID`], which
-/// names the version a write made while the bucket had no versioning state, or a token of
-/// the form [`mint_version_id`] produces — [`VERSION_ID_CHARS`] characters of the URL-safe
-/// Base64 alphabet. Anything else cannot name a version of any object in any bucket, so it
-/// is a malformed ARGUMENT rather than an absent version: S3 answers the former
-/// [`INVALID_ARGUMENT_CODE`] with HTTP 400 and reserves [`NO_SUCH_VERSION_CODE`] with HTTP
-/// 404 for a well-formed id that names no stored version. Checked by every operation that
-/// takes a `versionId`, so one id is well-formed or malformed everywhere.
+/// The token is opaque and travels in a `versionId` query parameter, so S3 draws it from
+/// the alphanumerics and the unreserved characters that survive that round trip.
+const VERSION_ID_EXTRA_CHARS: [char; 3] = ['-', '_', '.'];
+
+/// Whether `version_id` is SHAPED like a version id S3 issues.
+///
+/// A `versionId` is one of exactly two things: the literal [`NULL_VERSION_ID`], which names
+/// the version a write made while the bucket had no versioning state, or a token of the
+/// published shape — between [`VERSION_ID_CHARS`] and [`MAX_VERSION_ID_CHARS`] characters,
+/// each an ASCII alphanumeric or one of [`VERSION_ID_EXTRA_CHARS`]. The width is a RANGE
+/// rather than one number because the token is opaque: this store mints ids of its own
+/// width, and an id another S3 issued is just as much a version id. Anything else cannot
+/// name a version of any object in any bucket, so it is a malformed ARGUMENT rather than an
+/// absent version: S3 answers the former [`INVALID_ARGUMENT_CODE`] with HTTP 400 and
+/// reserves [`NO_SUCH_VERSION_CODE`] with HTTP 404 for a well-formed id that names no stored
+/// version — which is why an id of the published shape that this store never minted is a
+/// 404 and not a 400. Checked by every operation that takes a `versionId`, so one id is
+/// well-formed or malformed everywhere.
 pub fn version_id_is_well_formed(version_id: &str) -> bool {
     if version_id == NULL_VERSION_ID {
         return true;
     }
-    version_id.chars().count() == VERSION_ID_CHARS
-        && version_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    let characters = version_id.chars().count();
+    (VERSION_ID_CHARS..=MAX_VERSION_ID_CHARS).contains(&characters)
+        && version_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || VERSION_ID_EXTRA_CHARS.contains(&character)
+        })
 }
 
 /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `versionId` that is not
@@ -7937,6 +8180,23 @@ pub const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 /// enables one: "General purpose buckets - By default, S3 Bucket Key is not enabled"
 /// (`ServerSideEncryptionRule$BucketKeyEnabled`).
 pub const DEFAULT_BUCKET_KEY_ENABLED: bool = false;
+
+/// The `EncryptionType` values a general purpose bucket blocks until a
+/// `PutBucketEncryption` names another set.
+///
+/// `BlockedEncryptionTypes` is "a bucket-level setting for Amazon S3 general purpose
+/// buckets used to prevent the upload of new objects encrypted with the specified
+/// server-side encryption type", and "currently, this parameter only supports blocking or
+/// unblocking server-side encryption with customer-provided keys (SSE-C)"
+/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`). A general purpose bucket blocks
+/// SSE-C uploads by default, which is why this is what a never-configured bucket reports.
+pub const DEFAULT_BLOCKED_ENCRYPTION_TYPES: [&str; 1] = [SSE_C_ENCRYPTION_TYPE];
+
+/// The `EncryptionType` value that names server-side encryption with customer-provided
+/// keys — one of the two values the enum publishes
+/// (`smithy_query(query="shape",shape="EncryptionType")` reports `[NONE, SSE-C]`), which
+/// `tests/all/bucket_encryption.rs` re-derives from that value list.
+pub const SSE_C_ENCRYPTION_TYPE: &str = "SSE-C";
 
 /// The `ServerSideEncryption` values a `KMSMasterKeyID` may accompany in a default
 /// encryption rule.

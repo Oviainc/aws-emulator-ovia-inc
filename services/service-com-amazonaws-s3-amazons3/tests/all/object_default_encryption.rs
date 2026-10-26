@@ -36,7 +36,9 @@
 //! ([`super::bucket_encryption`] for the configuration, [`super::object_encryption`] for
 //! `HeadObject`).
 
-use service_com_amazonaws_s3_amazons3::state::{DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM};
+use service_com_amazonaws_s3_amazons3::state::{
+    DEFAULT_BLOCKED_ENCRYPTION_TYPES, DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM,
+};
 
 use super::bucket_encryption::{as_reported, get_encryption, put_encryption, reported_rules, Rule};
 use super::bucket_lifecycle::{router, Answer};
@@ -283,7 +285,8 @@ async fn a_write_naming_no_encryption_inherits_the_bucket_default_and_every_read
             rules,
             as_reported(&configuration.unwrap_or_else(|| {
                 vec![Rule::by_default(DEFAULT_SSE_ALGORITHM)
-                    .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)]
+                    .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+                    .blocking(&DEFAULT_BLOCKED_ENCRYPTION_TYPES)]
             })),
             "case {case:?}: the write must leave the bucket's reported configuration \
              exactly as it was, got {rules:?}"

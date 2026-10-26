@@ -34,6 +34,7 @@ use super::bucket_lifecycle::{
     create_bucket, get_bucket_policy, policy_of_size, put_bucket_policy, router, send, send_bytes,
     Answer,
 };
+use super::bucket_public_access_block::allow_public_access;
 
 /// `DELETE /<bucket>?policy` — `DeleteBucketPolicy`.
 async fn delete_bucket_policy(router: &MultiServiceRouter, bucket: &str) -> Answer {
@@ -124,6 +125,10 @@ async fn deleting_a_bucket_policy_answers_204_and_leaves_the_bucket_without_one(
             created.status,
             String::from_utf8_lossy(&created.body)
         );
+        // Some of the documents below grant a wildcard principal, which the Block Public
+        // Access configuration every bucket is created with would deny; this suite is about
+        // the DELETE, so the guardrail is lifted first.
+        allow_public_access(&router, bucket).await;
     }
 
     for (bucket, _) in buckets {
@@ -348,6 +353,9 @@ async fn deleting_the_policy_leaves_the_bucket_and_its_objects_alone() {
         created.status,
         String::from_utf8_lossy(&created.body)
     );
+    // The policy below grants a wildcard principal, which the Block Public Access
+    // configuration the bucket was created with would deny; this test is about the DELETE.
+    allow_public_access(&router, bucket).await;
     let attached = put_bucket_policy(
         &router,
         bucket,

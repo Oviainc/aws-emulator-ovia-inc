@@ -48,6 +48,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 use super::bucket_ownership_controls::put_ownership_controls;
+use super::bucket_public_access_block::allow_public_access;
 
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -201,6 +202,10 @@ async fn get_acl(router: &MultiServiceRouter, bucket: &str) -> Answer {
 /// what an ACL write DOES, so each of their buckets is switched to `ObjectWriter`, the
 /// setting under which ACLs affect permissions. The one test that is about the disabled
 /// posture uses the plain create.
+///
+/// Block Public Access is lifted here for the same reason: a bucket is created with all
+/// four switches on, so a PUBLIC canned ACL or grant would be denied by that guardrail
+/// before anything about the ACL write itself could be observed.
 async fn create_bucket_with_acls_enabled(
     router: &MultiServiceRouter,
     bucket: &str,
@@ -215,6 +220,7 @@ async fn create_bucket_with_acls_enabled(
         enabled.status,
         String::from_utf8_lossy(&enabled.body)
     );
+    allow_public_access(router, bucket).await;
     created
 }
 
@@ -961,6 +967,9 @@ async fn a_bucket_whose_object_ownership_disables_acls_refuses_the_put_and_still
         enabled.status,
         String::from_utf8_lossy(&enabled.body)
     );
+    // The bucket was created with every Block Public Access switch on, which would deny
+    // the public canned ACL below for a different reason than the one under test.
+    allow_public_access(&router, bucket).await;
     for canned in ["public-read", "log-delivery-write"] {
         let put = put_acl(&router, bucket, &[("x-amz-acl", canned)], "").await;
         assert_eq!(

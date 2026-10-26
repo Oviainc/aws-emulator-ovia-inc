@@ -38,6 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{
     create_bucket, get_bucket_policy, put_bucket_policy, router, send, Answer,
 };
+use super::bucket_public_access_block::allow_public_access;
 
 /// The XML namespace botocore puts on an S3 request payload.
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -440,6 +441,10 @@ async fn the_policy_status_reports_whether_the_stored_policy_grants_public_acces
         created.status,
         String::from_utf8_lossy(&created.body)
     );
+    // Many of the rows below ARE public documents, which the Block Public Access
+    // configuration every bucket is created with would deny; this test is about the status
+    // the stored document reports.
+    allow_public_access(&router, bucket).await;
 
     for (label, document, expected) in status_rows() {
         let put = put_bucket_policy(&router, bucket, &document).await;
@@ -555,6 +560,10 @@ async fn block_public_access_does_not_change_the_policy_status() {
             created.status,
             String::from_utf8_lossy(&created.body)
         );
+        // One row's document is public, which the configuration the bucket was created with
+        // would deny; the switches are turned back on below, which is what this test is
+        // about.
+        allow_public_access(&router, &bucket).await;
         let put = put_bucket_policy(&router, &bucket, document).await;
         assert_eq!(
             put.status, 204,

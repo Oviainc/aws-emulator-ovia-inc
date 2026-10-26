@@ -177,11 +177,17 @@ fn violation_is_in_request_document(violation: &Violation) -> bool {
 /// fails one in a header, a query parameter or a URI label is `InvalidArgument`, "invalid
 /// argument". Both are HTTP 400, the status the protocol already renders a refusal with.
 ///
-/// `MalformedXML` carries the fixed text its own error-responses entry publishes, because
-/// that is what S3 sends however the document failed to validate. `InvalidArgument` keeps
-/// the clause the validator built from the request — which member, and the constraint it
-/// broke — since that is the only thing that says which argument was rejected.
+/// A field S3 PUBLISHES its own refusal for is answered with that refusal (see
+/// [`published_refusal`]) ahead of either, because the published wording is the contract
+/// for that field. Otherwise `MalformedXML` carries the fixed text its own error-responses
+/// entry publishes, because that is what S3 sends however the document failed to validate,
+/// and `InvalidArgument` keeps the clause the validator built from the request — which
+/// member, and the constraint it broke — since that is the only thing left that says which
+/// argument was rejected.
 fn s3_refusal(violation: &Violation) -> Refused {
+    if let Some(published) = published_refusal(violation) {
+        return published;
+    }
     if violation_is_in_request_document(violation) {
         return Refused {
             code: crate::state::MALFORMED_XML_CODE.to_string(),
@@ -192,6 +198,81 @@ fn s3_refusal(violation: &Violation) -> Refused {
         code: crate::state::INVALID_ARGUMENT_CODE.to_string(),
         message: violation.message(),
     }
+}
+
+/// The refusal S3 publishes for the request field `violation` names, or `None` for a field
+/// it publishes none for.
+///
+/// S3 does not report a refused value by naming the Smithy member path it travelled on: for
+/// each of these fields it publishes ONE sentence of its own, which a runbook and a
+/// message-matching client key on. The path's FIRST segment is the input member the value
+/// arrived on, so that is what the sentence is chosen by; everything the sentence does
+/// interpolate comes from the request.
+///
+/// Each row's source is the AWS S3 API reference for the operation that binds the field —
+/// `CopyObject`'s two directive headers, `GetObjectAttributes`'
+/// `x-amz-object-attributes`, `CreateBucket`'s `x-amz-object-ownership`, `ListBuckets`'
+/// `max-buckets`, and `UpdateObjectEncryption`'s `ObjectEncryption` payload, whose
+/// `InvalidRequest` messages that operation's own `@documentation` lists
+/// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`).
+fn published_refusal(violation: &Violation) -> Option<Refused> {
+    let mut segments = violation.path.split('.');
+    let member = segments.next()?;
+    let rejected = violation.value.as_deref().unwrap_or_default();
+    let (code, message) = match member {
+        // The two `CopyObject` directives, each an enum over [COPY, REPLACE].
+        "taggingDirective" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            "Unknown tagging directive.".to_string(),
+        ),
+        "metadataDirective" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            "Unknown metadata directive.".to_string(),
+        ),
+        // `GetObjectAttributes` names the attribute that is not one, whichever element of
+        // the header's list carried it.
+        "objectAttributes" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            "Invalid attribute name specified.".to_string(),
+        ),
+        // `CreateBucket` echoes the header value it did not recognise.
+        "objectOwnership" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            format!("Invalid x-amz-object-ownership header: {rejected}"),
+        ),
+        // `ListBuckets` states the bound rather than the value: the range is
+        // `MaxBuckets`' own (`min 1`, `max 10000`).
+        "maxBuckets" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            "Argument max-buckets must be an integer between 1 and 10000".to_string(),
+        ),
+        // `UpdateObjectEncryption`'s payload: a KMS key ARN that is not one is an
+        // `InvalidRequest` naming the requirement and then WHY the value does not meet it,
+        // the way S3 quotes an ARN parser's own diagnostic
+        // ([`crate::state::malformed_arn_reason`]); anything else about the container is
+        // the `InvalidRequest` that operation publishes for a payload that names no usable
+        // encryption type.
+        "objectEncryption" => {
+            let message = if segments.any(|segment| segment == "kMSKeyArn") {
+                format!(
+                    "Requests modifying object encryption configuration to SSE-KMS require a \
+                     valid target kms key arn: {}",
+                    crate::state::malformed_arn_reason(rejected)
+                )
+            } else {
+                "Requests that modify an object encryption configuration require a valid \
+                 new encryption type. Valid values are SSEKMS. Modify the request to \
+                 specify SSE-KMS for the updated encryption type, and then try again."
+                    .to_string()
+            };
+            (crate::state::INVALID_REQUEST_CODE, message)
+        }
+        _ => return None,
+    };
+    Some(Refused {
+        code: code.to_string(),
+        message,
+    })
 }
 
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus

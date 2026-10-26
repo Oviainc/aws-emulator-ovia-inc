@@ -90,6 +90,34 @@ fn tagging_payload(tags: &[(&str, &str)]) -> String {
     )
 }
 
+/// Turn every Block Public Access switch on `bucket` OFF.
+///
+/// Every bucket is created with all four ON, and the documents below grant a WILDCARD
+/// principal, so the `BlockPublicPolicy` guardrail would deny them before anything about
+/// the policy subresource itself could be observed — exactly as it would against real S3.
+async fn allow_public_access(router: &MultiServiceRouter, bucket: &str) {
+    let payload = "<PublicAccessBlockConfiguration \
+                   xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                   <BlockPublicAcls>false</BlockPublicAcls>\
+                   <IgnorePublicAcls>false</IgnorePublicAcls>\
+                   <BlockPublicPolicy>false</BlockPublicPolicy>\
+                   <RestrictPublicBuckets>false</RestrictPublicBuckets>\
+                   </PublicAccessBlockConfiguration>";
+    let answer = send(
+        router,
+        "PUT",
+        &format!("/{bucket}?publicAccessBlock"),
+        payload,
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "the bucket {bucket:?} must take the configuration that lifts Block Public Access, \
+         got {} with body {}",
+        answer.status, answer.body
+    );
+}
+
 /// A policy document granting `action` on `resource` to everyone.
 fn policy(action: &str, resource: &str) -> String {
     serde_json::json!({
@@ -114,6 +142,7 @@ async fn a_bucket_policy_round_trips_and_a_malformed_one_is_refused() {
         "the bucket must be created, got {} with body {}",
         created.status, created.body
     );
+    allow_public_access(&router, bucket).await;
 
     // Before any put, the bucket exists but carries no policy — a different state from
     // "no such bucket", and its own code.
@@ -238,6 +267,7 @@ async fn a_bucket_policy_past_the_published_size_limit_is_refused() {
         200,
         "the bucket must be created"
     );
+    allow_public_access(&router, bucket).await;
 
     // One row at the published ceiling and one past it. The ceiling is
     // `state::MAX_BUCKET_POLICY_BYTES` (20 KB), S3's published bucket-policy limit; the

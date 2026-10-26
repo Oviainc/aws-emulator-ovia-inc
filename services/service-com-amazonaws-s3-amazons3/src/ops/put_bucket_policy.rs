@@ -291,10 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Block Public Access: with `BlockPublicPolicy` on, S3 "causes Amazon S3 to reject
         // calls to PUT Bucket policy if the specified bucket policy allows public access"
         // (`PublicAccessBlockConfiguration$BlockPublicPolicy`). The refusal is
-        // `AccessDenied` — the guardrail denies the call — and the policy the bucket
-        // already carries is left untouched, so a re-put of a policy that was accepted
-        // before the switch went on is refused too. Whether a policy allows public access
-        // is the same classification `GetBucketPolicyStatus` reports.
+        // `AccessDenied` — the guardrail denies the call, naming the principal, the action,
+        // the resource and the setting that prevented it, the way the ACL half of the same
+        // guardrail words it — and the policy the bucket already carries is left untouched,
+        // so a re-put of a policy that was accepted before the switch went on is refused
+        // too. Whether a policy allows public access is the same classification
+        // `GetBucketPolicyStatus` reports.
         if bucket
             .public_access_block()
             .is_some_and(|settings| settings.block_public_policy)
@@ -303,7 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
-                ACCESS_DENIED_MESSAGE,
+                crate::state::block_public_policy_denial(
+                    PUT_BUCKET_POLICY_ACTION,
+                    &crate::state::bucket_arn(&input.bucket),
+                ),
             ));
         }
 
@@ -315,10 +320,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The code S3 answers a call its Block Public Access configuration denies with, and the
-/// status and message its error-responses list carries for it — the wording the sibling
-/// ACL write states the same refusal in.
+/// status its error-responses list carries for it — the pair the sibling ACL write states
+/// the same refusal in. The MESSAGE is built per call by
+/// [`crate::state::block_public_policy_denial`], because it names the caller, the action
+/// and the resource the request addressed.
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_STATUS: u16 = 403;
-/// See [`ACCESS_DENIED_CODE`].
-const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The IAM action this operation is authorized by, which its refusal names.
+const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";

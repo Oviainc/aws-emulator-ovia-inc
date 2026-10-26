@@ -50,6 +50,20 @@
 //! (`smithy_query(query="shape",shape="TargetGrant")`), so both normalizations are keyed on
 //! the DOCUMENT — a request whose body is an XML document, a response whose body spells the
 //! attribute — and never on which operation is being served.
+//!
+//! ## `@xmlName` on a UNION member: an element the codec does not match
+//!
+//! The same protocol carries one more thing the framework's generic XML codec cannot
+//! express. A union's set member is read from the child element whose local name is the
+//! member's own SMITHY name, so a union member carrying an `@xmlName` arrives under a name
+//! that matches nothing and the union deserializes as "no member set" — a request every S3
+//! client sends correctly, refused for a member it did set.
+//! `UpdateObjectEncryption`'s payload is the one such document in this service:
+//! `smithy_query(query="shape",shape="ObjectEncryption")` reports its single member
+//! `SSEKMS` with `xmlName: "SSE-KMS"`. [`XML_NAMED_UNION_MEMBERS`] is the one place that
+//! mapping lives, and [`published_names_as_members`] normalizes an incoming document onto
+//! the member name the codec binds. Nothing is normalized on the way OUT: no operation in
+//! this service answers a union.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -486,6 +500,111 @@ fn write_text_element(writer: &mut Writer<Vec<u8>>, name: &str, text: &[u8]) -> 
     Some(())
 }
 
+/// One UNION member whose element the API publishes under a name the framework's XML codec
+/// does not match it by.
+///
+/// The codec reads a union's set member from the child element whose local name is the
+/// member's own SMITHY name; a union member carrying an `@xmlName` therefore arrives under
+/// a name that matches nothing, and the union deserializes as "no member set". The
+/// published name is what every S3 client sends, so an incoming document is normalized onto
+/// the name the codec binds — the same normalization [`XML_ATTRIBUTE_MEMBERS`] does for a
+/// member that travels as an attribute, and for the same reason.
+#[derive(Debug, Clone, Copy)]
+pub struct XmlNamedUnionMember {
+    /// The element the API publishes (`ObjectEncryption$SSEKMS`'s `@xmlName`, `SSE-KMS`).
+    pub published: &'static str,
+    /// The member's own Smithy name, which is the element the codec binds it from
+    /// (`SSEKMS`).
+    pub member: &'static str,
+}
+
+/// Every union member of this service's model whose `@xmlName` differs from its member
+/// name.
+///
+/// One row today — `ObjectEncryption$SSEKMS`
+/// (`smithy_query(query="shape",shape="ObjectEncryption")` reports
+/// `SSEKMS: {xmlName: "SSE-KMS"}`) — and the normalization below is written over the TABLE
+/// rather than over that row. `tests/all/object_encryption_update.rs` re-derives the set
+/// from the model, so a model update that names another one cannot quietly go unmatched.
+pub const XML_NAMED_UNION_MEMBERS: &[XmlNamedUnionMember] = &[XmlNamedUnionMember {
+    published: "SSE-KMS",
+    member: "SSEKMS",
+}];
+
+/// The union member the API publishes under the element named `element`, if any.
+fn union_member_by_published_name(element: &[u8]) -> Option<&'static XmlNamedUnionMember> {
+    XML_NAMED_UNION_MEMBERS
+        .iter()
+        .find(|member| member.published.as_bytes() == element)
+}
+
+/// `document` with every published union-member element renamed to the member name the
+/// codec binds, or `None` when it carries none.
+///
+/// Only the element NAME changes: its attributes, its children and their text are written
+/// back exactly as they arrived.
+fn published_names_as_members(document: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = Reader::from_reader(document);
+    reader.config_mut().trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut renamed = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(start)) => match union_member_by_published_name(start.name().as_ref()) {
+                Some(member) => {
+                    renamed = true;
+                    writer
+                        .write_event(Event::Start(renamed_start(&start, member.member)))
+                        .ok()?;
+                }
+                None => {
+                    writer.write_event(Event::Start(start)).ok()?;
+                }
+            },
+            Ok(Event::Empty(empty)) => match union_member_by_published_name(empty.name().as_ref()) {
+                Some(member) => {
+                    renamed = true;
+                    writer
+                        .write_event(Event::Empty(renamed_start(&empty, member.member)))
+                        .ok()?;
+                }
+                None => {
+                    writer.write_event(Event::Empty(empty)).ok()?;
+                }
+            },
+            Ok(Event::End(end)) => match union_member_by_published_name(end.name().as_ref()) {
+                Some(member) => {
+                    renamed = true;
+                    writer
+                        .write_event(Event::End(BytesEnd::new(member.member)))
+                        .ok()?;
+                }
+                None => {
+                    writer.write_event(Event::End(end)).ok()?;
+                }
+            },
+            Ok(other) => {
+                writer.write_event(other).ok()?;
+            }
+            // A document the XML reader cannot walk is left for the framework's own
+            // parser to refuse, so the refusal a client sees is the framework's.
+            Err(_) => return None,
+        }
+    }
+    renamed.then(|| writer.into_inner())
+}
+
+/// `start` under the element name `name`, carrying its attributes verbatim —
+/// `push_attribute` copies an `Attribute`'s raw value unchanged, so nothing is re-escaped.
+fn renamed_start(start: &BytesStart<'_>, name: &'static str) -> BytesStart<'static> {
+    let mut renamed = BytesStart::new(name).into_owned();
+    for attribute in start.attributes().flatten() {
+        renamed.push_attribute(attribute);
+    }
+    renamed
+}
+
 /// `document` with every `@xmlAttribute` member moved out of its own element and onto its
 /// parent's start tag, with the namespace its prefix needs declared there, or `None` when
 /// it carries none.
@@ -742,34 +861,47 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         if let Some(violation) = xml_charset_violation(request, input_schema) {
             return Err(ProtocolError::Invalid(vec![violation]));
         }
-        // Only a request whose BODY IS AN XML DOCUMENT can carry a member that travels as
-        // an XML attribute, and only a body that actually spells one needs normalizing;
-        // everything else — every request whose body is not a document, and every document
-        // whose grantee is already spelled as an element — is the framework's own path,
-        // byte for byte.
+        // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
+        // codec cannot bind as the document spells it, and only a body that actually
+        // spells one needs normalizing; everything else — every request whose body is not
+        // a document, and every document whose members are already spelled the way the
+        // codec binds them — is the framework's own path, byte for byte.
         if carries_xml_document_payload(input_schema) {
             let body = request
                 .body()
                 .bytes()
                 .ok_or_else(|| ProtocolError::BodyRead("body is not available as bytes".into()))?;
+            // Two normalizations, each applied only to a document that calls for it, and
+            // the second over the result of the first so a document needing both is served.
+            let mut normalized: Option<Vec<u8>> = None;
             if XML_ATTRIBUTE_MEMBERS
                 .iter()
                 .any(|member| holds(body, format!("{}=", member.attribute).as_bytes()))
             {
-                if let Some(document) = attributes_as_elements(body) {
-                    let uri = request.uri();
-                    let binding = HttpBindingDeserializer::new(
-                        input_schema.http().map(|http| http.uri()),
-                        request_path(uri),
-                        request_query(uri),
-                        request_headers(request),
-                        OwnedXmlBody {
-                            document: document.clone(),
-                        },
-                    )
-                    .with_payload_bytes(document);
-                    return Ok(Box::new(binding));
+                normalized = attributes_as_elements(body);
+            }
+            let current: &[u8] = normalized.as_deref().unwrap_or(body);
+            if XML_NAMED_UNION_MEMBERS
+                .iter()
+                .any(|member| holds(current, format!("<{}", member.published).as_bytes()))
+            {
+                if let Some(document) = published_names_as_members(current) {
+                    normalized = Some(document);
                 }
+            }
+            if let Some(document) = normalized {
+                let uri = request.uri();
+                let binding = HttpBindingDeserializer::new(
+                    input_schema.http().map(|http| http.uri()),
+                    request_path(uri),
+                    request_query(uri),
+                    request_headers(request),
+                    OwnedXmlBody {
+                        document: document.clone(),
+                    },
+                )
+                .with_payload_bytes(document);
+                return Ok(Box::new(binding));
             }
         }
         self.inner.deserialize_input(request, input_schema)

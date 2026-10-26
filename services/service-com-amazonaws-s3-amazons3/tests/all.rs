@@ -107,6 +107,8 @@ mod object_and_policy;
 mod object_and_tagging_roundtrip;
 #[path = "all/object_annotations.rs"]
 mod object_annotations;
+#[path = "all/object_attributes.rs"]
+mod object_attributes;
 #[path = "all/object_batch_deletion.rs"]
 mod object_batch_deletion;
 #[path = "all/object_copy.rs"]
@@ -117,6 +119,8 @@ mod object_content_type;
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
 mod object_encryption;
+#[path = "all/object_encryption_update.rs"]
+mod object_encryption_update;
 #[path = "all/object_legal_hold.rs"]
 mod object_legal_hold;
 #[path = "all/object_listing_and_deletion.rs"]
@@ -145,9 +149,15 @@ mod object_write_and_read_back;
 mod object_write_tagging_header;
 #[path = "all/objects.rs"]
 mod objects;
+#[path = "all/public_access_block_default.rs"]
+mod public_access_block_default;
 #[path = "all/public_access_guardrails.rs"]
 mod public_access_guardrails;
 #[path = "all/refusal_codes.rs"]
 mod refusal_codes;
+#[path = "all/refusal_messages_published.rs"]
+mod refusal_messages_published;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_id_classification.rs"]
+mod version_id_classification;

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateObjectEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateObjectEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateObjectEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-records the server-side encryption configuration of an object this emulator holds,
+//! leaving everything else about it — its bytes, its metadata and its storage class —
+//! exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -151,17 +145,23 @@ use super::types::*;
 // `UpdateObjectEncryptionError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UpdateObjectEncryptionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#UpdateObjectEncryption")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// `#[operation_error]` accepts only variants the model declares for this operation, so the
+// scaffold's `NotImplemented` cannot live here — hence the `UpdateObjectEncryptionError`
+// alias below. `Bucket` is an @httpLabel, so a request can name a bucket that does not
+// exist and AWS answers the service-wide `NoSuchBucket` (`httpError 404`), the shape every
+// other bucket-scoped operation in this crate widens in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#UpdateObjectEncryption",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum UpdateObjectEncryptionErrorModeled {
     AccessDenied(AccessDenied),
     InvalidRequest(InvalidRequest),
     NoSuchKey(NoSuchKey),
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -215,18 +215,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateObjectEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateObjectEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateObjectEncryption"))
+        // The write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // doesn't match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`UpdateObjectEncryptionRequest$ExpectedBucketOwner`). This emulator serves one
+        // account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(access_denied(ACCESS_DENIED_MESSAGE));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // A `versionId` that is not shaped like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version — judged by the one
+        // shared rule every operation that takes a `versionId` uses.
+        let version_id = input.version_id.as_deref();
+        if version_id
+            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::INVALID_VERSION_ID_MESSAGE,
+            ));
+        }
+
+        // The ENCRYPTION the request asks for, and the object it asks for it on, are both
+        // resolved before anything is written: the address comes first, because what the
+        // call can say about the request's own members depends on the object it names.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(UpdateObjectEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.addressed_object(&input.key, version_id) else {
+            return Err(no_such_object(version_id));
+        };
+
+        // "The encryption type for the specified object can't be updated because that
+        // object is protected by S3 Object Lock. If the object has a governance-mode
+        // retention period or a legal hold, you must first remove the Object Lock status on
+        // the object before you issue your UpdateObjectEncryption request" (this
+        // operation's own list of `AccessDenied` messages).
+        let locked = object.legal_hold == Some(true)
+            || object
+                .retention
+                .as_ref()
+                .is_some_and(|retention| retention.in_force_at(::std::time::SystemTime::now()));
+        if locked {
+            return Err(access_denied(OBJECT_LOCK_DENIAL_MESSAGE));
+        }
+
+        // "Source objects that are unencrypted, or encrypted with either dual-layer
+        // server-side encryption with KMS keys (DSSE-KMS) or server-side encryption with
+        // customer-provided keys (SSE-C) aren't supported by this operation" — each with
+        // its own published sentence.
+        match object.encryption.sse_algorithm.as_deref() {
+            None => return Err(invalid_request(UNENCRYPTED_SOURCE_MESSAGE)),
+            Some(algorithm) if UNSUPPORTED_SOURCE_ALGORITHMS.contains(&algorithm) => {
+                return Err(invalid_request(UNSUPPORTED_SOURCE_MESSAGE))
+            }
+            Some(_) => {}
+        }
+
+        // The ONE encryption type this operation's payload can name: `ObjectEncryption` is
+        // a union whose only member is `SSEKMS`
+        // (`smithy_query(query="shape",shape="ObjectEncryption")`), which carries the KMS
+        // key ARN the object is re-encrypted under and, optionally, the S3 Bucket Key
+        // setting to apply with it.
+        let ObjectEncryption::Ssekms(requested) = &input.object_encryption;
+        let updated = crate::state::ObjectEncryption {
+            sse_algorithm: Some(crate::state::KMS_SSE_ALGORITHMS[0].to_string()),
+            kms_key_id: Some(requested.kms_key_arn.clone()),
+            // The request names no encryption context, and the configuration is replaced
+            // in full, so the object carries none afterwards.
+            kms_encryption_context: None,
+            bucket_key_enabled: requested.bucket_key_enabled,
+        };
+
+        match store.replace_object_encryption(&input.bucket, &input.key, version_id, updated) {
+            Some(crate::state::ObjectEncryptionWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => {
+                return Err(UpdateObjectEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
+            }
+            Some(crate::state::ObjectEncryptionWrite::NoSuchObject) => {
+                return Err(no_such_object(version_id))
+            }
+            // The emulator's own ceilings, not AWS limits (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 refusal channel, the same channel
+            // `PutObjectRetention` uses for the same two budgets.
+            Some(crate::state::ObjectEncryptionWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the encryption configuration on {:?} would leave the bucket {:?} \
+                     holding {would_hold} bytes of objects, past the {} bytes this emulator \
+                     keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectEncryptionWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the encryption configuration on {:?} would leave this emulator holding \
+                     {would_hold} bytes of objects across every bucket, past the {} bytes it \
+                     keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(UpdateObjectEncryptionOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`UpdateObjectEncryptionResponse$RequestCharged`) — Requester Pays
+            // is not emulated, so nobody was charged and nothing is reported.
+            request_charged: None,
+        })
     }
 }
+
+/// The 404 for an address whose bucket this emulator holds but whose object this operation
+/// cannot find: the version the request NAMED is missing (`NoSuchVersion`), or the key has
+/// no current object (`NoSuchKey`, the shape this operation models) — which is also the
+/// case where the key's current version is a delete marker.
+fn no_such_object(version_id: Option<&str>) -> UpdateObjectEncryptionError {
+    match version_id {
+        Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::NO_SUCH_VERSION_CODE,
+            NOT_FOUND_STATUS,
+            crate::state::NO_SUCH_VERSION_MESSAGE,
+        ),
+        None => UpdateObjectEncryptionErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+    }
+}
+
+/// An `AccessDenied` (403) carrying `message`.
+///
+/// Through the unmodelled channel rather than the modeled shape: `AccessDenied` declares no
+/// `message` member, so a modeled one would go out with the error code's generic sentence
+/// instead of the one this operation publishes for the reason it denied the call.
+fn access_denied(message: &'static str) -> UpdateObjectEncryptionError {
+    crate::scaffolded::Scaffolded::unmodeled(ACCESS_DENIED_CODE, ACCESS_DENIED_STATUS, message)
+}
+
+/// An `InvalidRequest` (400) carrying `message`, through the unmodelled channel for the
+/// reason [`access_denied`] is.
+fn invalid_request(message: &'static str) -> UpdateObjectEncryptionError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_REQUEST_CODE,
+        crate::state::INVALID_REQUEST_STATUS,
+        message,
+    )
+}
+
+/// The wire error code and status this operation's model declares for the refusal it words
+/// itself (`smithy_query(query="operation",operation="UpdateObjectEncryption")`:
+/// `AccessDenied` with `httpError 403`), and the text S3 "Error responses" publishes for
+/// that code where this operation publishes no sentence of its own.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+/// The status `NoSuchVersion` is rendered with, the one `NoSuchKey` carries in the model.
+const NOT_FOUND_STATUS: u16 = 404;
+
+/// The `ServerSideEncryption` values a SOURCE object this operation will not re-encrypt is
+/// stored under: dual-layer SSE-KMS, and the customer-key encryption whose value the
+/// algorithm enum spells the same way `PutObject`'s header does.
+///
+/// "Only source objects encrypted with SSE-S3 or SSE-KMS are supported" (this operation's
+/// documentation), so everything else the `ServerSideEncryption` enum publishes is here.
+const UNSUPPORTED_SOURCE_ALGORITHMS: [&str; 2] = ["aws:kms:dsse", "SSE-C"];
+
+/// The `InvalidRequest` sentence for a source object that carries no encryption at all,
+/// verbatim from this operation's own list of them.
+const UNENCRYPTED_SOURCE_MESSAGE: &str =
+    "The UpdateObjectEncryption operation doesn't supported unencrypted source objects. Only \
+     source objects encrypted with SSE-S3 or SSE-KMS are supported.";
+
+/// The `InvalidRequest` sentence for a source object encrypted with an unsupported type,
+/// from the same list.
+const UNSUPPORTED_SOURCE_MESSAGE: &str =
+    "The UpdateObjectEncryption operation doesn't support source objects with the encryption \
+     type DSSE-KMS or SSE-C. Only source objects encrypted with SSE-S3 or SSE-KMS are \
+     supported.";
+
+/// The `AccessDenied` sentence for an object S3 Object Lock protects, from this operation's
+/// own list of them.
+const OBJECT_LOCK_DENIAL_MESSAGE: &str =
+    "The encryption type for the specified object can’t be updated because that object is \
+     protected by S3 Object Lock. If the object has a governance-mode retention period or a \
+     legal hold, you must first remove the Object Lock status on the object before you issue \
+     your UpdateObjectEncryption request. You can't use the UpdateObjectEncryption operation \
+     with objects that have an Object Lock compliance mode retention period applied to them.";

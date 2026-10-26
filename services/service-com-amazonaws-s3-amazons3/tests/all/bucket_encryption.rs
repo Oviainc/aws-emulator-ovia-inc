@@ -18,9 +18,11 @@
 //!   with every member the request named and no member it did not.
 //! * "By default, all buckets have a default encryption configuration that uses
 //!   server-side encryption with Amazon S3 managed keys (SSE-S3)"
-//!   (`GetBucketEncryption`'s documentation) and "General purpose buckets - By default, S3
-//!   Bucket Key is not enabled" (`ServerSideEncryptionRule$BucketKeyEnabled`): a bucket no
-//!   put has configured reports one `AES256` rule with the Bucket Key off.
+//!   (`GetBucketEncryption`'s documentation), "General purpose buckets - By default, S3
+//!   Bucket Key is not enabled" (`ServerSideEncryptionRule$BucketKeyEnabled`), and a
+//!   general purpose bucket blocks the customer-key encryption type
+//!   (`…$BlockedEncryptionTypes`): a bucket no put has configured reports one `AES256` rule
+//!   with the Bucket Key off and that type blocked.
 //! * "This parameter is allowed if and only if `SSEAlgorithm` is set to `aws:kms` or
 //!   `aws:kms:dsse`" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`): a rule naming a
 //!   KMS key beside any other algorithm is refused with `InvalidArgument` (HTTP 400).
@@ -32,7 +34,8 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::state::{
-    DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM, MAX_SERVER_SIDE_ENCRYPTION_RULES,
+    DEFAULT_BLOCKED_ENCRYPTION_TYPES, DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM,
+    MAX_SERVER_SIDE_ENCRYPTION_RULES, SSE_C_ENCRYPTION_TYPE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -106,12 +109,22 @@ impl Rule {
     /// `BucketKeyEnabled` is a switch with a documented off state ("General purpose
     /// buckets - By default, S3 Bucket Key is not enabled",
     /// `ServerSideEncryptionRule$BucketKeyEnabled`), so a rule stored without it is
-    /// reported with it OFF rather than with the member dropped. Every round-trip
-    /// assertion compares against this form, so what is pinned is the configuration a
-    /// reader sees rather than the bytes a writer sent.
+    /// reported with it OFF rather than with the member dropped. `BlockedEncryptionTypes`
+    /// is a bucket-level SETTING with a default of its own, which a rule that says nothing
+    /// about it does not turn off, so such a rule is reported with the default blocked set.
+    /// Every round-trip assertion compares against this form, so what is pinned is the
+    /// configuration a reader sees rather than the bytes a writer sent.
     pub(crate) fn as_reported(&self) -> Self {
         Self {
             bucket_key_enabled: Some(self.bucket_key_enabled.unwrap_or(false)),
+            blocked_encryption_types: Some(
+                self.blocked_encryption_types.clone().unwrap_or_else(|| {
+                    DEFAULT_BLOCKED_ENCRYPTION_TYPES
+                        .iter()
+                        .map(|blocked| (*blocked).to_string())
+                        .collect()
+                }),
+            ),
             ..self.clone()
         }
     }
@@ -240,9 +253,29 @@ pub(crate) fn reported_rules(answer: &Answer) -> Vec<Rule> {
     rules
 }
 
-/// The one rule a bucket no `PutBucketEncryption` has configured reports.
+/// The one rule a bucket no `PutBucketEncryption` has configured reports: the SSE-S3
+/// default with the Bucket Key off and the published encryption type blocked.
 fn default_rule() -> Rule {
-    Rule::by_default(DEFAULT_SSE_ALGORITHM).with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+    Rule::by_default(DEFAULT_SSE_ALGORITHM)
+        .with_bucket_key(DEFAULT_BUCKET_KEY_ENABLED)
+        .blocking(&DEFAULT_BLOCKED_ENCRYPTION_TYPES)
+}
+
+#[test]
+fn the_blocked_encryption_type_is_one_the_model_publishes() {
+    // The default this emulator reports names an `EncryptionType` value, so it has to be
+    // one of the values the enum publishes — re-derived from that list rather than trusted.
+    assert!(
+        ENCRYPTION_TYPE_VALUES.contains(&SSE_C_ENCRYPTION_TYPE),
+        "the blocked encryption type must be one of {ENCRYPTION_TYPE_VALUES:?}, got \
+         {SSE_C_ENCRYPTION_TYPE:?}"
+    );
+    assert_eq!(
+        DEFAULT_BLOCKED_ENCRYPTION_TYPES.as_slice(),
+        [SSE_C_ENCRYPTION_TYPE],
+        "a new bucket blocks exactly the customer-key encryption type, got {:?}",
+        DEFAULT_BLOCKED_ENCRYPTION_TYPES
+    );
 }
 
 /// The table of configurations every row of which must round-trip unchanged.
@@ -397,7 +430,7 @@ async fn putting_an_encryption_configuration_stores_it_and_reads_back_through_ge
         let replaced = get_encryption(&router, &bucket).await;
         assert_eq!(
             reported_rules(&replaced),
-            replacement,
+            as_reported(&replacement),
             "case {case:?}: the configuration must be replaced, not merged, got {:?}",
             reported_rules(&replaced)
         );
@@ -749,7 +782,7 @@ async fn an_expected_bucket_owner_that_is_not_the_account_is_access_denied() {
         let unchanged = get_encryption(&router, bucket).await;
         assert_eq!(
             reported_rules(&unchanged),
-            stored,
+            as_reported(&stored),
             "case {expected:?}: a refused put must leave the stored configuration \
              untouched, got {:?}",
             reported_rules(&unchanged)

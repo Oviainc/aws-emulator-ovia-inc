@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPublicAccessBlock
-//! Reports the `PublicAccessBlockConfiguration` `PutPublicAccessBlock` stored on the
-//! bucket, and the documented not-found when the bucket carries none.
+//! Reports the `PublicAccessBlockConfiguration` in force on the bucket — the one
+//! `PutPublicAccessBlock` stored, or the all-on configuration the bucket was created with
+//! — and the documented not-found once `DeletePublicAccessBlock` has withdrawn it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,7 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // AWS answers a bucket with no Block Public Access configuration with the code
             // below and HTTP 404 — the same subresource-not-there shape
             // `GetBucketOwnershipControls` answers — which the model declares no shape
-            // for, so it goes out through the unmodelled channel.
+            // for, so it goes out through the unmodelled channel. A bucket reaches that
+            // state only through `DeletePublicAccessBlock`: a bucket this emulator created
+            // comes into being with every switch on
+            // (`crate::state::BucketPublicAccessBlock::all_enabled`), so this is not the
+            // answer a never-configured bucket gets.
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE,
                 NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_STATUS,

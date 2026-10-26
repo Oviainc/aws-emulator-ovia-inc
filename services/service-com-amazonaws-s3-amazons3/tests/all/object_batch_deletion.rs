@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::state::VERSION_ID_CHARS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, Answer};
@@ -360,13 +361,12 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     for (key, marker_id) in &marker_ids {
         named.push((key.clone(), Some(marker_id.clone())));
     }
-    // A WELL-FORMED id this store never minted: 32 characters of the URL-safe Base64
-    // alphabet, so it is shaped like a version id and names no stored version — which is
-    // `NoSuchVersion`, where an id that is not shaped like one at all is a malformed
-    // argument.
+    // A WELL-FORMED id this store never minted: a token of the published shape, so it is
+    // shaped like a version id and names no stored version — which is `NoSuchVersion`,
+    // where an id that is not shaped like one at all is a malformed argument.
     named.push((
         "one".to_string(),
-        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+        Some("a".repeat(VERSION_ID_CHARS)),
     ));
     named.push(("one".to_string(), Some("not-a-version".to_string())));
     let borrowed: Vec<Identifier> = named
