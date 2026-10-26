@@ -8,6 +8,12 @@
 //! two optional switches the call carries are recorded as that operation's
 //! `Properties`.
 //!
+//! `IncludeEc2InstanceShutdown` is one of those switches and it also ACTS: set to true,
+//! the Amazon EC2 instances the registration associated with the application are stopped
+//! through the service that owns them
+//! ([`crate::state::ec2_shutdown::stop_instances`]), so the shutdown is observable where
+//! an instance's state lives.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -153,91 +159,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StopApplicationErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
-        let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
-        state.settle(now);
+        // Everything this service's own store has to do is done here, with the guard held
+        // for exactly that long: the EC2 hop below is awaited, and this lock is never held
+        // across a call to another service.
+        let (operation_id, instances_to_shut_down) = record_stop(&state, input, &region, now)?;
 
-        if let Some(entity) = input.stop_connected_entity.as_deref() {
-            // `StopConnectedEntity` is an enum in the model, so the boundary validator
-            // has already refused anything outside it; this re-states the refusal
-            // against the model's own catalogue.
-            if !CONNECTED_ENTITY_TYPE_VALUES.contains(&entity) {
-                return Err(StopApplicationErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "StopConnectedEntity must be one of {}, but was {entity}",
-                        CONNECTED_ENTITY_TYPE_VALUES.join(", ")
-                    )),
-                )
-                .into());
-            }
-        }
-
-        let Some(mut application) = state
-            .region(&region)
-            .applications
-            .get(&input.application_id)
-            .cloned()
-        else {
-            return Err(StopApplicationErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::application_not_found_message(
-                    &input.application_id,
-                )),
-            )
-            .into());
-        };
-
-        // A change the clock still owes this application is an operation already under
-        // way on it, which is what `ConflictException` reports.
-        if application.pending.is_some() {
-            return Err(StopApplicationErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Application {} is {} and cannot be stopped until that completes",
-                    application.id, application.status
-                )),
-            )
-            .into());
-        }
-
-        application.status = crate::state::APPLICATION_STATUS_STOPPING.to_string();
-        application.last_updated = now;
-        application.pending = Some(crate::state::PendingTransition {
-            due_at: now + crate::state::TRANSITION_SPAN,
-            change: crate::state::PendingChange::Status {
-                status: crate::state::APPLICATION_STATUS_STOPPED.to_string(),
-                // Stopping an application does not re-run discovery, so the discovery
-                // status it already reached is the one it keeps.
-                discovery_status: application.discovery_status.clone(),
-            },
-        });
-
-        // The operation's `Properties` are the parameters of the call that filed it, so
-        // a client reading the record back learns how the stop was asked for.
-        let mut properties = ::std::collections::HashMap::new();
-        if let Some(entity) = input.stop_connected_entity {
-            properties.insert("StopConnectedEntity".to_string(), entity);
-        }
-        if let Some(shutdown) = input.include_ec2_instance_shutdown {
-            properties.insert(
-                "IncludeEc2InstanceShutdown".to_string(),
-                shutdown.to_string(),
-            );
-        }
-
-        // The application was just found in this Region, so reaching for the partition
-        // to write mints nothing.
-        let region_state = state.region_entry(&region);
-        let operation_id = region_state.record_operation(
-            crate::state::OPERATION_TYPE_STOP_APPLICATION,
-            &application,
-            properties,
-            now,
-        );
-        region_state
-            .applications
-            .insert(input.application_id, application);
+        // EC2 moves each instance to `stopping` now and to `stopped` on its own clock,
+        // the way a client calling `StopInstances` would see it. The application's own
+        // stop stands whatever EC2 answers (see
+        // [`crate::state::ec2_shutdown::stop_instances`]): this service holds no instance
+        // state to move on its own.
+        crate::state::ec2_shutdown::stop_instances(ctx, &region, &instances_to_shut_down).await;
 
         Ok(StopApplicationOutput {
             operation_id: Some(operation_id),
         })
     }
+}
+
+/// File the stop in this service's own store: the application takes `STOPPING` now and the
+/// `STOPPED` the clock then owes it, and the `STOP_APPLICATION` record the call answers
+/// with is persisted. Answers that record's id and the Amazon EC2 instances the call asked
+/// to have shut down — empty unless `IncludeEc2InstanceShutdown` is set to true.
+///
+/// SYNCHRONOUS, and separate from `handle` for that reason: the store guard lives for
+/// exactly these writes, so the handler can await the hop into EC2 with no lock held.
+fn record_stop(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsSsmsapSsmsapState>,
+    input: StopApplicationInput,
+    region: &str,
+    now: ::std::time::SystemTime,
+) -> Result<(String, Vec<String>), StopApplicationError> {
+    let mut state = state.lock();
+    state.settle(now);
+
+    if let Some(entity) = input.stop_connected_entity.as_deref() {
+        // `StopConnectedEntity` is an enum in the model, so the boundary validator
+        // has already refused anything outside it; this re-states the refusal
+        // against the model's own catalogue.
+        if !CONNECTED_ENTITY_TYPE_VALUES.contains(&entity) {
+            return Err(StopApplicationErrorModeled::ValidationException(
+                crate::state::validation(format!(
+                    "StopConnectedEntity must be one of {}, but was {entity}",
+                    CONNECTED_ENTITY_TYPE_VALUES.join(", ")
+                )),
+            )
+            .into());
+        }
+    }
+
+    let Some(mut application) = state
+        .region(region)
+        .applications
+        .get(&input.application_id)
+        .cloned()
+    else {
+        return Err(StopApplicationErrorModeled::ResourceNotFoundException(
+            crate::state::not_found(crate::state::application_not_found_message(
+                &input.application_id,
+            )),
+        )
+        .into());
+    };
+
+    // A change the clock still owes this application is an operation already under
+    // way on it, which is what `ConflictException` reports.
+    if application.pending.is_some() {
+        return Err(StopApplicationErrorModeled::ConflictException(
+            crate::state::conflict(format!(
+                "Application {} is {} and cannot be stopped until that completes",
+                application.id, application.status
+            )),
+        )
+        .into());
+    }
+
+    application.status = crate::state::APPLICATION_STATUS_STOPPING.to_string();
+    application.last_updated = now;
+    application.pending = Some(crate::state::PendingTransition {
+        due_at: now + crate::state::TRANSITION_SPAN,
+        change: crate::state::PendingChange::Status {
+            status: crate::state::APPLICATION_STATUS_STOPPED.to_string(),
+            // Stopping an application does not re-run discovery, so the discovery
+            // status it already reached is the one it keeps.
+            discovery_status: application.discovery_status.clone(),
+        },
+    });
+
+    // The operation's `Properties` are the parameters of the call that filed it, so
+    // a client reading the record back learns how the stop was asked for.
+    let mut properties = ::std::collections::HashMap::new();
+    if let Some(entity) = input.stop_connected_entity {
+        properties.insert("StopConnectedEntity".to_string(), entity);
+    }
+    if let Some(shutdown) = input.include_ec2_instance_shutdown {
+        properties.insert(
+            "IncludeEc2InstanceShutdown".to_string(),
+            shutdown.to_string(),
+        );
+    }
+
+    // `IncludeEc2InstanceShutdown` shuts the application's Amazon EC2 instances down "in
+    // addition to the application", so the instances its registration associated with it
+    // are read off the record here, while it is resolved, and asked of the service that
+    // owns them once this guard is gone. The flag shuts nothing down unless it is set to
+    // true: absent and `false` both leave the instances running.
+    let instances_to_shut_down = if input.include_ec2_instance_shutdown == Some(true) {
+        application.ec2_instance_ids()
+    } else {
+        Vec::new()
+    };
+
+    // The application was just found in this Region, so reaching for the partition
+    // to write mints nothing.
+    let region_state = state.region_entry(region);
+    let operation_id = region_state.record_operation(
+        crate::state::OPERATION_TYPE_STOP_APPLICATION,
+        &application,
+        properties,
+        now,
+    );
+    region_state
+        .applications
+        .insert(input.application_id, application);
+
+    Ok((operation_id, instances_to_shut_down))
 }

@@ -102,6 +102,10 @@
 //! resolution the tagging calls run), so the policy a read reports always belongs to a
 //! resource some registration brought into being, and the grants go when it does.
 
+/// Shutting down the Amazon EC2 instances of an application through the service that
+/// owns them, which is what `StopApplication$IncludeEc2InstanceShutdown` asks for.
+pub mod ec2_shutdown;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
@@ -528,6 +532,30 @@ impl StoredApplication {
         self.pending
             .as_ref()
             .is_some_and(|pending| pending.removes() && now >= pending.due_at)
+    }
+
+    /// The Amazon EC2 instances this application runs on, each once, in the order the
+    /// registration named them.
+    ///
+    /// A registration associates an application with an EC2 instance in EITHER of two
+    /// places, exactly as it describes a component ([`registered_components`]): the
+    /// `Instances` the SAP system itself runs on, and the `Ec2InstanceId` each declared
+    /// component runs on. Both are instances of this application, so both are what a
+    /// call that acts on "the associated Amazon EC2 instance" acts on; an id named twice
+    /// is one instance, so it is answered once.
+    pub fn ec2_instance_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let declared = self
+            .instances
+            .iter()
+            .chain(self.components.iter().map(|c| &c.ec2_instance_id));
+        for id in declared {
+            if id.is_empty() || ids.iter().any(|known| known == id) {
+                continue;
+            }
+            ids.push(id.clone());
+        }
+        ids
     }
 
     /// Project the stored application onto the modelled `Application`.
@@ -963,10 +991,11 @@ impl StoredOperation {
     /// still running move to its terminal milestone at the same instant
     /// [`Self::settle`] moves its status.
     ///
-    /// Nothing else is reported: the work this emulator does for an operation is the
-    /// record it keeps on the resource the call named, so the milestones it knows are
-    /// that record's own — it starts and stops nothing on any other service's resource
-    /// and reports no milestone for one.
+    /// Nothing else is reported: the milestones an operation has are the ones of the
+    /// resource the call named, so a change this service asked ANOTHER service to make on
+    /// its own resource (the instance shutdown of
+    /// [`ec2_shutdown::stop_instances`]) is a milestone of that resource there, and none
+    /// of this record here.
     pub fn events(&self) -> Vec<OperationEventRecord> {
         // The resource kind as a `Resource$ResourceType`, and as the word a description
         // names it by — the record's own kind either way, so neither is written out per

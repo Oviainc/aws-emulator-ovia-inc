@@ -26,7 +26,7 @@ use service_com_amazonaws_ssmsap_ssmsap::state::{
     TRANSITION_SPAN,
 };
 use service_com_amazonaws_ssmsap_ssmsap::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The region the test signs for; it is the region every expected ARN carries.
 ///
@@ -116,6 +116,27 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine.clone()));
         Self { router, engine }
+    }
+
+    /// The SAME harness with EC2 mounted beside this service on the ONE engine, and the
+    /// in-process callback that EC2 is driven over — the very seam a handler of this
+    /// service reaches another service through.
+    ///
+    /// `pub(crate)` for the suite that pins what stopping an application does to its
+    /// Amazon EC2 instances (`tests/all/ec2_instance_shutdown.rs`): the rule it drives
+    /// spans both services, so it needs the owner of the instances on this engine — and
+    /// the same dispatch path every other suite uses, which is why the second service is
+    /// a constructor here rather than a harness of its own there.
+    pub(crate) fn with_ec2() -> (Self, EmbeddedEmulator) {
+        let engine: std::sync::Arc<engine::InMemoryEngine> =
+            std::sync::Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(EmulatedService::new(engine.clone()));
+        router.register_service(
+            service_com_amazonaws_ec2_amazonec2::EmulatedService::new(engine.clone()),
+        );
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        (Self { router, engine }, callback)
     }
 
     /// Edit the store the mounted service reads.

@@ -33,6 +33,8 @@ mod configuration_check_rules;
 mod configuration_checks;
 #[path = "all/deregistration_window.rs"]
 mod deregistration_window;
+#[path = "all/ec2_instance_shutdown.rs"]
+mod ec2_instance_shutdown;
 #[path = "all/filter_validation.rs"]
 mod filter_validation;
 #[path = "all/get_database.rs"]
