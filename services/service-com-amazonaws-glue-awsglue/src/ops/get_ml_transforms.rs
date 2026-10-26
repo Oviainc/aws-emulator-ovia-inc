@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLTransforms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLTransforms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLTransforms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the machine learning transforms this account holds, one bounded page at a time:
+//! "Gets a sortable, filterable list of existing Glue machine learning transforms." The
+//! `Filter` criteria narrow the listing to the transforms that satisfy every criterion
+//! they name, the `Sort` criteria order it by one of the transform's own properties, and
+//! each element is the whole stored record, so a client that works from the listing is
+//! never less informed than one that re-reads each transform.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +76,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `PageSize`, whose range
+/// is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +153,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLTransforms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLTransformsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLTransforms"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetMLTransformsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the Glue machine learning transform store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`PageSize`, range 1..1000). The clamp re-states that range in the handler so the
+        // page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        // Which transforms the filter admits and what order they come in is the store's
+        // own selection, shared with the listing that reports only their ids, so the two
+        // can never disagree about either.
+        let ordered = store.ml_transforms_in_order(input.filter.as_ref(), input.sort.as_ref());
+        let descending = input
+            .sort
+            .as_ref()
+            .is_some_and(|sort| sort.sort_direction == crate::state::SORT_DIRECTION_DESCENDING);
+
+        // The token is the ordering key of the last transform of the previous page, so this
+        // page resumes at the first transform ordered strictly after it — which stays
+        // correct across transforms created or deleted between two calls. A token this
+        // service never issued names a place in that same order rather than earning a
+        // refusal, exactly as this crate's sibling listings resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| {
+                if descending {
+                    key.as_str() >= cursor
+                } else {
+                    key.as_str() <= cursor
+                }
+            }),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        // `get` rather than an index, so no arithmetic on a request-derived page size can
+        // slice out of range.
+        let page = ordered.get(start..end).unwrap_or_default();
+
+        Ok(GetMLTransformsOutput {
+            // "A list of machine learning transforms": element for element the whole
+            // stored record, which is the projection a single-transform read serves too.
+            transforms: page
+                .iter()
+                .map(|(_, transform)| transform.to_ml_transform())
+                .collect(),
+            // The token names the last entry of the page, taken from the page itself so
+            // there is no index arithmetic to underflow on an empty page, and is absent
+            // once the page reaches the end of the listing — "a pagination token, if more
+            // results are available".
+            next_token: if end < ordered.len() {
+                page.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            },
+        })
     }
 }

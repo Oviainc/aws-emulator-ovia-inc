@@ -79,6 +79,8 @@ mod job_runs;
 mod job_updates;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/ml_transforms.rs"]
+mod ml_transforms;
 #[path = "all/partitions.rs"]
 mod partitions;
 #[path = "all/registries.rs"]

@@ -120,6 +120,15 @@
 //! keyed by profile name ([`ComAmazonawsGlueAwsglueState::usage_profiles`]), because every
 //! operation that addresses a profile names it by `Name` alone and carries no `CatalogId`.
 //!
+//! MACHINE LEARNING TRANSFORMS — the transforms `CreateMLTransform` registers — sit beside
+//! that tree in a per-account namespace keyed by the opaque `TransformId` the create mints
+//! ([`ComAmazonawsGlueAwsglueState::ml_transforms`]), because every operation that
+//! addresses one takes that id alone and no `CatalogId`, and a transform's NAME is no
+//! address at all: "Names are not guaranteed unique and can be changed at any time"
+//! (`MLTransform$Name`). The catalog TABLES a transform reads are recorded on the
+//! transform as the create named them ([`MlTransformEntry::input_record_tables`]), which is
+//! where its reported schema is taken from.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -136,21 +145,23 @@ use crate::ops::types::{
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
+    CreateMLTransformInput,
     CreateSecurityConfigurationInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, EncryptionConfiguration, ErrorDetail, ExecutionProperty, FederatedDatabase,
-    FederatedTable, Job,
+    FederatedTable, GlueTable, Job, MLTransform,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
     NotificationProperty, Partition, PartitionInput, PrincipalPermissions, ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
-    SchemaChangePolicy, SchemaId, SecurityConfiguration, SourceControlDetails,
+    SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
+    TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     UpdateCrawlerInput, Workflow, WorkflowGraph,
 };
 
@@ -314,6 +325,13 @@ pub const MAX_GLOSSARY_TERMS: usize = 1_000;
 /// bounded here. A create past the ceiling is refused with `CreateUsageProfile`'s own
 /// modelled `ResourceNumberLimitExceededException`.
 pub const MAX_USAGE_PROFILES: usize = 1_000;
+
+/// Ceiling on the machine learning transforms this emulator will hold, for the same reason
+/// as [`MAX_CRAWLERS`]: `CreateMLTransform` writes a record any caller can reach, each one
+/// carrying its input tables, parameters and schema, so the number of records one process
+/// will hold is bounded here. A create past the ceiling is refused with
+/// `CreateMLTransform`'s own modelled `ResourceNumberLimitExceededException`.
+pub const MAX_ML_TRANSFORMS: usize = 1_000;
 
 /// Ceiling on the resource policies this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `PutResourcePolicy` writes a record any caller can reach, and each
@@ -667,6 +685,17 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// order to page over. The key is the name exactly as sent — the model documents no
     /// case fold for a usage profile name.
     pub usage_profiles: BTreeMap<String, UsageProfileEntry>,
+    /// Every machine learning transform this emulator holds, keyed by its `TransformId`.
+    ///
+    /// Per account and beside the catalog tree, like crawlers and usage profiles:
+    /// `GetMLTransform`, `UpdateMLTransform` and `DeleteMLTransform` address a transform by
+    /// an id alone, with no `CatalogId` member. Keyed by that minted id rather than by name
+    /// because the id is the whole address and a transform's name is not even unique —
+    /// "Names are not guaranteed unique and can be changed at any time"
+    /// (`MLTransform$Name`) — so two transforms may share one. Ordered, so the two
+    /// transform listings have one deterministic order to fall back on, and bounded by
+    /// [`MAX_ML_TRANSFORMS`].
+    pub ml_transforms: BTreeMap<String, MlTransformEntry>,
     /// Every column statistics task run this emulator holds, oldest first.
     ///
     /// A run lives BESIDE the catalog tree rather than on the table it was started for,
@@ -1268,6 +1297,86 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_USAGE_PROFILES`].
     pub fn can_store_usage_profile(&self) -> bool {
         self.usage_profiles.len() < MAX_USAGE_PROFILES
+    }
+
+    /// Whether the store can hold another machine learning transform, i.e. is below
+    /// [`MAX_ML_TRANSFORMS`].
+    pub fn can_store_ml_transform(&self) -> bool {
+        self.ml_transforms.len() < MAX_ML_TRANSFORMS
+    }
+
+    /// Every stored machine learning transform `filter` admits, in the order `sort` names,
+    /// each paired with its ordering key — which is what a listing's continuation token
+    /// carries ([`MlTransformEntry::ordering_key`]).
+    ///
+    /// One walk, shared by the two transform listings, so the listing that reports
+    /// transforms and the one that reports their ids can never disagree about which
+    /// transforms a filter admits or what order they come in. Bounded by
+    /// [`MAX_ML_TRANSFORMS`].
+    pub fn ml_transforms_in_order(
+        &self,
+        filter: Option<&TransformFilterCriteria>,
+        sort: Option<&TransformSortCriteria>,
+    ) -> Vec<(String, &MlTransformEntry)> {
+        let column = sort.map(|criteria| criteria.column.as_str());
+        let mut ordered: Vec<(String, &MlTransformEntry)> = self
+            .ml_transforms
+            .values()
+            .filter(|transform| filter.is_none_or(|criteria| transform.matches(criteria)))
+            .map(|transform| (transform.ordering_key(column), transform))
+            .collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        if sort.is_some_and(|criteria| criteria.sort_direction == SORT_DIRECTION_DESCENDING) {
+            // The ordering key is unique per transform, so reversing the ascending order
+            // is exactly the descending one.
+            ordered.reverse();
+        }
+        ordered
+    }
+
+    /// The schema a machine learning transform over `tables` runs against: "the columns and
+    /// data types that this transform can run against" (`MLTransform$Schema`).
+    ///
+    /// A create carries no schema, so the columns are read out of the CATALOG, from the
+    /// input record tables the request addressed, in the order those tables name them. A
+    /// column name already contributed by an earlier table is not repeated — the schema is
+    /// a map from column to type — and a table this store does not hold contributes
+    /// nothing, the way a run over an absent table recommends nothing rather than being
+    /// refused. Capped at [`MAX_TRANSFORM_SCHEMA_COLUMNS`], which is the modelled length of
+    /// the member.
+    pub fn ml_transform_schema(&self, tables: &[GlueTable]) -> Vec<SchemaColumn> {
+        let mut schema: Vec<SchemaColumn> = Vec::new();
+        for table in tables {
+            let catalog_id = resolve_catalog_id(table.catalog_id.as_ref());
+            let Some(stored) = self
+                .database(&catalog_id, &table.database_name)
+                .and_then(|database| database.tables.get(&fold_name(&table.table_name)))
+            else {
+                continue;
+            };
+            for column in stored
+                .storage_descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.columns.as_ref())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if schema.len() >= MAX_TRANSFORM_SCHEMA_COLUMNS {
+                    return schema;
+                }
+                if schema
+                    .iter()
+                    .any(|held| held.name.as_deref() == Some(column.name.as_str()))
+                {
+                    continue;
+                }
+                schema.push(SchemaColumn {
+                    name: Some(column.name.clone()),
+                    data_type: column.r#type.clone(),
+                });
+            }
+        }
+        schema
     }
 
     /// Whether the store can hold another form type, i.e. is below [`MAX_FORM_TYPES`].
@@ -2653,6 +2762,383 @@ impl UsageProfileEntry {
             last_modified_on: now,
             tags: input.tags.clone().unwrap_or_default(),
         }
+    }
+}
+
+/// How many machine learning transform ids this process has minted. A nonce source for
+/// [`new_ml_transform_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
+static MINTED_ML_TRANSFORM_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `TransformId`: the id the service assigns a machine learning transform when
+/// `CreateMLTransform` stores it.
+///
+/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is inside `HashString`'s
+/// `length 1..255` — the same shape and the same width as the other `HashString` id this
+/// store mints ([`new_data_quality_rule_recommendation_run_id`]), because the service
+/// publishes no spelling for this one. The bits come from [`mint_hex_id`], so two creates
+/// landing in the same nanosecond cannot be given the same id, and the id is stored on the
+/// record, so "the ID is guaranteed to be unique and does not change"
+/// (`MLTransform$TransformId`) holds across every later read.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_ml_transform_id() -> String {
+    mint_hex_id(&MINTED_ML_TRANSFORM_IDS, ML_TRANSFORM_ID_WORDS)
+}
+
+/// How many 64-bit words a machine learning transform id carries: two, i.e. 128 bits
+/// rendered as 32 lowercase hexadecimal characters.
+const ML_TRANSFORM_ID_WORDS: usize = 2;
+
+/// The `TransformStatusType` a machine learning transform is stored in by a create: of the
+/// modelled enum (`NOT_READY`, `READY`, `DELETING`), the one that says the transform
+/// cannot be used yet.
+///
+/// A create registers the transform and nothing more — "Call this operation as the first
+/// step in the process of using a machine learning transform" (`CreateMLTransform`) — so
+/// it holds no labels and has been taught nothing. Moving on from here takes a TASK RUN
+/// that teaches it, not the passage of time, so no later status is owed by the clock.
+pub const TRANSFORM_STATUS_NOT_READY: &str = "NOT_READY";
+
+/// The `SortDirectionType` that reverses a listing's order: one of the modelled values
+/// (`ASCENDING`, `DESCENDING`), the one a sort criteria names to walk the order backwards.
+pub const SORT_DIRECTION_DESCENDING: &str = "DESCENDING";
+
+/// The `TransformSortColumnType` that orders transforms by their creation instant. One of
+/// the modelled values the generated [`crate::ops::types::TRANSFORM_SORT_COLUMN_TYPE_VALUES`]
+/// carries (`CREATED`, `LAST_MODIFIED`, `NAME`, `STATUS`, `TRANSFORM_TYPE`), which the
+/// request layer validates a sort criteria against.
+pub const TRANSFORM_SORT_COLUMN_CREATED: &str = "CREATED";
+/// See [`TRANSFORM_SORT_COLUMN_CREATED`]: orders by the instant last modified.
+pub const TRANSFORM_SORT_COLUMN_LAST_MODIFIED: &str = "LAST_MODIFIED";
+/// See [`TRANSFORM_SORT_COLUMN_CREATED`]: orders by the transform's name.
+pub const TRANSFORM_SORT_COLUMN_NAME: &str = "NAME";
+/// See [`TRANSFORM_SORT_COLUMN_CREATED`]: orders by the transform's status.
+pub const TRANSFORM_SORT_COLUMN_STATUS: &str = "STATUS";
+/// See [`TRANSFORM_SORT_COLUMN_CREATED`]: orders by the transform's algorithm type.
+pub const TRANSFORM_SORT_COLUMN_TRANSFORM_TYPE: &str = "TRANSFORM_TYPE";
+
+/// `MLTransform$GlueVersion` when the create named none: "If the value is not set, the
+/// Glue compatibility defaults to Glue 0.9" (`CreateMLTransform$GlueVersion`).
+pub const DEFAULT_ML_TRANSFORM_GLUE_VERSION: &str = "0.9";
+
+/// `MLTransform$MaxCapacity` when the create named no capacity at all: "You can allocate
+/// from 2 to 100 DPUs; the default is 10" (`CreateMLTransform$MaxCapacity`).
+pub const DEFAULT_ML_TRANSFORM_DPUS: f64 = 10.0;
+
+/// `MLTransform$Timeout` when the create named none: "The default is 2,880 minutes (48
+/// hours)" (`CreateMLTransform$Timeout`).
+pub const DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES: i32 = 2_880;
+
+/// How many columns a transform's schema holds at most: the modelled length of
+/// `MLTransform$Schema` (`TransformSchema`, length 0..100) — "Has an upper bound of 100
+/// columns".
+pub const MAX_TRANSFORM_SCHEMA_COLUMNS: usize = 100;
+
+/// The separator between the parts of a transform listing's ordering key (and so of its
+/// `NextToken`).
+///
+/// `U+0001` cannot appear in a name, a status, an algorithm type or a minted id: every
+/// such value's modelled pattern admits `\u0020` and up, so the separator can never be
+/// confused with a character inside one of the parts it joins — and a key whose first part
+/// is a prefix of another's therefore still orders before it.
+const TRANSFORM_KEY_SEPARATOR: char = '\u{1}';
+
+/// `at` rendered so that lexicographic order over the rendering is the order of the
+/// instants themselves: nanoseconds since the epoch, zero-padded, so no comparison of
+/// ordering keys has to parse a number back out. Twenty digits hold any nanosecond count
+/// this clock can report.
+fn ordered_instant(at: SystemTime) -> String {
+    let nanos = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:020}")
+}
+
+/// `at` as seconds since the epoch, the one scale a transform's instants are compared
+/// against a client-supplied timestamp on.
+fn secs_since_epoch(at: SystemTime) -> f64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// A stored machine learning transform: the definition `CreateMLTransform` registered,
+/// plus the members the SERVER fills in.
+///
+/// Every member of the modelled `MLTransform` shape is held here, plus the create's
+/// `Tags`, which that shape does not carry — so a later read reports what the create
+/// stored and nothing invented on the way out. The server-set members are the minted
+/// `TransformId`, the two instants, the status every create starts in
+/// ([`TRANSFORM_STATUS_NOT_READY`]), the label count and the SCHEMA, which is taken from
+/// the catalog tables the create named rather than from the request.
+///
+/// `EvaluationMetrics` is NOT held: metrics "provide an estimate of the quality of your
+/// machine learning transform" (`MLTransform$EvaluationMetrics`), and nothing has trained
+/// or evaluated this transform, so there are none to report.
+#[derive(Debug, Clone)]
+pub struct MlTransformEntry {
+    /// `MLTransform$TransformId`, minted by [`new_ml_transform_id`], which is also this
+    /// record's key in [`ComAmazonawsGlueAwsglueState::ml_transforms`].
+    pub transform_id: String,
+    /// "A user-defined name for the machine learning transform", stored exactly as sent.
+    /// NOT unique over the namespace: "Names are not guaranteed unique and can be changed
+    /// at any time" (`MLTransform$Name`).
+    pub name: String,
+    /// "A user-defined, long-form description text", or `None` when the create named none.
+    pub description: Option<String>,
+    /// One of the modelled `TransformStatusType` values; see
+    /// [`TRANSFORM_STATUS_NOT_READY`].
+    pub status: String,
+    /// "The time and date that this machine learning transform was created."
+    pub created_on: SystemTime,
+    /// "The last point in time when this machine learning transform was modified", which
+    /// is the create's own instant until a write moves it.
+    pub last_modified_on: SystemTime,
+    /// "A list of Glue table definitions used by the transform", as the create addressed
+    /// them.
+    pub input_record_tables: Vec<GlueTable>,
+    /// "The algorithm-specific parameters that are associated with the machine learning
+    /// transform", stored exactly as sent.
+    pub parameters: TransformParameters,
+    /// "A count identifier for the labeling files generated by Glue for this transform"
+    /// (`MLTransform$LabelCount`): zero on a create, which generates none, and the count a
+    /// labelling write would move.
+    pub label_count: i32,
+    /// "The columns and data types that this transform can run against"
+    /// (`MLTransform$Schema`), taken from the catalog columns of
+    /// [`Self::input_record_tables`] when the transform was stored — the data the transform
+    /// reads is what decides them, so they are read out of the catalog rather than taken
+    /// from the request, which carries no schema at all.
+    pub schema: Vec<SchemaColumn>,
+    /// "The name or Amazon Resource Name (ARN) of the IAM role with the required
+    /// permissions", stored exactly as sent.
+    pub role: String,
+    /// "This value determines which version of Glue this machine learning transform is
+    /// compatible with", defaulting to [`DEFAULT_ML_TRANSFORM_GLUE_VERSION`].
+    pub glue_version: String,
+    /// "The number of Glue data processing units (DPUs) that are allocated to task runs for
+    /// this transform", as [`ml_transform_capacity`] resolved it.
+    pub max_capacity: Option<f64>,
+    /// "The type of predefined worker that is allocated when a task of this transform
+    /// runs", or `None` when the create named none.
+    pub worker_type: Option<String>,
+    /// "The number of workers of a defined `workerType` that are allocated when a task of
+    /// the transform runs", or `None` when the create named none.
+    pub number_of_workers: Option<i32>,
+    /// "The timeout in minutes of the machine learning transform", defaulting to
+    /// [`DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES`].
+    pub timeout: i32,
+    /// "The maximum number of times to retry after an `MLTaskRun` of the machine learning
+    /// transform fails", or `None` when the create named none: the model documents no
+    /// default for it, so nothing is reported where the client asked for nothing.
+    pub max_retries: Option<i32>,
+    /// "The encryption-at-rest settings of the transform that apply to accessing user
+    /// data", stored exactly as sent.
+    pub transform_encryption: Option<TransformEncryption>,
+    /// The create's `Tags`, which are not part of the `MLTransform` shape.
+    ///
+    /// Kept so the create does not discard what the client sent, and NOT reported by a
+    /// read: the shape carries no tag member, so the tags are reachable only through the
+    /// tagging operations.
+    pub tags: HashMap<String, String>,
+}
+
+impl MlTransformEntry {
+    /// Build a stored transform from a `CreateMLTransform` request served at `now`.
+    ///
+    /// The definition comes from the request; `transform_id` is the minted id and `schema`
+    /// the columns the catalog holds for the request's input tables
+    /// ([`ComAmazonawsGlueAwsglueState::ml_transform_schema`]).
+    pub fn from_create_input(
+        input: &CreateMLTransformInput,
+        transform_id: String,
+        schema: Vec<SchemaColumn>,
+        now: SystemTime,
+    ) -> Self {
+        let (worker_type, number_of_workers, max_capacity) = ml_transform_capacity(input);
+        Self {
+            transform_id,
+            name: input.name.clone(),
+            description: input.description.clone(),
+            status: TRANSFORM_STATUS_NOT_READY.to_string(),
+            created_on: now,
+            last_modified_on: now,
+            input_record_tables: input.input_record_tables.clone(),
+            parameters: input.parameters.clone(),
+            // A create generates no labelling file.
+            label_count: 0,
+            schema,
+            role: input.role.clone(),
+            glue_version: input
+                .glue_version
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ML_TRANSFORM_GLUE_VERSION.to_string()),
+            max_capacity,
+            worker_type,
+            number_of_workers,
+            timeout: input
+                .timeout
+                .unwrap_or(DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES),
+            max_retries: input.max_retries,
+            transform_encryption: input.transform_encryption.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `MLTransform` shape from what is stored, so a listing reports
+    /// the same transform a single read does. The stored `Tags` are not part of that shape,
+    /// so they stay out of it.
+    pub fn to_ml_transform(&self) -> MLTransform {
+        MLTransform {
+            transform_id: Some(self.transform_id.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            status: Some(self.status.clone()),
+            created_on: Some(to_date_time(self.created_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            input_record_tables: Some(self.input_record_tables.clone()),
+            parameters: Some(self.parameters.clone()),
+            // Nothing has trained or evaluated this transform, so it has no metrics.
+            evaluation_metrics: None,
+            label_count: self.label_count,
+            schema: Some(self.schema.clone()),
+            role: Some(self.role.clone()),
+            glue_version: Some(self.glue_version.clone()),
+            max_capacity: self.max_capacity,
+            worker_type: self.worker_type.clone(),
+            number_of_workers: self.number_of_workers,
+            timeout: Some(self.timeout),
+            max_retries: self.max_retries,
+            transform_encryption: self.transform_encryption.clone(),
+        }
+    }
+
+    /// Whether this transform satisfies every criterion `filter` names.
+    ///
+    /// A `TransformFilterCriteria` is a conjunction: each member it carries narrows the
+    /// listing, and a member it leaves out narrows nothing. The three enum members and the
+    /// name are matched exactly, the two instant pairs bound the window the criteria
+    /// describe ("the time and date before which the transforms were created", so an
+    /// instant strictly inside the bound), and `Schema` selects "datasets with a specific
+    /// schema", i.e. the transforms whose own schema carries every column it names.
+    pub fn matches(&self, filter: &TransformFilterCriteria) -> bool {
+        if filter
+            .name
+            .as_deref()
+            .is_some_and(|name| name != self.name.as_str())
+        {
+            return false;
+        }
+        if filter
+            .transform_type
+            .as_deref()
+            .is_some_and(|kind| kind != self.parameters.transform_type.as_str())
+        {
+            return false;
+        }
+        if filter
+            .status
+            .as_deref()
+            .is_some_and(|status| status != self.status.as_str())
+        {
+            return false;
+        }
+        if filter
+            .glue_version
+            .as_deref()
+            .is_some_and(|version| version != self.glue_version.as_str())
+        {
+            return false;
+        }
+        let created = secs_since_epoch(self.created_on);
+        let modified = secs_since_epoch(self.last_modified_on);
+        let outside_window = [
+            (filter.created_before.as_ref(), created, true),
+            (filter.created_after.as_ref(), created, false),
+            (filter.last_modified_before.as_ref(), modified, true),
+            (filter.last_modified_after.as_ref(), modified, false),
+        ]
+        .into_iter()
+        .any(|(bound, instant, before)| {
+            bound.is_some_and(|bound| {
+                if before {
+                    instant >= bound.as_secs_f64()
+                } else {
+                    instant <= bound.as_secs_f64()
+                }
+            })
+        });
+        if outside_window {
+            return false;
+        }
+        filter.schema.as_deref().is_none_or(|wanted| {
+            wanted.iter().all(|column| {
+                self.schema.iter().any(|held| {
+                    held.name == column.name
+                        && (column.data_type.is_none() || held.data_type == column.data_type)
+                })
+            })
+        })
+    }
+
+    /// This transform's place in a listing ordered by `column`, as the continuation token
+    /// renders it: the sorted value, then the transform's own id so that two transforms
+    /// sharing that value still have one total order to page over.
+    ///
+    /// `None` is the order a request that names no sort criteria gets, which is the same
+    /// key [`TRANSFORM_SORT_COLUMN_NAME`] names: the model documents no default order, so
+    /// the listing falls back on a deterministic one rather than on however the store
+    /// happens to hold its keys. A column outside the modelled list cannot reach here —
+    /// the request layer validates `Sort$Column` against it — and is ordered the same way.
+    pub fn ordering_key(&self, column: Option<&str>) -> String {
+        let sorted = match column {
+            Some(TRANSFORM_SORT_COLUMN_TRANSFORM_TYPE) => self.parameters.transform_type.clone(),
+            Some(TRANSFORM_SORT_COLUMN_STATUS) => self.status.clone(),
+            Some(TRANSFORM_SORT_COLUMN_CREATED) => ordered_instant(self.created_on),
+            Some(TRANSFORM_SORT_COLUMN_LAST_MODIFIED) => ordered_instant(self.last_modified_on),
+            Some(TRANSFORM_SORT_COLUMN_NAME) | Some(_) | None => self.name.clone(),
+        };
+        format!(
+            "{sorted}{TRANSFORM_KEY_SEPARATOR}{}",
+            self.transform_id
+        )
+    }
+}
+
+/// The capacity a machine learning transform runs its task runs with, as `(worker_type,
+/// number_of_workers, max_capacity)`.
+///
+/// `MaxCapacity` and the worker configuration are two spellings of one quantity, and the
+/// worker configuration wins where the request names one: "When the `WorkerType` field is
+/// set to a value other than `Standard`, the `MaxCapacity` field is set automatically and
+/// becomes read-only" (`CreateMLTransform$WorkerType`), so the figure reported is the DPUs
+/// those workers map to ([`dpu_per_worker`]). That sentence excepts `Standard`, which the
+/// model gives no per-worker figure at all, so a worker configuration this emulator cannot
+/// convert leaves the figure the REQUEST named — nothing the client sent is discarded, and
+/// nothing is derived where the service documents no conversion. Where the request names
+/// no capacity at all the documented default applies ([`DEFAULT_ML_TRANSFORM_DPUS`]).
+pub fn ml_transform_capacity(
+    input: &CreateMLTransformInput,
+) -> (Option<String>, Option<i32>, Option<f64>) {
+    match (input.worker_type.as_deref(), input.number_of_workers) {
+        (Some(worker_type), workers) => (
+            Some(worker_type.to_string()),
+            workers,
+            dpu_per_worker(worker_type)
+                .zip(workers)
+                .map(|(per_worker, workers)| per_worker * f64::from(workers))
+                .or(input.max_capacity),
+        ),
+        // A worker count with no worker type names no DPU figure this emulator could
+        // derive, so only what the request itself named is reported.
+        (None, Some(workers)) => (None, Some(workers), input.max_capacity),
+        (None, None) => (
+            None,
+            None,
+            Some(input.max_capacity.unwrap_or(DEFAULT_ML_TRANSFORM_DPUS)),
+        ),
     }
 }
 
