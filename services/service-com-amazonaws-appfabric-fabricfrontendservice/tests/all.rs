@@ -33,6 +33,8 @@ mod ingestion_deletion;
 mod ingestion_destination_lifecycle;
 #[path = "all/ingestion_enablement.rs"]
 mod ingestion_enablement;
+#[path = "all/nested_resource_arn_region.rs"]
+mod nested_resource_arn_region;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

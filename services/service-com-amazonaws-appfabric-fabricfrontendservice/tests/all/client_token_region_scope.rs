@@ -266,8 +266,9 @@ async fn the_parameter_mismatch_conflict_is_judged_within_one_region() {
 
 /// RULE: the scope is the same for the nested creates — a token spent on
 /// `CreateIngestion` in one Region does not replay that ingestion for a call
-/// signed for another Region, which gets its own ingestion carrying its own
-/// Region's ARN.
+/// signed for another Region, which gets its own, distinct ingestion. The ARN
+/// of each of them names the Region of the app bundle they are nested under,
+/// because a nested resource lives wherever its parent does.
 #[tokio::test]
 async fn the_region_scope_holds_for_a_nested_create() {
     // The ingestion bodies the rule holds over: the token beside the members that
@@ -321,9 +322,13 @@ async fn the_region_scope_holds_for_a_nested_create() {
                 .call_in_region(region, "POST", &uri, Some(body.clone()))
                 .await;
             let arn = created_arn(&created, "ingestion", &case);
+            // The ingestion hangs off a bundle in `first_region`, so that is
+            // the Region its ARN names however the create call was signed: one
+            // response body can never name two Regions for one resource chain.
             assert!(
-                arn.contains(&format!(":appfabric:{region}:")),
-                "case {case:?}: expected an ingestion ARN in {region}, got {arn:?}"
+                arn.contains(&format!(":appfabric:{first_region}:")),
+                "case {case:?}: an ingestion created through the {region} endpoint under a \
+                 {first_region} bundle must carry a {first_region} ARN, got {arn:?}"
             );
             assert!(
                 arns.insert(arn.clone()),
