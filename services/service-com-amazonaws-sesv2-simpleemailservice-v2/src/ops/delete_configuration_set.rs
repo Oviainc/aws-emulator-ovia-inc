@@ -171,6 +171,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An identity's default configuration set is a reference to this record, so
+        // the reference goes with it: once the set is gone no identity still reports
+        // it, and a later read reports the identity as having no configuration set
+        // rather than naming one the account no longer holds.
+        for identity in store.identities.values_mut() {
+            if identity.configuration_set_name.as_deref() == Some(name.as_str()) {
+                identity.configuration_set_name = None;
+            }
+        }
+
         // `DeleteConfigurationSetResponse` carries no members.
         Ok(DeleteConfigurationSetOutput {})
     }

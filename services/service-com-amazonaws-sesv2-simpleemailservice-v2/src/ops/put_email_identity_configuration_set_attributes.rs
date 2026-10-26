@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEmailIdentityConfigurationSetAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEmailIdentityConfigurationSetAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEmailIdentityConfigurationSetAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +129,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEmailIdentityConfigurationSetAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEmailIdentityConfigurationSetAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEmailIdentityConfigurationSetAttributes"))
+        // Request metadata is not needed: both the identity and the configuration set
+        // are keyed by name within the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutEmailIdentityConfigurationSetAttributes without the shared emulator state",
+            ));
+        };
+
+        // A name the service could never have created names no set at all, so it is
+        // the caller's mistake rather than a missing resource — the same character and
+        // length rule every operation taking a `ConfigurationSetName` applies.
+        if let Some(set_name) = input.configuration_set_name.as_deref() {
+            if !crate::state::configuration_set_name_is_valid(set_name) {
+                return Err(
+                    PutEmailIdentityConfigurationSetAttributesErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::configuration_set_name_invalid(set_name)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so this
+        // write lands on the same record a read would have reported.
+        store.settle(::std::time::SystemTime::now());
+
+        // Both halves of the association are resolved against the state before
+        // anything is written: the set the request names has to be one the account
+        // holds, and a name no set in the table carries is reported missing.
+        let unknown_set = input
+            .configuration_set_name
+            .as_deref()
+            .filter(|set_name| !store.configuration_sets.contains_key(*set_name))
+            .map(str::to_string);
+
+        let Some(record) = store
+            .identities
+            .get_mut(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(
+                PutEmailIdentityConfigurationSetAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Email identity {} does not exist.",
+                            input.email_identity
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if let Some(set_name) = unknown_set {
+            return Err(
+                PutEmailIdentityConfigurationSetAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::configuration_set_not_found(&set_name)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Used to associate a configuration set with an email identity": the request
+        // carries the whole association, so the stored reference becomes exactly what
+        // was asked for — a request naming a set replaces whichever set was associated
+        // before, and one that names none leaves the identity with no association at
+        // all. `GetEmailIdentity` reports it as `ConfigurationSetName`.
+        record.configuration_set_name = input.configuration_set_name;
+
+        // `PutEmailIdentityConfigurationSetAttributesResponse` carries no members.
+        Ok(PutEmailIdentityConfigurationSetAttributesOutput {})
     }
 }

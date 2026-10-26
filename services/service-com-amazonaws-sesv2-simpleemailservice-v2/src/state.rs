@@ -1302,9 +1302,11 @@ pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
 /// hold.
 ///
 /// One wording for every operation that takes a `ConfigurationSetName`, so a client
-/// sees the same sentence whichever call first tells it the set is not there.
+/// sees the same sentence whichever call first tells it the set is not there. SES
+/// delimits the name it interpolated with angle brackets, so the sentence stays
+/// readable for a name that is itself a sentence fragment.
 pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
-    format!("Configuration set {configuration_set_name} does not exist.")
+    format!("Configuration set <{configuration_set_name}> does not exist.")
 }
 
 /// One address on a suppression list.
