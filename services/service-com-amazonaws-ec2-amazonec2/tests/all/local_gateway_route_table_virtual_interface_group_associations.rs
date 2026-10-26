@@ -169,12 +169,16 @@ fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
                 .insert_local_gateway_route_table_virtual_interface_group_association(
                     AssociationSpec {
                         local_gateway_route_table_id: row.route_table_id.to_string(),
+                        local_gateway_route_table_arn: route_table_arn(
+                            row.region,
+                            row.route_table_id,
+                        ),
                         local_gateway_virtual_interface_group_id: row
                             .virtual_interface_group_id
                             .to_string(),
                         local_gateway_id: row.local_gateway_id.to_string(),
-                        region: row.region.to_string(),
                         state: row.state.to_string(),
+                        becomes: None,
                         tags: row.tags,
                     },
                 )
@@ -310,10 +314,11 @@ async fn every_stored_association_is_reported_and_a_later_write_is_visible() {
         .lock()
         .insert_local_gateway_route_table_virtual_interface_group_association(AssociationSpec {
             local_gateway_route_table_id: "lgw-rtb-00000000000000009".to_string(),
+            local_gateway_route_table_arn: route_table_arn(REGION, "lgw-rtb-00000000000000009"),
             local_gateway_virtual_interface_group_id: "lgw-vif-grp-00000000000000009".to_string(),
             local_gateway_id: "lgw-00000000000000009".to_string(),
-            region: REGION.to_string(),
             state: "available".to_string(),
+            becomes: None,
             tags: vec![tag("Name", "late")],
         })
         .expect("after a later write: the store must take the association");
