@@ -41,7 +41,8 @@
 //! workload's, keyed by the `ProfileArn` they share then by the share's own `ShareId`, and
 //! each raises the invitation `ListShareInvitations` reports to the principal it was
 //! offered to. The shares of a REVIEW TEMPLATE (`CreateTemplateShare`,
-//! `ListTemplateShares`) are held the same way, keyed by the `TemplateArn` they share then
+//! `ListTemplateShares`, `DeleteTemplateShare`) are held the same way, keyed by the
+//! `TemplateArn` they share then
 //! by the share's own `ShareId`, and raise an invitation of their own kind through that
 //! same enumeration. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
@@ -5692,6 +5693,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateTemplateShare`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_template_share_tokens: TokenLedger<CreateTemplateShareToken>,
+    /// `DeleteTemplateShare`'s `ClientRequestToken` -> the delete the original request
+    /// completed ([`delete_replay`]), held exactly as [`Self::delete_profile_share_tokens`]
+    /// is and for the same reason: the revoked share cannot serve the replay, so the
+    /// completed delete does, and a retry carrying the token answers that success rather
+    /// than the not-found the original request's own work produced.
+    pub delete_template_share_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -7394,6 +7401,25 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         Some(record)
     }
 
+    /// Drop one share of a review template and everything keyed to it — the
+    /// review-template counterpart of [`Self::remove_profile_share`], sharing its removal
+    /// through [`take_share`]: the create token that resolved to the share goes with it, so
+    /// the next request carrying that token shares afresh rather than replaying a share
+    /// that is gone.
+    ///
+    /// `None` when the template holds no such share, which is what tells a delete that the
+    /// share it was asked to remove does not exist.
+    pub fn remove_template_share(
+        &mut self,
+        template_arn: &str,
+        share_id: &str,
+    ) -> Option<TemplateShareRecord> {
+        let record = take_share(&mut self.template_shares, template_arn, share_id)?;
+        self.create_template_share_tokens
+            .retain(|token| !(token.template_arn == template_arn && token.share_id == share_id));
+        Some(record)
+    }
+
     /// The share the invitation `share_invitation_id` mediates, of WHICHEVER resource kind,
     /// if it was offered to `principal` — what `UpdateShareInvitation` resolves, for
     /// writing.
@@ -9076,6 +9102,23 @@ pub fn profile_share_not_found(profile_arn: &str, share_id: &str) -> ResourceNot
         PROFILE_SHARE_RESOURCE_TYPE,
         share_id.to_string(),
         &format!("share with ID {share_id} of a profile with ARN {profile_arn}"),
+    )
+}
+
+/// [`resource_not_found`] for a share id that names no share of the review template.
+///
+/// The review-template counterpart of [`profile_share_not_found`], worded the same way and
+/// for the same reasons: a `ShareId` identifies a share on its own, so the `ResourceId` is
+/// that id AS SENT, and the message names the template the share was looked for in, so a
+/// caller can tell a share of another template from a share that was revoked. The
+/// `ResourceType` is the one every refusal about a review-template SHARE in this service
+/// carries ([`TEMPLATE_SHARE_RESOURCE_TYPE`], as [`template_share_conflict`] does), rather
+/// than the type of the template itself.
+pub fn template_share_not_found(template_arn: &str, share_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        TEMPLATE_SHARE_RESOURCE_TYPE,
+        share_id.to_string(),
+        &format!("share with ID {share_id} of a review template with ARN {template_arn}"),
     )
 }
 
