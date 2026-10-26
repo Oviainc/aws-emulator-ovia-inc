@@ -9,6 +9,13 @@
 //! envelope [`crate::state::seal`] builds for `Encrypt`, so `Decrypt` opens it and
 //! returns exactly the plaintext data key this call handed back.
 //!
+//! The length of that data key comes from `KeySpec` or from `NumberOfBytes`, never from
+//! both and never from neither: "You must specify either the KeySpec or the
+//! NumberOfBytes parameter (but not both) in every GenerateDataKey request"
+//! (`smithy_query(query="doc",shape="GenerateDataKeyRequest",member="KeySpec")`), so a
+//! request that states the length twice, or does not state it at all, is refused and
+//! nothing is generated.
+//!
 //! One deliberate divergence: `GrantTokens`, judged here the way `Encrypt` judges them
 //! — see that file's module doc for why a presented grant token is the only permission
 //! a handler here can evaluate.
@@ -203,11 +210,6 @@ const MIN_DATA_KEY_BYTES: usize = 1;
 /// See [`MIN_DATA_KEY_BYTES`].
 const MAX_DATA_KEY_BYTES: usize = 1024;
 
-/// The data key a request that names neither `KeySpec` nor `NumberOfBytes` gets: "if
-/// you don't specify a key spec or number of bytes, GenerateDataKey returns a 256-bit
-/// AES key" (the operation doc), which is 32 bytes.
-const DEFAULT_DATA_KEY_BYTES: usize = 32;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -393,10 +395,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You must also specify the length of the data key. Use either the KeySpec or
         // NumberOfBytes parameters (but not both)" (the operation doc): the two members
         // are alternative statements of ONE length, so a request stating it twice or
-        // not at all does not say how long the data key is. Neither case is modelled as
-        // an error of this operation, so both are refused as invalid requests — except
-        // that, unlike `GenerateDataKeyWithoutPlaintext`, "if you don't specify a key
-        // spec or number of bytes, GenerateDataKey returns a 256-bit AES key".
+        // not at all does not say how long the data key is — "You must specify either
+        // the KeySpec or the NumberOfBytes parameter (but not both) in every
+        // GenerateDataKey request"
+        // (`smithy_query(query="doc",shape="GenerateDataKeyRequest",member="KeySpec")`).
+        // Neither case is modelled as an error of this operation, so both are refused as
+        // invalid requests.
         let length = match (input.key_spec.as_deref(), input.number_of_bytes) {
             (Some(key_spec), None) => {
                 let Some(length) = crate::state::data_key_bytes(key_spec) else {
@@ -421,7 +425,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      specify either one of them, but not both.",
                 ));
             }
-            (None, None) => DEFAULT_DATA_KEY_BYTES,
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The length of the data key was not specified; specify either KeySpec \
+                     or NumberOfBytes.",
+                ));
+            }
         };
 
         // `Recipient` asks KMS to return the data key encrypted under the public key

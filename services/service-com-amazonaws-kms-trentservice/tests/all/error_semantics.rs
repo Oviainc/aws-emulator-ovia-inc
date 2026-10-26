@@ -181,15 +181,14 @@ async fn a_generated_data_key_round_trips_through_decrypt() {
     let key_id = text("setup", &metadata, "KeyId");
 
     // Rows: how the request states the length of the data key, and how many bytes that
-    // is — the modelled `DataKeySpec` values, the modelled `NumberOfBytes` bounds, and
-    // the documented default for a request that states neither.
+    // is — the modelled `DataKeySpec` values and the modelled `NumberOfBytes` bounds.
+    // Which requests state a length at all is the subject of `super::data_key`.
     let rows: Vec<(&str, Value, usize)> = vec![
         ("KeySpec AES_256", json!({"KeySpec": "AES_256"}), 32),
         ("KeySpec AES_128", json!({"KeySpec": "AES_128"}), 16),
         ("NumberOfBytes 1", json!({"NumberOfBytes": 1}), 1),
         ("NumberOfBytes 1024", json!({"NumberOfBytes": 1024}), 1024),
         ("NumberOfBytes 70", json!({"NumberOfBytes": 70}), 70),
-        ("neither, the default", json!({}), 32),
     ];
     for (case, mut body, expected_len) in rows {
         body["KeyId"] = json!(key_id);
