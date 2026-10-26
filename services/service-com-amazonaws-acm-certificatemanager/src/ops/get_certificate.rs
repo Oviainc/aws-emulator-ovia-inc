@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the PEM certificate material stored for the certificate the
+//! requested ARN names — the certificate itself, and the chain of trust it is served
+//! with — as the call that stored it carried them. A read only: the record is left
+//! exactly as it stands, apart from the outcomes the clock already owed the store
+//! before this call.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A chain comes back for every certificate: the chain the resource was stored with,
+//! and the certificate itself for a resource stored without one.
+//!
+//! A resource no certificate has been issued for yet carries no material, and is
+//! refused with the documented `RequestInProgressException` rather than answered with
+//! an empty body.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +163,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCertificate"))
+        let _ = ctx;
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the modelled validation failure is
+        // the one honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The member's `@pattern` already admitted only an `acm` ARN; what is left is
+        // that it names a CERTIFICATE.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(GetCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A read of one record, except for the outcomes the clock already owes: a
+        // request whose validation fell due before this call is answered as it stands
+        // now, which is what makes a poll for the issued certificate terminate.
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
+            return Err(GetCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The certificate request is in process and the certificate in your account
+        // has not yet been issued" (`RequestInProgressException` doc) — the state this
+        // operation has nothing to hand back in, and the retry signal a client polling
+        // for the certificate loops on.
+        let Some(body) = certificate.certificate_body.clone() else {
+            return Err(GetCertificateErrorModeled::RequestInProgressException(
+                RequestInProgressException {
+                    message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Certificates forming the requested certificate's chain of trust"
+        // (`GetCertificateResponse$CertificateChain` doc). Every certificate ACM hands
+        // out has one: the chain the resource was stored with when it holds one, and
+        // otherwise the certificate itself — the only certificate of its chain of trust
+        // ACM holds for a certificate stored without one.
+        let chain = certificate
+            .certificate_chain
+            .clone()
+            .unwrap_or_else(|| body.clone());
+
+        Ok(GetCertificateOutput {
+            certificate: Some(body),
+            certificate_chain: Some(chain),
+        })
     }
 }

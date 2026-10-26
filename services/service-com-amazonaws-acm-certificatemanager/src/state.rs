@@ -7,7 +7,9 @@
 //! projected from these records — see [`certificate_detail`], [`certificate_summary`]
 //! and [`certificate_search_result`] — so `DescribeCertificate`, `ListCertificates`
 //! and `SearchCertificates` report what `RequestCertificate` stored rather than
-//! echoing their own input.
+//! echoing their own input. The record carries the certificate's own PEM material
+//! beside those facts ([`Certificate::certificate_body`]), so `GetCertificate` hands
+//! back the certificate the resource was stored from.
 //!
 //! Beside them, one [`AcmeEndpointRecord`] per managed ACME endpoint, keyed by its
 //! ARN, plus the idempotency index `CreateAcmeEndpoint` consults
@@ -780,6 +782,24 @@ pub struct Certificate {
     pub serial: Option<String>,
     pub not_before: Option<SystemTime>,
     pub not_after: Option<SystemTime>,
+    /// The PEM-encoded X.509 certificate this ACM resource holds, as the call that
+    /// stored it carried it, so a read reports the certificate itself rather than a
+    /// re-encoding of what was parsed out of it.
+    ///
+    /// `None` for a record no signed certificate exists for: this emulator operates no
+    /// certificate authority and signs nothing, so the only certificate material it
+    /// holds is the material a client imported. `GetCertificate` reports this member,
+    /// and answers the documented "has not yet been issued" refusal
+    /// ([`REQUEST_IN_PROGRESS_MESSAGE`]) while it is absent.
+    pub certificate_body: Option<String>,
+    /// The PEM-encoded chain stored beside [`Self::certificate_body`] — "the
+    /// certificate of the issuing CA and the intermediate certificates of any other
+    /// subordinate CAs" (`GetCertificate` doc) — as the call that stored it carried it.
+    ///
+    /// `None` for a resource stored without one, which holds no issuing authority's
+    /// certificate: the chain of trust `GetCertificate` then reports is the
+    /// certificate itself.
+    pub certificate_chain: Option<String>,
     /// Tag key -> value, as `ListTagsForCertificate` reports them.
     pub tags: BTreeMap<String, String>,
 }
@@ -2188,6 +2208,19 @@ pub fn certificate_resource_message(
 /// certificate nor the status it is in. Rendered here so every operation that requires
 /// an issued certificate reports the same sentence.
 pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+
+/// The `RequestInProgressException` message for a request that asks for the
+/// certificate material of a resource this service holds none for.
+///
+/// `RequestInProgressException` carries one modelled member (`message: String`), and
+/// the model documents the whole error class in one sentence — "The certificate request
+/// is in process and the certificate in your account has not yet been issued"
+/// (`RequestInProgressException` doc) — so that sentence, terminated by a period, is
+/// what the refusal reports. Rendered here so every path that needs an existing
+/// certificate body reports the same sentence.
+pub const REQUEST_IN_PROGRESS_MESSAGE: &str =
+    "The certificate request is in process and the certificate in your account has not yet \
+     been issued.";
 
 /// The refusal sentence for a pagination token the service did not issue.
 ///

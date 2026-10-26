@@ -25,11 +25,12 @@ use crate::certificate_lifecycle::{
 
 /// The implemented operations that resolve `CertificateArn` and model
 /// `ResourceNotFoundException`
-/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,ResendValidationEmail,RevokeCertificate,UpdateCertificateOptions")`).
+/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,GetCertificate,ListTagsForCertificate,ResendValidationEmail,RevokeCertificate,UpdateCertificateOptions")`).
 const CERTIFICATE_LOOKUPS: &[&str] = &[
     "AddTagsToCertificate",
     "DeleteCertificate",
     "DescribeCertificate",
+    "GetCertificate",
     "ListTagsForCertificate",
     "ResendValidationEmail",
     "RevokeCertificate",

@@ -452,6 +452,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             serial: None,
             not_before: None,
             not_after: None,
+            // No certificate authority has signed anything for this request yet, so
+            // there is no PEM material to hand out: `GetCertificate` answers the
+            // documented "has not yet been issued" refusal until there is.
+            certificate_body: None,
+            certificate_chain: None,
             tags,
         };
 

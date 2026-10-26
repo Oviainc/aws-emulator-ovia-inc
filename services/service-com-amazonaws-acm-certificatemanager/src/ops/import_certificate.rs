@@ -9,7 +9,8 @@
 //! already `ISSUED`, with the key pair origin of a key the client generated. The
 //! response is the ARN that record is stored under, so `DescribeCertificate` and the
 //! list and search operations report the imported certificate rather than anything
-//! this service invented.
+//! this service invented. The PEM bodies themselves are stored beside those facts, so
+//! `GetCertificate` hands back the content the import carried.
 //!
 //! A request that names `CertificateArn` replaces the certificate stored under it
 //! ("include this argument only when you want to replace a previously imported
@@ -395,6 +396,14 @@ struct ImportedCertificate {
     extended_key_usages: Vec<String>,
     not_before: ::std::time::SystemTime,
     not_after: ::std::time::SystemTime,
+    /// The PEM text the request carried, held as it arrived apart from its line
+    /// endings: the stored resource is the certificate the client brought, so a later
+    /// read hands back that content rather than a re-encoding of what was parsed out
+    /// of it.
+    body: String,
+    /// The PEM text of the chain the request carried, held the same way, and absent
+    /// for an import that carried none.
+    chain: Option<String>,
 }
 
 impl ImportedCertificate {
@@ -451,6 +460,10 @@ impl ImportedCertificate {
             // The validity window is the certificate's own, not a window ACM chose.
             not_before: Some(self.not_before),
             not_after: Some(self.not_after),
+            // The material `GetCertificate` reports, which this import is what brings
+            // into the store.
+            certificate_body: Some(self.body),
+            certificate_chain: self.chain,
             tags,
         }
     }
@@ -481,8 +494,9 @@ fn imported_certificate(
         invalid_parameter("the Certificate must be one PEM-encoded X.509 certificate")
     })?;
 
-    if let Some(chain) = input.certificate_chain.as_deref() {
-        let chain = X509Certificate::load_pem_chain(chain).map_err(|_| {
+    let mut chain_pem: Option<String> = None;
+    if let Some(chain_body) = input.certificate_chain.as_deref() {
+        let chain = X509Certificate::load_pem_chain(chain_body).map_err(|_| {
             invalid_parameter("the CertificateChain must be PEM-encoded X.509 certificates")
         })?;
         let Some(issuer) = chain.first() else {
@@ -502,6 +516,7 @@ fn imported_certificate(
                  issued the Certificate",
             ));
         }
+        chain_pem = Some(pem_text(chain_body, "CertificateChain")?);
     }
 
     let tbs = &certificate.tbs_certificate;
@@ -546,6 +561,8 @@ fn imported_certificate(
     check_private_key(&input.private_key, &public_key)?;
 
     Ok(ImportedCertificate {
+        body: pem_text(&input.certificate, "Certificate")?,
+        chain: chain_pem,
         domain_name,
         subject_alternative_names: names,
         subject: tbs.subject.to_string(),
@@ -558,6 +575,24 @@ fn imported_certificate(
         not_before,
         not_after,
     })
+}
+
+/// The PEM body `member` carried, as the text ACM stores it as.
+///
+/// "The certificate, private key, and certificate chain must be PEM-encoded"
+/// (`ImportCertificate` doc), and PEM is a text encoding, so a blob that is not text at
+/// all is not one — and could not be reported back under the PEM `@pattern` the read
+/// operations' members carry.
+///
+/// That pattern admits either line ending on input (`\u{000D}?\u{000A}` between the
+/// armour and each base64 line), and ACM's recorded behaviour is to hand the material
+/// back with the newlines alone, so a body that arrived with CRLF endings is stored
+/// without the carriage returns. Nothing else about the body is touched: the
+/// certificate the client brought is the certificate ACM serves.
+fn pem_text(body: &[u8], member: &str) -> Result<String, ImportCertificateError> {
+    let text = ::std::str::from_utf8(body)
+        .map_err(|_| invalid_parameter(format!("the {member} must be PEM-encoded text")))?;
+    Ok(text.replace("\r\n", "\n"))
 }
 
 /// The public key a certificate's `SubjectPublicKeyInfo` carries, with the
