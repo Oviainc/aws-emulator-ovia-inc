@@ -95,6 +95,8 @@ mod publisher_registration;
 mod rds_stack_resources;
 #[path = "all/regional_stack_namespace.rs"]
 mod regional_stack_namespace;
+#[path = "all/resource_scans.rs"]
+mod resource_scans;
 #[path = "all/resource_signals.rs"]
 mod resource_signals;
 #[path = "all/rolled_back_resource_records.rs"]
