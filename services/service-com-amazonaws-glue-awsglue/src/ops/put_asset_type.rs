@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAssetType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAssetType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAssetType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an asset type in this account's per-account asset type namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::asset_types`]), keyed by the request's
+//! `Name`: "Creates or updates an asset type", so a put under a free name mints an asset
+//! type and a put under a name already stored replaces that asset type's forms, keeping
+//! the id the first put minted. Each form reference names a form type in the SAME store,
+//! by the `FormTypeId` the catalog minted for it or by the `FormTypeName` it was
+//! registered under, so a reference to a form type this account does not hold is refused
+//! with the modelled `EntityNotFoundException` rather than stored. `GetAssetType` reads
+//! the record back by the minted id.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAssetType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAssetTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAssetType"))
+        // `ClientToken` is the request's idempotency token, and this operation needs no
+        // bookkeeping to honour it: the write is keyed by `Name` and replaces that asset
+        // type's whole set of forms, so a retried put stores the same record and answers
+        // with the same id, name and forms as the put it retries.
+        let _ = (ctx, &input.client_token);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(PutAssetTypeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue asset type store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // "Each entry references the form type that defines the form's schema": a
+        // reference resolves against the form types THIS store holds, by the identifier
+        // the catalog minted for one or by the name it was registered under
+        // ([`crate::state::ComAmazonawsGlueAwsglueState::form_type_by_reference`]), so a
+        // put naming a form type that was never registered addresses an entity that does
+        // not exist and is refused with this operation's modelled
+        // `EntityNotFoundException` rather than stored. The reference is stored exactly as
+        // sent, so a read reports the identifier the client wrote.
+        let mut forms: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for (form_name, reference) in &input.forms {
+            if store
+                .form_type_by_reference(&reference.form_type_identifier)
+                .is_none()
+            {
+                return Err(PutAssetTypeErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        // What is pinned is the behaviour — 400 with
+                        // `EntityNotFoundException`; the wording names the member that
+                        // resolved to nothing, taken from the request.
+                        message: Some(format!(
+                            "Form type {} not found",
+                            reference.form_type_identifier
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            forms.insert(form_name.clone(), reference.form_type_identifier.clone());
+        }
+
+        // "If an asset type with the given name already exists, it is updated": the name
+        // decides which. A name this store already holds is UPDATED in place — the stored
+        // forms become the request's, and the id minted when the name was first stored is
+        // kept, so a caller holding that id still addresses the asset type it addressed
+        // before.
+        let stored = if let Some(existing) = store.asset_types.get_mut(&input.name) {
+            existing.forms = forms;
+            existing.clone()
+        } else {
+            // The store is resident memory and this put is reachable by any caller, so
+            // the number of records one process will hold is bounded. `PutAssetType`
+            // models no limit error, so past the ceiling the request is refused with the
+            // closest client error it does model rather than with a server fault, which
+            // an SDK would retry.
+            if !store.can_store_asset_type() {
+                return Err(PutAssetTypeErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} asset types",
+                            crate::state::MAX_ASSET_TYPES
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            let fresh = crate::state::AssetTypeEntry::new(input.name.clone(), forms);
+            store.asset_types.insert(input.name.clone(), fresh.clone());
+            fresh
+        };
+        ::tracing::info!(
+            operation = "PutAssetType",
+            asset_type = %stored.name,
+            forms = stored.forms.len(),
+            "stored a Glue asset type"
+        );
+
+        // Every member comes from the record now in the store, so the put reports the
+        // asset type a later `GetAssetType` of the same id reports.
+        Ok(PutAssetTypeOutput {
+            id: Some(stored.id.clone()),
+            name: Some(stored.name.clone()),
+            forms: Some(stored.forms_map()),
+        })
     }
 }

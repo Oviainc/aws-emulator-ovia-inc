@@ -5,8 +5,9 @@
 //! Reports the metadata form type the request's `Identifier` names: the records
 //! `PutFormType` keeps in
 //! [`crate::state::ComAmazonawsGlueAwsglueState::form_types`] are addressed by the
-//! `FormTypeId` a put minted (`Identifier` targets the same `FormTypeId` shape the put's
-//! `Id` carries), and an identifier this account holds no form type under is a miss.
+//! identifier a client holds for one — the `FormTypeId` a put minted (`Identifier` targets
+//! the same `FormTypeId` shape the put's `Id` carries) or the name it was registered under
+//! — and an identifier this account holds no form type under is a miss.
 //!
 //! ## Shape of an operation
 //!
@@ -156,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: the stored form type is projected out and nothing is written.
         let store = state.lock();
-        let Some(entry) = store.form_type_by_id(&input.identifier) else {
+        let Some(entry) = store.form_type_by_reference(&input.identifier) else {
             return Err(GetFormTypeErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     // Wording for this slice is pinned by no recording or doc, so the
