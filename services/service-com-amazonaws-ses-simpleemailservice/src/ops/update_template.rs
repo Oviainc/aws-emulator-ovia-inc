@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +129,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let Template {
+            template_name,
+            subject_part,
+            text_part,
+            html_part,
+        } = input.template;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTemplate",
+            ));
+        };
+        let mut state = state.lock();
+
+        // Updating is not creating: this operation replaces the content of a
+        // template the account already holds, so a name the store holds nothing
+        // under is the modelled absence — whatever parts the request carries —
+        // and recording a new template is what `CreateTemplate` is for. The
+        // refusal names the template the request named, as the sibling reader in
+        // `get_template.rs` does. One lookup serves both the refusal and the
+        // write, so no later step has to assume the entry is there.
+        let Some(stored) = state.templates.get_mut(&template_name) else {
+            return Err(UpdateTemplateErrorModeled::TemplateDoesNotExistException(
+                TemplateDoesNotExistException {
+                    template_name: Some(template_name.clone()),
+                    message: Some(format!("Template {template_name} does not exist.")),
+                },
+            )
+            .into());
+        };
+
+        // A template is "composed of a subject line and either an HTML part or a
+        // text-only part" (`Template`), which holds however the template reaches
+        // the store: the subject is the one part a send cannot supply for itself,
+        // so an update that would leave the template carrying none is refused
+        // rather than replacing a usable template with one no send could ever
+        // use. `SubjectPart` carries no length bound in the model, so a subject
+        // sent as an empty string reaches here, and it is the same absence.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTemplate"))
+        // The refusal is the parameter-value one `create_template.rs` answers the
+        // same request with, not the modelled `InvalidTemplateException`: that
+        // error is for content that "could not be rendered" — a body whose markup
+        // or partial a render failed on — and a request that names no subject at
+        // all never got as far as having content to render.
+        if subject_part.as_deref().unwrap_or_default().is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                "The subject must be specified.",
+            ));
+        }
+
+        // The request carries the WHOLE `Template`, so an update REPLACES the
+        // template's content: a part the request does not send is absent
+        // afterwards instead of keeping what the previous content held. The parts
+        // are stored exactly as they were sent — a template is rendered when a
+        // send names it, never rewritten here — and the creation instant
+        // `ListTemplates` reports (`TemplateMetadata$CreatedTimestamp`, "The time
+        // and date the template was created") belongs to the create, so replacing
+        // the content leaves it alone. Nothing is added to the store, so its
+        // ceiling is not reached by an update.
+        stored.subject_part = subject_part;
+        stored.text_part = text_part;
+        stored.html_part = html_part;
+
+        Ok(UpdateTemplateOutput {})
     }
 }

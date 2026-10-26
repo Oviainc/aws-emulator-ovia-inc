@@ -39,10 +39,14 @@ mod ses_receipt_rule_sets;
 mod ses_store_bounds;
 #[path = "all/ses_template_creation.rs"]
 mod ses_template_creation;
+#[path = "all/ses_template_delete.rs"]
+mod ses_template_delete;
 #[path = "all/ses_template_deletion.rs"]
 mod ses_template_deletion;
 #[path = "all/ses_template_listing.rs"]
 mod ses_template_listing;
+#[path = "all/ses_template_update.rs"]
+mod ses_template_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The `z`-prefixed service-wide suites sort after the per-operation ones;
