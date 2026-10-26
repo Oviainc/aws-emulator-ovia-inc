@@ -1460,12 +1460,21 @@ pub struct Service {
     pub enable_execute_command: bool,
     pub availability_zone_rebalancing: Option<String>,
     pub resource_management_type: Option<String>,
+    pub version: i64,
+    pub run_status: Option<String>,
+    pub extend_deployment_time_period: i32,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#Deployment")]
 #[derive(Debug, Clone, Default)]
 pub struct Deployment {
     pub id: Option<String>,
+    pub scale: Option<Scale>,
+    pub stability_status: Option<String>,
+    pub healthy_task_count: i32,
+    pub failed_launch_task_count: i32,
+    pub replaced_task_count: i32,
+    pub total_failed_tasks: i32,
     pub status: Option<String>,
     pub task_definition: Option<String>,
     pub desired_count: i32,

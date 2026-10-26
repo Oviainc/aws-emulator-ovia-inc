@@ -1019,6 +1019,23 @@ pub const DEPLOYMENT_ACTIVE: &str = "ACTIVE";
 /// the ones still being replaced.
 pub const MAX_SUPERSEDED_DEPLOYMENTS: usize = 10;
 
+/// `Service$runStatus` for a service whose scheduler has nothing outstanding: everything
+/// the service wants is in place.
+///
+/// The member is not in the Smithy model — it is one of the members the real service
+/// returns beside the modelled ones — so its three values are the ones recorded responses
+/// carry, and each reports what the scheduler still owes the service (see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_run_status`]).
+pub const RUN_STATUS_STEADY_STATE: &str = "SteadyState";
+
+/// See [`RUN_STATUS_STEADY_STATE`]: the scheduler still has work to do for this service —
+/// a task or a task set it has to place or let go of.
+pub const RUN_STATUS_MORE_WORK: &str = "MoreWork";
+
+/// See [`RUN_STATUS_STEADY_STATE`]: the service record is the tombstone of a service whose
+/// deletion has finished, which runs nothing at all.
+pub const RUN_STATUS_TOMBSTONE: &str = "TOMBSTONE";
+
 /// `Deployment$rolloutState` while the deployment is still placing tasks — the member's
 /// doc: "When a service deployment is started, it begins in an `IN_PROGRESS` state."
 pub const ROLLOUT_IN_PROGRESS: &str = "IN_PROGRESS";
@@ -2681,8 +2698,8 @@ pub struct ServiceRecord {
     pub enable_execute_command: bool,
     pub availability_zone_rebalancing: String,
     pub tags: Vec<Tag>,
-    /// `Service$createdBy`: "The principal that created the service" — the principal of
-    /// the request that created it, resolved by [`caller_principal`].
+    /// `Service$createdBy`: "The principal that created the service" — the authenticated
+    /// caller of the request that created it, resolved by [`caller_identity_arn`].
     pub created_by: String,
     /// `Service$events`: "The event stream for your service", OLDEST first. The
     /// scheduler's own narrative: an entry is appended only when a transition the clock
@@ -2718,6 +2735,33 @@ pub struct ServiceRecord {
     /// deployment transitions to a COMPLETED state" — so a rollout is never COMPLETED in
     /// the same instant the call that started it answers; the CLOCK settles it.
     pub deployment_steady_due_at: Option<SystemTime>,
+    /// Whether the current deployment's rollout has reached its steady state at least
+    /// once, and so whether that deployment has TAKEN OVER the service: the share of the
+    /// service's desired count it is scaled to (`Deployment$scale`) follows from it.
+    ///
+    /// Kept beside [`Self::deployment_steady_due_at`] rather than read off it, because
+    /// scaling a service that has already settled puts the scheduler back to work
+    /// (re-opening that instant) without handing the service back to an earlier rollout.
+    pub deployment_rollout_completed: bool,
+    /// When the scheduler's confirmation that the current deployment is STABLE falls due,
+    /// or `None` once it has been confirmed.
+    ///
+    /// `Deployment$stabilityStatus` is the deployment-level counterpart of
+    /// `TaskSet$stabilityStatus` ("whether the task set has reached a steady state"), and
+    /// the scheduler re-confirms it after every write that touches the deployment, so a
+    /// caller that reads the service straight after writing it sees `STABILIZING` — a span
+    /// the CLOCK settles ([`TRANSITION_SPAN`]), stored rather than slept on.
+    pub deployment_stable_due_at: Option<SystemTime>,
+    /// Whether this service has reached a steady state at least once, and so whether its
+    /// run status is one the scheduler has anything to say about (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_run_status`]).
+    /// Sticky: a later deployment does not take it back.
+    pub reached_steady_state: bool,
+    /// `Service$version`: the version of the configuration the service runs, which is `0`
+    /// for the service as created and advances with every NEW service revision the service
+    /// rolls out (the member is not in the Smithy model; recorded responses carry `0`
+    /// through updates that start no new deployment).
+    pub version: i64,
     /// The deployments this one REPLACED and whose tasks are still being replaced,
     /// newest first. `Deployment$status`: "ACTIVE: A service deployment that still has
     /// running tasks, but are in the process of being replaced with a new launch type,
@@ -2847,7 +2891,7 @@ impl ServiceRecord {
                 service_connect_configuration: self.service_connect_configuration.clone(),
                 volume_configurations: self.volume_configurations.clone(),
                 vpc_lattice_configurations: self.vpc_lattice_configurations.clone(),
-                rollout_completed: self.deployment_steady_due_at.is_none(),
+                rollout_completed: self.deployment_rollout_completed,
                 replaced_due_at: now + TRANSITION_SPAN,
             },
         );
@@ -3515,6 +3559,49 @@ pub struct ServiceTally {
     pub pending: i32,
 }
 
+/// What one pass over the task map counts for ONE deployment of a service, beside its
+/// RUNNING/PENDING split: see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::deployment_counters`].
+#[derive(Debug, Clone, Copy, Default)]
+struct DeploymentCounters {
+    /// The deployment's tasks that count as healthy (`Deployment$healthyTaskCount`).
+    healthy: i32,
+    /// The tasks it lost while it still wanted them (`Deployment$totalFailedTasks`).
+    total_failed: i32,
+    /// Of those, the ones that never reached `RUNNING`
+    /// (`Deployment$failedLaunchTaskCount`).
+    failed_launch: i32,
+    /// The tasks of an earlier deployment it replaced (`Deployment$replacedTaskCount`).
+    replaced: i32,
+}
+
+/// `sequence` spelled as a UUID: the five hyphen-separated groups of 8, 4, 4, 4 and 12
+/// hexadecimal digits Amazon ECS spells an identifier of this kind in, with the counter
+/// carried in the first and last group so every id is distinct.
+///
+/// Defined once, so every member whose id AWS spells as a UUID takes the same shape.
+fn uuid_from_sequence(sequence: u64) -> String {
+    format!("{sequence:08x}-0000-0000-0000-{sequence:012x}")
+}
+
+/// The `Scale` a deployment is reported with: the share of the service's `desiredCount`
+/// that deployment is scaled to, as the percentage `Scale` measures
+/// ([`SCALE_UNIT_PERCENT`]).
+///
+/// A deployment that has taken the service over holds the whole of it
+/// ([`MAX_SCALE_PERCENT`]); one that has not — a rollout still under way, or one a newer
+/// deployment has replaced — holds none of it ([`MIN_SCALE_PERCENT`]).
+fn deployment_scale(taken_over: bool) -> Scale {
+    Scale {
+        value: if taken_over {
+            MAX_SCALE_PERCENT
+        } else {
+            MIN_SCALE_PERCENT
+        },
+        unit: Some(SCALE_UNIT_PERCENT.to_string()),
+    }
+}
+
 /// Per-service state for com-amazonaws-ecs-amazonec2containerservicev20141113. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -3809,6 +3896,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             };
             if settled.is_some() {
                 service.deployment_steady_due_at = None;
+                // The rollout has taken the service over, and the service has reached a
+                // steady state at least once — neither of which a later rollout undoes.
+                service.deployment_rollout_completed = true;
+                service.reached_steady_state = true;
                 service.events.extend(events);
                 // "A maximum of 100 of the latest events are displayed", so only the
                 // latest are kept at all.
@@ -3817,9 +3908,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     service.events.drain(..first_kept);
                 }
             }
+            // The scheduler's confirmation that the deployment is stable, owed at the
+            // instant the write that touched it put on the record: once it is due the
+            // deployment is stable whether or not anybody called.
+            if service.deployment_stable_due_at.is_some_and(|due| due <= now) {
+                service.deployment_stable_due_at = None;
+            }
             if drained {
                 service.status = SERVICE_INACTIVE.to_string();
                 service.drain_due_at = None;
+                // The deletion is over, and the tombstone it leaves keeps no event
+                // stream: a deleted service reports none of the events of the service it
+                // used to be.
+                service.events.clear();
             }
             if !replaced.is_empty() {
                 service
@@ -3851,13 +3952,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
-    /// Mint one service event at `at`, with the next event id (32 lowercase hex digits,
-    /// the shape every id this emulator mints takes). `ServiceEvent$id` is "The ID string
-    /// of the event", with no documented format.
+    /// Mint one service event at `at`, with the next event id.
+    ///
+    /// `ServiceEvent$id` is "The ID string of the event"; Amazon ECS spells it as a UUID
+    /// ([`uuid_from_sequence`]), and the counter is what makes every event of every
+    /// service distinct.
     fn mint_service_event(&mut self, at: SystemTime, message: String) -> ServiceEventRecord {
         self.next_service_event_seq += 1;
         ServiceEventRecord {
-            id: format!("{:032x}", self.next_service_event_seq),
+            id: uuid_from_sequence(self.next_service_event_seq),
             created_at: DateTime::from(at),
             message,
         }
@@ -3879,13 +3982,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// Mint the next attachment id. `Attachment$id` is "the unique identifier for the
-    /// attachment", which Amazon ECS spells as a UUID — the form the five hyphen-separated
-    /// hexadecimal groups below take; the counter is what makes every attachment of every
-    /// task distinct.
+    /// attachment", which Amazon ECS spells as a UUID ([`uuid_from_sequence`]); the
+    /// counter is what makes every attachment of every task distinct.
     pub fn next_attachment_id(&mut self) -> String {
         self.next_attachment_seq += 1;
-        let sequence = self.next_attachment_seq;
-        format!("{:08x}-0000-0000-0000-{:012x}", sequence, sequence)
+        uuid_from_sequence(self.next_attachment_seq)
     }
 
     /// The attachments Amazon ECS allocates to a task it is placing, from the task
@@ -4563,6 +4664,23 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let deployment_platform_version = requested_platform_version
             .as_deref()
             .map(|requested| resolved_platform_version(requested, &os_family));
+        let service_tasks = self.service_tasks(service);
+        // When each of the service's deployments started, newest first: the primary one
+        // and the ones it is still replacing.
+        let mut generations: Vec<(&str, DateTime)> =
+            vec![(service.deployment_id.as_str(), service.deployment_created_at)];
+        generations.extend(
+            service
+                .superseded_deployments
+                .iter()
+                .map(|superseded| (superseded.id.as_str(), superseded.created_at)),
+        );
+        let counters = Self::deployment_counters(
+            &service_tasks,
+            &service.deployment_id,
+            service.deployment_created_at,
+            &generations,
+        );
         let deployment = Deployment {
             id: Some(service.deployment_id.clone()),
             status: Some(DEPLOYMENT_PRIMARY.to_string()),
@@ -4573,6 +4691,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // Nothing executes a container here, so no task of a deployment ever fails
             // to start: the count is a true zero rather than an invented number.
             failed_tasks: 0,
+            healthy_task_count: counters.healthy,
+            failed_launch_task_count: counters.failed_launch,
+            replaced_task_count: counters.replaced,
+            total_failed_tasks: counters.total_failed,
+            // The share of the service's desired count this deployment is scaled to: the
+            // whole of it once the rollout has taken the service over, and none of it
+            // while the rollout is still under way.
+            scale: Some(deployment_scale(service.deployment_rollout_completed)),
+            // Stable when the scheduler's confirmation is in AND the deployment holds the
+            // tasks the service wants, which is what the `stabilityStatus` of a task set
+            // reads ("The task `runningCount` is equal to the `computedDesiredCount`",
+            // "The `pendingCount` is 0"); anything else is still stabilizing.
+            stability_status: Some(
+                if settled
+                    && service.deployment_stable_due_at.is_none()
+                    && tally.running == service.desired_count
+                    && tally.pending == 0
+                {
+                    STABILITY_STATUS_STEADY_STATE
+                } else {
+                    STABILITY_STATUS_STABILIZING
+                }
+                .to_string(),
+            ),
             created_at: Some(service.deployment_created_at),
             updated_at: Some(service.deployment_updated_at),
             capacity_provider_strategy: capacity_provider_strategy.clone(),
@@ -4638,12 +4780,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // (`Deployment$status`: "ACTIVE: A service deployment that still has
                 // running tasks, but are in the process of being replaced").
                 let mut deployments = vec![deployment];
-                deployments.extend(
-                    service
-                        .superseded_deployments
-                        .iter()
-                        .map(|superseded| self.superseded_deployment_view(service, superseded)),
-                );
+                deployments.extend(service.superseded_deployments.iter().map(|superseded| {
+                    self.superseded_deployment_view(
+                        service,
+                        superseded,
+                        &service_tasks,
+                        &generations,
+                    )
+                }));
                 deployments
             } else {
                 Vec::new()
@@ -4704,7 +4848,128 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             enable_execute_command: service.enable_execute_command,
             availability_zone_rebalancing: Some(service.availability_zone_rebalancing.clone()),
             resource_management_type: Some(service.resource_management_type().to_string()),
+            // The version of the configuration the service runs, as stored: it advances
+            // with every new service revision the service rolls out.
+            version: service.version,
+            // What the scheduler still owes the service, for a service it has run at all.
+            run_status: self.service_run_status(service),
+            // The extra time period the service's current deployment has been granted.
+            // Nothing grants one: no operation of this API extends a deployment's time
+            // period, so every service reports none — a true zero rather than an invented
+            // number.
+            extend_deployment_time_period: 0,
         }
+    }
+
+    /// `Service$runStatus`: what the scheduler still owes this service, or `None` for a
+    /// service it has not run at all.
+    ///
+    /// The member is not in the Smithy model, so its readings come from the recorded
+    /// responses of the real service: the tombstone a finished deletion leaves reports
+    /// [`RUN_STATUS_TOMBSTONE`], a service whose scheduler still has a task or a task set
+    /// to place or let go of reports [`RUN_STATUS_MORE_WORK`], and one with nothing
+    /// outstanding reports [`RUN_STATUS_STEADY_STATE`]. A service the scheduler has not
+    /// worked on yet — freshly created, neither settled nor being deleted — has no run to
+    /// report and carries no run status at all.
+    fn service_run_status(&self, service: &ServiceRecord) -> Option<String> {
+        if service.status == SERVICE_INACTIVE {
+            return Some(RUN_STATUS_TOMBSTONE.to_string());
+        }
+        let deleting = service.status != SERVICE_ACTIVE;
+        if !deleting && !service.reached_steady_state {
+            return None;
+        }
+        Some(
+            if self.service_has_outstanding_work(service) {
+                RUN_STATUS_MORE_WORK
+            } else {
+                RUN_STATUS_STEADY_STATE
+            }
+            .to_string(),
+        )
+    }
+
+    /// Whether the scheduler still has work to do for `service`.
+    ///
+    /// A service whose deletion has started still has to let go of the tasks and task sets
+    /// it holds ("if there are still running tasks that require cleanup, the service status
+    /// moves from ACTIVE to DRAINING"), so those are its outstanding work. A live service's
+    /// work is the difference between the task set it wants and the one it has: a task
+    /// still coming up, or a count that is not yet the one it was asked for.
+    fn service_has_outstanding_work(&self, service: &ServiceRecord) -> bool {
+        if service.status != SERVICE_ACTIVE {
+            return self.service_has_active_tasks(&service.cluster_name, &service.name)
+                || !self
+                    .service_task_sets(&service.cluster_name, &service.name)
+                    .is_empty();
+        }
+        let tally = self.service_tally(&service.cluster_name, &service.name);
+        tally.pending > 0 || (service.places_tasks() && tally.running != service.desired_count)
+    }
+
+    /// Every task of ONE service, collected once so the counts of its deployments cost one
+    /// pass over the task map rather than one per deployment.
+    fn service_tasks(&self, service: &ServiceRecord) -> Vec<&TaskRecord> {
+        self.tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == service.cluster_name
+                    && task.service_name.as_deref() == Some(service.name.as_str())
+            })
+            .collect()
+    }
+
+    /// What the task map counts for ONE deployment of a service beyond its RUNNING/PENDING
+    /// split ([`Self::deployment_tally`]): the tasks it holds that count as healthy, the
+    /// ones it lost, and the ones of an earlier deployment it replaced.
+    ///
+    /// Every count is read off the task records, so none of them can drift from the tasks
+    /// that exist. `tasks` is the service's own tasks, collected ONCE per reported service
+    /// ([`Self::service_tasks`]) and shared by every deployment of it. `created_at` is the
+    /// instant the deployment started, and `generations` is when each of the service's
+    /// deployments started: a task counts as REPLACED by this deployment only when it
+    /// stopped since this deployment started and the deployment that placed it is not one
+    /// that started later, so a deployment is never credited with replacing the tasks of
+    /// the rollout that replaced IT.
+    fn deployment_counters(
+        tasks: &[&TaskRecord],
+        deployment_id: &str,
+        created_at: DateTime,
+        generations: &[(&str, DateTime)],
+    ) -> DeploymentCounters {
+        let instant = |at: DateTime| (at.secs(), at.subsec_nanos());
+        let started = instant(created_at);
+        let mut counters = DeploymentCounters::default();
+        for task in tasks {
+            if task.started_by.as_deref() == Some(deployment_id) {
+                // "Tasks for services that don't use a load balancer are considered
+                // healthy if they're in the RUNNING state" — a load-balanced service's
+                // tasks additionally have to be reported healthy by the load balancer,
+                // which is the load balancer's report and not something the service
+                // holds, so a task's own status is what this counts either way.
+                if task.last_status == STATUS_RUNNING {
+                    counters.healthy += 1;
+                }
+                // A task the deployment lost while it still wanted it running is one that
+                // failed; one the scheduler asked to stop (scaled in, replaced, drained
+                // away with its service) is not.
+                if task.last_status == STATUS_STOPPED && task.desired_status == STATUS_RUNNING {
+                    counters.total_failed += 1;
+                    // And one that never reached RUNNING failed to LAUNCH.
+                    if task.started_at.is_none() {
+                        counters.failed_launch += 1;
+                    }
+                }
+            } else if task.last_status == STATUS_STOPPED
+                && task.stopped_at.is_some_and(|at| instant(at) >= started)
+                && !generations.iter().any(|(id, at)| {
+                    task.started_by.as_deref() == Some(*id) && instant(*at) >= started
+                })
+            {
+                counters.replaced += 1;
+            }
+        }
+        counters
     }
 
     /// The `Deployment` a SUPERSEDED deployment is reported as: the configuration it was
@@ -4717,6 +4982,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &self,
         service: &ServiceRecord,
         superseded: &SupersededDeployment,
+        service_tasks: &[&TaskRecord],
+        generations: &[(&str, DateTime)],
     ) -> Deployment {
         let tally = self.deployment_tally(&service.cluster_name, &superseded.id);
         let fargate = superseded.launch_type.as_deref() == Some(LAUNCH_TYPE_FARGATE)
@@ -4733,6 +5000,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 &os_family,
             )
         });
+        let counters =
+            Self::deployment_counters(service_tasks, &superseded.id, superseded.created_at, generations);
         Deployment {
             id: Some(superseded.id.clone()),
             status: Some(DEPLOYMENT_ACTIVE.to_string()),
@@ -4741,6 +5010,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             pending_count: tally.pending,
             running_count: tally.running,
             failed_tasks: 0,
+            healthy_task_count: counters.healthy,
+            failed_launch_task_count: counters.failed_launch,
+            replaced_task_count: counters.replaced,
+            total_failed_tasks: counters.total_failed,
+            // A newer deployment has taken the service over, so none of the service's
+            // desired count is this one's share any more.
+            scale: Some(deployment_scale(false)),
+            // Its task set "is in the process of being replaced", which is work still
+            // under way, so it has not reached a steady state.
+            stability_status: Some(STABILITY_STATUS_STABILIZING.to_string()),
             created_at: Some(superseded.created_at),
             updated_at: Some(superseded.updated_at),
             capacity_provider_strategy: superseded
@@ -4892,6 +5171,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // drain further out.
         service.status = SERVICE_DRAINING.to_string();
         service.drain_due_at = Some(service.drain_due_at.unwrap_or(now + TRANSITION_SPAN));
+        // The delete is a write that touches the deployment, so its stability is
+        // re-confirmed from here (see `ServiceRecord::deployment_stable_due_at`).
+        service.deployment_stable_due_at = Some(now + TRANSITION_SPAN);
         // A deleted service has no rollout left to settle.
         service.deployment_steady_due_at = None;
         // And the rollout that was still under way ends here with it, rather than being
@@ -6410,12 +6692,10 @@ pub fn cluster_arn(region: &str, name: &str) -> String {
 /// Every request this emulator serves is signed with the emulator's own credentials, so
 /// the caller is the one IAM user it publishes — the very principal its
 /// `sts:GetCallerIdentity` answers, built the same way, so the principal a response
-/// names is one the caller can look up.
-///
-/// Distinct from [`caller_principal`], which spells a per-request name out of the
-/// request's own access key id: a member AWS fills from the AUTHENTICATED IAM identity
-/// has to name an identity that identity service knows, and a name derived from an
-/// access key id is not one.
+/// names is one the caller can look up. A name spelled out of the request's own access
+/// key id would not be one: a member AWS fills from the AUTHENTICATED IAM identity has to
+/// name an identity that identity service knows, and the same caller holds the same
+/// identity on every call it makes.
 pub fn caller_identity_arn() -> String {
     ::engine::emulator_arn("iam", "", "user/emulator")
 }
@@ -6768,26 +7048,6 @@ pub fn requested_role_arn(requested: Option<&str>) -> Option<String> {
 /// region, which is what the empty region renders.
 pub fn service_linked_role_arn() -> String {
     ::engine::emulator_arn("iam", "", SERVICE_LINKED_ROLE_RESOURCE)
-}
-
-/// The principal that made this request, for `Service$createdBy`.
-///
-/// Derived from the request's own SigV4 access key id, so the member reports WHO called
-/// rather than a fabricated identity. That id is caller-controlled text, so it is first
-/// reduced to the characters an access key id can hold.
-pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    let raw = ::engine::extract_akid(&ctx.parts().headers);
-    let filtered: String = raw
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(128)
-        .collect();
-    let akid = if filtered.is_empty() {
-        "default"
-    } else {
-        filtered.as_str()
-    };
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
 }
 
 /// The ARN of a service revision:

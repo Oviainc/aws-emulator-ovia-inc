@@ -203,6 +203,27 @@ pub(crate) async fn register_instance(
     string(&body["containerInstance"], "containerInstanceArn", case)
 }
 
+/// The principal every caller of this emulator authenticates as, and so the one a "who
+/// created this" member names: the identity `sts:GetCallerIdentity` publishes
+/// (`arn:aws:iam::<account>:user/emulator`).
+pub(crate) fn caller_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:user/emulator")
+}
+
+/// An integer member that must REACH the wire, as `Some(value)`, and `None` for a member
+/// the response left out — so an assertion on a member whose expected value is its
+/// modelled default cannot pass against a projection that never wrote it.
+pub(crate) fn present_count(body: &Value, member: &str, case: &str) -> Option<i64> {
+    match &body[member] {
+        Value::Null => None,
+        value => Some(
+            value
+                .as_i64()
+                .unwrap_or_else(|| panic!("case {case:?}: expected an integer {member}, got {body}")),
+        ),
+    }
+}
+
 /// The `networkConfiguration` every launch of an `awsvpc` task definition has to carry:
 /// an `awsvpc` task gets its own elastic network interface, so `CreateService`,
 /// `UpdateService` and `RunTask` must say which subnets and security groups it takes

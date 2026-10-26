@@ -806,7 +806,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| crate::state::AZ_REBALANCING_ENABLED.to_string()),
             tags: input.tags.clone().unwrap_or_default(),
-            created_by: crate::state::caller_principal(ctx),
+            // "The principal that created the service": the authenticated caller, the
+            // identity every request to this emulator signs as.
+            created_by: crate::state::caller_identity_arn(),
             // The event stream starts empty: the scheduler has not reached a steady
             // state yet, and nothing else has happened to write about.
             events: Vec::new(),
@@ -825,6 +827,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             // A created service is not being drained away: nothing has deleted it.
             drain_due_at: None,
+            // The rollout this create starts has not taken the service over yet, and the
+            // service has reached no steady state: it is the create that starts the work.
+            deployment_rollout_completed: false,
+            reached_steady_state: false,
+            // The scheduler confirms the new deployment's stability a span after the
+            // create, so the created service reports a deployment that is STABILIZING.
+            deployment_stable_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            // The configuration the service was created with is its first: version 0.
+            version: 0,
             // A created service has replaced no deployment of its own.
             superseded_deployments: Vec::new(),
         };

@@ -87,6 +87,8 @@ mod service_listing;
 mod service_load_balancer_cross_field;
 #[path = "all/service_projection.rs"]
 mod service_projection;
+#[path = "all/service_run_state.rs"]
+mod service_run_state;
 #[path = "all/service_validation.rs"]
 mod service_validation;
 #[path = "all/state_roundtrip.rs"]

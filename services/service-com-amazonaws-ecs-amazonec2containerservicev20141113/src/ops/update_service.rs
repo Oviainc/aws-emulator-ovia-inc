@@ -863,6 +863,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(deployment_id) = new_deployment_id {
             service.deployment_id = deployment_id;
             service.deployment_created_at = updated_at;
+            // A new deployment rolls out a new service revision, so the configuration the
+            // service runs is a new version of it — and the new rollout has taken nothing
+            // over yet.
+            service.version += 1;
+            service.deployment_rollout_completed = false;
         }
         if let Some(arn) = new_revision_arn {
             service.service_revision_arn = arn;
@@ -870,6 +875,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if restarts_rollout {
             service.deployment_steady_due_at = Some(now + crate::state::TRANSITION_SPAN);
         }
+        // This update is a write that touches the deployment, so the scheduler confirms
+        // its stability afresh: the updated service reports a STABILIZING deployment until
+        // that confirmation falls due.
+        service.deployment_stable_due_at = Some(now + crate::state::TRANSITION_SPAN);
         service.deployment_updated_at = updated_at;
 
         // The scheduler brings the task set back in line with what the service now

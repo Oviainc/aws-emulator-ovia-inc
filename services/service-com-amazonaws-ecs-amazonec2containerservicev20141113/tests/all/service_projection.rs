@@ -30,17 +30,13 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, list, ok, refused, register_capacity, register_definition, service, string, ACCOUNT,
-    SIGNED_REGION,
+    caller_principal, count, list, ok, refused, register_capacity, register_definition, service,
+    string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
 /// fall due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
-
-/// The access key id the harness signs every request with, so `createdBy` reports THIS
-/// caller rather than a fabricated identity.
-const CALLER_AKID: &str = "AKIDECSTEST";
 
 /// Describe one service, asserting it is reported (rather than failed) and returning it.
 async fn describe(
@@ -316,8 +312,8 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
         for reported in [&created, &read] {
             assert_eq!(
                 string(reported, "createdBy", case),
-                format!("arn:aws:iam::{ACCOUNT}:user/{CALLER_AKID}"),
-                "case {case:?}: createdBy must name the calling principal, got {reported}"
+                caller_principal(),
+                "case {case:?}: createdBy must name the authenticated caller, got {reported}"
             );
             assert_eq!(
                 string(&reported["deploymentController"], "type", case),
