@@ -193,12 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        let mut budget = crate::state::project_budget(stored, now);
-        // "Specifies whether the response includes the filter expression associated with
-        // the budget" — so it is left out until the caller asks for it.
-        if !input.show_filter_expression.unwrap_or(false) {
-            budget.filter_expression = None;
-        }
+        // The `ShowFilterExpression` projection is the shared one
+        // (`crate::state::with_shown_filter_expression`), so this read and the list read
+        // report the same members for the same stored budget.
+        let budget = crate::state::with_shown_filter_expression(
+            crate::state::project_budget(stored, now),
+            input.show_filter_expression,
+        );
 
         Ok(DescribeBudgetOutput {
             budget: Some(budget),

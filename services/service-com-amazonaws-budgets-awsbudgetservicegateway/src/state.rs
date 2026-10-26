@@ -1371,6 +1371,28 @@ pub fn budget_as_read(budget: &Budget, at: SystemTime) -> Budget {
     budget
 }
 
+/// `budget` as a read that takes `ShowFilterExpression` reports it: with its
+/// `FilterExpression` only when the caller asked for it.
+///
+/// "Specifies whether the response includes the filter expression associated with the
+/// budget" (`DescribeBudgetRequest$ShowFilterExpression`, and the same sentence on
+/// `DescribeBudgetsRequest$ShowFilterExpression`) — so the member is left out until the
+/// flag is sent true, and a request that omits the flag asked for nothing. Every other
+/// member is reported either way.
+///
+/// The ONE home for that flag, applied on top of [`project_budget`] / [`budget_as_read`]
+/// by each read that models it, so the single read and the list read cannot come to
+/// report different members for the same stored budget.
+pub fn with_shown_filter_expression(
+    mut budget: Budget,
+    show_filter_expression: Option<bool>,
+) -> Budget {
+    if !show_filter_expression.unwrap_or(false) {
+        budget.filter_expression = None;
+    }
+    budget
+}
+
 /// The amount of cost or usage attributed to a budget this emulator holds.
 ///
 /// Nothing in this emulator spends behind a budget — it holds budgets, their

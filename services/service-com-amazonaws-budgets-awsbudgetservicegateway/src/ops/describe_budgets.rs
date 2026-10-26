@@ -200,14 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let show_filter_expression = input.show_filter_expression.unwrap_or(false);
+        // The `ShowFilterExpression` projection is the shared one
+        // (`crate::state::with_shown_filter_expression`), so this read and the single read
+        // report the same members for the same stored budget.
         let page = page
             .into_iter()
-            .map(|mut budget| {
-                if !show_filter_expression {
-                    budget.filter_expression = None;
-                }
-                budget
+            .map(|budget| {
+                crate::state::with_shown_filter_expression(budget, input.show_filter_expression)
             })
             .collect();
 
