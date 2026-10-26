@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProjectAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProjectAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProjectAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the assets associated with the project the request
+//! names, reading the membership `BatchAssociateProjectAssets` persisted on that
+//! project's record.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProjectAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProjectAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProjectAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+
+        // A pure read: nothing below writes, so two callers listing one project in
+        // either order see the same assets.
+        let store = state.lock();
+
+        // The listing is scoped to ONE project, so that project has to exist: an id
+        // this service holds no project for is a refusal rather than an empty page,
+        // which would report absence as success. This operation declares no
+        // `ResourceNotFoundException`, so the absence is stated on the client-input
+        // error it does declare, in the one wording every not-found refusal in this
+        // service carries.
+        let Some(project) = store.projects.get(&input.project_id) else {
+            return Err(invalid_request(crate::state::not_found_message(
+                crate::state::RESOURCE_PROJECT,
+                &input.project_id,
+            )));
+        };
+
+        // The project's membership, in the one order it is stored in: ascending by
+        // asset id. A stable total order is what makes `nextToken` resumable.
+        let asset_ids: Vec<String> = project.asset_ids.iter().cloned().collect();
+
+        // `nextToken` is this enumeration's resume point: the asset id the next page
+        // starts at, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$` and stays opaque to the caller. A token whose resume
+        // point is not in this enumeration is refused rather than answered with an
+        // empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                asset_ids
+                    .iter()
+                    .position(|asset_id| *asset_id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(asset_ids.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when an asset follows this page.
+        let next_token = asset_ids.get(end).map(::hex::encode);
+
+        Ok(ListProjectAssetsOutput {
+            asset_ids: asset_ids[start..end].to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`: "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Decode a `nextToken` back into the asset id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListProjectAssetsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure() -> ListProjectAssetsError {
+    ListProjectAssetsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares.
+fn invalid_request(message: String) -> ListProjectAssetsError {
+    ListProjectAssetsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListProjectAssetsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
 }

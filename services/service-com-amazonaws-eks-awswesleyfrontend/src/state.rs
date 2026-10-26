@@ -84,7 +84,8 @@ use crate::ops::types::{
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
     OidcIdentityProviderConfig, OutpostConfigResponse, PodIdentityAssociation,
     PodIdentityAssociationSummary, RemoteAccessConfig, RemoteNetworkConfigResponse,
-    ResourceNotFoundException, StorageConfigResponse, Taint, Update, UpdateParam,
+    ResourceInUseException, ResourceNotFoundException, StorageConfigResponse, Taint, Update,
+    UpdateParam,
     UpgradePolicyResponse, VpcConfigResponse, WarmPoolConfig, ZonalShiftConfigResponse,
 };
 use crate::ops::types::{
@@ -745,6 +746,35 @@ pub fn connected_cluster_refusal(cluster_name: &str) -> ClientException {
     ClientException {
         cluster_name: Some(cluster_name.to_string()),
         message: Some(CONNECTED_CLUSTER_REFUSAL_MESSAGE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The `ResourceInUseException` payload every operation that starts a cluster
+/// update is refused with while that cluster is already running one.
+///
+/// A cluster runs at most one update at a time ([`ClusterRecord::in_flight_update`]),
+/// so the refusal is a fact about the CLUSTER rather than about whatever the call
+/// named inside it, and the recorded service words it as "Cannot <UpdateType>
+/// because cluster <clusterName> currently has update <updateId> in progress": the
+/// fixed text states WHICH kind of update was refused (`update_type`, the
+/// `UPDATE_TYPE_*` token the call would have minted), the cluster the request named,
+/// and the id of the update already running — the id a client keys its retry on, by
+/// polling `DescribeUpdate` until that update leaves `InProgress`.
+///
+/// Shared here so no two operations can word or classify the gate differently.
+pub fn update_in_progress(
+    update_type: &str,
+    cluster_name: &str,
+    in_flight: &UpdateRecord,
+) -> ResourceInUseException {
+    let update_id = &in_flight.id;
+    ResourceInUseException {
+        cluster_name: Some(cluster_name.to_string()),
+        message: Some(format!(
+            "Cannot {update_type} because cluster {cluster_name} currently has update \
+             {update_id} in progress"
+        )),
         ..Default::default()
     }
 }
@@ -1620,6 +1650,13 @@ pub struct PendingClusterConfig {
     /// records rather than to a configuration member of the cluster itself, so it
     /// carries its own structure; see [`CertificateAuthorityActivation`].
     pub certificate_authority_activation: Option<CertificateAuthorityActivation>,
+    /// The certificate authority a `DeleteCertificateAuthority` update removes
+    /// from the cluster's trust bundle when it completes: "Deleting a certificate
+    /// authority removes its public certificate from the cluster's trust bundle",
+    /// and "this is an asynchronous operation that returns an update object", so
+    /// the record stays on the cluster reporting `DELETING` distribution until the
+    /// clock completes that update.
+    pub certificate_authority_removal: Option<String>,
 }
 
 impl PendingClusterConfig {
@@ -1675,6 +1712,9 @@ impl PendingClusterConfig {
         }
         if let Some(activation) = self.certificate_authority_activation {
             activation.apply(record);
+        }
+        if let Some(removed) = self.certificate_authority_removal {
+            record.certificate_authorities.remove(&removed);
         }
     }
 }
@@ -3891,12 +3931,15 @@ pub const CA_SIGNING_ACTIVATING: &str = "ACTIVATING";
 
 /// The `CertificateAuthorityDistributionStatus` members this slice uses, from
 /// `smithy_query query="shape" shape="CertificateAuthorityDistributionStatus"`
-/// (`IN_PROGRESS | COMPLETE | FAILED | DELETING`). `FAILED` and `DELETING` are
-/// written by no operation here: this emulator's distribution never fails, and
-/// `DeleteCertificateAuthority` is still a 501 with its own gap issue.
+/// (`IN_PROGRESS | COMPLETE | FAILED | DELETING`). `FAILED` is written by no
+/// operation here: this emulator's trust distribution never fails. `DELETING` is
+/// what a certificate authority reports while the update that removes it from the
+/// cluster's trust bundle is in flight.
 pub const CA_DISTRIBUTION_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`CA_DISTRIBUTION_IN_PROGRESS`].
 pub const CA_DISTRIBUTION_COMPLETE: &str = "COMPLETE";
+/// See [`CA_DISTRIBUTION_IN_PROGRESS`].
+pub const CA_DISTRIBUTION_DELETING: &str = "DELETING";
 
 /// The `CertificateAuthorityCreatedBy`/`CertificateAuthorityActivatedBy` members
 /// (both `EKS | CUSTOMER`): "Certificate authorities that you create are

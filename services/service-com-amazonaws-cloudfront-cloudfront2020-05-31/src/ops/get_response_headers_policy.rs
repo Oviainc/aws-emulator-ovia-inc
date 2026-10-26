@@ -154,11 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // A response headers policy id addresses ONE policy whoever created it: one this
-        // account created, or one AWS published and every account holds.
+        // account created, or one AWS published and every account holds. An id neither holds
+        // is the modelled 404, built from the id SUBMITTED so an identifier that is no policy
+        // id at all is told apart from a well-formed one that names no policy.
         let Some(stored) = store.readable_response_headers_policy(&input.id) else {
             return Err(
                 GetResponseHeadersPolicyErrorModeled::NoSuchResponseHeadersPolicy(
-                    crate::state::no_such_response_headers_policy(),
+                    crate::state::no_such_response_headers_policy(&input.id),
                 )
                 .into(),
             );

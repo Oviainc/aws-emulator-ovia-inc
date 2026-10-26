@@ -20,7 +20,7 @@
 //!   its modelled length bound is refused — both before any resource is resolved;
 //! * a resource carries at most [`state::TAGS_PER_RESOURCE_LIMIT`] tags, counted
 //!   after the merge, and a refused request writes nothing;
-//! * a dashboard CloudTrail has not finished loading is not ready to be tagged;
+//! * the dashboard a create has returned is ready to be tagged;
 //! * an event data store resolves in its own registry, held to the Region its ARN
 //!   pins, and one awaiting deletion is inactive;
 //! * a trail or event data store that applies to all Regions is tagged only from its
@@ -1455,11 +1455,12 @@ async fn one_request_cannot_name_the_same_tag_key_twice() {
     }
 }
 
-/// RULE: `ConflictException` is "thrown when the specified resource is not ready for
-/// an operation … before CloudTrail has time to fully load the resource" — a
-/// dashboard is tagged only once the clock has settled it out of `CREATING`.
+/// RULE: the dashboard `CreateDashboard` has returned is ready for the calls that
+/// address it, so it is tagged straight after the create and the status it reports
+/// while CloudTrail finishes loading it refuses nothing — `ConflictException` is left
+/// for a resource another operation is modifying.
 #[tokio::test]
-async fn a_dashboard_is_tagged_once_cloudtrail_has_finished_loading_it() {
+async fn a_dashboard_is_tagged_as_soon_as_the_create_has_returned_it() {
     let emulator = Emulator::new();
     emulator
         .call("CreateDashboard", &json!({"Name": "loading-dashboard"}))
@@ -1472,35 +1473,35 @@ async fn a_dashboard_is_tagged_once_cloudtrail_has_finished_loading_it() {
     };
     let set = tags(&[("team", Some("security"))]);
 
-    // Straight after the create, the dashboard is still loading.
+    // Straight after the create, with no wait at all.
     emulator
         .add_tags(&resource_id, &set)
         .await
-        .expect_error(
-            "AddTags while the dashboard is CREATING",
-            409,
-            "ConflictException",
-        );
-    let while_creating = emulator.stored_tags(&target);
-    assert!(
-        while_creating.is_empty(),
-        "case AddTags while the dashboard is CREATING: the refused request wrote tags, \
-         got {while_creating:?}"
-    );
-
-    // Once the load the clock owed is due, the same call is accepted.
-    tokio::time::sleep(past_settle()).await;
-    emulator
-        .add_tags(&resource_id, &set)
-        .await
-        .expect_ok("AddTags once the dashboard is CREATED");
+        .expect_ok("AddTags straight after the create");
     let actual = emulator
-        .tags_of("AddTags once the dashboard is CREATED", &resource_id)
+        .tags_of("AddTags straight after the create", &resource_id)
         .await;
     assert_eq!(
         actual,
         tags(&[("team", Some("security"))]),
-        "case AddTags once the dashboard is CREATED: wrong tag set, got {actual:?}"
+        "case AddTags straight after the create: wrong tag set, got {actual:?}"
+    );
+
+    // And once the status the clock owed has settled, the stored tag set is still the
+    // one that call wrote: the clock does not decide whether a dashboard takes tags.
+    tokio::time::sleep(past_settle()).await;
+    emulator
+        .add_tags(&resource_id, &tags(&[("owner", Some("ct"))]))
+        .await
+        .expect_ok("AddTags once the dashboard is CREATED");
+    let settled = emulator.stored_tags(&target);
+    assert_eq!(
+        settled,
+        vec![
+            ("team".to_string(), Some("security".to_string())),
+            ("owner".to_string(), Some("ct".to_string())),
+        ],
+        "case AddTags once the dashboard is CREATED: wrong stored tag set, got {settled:?}"
     );
 }
 

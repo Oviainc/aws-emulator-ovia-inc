@@ -319,16 +319,64 @@ pub fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
     })
 }
 
+/// The three notification flags as ONE clause of the documented
+/// `notifyOnCaseSeverity` rule reads them.
+///
+/// A clause reads the flags over the scope its own wording gives it, and the two
+/// clauses of that rule are not worded over the same scope, so each is handed its own
+/// set of values rather than sharing one (see [`notification_rule_violation`]). A flag
+/// that is absent from the scope a clause reads counts as `false` for it: "null or
+/// false" is exactly what the rule admits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotificationFlags {
+    pub notify_on_create_or_reopen_case: bool,
+    pub notify_on_add_correspondence_to_case: bool,
+    pub notify_on_resolve_case: bool,
+}
+
+impl NotificationFlags {
+    /// The three flags read out of optional members, an absent one counting as
+    /// `false`.
+    pub fn new(
+        notify_on_create_or_reopen_case: Option<bool>,
+        notify_on_add_correspondence_to_case: Option<bool>,
+        notify_on_resolve_case: Option<bool>,
+    ) -> Self {
+        Self {
+            notify_on_create_or_reopen_case: notify_on_create_or_reopen_case.unwrap_or(false),
+            notify_on_add_correspondence_to_case: notify_on_add_correspondence_to_case
+                .unwrap_or(false),
+            notify_on_resolve_case: notify_on_resolve_case.unwrap_or(false),
+        }
+    }
+
+    /// Whether any of the three asks for a notification.
+    pub fn any_set(&self) -> bool {
+        self.notify_on_create_or_reopen_case
+            || self.notify_on_add_correspondence_to_case
+            || self.notify_on_resolve_case
+    }
+}
+
 /// Why `severity` cannot hold together with the three notification flags, as the
 /// message the refusal carries, or `None` when it can.
 ///
-/// The rule is documented on `notifyOnCaseSeverity`
-/// (`smithy_query(query="doc",shape="UpdateSlackChannelConfigurationRequest",member="notifyOnCaseSeverity")`):
-/// with `high` or `all` at least one of the three flags must be `true`, and with
-/// `none` every one of them must be null or `false`. It is evaluated over the values
-/// the configuration will HOLD — create applies its documented default of `false` to
-/// an absent flag, update keeps the stored value — because that is what the
-/// notification setting means.
+/// The rule is documented on `notifyOnCaseSeverity` on both requests that carry it,
+/// and each of its two clauses is evaluated over the scope ITS OWN wording gives it:
+///
+/// * with `high` or `all`, "at least one of the following parameters must be `true`"
+///   — worded over the configuration, so it reads `will_hold`: the values the record
+///   will carry once the write lands (create applies its documented default of
+///   `false` to an absent flag, update keeps the stored value, as that member's note
+///   states for an unspecified parameter).
+/// * with `none`, the UPDATE request narrows the clause to "any of the following
+///   parameters **that you specify in your request** must be `false`"
+///   (`smithy_query(query="doc",shape="UpdateSlackChannelConfigurationRequest",member="notifyOnCaseSeverity")`),
+///   so it reads `in_scope_for_none`: only the flags the request itself carried. The
+///   CREATE request words the same clause over the whole configuration ("the
+///   following parameters must be null or false") because a create has no prior
+///   values to keep — and there both scopes are the same set, since an unspecified
+///   flag is created `false`.
 ///
 /// The message RESTATES that documented rule in service prose through
 /// [`invalid_request_message`], so the operation that was called is named and the
@@ -337,21 +385,17 @@ pub fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
 pub fn notification_rule_violation(
     operation: &str,
     severity: &str,
-    notify_on_create_or_reopen_case: bool,
-    notify_on_add_correspondence_to_case: bool,
-    notify_on_resolve_case: bool,
+    will_hold: NotificationFlags,
+    in_scope_for_none: NotificationFlags,
 ) -> Option<String> {
-    let any_flag_set = notify_on_create_or_reopen_case
-        || notify_on_add_correspondence_to_case
-        || notify_on_resolve_case;
     let [create_or_reopen, add_correspondence, resolve] = NOTIFICATION_FLAG_PARAMETERS;
     let rule = match severity {
-        "high" | "all" if !any_flag_set => format!(
+        "high" | "all" if !will_hold.any_set() => format!(
             "If NotifyOnCaseSeverity is all or high, you must enter true for at least \
              one of the following parameters: {create_or_reopen}, {add_correspondence} \
              or {resolve}."
         ),
-        "none" if any_flag_set => format!(
+        "none" if in_scope_for_none.any_set() => format!(
             "If NotifyOnCaseSeverity is none, the following parameters must be null \
              or false: {create_or_reopen}, {add_correspondence} or {resolve}."
         ),

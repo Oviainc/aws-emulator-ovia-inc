@@ -1261,6 +1261,13 @@ pub struct EndpointConfig {
 /// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
 /// transition; it is stored, never slept on, and materialised by whichever reporting
 /// call first runs at or after it.
+///
+/// `instance_usage` is how many instances of each ML instance type this endpoint holds,
+/// snapshotted from the configuration it was created from (like its variant summaries,
+/// and for the same reason: a later configuration does not retroactively change what is
+/// deployed). It is what the per-instance-type hosting quota counts against
+/// ([`ComAmazonawsSagemakerSagemakerState::endpoint_instances_in_use`]), so deleting the
+/// endpoint releases exactly what creating it took.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub name: String,
@@ -1278,6 +1285,91 @@ pub struct Endpoint {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub in_service_at: SystemTime,
+    pub instance_usage: BTreeMap<String, i64>,
+}
+
+/// The unit the per-instance-type hosting quotas are counted in: what their limit, the
+/// account's utilisation of them and a request's delta are numbers OF, as
+/// [`account_quota_exceeded`] states them.
+pub const INSTANCES_UNIT: &str = "Instances";
+
+/// The published name of the quota that bounds how many instances of ONE ML instance type
+/// an account may run behind its endpoints, as a refusal states it.
+///
+/// Service Quotas names the entry `<instance type> for endpoint usage` (it is listed under
+/// that name for this service, beside the notebook-instance and training entries of the
+/// same shape), so the instance type is part of the quota's NAME rather than prose around
+/// it: a client reads which type it has no room for straight off the message.
+pub fn endpoint_usage_quota_name(instance_type: &str) -> String {
+    format!("{instance_type} for endpoint usage")
+}
+
+/// The instance FAMILIES whose published default endpoint-usage quota is zero instances:
+/// the newest accelerated generations (the `p4`/`p5`/`p6` GPU families and the Trainium
+/// ones), which an account has to be granted capacity for before it can host anything on
+/// them.
+///
+/// Keyed on the FAMILY — the middle segment of an `ml.<family>.<size>` instance type — so
+/// a size AWS adds to one of these families needs no edit here, and so the rule is one
+/// about generations rather than a list of every type. Every other family's default is a
+/// non-zero number of instances ([`DEFAULT_ENDPOINT_USAGE_QUOTA`]).
+const ZERO_DEFAULT_HOSTING_FAMILIES: [&str; 11] = [
+    "p4d",
+    "p4de",
+    "p5",
+    "p5e",
+    "p5en",
+    "p6-b200",
+    "p6-b300",
+    "p6e-gb200",
+    "trn1",
+    "trn1n",
+    "trn2",
+];
+
+/// How many instances of ONE type an account may host, for a type whose published default
+/// is not zero.
+///
+/// This emulator models neither Service Quotas nor an account's adjustments, so — as with
+/// [`MODEL_QUOTA`] — this is the emulator's OWN bound rather than a claim about any
+/// account's limit for a particular type: far above any deployment an emulator serves, and
+/// what stops one request asking for an unbounded number of instances.
+pub const DEFAULT_ENDPOINT_USAGE_QUOTA: i64 = 1_000;
+
+/// The account's quota, in instances, for hosting `instance_type` behind an endpoint.
+///
+/// Zero for a family AWS publishes a zero default for ([`ZERO_DEFAULT_HOSTING_FAMILIES`]),
+/// so an endpoint on one is refused until the account is granted capacity;
+/// [`DEFAULT_ENDPOINT_USAGE_QUOTA`] for every other type.
+pub fn endpoint_usage_quota(instance_type: &str) -> i64 {
+    // `ml.<family>.<size>`: the family is the second segment, and a value that is not in
+    // that form names no family of the zero-default generations.
+    let family = instance_type.split('.').nth(1).unwrap_or_default();
+    if ZERO_DEFAULT_HOSTING_FAMILIES.contains(&family) {
+        return 0;
+    }
+    DEFAULT_ENDPOINT_USAGE_QUOTA
+}
+
+/// How many instances of each ML instance type `variants` ask for: one entry per type, the
+/// instance counts of the variants naming it added up.
+///
+/// A variant that names an instance type runs at least one instance of it, so a variant
+/// with no `InitialInstanceCount` counts as one; a variant that names no single type at all
+/// — a serverless one, or one that lists a pool of alternatives for the service to choose
+/// from — holds no instances of any one type and contributes nothing.
+pub fn instance_demand<'variants>(
+    variants: impl IntoIterator<Item = &'variants ProductionVariant>,
+) -> BTreeMap<String, i64> {
+    let mut demand: BTreeMap<String, i64> = BTreeMap::new();
+    for variant in variants {
+        let Some(instance_type) = variant.instance_type.as_deref() else {
+            continue;
+        };
+        let count = i64::from(variant.initial_instance_count.unwrap_or(1)).max(1);
+        *demand.entry(instance_type.to_string()).or_default() += count;
+    }
+    demand
 }
 
 /// Materialise the `Creating` -> `InService` transition the clock already owes a
@@ -2734,6 +2826,43 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// How many instances of `instance_type` the endpoints this account holds are already
+    /// using — the utilisation its hosting quota is measured against.
+    ///
+    /// Read off the endpoints themselves rather than off the configurations they name, so
+    /// what an endpoint holds is what it was created with and a deleted endpoint uses
+    /// nothing.
+    pub fn endpoint_instances_in_use(&self, instance_type: &str) -> i64 {
+        self.endpoints
+            .values()
+            .filter_map(|endpoint| endpoint.instance_usage.get(instance_type))
+            .sum()
+    }
+
+    /// Why this account cannot host `demand` on top of what its endpoints already hold, or
+    /// `None` when every instance type it names is within quota.
+    ///
+    /// One instance type past its quota is enough to refuse the whole deployment, and the
+    /// one reported is the first in type order, so the same request is always refused the
+    /// same way. The sentence is [`account_quota_exceeded`]'s, counted in
+    /// [`INSTANCES_UNIT`]: the limit, the utilisation and the delta, which is what a client
+    /// reads to decide between asking for fewer instances and requesting an increase.
+    pub fn hosting_quota_exceeded(&self, demand: &BTreeMap<String, i64>) -> Option<String> {
+        demand.iter().find_map(|(instance_type, delta)| {
+            let limit = endpoint_usage_quota(instance_type);
+            let in_use = self.endpoint_instances_in_use(instance_type);
+            (in_use + delta > limit).then(|| {
+                account_quota_exceeded(
+                    &endpoint_usage_quota_name(instance_type),
+                    INSTANCES_UNIT,
+                    limit,
+                    in_use,
+                    *delta,
+                )
+            })
+        })
     }
 
     /// Whether another hub fits, i.e. the store is below [`HUB_QUOTA`].

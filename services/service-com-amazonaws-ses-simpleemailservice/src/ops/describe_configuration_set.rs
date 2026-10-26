@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored configuration set: its name always, and each further
+//! attribute group the request asks for by name. Nothing here writes: a set the
+//! account does not hold is refused, and a set that holds no association for an
+//! asked-for group simply reports none.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationSet"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let name = input.configuration_set_name;
+        let asked = input
+            .configuration_set_attribute_names
+            .as_deref()
+            .unwrap_or_default();
+        // `ConfigurationSetAttribute` is a modeled enum, so the boundary refuses a
+        // value outside its value set before this handler runs. This is the
+        // belt-and-braces refusal: an attribute name this handler cannot
+        // interpret is never silently dropped from the answer.
+        if let Some(unknown) = asked
+            .iter()
+            .find(|attribute| !CONFIGURATION_SET_ATTRIBUTE_VALUES.contains(&attribute.as_str()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ConfigurationSetAttributeNames entries must each be one of {:?}, got {unknown:?}",
+                CONFIGURATION_SET_ATTRIBUTE_VALUES
+            )));
+        }
+        let asked_for = |attribute: &str| asked.iter().any(|name| name == attribute);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and the only error this
+            // operation models is a client error, so it does not fit.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeConfigurationSet",
+            ));
+        };
+        let state = state.lock();
+        let Some(configuration_set) = state.configuration_sets.get(&name) else {
+            return Err(
+                DescribeConfigurationSetErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeConfigurationSetOutput {
+            configuration_set: Some(ConfigurationSet {
+                name: configuration_set.name.clone(),
+            }),
+            // The attribute groups are reported only when the request names
+            // them, by the wire values the model's own `ConfigurationSetAttribute`
+            // enum carries (`crate::ops::CONFIGURATION_SET_ATTRIBUTE_VALUES`).
+            //
+            // `eventDestinations`: no operation of this emulator records one yet,
+            // so a stored set has none and the list is empty.
+            event_destinations: asked_for("eventDestinations").then(Vec::new),
+            // `trackingOptions`: present exactly while the set carries the
+            // association the tracking-options operations write.
+            tracking_options: asked_for("trackingOptions")
+                .then(|| configuration_set.custom_redirect_domain.clone())
+                .flatten()
+                .map(|custom_redirect_domain| TrackingOptions {
+                    custom_redirect_domain: Some(custom_redirect_domain),
+                }),
+            // `deliveryOptions`: a TLS policy is stored only by
+            // `PutConfigurationSetDeliveryOptions`, which is still a scaffold, so
+            // no stored set carries one and the group is reported absent whether
+            // or not the request asks for it. The model documents no default for
+            // `DeliveryOptions$TlsPolicy`, so answering one here would report a
+            // policy the service never stored; the group becomes answerable when
+            // that operation is implemented.
+            delivery_options: None,
+            // `reputationOptions`: `SendingEnabled` is the set's stored sending
+            // state. `ReputationMetricsEnabled` is the member's documented
+            // default ("The default value is false"), which is what holds while
+            // nothing has published metrics for the set, and `LastFreshStart` is
+            // "null" for a set whose sending "has never been disabled and later
+            // re-enabled".
+            reputation_options: asked_for("reputationOptions").then_some(ReputationOptions {
+                sending_enabled: configuration_set.sending_enabled,
+                reputation_metrics_enabled: false,
+                last_fresh_start: None,
+            }),
+        })
     }
 }

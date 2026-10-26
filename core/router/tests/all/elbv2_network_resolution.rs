@@ -40,42 +40,46 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{element, elements, form_encode, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+///
+/// This constant and the request plumbing below are `pub(crate)` because the sibling suite
+/// `elbv2_ip_target_refusal_classes.rs` drives the same two services over the same wire:
+/// one copy, so the two cannot drift into asserting different things.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The EC2 API version a client sends in an ec2Query body.
-const EC2_API_VERSION: &str = "2016-11-15";
+pub(crate) const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The API version an awsQuery request naming the ELBv2 model carries.
-const ELB_VERSION: &str = "2015-12-01";
+pub(crate) const ELB_VERSION: &str = "2015-12-01";
 
 /// An AMI id a launch names; `RunInstances` only has to accept it, and this suite asserts
 /// nothing about the image.
 const AMI: &str = "ami-0123456789abcdef0";
 
-/// One answer, reduced to what this suite branches on.
+/// One answer, reduced to what these suites branch on.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    text: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) text: String,
 }
 
 impl Answer {
     /// The awsQuery / ec2Query error code of a refusal, or an empty string.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         opt_element(&self.text, "Code").unwrap_or_default()
     }
 
     /// The refusal message, with the serializer's escaping undone.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         elements(&self.text, "Message").first().cloned().unwrap_or_default()
     }
 }
 
 /// Send one form-encoded request to the service `signing_name` addresses.
-fn send(
+pub(crate) fn send(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     signing_name: &str,
@@ -103,7 +107,7 @@ fn send(
 }
 
 /// One form body: the action, the version, and the parameters.
-fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
+pub(crate) fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
     let mut body = format!("Action={action}&Version={version}");
     for (name, value) in params {
         body.push('&');
@@ -115,7 +119,7 @@ fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// Drive one ec2Query action.
-fn ec2(
+pub(crate) fn ec2(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     action: &str,
@@ -125,7 +129,7 @@ fn ec2(
 }
 
 /// Drive one ec2Query action that must succeed, and answer its body.
-fn ec2_ok(
+pub(crate) fn ec2_ok(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     action: &str,
@@ -141,7 +145,7 @@ fn ec2_ok(
 
 /// Drive one awsQuery action against the ELBv2 model, addressed by its own routing key so
 /// this suite does not depend on which front door claims the shared signing name.
-fn elbv2(
+pub(crate) fn elbv2(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     action: &str,
@@ -249,7 +253,7 @@ fn seed_network(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime) 
 }
 
 /// Create an `ip` or `instance` target group in `vpc` and answer its ARN.
-fn target_group(
+pub(crate) fn target_group(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     name: &str,
@@ -276,7 +280,7 @@ fn target_group(
 }
 
 /// Register one target, optionally naming its Availability Zone.
-fn register(
+pub(crate) fn register(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     group: &str,
@@ -291,7 +295,7 @@ fn register(
 }
 
 /// The `(target id, Availability Zone)` pairs `DescribeTargetHealth` reports for a group.
-fn target_zones(
+pub(crate) fn target_zones(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     group: &str,
@@ -318,15 +322,14 @@ fn target_zones(
 }
 
 /// One row of the `ip` target table: the case name, the address, the zone the request
-/// names, and either the zone the registration must report or the refusal message's
-/// leading words.
+/// names, and either the zone the registration must report or the refusal it earns.
 struct IpRow {
     case: &'static str,
     address: &'static str,
     requested_zone: Option<&'static str>,
     /// `Ok(zone)` — accepted, and the registration reports this zone (`""` meaning "the
-    /// zone of the subnet named by index"); `Err(start)` — refused, and the message starts
-    /// with this.
+    /// zone of the subnet named by index"); `Err(message)` — refused with exactly this
+    /// message, because WHICH refusal the address earns is the behaviour under test.
     expected: Result<&'static str, &'static str>,
 }
 
@@ -491,13 +494,21 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                     case: "an address in the VPC CIDR that no subnet holds",
                     address: "10.80.9.9",
                     requested_zone: None,
-                    expected: Err("The IP address '10.80.9.9' is in the CIDR of VPC"),
+                    expected: Err(
+                        "The IP address '10.80.9.9' is within the VPC, but is not within a \
+                         VPC subnet so it can't be registered",
+                    ),
                 },
                 IpRow {
+                    // Naming a zone is no remedy for this class either: the address is in
+                    // no subnet of the VPC whatever the request says.
                     case: "an address in the VPC CIDR that no subnet holds, with a zone",
                     address: "10.80.9.10",
                     requested_zone: Some("us-west-2a"),
-                    expected: Err("The IP address '10.80.9.10' is in the CIDR of VPC"),
+                    expected: Err(
+                        "The IP address '10.80.9.10' is within the VPC, but is not within \
+                         a VPC subnet so it can't be registered",
+                    ),
                 },
                 IpRow {
                     case: "a private address outside the VPC with the zone to serve it",
@@ -509,7 +520,11 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                     case: "a private address outside the VPC with no zone",
                     address: "192.168.5.6",
                     requested_zone: None,
-                    expected: Err("You must specify a valid Availability Zone"),
+                    expected: Err(
+                        "You must specify a valid Availability Zone or select 'all' for \
+                         all enabled Availability zones, since the IP address \
+                         '192.168.5.6' is outside the VPC",
+                    ),
                 },
                 IpRow {
                     case: "an address of the RFC 6598 range with a zone",
@@ -521,23 +536,49 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                     case: "a publicly routable address with a zone",
                     address: "8.8.8.8",
                     requested_zone: Some("us-west-2a"),
-                    expected: Err("The IP address '8.8.8.8' is not valid"),
+                    expected: Err(
+                        "The IP address '8.8.8.8' is not allowed, as it must be an address \
+                         from a VPC subnet, RFC1918, or RFC6598",
+                    ),
                 },
                 IpRow {
                     case: "a publicly routable address of another range",
                     address: "203.0.113.4",
                     requested_zone: Some("us-west-2b"),
-                    expected: Err("The IP address '203.0.113.4' is not valid"),
+                    expected: Err(
+                        "The IP address '203.0.113.4' is not allowed, as it must be an \
+                         address from a VPC subnet, RFC1918, or RFC6598",
+                    ),
                 },
                 IpRow {
                     // Whether the address is one an `ip` target may carry at all does not
-                    // depend on the zone, so it is judged first: a publicly routable
-                    // address is refused on its own terms rather than asked for a zone
-                    // that would not make it registrable.
+                    // depend on the zone, so it is judged first: such an address is
+                    // refused on its own terms rather than asked for a zone that would not
+                    // make it registrable.
                     case: "a publicly routable address with no zone",
                     address: "1.1.1.1",
                     requested_zone: None,
-                    expected: Err("The IP address '1.1.1.1' is not valid"),
+                    expected: Err(
+                        "The IP address '1.1.1.1' is not allowed, as it must be an address \
+                         from a VPC subnet, RFC1918, or RFC6598",
+                    ),
+                },
+                IpRow {
+                    // All zones is no remedy either: the class is chosen by the address.
+                    case: "a publicly routable address with all zones",
+                    address: "192.0.2.10",
+                    requested_zone: Some("all"),
+                    expected: Err(
+                        "The IP address '192.0.2.10' is not allowed, as it must be an \
+                         address from a VPC subnet, RFC1918, or RFC6598",
+                    ),
+                },
+                IpRow {
+                    // And all zones IS the remedy for the address class that has one.
+                    case: "a private address outside the VPC with all zones",
+                    address: "192.168.5.7",
+                    requested_zone: Some("all"),
+                    expected: Ok("all"),
                 },
             ];
             let mut accepted: Vec<(String, String)> = Vec::new();
@@ -553,17 +594,17 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                         );
                         accepted.push((row.address.to_string(), zone.to_string()));
                     }
-                    Err(starts_with) => {
+                    Err(message) => {
                         assert_eq!(
                             (answer.status, answer.code()),
                             (400, "ValidationError".to_string()),
                             "case {:?}: expected 400 ValidationError, got {answer:?}",
                             row.case
                         );
-                        assert!(
-                            answer.message().starts_with(starts_with),
-                            "case {:?}: expected a message starting {starts_with:?}, got \
-                             {:?}",
+                        assert_eq!(
+                            answer.message(),
+                            message,
+                            "case {:?}: expected the refusal {message:?}, got {:?}",
                             row.case,
                             answer.message()
                         );

@@ -18,7 +18,8 @@
 //! together: a policy belongs to the resource it is attached to, so a dashboard later
 //! created with the same name in the same Region inherits nothing. Only termination
 //! protection stops a delete — "You cannot delete a dashboard that has termination
-//! protection enabled" — and `UpdateDashboard` is what turns it off.
+//! protection enabled", refused with `ValidationException` — and `UpdateDashboard` is
+//! what turns it off.
 //!
 //! ## Shape of an operation
 //!
@@ -102,26 +103,22 @@ fn dashboard_not_found() -> DeleteDashboardError {
 /// Refuse the delete because the dashboard it addressed is protected from deletion.
 ///
 /// "You cannot delete a dashboard that has termination protection enabled" — the
-/// dashboard exists and was addressed correctly, so this is not a miss; it is the state
-/// of the resource conflicting with the request, which is what this operation's
-/// `ConflictException` covers (the only other error it models,
-/// `UnsupportedOperationException`, is about an operation the service does not support at
-/// all). The status is the one this service answers its dashboard `ConflictException`
-/// with ([`crate::state::DASHBOARD_CONFLICT_HTTP_STATUS`]), not the shape's modelled 409.
+/// dashboard exists and was addressed correctly, so this is not a miss; the request
+/// asks for something the dashboard's own configuration forbids, which CloudTrail
+/// answers with the error code `ValidationException` at HTTP 400 (the recorded
+/// refusal of a delete against a protected dashboard). None of the three errors this
+/// operation models carries that refusal, so it is answered through
+/// [`crate::scaffolded::Scaffolded::validation`], the channel for a refusal the model
+/// does not express.
 ///
-/// The text names the dashboard the request addressed and the way out, so a caller can
-/// act on it; AWS publishes no wording for this refusal, so the status and the code are
-/// what is contract here.
+/// The text names the dashboard the request addressed and the way out, so a caller
+/// can act on it; AWS publishes no wording for this refusal, so the status and the
+/// code are what is contract here.
 fn termination_protected(dashboard_arn: &str) -> DeleteDashboardError {
-    crate::scaffolded::Scaffolded::modeled_with_status(
-        DeleteDashboardErrorModeled::ConflictException(ConflictException {
-            message: Some(format!(
-                "The dashboard {dashboard_arn} cannot be deleted while termination protection \
-                 is enabled for it: disable termination protection and try again."
-            )),
-        }),
-        crate::state::DASHBOARD_CONFLICT_HTTP_STATUS,
-    )
+    crate::scaffolded::Scaffolded::validation(format!(
+        "The dashboard {dashboard_arn} cannot be deleted while termination protection is \
+         enabled for it: disable termination protection and try again."
+    ))
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

@@ -63,6 +63,14 @@ pub const MAX_IDENTITIES: usize = 10_000;
 /// caller input grow this store without end.
 pub const MAX_CONFIGURATION_SETS: usize = 10_000;
 
+/// The characters a configuration set name may be built from, and the longest
+/// such name.
+///
+/// `ConfigurationSet$Name` states the rule: "Contain only letters (a-z, A-Z),
+/// numbers (0-9), underscores (_), or dashes (-)" and "Contain 64 characters or
+/// fewer".
+pub const MAX_CONFIGURATION_SET_NAME: usize = 64;
+
 /// The entries the send log may hold at once.
 ///
 /// The 24-hour quota is the real ceiling — a day's accepted sends are at most
@@ -284,6 +292,15 @@ pub struct ConfigurationSet {
     /// (`UpdateConfigurationSetSendingEnabled`); a send that names it is refused
     /// with `ConfigurationSetSendingPausedException` while it is false.
     pub sending_enabled: bool,
+    /// The custom open-and-click redirect domain of this set's `TrackingOptions`
+    /// sub-resource.
+    ///
+    /// The sub-resource EXISTS exactly while this is `Some`: that is what
+    /// `CreateConfigurationSetTrackingOptions` adds, what
+    /// `UpdateConfigurationSetTrackingOptions` replaces (and what its
+    /// `TrackingOptionsDoesNotExistException` reports the absence of), and what
+    /// `DescribeConfigurationSet` reports as `TrackingOptions`.
+    pub custom_redirect_domain: Option<String>,
 }
 
 /// A receipt rule set: a named, ordered collection of receipt rules.
@@ -441,6 +458,15 @@ impl ComAmazonawsSesSimpleemailserviceState {
         let Some((_, domain)) = addr.split_once('@') else {
             return false;
         };
+        self.covers_verified_domain(domain)
+    }
+
+    /// Whether `domain` is itself a verified domain identity, or sits under one.
+    ///
+    /// A verified domain covers its subdomains, which is the same reading
+    /// [`Self::is_verified_sender`] applies to a sender's domain; it is what lets
+    /// a custom tracking subdomain of a verified domain be used.
+    pub fn covers_verified_domain(&self, domain: &str) -> bool {
         domain_suffixes(domain).any(|suffix| self.is_verified(suffix))
     }
 
@@ -472,6 +498,43 @@ impl ComAmazonawsSesSimpleemailserviceState {
         self.identities
             .get(name)
             .is_some_and(|identity| identity.verification_status == VerificationStatus::Success)
+    }
+
+    /// The custom redirect domain a tracking-options request may be stored with,
+    /// or the message Amazon SES refuses it as invalid tracking options with.
+    ///
+    /// Both refusals are the ones `InvalidTrackingOptionsException` documents,
+    /// in the words it documents them with: the error "appears most often in the
+    /// following situations: When the tracking domain you specified is not
+    /// verified in Amazon SES. When the tracking domain you specified is not a
+    /// valid domain or subdomain." Neither sentence carries a value, so neither
+    /// message interpolates one. A tracking subdomain is covered by the verified
+    /// domain above it ([`Self::covers_verified_domain`]), which is how a custom
+    /// open-and-click domain is set up.
+    ///
+    /// Only a single trailing dot is taken off — the root label of a fully
+    /// qualified name, which names the same domain. Nothing else is normalised:
+    /// a padded or doubly dotted value is not a domain name and is refused as
+    /// one.
+    ///
+    /// Shared by `CreateConfigurationSetTrackingOptions` and
+    /// `UpdateConfigurationSetTrackingOptions`, which read one rule between
+    /// them; each wraps the message in its own modelled error.
+    pub fn tracking_domain(&self, custom_redirect_domain: Option<&str>) -> Result<String, String> {
+        let given = custom_redirect_domain.unwrap_or_default();
+        let domain = given.strip_suffix('.').unwrap_or(given);
+        if !is_domain_name(domain) {
+            return Err(
+                "The tracking domain you specified is not a valid domain or subdomain."
+                    .to_string(),
+            );
+        }
+        if !self.covers_verified_domain(domain) {
+            return Err(
+                "The tracking domain you specified is not verified in Amazon SES.".to_string(),
+            );
+        }
+        Ok(domain.to_string())
     }
 
     /// The number of emails sent in the trailing [`SEND_QUOTA_WINDOW`], as
@@ -578,6 +641,9 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // refuses a send naming it only after
                     // `UpdateConfigurationSetSendingEnabled` disables it.
                     sending_enabled: true,
+                    // And it carries no `TrackingOptions` sub-resource:
+                    // `CreateConfigurationSetTrackingOptions` is what adds one.
+                    custom_redirect_domain: None,
                 }),
         )
     }
@@ -771,6 +837,20 @@ pub fn is_email_address(value: &str) -> bool {
 /// internationalised (`xn--…`) TLD and refuses an all-numeric one.
 pub fn is_domain_name(value: &str) -> bool {
     ::service_common::email_address::is_domain_name(value)
+}
+
+/// Whether `name` is a configuration set name of the form the model documents.
+///
+/// `ConfigurationSet$Name` states both halves of the rule: a name must "contain
+/// only letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes (-)" and
+/// "contain 64 characters or fewer" ([`MAX_CONFIGURATION_SET_NAME`]). A name
+/// built from no characters at all names nothing, so it is not one either.
+pub fn is_configuration_set_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_CONFIGURATION_SET_NAME
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 /// `text` as a log entry keeps it: at most [`MAX_LOGGED_TEXT`] characters, and
