@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAcmeDomainValidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAcmeDomainValidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored ACME domain validation its `AcmeDomainValidationArn`
+//! identifies, so that ARN answers to no record afterwards and the endpoint it hung under
+//! no longer validates the domain it covered ("after deletion, the ACME endpoint can no
+//! longer issue certificates for the associated domain"). Answers an empty body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAcmeDomainValidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN that names ANOTHER account is `ValidationException`: a caller addresses only
+//! their own account's resources, so such an ARN is a verdict on the request rather than a
+//! lookup — the same rule [`crate::ops::delete_acme_endpoint`] applies to the endpoint ARN
+//! it takes. An ARN of this account that no record answers to is already in the state this
+//! call asks for — the operation is `@idempotent` and its model declares no not-found
+//! error — so the call answers success and writes nothing. The validation's own status does
+//! not gate the delete (see the note in [`DeleteAcmeDomainValidation::handle`]): a
+//! validation whose prevalidation is still in flight has nothing to wait for, which is what
+//! this operation's `ConflictException` would be telling a caller to do.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +170,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAcmeDomainValidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAcmeDomainValidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // No request metadata is needed: the `AcmeDomainValidationArn` the request names
+        // carries the Region, the account and the endpoint the validation was created
+        // under, so the record is found by ARN alone — as in
+        // `DescribeAcmeDomainValidation`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                DeleteAcmeDomainValidationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the acm acme domain validation store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could delete. Decided before the store is
+        // consulted at all, and reported for the resource type the member's own
+        // `@pattern` fixes.
+        if !crate::state::arn_is_in_caller_account(&input.acme_domain_validation_arn) {
+            return Err(
+                DeleteAcmeDomainValidationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::cross_account_arn_refusal(
+                            crate::state::ACME_DOMAIN_VALIDATION_SEGMENT,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // ONE instant answers the whole request: it materialises the transitions the clock
+        // already owes, so the deletion acts on the validation as it stands now.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+        // Whatever status the validation carries, this call removes it, and the record goes
+        // with the idempotency tokens that resolved to it
+        // ([`crate::state::ComAmazonawsAcmCertificatemanagerState::remove_acme_domain_validation`]),
+        // so a replayed create mints a fresh validation rather than naming a deleted one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAcmeDomainValidation"))
+        // The status does not gate the delete the way it gates `UpdateAcmeDomainValidation`,
+        // because the two calls ask for different things. An update asks the service to
+        // apply a configuration to a validation it is still working through, so the caller
+        // is told to wait and waiting makes the update possible. A delete asks for the
+        // validation to stop existing: one whose prevalidation is still in flight is being
+        // abandoned, and a settled one has nothing left to wait for, so refusing either
+        // would leave a record no call could ever remove.
+        //
+        // An ARN no record answers to leaves the store untouched and is a success: the
+        // validation is already gone, which is the state this `@idempotent` call asks for.
+        store.remove_acme_domain_validation(&input.acme_domain_validation_arn);
+
+        Ok(DeleteAcmeDomainValidationOutput)
     }
 }
