@@ -1416,6 +1416,39 @@ impl ComAmazonawsFmsAwsfms20180101State {
         summaries
     }
 
+    /// The organisation's Firewall Manager administrators OTHER than its
+    /// DEFAULT administrator that are still administrators AT `now`, in
+    /// ascending account-id order.
+    ///
+    /// These are the accounts that have to leave before the default
+    /// administrator may: `DisassociateAdminAccount` documents that
+    /// "disassociation of the default administrator account follows the first
+    /// in, last out principle. If you are the default administrator, all
+    /// Firewall Manager administrators within the organization must first
+    /// disassociate their accounts before you can disassociate your account."
+    ///
+    /// Read off [`Self::admin_account_summaries`], this store's ONE answer to
+    /// which accounts are administrators of the organisation and with which
+    /// `OrganizationStatus`, so the precondition and the enumeration cannot
+    /// disagree about who is still an administrator. The default administrator
+    /// is the summary that carries `DefaultAdmin`, and an account whose status
+    /// is [`ORGANIZATION_STATUS_OFFBOARDING_COMPLETE`] "has been removed as an
+    /// Firewall Manager administrator" (`AdminAccountSummary$Status`), so it is
+    /// no longer one of them.
+    ///
+    /// It takes `now` for the reason [`AdminAccountRecord::is_active_at`] does:
+    /// one request decides from ONE reading of a clock that is not monotonic.
+    pub fn other_administrator_accounts(&self, now: SystemTime) -> Vec<String> {
+        self.admin_account_summaries(now)
+            .into_values()
+            .filter(|summary| {
+                !summary.default_admin
+                    && summary.status.as_deref() != Some(ORGANIZATION_STATUS_OFFBOARDING_COMPLETE)
+            })
+            .filter_map(|summary| summary.admin_account)
+            .collect()
+    }
+
     /// The Firewall Manager administrator accounts that manage the calling
     /// account, in account-id order.
     ///

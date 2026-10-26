@@ -36,6 +36,11 @@ mod tag_index_single_writer;
 #[path = "all/violation_details.rs"]
 mod violation_details;
 
+// Declared beside them, for the same reason: this suite's name sorts into the
+// contended region of the list below.
+#[path = "all/admin_disassociation_first_in_last_out.rs"]
+mod admin_disassociation_first_in_last_out;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

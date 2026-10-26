@@ -174,20 +174,39 @@ async fn get_admin_scope_reports_the_lifecycle_phase_the_clock_has_reached() {
     }
     expect_phase(&router, "the onboarding the clock completed", &rows).await;
 
-    // The default administrator asks to be disassociated. The tear-down span is
-    // never zero either, so the association still exists — the organisation
-    // scoped call is still served — and the default administrator is reported
-    // as being removed, while the administrators it onboarded are untouched.
-    let (status, body) = call(&router, "DisassociateAdminAccount", &json!({})).await;
+    // The default administrator asks to be disassociated. It comes out LAST —
+    // every other Firewall Manager administrator of the organization has to
+    // disassociate before it may — so this phase is driven on an organization
+    // that holds only the default administrator, and the accounts the earlier
+    // phases onboarded are accounts this one holds no administrator record for.
+    // The refusal the precondition states is asserted by the
+    // `admin_disassociation_first_in_last_out` suite.
+    let offboarding = emulator();
+    associate_admin(&offboarding).await;
+    let (status, body) = call(&offboarding, "DisassociateAdminAccount", &json!({})).await;
     assert_eq!(
         status, 200,
         "the holder's disassociation must be accepted, got {status} with {body:?}"
     );
-    rows[0].1 = Expectation::Served {
-        scope: full,
-        status: organization_status("OFFBOARDING"),
-    };
-    expect_phase(&router, "a default administrator being removed", &rows).await;
+    let mut rows: Vec<(&str, Expectation)> = vec![
+        (
+            ACCOUNT,
+            Expectation::Served {
+                scope: full,
+                status: organization_status("OFFBOARDING"),
+            },
+        ),
+        (
+            NO_ADMINISTRATOR,
+            Expectation::Refused("ResourceNotFoundException"),
+        ),
+    ];
+    rows.extend(
+        DELEGATED_ACCOUNTS
+            .iter()
+            .map(|account| (*account, Expectation::Refused("ResourceNotFoundException"))),
+    );
+    expect_phase(&offboarding, "a default administrator being removed", &rows).await;
 
     // Once the tear-down has completed the organization holds no administrator
     // association, so this organisation-scoped call is refused for every
@@ -197,5 +216,5 @@ async fn get_admin_scope_reports_the_lifecycle_phase_the_clock_has_reached() {
     for row in rows.iter_mut() {
         row.1 = Expectation::Refused("AccessDeniedException");
     }
-    expect_phase(&router, "no administrator association left", &rows).await;
+    expect_phase(&offboarding, "no administrator association left", &rows).await;
 }

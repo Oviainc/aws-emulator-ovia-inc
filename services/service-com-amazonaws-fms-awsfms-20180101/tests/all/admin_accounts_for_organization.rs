@@ -482,8 +482,10 @@ async fn a_next_token_resumes_the_page_only_when_this_service_minted_it() {
 async fn a_pending_disassociation_is_reported_as_offboarding() {
     let router = emulator();
     associate_admin(&router).await;
-    let onboarded = ADMIN_ACCOUNTS[0];
-    put_admin_account(&router, "offboarding", onboarded, None).await;
+    // Only the default administrator: it comes out LAST, so an organization
+    // still holding another Firewall Manager administrator has no pending
+    // default-administrator disassociation to report (the precondition itself
+    // is asserted by the `admin_disassociation_first_in_last_out` suite).
 
     let (status, body) = call(&router, "DisassociateAdminAccount", &json!({})).await;
     assert_eq!(

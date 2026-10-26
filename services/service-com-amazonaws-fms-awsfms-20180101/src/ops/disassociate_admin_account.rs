@@ -27,11 +27,25 @@
 //! (`engine::emulator_account_id`), so "the caller holds the association" is read
 //! against that account id.
 //!
-//! The first-in-last-out rule in the same paragraph concerns the NON-default
-//! administrators `PutAdminAccount` creates. That operation is still a 501 and
-//! this service's state therefore holds no administrator other than the default
-//! one, so the rule has no case to refuse yet; it belongs to `PutAdminAccount`'s
-//! own gap issue.
+//! ### First in, last out
+//!
+//! The default administrator's association is the organisation's FIRST, so it
+//! comes out LAST: "all Firewall Manager administrators within the organization
+//! must first disassociate their accounts before you can disassociate your
+//! account". So while the organisation still holds any Firewall Manager
+//! administrator other than the default one — the accounts
+//! `PutAdminAccount` onboards, which
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::other_administrator_accounts`]
+//! reads off the same enumeration `ListAdminAccountsForOrganization` reports —
+//! the tear-down the caller asks for is not possible, which is exactly what the
+//! modelled `InvalidOperationException` reports ("the operation failed because
+//! there was nothing to do or the operation wasn't possible"). The refusal names
+//! the administrators that still have to leave, so the caller knows which
+//! accounts must call this operation first.
+//!
+//! The precondition is checked on the call that STARTS the tear-down, not on a
+//! repeat of one already recorded (see the idempotence below): an administrator
+//! onboarded after the request was accepted cannot retroactively refuse it.
 //!
 //! ### The disassociation is not instantaneous
 //!
@@ -233,6 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // The organisation's other Firewall Manager administrators, as of the
+        // same instant, read BEFORE the association is resolved mutably: the
+        // first-in-last-out precondition below is about them, and this reading
+        // writes nothing, so a call that is refused for any reason leaves the
+        // store exactly as it was.
+        let other_administrators = store.other_administrator_accounts(now);
         // The administrator gate every organisation-scoped operation goes through,
         // resolved mutably because this one CHANGES the association: with none —
         // including one already torn down, which the clock-derived predicate reads
@@ -253,6 +273,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Already asked for: keep the completion instant the first call set rather
         // than pushing it out, so a retry cannot stretch the tear-down.
         if !admin.removal_pending() {
+            // First in, last out: the default administrator's association is the
+            // one the organisation's other administrators were onboarded under,
+            // so each of them has to disassociate before this one may.
+            if !other_administrators.is_empty() {
+                return Err(
+                    DisassociateAdminAccountErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(format!(
+                                "account {caller} is the Firewall Manager default administrator: \
+                                 all Firewall Manager administrators within the organization must \
+                                 first disassociate their accounts before you can disassociate \
+                                 your account, and these have not: {}",
+                                other_administrators.join(", ")
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
             admin.role_status = crate::state::ROLE_STATUS_PENDING_DELETION.to_string();
             admin.removal_due = Some(now + crate::state::DISASSOCIATION_SPAN);
         }
