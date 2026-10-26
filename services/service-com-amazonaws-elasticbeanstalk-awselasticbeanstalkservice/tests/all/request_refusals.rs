@@ -40,7 +40,11 @@ struct ConstraintCase {
 }
 
 /// The envelope AWS states a request-validation refusal in.
-fn envelope(violations: usize) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting the same boundary rule for its own
+/// operations states the envelope through THIS function rather than keeping a
+/// second copy of the wording, which could then drift from it.
+pub(crate) fn envelope(violations: usize) -> String {
     let noun = if violations == 1 {
         "validation error"
     } else {

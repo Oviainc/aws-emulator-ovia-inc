@@ -48,7 +48,7 @@ const APPLICATION: &str = "info-app";
 
 /// `aws:elasticbeanstalk:environment` / `EnvironmentType` set to
 /// `SingleInstance` — "launch one EC2 instance with no load balancer".
-const SINGLE_INSTANCE: &[(&str, &str)] = &[
+pub(crate) const SINGLE_INSTANCE: &[(&str, &str)] = &[
     (
         "OptionSettings.member.1.Namespace",
         "aws:elasticbeanstalk:environment",
@@ -79,11 +79,11 @@ const MIN_SIZE_5: &[(&str, &str)] = &[
 /// tests below FOLLOW, so an entry naming an object object storage does not hold
 /// fails them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
-    info_type: String,
-    ec2_instance_id: String,
-    sample_timestamp: String,
-    message: String,
+pub(crate) struct Entry {
+    pub(crate) info_type: String,
+    pub(crate) ec2_instance_id: String,
+    pub(crate) sample_timestamp: String,
+    pub(crate) message: String,
 }
 
 /// Every entry of a `RetrieveEnvironmentInfo` answer, in the order it lists
@@ -141,7 +141,12 @@ fn expected_url_prefix(info_type: &str, environment_id: &str, ec2_instance_id: &
 }
 
 /// Call `action`, failing the named case unless it answered 200.
-async fn ok(emulator: &Emulator, case: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+pub(crate) async fn ok(
+    emulator: &Emulator,
+    case: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> Answer {
     let answer = emulator.call(action, params).await;
     assert_eq!(
         answer.status, 200,
@@ -152,7 +157,7 @@ async fn ok(emulator: &Emulator, case: &str, action: &str, params: &[(&str, &str
 }
 
 /// Create [`APPLICATION`].
-async fn application(emulator: &Emulator) {
+pub(crate) async fn application(emulator: &Emulator) {
     ok(
         emulator,
         "fixture",
@@ -164,7 +169,12 @@ async fn application(emulator: &Emulator) {
 
 /// Launch `environment` with `extra` parameters and wait out the launch the
 /// clock owes, so it is `Ready`; answers its `EnvironmentId`.
-async fn launch(emulator: &Emulator, environment: &str, extra: &[(&str, &str)], case: &str) -> String {
+pub(crate) async fn launch(
+    emulator: &Emulator,
+    environment: &str,
+    extra: &[(&str, &str)],
+    case: &str,
+) -> String {
     let mut params: Vec<(&str, &str)> = vec![
         ("ApplicationName", APPLICATION),
         ("EnvironmentName", environment),
@@ -197,7 +207,7 @@ async fn reported_instances(emulator: &Emulator, environment: &str, case: &str) 
 
 /// `RetrieveEnvironmentInfo` for `info_type`, by whichever identifier `by`
 /// names.
-async fn retrieve(
+pub(crate) async fn retrieve(
     emulator: &Emulator,
     by: (&str, &str),
     info_type: &str,

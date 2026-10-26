@@ -35,6 +35,8 @@ mod dns_availability;
 mod environment_draft_configuration;
 #[path = "all/environment_info.rs"]
 mod environment_info;
+#[path = "all/environment_info_request_shape.rs"]
+mod environment_info_request_shape;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
 #[path = "all/environment_resources.rs"]
