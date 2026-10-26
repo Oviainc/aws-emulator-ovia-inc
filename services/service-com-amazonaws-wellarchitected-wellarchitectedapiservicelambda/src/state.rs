@@ -1882,56 +1882,156 @@ pub struct LensReviewRecord {
     pub lens_version: Option<String>,
 }
 
+/// The CONTENT of ONE lens, as every read of a review of that lens reports and counts it:
+/// the pillars the lens is organized into — each with the `PillarName` its content gives
+/// it, in the lens's own order — and the questions it asks, in the lens's own order.
+///
+/// A lens review reports and counts what the LENS defines, and this emulator holds lens
+/// content in two halves that never overlap: an AWS-official lens's content is its catalog
+/// row ([`official_lens`]) and a custom lens's is the document its published version
+/// carries ([`LensRecord::reviewed_content`]). Every derivation over "what does this lens
+/// ask?" — a question listing, a risk or question roll-up, a pillar summary, a `PillarId`
+/// or `QuestionId` a request supplies — resolves one of them through
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content`] and
+/// then reads THIS view, so neither half of the catalog is reported differently from the
+/// other and a lens this emulator holds no content for asks nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LensContentView {
+    /// `PillarReviewSummary$PillarId` and `$PillarName` of each pillar, in the lens's own
+    /// pillar order.
+    pillars: Vec<(String, String)>,
+    /// The questions the lens asks, in the lens's own order, each carrying the pillar it
+    /// belongs to and the choices the lens defines for it.
+    questions: Vec<ReviewQuestion>,
+}
+
+impl LensContentView {
+    /// This lens's content from its two halves: the pillars it is organized into and the
+    /// questions it asks, each in the lens's own order.
+    pub fn new(pillars: Vec<(String, String)>, questions: Vec<ReviewQuestion>) -> Self {
+        Self { pillars, questions }
+    }
+
+    /// The lens content this emulator holds for a lens it holds NONE for: no pillar and no
+    /// question, so every roll-up over it is the empty roll-up and every identifier a
+    /// request supplies for it is taken as given.
+    pub fn nothing() -> &'static Self {
+        static NOTHING: LensContentView = LensContentView {
+            pillars: Vec::new(),
+            questions: Vec::new(),
+        };
+        &NOTHING
+    }
+
+    /// The questions this lens asks, in the lens's own order.
+    pub fn questions(&self) -> &[ReviewQuestion] {
+        &self.questions
+    }
+
+    /// The questions this lens asks, taken by value for a caller that reports them.
+    pub fn into_questions(self) -> Vec<ReviewQuestion> {
+        self.questions
+    }
+
+    /// The pillars this lens is organized into, in the lens's own order.
+    pub fn pillars(&self) -> &[(String, String)] {
+        &self.pillars
+    }
+
+    /// The questions ONE pillar of this lens asks, in the lens's own order: what a pillar
+    /// review summary of a review of this lens is counted over.
+    pub fn pillar_questions<'content>(
+        &'content self,
+        pillar_id: &'content str,
+    ) -> impl Iterator<Item = &'content ReviewQuestion> + 'content {
+        self.questions
+            .iter()
+            .filter(move |question| question.pillar_id == pillar_id)
+    }
+
+    /// The `PillarId`s this lens's content organizes it into — the pillar set a `PillarId`
+    /// a request supplies is judged against.
+    pub fn pillar_ids(&self) -> BTreeSet<&str> {
+        self.pillars
+            .iter()
+            .map(|(pillar_id, _)| pillar_id.as_str())
+            .collect()
+    }
+
+    /// Whether this lens asks `question_id` in `pillar_id` — a question belongs to the
+    /// pillar the lens content puts it in, so a question of another pillar is not this
+    /// pillar's.
+    pub fn asks_in_pillar(&self, pillar_id: &str, question_id: &str) -> bool {
+        self.questions.iter().any(|question| {
+            question.pillar_id == pillar_id && question.question_id == question_id
+        })
+    }
+
+    /// Whether this emulator holds NO content for the lens: it names no pillar and asks no
+    /// question, so there is nothing to judge an identifier against.
+    pub fn is_empty(&self) -> bool {
+        self.pillars.is_empty() && self.questions.is_empty()
+    }
+}
+
+/// The content of every lens ONE reviewed resource is reviewed against — a workload, the
+/// workload a milestone recorded, or a review template — by the lens ALIAS that identifies
+/// the lens ([`lens_alias`]), so a lens named two ways is one entry.
+///
+/// Resolved from the store in one pass
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens_content`])
+/// and then read by every projection of that resource, so a roll-up over all of its lens
+/// reviews and a read of one of them cannot disagree about what a lens asks.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewedLensContent {
+    lenses: BTreeMap<String, LensContentView>,
+}
+
+impl ReviewedLensContent {
+    /// The content of ONE of those lenses, named as a request names it (an alias or an
+    /// ARN). A lens the resource does not review, and one this emulator holds no content
+    /// for, asks nothing ([`LensContentView::nothing`]).
+    pub fn of(&self, lens: &str) -> &LensContentView {
+        self.lenses
+            .get(lens_alias(lens))
+            .unwrap_or_else(|| LensContentView::nothing())
+    }
+}
+
 /// The pillars ONE lens review reports a summary for, each with the `PillarName` the lens
 /// content gives it where this emulator holds that content.
 ///
 /// The pillars the lens is organized into come first, in the lens's own order
-/// ([`lens_pillars`]); then any pillar the review records notes for that the lens content
-/// does not name, in `PillarId` order and with no `PillarName`, so notes a caller wrote
-/// are always readable back. For a lens this emulator holds content for the second group
-/// is empty — an update refuses a `PillarNotes` key that lens does not define — and for a
-/// lens it holds none for the first group is, because such a lens is organized into no
-/// pillars HERE while the real lens is.
+/// ([`LensContentView::pillars`]); then any pillar the review records notes for that the
+/// lens content does not name, in `PillarId` order and with no `PillarName`, so notes a
+/// caller wrote are always readable back. For a lens this emulator holds content for the
+/// second group is empty — an update refuses a `PillarNotes` key that lens does not
+/// define — and for a lens it holds none for the first group is, because such a lens is
+/// organized into no pillars HERE while the real lens is.
 ///
 /// Shared by a workload's lens review and a review template's: both are reviews of the
 /// same lens content and report their pillars the same way, so the rule lives once.
 pub fn lens_review_pillars(
-    lens: &str,
+    content: &LensContentView,
     pillar_notes: Option<&BTreeMap<String, String>>,
-) -> Vec<(String, Option<&'static str>)> {
-    let defined = lens_pillars(lens);
-    let mut pillars: Vec<(String, Option<&'static str>)> = defined
+) -> Vec<(String, Option<String>)> {
+    let mut pillars: Vec<(String, Option<String>)> = content
+        .pillars()
         .iter()
-        .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
+        .map(|(pillar_id, pillar_name)| (pillar_id.clone(), Some(pillar_name.clone())))
         .collect();
     if let Some(written) = pillar_notes {
+        let defined = content.pillar_ids();
         // The notes are held in a `BTreeMap`, so the extra pillars come out in `PillarId`
         // order.
         pillars.extend(
             written
                 .keys()
-                .filter(|pillar_id| {
-                    !defined
-                        .iter()
-                        .any(|(defined_id, _, _)| defined_id == pillar_id)
-                })
+                .filter(|pillar_id| !defined.contains(pillar_id.as_str()))
                 .map(|pillar_id| (pillar_id.clone(), None)),
         );
     }
     pillars
-}
-
-/// The `PillarId`s the lens content this emulator holds organizes a lens into, EMPTY for a
-/// lens it holds no content for — which is therefore organized into no pillars here, so a
-/// caller's pillar identifier has nothing to be judged against.
-///
-/// The one place an operation that takes a `PillarId` of a lens under review resolves the
-/// pillar set to judge it against.
-pub fn defined_pillar_ids(lens: &str) -> BTreeSet<&'static str> {
-    lens_pillars(lens)
-        .iter()
-        .map(|(pillar_id, _, _)| *pillar_id)
-        .collect()
 }
 
 /// One stored workload. Every member of the modelled `Workload` output that a request
@@ -2135,13 +2235,19 @@ impl WorkloadRecord {
     /// that risk ([`AnswerRecord::risk`]). The map is DERIVED from the attached lenses
     /// and the stored answers on every read and never stored, so it moves when either
     /// does.
-    pub fn risk_counts(&self) -> BTreeMap<String, i32> {
+    ///
+    /// `content` is the content of the lenses this workload reviews, resolved from the
+    /// whole lens catalog
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens_content`]):
+    /// what a lens asks is that lens's own content, whichever half of the catalog holds
+    /// it.
+    pub fn risk_counts(&self, content: &ReviewedLensContent) -> BTreeMap<String, i32> {
         let mut counts = empty_risk_counts();
         // A lens is attached once however many ways the request named it, so count the
         // questions of each lens the workload reviews once ([`Self::lens_reviews`] is the
         // one place that identity rule lives).
         for lens in self.lens_reviews().keys() {
-            for (risk, count) in self.lens_risk_counts(lens) {
+            for (risk, count) in self.lens_risk_counts(lens, content) {
                 counts
                     .entry(risk)
                     .and_modify(|total| *total = total.saturating_add(count))
@@ -2155,22 +2261,27 @@ impl WorkloadRecord {
     /// [`Self::risk_counts`], counted over the questions that ONE lens asks rather than
     /// over every attached lens's.
     ///
-    /// `lens` is a lens as a request names it (an alias or an ARN). A lens this emulator
-    /// holds no question set for asks nothing ([`lens_questions`]), so every bucket is 0.
-    pub fn lens_risk_counts(&self, lens: &str) -> BTreeMap<String, i32> {
-        self.risk_counts_over(lens, lens_questions(lens).iter())
+    /// `lens` is a lens as a request names it (an alias or an ARN), and `content` is as
+    /// [`Self::risk_counts`] takes it. A lens this emulator holds no content for asks
+    /// nothing, so every bucket is 0.
+    pub fn lens_risk_counts(
+        &self,
+        lens: &str,
+        content: &ReviewedLensContent,
+    ) -> BTreeMap<String, i32> {
+        self.risk_counts_over(lens, content.of(lens).questions().iter())
     }
 
     /// The risk roll-up of ONE pillar of one lens review: [`Self::lens_risk_counts`]
     /// narrowed to the questions that pillar asks, which is what a pillar review summary
     /// of a lens review reports.
-    pub fn pillar_risk_counts(&self, lens: &str, pillar_id: &str) -> BTreeMap<String, i32> {
-        self.risk_counts_over(
-            lens,
-            lens_questions(lens)
-                .iter()
-                .filter(|question| question.pillar_id == pillar_id),
-        )
+    pub fn pillar_risk_counts(
+        &self,
+        lens: &str,
+        pillar_id: &str,
+        content: &ReviewedLensContent,
+    ) -> BTreeMap<String, i32> {
+        self.risk_counts_over(lens, content.of(lens).pillar_questions(pillar_id))
     }
 
     /// The risk roll-up over an arbitrary set of ONE lens's questions — the one place a
@@ -2179,11 +2290,11 @@ impl WorkloadRecord {
     fn risk_counts_over<'question>(
         &self,
         lens: &str,
-        questions: impl Iterator<Item = &'question FrameworkQuestion>,
+        questions: impl Iterator<Item = &'question ReviewQuestion>,
     ) -> BTreeMap<String, i32> {
         let mut counts = empty_risk_counts();
         for question in questions {
-            let risk = match self.answer(lens, question.question_id) {
+            let risk = match self.answer(lens, &question.question_id) {
                 Some(answer) => answer.risk(),
                 None => RISK_UNANSWERED,
             };
@@ -2291,9 +2402,13 @@ impl WorkloadRecord {
 
     /// The pillars ONE lens review of this workload reports a summary for, through the
     /// one place that rule lives ([`lens_review_pillars`]).
-    pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
+    pub fn lens_review_pillars(
+        &self,
+        lens: &str,
+        content: &ReviewedLensContent,
+    ) -> Vec<(String, Option<String>)> {
         lens_review_pillars(
-            lens,
+            content.of(lens),
             self.lens_review_record(lens)
                 .map(|written| &written.pillar_notes),
         )
@@ -2313,7 +2428,12 @@ impl WorkloadRecord {
     /// pillar of the lens ([`Self::lens_review_pillars`]) and the risk roll-ups of the
     /// lens's and each pillar's questions from this workload's stored answers — so a
     /// review moves when an answer does.
-    pub fn to_lens_review(&self, lens: &str, reviewed: &ReviewedLens) -> LensReview {
+    pub fn to_lens_review(
+        &self,
+        lens: &str,
+        reviewed: &ReviewedLens,
+        content: &ReviewedLensContent,
+    ) -> LensReview {
         let written = self.lens_review_record(lens);
         LensReview {
             lens_alias: Some(lens.to_string()),
@@ -2322,13 +2442,13 @@ impl WorkloadRecord {
             lens_name: reviewed.lens_name.clone(),
             lens_status: reviewed.lens_status.clone(),
             pillar_review_summaries: Some(
-                self.lens_review_pillars(lens)
+                self.lens_review_pillars(lens, content)
                     .into_iter()
                     .map(|(pillar_id, pillar_name)| PillarReviewSummary {
                         notes: written
                             .and_then(|written| written.pillar_notes.get(&pillar_id).cloned()),
                         risk_counts: Some(risk_counts_to_map(
-                            &self.pillar_risk_counts(lens, &pillar_id),
+                            &self.pillar_risk_counts(lens, &pillar_id, content),
                         )),
                         // The risk counts restricted to the questions a PROFILE
                         // prioritises are not projected for a pillar: which questions
@@ -2337,7 +2457,7 @@ impl WorkloadRecord {
                         // workload is prioritized.
                         prioritized_risk_counts: None,
                         pillar_id: Some(pillar_id),
-                        pillar_name: pillar_name.map(str::to_string),
+                        pillar_name,
                     })
                     .collect(),
             ),
@@ -2353,7 +2473,7 @@ impl WorkloadRecord {
             notes: written.and_then(|written| written.notes.clone()),
             // The roll-up over THIS lens's questions alone, derived from the stored
             // answers on every read: it moves when an answer does.
-            risk_counts: Some(risk_counts_to_map(&self.lens_risk_counts(lens))),
+            risk_counts: Some(risk_counts_to_map(&self.lens_risk_counts(lens, content))),
             // Neither operation that returns this shape is `@paginated`, and both report
             // every pillar of the lens in one answer, so there is never a further page to
             // fetch.
@@ -2425,8 +2545,10 @@ impl WorkloadRecord {
         accounts
     }
 
-    /// The `Workload` shape `GetWorkload`/`UpdateWorkload` return.
-    pub fn to_workload(&self) -> Workload {
+    /// The `Workload` shape `GetWorkload`/`UpdateWorkload` return. `content` is the
+    /// content of the lenses this workload reviews, which its risk roll-up is counted over
+    /// ([`Self::risk_counts`]).
+    pub fn to_workload(&self, content: &ReviewedLensContent) -> Workload {
         Workload {
             workload_id: Some(self.workload_id.clone()),
             workload_arn: Some(self.workload_arn.clone()),
@@ -2453,7 +2575,7 @@ impl WorkloadRecord {
             industry: self.industry.clone(),
             notes: self.notes.clone(),
             improvement_status: Some(self.improvement_status.clone()),
-            risk_counts: Some(risk_counts_to_map(&self.risk_counts())),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts(content))),
             pillar_priorities: Some(self.pillar_priorities.clone()),
             lenses: Some(self.lenses.clone()),
             owner: Some(self.owner.clone()),
@@ -2483,8 +2605,9 @@ impl WorkloadRecord {
         }
     }
 
-    /// The `WorkloadSummary` projection `ListWorkloads` pages over.
-    pub fn to_summary(&self) -> WorkloadSummary {
+    /// The `WorkloadSummary` projection `ListWorkloads` pages over. `content` is as
+    /// [`Self::to_workload`] takes it.
+    pub fn to_summary(&self, content: &ReviewedLensContent) -> WorkloadSummary {
         WorkloadSummary {
             workload_id: Some(self.workload_id.clone()),
             workload_arn: Some(self.workload_arn.clone()),
@@ -2492,7 +2615,7 @@ impl WorkloadRecord {
             owner: Some(self.owner.clone()),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             lenses: Some(self.lenses.clone()),
-            risk_counts: Some(risk_counts_to_map(&self.risk_counts())),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts(content))),
             improvement_status: Some(self.improvement_status.clone()),
             // As in [`Self::to_workload`]: the associations are projected from the
             // record, the prioritised roll-up has nothing to compute it from.
@@ -2542,25 +2665,26 @@ pub struct MilestoneRecord {
 }
 
 impl MilestoneRecord {
-    /// The `Milestone` shape `GetMilestone` returns.
-    pub fn to_milestone(&self) -> Milestone {
+    /// The `Milestone` shape `GetMilestone` returns. `content` is the content of the
+    /// lenses the RECORDED workload reviews, which its risk roll-up is counted over.
+    pub fn to_milestone(&self, content: &ReviewedLensContent) -> Milestone {
         Milestone {
             milestone_number: Some(self.milestone_number),
             milestone_name: Some(self.milestone_name.clone()),
             recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
-            workload: Some(self.workload.to_workload()),
+            workload: Some(self.workload.to_workload(content)),
         }
     }
 
     /// The `MilestoneSummary` projection `ListMilestones` pages over: the same milestone,
     /// with the recorded workload projected to its `WorkloadSummary`
     /// (`smithy_query(query="shape", shape="MilestoneSummary")`).
-    pub fn to_summary(&self) -> MilestoneSummary {
+    pub fn to_summary(&self, content: &ReviewedLensContent) -> MilestoneSummary {
         MilestoneSummary {
             milestone_number: Some(self.milestone_number),
             milestone_name: Some(self.milestone_name.clone()),
             recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
-            workload_summary: Some(self.workload.to_summary()),
+            workload_summary: Some(self.workload.to_summary(content)),
         }
     }
 }
@@ -2720,12 +2844,16 @@ impl ReviewTemplateRecord {
     /// the request named it. The map is DERIVED from the applied lenses and the stored
     /// answers on every read and never stored, so it moves when either does — exactly
     /// as a workload's risk roll-up does ([`WorkloadRecord::risk_counts`]).
-    pub fn question_counts(&self) -> BTreeMap<String, i32> {
+    ///
+    /// `content` is the content of the lenses this template applies, resolved from the
+    /// whole lens catalog
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens_content`]).
+    pub fn question_counts(&self, content: &ReviewedLensContent) -> BTreeMap<String, i32> {
         let mut counts = empty_question_counts();
         let applied: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
         for lens in applied {
-            for (bucket, count) in self.lens_question_counts(lens) {
+            for (bucket, count) in self.lens_question_counts(lens, content) {
                 counts
                     .entry(bucket)
                     .and_modify(|total| *total = total.saturating_add(count))
@@ -2739,21 +2867,26 @@ impl ReviewTemplateRecord {
     /// [`Self::question_counts`], counted over the questions that ONE lens asks rather
     /// than over every applied lens's — which is what a lens review reports.
     ///
-    /// `lens` is a lens as a request names it (an alias or an ARN). A lens this emulator
-    /// holds no question set for asks nothing ([`lens_questions`]), so every bucket is 0.
-    pub fn lens_question_counts(&self, lens: &str) -> BTreeMap<String, i32> {
-        self.question_counts_over(lens, lens_questions(lens).iter())
+    /// `lens` is a lens as a request names it (an alias or an ARN), and `content` is as
+    /// [`Self::question_counts`] takes it. A lens this emulator holds no content for asks
+    /// nothing, so every bucket is 0.
+    pub fn lens_question_counts(
+        &self,
+        lens: &str,
+        content: &ReviewedLensContent,
+    ) -> BTreeMap<String, i32> {
+        self.question_counts_over(lens, content.of(lens).questions().iter())
     }
 
     /// [`Self::lens_question_counts`] narrowed to the questions ONE pillar of that lens
     /// asks, which is what a pillar review summary of a lens review reports.
-    pub fn pillar_question_counts(&self, lens: &str, pillar_id: &str) -> BTreeMap<String, i32> {
-        self.question_counts_over(
-            lens,
-            lens_questions(lens)
-                .iter()
-                .filter(|question| question.pillar_id == pillar_id),
-        )
+    pub fn pillar_question_counts(
+        &self,
+        lens: &str,
+        pillar_id: &str,
+        content: &ReviewedLensContent,
+    ) -> BTreeMap<String, i32> {
+        self.question_counts_over(lens, content.of(lens).pillar_questions(pillar_id))
     }
 
     /// The question roll-up over an arbitrary set of ONE lens's questions — the one
@@ -2762,11 +2895,11 @@ impl ReviewTemplateRecord {
     fn question_counts_over<'question>(
         &self,
         lens: &str,
-        questions: impl Iterator<Item = &'question FrameworkQuestion>,
+        questions: impl Iterator<Item = &'question ReviewQuestion>,
     ) -> BTreeMap<String, i32> {
         let mut counts = empty_question_counts();
         for question in questions {
-            let bucket = if self.answer(lens, question.question_id).is_some() {
+            let bucket = if self.answer(lens, &question.question_id).is_some() {
                 QUESTION_ANSWERED
             } else {
                 QUESTION_UNANSWERED
@@ -2814,9 +2947,13 @@ impl ReviewTemplateRecord {
     /// The pillars ONE lens review of this template reports a summary for, through the
     /// one place that rule lives ([`lens_review_pillars`]) — the same rule a WORKLOAD's
     /// lens review follows ([`WorkloadRecord::lens_review_pillars`]).
-    pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
+    pub fn lens_review_pillars(
+        &self,
+        lens: &str,
+        content: &ReviewedLensContent,
+    ) -> Vec<(String, Option<String>)> {
         lens_review_pillars(
-            lens,
+            content.of(lens),
             self.lens_review_record(lens)
                 .map(|written| &written.pillar_notes),
         )
@@ -2835,7 +2972,12 @@ impl ReviewTemplateRecord {
     /// version and currency from `reviewed`, one pillar summary per pillar of the lens
     /// ([`Self::lens_review_pillars`]) and the answered/unanswered roll-ups from the
     /// template's stored answers.
-    pub fn to_lens_review(&self, lens: &str, reviewed: &ReviewedLens) -> ReviewTemplateLensReview {
+    pub fn to_lens_review(
+        &self,
+        lens: &str,
+        reviewed: &ReviewedLens,
+        content: &ReviewedLensContent,
+    ) -> ReviewTemplateLensReview {
         let written = self.lens_review_record(lens);
         ReviewTemplateLensReview {
             lens_alias: Some(lens.to_string()),
@@ -2844,18 +2986,18 @@ impl ReviewTemplateRecord {
             lens_name: reviewed.lens_name.clone(),
             lens_status: reviewed.lens_status.clone(),
             pillar_review_summaries: Some(
-                self.lens_review_pillars(lens)
+                self.lens_review_pillars(lens, content)
                     .into_iter()
                     .map(|(pillar_id, pillar_name)| ReviewTemplatePillarReviewSummary {
                         notes: written
                             .and_then(|written| written.pillar_notes.get(&pillar_id).cloned()),
                         question_counts: Some(
-                            self.pillar_question_counts(lens, &pillar_id)
+                            self.pillar_question_counts(lens, &pillar_id, content)
                                 .into_iter()
                                 .collect::<HashMap<String, i32>>(),
                         ),
                         pillar_id: Some(pillar_id),
-                        pillar_name: pillar_name.map(str::to_string),
+                        pillar_name,
                     })
                     .collect(),
             ),
@@ -2867,7 +3009,7 @@ impl ReviewTemplateRecord {
             )),
             notes: written.and_then(|written| written.notes.clone()),
             question_counts: Some(
-                self.lens_question_counts(lens)
+                self.lens_question_counts(lens, content)
                     .into_iter()
                     .collect::<HashMap<String, i32>>(),
             ),
@@ -2904,14 +3046,20 @@ impl ReviewTemplateRecord {
 
     /// The `ReviewTemplate` shape `GetReviewTemplate` returns. `update_status` is as
     /// [`Self::to_summary`] takes it, so a summary and a `GetReviewTemplate` of the same
-    /// template cannot disagree about it.
-    pub fn to_review_template(&self, update_status: &str) -> ReviewTemplate {
+    /// template cannot disagree about it; `content` is the content of the lenses this
+    /// template applies, which its question roll-up is counted over
+    /// ([`Self::question_counts`]).
+    pub fn to_review_template(
+        &self,
+        update_status: &str,
+        content: &ReviewedLensContent,
+    ) -> ReviewTemplate {
         ReviewTemplate {
             description: Some(self.description.clone()),
             lenses: Some(self.lenses.clone()),
             notes: self.notes.clone(),
             question_counts: Some(
-                self.question_counts()
+                self.question_counts(content)
                     .into_iter()
                     .collect::<HashMap<String, i32>>(),
             ),
@@ -6187,32 +6335,75 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
-    /// The questions the lens a request named asks, in the lens's own order — the ONE
-    /// question set every read of a lens review's answers reports and pages over.
+    /// The CONTENT of the lens a request named — the pillars it is organized into and the
+    /// questions it asks — resolved from the WHOLE lens catalog.
     ///
-    /// A lens review asks what the LENS's content defines, and this store holds that
-    /// content in two halves that never overlap: an AWS-official lens (named by its alias
-    /// or by its account-less ARN, [`is_aws_official_lens`]) asks its catalog entry's
-    /// questions ([`lens_questions`]), and a custom lens asks the pillars and questions
-    /// its imported document defines, as published ([`LensRecord::reviewed_content`] →
-    /// [`LensDefinition::review_questions`]).
+    /// A lens review reports and counts what the LENS's content defines, and this store
+    /// holds that content in two halves that never overlap: an AWS-official lens (named by
+    /// its alias or by its account-less ARN, [`is_aws_official_lens`]) is its catalog row
+    /// ([`official_lens`]), and a custom lens is the pillars and questions its imported
+    /// document defines, as published ([`LensRecord::reviewed_content`]). This is the ONE
+    /// place that resolution lives, so a listing of a review's answers, a risk or question
+    /// roll-up, a pillar summary and the judgement of a `PillarId` a request supplies
+    /// cannot disagree about what a lens asks.
     ///
-    /// Empty only for a lens this emulator holds no content for at all: an official alias
-    /// the catalog carries no questions for, a custom lens this store does not hold, or
-    /// one no version has been published from — and an unpublished custom lens cannot be
-    /// applied to a workload or a review template in the first place
-    /// ([`Self::unapplicable_lenses_refusal`]).
-    pub fn lens_review_questions(&self, lens: &str) -> Vec<ReviewQuestion> {
+    /// Empty ([`LensContentView::is_empty`]) only for a lens this emulator holds no content
+    /// for at all: an official alias the catalog carries no questions for, a custom lens
+    /// this store does not hold, or one no version has been published from — and an
+    /// unpublished custom lens cannot be applied to a workload or a review template in the
+    /// first place ([`Self::unapplicable_lenses_refusal`]).
+    pub fn lens_content(&self, lens: &str) -> LensContentView {
         if is_aws_official_lens(lens) {
-            return lens_questions(lens)
-                .iter()
-                .map(FrameworkQuestion::to_review_question)
-                .collect();
+            return official_lens(lens).map_or_else(LensContentView::default, |official| {
+                LensContentView::new(
+                    official
+                        .pillars()
+                        .into_iter()
+                        .map(|(pillar_id, pillar_name, _)| {
+                            (pillar_id.to_string(), pillar_name.to_string())
+                        })
+                        .collect(),
+                    official
+                        .questions
+                        .iter()
+                        .map(FrameworkQuestion::to_review_question)
+                        .collect(),
+                )
+            });
         }
         self.lens_by_alias(lens)
             .and_then(LensRecord::reviewed_content)
-            .map(|content| content.definition.review_questions())
-            .unwrap_or_default()
+            .map_or_else(LensContentView::default, |content| {
+                LensContentView::new(
+                    content
+                        .definition
+                        .pillars
+                        .iter()
+                        .map(|pillar| (pillar.id.clone(), pillar.name.clone()))
+                        .collect(),
+                    content.definition.review_questions(),
+                )
+            })
+    }
+
+    /// The content of every lens ONE reviewed resource is reviewed against — a workload's
+    /// or a review template's `lenses`, or those of the workload a milestone recorded —
+    /// resolved in one pass through [`Self::lens_content`], so every projection of that
+    /// resource reads the same answer to "what does this lens ask?".
+    pub fn reviewed_lens_content(&self, lenses: &[String]) -> ReviewedLensContent {
+        ReviewedLensContent {
+            lenses: lenses
+                .iter()
+                .map(|lens| (lens_alias(lens).to_string(), self.lens_content(lens)))
+                .collect(),
+        }
+    }
+
+    /// The questions the lens a request named asks, in the lens's own order — the ONE
+    /// question set every read of a lens review's answers reports and pages over, from the
+    /// one place that resolution lives ([`Self::lens_content`]).
+    pub fn lens_review_questions(&self, lens: &str) -> Vec<ReviewQuestion> {
+        self.lens_content(lens).into_questions()
     }
 
     /// The ONE question the lens a request named asks under `question_id`, when it asks
@@ -8066,20 +8257,22 @@ pub const JIRA_CONFIGURATION_MEMBER: &str = "JiraConfiguration";
 /// A pillar of a lens is what that lens's content names, so an identifier naming a pillar
 /// the lens does NOT define belongs to no pillar of that lens review and is refused rather
 /// than stored. Only a lens this emulator holds content for has a pillar set to judge an
-/// identifier against ([`defined_pillar_ids`]); for a lens it holds none for there is
-/// nothing to judge, so the value is taken as given rather than refused for a pillar the
-/// real lens may well define.
+/// identifier against (`content`, resolved through
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content`]); for
+/// a lens it holds none for there is nothing to judge, so the value is taken as given
+/// rather than refused for a pillar the real lens may well define.
 ///
-/// `member` is the member the finding names, and the offending ids are sorted and
-/// deduplicated, so the refusal does not depend on the order the request listed them in.
-/// Shared by every operation that takes a `PillarId` of a lens under review, so they
-/// cannot word it differently.
+/// `member` is the member the finding names, `lens` the lens as the request named it, and
+/// the offending ids are sorted and deduplicated, so the refusal does not depend on the
+/// order the request listed them in. Shared by every operation that takes a `PillarId` of
+/// a lens under review, so they cannot word it differently.
 pub fn undefined_pillar_refusal<'id>(
     member: &str,
     lens: &str,
+    content: &LensContentView,
     pillar_ids: impl Iterator<Item = &'id str>,
 ) -> Option<crate::ops::types::ValidationException> {
-    let defined = defined_pillar_ids(lens);
+    let defined = content.pillar_ids();
     if defined.is_empty() {
         return None;
     }
@@ -8106,24 +8299,20 @@ pub fn undefined_pillar_refusal<'id>(
 /// The questions of a pillar are what that lens's content names, so an identifier naming a
 /// question of another pillar — or of none — belongs to no question of that pillar's
 /// review. As with [`undefined_pillar_refusal`], a lens this emulator holds no content for
-/// asks nothing here ([`lens_questions`]), so there is no question set to judge an
-/// identifier against and the value is taken as given.
+/// asks nothing here, so there is no question set to judge an identifier against and the
+/// value is taken as given.
 pub fn undefined_pillar_question_refusal<'id>(
     member: &str,
     lens: &str,
     pillar_id: &str,
+    content: &LensContentView,
     question_ids: impl Iterator<Item = &'id str>,
 ) -> Option<crate::ops::types::ValidationException> {
-    let asked = lens_questions(lens);
-    if asked.is_empty() {
+    if content.questions().is_empty() {
         return None;
     }
     let mut undefined: Vec<&str> = question_ids
-        .filter(|question_id| {
-            !asked
-                .iter()
-                .any(|question| question.pillar_id == pillar_id && &question.question_id == question_id)
-        })
+        .filter(|question_id| !content.asks_in_pillar(pillar_id, question_id))
         .collect();
     if undefined.is_empty() {
         return None;

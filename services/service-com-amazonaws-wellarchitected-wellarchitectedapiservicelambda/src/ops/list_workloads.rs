@@ -204,7 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let workload_summaries = page
             .iter()
             .filter_map(|(_, id)| store.workloads.get(id))
-            .map(crate::state::WorkloadRecord::to_summary)
+            // Each workload's roll-up is counted over the content of the lenses IT reviews,
+            // resolved from the whole lens catalog.
+            .map(|record| record.to_summary(&store.reviewed_lens_content(&record.lenses)))
             .collect();
 
         Ok(ListWorkloadsOutput {
