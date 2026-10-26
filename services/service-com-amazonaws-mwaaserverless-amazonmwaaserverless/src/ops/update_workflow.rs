@@ -368,39 +368,31 @@ fn unavailable() -> UpdateWorkflowError {
 /// A stable digest of the configuration this request asks for, so the minted
 /// `WorkflowVersion` is derived from what the version freezes and two different
 /// configurations never share a version identifier.
+///
+/// The configuration walk is the shared one
+/// ([`crate::state::WorkflowConfigurationView::digest_fields`]), so a member added
+/// to the configuration reaches this digest and every other one at once. The
+/// workflow's identity leads, because the same configuration under two workflows
+/// is two different snapshots.
 fn request_fingerprint(input: &UpdateWorkflowInput) -> String {
-    let mut fields: Vec<String> = vec![
-        input.workflow_arn.clone(),
-        input.role_arn.clone(),
-        input.description.clone().unwrap_or_default(),
-        input.trigger_mode.clone().unwrap_or_default(),
-        input
-            .engine_version
-            .map(|version| version.to_string())
-            .unwrap_or_default(),
-        input.definition_s3_location.bucket.clone(),
-        input.definition_s3_location.object_key.clone(),
-        input
-            .definition_s3_location
-            .version_id
-            .clone()
-            .unwrap_or_default(),
-    ];
-    match input.code.as_ref() {
-        Some(Code::S3Location(location)) => {
-            fields.push(location.bucket.clone());
-            fields.push(location.object_key.clone());
-            fields.push(location.version_id.clone().unwrap_or_default());
+    let mut fields: Vec<String> = vec![input.workflow_arn.clone()];
+    fields.extend(
+        crate::state::WorkflowConfigurationView {
+            role_arn: &input.role_arn,
+            description: input.description.as_deref(),
+            trigger_mode: input.trigger_mode.as_deref(),
+            engine_version: input.engine_version,
+            definition_s3_location: &input.definition_s3_location,
+            code: input.code.as_ref(),
+            // `UpdateWorkflowRequest` carries no `EncryptionConfiguration` member
+            // (`smithy_query(query="operation", operation="UpdateWorkflow")`), so this
+            // request supplies none to digest.
+            encryption_configuration: None,
+            logging_configuration: input.logging_configuration.as_ref(),
+            network_configuration: input.network_configuration.as_ref(),
         }
-        None => fields.push(String::new()),
-    }
-    if let Some(logging) = input.logging_configuration.as_ref() {
-        fields.push(logging.log_group_name.clone());
-    }
-    if let Some(network) = input.network_configuration.as_ref() {
-        fields.extend(network.security_group_ids.clone().unwrap_or_default());
-        fields.extend(network.subnet_ids.clone().unwrap_or_default());
-    }
+        .digest_fields(),
+    );
     let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
     crate::state::digest(&borrowed)
 }

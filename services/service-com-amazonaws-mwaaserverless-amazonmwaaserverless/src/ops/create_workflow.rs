@@ -520,43 +520,28 @@ fn response_for(workflow: &crate::state::Workflow) -> CreateWorkflowOutput {
 
 /// A stable digest of the request, so a repeated `ClientToken` can be told apart
 /// from a token reused for a different request.
+///
+/// The configuration walk is the shared one
+/// ([`crate::state::WorkflowConfigurationView::digest_fields`]), so a member added
+/// to the configuration reaches this digest and every other one at once. The
+/// workflow's identity leads, and the tags this request asks for follow, because
+/// neither is part of the configuration a version freezes.
 fn request_fingerprint(input: &CreateWorkflowInput) -> String {
-    let mut fields: Vec<String> = vec![
-        input.name.clone(),
-        input.role_arn.clone(),
-        input.description.clone().unwrap_or_default(),
-        input.trigger_mode.clone().unwrap_or_default(),
-        input
-            .engine_version
-            .map(|version| version.to_string())
-            .unwrap_or_default(),
-        input.definition_s3_location.bucket.clone(),
-        input.definition_s3_location.object_key.clone(),
-        input
-            .definition_s3_location
-            .version_id
-            .clone()
-            .unwrap_or_default(),
-    ];
-    match input.code.as_ref() {
-        Some(Code::S3Location(location)) => {
-            fields.push(location.bucket.clone());
-            fields.push(location.object_key.clone());
-            fields.push(location.version_id.clone().unwrap_or_default());
+    let mut fields: Vec<String> = vec![input.name.clone()];
+    fields.extend(
+        crate::state::WorkflowConfigurationView {
+            role_arn: &input.role_arn,
+            description: input.description.as_deref(),
+            trigger_mode: input.trigger_mode.as_deref(),
+            engine_version: input.engine_version,
+            definition_s3_location: &input.definition_s3_location,
+            code: input.code.as_ref(),
+            encryption_configuration: input.encryption_configuration.as_ref(),
+            logging_configuration: input.logging_configuration.as_ref(),
+            network_configuration: input.network_configuration.as_ref(),
         }
-        None => fields.push(String::new()),
-    }
-    if let Some(encryption) = input.encryption_configuration.as_ref() {
-        fields.push(encryption.r#type.clone());
-        fields.push(encryption.kms_key_id.clone().unwrap_or_default());
-    }
-    if let Some(logging) = input.logging_configuration.as_ref() {
-        fields.push(logging.log_group_name.clone());
-    }
-    if let Some(network) = input.network_configuration.as_ref() {
-        fields.extend(network.security_group_ids.clone().unwrap_or_default());
-        fields.extend(network.subnet_ids.clone().unwrap_or_default());
-    }
+        .digest_fields(),
+    );
     // Tags are an unordered map on the wire, so fingerprint them in key order.
     let mut tags: Vec<(String, String)> =
         input.tags.clone().unwrap_or_default().into_iter().collect();

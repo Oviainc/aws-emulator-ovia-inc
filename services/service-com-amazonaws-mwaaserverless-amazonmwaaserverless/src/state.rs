@@ -1007,6 +1007,77 @@ pub fn digest(fields: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// The workflow configuration a request supplies, borrowed for digesting: the
+/// members of the configuration a version freezes ([`WorkflowSnapshot`]) that a
+/// request can express.
+///
+/// An operation whose request shape carries no member for part of the
+/// configuration leaves that field `None`, so what is digested is always the
+/// configuration the request itself supplies.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowConfigurationView<'a> {
+    pub role_arn: &'a str,
+    pub description: Option<&'a str>,
+    pub trigger_mode: Option<&'a str>,
+    pub engine_version: Option<i32>,
+    pub definition_s3_location: &'a DefinitionS3Location,
+    pub code: Option<&'a Code>,
+    pub encryption_configuration: Option<&'a EncryptionConfiguration>,
+    pub logging_configuration: Option<&'a LoggingConfiguration>,
+    pub network_configuration: Option<&'a NetworkConfiguration>,
+}
+
+impl WorkflowConfigurationView<'_> {
+    /// This configuration's digest fields, in the ONE order every workflow
+    /// digest walks them in: the role, description, trigger mode and engine
+    /// version, the definition object's three members, the code union's three
+    /// members or a placeholder when it carries none, the encryption members
+    /// when the request supplies them, the log group when it does, and the
+    /// network id lists when it does.
+    ///
+    /// An absent optional member digests as an empty field rather than being
+    /// skipped wherever its position is fixed, and [`digest`] length-delimits
+    /// every field, so two different configurations never share a digest. This
+    /// is the single derivation every operation that digests a workflow
+    /// configuration drives, so a member added here reaches all of them.
+    pub fn digest_fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = vec![
+            self.role_arn.to_string(),
+            self.description.unwrap_or_default().to_string(),
+            self.trigger_mode.unwrap_or_default().to_string(),
+            self.engine_version
+                .map(|version| version.to_string())
+                .unwrap_or_default(),
+            self.definition_s3_location.bucket.clone(),
+            self.definition_s3_location.object_key.clone(),
+            self.definition_s3_location
+                .version_id
+                .clone()
+                .unwrap_or_default(),
+        ];
+        match self.code {
+            Some(Code::S3Location(location)) => {
+                fields.push(location.bucket.clone());
+                fields.push(location.object_key.clone());
+                fields.push(location.version_id.clone().unwrap_or_default());
+            }
+            None => fields.push(String::new()),
+        }
+        if let Some(encryption) = self.encryption_configuration {
+            fields.push(encryption.r#type.clone());
+            fields.push(encryption.kms_key_id.clone().unwrap_or_default());
+        }
+        if let Some(logging) = self.logging_configuration {
+            fields.push(logging.log_group_name.clone());
+        }
+        if let Some(network) = self.network_configuration {
+            fields.extend(network.security_group_ids.clone().unwrap_or_default());
+            fields.extend(network.subnet_ids.clone().unwrap_or_default());
+        }
+        fields
+    }
+}
+
 /// Mint a `WorkflowArn`: `arn:aws:airflow-serverless:<region>:<account>:workflow/<name>-<10 alnum>`,
 /// the shape the modelled `WorkflowArn` pattern requires. The 10-character suffix
 /// is the service-generated unique part the docs describe ("The service generates

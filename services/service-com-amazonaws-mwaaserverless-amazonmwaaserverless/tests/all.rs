@@ -49,6 +49,8 @@ mod task_instance_listing;
 mod task_instance_reads;
 #[path = "all/validation_errors.rs"]
 mod validation_errors;
+#[path = "all/workflow_configuration_digest.rs"]
+mod workflow_configuration_digest;
 #[path = "all/workflow_deletion_teardown.rs"]
 mod workflow_deletion_teardown;
 #[path = "all/workflow_lifecycle.rs"]
