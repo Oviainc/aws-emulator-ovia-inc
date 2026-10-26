@@ -73,17 +73,20 @@ type RefusalCase<'a> = (
 
 /// One answered export: the status, the error code of a refusal, the two response headers
 /// the operation binds and the body bytes.
-struct Export {
-    status: u16,
-    error: Option<String>,
+///
+/// Shared with the `stage_export_documentation` suite, which exports the documentation set
+/// a stage serves through this same wire path.
+pub(crate) struct Export {
+    pub(crate) status: u16,
+    pub(crate) error: Option<String>,
     content_type: Option<String>,
     content_disposition: Option<String>,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Export {
     /// The export body as the JSON document it is, with the case named on failure.
-    fn json(&self, case: &str) -> Value {
+    pub(crate) fn json(&self, case: &str) -> Value {
         assert_eq!(
             self.status, 200,
             "case {case}: expected 200 from GetExport, got {} with {:?}",
@@ -105,7 +108,7 @@ impl Export {
 /// `accepts` is sent as the `Accept` header the member is bound to; `parameters` are the
 /// query string parameters the `parameters` map is bound to, sent with no value at all
 /// when the value is empty.
-async fn export(
+pub(crate) async fn export(
     gateway: &Gateway,
     api: &str,
     stage: &str,
@@ -212,7 +215,7 @@ async fn create_integration(
 ///
 /// Answers the API id and the resource id of every path it created, so a case can put a
 /// response or an integration on one of them.
-async fn api_with_paths(
+pub(crate) async fn api_with_paths(
     gateway: &Gateway,
     name: &str,
     paths: &[NamedList<'_>],
@@ -900,6 +903,12 @@ async fn the_vendor_extensions_are_carried_only_when_the_parameters_ask_for_them
             true,
         ),
         (
+            "extensions=documentation, which asks for neither of these two",
+            &[("extensions", "documentation")],
+            false,
+            false,
+        ),
+        (
             "a parameter the member documents no meaning for",
             &[("ignore", "documentation")],
             false,
@@ -1281,9 +1290,19 @@ async fn an_export_this_service_cannot_produce_is_refused_rather_than_approximat
             "dev",
             "oas30",
             None,
-            &[("extensions", "postman")],
+            &[("extensions", "intergrations")],
             400,
             "BadRequestException",
+        ),
+        (
+            "the Postman extensions asked for as the extensions value the member documents",
+            api.as_str(),
+            "dev",
+            "oas30",
+            None,
+            &[("extensions", "postman")],
+            501,
+            "NotImplemented",
         ),
         (
             "the Postman extensions this emulator does not generate",
