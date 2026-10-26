@@ -237,7 +237,12 @@ async fn a_read_reports_every_member_the_create_stored() {
                 "case {case:?}: get-threat-intel-set expected 200, got {status} {got:?}"
             );
             for member in ["name", "format", "location", "expectedBucketOwner", "tags"] {
-                let expected = request.get(member).cloned().unwrap_or(Value::Null);
+                // A read always reports a tag map, empty when the create named none.
+                let expected = request.get(member).cloned().unwrap_or(if member == "tags" {
+                    json!({})
+                } else {
+                    Value::Null
+                });
                 assert_eq!(
                     got[member], expected,
                     "case {case:?}: member {member} must read back what the create stored, \
@@ -271,11 +276,12 @@ async fn a_read_reports_every_member_the_create_stored() {
     }
 }
 
-/// An untagged list reports NO `tags` member: `TagMap` is modelled len 1..200
-/// (`smithy_query(shape="TagMap")`), so an empty map is not a value of that member —
-/// which is also why a create that sends one is refused at the modelled boundary.
+/// An untagged list reports an EMPTY `tags` map rather than no member: the map is
+/// always reported, and `TagMap`'s modelled len 1..200
+/// (`smithy_query(shape="TagMap")`) bounds what a REQUEST may carry — which is why a
+/// create that sends an empty map is still refused at the modelled boundary.
 #[tokio::test]
-async fn an_untagged_list_reports_no_tag_map() {
+async fn an_untagged_list_reports_an_empty_tag_map() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
 
@@ -289,7 +295,7 @@ async fn an_untagged_list_reports_no_tag_map() {
             json!({"name": "tagged", "format": "TXT", "location": "s3://b/k2", "activate": false, "tags": {"team": "security"}}),
         ),
     ] {
-        let expected = request.get("tags").cloned().unwrap_or(Value::Null);
+        let expected = request.get("tags").cloned().unwrap_or_else(|| json!({}));
         let set_id = created_set_id(&router, &detector_id, &request).await;
         let (_, got) = get_set(&router, &detector_id, &set_id).await;
         assert_eq!(

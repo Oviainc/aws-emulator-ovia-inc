@@ -147,6 +147,8 @@ mod resource_tag_removal;
 mod sample_finding_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_map_projection.rs"]
+mod tag_map_projection;
 #[path = "all/threat_entity_set_delete.rs"]
 mod threat_entity_set_delete;
 #[path = "all/threat_entity_set_lifecycle.rs"]

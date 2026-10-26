@@ -304,7 +304,15 @@ fn assert_create_round_trip(case: &str, sent: &Value, read: &Value) {
         read["name"], sent["name"],
         "case {case}: expected the saved name back, got {read:?}"
     );
-    for member in ["description", "rank", "findingCriteria", "tags"] {
+    // The tag map is always reported, empty when the create named none; the other
+    // members with no documented default are reported only when the create carried
+    // them.
+    let expected_tags = sent.get("tags").cloned().unwrap_or_else(|| json!({}));
+    assert_eq!(
+        read["tags"], expected_tags,
+        "case {case}: expected tags {expected_tags} as stored, got {read:?}"
+    );
+    for member in ["description", "rank", "findingCriteria"] {
         match sent.get(member) {
             Some(expected) => assert_eq!(
                 &read[member], expected,
