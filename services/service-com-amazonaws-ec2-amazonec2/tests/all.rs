@@ -140,6 +140,12 @@ mod dedicated_hosts;
 mod default_network;
 #[path = "all/default_network_per_region.rs"]
 mod default_network_per_region;
+// What `DeleteCarrierGateway` removes from the carrier gateway store, what it reports back,
+// what it refuses and what it releases. Declared beside the other `delete_*` suites rather
+// than at the tail of this file: the tail is where every concurrent ec2 landing appends its
+// two lines, and these two lost repeated serialized squash merges there.
+#[path = "all/delete_carrier_gateway.rs"]
+mod delete_carrier_gateway;
 #[path = "all/delete_coip_pool.rs"]
 mod delete_coip_pool;
 #[path = "all/delete_network_interface.rs"]
