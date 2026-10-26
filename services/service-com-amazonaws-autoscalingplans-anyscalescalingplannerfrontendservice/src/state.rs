@@ -809,7 +809,10 @@ fn validate_predefined_scaling_metric(
 /// and cannot be used otherwise" — so a load metric specification is exactly what turns
 /// predictive scaling on, and every member documented "Only valid when configuring
 /// predictive scaling" is refused without one.
-fn configures_predictive_scaling(instruction: &ScalingInstruction) -> bool {
+///
+/// Public because the forecast path asks the same question: an instruction configuring
+/// no predictive scaling has no forecast to report.
+pub fn configures_predictive_scaling(instruction: &ScalingInstruction) -> bool {
     instruction.predefined_load_metric_specification.is_some()
         || instruction.customized_load_metric_specification.is_some()
 }

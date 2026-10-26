@@ -650,13 +650,12 @@ impl ResourceForecast {
     /// (`ScalingInstruction$PredefinedLoadMetricSpecification`: "This parameter or a
     /// CustomizedLoadMetricSpecification is required when configuring predictive scaling,
     /// and cannot be used otherwise"), so an instruction carrying neither has no forecast
-    /// at all — only the dynamic target tracking scaling the rest of it describes.
+    /// at all — only the dynamic target tracking scaling the rest of it describes. That
+    /// question is answered by [`crate::state::configures_predictive_scaling`], the one
+    /// definition the write path refuses predictive-scaling members by, so a forecast is
+    /// issued for exactly the instructions those members are accepted on.
     fn of(instruction: &ScalingInstruction) -> Option<Self> {
-        let configures_predictive_scaling = instruction
-            .predefined_load_metric_specification
-            .is_some()
-            || instruction.customized_load_metric_specification.is_some();
-        if !configures_predictive_scaling {
+        if !crate::state::configures_predictive_scaling(instruction) {
             return None;
         }
         let load_per_unit = instruction

@@ -67,7 +67,10 @@ fn refused(label: String, instructions: Value, message_fragment: String) -> Refu
 }
 
 /// The wording of the refusal for a member the instruction's modes do not allow.
-fn predictive_only_fragment(member: &str) -> String {
+///
+/// `pub(crate)` so a suite asserting the same refusal names the wording here rather than
+/// rebuilding it.
+pub(crate) fn predictive_only_fragment(member: &str) -> String {
     format!("{member}: only valid when configuring predictive scaling")
 }
 
