@@ -93,6 +93,8 @@ mod rds_stack_resources;
 mod regional_stack_namespace;
 #[path = "all/resource_signals.rs"]
 mod resource_signals;
+#[path = "all/rolled_back_resource_records.rs"]
+mod rolled_back_resource_records;
 #[path = "all/s3vectors_resource_types.rs"]
 mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]
