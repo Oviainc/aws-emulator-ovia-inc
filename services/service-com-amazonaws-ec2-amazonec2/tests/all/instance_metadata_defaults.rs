@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::error_code;
+use super::ec2_query::{error_code, error_message};
 use super::wire::{child, child_text, document, param, Param};
 
 /// The Region every call here is signed for: the one the default network is seeded for.
@@ -45,6 +45,16 @@ const MANAGED_BY: &str = ec2::state::MANAGED_BY_ACCOUNT;
 /// bounds are here, plus an interior value no recorded request cited; the values PAST each
 /// bound are in [`the_hop_limit_range_is_the_documented_one`].
 const HOP_LIMITS: &[&str] = &["1", "3", "64"];
+
+/// The message a hop limit outside that documented range is refused with: it names the
+/// member and the range the member accepts, and quotes no value, so every rejected hop
+/// limit is answered with exactly this text.
+///
+/// Source: the same `ModifyInstanceMetadataDefaultsRequest$HttpPutResponseHopLimit` doc as
+/// [`HOP_LIMITS`] — "Possible values: Integers from `1` to `64`, and `-1` to indicate no
+/// preference".
+const HOP_LIMIT_MESSAGE: &str =
+    "Invalid value for HttpPutResponseHopLimit. Expecting 1-64, or -1 for no-preference.";
 
 /// One account-level IMDS default setting.
 struct Setting {
@@ -473,6 +483,12 @@ async fn the_hop_limit_range_is_the_documented_one() {
                 "case {case:?}: expected error code {:?} for hop limit {limit}, got \
                  {code:?} with body {body}",
                 ec2::state::INVALID_PARAMETER_VALUE
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, HOP_LIMIT_MESSAGE,
+                "case {case:?}: expected the message {HOP_LIMIT_MESSAGE:?} for hop limit \
+                 {limit}, got {message:?} with body {body}"
             );
             let reported = defaults(&router, case).await;
             let expected = BTreeMap::from([

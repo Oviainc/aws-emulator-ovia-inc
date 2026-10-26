@@ -175,6 +175,29 @@ fn requested_state<E>(
     }
 }
 
+/// Refuse a hop limit outside the range this request member accepts, the way EC2 words
+/// it: HTTP 400 `InvalidParameterValue` with a message naming the member and that range.
+///
+/// EC2's wording for this member does not quote the value at fault, so this takes no
+/// argument. The bounds are interpolated from [`state::MIN_METADATA_HOP_LIMIT`],
+/// [`state::MAX_METADATA_HOP_LIMIT`] and [`state::METADATA_HOP_LIMIT_NO_PREFERENCE`] —
+/// which carry the model-doc citation for the range itself — rather than written into the
+/// text, so the message and the check below can never state different limits.
+///
+/// It lives here rather than in [`crate::state`] because this is the only operation that
+/// sets the account's hop-limit default: "each operation's own validation and
+/// orchestration stays in its `src/ops/<operation>.rs` file" (`crate::state`'s module
+/// docs).
+fn invalid_hop_limit_value<E>() -> crate::scaffolded::Scaffolded<E> {
+    state::invalid_parameter_value(format!(
+        "Invalid value for HttpPutResponseHopLimit. Expecting {min}-{max}, or {none} for \
+         no-preference.",
+        min = state::MIN_METADATA_HOP_LIMIT,
+        max = state::MAX_METADATA_HOP_LIMIT,
+        none = state::METADATA_HOP_LIMIT_NO_PREFERENCE,
+    ))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyInstanceMetadataDefaults<Eng>
 {
@@ -236,16 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 Some(Some(limit))
             }
-            Some(limit) => {
-                return Err(state::invalid_parameter_value(format!(
-                    "Value ({limit}) for parameter httpPutResponseHopLimit is invalid. \
-                     Valid values are integers from {min} to {max}, and {none} to indicate \
-                     no preference",
-                    min = state::MIN_METADATA_HOP_LIMIT,
-                    max = state::MAX_METADATA_HOP_LIMIT,
-                    none = state::METADATA_HOP_LIMIT_NO_PREFERENCE,
-                )))
-            }
+            Some(_) => return Err(invalid_hop_limit_value()),
         };
 
         // A modify that names no setting asks for no modification: EC2 refuses a request
