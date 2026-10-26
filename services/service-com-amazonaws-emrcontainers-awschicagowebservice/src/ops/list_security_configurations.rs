@@ -75,27 +75,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The opaque `nextToken` for the configuration the next page starts at: that
-/// configuration's place in the newest-first order, under this operation's cursor scope.
-///
-/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
-/// one encoder every paginated list in this service shares.
-fn encode_cursor(record: &crate::state::SecurityConfigurationRecord) -> String {
-    crate::state::encode_list_cursor(
-        crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE,
-        record.created_at_millis,
-        record.sequence,
-    )
-}
-
-/// The place in the newest-first order a `nextToken` names.
-///
-/// `None` — refused as an invalid request — when the token is not one of THIS operation's
-/// cursors: a cursor another listing minted does not carry this scope.
-fn decode_cursor(token: &str) -> Option<(i64, u64)> {
-    crate::state::decode_list_cursor(crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE, token)
-}
-
 /// Whether one stored configuration satisfies every filter the request carried. A filter
 /// the request omitted constrains nothing.
 ///
@@ -213,70 +192,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing listed here depends on it; it is called because every handler does.
         state.settle();
 
-        // `maxResults` is the page size. The model declares no range for it, but a page
-        // of fewer than one item is not a page, so it is refused rather than silently
-        // read as "no limit".
-        let page_size = match input.max_results {
-            Some(limit) if limit < 1 => {
-                return Err(ListSecurityConfigurationsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "maxResults must be at least 1, but {limit} was requested"
-                        )),
-                    },
-                )
-                .into());
-            }
-            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
-            None => None,
-        };
+        // The page itself — the `maxResults` bound, the newest-first order, the cursor
+        // position and the `nextToken` — is the one rule every paginated list in this
+        // service shares ([`crate::state::page_of`]), applied here to the configurations
+        // THIS region holds that the request's filters kept: one created at another
+        // region's endpoint is not one this endpoint lists. The cursor carries this
+        // operation's scope, so a cursor another listing minted is refused as an invalid
+        // request, as is a page of fewer than one configuration.
+        let page = crate::state::page_of(
+            crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE,
+            state
+                .region_security_configurations(&region)
+                .filter(|record| matches_filters(record, &input)),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|refusal| {
+            ListSecurityConfigurationsError::from(
+                ListSecurityConfigurationsErrorModeled::ValidationException(ValidationException {
+                    message: Some(refusal.message()),
+                }),
+            )
+        })?;
 
-        // Newest first, over the configurations THIS region holds: one created at another
-        // region's endpoint is not one this endpoint lists. The creation sequence breaks a
-        // tie between two configurations created in the same millisecond, so the order is
-        // total and a page boundary never depends on hash order.
-        let mut matching: Vec<&crate::state::SecurityConfigurationRecord> = state
-            .region_security_configurations(&region)
-            .filter(|record| matches_filters(record, &input))
-            .collect();
-        matching.sort_by(|left, right| {
-            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
-        });
-
-        // `nextToken` is the POSITION in the newest-first order the next page starts at,
-        // not the identity of a row, so resuming reports everything ordered after the
-        // cursor with no repeats and no gaps.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(cursor) = decode_cursor(token) else {
-                    return Err(ListSecurityConfigurationsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some("nextToken is not a valid pagination token".to_string()),
-                        },
-                    )
-                    .into());
-                };
-                matching
-                    .iter()
-                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
-                    .unwrap_or(matching.len())
-            }
-        };
-
-        let end = page_size.map_or(matching.len(), |size| {
-            start.saturating_add(size).min(matching.len())
-        });
-        let security_configurations: Vec<SecurityConfiguration> = matching[start..end]
+        let security_configurations: Vec<SecurityConfiguration> = page
+            .records
             .iter()
             .map(|record| record.to_security_configuration())
             .collect();
-        // A `nextToken` only when configurations remain after this page.
-        let next_token = matching.get(end).map(|record| encode_cursor(record));
 
         Ok(ListSecurityConfigurationsOutput {
             security_configurations: Some(security_configurations),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }

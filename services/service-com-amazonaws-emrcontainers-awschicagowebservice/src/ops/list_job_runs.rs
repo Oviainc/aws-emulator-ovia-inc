@@ -73,28 +73,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The opaque `nextToken` for the run the next page starts at: the virtual cluster it
-/// pages — the cursor's scope — plus that run's place in the newest-first order.
-///
-/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
-/// one encoder every paginated list in this service shares.
-fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::JobRunRecord) -> String {
-    crate::state::encode_list_cursor(
-        virtual_cluster_id,
-        record.created_at_millis,
-        record.sequence,
-    )
-}
-
-/// The place in this cluster's newest-first order a `nextToken` names.
-///
-/// `None` — refused as an invalid request — when the token is not one of this service's
-/// cursors or belongs to another virtual cluster's listing, so a token cannot be carried
-/// from one cluster's pagination to another's.
-fn decode_cursor(virtual_cluster_id: &str, token: &str) -> Option<(i64, u64)> {
-    crate::state::decode_list_cursor(virtual_cluster_id, token)
-}
-
 /// Whether one stored job run satisfies every filter the request carried. A filter the
 /// request omitted constrains nothing.
 fn matches_filters(record: &crate::state::JobRunRecord, input: &ListJobRunsInput) -> bool {
@@ -225,72 +203,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `maxResults` is the page size. The model declares no range for it, but a page
-        // of fewer than one item is not a page, so it is refused rather than silently
-        // read as "no limit".
-        let page_size = match input.max_results {
-            Some(limit) if limit < 1 => {
-                return Err(ListJobRunsErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "maxResults must be at least 1, but {limit} was requested"
-                    )),
-                })
-                .into());
-            }
-            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
-            None => None,
-        };
+        // The page itself — the `maxResults` bound, the newest-first order, the cursor
+        // position and the `nextToken` — is the one rule every paginated list in this
+        // service shares ([`crate::state::page_of`]), applied here to the runs this cluster
+        // holds that the request's filters kept. The cursor's scope is the virtual cluster
+        // this listing pages, so a token cannot be carried from one cluster's pagination to
+        // another's; a token outside that scope, like a page of fewer than one run, is
+        // refused as an invalid request.
+        let page = crate::state::page_of(
+            &input.virtual_cluster_id,
+            state
+                .cluster_job_runs(&input.virtual_cluster_id)
+                .filter(|record| matches_filters(record, &input)),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|refusal| {
+            ListJobRunsError::from(ListJobRunsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal.message()),
+                },
+            ))
+        })?;
 
-        // Newest first, over the runs this cluster actually holds. The creation sequence
-        // breaks a tie between two runs created in the same millisecond, so the order is
-        // total and a page boundary never depends on hash order.
-        let mut matching: Vec<&crate::state::JobRunRecord> = state
-            .cluster_job_runs(&input.virtual_cluster_id)
-            .filter(|record| matches_filters(record, &input))
-            .collect();
-        matching.sort_by(|left, right| {
-            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
-        });
-
-        // `nextToken` is the cursor the previous page ended on: the POSITION in the
-        // newest-first order of the next run to report, not the identity of a row. So a
-        // run whose state changed between pages (a PENDING one that reached RUNNING, say,
-        // under a `states` filter) cannot invalidate a token the client already holds:
-        // resuming reports everything ordered after the cursor, with no repeats and no
-        // gaps.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(cursor) = decode_cursor(&input.virtual_cluster_id, token) else {
-                    return Err(ListJobRunsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some("nextToken is not a valid pagination token".to_string()),
-                        },
-                    )
-                    .into());
-                };
-                matching
-                    .iter()
-                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
-                    .unwrap_or(matching.len())
-            }
-        };
-
-        let end = page_size.map_or(matching.len(), |size| {
-            start.saturating_add(size).min(matching.len())
-        });
-        let job_runs: Vec<JobRun> = matching[start..end]
+        let job_runs: Vec<JobRun> = page
+            .records
             .iter()
             .map(|record| record.to_job_run())
             .collect();
-        // A `nextToken` only when runs remain after this page.
-        let next_token = matching
-            .get(end)
-            .map(|record| encode_cursor(&input.virtual_cluster_id, record));
 
         Ok(ListJobRunsOutput {
             job_runs: Some(job_runs),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }

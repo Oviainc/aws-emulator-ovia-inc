@@ -314,6 +314,133 @@ pub fn list_managed_endpoints_scope(virtual_cluster_id: &str) -> String {
     format!("endpoints:{virtual_cluster_id}")
 }
 
+/// The place one listed record occupies in the newest-first order every `@paginated` list
+/// in this service reports: its stored `createdAt` in milliseconds, and the creation
+/// sequence that breaks a tie between two records stored in the same millisecond, so the
+/// order is total and a page boundary never depends on hash order.
+///
+/// Implemented by each record a list pages over, so [`page_of`] — not one copy per
+/// handler — is the only place the order, the cursor scan and the page bounds are written.
+pub trait ListPosition {
+    fn list_position(&self) -> (i64, u64);
+}
+
+impl ListPosition for VirtualClusterRecord {
+    fn list_position(&self) -> (i64, u64) {
+        (self.created_at_millis, self.sequence)
+    }
+}
+
+impl ListPosition for JobRunRecord {
+    fn list_position(&self) -> (i64, u64) {
+        (self.created_at_millis, self.sequence)
+    }
+}
+
+impl ListPosition for JobTemplateRecord {
+    fn list_position(&self) -> (i64, u64) {
+        (self.created_at_millis, self.sequence)
+    }
+}
+
+impl ListPosition for SecurityConfigurationRecord {
+    fn list_position(&self) -> (i64, u64) {
+        (self.created_at_millis, self.sequence)
+    }
+}
+
+impl ListPosition for ManagedEndpointRecord {
+    fn list_position(&self) -> (i64, u64) {
+        (self.created_at_millis, self.sequence)
+    }
+}
+
+/// Why a `@paginated` list cannot serve the page a request asked for. Both are invalid
+/// requests: each list refuses them with its OWN modelled `ValidationException`, carrying
+/// [`PageRefusal::message`], so the wording cannot differ between two listings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageRefusal {
+    /// `maxResults` named a page of fewer than one item, carrying the value requested.
+    MaxResultsBelowOne(i32),
+    /// `nextToken` is not a cursor this listing's scope issued.
+    UnknownNextToken,
+}
+
+impl PageRefusal {
+    /// The `message` the refusing `ValidationException` carries.
+    pub fn message(&self) -> String {
+        match self {
+            Self::MaxResultsBelowOne(limit) => {
+                format!("maxResults must be at least 1, but {limit} was requested")
+            }
+            Self::UnknownNextToken => "nextToken is not a valid pagination token".to_string(),
+        }
+    }
+}
+
+/// One page of a `@paginated` list: the records to report, in the order they go on the
+/// wire, and the `nextToken` that resumes after them.
+#[derive(Debug)]
+pub struct ListPage<'a, R> {
+    pub records: Vec<&'a R>,
+    pub next_token: Option<String>,
+}
+
+/// The page-bounds rule every `@paginated` list in this service follows, over the records
+/// a listing's filters already kept:
+///
+/// * `maxResults` is the page size, and a page of fewer than one item is not a page, so it
+///   is refused rather than silently read as "no limit";
+/// * the order is newest first, by [`ListPosition`];
+/// * `nextToken` is the POSITION in that order the next page starts at, not the identity of
+///   a row, so a record whose state changed between pages cannot invalidate a token the
+///   client already holds: resuming reports everything ordered at or after the cursor, with
+///   no repeats and no gaps. A token no [`decode_list_cursor`] of this `scope` accepts is
+///   refused, so a cursor one listing minted is never read as a position in another's order;
+/// * a `nextToken` comes back only while records remain after the page.
+///
+/// One rule for every paginated list here, beside the one cursor encoder, so the two halves
+/// of the pagination contract cannot drift apart.
+pub fn page_of<'a, R: ListPosition>(
+    scope: &str,
+    records: impl IntoIterator<Item = &'a R>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<ListPage<'a, R>, PageRefusal> {
+    let page_size = match max_results {
+        Some(limit) if limit < 1 => return Err(PageRefusal::MaxResultsBelowOne(limit)),
+        Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+        None => None,
+    };
+
+    let mut ordered: Vec<&'a R> = records.into_iter().collect();
+    ordered.sort_by_key(|record| std::cmp::Reverse(record.list_position()));
+
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let cursor = decode_list_cursor(scope, token).ok_or(PageRefusal::UnknownNextToken)?;
+            ordered
+                .iter()
+                .position(|record| record.list_position() <= cursor)
+                .unwrap_or(ordered.len())
+        }
+    };
+
+    let end = page_size.map_or(ordered.len(), |size| {
+        start.saturating_add(size).min(ordered.len())
+    });
+    let next_token = ordered.get(end).map(|record| {
+        let (created_at_millis, sequence) = record.list_position();
+        encode_list_cursor(scope, created_at_millis, sequence)
+    });
+
+    Ok(ListPage {
+        records: ordered[start..end].to_vec(),
+        next_token,
+    })
+}
+
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}` — the
 /// `VirtualClusterArn` shape's pattern.
 pub fn virtual_cluster_arn(region: &str, id: &str) -> String {

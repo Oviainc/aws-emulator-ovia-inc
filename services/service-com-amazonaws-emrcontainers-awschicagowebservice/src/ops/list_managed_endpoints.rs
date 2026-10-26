@@ -75,31 +75,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The opaque `nextToken` for the endpoint the next page starts at: the cluster's endpoint
-/// listing — the cursor's scope — plus that endpoint's place in the newest-first order.
-///
-/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
-/// one encoder every paginated list in this service shares.
-fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::ManagedEndpointRecord) -> String {
-    crate::state::encode_list_cursor(
-        &crate::state::list_managed_endpoints_scope(virtual_cluster_id),
-        record.created_at_millis,
-        record.sequence,
-    )
-}
-
-/// The place in this cluster's newest-first order a `nextToken` names.
-///
-/// `None` — refused as an invalid request — when the token is not one of this service's
-/// cursors or belongs to another listing (another cluster's endpoints, or the same
-/// cluster's job runs), so a token cannot be carried from one listing to another's.
-fn decode_cursor(virtual_cluster_id: &str, token: &str) -> Option<(i64, u64)> {
-    crate::state::decode_list_cursor(
-        &crate::state::list_managed_endpoints_scope(virtual_cluster_id),
-        token,
-    )
-}
-
 /// Whether one stored managed endpoint satisfies every filter the request carried. A
 /// filter the request omitted constrains nothing.
 fn matches_filters(
@@ -243,74 +218,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `maxResults` is the page size. The model declares no range for it, but a page of
-        // fewer than one item is not a page, so it is refused rather than silently read as
-        // "no limit".
-        let page_size = match input.max_results {
-            Some(limit) if limit < 1 => {
-                return Err(ListManagedEndpointsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "maxResults must be at least 1, but {limit} was requested"
-                        )),
-                    },
-                )
-                .into());
-            }
-            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
-            None => None,
-        };
+        // The page itself — the `maxResults` bound, the newest-first order, the cursor
+        // position and the `nextToken` — is the one rule every paginated list in this
+        // service shares ([`crate::state::page_of`]), applied here to the endpoints this
+        // cluster holds that the request's filters kept. The cursor's scope is this
+        // cluster's endpoint listing, so a cursor another listing minted (another cluster's
+        // endpoints, or the same cluster's job runs) is refused as an invalid request, as is
+        // a page of fewer than one endpoint.
+        let page = crate::state::page_of(
+            &crate::state::list_managed_endpoints_scope(&input.virtual_cluster_id),
+            state
+                .cluster_managed_endpoints(&input.virtual_cluster_id)
+                .filter(|record| matches_filters(record, &input)),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|refusal| {
+            ListManagedEndpointsError::from(
+                ListManagedEndpointsErrorModeled::ValidationException(ValidationException {
+                    message: Some(refusal.message()),
+                }),
+            )
+        })?;
 
-        // Newest first, over the endpoints this cluster actually holds. The creation
-        // sequence breaks a tie between two endpoints created in the same millisecond, so
-        // the order is total and a page boundary never depends on hash order.
-        let mut matching: Vec<&crate::state::ManagedEndpointRecord> = state
-            .cluster_managed_endpoints(&input.virtual_cluster_id)
-            .filter(|record| matches_filters(record, &input))
-            .collect();
-        matching.sort_by(|left, right| {
-            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
-        });
-
-        // `nextToken` is the cursor the previous page ended on: the POSITION in the
-        // newest-first order of the next endpoint to report, not the identity of a row. So
-        // an endpoint whose state changed between pages (a CREATING one that reached
-        // ACTIVE, say, under a `states` filter) cannot invalidate a token the client
-        // already holds: resuming reports everything ordered after the cursor, with no
-        // repeats and no gaps.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(cursor) = decode_cursor(&input.virtual_cluster_id, token) else {
-                    return Err(ListManagedEndpointsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some("nextToken is not a valid pagination token".to_string()),
-                        },
-                    )
-                    .into());
-                };
-                matching
-                    .iter()
-                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
-                    .unwrap_or(matching.len())
-            }
-        };
-
-        let end = page_size.map_or(matching.len(), |size| {
-            start.saturating_add(size).min(matching.len())
-        });
-        let endpoints: Vec<Endpoint> = matching[start..end]
+        let endpoints: Vec<Endpoint> = page
+            .records
             .iter()
             .map(|record| record.to_endpoint())
             .collect();
-        // A `nextToken` only when endpoints remain after this page.
-        let next_token = matching
-            .get(end)
-            .map(|record| encode_cursor(&input.virtual_cluster_id, record));
 
         Ok(ListManagedEndpointsOutput {
             endpoints: Some(endpoints),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }

@@ -25,6 +25,8 @@ mod managed_endpoint_describe;
 mod managed_endpoint_listing;
 #[path = "all/managed_endpoint_wire_form.rs"]
 mod managed_endpoint_wire_form;
+#[path = "all/paginated_page_bounds.rs"]
+mod paginated_page_bounds;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
