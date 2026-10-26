@@ -25,3 +25,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/tag_key_constraints.rs"]
 mod tag_key_constraints;
+#[path = "all/untag_resource_tag_keys.rs"]
+mod untag_resource_tag_keys;
