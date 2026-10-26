@@ -23,12 +23,39 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Codec for the opaque pagination cursors `state::paginate` mints and reads back.
 hex = { workspace = true }
+# `arn`: the ONE parse of a resource ARN, shared with every other service — an
+# extension action's target URI is read through it rather than split here.
+service-common = { path = "../common" }
+# The `Content` an extension action-point event carries is base64, and a replacement
+# `Content` the action answers with is decoded the same way
+# (`state::extension_actions`).
+base64 = "0.22"
+# The AWS SDKs for the four target kinds an extension action's `Uri` may name, each
+# driven over the in-process callback (`OperationContext::callback`): a Lambda function
+# (`Invoke`, the one kind that can answer the action point), an Amazon SQS queue
+# (`SendMessage`), an Amazon SNS topic (`Publish`) and an Amazon EventBridge event bus
+# (`PutEvents`). Only the generated clients are needed — the emulator supplies the
+# transport, so the SDKs' own HTTPS stacks and runtimes are left out.
+aws-sdk-lambda = { version = "1", default-features = false }
+aws-sdk-sqs = { version = "1", default-features = false }
+aws-sdk-sns = { version = "1", default-features = false }
+aws-sdk-eventbridge = { version = "1", default-features = false }
+# The SDK's `RequestId`, to report the Lambda request id of a failed action-point
+# invocation in the refusal the gated call answers with.
+aws-types = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# `tokio::time` drives the tests' wait past an action point's due instant.
+tokio = { workspace = true, features = ["time"] }
+# An extension action's target lives in another service, and an invocation is asserted
+# where a client sees it: on the queue the action's `Uri` names, and against the Lambda
+# function it names.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [lints]
 workspace = true

@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetDeploymentErrorModeled::InternalServerException(
@@ -203,30 +203,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let now = std::time::SystemTime::now();
-        let mut store = state.lock();
+        {
+            let mut store = state.lock();
 
-        let Some(application) = store.application_mut(&input.application_id) else {
-            return Err(not_found(
-                crate::state::application_not_found(&input.application_id),
-                input.application_id,
-            ));
-        };
-        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
-            return Err(not_found(
-                crate::state::environment_not_found(
-                    &input.application_id,
-                    &input.environment_id,
-                ),
-                input.environment_id,
-            ));
-        };
+            let Some(application) = store.application_mut(&input.application_id) else {
+                return Err(not_found(
+                    crate::state::application_not_found(&input.application_id),
+                    input.application_id,
+                ));
+            };
+            let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+                return Err(not_found(
+                    crate::state::environment_not_found(
+                        &input.application_id,
+                        &input.environment_id,
+                    ),
+                    input.environment_id,
+                ));
+            };
 
-        // Reporting a deployment materialises only what the CLOCK already made due —
-        // the growth steps, the bake period and the completion the strategy's own
-        // durations schedule. Nothing here depends on this call happening.
-        environment.materialize(now);
+            // Reporting a deployment materialises only what the CLOCK already made due —
+            // the growth steps, the bake period and the completion the strategy's own
+            // durations schedule. Nothing here depends on this call happening.
+            environment.materialize(now);
 
-        let Some(deployment) = environment.deployments.get(&input.deployment_number) else {
+            if !environment
+                .deployments
+                .contains_key(&input.deployment_number)
+            {
+                return Err(not_found(
+                    crate::state::deployment_not_found(
+                        &input.application_id,
+                        &input.environment_id,
+                        input.deployment_number,
+                    ),
+                    input.deployment_number.to_string(),
+                ));
+            }
+        }
+
+        // The action points of the deployment's own lifecycle are owed by the same clock
+        // that owes it those transitions: each `ON_DEPLOYMENT_*` point by a stage the
+        // deployment has already reached, and `AT_DEPLOYMENT_TICK` by the interval that
+        // has elapsed — so the invocations this performs were due whether or not anybody
+        // asked for this report.
+        crate::state::extension_actions::drive_deployment(
+            &*self.engine,
+            ctx,
+            &input.application_id,
+            &input.environment_id,
+            input.deployment_number,
+        )
+        .await;
+
+        let store = state.lock();
+        let Some(deployment) = store
+            .application(&input.application_id)
+            .and_then(|application| application.environments.get(&input.environment_id))
+            .and_then(|environment| environment.deployments.get(&input.deployment_number))
+        else {
             return Err(not_found(
                 crate::state::deployment_not_found(
                     &input.application_id,

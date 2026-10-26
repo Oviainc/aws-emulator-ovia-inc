@@ -185,6 +185,38 @@ fn not_found(message: String, resource_name: String) -> StartDeploymentError {
     .into()
 }
 
+/// A `BadRequestException` (HTTP 400) refusing the deployment because an extension
+/// action AppConfig consults before starting it did not answer.
+///
+/// "A raising target refuses the calling operation and leaves no record": the message is
+/// the service's own template, built by
+/// [`crate::state::extension_actions::ActionTarget::refusal_message`].
+fn extension_failed(message: String) -> StartDeploymentError {
+    StartDeploymentErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// What this call resolved before it consulted the `PRE_START_DEPLOYMENT` action point:
+/// everything the deployment is written from, plus the actions to invoke and the event
+/// they are handed.
+///
+/// Collected under the state lock and then handed to the invocations, which cannot be
+/// made while it is held — so the record is written afterwards, from a second look at the
+/// store.
+struct Prepared {
+    configuration_name: String,
+    configuration_location_uri: String,
+    version_label: Option<String>,
+    strategy: crate::state::DeploymentStrategy,
+    applied_extensions: Vec<AppliedExtension>,
+    targets: Vec<crate::state::extension_actions::ActionTarget>,
+    event: crate::state::extension_actions::ActionEvent,
+}
+
 /// The `StartDeployment` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -219,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartDeploymentErrorModeled::InternalServerException(
@@ -247,6 +279,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let started_at = std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let dynamic_parameters = input
+            .dynamic_extension_parameters
+            .clone()
+            .unwrap_or_default();
+
+        // Everything this call resolves and refuses on is decided under the lock; the
+        // `PRE_START_DEPLOYMENT` invocations below cannot be made while it is held, so
+        // the guard is confined to this block and the record is written from a second
+        // look at the store afterwards.
+        let prepared = {
         let mut store = state.lock();
 
         // Resolve every resource the deployment names before anything is written.
@@ -276,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The deployment records WHAT it deployed, so the configuration's name and
         // location are copied off the profile as it stands now.
+        let application_name = application.name.clone();
         let configuration_name = profile.name.clone();
         let configuration_location_uri = profile.location_uri.clone();
         // `ConfigurationVersion` names a hosted version either by its version number or
@@ -285,6 +329,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version_label = profile
             .resolve_hosted_version(&input.configuration_version)
             .and_then(|version| version.version_label.clone());
+        // The candidate configuration an extension action is handed: the bytes a
+        // consumer of this profile would be served for the version being deployed, read
+        // through the same projection the data plane serves.
+        let candidate_content = profile
+            .resolve_hosted_version(&input.configuration_version)
+            .map(|version| {
+                (
+                    version.content_type.clone(),
+                    profile.served_content(&version.content),
+                )
+            });
 
         let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
             return Err(not_found(
@@ -347,6 +402,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "StartDeployment synchronously invokes the action bound at
+        // PRE_START_DEPLOYMENT before creating the deployment": the actions are
+        // resolved here, against the associations in force at this instant, and the
+        // event they are handed names the resources this deployment runs on and the
+        // candidate configuration it would put in service.
+        let next_deployment_number = environment.next_deployment_number;
+        let previous_deployment_number = environment.latest_deployment_number();
+        let environment_id = environment.id.clone();
+        let environment_name = environment.name.clone();
+        let scope = crate::state::extension_actions::Scope {
+            application_id: &input.application_id,
+            environment_id: Some(&input.environment_id),
+            configuration_profile_id: Some(&input.configuration_profile_id),
+        };
+        let targets = crate::state::extension_actions::targets_at(
+            &mut store,
+            crate::state::extension_actions::PRE_START_DEPLOYMENT,
+            &scope,
+            &region,
+            &dynamic_parameters,
+        );
+        let mut event = crate::state::extension_actions::ActionEvent::new()
+            .resource("Application", &input.application_id, &application_name)
+            .resource("Environment", &environment_id, &environment_name)
+            .resource(
+                "ConfigurationProfile",
+                &input.configuration_profile_id,
+                &configuration_name,
+            )
+            .member(
+                "DeploymentNumber",
+                ::serde_json::Value::from(next_deployment_number),
+            )
+            .member(
+                "PreviousDeploymentNumber",
+                ::serde_json::Value::from(previous_deployment_number),
+            );
+        event = match candidate_content {
+            Some((content_type, content)) => event.content(
+                &content_type,
+                &input.configuration_version,
+                &content,
+            ),
+            // A configuration whose bytes this service does not hold — one stored in S3,
+            // Parameter Store or Secrets Manager — has a version but no content here,
+            // and content invented for it would be content no caller wrote.
+            None => event.member(
+                "ContentVersion",
+                ::serde_json::Value::from(input.configuration_version.as_str()),
+            ),
+        };
+
+        Prepared {
+            configuration_name,
+            configuration_location_uri,
+            version_label,
+            strategy,
+            applied_extensions,
+            targets,
+            event,
+        }
+        };
+
+        // The action point is consulted BEFORE the deployment is created: a target that
+        // refuses the action refuses this call, and no deployment record exists to roll
+        // back — nothing has been written yet.
+        let mut pre_start_invocations: Vec<ActionInvocation> = Vec::new();
+        for target in &prepared.targets {
+            match crate::state::extension_actions::invoke(
+                ctx,
+                target,
+                &prepared.event.document(target),
+                &region,
+            )
+            .await
+            {
+                Ok(_) => pre_start_invocations.push(target.invocation_record(None)),
+                Err(failure) => {
+                    if failure.refuses_the_call() {
+                        return Err(extension_failed(target.refusal_message(&failure)));
+                    }
+                    // The invocation did not happen for a reason that is not the
+                    // extension's answer, so it is RECORDED on the deployment rather
+                    // than reported as a veto the extension never gave.
+                    pre_start_invocations.push(target.invocation_record(Some(&failure)));
+                }
+            }
+        }
+
+        let deployment_number = {
+        let mut store = state.lock();
+        let Some(environment) = store
+            .application_mut(&input.application_id)
+            .and_then(|application| application.environments.get_mut(&input.environment_id))
+        else {
+            return Err(not_found(
+                crate::state::environment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
+                ),
+                input.environment_id,
+            ));
+        };
+        // Re-read after the invocations: the environment is only ready for this
+        // deployment if nothing else started one while the action point was being
+        // consulted.
+        environment.materialize(started_at);
+        if let Some(active) = environment.active_deployment() {
+            return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::environment_not_ready_for_deployment(
+                    &environment.id,
+                    &active.state,
+                )),
+            })
+            .into());
+        }
+
         let deployment_number = environment.next_deployment_number;
         environment.next_deployment_number += 1;
         let deployment = crate::state::Deployment::start(
@@ -354,20 +526,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployment_number,
                 application_id: environment.application_id.clone(),
                 environment_id: environment.id.clone(),
-                configuration_profile_id: input.configuration_profile_id,
-                configuration_name,
-                configuration_location_uri,
+                configuration_profile_id: input.configuration_profile_id.clone(),
+                configuration_name: prepared.configuration_name,
+                configuration_location_uri: prepared.configuration_location_uri,
                 configuration_version: input.configuration_version,
                 description: input.description,
                 kms_key_identifier: input.kms_key_identifier,
-                version_label,
-                applied_extensions,
+                version_label: prepared.version_label,
+                applied_extensions: prepared.applied_extensions,
                 tags: input.tags.unwrap_or_default(),
             },
-            &strategy,
+            &prepared.strategy,
             started_at,
         );
-        let stored = environment.record_deployment(deployment);
+        environment.record_deployment(deployment);
+        // The extensions consulted before the deployment started are recorded on the
+        // event that says it started: "an extension that was invoked as part of a
+        // deployment event" (`smithy_query(query="shape",shape="ActionInvocation")`).
+        if !pre_start_invocations.is_empty() {
+            if let Some(started) = environment
+                .deployments
+                .get_mut(&deployment_number)
+                .and_then(|deployment| deployment.event_log.first_mut())
+            {
+                let mut invocations = started.action_invocations.take().unwrap_or_default();
+                invocations.extend(pre_start_invocations);
+                started.action_invocations = Some(invocations);
+            }
+        }
+
+        // The environment is DEPLOYING for as long as this deployment is in flight.
+        environment.materialize(started_at);
+        deployment_number
+        };
+
+        // The deployment is under way, so the action points of its own lifecycle are
+        // owed from here on — starting with `ON_DEPLOYMENT_START`, and, for a strategy
+        // with nothing left to wait for, the completion the clock already made due.
+        crate::state::extension_actions::drive_deployment(
+            &*self.engine,
+            ctx,
+            &input.application_id,
+            &input.environment_id,
+            deployment_number,
+        )
+        .await;
+
+        let store = state.lock();
+        let Some(stored) = store
+            .application(&input.application_id)
+            .and_then(|application| application.environments.get(&input.environment_id))
+            .and_then(|environment| environment.deployments.get(&deployment_number))
+        else {
+            return Err(StartDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The deployment could not be re-read after it was started".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
 
         // Answered from the stored deployment. `KmsKeyArn` is deliberately left unset, not
         // overlooked: it is the ARN of the key `KmsKeyIdentifier` resolves to and this
@@ -399,9 +618,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_label: stored.version_label.clone(),
             r#type: Some(stored.deployment_type.clone()),
         };
-
-        // The environment is DEPLOYING for as long as this deployment is in flight.
-        environment.materialize(started_at);
 
         Ok(output)
     }

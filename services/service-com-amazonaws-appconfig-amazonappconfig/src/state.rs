@@ -32,6 +32,7 @@ use crate::ops::types::{
     Treatment, TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
 };
 
+pub mod extension_actions;
 pub mod feature_flags;
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member
@@ -1937,6 +1938,15 @@ pub struct Deployment {
     /// as the instant it was owed from, so the transition is the clock's and no reader
     /// has to sleep for it.
     pub rollback_completion_due: Option<SystemTime>,
+    /// How many of this deployment's logged events of each `DeploymentEventType` have
+    /// already had the action point they owe invoked, so each stage of the deployment
+    /// invokes its actions exactly once however often the deployment is read
+    /// ([`extension_actions::drive_deployment`]).
+    pub notified_event_counts: BTreeMap<String, usize>,
+    /// The instant the next `AT_DEPLOYMENT_TICK` invocation falls due, set for as long as
+    /// this deployment is in flight. Stored as the instant it is owed from, so the ticks
+    /// are the clock's and no reader has to sleep for them.
+    pub next_tick_due: Option<SystemTime>,
     pub event_log: Vec<DeploymentEvent>,
     pub kms_key_identifier: Option<String>,
     pub version_label: Option<String>,
@@ -2011,6 +2021,10 @@ impl Deployment {
             completed_at: None,
             // Nothing has stopped it: the only thing that sets this is a caller's stop.
             rollback_completion_due: None,
+            // No stage of it has been reached yet, and its first tick falls due one
+            // interval in: see [`extension_actions::drive_deployment`].
+            notified_event_counts: BTreeMap::new(),
+            next_tick_due: Some(started_at + extension_actions::tick_interval()),
             event_log: vec![deployment_event(
                 EVENT_DEPLOYMENT_STARTED,
                 TRIGGERED_BY_USER,
@@ -3347,36 +3361,28 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         environment_id: &str,
         configuration_profile_id: &str,
     ) -> Vec<AppliedExtension> {
+        let scope = extension_actions::Scope {
+            application_id,
+            environment_id: Some(environment_id),
+            configuration_profile_id: Some(configuration_profile_id),
+        };
         let mut applied: BTreeMap<&str, AppliedExtension> = BTreeMap::new();
         for association in self.extension_associations.values() {
-            let bound = match parse_resource_arn(&association.resource_arn) {
-                Some(TaggedResource::Application {
-                    application_id: bound_application,
-                }) => bound_application == application_id,
-                Some(TaggedResource::Environment {
-                    application_id: bound_application,
-                    environment_id: bound_environment,
-                }) => bound_application == application_id && bound_environment == environment_id,
-                Some(TaggedResource::ConfigurationProfile {
-                    application_id: bound_application,
-                    configuration_profile_id: bound_profile,
-                }) => {
-                    bound_application == application_id
-                        && bound_profile == configuration_profile_id
-                }
-                _ => false,
-            };
-            if bound {
-                applied.insert(
-                    association.id.as_str(),
-                    AppliedExtension {
-                        extension_id: Some(association.extension_id.clone()),
-                        extension_association_id: Some(association.id.clone()),
-                        version_number: association.extension_version_number,
-                        parameters: Some(association.parameters.clone()),
-                    },
-                );
+            // The SAME binding the action-point dispatch resolves its targets through,
+            // so what a deployment reports as applied and what it actually invokes
+            // cannot disagree.
+            if !extension_actions::association_binds(&association.resource_arn, &scope) {
+                continue;
             }
+            applied.insert(
+                association.id.as_str(),
+                AppliedExtension {
+                    extension_id: Some(association.extension_id.clone()),
+                    extension_association_id: Some(association.id.clone()),
+                    version_number: association.extension_version_number,
+                    parameters: Some(association.parameters.clone()),
+                },
+            );
         }
         applied.into_values().collect()
     }

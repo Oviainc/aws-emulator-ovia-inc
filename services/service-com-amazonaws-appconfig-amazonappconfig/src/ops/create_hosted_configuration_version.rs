@@ -144,6 +144,17 @@ impl From<CreateHostedConfigurationVersionErrorModeled> for CreateHostedConfigur
     }
 }
 
+/// A `BadRequestException` (HTTP 400) refusing the write because the extension action
+/// AppConfig consults before creating a hosted configuration version did not answer.
+fn extension_failed(message: String) -> CreateHostedConfigurationVersionError {
+    CreateHostedConfigurationVersionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
 /// The `CreateHostedConfigurationVersion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::InternalServerException(
@@ -188,6 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
+        // Everything this write is refused on is decided under the lock; the
+        // `PRE_CREATE_HOSTED_CONFIGURATION_VERSION` invocation below cannot be made while
+        // it is held, so the guard is confined to this block and the version is stored
+        // from a second look at the store afterwards.
+        let (mut content, targets, event, profile_type, previously_stored) = {
         let mut store = state.lock();
 
         // The one member of this service's API that stores caller-supplied bytes, so the
@@ -331,6 +348,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+
+        // "CreateHostedConfigurationVersion is consulted by the action bound at
+        // PRE_CREATE_HOSTED_CONFIGURATION_VERSION before the version is created": the
+        // event carries the bytes this write is about to store and, from the second
+        // version on, the bytes the previously STORED version holds.
+        let version_number = profile.next_version_number;
+        let previous = profile.hosted_versions.values().next_back().map(|version| {
+            crate::state::extension_actions::previous_content(
+                &version.content_type,
+                version.version_number,
+                &version.content,
+            )
+        });
+        let application_name = application.name.clone();
+        let profile_name = profile.name.clone();
+        let profile_type = profile.profile_type.clone();
+        // The bytes the latest stored version holds, which the feature-flags helper reads
+        // to carry a previous version's stamps over; kept here because a replacement
+        // `Content` an action answers goes through that helper too.
+        let previously_stored = profile
+            .hosted_versions
+            .values()
+            .next_back()
+            .map(|version| version.content.clone());
+        let scope = crate::state::extension_actions::Scope {
+            application_id: &input.application_id,
+            // A hosted configuration version is written against a profile, which no
+            // environment is part of, so an association bound to an environment is not
+            // bound to this workflow.
+            environment_id: None,
+            configuration_profile_id: Some(&input.configuration_profile_id),
+        };
+        let targets = crate::state::extension_actions::targets_at(
+            &mut store,
+            crate::state::extension_actions::PRE_CREATE_HOSTED_CONFIGURATION_VERSION,
+            &scope,
+            &region,
+            // `DynamicExtensionParameters` is a member of `StartDeployment`, not of this
+            // operation, so an action here sees only the association's own values.
+            &std::collections::HashMap::new(),
+        );
+        let mut event = crate::state::extension_actions::ActionEvent::new()
+            .resource("Application", &input.application_id, &application_name)
+            .resource(
+                "ConfigurationProfile",
+                &input.configuration_profile_id,
+                &profile_name,
+            )
+            .content(&input.content_type, &version_number.to_string(), &content);
+        if let Some(previous) = previous {
+            event = event.member("PreviousContent", previous);
+        }
+
+        (content, targets, event, profile_type, previously_stored)
+        };
+
+        // The action point is consulted BEFORE the version is created: a target that
+        // refuses the action refuses this write and stores nothing, and a target that
+        // answers a replacement `Content` decides what is stored.
+        let mut replaced: Option<Vec<u8>> = None;
+        for target in &targets {
+            match crate::state::extension_actions::invoke(
+                ctx,
+                target,
+                &event.document(target),
+                &region,
+            )
+            .await
+            {
+                Ok(answer) => {
+                    let Some(replacement) = answer
+                        .as_ref()
+                        .and_then(crate::state::extension_actions::replacement_content)
+                    else {
+                        continue;
+                    };
+                    match replacement {
+                        Ok(bytes) => replaced = Some(bytes),
+                        Err(reason) => {
+                            return Err(extension_failed(target.refusal_message(
+                                &crate::state::extension_actions::Failure::new(
+                                    "InvalidExtensionResponse",
+                                    Some(&reason),
+                                    None,
+                                ),
+                            )));
+                        }
+                    }
+                }
+                Err(failure) => {
+                    if failure.refuses_the_call() {
+                        return Err(extension_failed(target.refusal_message(&failure)));
+                    }
+                    // The invocation did not happen for a reason that is not the
+                    // extension's answer, so the write proceeds with the bytes the
+                    // caller sent rather than being refused with a veto the extension
+                    // never gave. This operation's record carries no event log to note
+                    // it on, so the attempt is logged: a caller must not read an
+                    // untransformed version as one the action left alone.
+                    ::tracing::warn!(
+                        extension = %target.extension_name,
+                        uri = %target.uri,
+                        code = %failure.code,
+                        "the PRE_CREATE_HOSTED_CONFIGURATION_VERSION action could not be \
+                         invoked; the version was stored as submitted"
+                    );
+                }
+            }
+        }
+        // A replacement is what gets STORED, so it is held to everything the caller's own
+        // bytes are held to: the profile Type's own semantics, and the size bound.
+        if let Some(bytes) = replaced {
+            content = bytes;
+            if profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE {
+                // The feature-flags helper checks and stamps whatever document AppConfig
+                // is about to store, so a replacement goes through it exactly as the
+                // caller's document did: an extension cannot leave a feature-flag profile
+                // holding a document a write would have been refused for, or one served
+                // without the metadata the Type reference puts on every entry.
+                if !crate::state::feature_flags::is_valid_feature_flags_content(&content) {
+                    return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
+                                    .to_string(),
+                            ),
+                            reason: None,
+                            details: None,
+                        },
+                    )
+                    .into());
+                }
+                let Some(stamped) = crate::state::feature_flags::stamped_feature_flags_content(
+                    &content,
+                    previously_stored.as_deref(),
+                    std::time::SystemTime::now(),
+                ) else {
+                    return Err(
+                        CreateHostedConfigurationVersionErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: Some(
+                                    "The feature-flag document could not be stamped with its \
+                                     flag metadata"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                content = stamped;
+            }
+        }
+        if content.len() > crate::state::MAX_HOSTED_CONFIGURATION_BYTES {
+            return Err(CreateHostedConfigurationVersionErrorModeled::PayloadTooLargeException(
+                PayloadTooLargeException {
+                    message: Some(crate::state::CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE.to_string()),
+                    measure: Some(crate::state::BYTES_MEASURE_KILOBYTES.to_string()),
+                    limit: crate::state::MAX_HOSTED_CONFIGURATION_BYTES as f32
+                        / crate::state::BYTES_PER_KILOBYTE,
+                    size: content.len() as f32 / crate::state::BYTES_PER_KILOBYTE,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(profile) = store
+            .application(&input.application_id)
+            .and_then(|application| application.profiles.get(&input.configuration_profile_id))
+        else {
+            return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &input.application_id,
+                        &input.configuration_profile_id,
+                    )),
+                    resource_name: Some(input.configuration_profile_id),
+                },
+            )
+            .into());
+        };
 
         // Both the number of versions a profile keeps and the total content this
         // service holds are bounded, so a loop of writes cannot grow the emulator's
