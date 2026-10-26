@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     parameter_name, type_with_derived_legal_address, DEFAULT_HERITAGE_STATUS,
     DERIVED_MEMBER_UNKNOWN, HERITAGE_STATUS_OPT_IN, HERITAGE_STATUS_OPT_OUT,
-    MANAGEMENT_ACCOUNT_ONLY, SETTLED_REGISTRATION_STATUS, STATUS_DELETED, STATUS_PENDING,
-    STATUS_REJECTED, STATUS_VERIFIED, TRN_VALIDATION_DELAY,
+    SETTLED_REGISTRATION_STATUS, STATUS_DELETED, STATUS_PENDING, STATUS_REJECTED,
+    STATUS_VERIFIED, TRN_VALIDATION_DELAY,
 };
 
 use crate::tax_registration_lifecycle::{
@@ -418,12 +418,12 @@ async fn read_status(
         .map(std::string::ToString::to_string)
 }
 
-/// RULE: `GetTaxInheritance` reports an enum value for the account's election —
-/// the default while none is recorded — and only an AWS Organizations management
-/// account may set one, so this emulator's standalone account is refused with
-/// `ValidationException` / `FieldValidationFailed` and nothing is recorded.
+/// RULE: `GetTaxInheritance` reports an enum value for the account's election,
+/// and the one it reports while no election is recorded is the default an account
+/// that has not opted in has. What a write records is asserted in
+/// `tests/all/tax_inheritance_election.rs`.
 #[tokio::test]
-async fn tax_inheritance_is_reported_as_an_enum_and_set_only_by_a_management_account() {
+async fn tax_inheritance_is_reported_as_an_enum_value() {
     let router = emulator();
 
     assert!(
@@ -435,61 +435,18 @@ async fn tax_inheritance_is_reported_as_an_enum_and_set_only_by_a_management_acc
         DEFAULT_HERITAGE_STATUS, HERITAGE_STATUS_OPT_OUT,
         "an account that has not opted in is OptOut, got {DEFAULT_HERITAGE_STATUS:?}"
     );
-    let before = call(&router, "GetTaxInheritance", &json!({})).await;
-    assert_eq!(
-        before.status, 200,
-        "GetTaxInheritance expected 200, got {before:?}"
-    );
-    assert_eq!(
-        before.get("heritageStatus").as_str(),
-        Some("OptOut"),
-        "expected the default election while none is recorded, got {:?}",
-        before.body
-    );
-
-    // Both values the model's `HeritageStatus` enum lists, each tried twice: the
-    // refusal is about the CALLER, so it does not depend on the value asked for.
-    for election in [
-        HERITAGE_STATUS_OPT_OUT,
-        HERITAGE_STATUS_OPT_IN,
-        HERITAGE_STATUS_OPT_OUT,
-    ] {
-        let put = call(
-            &router,
-            "PutTaxInheritance",
-            &json!({ "heritageStatus": election }),
-        )
-        .await;
+    // A read records nothing, so repeating it reports the same default.
+    for read in 1..=2 {
+        let before = call(&router, "GetTaxInheritance", &json!({})).await;
         assert_eq!(
-            (put.status, put.error_code.as_str()),
-            (400, "ValidationException"),
-            "case {election:?}: expected 400 ValidationException, got {put:?}"
+            before.status, 200,
+            "case \"read {read}\": GetTaxInheritance expected 200, got {before:?}"
         );
         assert_eq!(
-            put.get("errorCode").as_str(),
-            Some("FieldValidationFailed"),
-            "case {election:?}: expected the FieldValidationFailed code, got {:?}",
-            put.body
-        );
-        assert_eq!(
-            put.get("message").as_str(),
-            Some(MANAGEMENT_ACCOUNT_ONLY),
-            "case {election:?}: expected the management-account rule stated, got {:?}",
-            put.body
-        );
-        // The refusal is of the call, not of a parameter, so it names no field.
-        assert!(
-            put.body.get("fieldList").is_none(),
-            "case {election:?}: a refusal of the call must name no field, got {:?}",
-            put.body
-        );
-
-        let after = call(&router, "GetTaxInheritance", &json!({})).await;
-        assert_eq!(
-            after.get("heritageStatus").as_str(),
+            before.get("heritageStatus").as_str(),
             Some(DEFAULT_HERITAGE_STATUS),
-            "case {election:?}: a refused election must record nothing, got {:?}",
-            after.body
+            "case \"read {read}\": expected the default election while none is recorded, got {:?}",
+            before.body
         );
     }
 }
