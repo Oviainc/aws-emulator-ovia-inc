@@ -37,6 +37,8 @@ mod crawler_updates;
 mod crawlers;
 #[path = "all/create_partition.rs"]
 mod create_partition;
+#[path = "all/custom_entity_type_listing.rs"]
+mod custom_entity_type_listing;
 #[path = "all/custom_entity_types.rs"]
 mod custom_entity_types;
 #[path = "all/data_catalog.rs"]
