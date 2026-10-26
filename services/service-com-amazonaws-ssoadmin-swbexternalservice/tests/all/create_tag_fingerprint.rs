@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE rule both `@idempotencyToken`-scoped creates fold their `Tags` into the
-//! request a `ClientToken` is scoped to by, driven through BOTH operations that share it.
+//! The ONE rule the `@idempotencyToken`-scoped creates fold their `Tags` into the
+//! request a `ClientToken` is scoped to by, driven through both operations that can mint
+//! repeatedly under it (`CreateInstance` shares the same fold, over the one instance an
+//! account may hold, in `instance_create_client_token_fold.rs`).
 //!
 //! `CreateApplication` and `CreateTrustedTokenIssuer` each judge a reused `ClientToken`
 //! by comparing the whole request it first carried with the one it carries now, and a tag

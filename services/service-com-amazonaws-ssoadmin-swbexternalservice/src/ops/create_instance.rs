@@ -13,7 +13,10 @@
 //! (`crate::scaffolded::modeled_error_status`). `ClientToken` is `@idempotencyToken`, so a
 //! retry carrying the token of the call that DID create the instance answers with that
 //! instance instead of the refusal, and the same token with different parameters is the
-//! modelled `ConflictException`.
+//! modelled `ConflictException`. Which of the two a repeated token earns is decided by
+//! `crate::state::instance_fingerprint` over the request as it ARRIVED — the same fold
+//! the sibling `@idempotencyToken` creates use, under which `Tags` compare as the
+//! order-insensitive MULTISET of pairs the request carried.
 //!
 //! What it creates is an ACCOUNT instance (`crate::state::InstanceType::Account`): the
 //! operation is documented as creating an instance "for a standalone Amazon Web Services
@@ -216,6 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // very call that establishes it.
         store.on_instance_create(now);
 
+        // Every parameter this `ClientToken` is scoped to, digested the way the sibling
+        // `@idempotencyToken` creates digest theirs: `Tags` as the order-insensitive
+        // MULTISET of pairs the request carried, so no two different requests share a
+        // fingerprint.
+        let fingerprint = crate::state::instance_fingerprint(
+            input.name.as_deref(),
+            input.tags.as_deref().unwrap_or_default(),
+        );
+
         // `ClientToken` is `@idempotencyToken`: a retry of the call that created the
         // instance must answer with that instance, not with a refusal. "Passing the same
         // value to a later call to an operation requires that you also pass the same
@@ -223,9 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a conflict rather than a second answer.
         if let Some(client_token) = input.client_token.as_deref() {
             if let Some(existing) = store.instance_by_client_token(client_token) {
-                let same_request = existing.name == input.name
-                    && tags_match(&existing.tags, input.tags.as_deref().unwrap_or(&[]));
-                if !same_request {
+                if existing.request_fingerprint != fingerprint {
                     return Err(CreateInstanceErrorModeled::ConflictException(
                         ConflictException {
                             message: Some(crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string()),
@@ -264,6 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         instance.client_token = input.client_token;
         instance.tags = input.tags.unwrap_or_default();
+        // The request as it ARRIVED, so a later retry of this very call is told from the
+        // same token carrying a different request even after the instance's tags have
+        // been changed by `TagResource`/`UntagResource`.
+        instance.request_fingerprint = fingerprint;
         // A freshly minted id cannot already be stored; checking before the insert means
         // a collision is reported rather than silently replacing another instance.
         if store.instances.contains_key(&instance.instance_arn) {
@@ -290,18 +304,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance_arn: Some(stored.instance_arn.clone()),
         })
     }
-}
-
-/// Whether two tag sets are the same set of (key, value) pairs, order disregarded — the
-/// comparison the `ClientToken` idempotency check needs over `Tags`, which the model
-/// carries as a list but AWS treats as a set keyed by `Key`.
-fn tags_match(stored: &[Tag], requested: &[Tag]) -> bool {
-    if stored.len() != requested.len() {
-        return false;
-    }
-    requested.iter().all(|wanted| {
-        stored
-            .iter()
-            .any(|tag| tag.key == wanted.key && tag.value == wanted.value)
-    })
 }

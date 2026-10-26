@@ -1245,6 +1245,15 @@ pub struct Instance {
     pub client_token: Option<String>,
     /// The tags `CreateInstance` attached to the instance.
     pub tags: Vec<Tag>,
+    /// The [`instance_fingerprint`] of the `CreateInstance` request that minted this
+    /// instance, which is what tells a genuine retry of that call from the same
+    /// `ClientToken` carrying a DIFFERENT request. It fingerprints the request as it
+    /// ARRIVED rather than what the instance holds now, so a `TagResource` or
+    /// `UntagResource` in between cannot turn a true retry into a conflict.
+    ///
+    /// Empty for an instance no `CreateInstance` call minted: such an instance carries no
+    /// `ClientToken` either, so no idempotency check ever reaches its fingerprint.
+    pub request_fingerprint: String,
     /// When the clock owes this instance its move out of `CREATE_IN_PROGRESS`, or `None`
     /// for an instance that is already in a terminal status. Stored as a due INSTANT and
     /// applied by [`Instance::materialize_due`]; nothing sleeps for it.
@@ -1299,6 +1308,7 @@ impl Instance {
             access_control_attributes: None,
             client_token: None,
             tags: Vec::new(),
+            request_fingerprint: String::new(),
             active_due: None,
             deleted_due: None,
         }
@@ -3653,6 +3663,25 @@ pub fn mint_application_arn(instance_arn: &str) -> String {
     )
 }
 
+/// A stable digest of every parameter a `@idempotencyToken`-carrying `CreateInstance` is
+/// scoped to — the same rule as [`application_fingerprint`] and
+/// [`trusted_token_issuer_fingerprint`], over this operation's members (`Name` and
+/// `Tags`; `ClientToken` is the key the fingerprint is compared UNDER, not part of it).
+///
+/// A `Name` the caller omitted is a different request from one that sent the empty
+/// string, so the two are distinguished before the parts are length-prefixed. `Tags` go
+/// in through [`push_sorted_tag_parts`], so two requests differing only in the order
+/// their tags arrived fingerprint alike, while any difference in the MULTISET of pairs
+/// they carry — a missing pair, an extra one, a repeated one — fingerprints differently.
+pub fn instance_fingerprint(name: Option<&str>, tags: &[Tag]) -> String {
+    let mut parts = match name {
+        Some(name) => vec!["name".to_string(), name.to_string()],
+        None => vec!["no-name".to_string()],
+    };
+    push_sorted_tag_parts(&mut parts, tags);
+    request_fingerprint(&parts)
+}
+
 /// A stable digest of every parameter a `@idempotencyToken`-carrying
 /// `CreateApplication` is scoped to — the same rule as
 /// [`trusted_token_issuer_fingerprint`], over this operation's members.
@@ -3727,8 +3756,12 @@ pub fn trusted_token_issuer_fingerprint(
 /// The one place every `@idempotencyToken`-scoped create expresses the rule that a tag
 /// set carries no order the caller chose, so two requests differing only in the order
 /// their tags arrived fingerprint alike and the second is a replay rather than a
-/// conflict. Both [`application_fingerprint`] and [`trusted_token_issuer_fingerprint`]
-/// call it, so neither can drift from the other.
+/// conflict. [`instance_fingerprint`], [`application_fingerprint`] and
+/// [`trusted_token_issuer_fingerprint`] all call it, so none can drift from the others.
+///
+/// The pairs are sorted rather than deduplicated, so the parts it pushes represent the
+/// MULTISET the caller sent: a list that repeats a pair is not the same request as one
+/// that carries a different pair in its place.
 fn push_sorted_tag_parts(parts: &mut Vec<String>, tags: &[Tag]) {
     let mut sorted: Vec<(&str, &str)> = tags
         .iter()

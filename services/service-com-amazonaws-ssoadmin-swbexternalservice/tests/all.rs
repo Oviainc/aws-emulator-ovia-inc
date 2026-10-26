@@ -77,6 +77,8 @@ mod inline_policy;
 mod inline_policy_independence;
 #[path = "all/instance_create.rs"]
 mod instance_create;
+#[path = "all/instance_create_client_token_fold.rs"]
+mod instance_create_client_token_fold;
 #[path = "all/instance_delete.rs"]
 mod instance_delete;
 #[path = "all/instance_describe.rs"]
