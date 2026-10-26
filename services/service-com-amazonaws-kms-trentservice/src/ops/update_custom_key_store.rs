@@ -10,8 +10,9 @@
 //! resolver this operation shares with `DescribeCustomKeyStores`, so the two can never
 //! disagree about which ids name nothing.
 //!
-//! Each property is changed only on a key store of the type it belongs to, and the
-//! result is read back through `DescribeCustomKeyStores`: "this operation does not
+//! Each property is changed only on a key store of the type it belongs to, and only in a
+//! connection state the property's own documentation admits, and the result is read back
+//! through `DescribeCustomKeyStores`: "this operation does not
 //! return any property values. To verify the updated property values, use the
 //! DescribeCustomKeyStores operation."
 //!
@@ -366,7 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
         let custom_key_store_type = store.custom_key_store_type();
-        let connected = store.connection_state == crate::state::CONNECTION_STATE_CONNECTED;
+        let connection_state = store.connection_state.clone();
 
         // Every property but the name belongs to ONE key store type: the CloudHSM
         // cluster and the kmsuser password are "valid only for custom key stores with a
@@ -401,20 +402,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // "To update most properties of an CloudHSM key store, the ConnectionState of
-        // the CloudHSM key store must be DISCONNECTED. However, you can update the
-        // CustomKeyStoreName of an AWS CloudHSM key store when it is in the CONNECTED or
-        // DISCONNECTED state" (the operation doc), which is what
+        // Each property states in its OWN documentation whether the key store has to be
+        // disconnected before it can be changed: "to change this value, the CloudHSM key
+        // store must be disconnected" (`CloudHsmClusterId`, `KeyStorePassword`) and "to
+        // change this value, the external key store must be disconnected"
+        // (`XksProxyUriEndpoint`, `XksProxyConnectivity`,
+        // `XksProxyVpcEndpointServiceName`, `XksProxyVpcEndpointServiceOwner`). The
+        // friendly name ("to change this value, the custom key store can be connected or
+        // disconnected"), the proxy API path and the proxy authentication credential
+        // ("you can change this value when the external key store is connected or
+        // disconnected") state no such requirement, so they are applied in whatever
+        // connection state the key store is in. Changing a property that does require it
+        // on a key store that is anything but DISCONNECTED is what
         // `CustomKeyStoreInvalidStateException` — "the request was rejected because of
-        // the ConnectionState of the custom key store" — reports. The name is the one
-        // property a connected key store accepts.
-        if connected && (cloud_hsm_properties || xks_properties) {
+        // the ConnectionState of the custom key store" — reports.
+        let requires_disconnected = input.cloud_hsm_cluster_id.is_some()
+            || input.key_store_password.is_some()
+            || input.xks_proxy_uri_endpoint.is_some()
+            || input.xks_proxy_connectivity.is_some()
+            || input.xks_proxy_vpc_endpoint_service_name.is_some()
+            || input.xks_proxy_vpc_endpoint_service_owner.is_some();
+        if requires_disconnected
+            && connection_state != crate::state::CONNECTION_STATE_DISCONNECTED
+        {
             return Err(UpdateCustomKeyStoreErrorModeled::CustomKeyStoreInvalidStateException(
                 CustomKeyStoreInvalidStateException {
                     message: Some(format!(
-                        "{} is {}. To update this property, the custom key store must be {}.",
+                        "{} is {connection_state}. To update this property, the custom key \
+                         store must be {}.",
                         input.custom_key_store_id,
-                        crate::state::CONNECTION_STATE_CONNECTED,
                         crate::state::CONNECTION_STATE_DISCONNECTED
                     )),
                 },
