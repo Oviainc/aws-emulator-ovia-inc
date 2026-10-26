@@ -6,7 +6,10 @@
 //! the file `location` names has to resolve first: it is read through the framework's
 //! IN-PROCESS callback into the Amazon S3 service mounted beside this one (no socket is
 //! opened), and a location that store reports as unreadable is a `BadRequestException` with
-//! nothing stored. A name identifies at most one plugin, so a repeat of a stored name is a
+//! nothing stored. Taking the file on is also what fixes the revision's `fileDescription`:
+//! the MD5 digest and the size of the artifact's bytes are computed here and kept on the
+//! record, so every later read of the revision reports the file it was built from. A name
+//! identifies at most one plugin, so a repeat of a stored name is a
 //! `ConflictException`. The plugin is answered `CREATING` and becomes `ACTIVE` once the
 //! clock says so (`crate::state::TRANSITION_SPAN`), which every later read materialises.
 //!
@@ -214,38 +217,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming an object the emulator's own Amazon S3 reports as absent (or as
         // one this account may not read) is a bad request, and the store is left
         // untouched — no ARN, no `CREATING` plugin, nothing for a later list or
-        // describe to report.
+        // describe to report. Taking it on is also what gives the plugin's
+        // revision its `fileDescription`: the digest and the size are computed
+        // from the artifact's bytes HERE, once, and the record keeps them, so
+        // every later read of this revision reports the file it was built from.
         //
         // The resolution is an IN-PROCESS call through the framework's callback
         // seam (see `crate::state::s3_client`): the request is dispatched to the
         // S3 service mounted beside this one, so no socket is opened, nothing
-        // leaves the host, and the caller cannot steer where it goes. It is a
-        // METADATA read (`HeadObject`), so the artifact's bytes are never copied
-        // into this service, and it carries ONE awaited call with no retry loop.
-        // No state lock is held across it: the store is taken afterwards, so the
-        // shared mutex is never held over the call and the await point is where
-        // a cancelled request stops.
+        // leaves the host, and the caller cannot steer where it goes. It carries
+        // ONE awaited call with no retry loop, and no state lock is held across
+        // it: the store is taken afterwards, so the shared mutex is never held
+        // over the call and the await point is where a cancelled request stops.
         //
         // It runs before the name-conflict and quota checks below. Both refusals
         // are modelled client errors and the recording pins no precedence
         // between them, so the order chosen here is the one that answers the
         // question the caller can act on first — the artifact — and either way
         // nothing is persisted.
-        if crate::state::custom_plugin_file_is_unreadable(
+        let file = match crate::state::take_on_custom_plugin_file(
             ctx,
             &region,
             &input.location.s3_location,
         )
         .await
         {
-            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    crate::state::S3_LOCATION_MEMBER,
-                    crate::state::CUSTOM_PLUGIN_FILE_UNREADABLE,
-                )),
-            })
-            .into());
-        }
+            crate::state::CustomPluginFileVerdict::Unreadable => {
+                return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::invalid_parameter_because(
+                        crate::state::S3_LOCATION_MEMBER,
+                        crate::state::CUSTOM_PLUGIN_FILE_UNREADABLE,
+                    )),
+                })
+                .into());
+            }
+            crate::state::CustomPluginFileVerdict::TakenOn(file) => Some(file),
+            // Nothing was learned about the object, so the revision reports no
+            // file description rather than one this service did not compute.
+            crate::state::CustomPluginFileVerdict::Unknown => None,
+        };
 
         let mut state = store.lock();
         state.settle_due();
@@ -293,6 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             content_type: input.content_type,
             location: input.location,
+            file,
             state: crate::state::CUSTOM_PLUGIN_CREATING.to_string(),
             revision: crate::state::FIRST_PLUGIN_REVISION,
             creation_time: ::std::time::SystemTime::now(),

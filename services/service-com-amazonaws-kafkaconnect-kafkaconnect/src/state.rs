@@ -529,11 +529,33 @@ pub struct CustomPluginRecord {
     pub description: Option<String>,
     pub content_type: String,
     pub location: CustomPluginLocation,
+    /// What the service took on about the plugin's artifact when it read the
+    /// file at [`Self::location`] — the facts the revision reports in
+    /// `fileDescription`. `None` only when nothing could be learned about the
+    /// object at create time (there was no object store to ask).
+    pub file: Option<CustomPluginFile>,
     pub state: String,
     pub revision: i64,
     pub creation_time: SystemTime,
     pub tags: HashMap<String, String>,
     pub pending: Option<PendingChange>,
+}
+
+/// The artifact a custom plugin revision was created from, as the service took
+/// it on: both facts are computed from the file's own BYTES when the plugin is
+/// created, and are then fixed for that revision — a revision describes the
+/// bytes it was built from, so a later write to the same key cannot change what
+/// an existing revision reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomPluginFile {
+    /// The hex-encoded MD5 digest of the artifact's bytes
+    /// (`CustomPluginFileDescription$fileMd5`: "The hex-encoded MD5 checksum of
+    /// the custom plugin file. You can use it to validate the file.").
+    pub md5: String,
+    /// The artifact's size in bytes
+    /// (`CustomPluginFileDescription$fileSize`: "The size in bytes of the
+    /// custom plugin file.").
+    pub size: i64,
 }
 
 impl CustomPluginRecord {
@@ -550,14 +572,19 @@ impl CustomPluginRecord {
 
     /// The summary of this plugin's latest (only) revision.
     ///
-    /// `fileDescription` is left unset: it reports the md5 and size of the
-    /// plugin file in the caller's S3 bucket, which this emulator never reads.
+    /// `fileDescription` reports the artifact this revision was created from —
+    /// the digest and the size the service computed when it took the file on
+    /// ([`CustomPluginFile`]) — and is unset only for a plugin created when
+    /// nothing could be learned about its file at all.
     pub fn latest_revision(&self) -> CustomPluginRevisionSummary {
         CustomPluginRevisionSummary {
             content_type: Some(self.content_type.clone()),
             creation_time: Some(date_time(self.creation_time)),
             description: self.description.clone(),
-            file_description: None,
+            file_description: self.file.as_ref().map(|file| CustomPluginFileDescription {
+                file_md5: Some(file.md5.clone()),
+                file_size: file.size,
+            }),
             location: Some(self.location_description()),
             revision: self.revision,
         }
@@ -1934,8 +1961,9 @@ pub const CUSTOM_PLUGIN_FILE_UNREADABLE: &str =
 ///
 /// The list is deliberately CLOSED: a refusal code S3 adds later (an ownership
 /// or a KMS refusal, say) falls into the warn-and-accept branch of
-/// [`custom_plugin_file_is_unreadable`] rather than refusing the create, because
-/// a code this service does not recognise is not evidence about the object.
+/// [`take_on_custom_plugin_file`] — [`CustomPluginFileVerdict::Unknown`] — rather
+/// than refusing the create, because a code this service does not recognise is
+/// not evidence about the object.
 const UNREADABLE_CODES: &[&str] = &[
     "NoSuchBucket",
     "NoSuchKey",
@@ -1996,8 +2024,22 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
-/// Whether Amazon S3 reports that the custom plugin file `location` names
-/// cannot be read.
+/// What reading the custom plugin file at a create's `location` established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomPluginFileVerdict {
+    /// Amazon S3 reports the object cannot be read — it is not there, or the
+    /// read is not permitted — so the create is refused and nothing is stored.
+    Unreadable,
+    /// The file was read: these are the facts the plugin's revision reports.
+    TakenOn(CustomPluginFile),
+    /// Nothing is known about the object, because there was no store to ask.
+    /// Nothing is refused on an assumption, and the revision reports no file
+    /// description it did not compute.
+    Unknown,
+}
+
+/// Take the custom plugin file `location` names on: read it through the
+/// emulator's own Amazon S3 and report what that read established.
 ///
 /// A custom plugin's file is resolved when the plugin is CREATED — the service
 /// takes the artifact on at that point — so a location naming an object that is
@@ -2006,50 +2048,66 @@ fn s3_client(
 /// way any emulated service reaches another: through the in-process callback
 /// ([`smithy_server_runtime::OperationContext::callback`], which dispatches
 /// inside this process — see [`s3_client`]: no socket, no outbound request, no
-/// host resolution), with `HeadObject` — a METADATA read, so the artifact's
-/// bytes are never copied into this service to answer a create, however large
-/// the plugin file is — and with the caller's `objectVersion` when it named one,
-/// so the version the plugin pins is the version that has to resolve.
+/// host resolution), and with the caller's `objectVersion` when it named one, so
+/// the version the plugin pins is the version that has to resolve.
+///
+/// The read is a WHOLE-OBJECT `GetObject`, because the two facts a revision
+/// reports about its file — the hex MD5 checksum and the size in bytes — are
+/// properties of the artifact's own bytes, so they are computed here from those
+/// bytes rather than taken from anything S3 reports about the object. (A ranged
+/// read is not an option: `GetObject` with a `Range` is answered 501 by the S3
+/// emulator, which would make every create unverifiable.) The body is read one
+/// yielded chunk at a time and folded straight into the digest and the running
+/// byte count ([`digest_plugin_file`]), so no copy of the whole artifact is
+/// built however large it is and nothing of it is stored in this service.
 ///
 /// The verdict is read from S3's own error CODE and never from the HTTP status:
 /// a request that reached no S3 at all is a 404 too, so a status cannot tell S3
-/// reporting an unreadable object from this emulator failing to ask. (A ranged
-/// read is not an option: `GetObject` with a `Range` is answered 501 by the S3
-/// emulator, which would make every create unverifiable.)
-///
-/// `false` means the plugin may be stored. That includes the case where this
-/// emulator has no S3 to ask (a router with only this service mounted, say):
-/// nothing is then known about the object, and a refusal has to be grounded in
-/// what S3 answered, never assumed.
-pub async fn custom_plugin_file_is_unreadable(
+/// reporting an unreadable object from this emulator failing to ask. That is why
+/// anything other than a recognised refusal answers [`CustomPluginFileVerdict::Unknown`]
+/// rather than refusing the create: with no S3 to ask (a router with only this
+/// service mounted, say) nothing is known about the object, and a refusal has to
+/// be grounded in what S3 answered, never assumed.
+pub async fn take_on_custom_plugin_file(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     location: &S3Location,
-) -> bool {
+) -> CustomPluginFileVerdict {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     // The caller has already refused a `bucketArn` that is not a bucket ARN with
     // its own message, so a value that names no bucket is not re-judged here.
     let Some(bucket) = s3_bucket_name(&location.bucket_arn) else {
-        return false;
+        return CustomPluginFileVerdict::Unknown;
     };
     let mut read = s3_client(ctx, region)
-        .head_object()
+        .get_object()
         .bucket(bucket)
         .key(&location.file_key);
     if let Some(object_version) = location.object_version.as_deref() {
         read = read.version_id(object_version);
     }
     match read.send().await {
-        // Only that the read RESOLVED is in question, so this is a METADATA read:
-        // the artifact's bytes are the caller's and are never copied into this
-        // service to answer a create.
-        Ok(_) => false,
+        Ok(object) => match digest_plugin_file(object.body).await {
+            Ok(file) => CustomPluginFileVerdict::TakenOn(file),
+            Err(error) => {
+                // The object resolved, so there is nothing to refuse, but its
+                // bytes did not arrive whole: a digest over a truncated body
+                // would describe a file the caller never uploaded.
+                ::tracing::warn!(
+                    bucket_arn = ?location.bucket_arn,
+                    file_key = ?location.file_key,
+                    error = %error,
+                    "the custom plugin file resolved but its bytes could not be read whole"
+                );
+                CustomPluginFileVerdict::Unknown
+            }
+        },
         Err(error) => {
             if UNREADABLE_CODES.contains(&error.code().unwrap_or_default()) {
                 // S3 says the object is not there, or not readable by this
                 // account: the refusal is grounded.
-                return true;
+                return CustomPluginFileVerdict::Unreadable;
             }
             // Any other answer is this emulator failing to ask its own S3, not
             // S3 reporting an unreadable object, so it refuses nothing — and it
@@ -2064,9 +2122,47 @@ pub async fn custom_plugin_file_is_unreadable(
                 code = ?error.code(),
                 "the custom plugin file could not be resolved against the emulator's Amazon S3"
             );
-            false
+            CustomPluginFileVerdict::Unknown
         }
     }
+}
+
+/// The facts a revision reports about an artifact, folded out of the artifact's
+/// own bytes as the read yields them: the hex-encoded MD5 digest of those bytes
+/// and how many of them there are.
+///
+/// MD5 is an incremental digest, so each chunk the body yields is folded into it
+/// and into the byte count and then dropped. No second copy of the artifact is
+/// built — not even a concatenated one — so the memory one create needs does not
+/// grow with the size of the file, and there is no ceiling past which this
+/// service stops describing a plugin it read.
+///
+/// The digest is MD5 because that is the checksum the member reports
+/// (`CustomPluginFileDescription$fileMd5`, "The hex-encoded MD5 checksum of the
+/// custom plugin file"), and it is rendered lowercase hex, the form "hex-encoded"
+/// names and the form a client comparing it against its own digest of the file
+/// computes. It is a CONTENT checksum the API contract fixes — what a client
+/// validates an upload with — and nothing here authenticates anything by it.
+///
+/// The error is the read's own: a body that did not arrive whole describes no
+/// file, so the caller reports nothing rather than a digest over a truncated
+/// artifact.
+async fn digest_plugin_file(
+    mut body: ::aws_smithy_types::byte_stream::ByteStream,
+) -> Result<CustomPluginFile, ::aws_smithy_types::byte_stream::error::Error> {
+    use ::md5::Digest as _;
+
+    let mut digest = ::md5::Md5::new();
+    let mut size: i64 = 0;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        size = size.saturating_add(i64::try_from(chunk.len()).unwrap_or(i64::MAX));
+        digest.update(&chunk);
+    }
+    Ok(CustomPluginFile {
+        md5: ::hex::encode(digest.finalize()),
+        size,
+    })
 }
 
 /// One page of a list operation: the items to answer with, and the `nextToken`

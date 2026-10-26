@@ -10195,6 +10195,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "md-5 0.10.6",
  "percent-encoding",
  "serde_json",
  "service-com-amazonaws-s3-amazons3",

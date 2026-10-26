@@ -29,8 +29,12 @@ tracing = { workspace = true }
 # generator so the suffix is DETERMINISTIC for a given sequence of calls (a test
 # or a replay sees the same ARNs twice) while still being unique per resource.
 sha2 = { workspace = true }
-# Encodes the opaque `nextToken` this service's list operations page with.
+# Encodes the opaque `nextToken` this service's list operations page with, and
+# the hex-encoded digest a custom plugin revision reports its file by.
 hex = { workspace = true }
+# Digests a custom plugin's artifact: `CustomPluginFileDescription$fileMd5` is
+# "The hex-encoded MD5 checksum of the custom plugin file".
+md-5 = "0.10"
 # The Amazon S3 client `CreateCustomPlugin` resolves the custom plugin file at
 # `location.s3Location` with, over the in-process callback into this same
 # emulator (no network client feature is enabled: the transport is the
