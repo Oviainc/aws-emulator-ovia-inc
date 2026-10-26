@@ -405,11 +405,14 @@ impl CampaignState {
     /// legal from here (which the caller answers with
     /// `InvalidCampaignStateException`).
     ///
-    /// Start runs a campaign that is not running yet; Pause suspends a running
-    /// one; Resume puts a suspended one back to work, so it is legal from `Paused`
-    /// and from nowhere else; Stop ends one that has not finished. Nothing moves
-    /// out of a terminal state (`Completed`, `Failed`), and no action is a no-op:
-    /// repeating one is refused rather than silently accepted.
+    /// Start is the only action a campaign that has never entered its run takes:
+    /// every other verb acts on a run already under way, so Pause (which suspends
+    /// a running campaign), Resume (which puts a suspended one back to work, legal
+    /// from `Paused` and nowhere else) and Stop (which ends a run before it
+    /// finishes, legal from `Running` and `Paused`) are all refused from
+    /// `Initialized`. Nothing moves out of a terminal state (`Completed`,
+    /// `Failed`), and no action is a no-op: repeating one is refused rather than
+    /// silently accepted.
     ///
     /// A call is judged against the state the campaign is at NOW, which the clock
     /// has a say in — see [`StoredCampaign::state_at`], the one place a caller reads
@@ -421,9 +424,7 @@ impl CampaignState {
             }
             (Self::Running, CampaignAction::Pause) => Some(Self::Paused),
             (Self::Paused, CampaignAction::Resume) => Some(Self::Running),
-            (Self::Initialized | Self::Running | Self::Paused, CampaignAction::Stop) => {
-                Some(Self::Stopped)
-            }
+            (Self::Running | Self::Paused, CampaignAction::Stop) => Some(Self::Stopped),
             _ => None,
         }
     }

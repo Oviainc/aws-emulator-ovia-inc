@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCampaign
-//! Moves the stored campaign into `Stopped`. The transition is written to the campaign
-//! record `GetCampaignState` reads; an illegal one is refused with
-//! `InvalidCampaignStateException` (HTTP 409).
+//! Ends a campaign's run: the stored campaign moves into `Stopped`, which is legal
+//! only while its run is under way (`Running` or `Paused`). The transition is written
+//! to the campaign record `GetCampaignState` reads; from any other state — including
+//! a campaign that has never been started — the call is refused with
+//! `InvalidCampaignStateException` (HTTP 409) and nothing is written.
 //!
 //! ## Shape of an operation
 //!
