@@ -252,6 +252,35 @@ pub async fn get(router: &MultiServiceRouter, uri: &str) -> Answer {
     get_signed(router, uri, SIGNED_FOR_EU_WEST_1).await
 }
 
+/// One request under ANY method, with the body that method carries: the sender a suite
+/// needs for a write, a removal or a read alike, so no suite grows a second copy of the
+/// request builder. `get` above is this one specialised to a read.
+pub async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Bytes) -> Answer {
+    let request = ::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("content-type", "application/json")
+        .header("authorization", SIGNED_FOR_EU_WEST_1)
+        .body(body)
+        .expect("the test request is well formed");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let bytes = response.into_body();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{method} {uri} answered a body that is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    Answer { status, body }
+}
+
 pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &str) -> Answer {
     let request = ::http::Request::builder()
         .method("GET")

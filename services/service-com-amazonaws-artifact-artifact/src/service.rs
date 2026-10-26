@@ -55,18 +55,22 @@
 //! error: a caller sees `UnauthorizedException` where the service itself would have
 //! said `ResourceNotFoundException`, and `BadRequestException` where it would have
 //! said `ValidationException`. Values the request carries in its URI are NOT the
-//! gateway's concern: a `@httpQuery` value outside its modelled constraint is refused
-//! by the service, as its 400 `ValidationException`, which is what the framework's own
-//! boundary already answers — `override_refusal` below only restates the MESSAGE of
-//! that refusal in this service's own wording.
+//! gateway's concern: a `@httpQuery` or `@httpLabel` value outside its modelled
+//! constraint is refused by THIS service, as its modelled 400 `ValidationException` —
+//! the whole shape, `reason` and `fieldList` included, not a message on its own.
 //!
-//! [`EmulatedService::front_door`] is check 1 and 2 for every request whose target or
-//! body the gateway judges, reached through [`Service::override_operation`] because
-//! both refusals precede the modelled walk: constraint validation runs before a
-//! handler, so a handler cannot answer ahead of it. The one judgement the gateway
-//! cannot make here is whether a well-formed identifier names a resource the account
-//! holds — that is this service's state — so each report handler makes it, through
-//! `crate::scaffolded::Scaffolded::unauthorized`, and answers the same 401.
+//! [`EmulatedService::examine`] is those three judgements for every request this service serves, reached
+//! through [`Service::override_operation`] because all of them precede the modelled walk:
+//! constraint validation runs before a handler, so a handler cannot answer ahead of it.
+//! The framework's own boundary refusal cannot carry the modelled shape (the seam it
+//! offers chooses an error code and a message, and nothing else), so a request whose
+//! URI-bound value the model's constraints refuse is answered HERE, by
+//! [`ConstraintRefusal`], in the one envelope `crate::state` words every such refusal in.
+//! `override_refusal` below stays as the wording of anything that still reaches that
+//! boundary. The one judgement the gateway cannot make here is whether a well-formed
+//! identifier names a resource the account holds — that is this service's state — so each
+//! report handler makes it, through `crate::scaffolded::Scaffolded::unauthorized`, and
+//! answers the same 401.
 //!
 //! ## The document plane
 //!
@@ -102,12 +106,14 @@
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerializableStruct;
 use aws_smithy_schema::Schema;
-use aws_smithy_schema_server::constraints::{path, validate};
+use aws_smithy_schema_server::constraints::{path, validate, Violation, ViolationKind};
+use aws_smithy_schema_server::ProtocolError;
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused,
     ServerHttpProtocol, Service,
 };
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::ops::types;
@@ -121,6 +127,21 @@ enum FrontDoorVerdict {
     Unauthorized,
     /// The request's body does not bind to the modelled shape.
     InvalidRequestBody,
+}
+
+/// What the pre-dispatch examination of one request concluded, when it refuses it.
+///
+/// Two layers answer before the modelled walk, and they are NOT the same refusal: the
+/// gateway in front of this service judges the target and the body in its own shapes (see
+/// the module docs), while a value the request carried in its URI is this service's own to
+/// refuse, as the modelled `ValidationException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreDispatchRefusal {
+    /// The gateway refuses the request before this service is reached.
+    FrontDoor(FrontDoorVerdict),
+    /// The model's own constraints refuse values the request carried in its URI; each
+    /// violation names the member and what its value failed.
+    InvalidInput(Vec<Violation>),
 }
 
 /// The resource one request targets, as the gateway reads it: the kind of identifier
@@ -211,7 +232,8 @@ fn body_bound(schema: &Schema, violated: &str) -> bool {
     })
 }
 
-/// Run the front door's two checks over one operation's request.
+/// Run the pre-dispatch checks over one operation's request: the front door's two, and
+/// this service's own refusal of a URI-bound value the model's constraints reject.
 ///
 /// `target` names the resource the input targets, for an operation whose input carries
 /// an identifier, and `None` for one that does not.
@@ -222,12 +244,16 @@ fn body_bound(schema: &Schema, violated: &str) -> bool {
 /// model's, through the same validator the walk runs. Deserialization does not enforce
 /// constraints, which is what lets the gateway judge a value the modelled constraint
 /// would have refused.
+///
+/// The layering decides the order: the gateway answers ahead of this service, so an
+/// unauthorizable target comes first and a body it cannot bind second, and only a request
+/// both of them pass is refused for a value its URI carried.
 fn judge<I>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
     schema: &'static Schema,
     target: fn(&I) -> Option<Target<'_>>,
-) -> Option<FrontDoorVerdict>
+) -> Option<PreDispatchRefusal>
 where
     I: DeserializableStruct + SerializableStruct,
 {
@@ -235,27 +261,122 @@ where
     let input = match I::deserialize(&mut *deserializer) {
         Ok(input) => input,
         // A member the shape requires, absent from the body, is a body the gateway
-        // cannot bind either. Anything else the codec could not read (an absent URI
-        // value, a body that is not the protocol's format at all) is left to the
-        // framework's own refusal: the gateway's answer to it is not recorded.
+        // cannot bind. A URI-bound one is this service's own refusal, stated against the
+        // member the request did not carry — absence is a constraint violation like any
+        // other, found while reading the request rather than while walking it. Anything
+        // else the codec could not read (a body that is not the protocol's format at all)
+        // is left to the framework's own refusal: the gateway's answer to it is not
+        // recorded.
         Err(aws_smithy_schema::serde::SerdeError::MissingMember { member_name }) => {
-            return body_bound(schema, &member_name).then_some(FrontDoorVerdict::InvalidRequestBody)
+            return Some(if body_bound(schema, &member_name) {
+                PreDispatchRefusal::FrontDoor(FrontDoorVerdict::InvalidRequestBody)
+            } else {
+                PreDispatchRefusal::InvalidInput(vec![Violation {
+                    path: member_name,
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                }])
+            })
         }
         Err(_) => return None,
     };
 
     // 1. Authorize the target, ahead of every constraint the model declares.
     if target(&input).is_some_and(|target| !target.names_a_resource()) {
-        return Some(FrontDoorVerdict::Unauthorized);
+        return Some(PreDispatchRefusal::FrontDoor(FrontDoorVerdict::Unauthorized));
     }
 
     // 2. Validate the body. A violation on a URI-bound member is NOT the gateway's:
     // the service refuses that one itself, as its modelled `ValidationException`.
-    validate(&input, schema)
+    let violations = validate(&input, schema);
+    if violations
         .iter()
         .any(|violation| body_bound(schema, &violation.path))
-        .then_some(FrontDoorVerdict::InvalidRequestBody)
+    {
+        return Some(PreDispatchRefusal::FrontDoor(
+            FrontDoorVerdict::InvalidRequestBody,
+        ));
+    }
+
+    // 3. And the service's own refusal of what the URI carried.
+    (!violations.is_empty()).then_some(PreDispatchRefusal::InvalidInput(violations))
 }
+
+/// Answers a request whose URI-bound values the model's own constraints refuse, in this
+/// service's modelled `ValidationException` — the WHOLE shape, which declares `reason`
+/// @required beside `message` and carries `fieldList` where the refused member is known.
+///
+/// WHY this is a seam and not the framework's boundary refusal: constraint validation runs
+/// ahead of every handler, and the hook it offers a service
+/// ([`Service::override_refusal`]) chooses an error code and a message and nothing else,
+/// so the required `reason` cannot travel on it. [`Service::override_operation`] is the one
+/// hook that sees the whole request ahead of that walk, which is what lets the refusal be
+/// answered in the modelled shape — the same payload `crate::state` builds for every
+/// field-validation refusal this service states itself.
+///
+/// The violations are derived from the request, by the same [`EmulatedService::examine`]
+/// the routing decision used: nothing about one request is carried on this value, so one
+/// instance serves every caller.
+struct ConstraintRefusal<Eng> {
+    /// The engine type this service's operations are named through; no store is read
+    /// here, as a refusal of what the request CARRIED needs none.
+    engine: PhantomData<fn() -> Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let protocol = svc.definition().protocol();
+            let violations = match EmulatedService::<Eng>::examine(protocol, req) {
+                Some(PreDispatchRefusal::InvalidInput(violations)) => violations,
+                // Unreachable: this answer is routed to only for a request whose URI-bound
+                // values the same examination refused, and it re-reads the same request.
+                // Stated explicitly rather than folded into the arm above, so a routing
+                // change that reached it leaves a record instead of a bare 400 — and
+                // without failing the request on an invariant, which a refusal must never
+                // do.
+                other => {
+                    ::tracing::warn!(
+                        found = ?other,
+                        "a request answered as a constraint refusal carried no modelled \
+                         constraint violation"
+                    );
+                    Vec::new()
+                }
+            };
+            match crate::state::constraint_violation_exception(&violations) {
+                // Rendered through the service's own protocol, as every other modelled
+                // error of this service is, with the status and the code the model
+                // declares for the shape (`@error("client")`, `@httpError(400)`).
+                Some(refusal) => protocol
+                    .serialize_error(
+                        &refusal,
+                        &types::SCHEMA_VALIDATION_EXCEPTION,
+                        VALIDATION_EXCEPTION_CODE,
+                        VALIDATION_EXCEPTION_STATUS,
+                    )
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e)),
+                // With no violation to state there is nothing this service can word, so
+                // the framework answers the refusal itself, as it did before this seam.
+                None => svc
+                    .definition()
+                    .framework_error_response(ProtocolError::Invalid(violations)),
+            }
+        })
+    }
+}
+
+/// The wire error code of this service's modelled input refusal (`__type` and
+/// `x-amzn-errortype`), which is the shape's own name.
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// The HTTP status the model declares for it (`@httpError(400)`).
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
 /// Serves a report or term document from the stored bytes [`crate::state`] holds.
 ///
@@ -477,6 +598,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     unauthorized: FrontDoorAnswer,
     /// Answers a request whose body the front door cannot bind to the modelled shape.
     invalid_request_body: FrontDoorAnswer,
+    /// Answers a request whose URI-bound values the model's own constraints refuse, in
+    /// this service's modelled `ValidationException`.
+    invalid_input: ConstraintRefusal<Eng>,
     /// Serves the report and term documents the control plane announces URLs for.
     documents: Documents<Eng>,
 }
@@ -491,30 +615,35 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             engine: Arc::clone(&engine),
             unauthorized: FrontDoorAnswer(FrontDoorRefusal::unauthorized()),
             invalid_request_body: FrontDoorAnswer(FrontDoorRefusal::invalid_request_body()),
+            invalid_input: ConstraintRefusal {
+                engine: PhantomData,
+            },
             documents: Documents { engine },
         }
     }
 
-    /// The front door's judgement on one request, or `None` when it passes the request
-    /// through to the modelled walk.
+    /// The pre-dispatch judgement on one request, or `None` when it passes through to the
+    /// modelled walk.
     ///
-    /// One arm per operation the gateway judges: every operation whose input names a
-    /// resource by identifier (checked first, so authorization precedes validation),
-    /// and every operation that carries members in its request body. Each arm names
-    /// its operation through that operation's own [`Operation::NAME`] and its input
-    /// through the model-derived input schema, so nothing here is spelled out that the
-    /// model already states.
+    /// One arm per operation, because the judgement needs that operation's own input
+    /// shape: the gateway's two checks for an input that names a resource or carries
+    /// members in its body, and the model's constraints over what the URI carried for
+    /// every operation, which is every one of them. Each arm names its operation through
+    /// that operation's own [`Operation::NAME`] and its input through the model-derived
+    /// input schema, so nothing here is spelled out that the model already states.
+    ///
+    /// Takes the protocol rather than reading it off `self`, so the refusal this returns
+    /// can be re-derived from the same request by [`ConstraintRefusal`], which is handed a
+    /// `&dyn Service` and not this type.
     ///
     /// The three tag operations' `resourceArn` is deliberately not a [`Target`]: it is a
     /// `LongStringAttribute` the model gives no identifier syntax (any string without
     /// `<>` is admissible), so whether it names a resource at all is a question about
     /// this service's STATE — which tag set the ARN addresses — and each tag handler
     /// answers it with the same 401 through `crate::scaffolded::Scaffolded::unauthorized`.
-    /// `TagResource` is here for its `tags` BODY alone.
-    fn front_door(&self, req: &RtRequest) -> Option<FrontDoorVerdict> {
+    fn examine(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<PreDispatchRefusal> {
         use crate::ops;
 
-        let protocol = self.definition().protocol();
         let key = protocol.routing_key(req).ok()?;
 
         // Reports: the `reportId` every report operation targets.
@@ -618,8 +747,62 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             );
         }
 
-        // Every other operation carries neither a resource identifier nor a request
-        // body, so the gateway has nothing to judge: the modelled walk answers it.
+        // And every remaining operation, which neither names a resource the gateway
+        // authorizes nor carries a body it binds — so what is judged for these is only
+        // what their URI carried, against the model's own constraints. They are listed
+        // for exactly that: the refusal of a `@httpQuery` or `@httpLabel` value is this
+        // service's, and it is the same refusal on every operation that has one.
+        if key == <ops::list_reports::ListReports<Eng> as Operation>::NAME {
+            return judge::<types::ListReportsInput>(
+                protocol,
+                req,
+                types::LIST_REPORTS_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+        if key == <ops::list_customer_agreements::ListCustomerAgreements<Eng> as Operation>::NAME {
+            return judge::<types::ListCustomerAgreementsInput>(
+                protocol,
+                req,
+                types::LIST_CUSTOMER_AGREEMENTS_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+        if key == <ops::list_compliance_inquiries::ListComplianceInquiries<Eng> as Operation>::NAME {
+            return judge::<types::ListComplianceInquiriesInput>(
+                protocol,
+                req,
+                types::LIST_COMPLIANCE_INQUIRIES_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+        if key == <ops::get_account_settings::GetAccountSettings<Eng> as Operation>::NAME {
+            return judge::<types::GetAccountSettingsInput>(
+                protocol,
+                req,
+                types::GET_ACCOUNT_SETTINGS_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+        if key == <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::NAME {
+            return judge::<types::ListTagsForResourceInput>(
+                protocol,
+                req,
+                types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+        if key == <ops::untag_resource::UntagResource<Eng> as Operation>::NAME {
+            return judge::<types::UntagResourceInput>(
+                protocol,
+                req,
+                types::UNTAG_RESOURCE_INPUT_SCHEMA,
+                |_| None,
+            );
+        }
+
+        // A request naming no modelled operation of this service: there is no input shape
+        // to judge it against, and the router answers it itself.
         None
     }
 }
@@ -676,18 +859,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.documents as &dyn ErasedOperation);
         }
 
-        // And this service is reached through a gateway that answers before it (see the
-        // module docs): a request whose target it cannot authorize, or whose body it
-        // cannot bind, never reaches the modelled walk at all. Both answers are
-        // pre-dispatch, which is what this hook is.
+        // And the three refusals that precede the modelled walk (see the module docs):
+        // this service is reached through a gateway whose authorization of the target and
+        // binding of the body answer before it, and a value the request carried in its URI
+        // is refused by this service in its modelled `ValidationException`, which the
+        // framework's own boundary refusal cannot carry.
         //
         // The request's auth schemes are unaffected: the router reads them off the
-        // MODELLED operation the routing key names, so a front-door refusal is still
+        // MODELLED operation the routing key names, so a pre-dispatch refusal is still
         // only reached by a request whose signature verified.
-        match self.front_door(req)? {
-            FrontDoorVerdict::Unauthorized => Some(&self.unauthorized as &dyn ErasedOperation),
-            FrontDoorVerdict::InvalidRequestBody => {
+        match Self::examine(self.definition().protocol(), req)? {
+            PreDispatchRefusal::FrontDoor(FrontDoorVerdict::Unauthorized) => {
+                Some(&self.unauthorized as &dyn ErasedOperation)
+            }
+            PreDispatchRefusal::FrontDoor(FrontDoorVerdict::InvalidRequestBody) => {
                 Some(&self.invalid_request_body as &dyn ErasedOperation)
+            }
+            PreDispatchRefusal::InvalidInput(_) => {
+                Some(&self.invalid_input as &dyn ErasedOperation)
             }
         }
     }
@@ -697,18 +886,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // What reaches here is a refusal of a value the request carried in its URI —
-        // the gateway in front of this service validates the BODY (answered as
-        // `BadRequestException` before dispatch, see `front_door`) and leaves
-        // URI-bound values to the service, which refuses them as its modelled 400
-        // `ValidationException` naming the member and the constraint. The STATUS and
-        // the CODE of that refusal are already the framework's, and are what the model
-        // declares (`ValidationException`, `@httpError(400)`); only the MESSAGE
-        // differs, because this service states a constraint violation as the
-        // validation envelope naming the member path and the requirement it failed
-        // WITHOUT quoting the rejected value back at the caller. So the code is
-        // restated unchanged alongside the reworded message: `Refused` carries both,
-        // and a message without its matching code is worse than leaving both alone.
+        // A refusal of a modelled constraint on a value the request carried does not reach
+        // here: `override_operation` answers it ahead of the walk, in the modelled
+        // `ValidationException` whose required `reason` this seam cannot carry (`Refused`
+        // is a code and a message). This stays as the wording of whatever still reaches
+        // the boundary — a refusal on a request `examine` could not read an input from —
+        // so such a request is still answered in this service's validation envelope,
+        // naming the member path and the requirement it failed WITHOUT quoting the
+        // rejected value back at the caller. The STATUS and the CODE are already the
+        // framework's, and are what the model declares (`ValidationException`,
+        // `@httpError(400)`); the code is restated unchanged alongside the reworded
+        // message, because a message without its matching code is worse than leaving
+        // both alone.
         //
         // An authentication refusal is left to the framework: it is not a
         // modelled-input failure and this service does not restate it.
@@ -716,7 +905,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return None;
         };
         Some(Refused {
-            code: "ValidationException".to_string(),
+            code: VALIDATION_EXCEPTION_CODE.to_string(),
             message: crate::state::constraint_violation_message(violations)?,
         })
     }

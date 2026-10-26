@@ -61,5 +61,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/timestamp_wire_form.rs"]
 mod timestamp_wire_form;
+#[path = "all/validation_exception_shape.rs"]
+mod validation_exception_shape;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;

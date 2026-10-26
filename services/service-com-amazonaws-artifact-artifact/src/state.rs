@@ -2266,14 +2266,49 @@ pub fn unknown_query_identifiers(member: &str) -> ValidationException {
 /// envelope [`constraint_violation_message`] renders for a modelled constraint, without
 /// echoing the refused value, which the request already carried.
 pub fn field_validation_failed(member: &str, requirement: &str) -> ValidationException {
-    let clause = field_constraint_clause(member, requirement);
+    field_validation_failed_over(vec![ValidationExceptionField {
+        name: member.to_string(),
+        message: field_constraint_clause(member, requirement),
+    }])
+}
+
+/// The ONE envelope every field-validation refusal of this service is stated in, over the
+/// members it names.
+///
+/// The modelled shape declares `reason` @required beside `message`, so a refusal carrying
+/// only a message is not the modelled error at all: the reason a value the request carried
+/// was refused is `ValidationExceptionReason`'s `fieldValidationFailed`, and `fieldList`
+/// ("The field that caused the error, if applicable") names each refused member with the
+/// clause its value failed. The message states those same clauses in the AWS validation
+/// envelope, so the two halves of one refusal cannot disagree.
+fn field_validation_failed_over(fields: Vec<ValidationExceptionField>) -> ValidationException {
+    let clauses: Vec<&str> = fields.iter().map(|field| field.message.as_str()).collect();
     ValidationException {
-        message: format!("1 validation error detected: {clause}"),
+        message: validation_envelope(&clauses),
         reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: clause,
-        }]),
+        field_list: Some(fields),
+    }
+}
+
+/// The AWS validation envelope over `clauses`: `N validation error(s) detected: <clause>;
+/// …`. Written in ONE place, so a refusal stated by a handler and one stated for a
+/// modelled constraint are worded alike.
+///
+/// A refusal states at least one clause — there is no such thing as a validation error
+/// with nothing wrong — so every caller checks that first, and the assertion keeps it that
+/// way as callers are added rather than letting one render a count of none.
+fn validation_envelope(clauses: &[&str]) -> String {
+    debug_assert!(
+        !clauses.is_empty(),
+        "a validation refusal states at least one clause"
+    );
+    match clauses {
+        [only] => format!("1 validation error detected: {only}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
     }
 }
 
@@ -2307,15 +2342,38 @@ pub const UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT: &str =
 /// violation, so a constraint it learns to check cannot drift from this wording; only the
 /// echo of the value is removed.
 pub fn constraint_violation_message(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations.iter().map(clause_without_rejected_value).collect();
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
+    if violations.is_empty() {
+        return None;
     }
+    let clauses: Vec<String> = violations.iter().map(clause_without_rejected_value).collect();
+    let clauses: Vec<&str> = clauses.iter().map(String::as_str).collect();
+    Some(validation_envelope(&clauses))
+}
+
+/// The modelled `ValidationException` this service answers a request the boundary
+/// validator refused against the model's own constraints with.
+///
+/// The SAME refusal the handlers state for a value they refuse themselves
+/// ([`field_validation_failed_over`]): the AWS validation envelope in `message`, the
+/// required `reason` set to `fieldValidationFailed`, and one `fieldList` entry per refused
+/// member naming it and the clause its value failed. `None` when there is nothing to
+/// state, so a caller with no violation to report keeps the framework's own answer.
+pub fn constraint_violation_exception(violations: &[Violation]) -> Option<ValidationException> {
+    if violations.is_empty() {
+        return None;
+    }
+    Some(field_validation_failed_over(
+        violations
+            .iter()
+            .map(|violation| ValidationExceptionField {
+                // The member the clause is stated against is the violation's own path, so
+                // the entry names exactly what the message names — including a path that
+                // descends into a structure, list or map member.
+                name: violation.path.clone(),
+                message: clause_without_rejected_value(violation),
+            })
+            .collect(),
+    ))
 }
 
 /// One violation's clause with the rejected value removed from it.
