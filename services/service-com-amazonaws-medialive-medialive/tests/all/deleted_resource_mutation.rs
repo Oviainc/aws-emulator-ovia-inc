@@ -24,6 +24,10 @@
 //! deregistration has been accepted — but a node is addressed through the
 //! cluster that holds it, which this table's static per-id URIs cannot build, so
 //! that row lives in the node suite (`node_lifecycle`) instead.
+//!
+//! The INPUT SECURITY GROUP does NOT follow it: its delete is a SOFT delete, so
+//! the deleted group stays mutable. That contract has its own suite
+//! (`post_delete_mutation_classification`).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -111,7 +115,7 @@ fn delete_tags(_id: &str, arn: &str) -> (&'static str, String, Option<Value>) {
 /// terminal state.
 #[tokio::test]
 async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
-    let table: [Row; 5] = [
+    let table: [Row; 4] = [
         Row {
             case: "input",
             create: (
@@ -187,40 +191,6 @@ async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
                     op: "DeleteSchedule",
                     request: |id, _arn| {
                         ("DELETE", format!("/prod/channels/{id}/schedule"), None)
-                    },
-                    live_status: 200,
-                },
-                CREATE_TAGS,
-                DELETE_TAGS,
-            ],
-        },
-        Row {
-            case: "input security group",
-            create: (
-                "/prod/inputSecurityGroups",
-                || {
-                    json!({
-                        "whitelistRules": [{ "cidr": "10.0.0.0/16" }],
-                        "tags": { "team": "video" },
-                    })
-                },
-                Some("securityGroup"),
-            ),
-            read: (|id| format!("/prod/inputSecurityGroups/{id}"), None),
-            delete: (|id| format!("/prod/inputSecurityGroups/{id}"), 200),
-            settle_before_delete: false,
-            // `InputSecurityGroupState` models no DELETING step, so the delete
-            // is done with the call.
-            transient_delete: false,
-            mutations: &[
-                Mutation {
-                    op: "UpdateInputSecurityGroup",
-                    request: |id, _arn| {
-                        (
-                            "PUT",
-                            format!("/prod/inputSecurityGroups/{id}"),
-                            Some(json!({ "whitelistRules": [{ "cidr": "192.0.2.0/24" }] })),
-                        )
                     },
                     live_status: 200,
                 },

@@ -2253,7 +2253,7 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         }
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
-        "AWS::EC2::SecurityGroup" => rules(255, Characters::AsGenerated),
+        EC2_SECURITY_GROUP => rules(255, Characters::AsGenerated),
         // Amazon EventBridge `PutRule.Name`: `RuleName`, `@length(min: 1, max: 64)` with
         // pattern `^[\.\-_A-Za-z0-9]+$` (EventBridge's own Smithy model), which a
         // generated name is already inside but may be longer than.
@@ -2679,7 +2679,17 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::CloudWatch::Alarm",
     CLOUDWATCH_METRIC_STREAM,
     "AWS::DynamoDB::Table",
-    "AWS::EC2::SecurityGroup",
+    EC2_DHCP_OPTIONS,
+    EC2_INTERNET_GATEWAY,
+    EC2_NAT_GATEWAY,
+    EC2_NETWORK_ACL,
+    EC2_NETWORK_INTERFACE,
+    EC2_ROUTE_TABLE,
+    EC2_SECURITY_GROUP,
+    EC2_SUBNET,
+    EC2_VPC,
+    EC2_VPC_ENDPOINT,
+    EC2_VPN_GATEWAY,
     ECR_PUBLIC_REPOSITORY,
     ECR_REPOSITORY,
     ECS_CLUSTER,
@@ -3276,15 +3286,56 @@ fn return_values(
             attributes.insert("Id".to_string(), arn.clone());
             (arn, attributes)
         }
-        // "Ref returns the ID of the security group" for a VPC security group; Fn::GetAtt:
-        // GroupId (VpcId is left out: it is whatever the declared `VpcId` property
-        // resolves to, which is another resource of the template rather than a value of
-        // this one). The id is the service-assigned `sg-` + 17 hexadecimal form EC2
-        // publishes.
-        "AWS::EC2::SecurityGroup" => {
-            let group_id = generated_service_id("sg", name, EC2_ID_HEX_DIGITS);
-            attributes.insert("GroupId".to_string(), group_id.clone());
-            (group_id, attributes)
+        // The Amazon EC2 VPC-network types ([`EC2_VPC`] and its siblings), each of which
+        // publishes "Ref returns the ID of …" and one `Fn::GetAtt` attribute that IS that
+        // id: a VPC's `VpcId`, a subnet's `SubnetId`, a security group's `GroupId`, an
+        // internet gateway's `InternetGatewayId`, and the plain `Id` the types that publish
+        // no narrower name carry. The id is the `<prefix>-` + 17 hexadecimal form Amazon
+        // EC2 assigns, never the name CloudFormation computed, because EC2 takes no name on
+        // any of these creates ([`ec2_network_identity`]).
+        EC2_VPC => {
+            let id = ec2_network_identity("vpc", "VpcId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_SUBNET => {
+            let id = ec2_network_identity("subnet", "SubnetId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_SECURITY_GROUP => {
+            let id = ec2_network_identity("sg", "GroupId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_INTERNET_GATEWAY => {
+            let id = ec2_network_identity("igw", "InternetGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_ROUTE_TABLE => {
+            let id = ec2_network_identity("rtb", "RouteTableId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NAT_GATEWAY => {
+            let id = ec2_network_identity("nat", "NatGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_DHCP_OPTIONS => {
+            let id = ec2_network_identity("dopt", "DhcpOptionsId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_VPN_GATEWAY => {
+            let id = ec2_network_identity("vgw", "VPNGatewayId", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NETWORK_ACL => {
+            let id = ec2_network_identity("acl", "Id", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_NETWORK_INTERFACE => {
+            let id = ec2_network_identity("eni", "Id", name, &mut attributes);
+            (id, attributes)
+        }
+        EC2_VPC_ENDPOINT => {
+            let id = ec2_network_identity("vpce", "Id", name, &mut attributes);
+            (id, attributes)
         }
         // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
         // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
@@ -3651,7 +3702,15 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "Endpoint.Port",
         ],
         "AWS::SecretsManager::Secret" => &["Id"],
-        "AWS::EC2::SecurityGroup" => &["GroupId"],
+        EC2_VPC => &["VpcId"],
+        EC2_SUBNET => &["SubnetId"],
+        EC2_SECURITY_GROUP => &["GroupId"],
+        EC2_INTERNET_GATEWAY => &["InternetGatewayId"],
+        EC2_ROUTE_TABLE => &["RouteTableId"],
+        EC2_NAT_GATEWAY => &["NatGatewayId"],
+        EC2_DHCP_OPTIONS => &["DhcpOptionsId"],
+        EC2_VPN_GATEWAY => &["VPNGatewayId"],
+        EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
         ECS_SERVICE => &["Name"],
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
@@ -4322,6 +4381,59 @@ const SECRET_ARN_SUFFIX_CHARACTERS: usize = 6;
 /// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
 /// current (long) id form is 17 (`sg-0123456789abcdef0`).
 const EC2_ID_HEX_DIGITS: usize = 17;
+
+/// The Amazon EC2 VPC-network resource types whose published `Ref` return value is an EC2
+/// resource IDENTIFIER rather than a name.
+///
+/// Amazon EC2 takes no name on any of these creates: it ASSIGNS the resource an identifier
+/// of its own published form (`vpc-`, `subnet-`, `sg-`, `igw-`, … followed by
+/// [`EC2_ID_HEX_DIGITS`] hexadecimal characters). A declaration of one of these types
+/// therefore names the resource nowhere, and CloudFormation's
+/// `<stack name>-<logical id>-<unique id>` name is no identifier any EC2 API would take for
+/// it — which is what each type's own "Return values" section says: "Ref returns the ID of
+/// the VPC", "Ref returns the subnet ID", "Ref returns the ID of the security group", "Ref
+/// returns the ID of the internet gateway", and so on.
+///
+/// [`ec2_network_identity`] is what gives a resource of one of them an identifier of that
+/// form, so a property of another resource that references it (a Resolver endpoint's
+/// `IpAddresses[].SubnetId`, a DB subnet group's `SubnetIds`) carries a value the owning
+/// service's own API accepts instead of a name it refuses.
+pub const EC2_VPC: &str = "AWS::EC2::VPC";
+pub const EC2_SUBNET: &str = "AWS::EC2::Subnet";
+pub const EC2_SECURITY_GROUP: &str = "AWS::EC2::SecurityGroup";
+pub const EC2_INTERNET_GATEWAY: &str = "AWS::EC2::InternetGateway";
+pub const EC2_ROUTE_TABLE: &str = "AWS::EC2::RouteTable";
+pub const EC2_NETWORK_ACL: &str = "AWS::EC2::NetworkAcl";
+pub const EC2_NETWORK_INTERFACE: &str = "AWS::EC2::NetworkInterface";
+pub const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
+pub const EC2_VPC_ENDPOINT: &str = "AWS::EC2::VPCEndpoint";
+pub const EC2_DHCP_OPTIONS: &str = "AWS::EC2::DHCPOptions";
+pub const EC2_VPN_GATEWAY: &str = "AWS::EC2::VPNGateway";
+
+/// The identifier Amazon EC2 assigns a declared resource of one of the VPC-network types
+/// above: `<prefix>-` plus [`EC2_ID_HEX_DIGITS`] lowercase hexadecimal characters, derived
+/// from the resource's name ([`generated_service_id`]) so it is stable across reads and
+/// across a re-deployment of the same declaration.
+///
+/// `identifier_attribute` is the `Fn::GetAtt` attribute that type publishes FOR that
+/// identifier (`VpcId`, `SubnetId`, `GroupId`, `Id`, …), recorded with the same value — so
+/// the id a `Ref` answers and the id that attribute answers cannot disagree. A published
+/// attribute that is the PROPERTY the template declared (a VPC's `CidrBlock`, a subnet's
+/// `AvailabilityZone` and `VpcId`) is attached from the declaration itself
+/// ([`attach_attributes`]), and one that is ANOTHER EC2 resource's identifier (a VPC's
+/// `DefaultSecurityGroup` and `DefaultNetworkAcl`) is left out: nothing here holds that
+/// resource, and reporting an id for one that does not exist would be worse than reporting
+/// none.
+fn ec2_network_identity(
+    prefix: &str,
+    identifier_attribute: &str,
+    name: &str,
+    attributes: &mut BTreeMap<String, String>,
+) -> String {
+    let id = generated_service_id(prefix, name, EC2_ID_HEX_DIGITS);
+    attributes.insert(identifier_attribute.to_string(), id.clone());
+    id
+}
 
 /// The `AWS::ECS::Service` resource type: a service running on an ECS cluster.
 const ECS_SERVICE: &str = "AWS::ECS::Service";

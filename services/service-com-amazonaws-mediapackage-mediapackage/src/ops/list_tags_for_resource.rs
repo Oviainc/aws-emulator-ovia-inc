@@ -142,9 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting a tag set needs nothing from the request beyond its deserialized
-        // input.
-        let _ = ctx;
+        // Reporting a tag set resolves a resource, and MediaPackage resolves one only in
+        // the Region the request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -167,9 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nothing below writes, so a `ListTagsForResource` leaves the store exactly as it
         // found it: the tag set it reports is the one the creates and the tagging
-        // operations stored.
+        // operations stored. The ARN resolves only to a resource this REGION holds whose
+        // own ARN it is, so one naming another Region, account or partition reports
+        // not-found rather than this Region's resource of the same id.
         let state = state.lock();
-        let Some(tags) = state.tags(&target) else {
+        let Some(tags) = state.tags(&region, &input.resource_arn, &target) else {
             return Err(crate::state::resource_not_found(target.kind(), target.id()).into());
         };
 

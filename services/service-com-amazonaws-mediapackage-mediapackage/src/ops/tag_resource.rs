@@ -165,8 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Tagging needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // Tagging resolves a resource, and MediaPackage resolves one only in the Region
+        // the request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
                 message: Some("the mediapackage state store is unavailable".into()),
@@ -186,8 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The ARN resolves only to a resource this REGION holds whose own ARN it is, so
+        // one naming another Region, account or partition writes nothing and reports
+        // not-found instead of tagging this Region's resource of the same id.
         let mut state = state.lock();
-        let Some(tags) = state.tags_mut(&target) else {
+        let Some(tags) = state.tags_mut(&region, &input.resource_arn, &target) else {
             return Err(
                 crate::state::resource_not_found(target.kind(), target.id()).into(),
             );

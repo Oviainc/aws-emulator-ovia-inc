@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchQuickResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchQuickResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchQuickResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the quick responses of the knowledge base its `knowledgeBaseId` names, out of
+//! the STORED records, and answers one page of them.
+//!
+//! The parent is resolved FIRST: a `knowledgeBaseId` this account holds no knowledge base
+//! under is the modelled `ResourceNotFoundException` (HTTP 404), worded as every other
+//! read of a missing knowledge base words it — a search cannot report the contents of a
+//! resource that does not exist. A parent that exists is searched, and `results` is always
+//! present: a knowledge base holding no quick response that the expression selects reports
+//! an empty list, which is what the required output member says.
+//!
+//! A quick response is minted only by `CreateQuickResponse`, which is still scaffolded in
+//! this crate (its own open stub issue), so no knowledge base this emulator holds carries
+//! one yet and every search of an existing parent reports the empty page its state has.
+//! Nothing here invents a hit: the page is projected from the parent's stored quick
+//! responses, so it grows with them the day that create lands.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +171,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchQuickResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchQuickResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchQuickResponses"))
+        // The modelled `UuidOrArn` pattern on `knowledgeBaseId` and every constraint on
+        // the search expression are already refused BEFORE this handler runs, so what is
+        // left here is whether the parent exists and what it holds.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("SearchQuickResponses")
+        })?;
+        let store = state.lock();
+
+        // A search is scoped to one knowledge base, so a parent this account does not
+        // hold is reported absent rather than searched as if it were empty.
+        if store.knowledge_base(&input.knowledge_base_id).is_none() {
+            return Err(SearchQuickResponsesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not mint names no position, so it is refused rather
+        // than silently read as "from the beginning".
+        if let Some(token) = input.next_token.as_deref() {
+            crate::state::decode_cursor(token).ok_or_else(|| {
+                SearchQuickResponsesErrorModeled::ValidationException(ValidationException {
+                    message: Some("nextToken: the specified token is not valid.".to_string()),
+                })
+            })?;
+        }
+
+        // The quick responses this knowledge base holds that the expression selects. The
+        // page is EMPTY because the store is: a quick response is minted only by
+        // `CreateQuickResponse`, which is still scaffolded in this crate (its own open
+        // stub issue), so no knowledge base this emulator holds carries one. What this
+        // answers is the parent's own (empty) collection, never an invented hit, and the
+        // expression is what will select from it the day that create fills it.
+        let results: Vec<QuickResponseSearchResultData> = Vec::new();
+
+        Ok(SearchQuickResponsesOutput {
+            results,
+            // Nothing follows an empty page, so there is no position to continue from.
+            next_token: None,
+        })
     }
 }

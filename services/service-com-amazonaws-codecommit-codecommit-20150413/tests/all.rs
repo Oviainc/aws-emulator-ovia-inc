@@ -107,6 +107,8 @@ mod pull_request_comments;
 mod pull_request_creation;
 #[path = "all/pull_request_events.rs"]
 mod pull_request_events;
+#[path = "all/pull_request_listing.rs"]
+mod pull_request_listing;
 #[path = "all/refusal_message_shape.rs"]
 mod refusal_message_shape;
 #[path = "all/repositories_for_approval_rule_template.rs"]

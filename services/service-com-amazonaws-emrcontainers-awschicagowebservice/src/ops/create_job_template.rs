@@ -10,7 +10,7 @@
 //! NOT mint a second template: the same request replayed — concurrently or later —
 //! answers with the template the first call minted, and the same token carrying a
 //! different request is refused with the modelled `ValidationException`
-//! ([`crate::state::job_template_fingerprint`] is what tells the two apart).
+//! ([`crate::state::request_fingerprint`] is what tells the two apart).
 //!
 //! ## Shape of an operation
 //!
@@ -169,12 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         // Computed from the request BEFORE the store is locked: it depends on nothing in
         // state, and the lock is what serialises racing creates that share one token.
-        let fingerprint = crate::state::job_template_fingerprint(
-            &input.name,
-            &input.job_template_data,
-            input.tags.as_ref(),
-            input.kms_key_arn.as_deref(),
-        );
+        let fingerprint = crate::state::request_fingerprint(&input);
         let mut state = store.lock();
         state.settle();
 

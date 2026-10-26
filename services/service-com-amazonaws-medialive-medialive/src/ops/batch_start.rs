@@ -240,8 +240,10 @@ enum Outcome {
 /// answers with, which on this service is the modelled exception's shape name
 /// (`smithy_query(query="operation", operation="StartChannel")`).
 mod failure_code {
-    /// No resource of that kind has that id — `NotFoundException` (404), which
-    /// both single-resource starts in this service model.
+    /// Neither an existing resource nor one a caller may still act on —
+    /// `NotFoundException` (404), which both single-resource starts in this
+    /// service model: no resource of that kind has that id, or the one it had
+    /// has been deleted.
     pub const NOT_FOUND: &str = "NotFoundException";
     /// The resource exists but its current state does not allow a start —
     /// `ConflictException` (409), which both single-resource starts answer for a
@@ -289,17 +291,26 @@ fn accepted(
     }))
 }
 
-/// One channel's start, under exactly `StartChannel`'s rule: a channel runs only
-/// from the stopped `IDLE` — every other state (still creating, already
-/// starting, running, stopping, deleting, deleted) is refused — and an accepted
-/// start puts it in `STARTING`, owing the `RUNNING` the clock then makes due.
+/// One channel's start, under exactly `StartChannel`'s rule: an id whose delete
+/// has been accepted names no channel to start and is reported NOT FOUND, and a
+/// channel that still exists runs only from the stopped `IDLE` — every other
+/// state (still creating, already starting, running, stopping) is a conflict —
+/// while an accepted start puts it in `STARTING`, owing the `RUNNING` the clock
+/// then makes due.
 fn start_channel(
     state: &mut State,
     id: &str,
     now: ::std::time::SystemTime,
 ) -> Result<Outcome, BatchStartError> {
-    let Some(channel) = state.channels.get_mut(id) else {
-        return Ok(not_found("Channel", id));
+    // The id is resolved through the shared channel guard FIRST, so a channel
+    // whose delete has been accepted is reported with the NOT-FOUND code
+    // `StartChannel` answers for it rather than with a state conflict. The guard
+    // hands back the tombstone's own ARN for the entry to name.
+    let channel = match state.mutable_channel(id) {
+        Ok(channel) => channel,
+        Err(dead) => {
+            return Ok(refused(id, dead.arn, failure_code::NOT_FOUND, dead.message));
+        }
     };
     if !channel.is_idle() {
         return Ok(refused(

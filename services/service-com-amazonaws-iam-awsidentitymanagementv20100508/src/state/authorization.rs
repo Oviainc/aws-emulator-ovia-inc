@@ -64,6 +64,9 @@ pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
 /// `iam:ListPoliciesGrantingServiceAccess`.
 pub const LIST_POLICIES_GRANTING_SERVICE_ACCESS: &str = "iam:ListPoliciesGrantingServiceAccess";
 
+/// `iam:ListOpenIDConnectProviders`.
+pub const LIST_OPEN_ID_CONNECT_PROVIDERS: &str = "iam:ListOpenIDConnectProviders";
+
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 

@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AssociateAccountsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -255,17 +254,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = crate::state::now_millis();
-        if let Some(group) = state.billing_groups.get_mut(&group_arn) {
-            if !to_add.is_empty() {
-                group.linked_account_ids.extend(to_add.iter().cloned());
-                group.last_modified_time_millis = now;
+        // The write goes through the state method that keeps the generation it
+        // supersedes, because moving `LastModifiedTime` moves the billing period the
+        // group's current generation is in force FROM: a read scoped to a period the
+        // previous generation held must still report the group as it stood then
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_billing_group`).
+        if !to_add.is_empty() {
+            if let Some(mut updated) = state.billing_groups.get(&group_arn).cloned() {
+                updated.linked_account_ids.extend(to_add.iter().cloned());
+                updated.last_modified_time_millis = crate::state::now_millis();
+                state.put_billing_group(updated);
             }
         }
+        let added = to_add.len();
         for account_id in to_add {
             state.associate_account(&account_id, &group_arn);
         }
 
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded — the shape every other write of this service emits
+        // (`UpdateBillingGroup`). Never a `@sensitive` member of the group, and not the
+        // account ids themselves, only how many came in, the access key id the caller
+        // presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            billing_group_arn = %group_arn,
+            associated_accounts = added,
+            outcome = if added == 0 { "unchanged" } else { "associated" },
+            "accounts associated with a billing group"
+        );
         Ok(AssociateAccountsOutput {
             arn: Some(group_arn),
         })

@@ -111,7 +111,8 @@ use crate::ops::types::{
     ConflictException, Database, DatabaseSummary, Filter, InternalServerException, Operation,
     OperationEvent, Resource, ResourceNotFoundException, RuleResult, RuleStatusCounts,
     SubCheckResult, ValidationException,
-    APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES, RULE_RESULT_STATUS_VALUES,
+    APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES, FILTER_OPERATOR_VALUES,
+    RULE_RESULT_STATUS_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -3503,6 +3504,76 @@ pub fn filters_within_bounds(filters: &[Filter]) -> Result<(), ValidationExcepti
             return Err(validation(format!(
                 "Filter Value is at most {FILTER_VALUE_MAX_LENGTH} characters, but {} were given",
                 filter.value.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Which `FilterOperator`s a filtered listing offers.
+///
+/// A listing either takes every operator the model's `FilterOperator` enum declares, or
+/// documents ONE operator for its filters — so the catalogue a listing is checked
+/// against, and the wording of the refusal, are the only way the shared rule differs
+/// between them. See [`validate_filters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOperators<'a> {
+    /// Every operator the model declares (see
+    /// [`crate::ops::types::FILTER_OPERATOR_VALUES`]).
+    Modelled,
+    /// The one operator a listing documents for its filters, e.g.
+    /// [`FILTER_OPERATOR_EQUALS`].
+    Only(&'a str),
+}
+
+impl FilterOperators<'_> {
+    /// Refuse an operator this listing does not offer, naming what it does offer.
+    fn accepts(&self, operator: &str) -> Result<(), ValidationException> {
+        match self {
+            Self::Modelled => {
+                if !FILTER_OPERATOR_VALUES.contains(&operator) {
+                    return Err(validation(format!(
+                        "Filter Operator must be one of {}, but was {operator}",
+                        FILTER_OPERATOR_VALUES.join(", ")
+                    )));
+                }
+            }
+            Self::Only(only) => {
+                if operator != *only {
+                    return Err(validation(format!(
+                        "Filter Operator must be {only}, but was {operator}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Refuse a `Filters` member this listing cannot apply, whatever is being listed.
+///
+/// This is the validation every filtered listing of this service shares, so one rule
+/// decides what makes a `Filter` usable: the bounds the model declares
+/// ([`filters_within_bounds`]) first, then, for each filter in the order the request
+/// carries them, an operator the listing offers (`operators`) and a `Name` in
+/// `allowed_names` — the attributes that listing reports, which are what
+/// [`filter_matches_attribute`] can then compare. A listing passes its own name
+/// catalogue ([`FILTER_NAMES`], [`CONFIGURATION_CHECK_FILTER_NAMES`],
+/// [`OPERATION_EVENT_FILTER_NAMES`]) and lifts the refusal into its own modelled
+/// `ValidationException`.
+pub fn validate_filters(
+    filters: &[Filter],
+    operators: FilterOperators<'_>,
+    allowed_names: &[&str],
+) -> Result<(), ValidationException> {
+    filters_within_bounds(filters)?;
+    for filter in filters {
+        operators.accepts(&filter.operator)?;
+        if !allowed_names.contains(&filter.name.as_str()) {
+            return Err(validation(format!(
+                "Filter Name must be one of {}, but was {}",
+                allowed_names.join(", "),
+                filter.name
             )));
         }
     }

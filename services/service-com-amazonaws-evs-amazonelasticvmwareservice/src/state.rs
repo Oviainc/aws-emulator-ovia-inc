@@ -777,10 +777,20 @@ impl StoredEntitlement {
     /// Consumes the record, because the one caller is the delete that has just taken it
     /// out of its environment's map — the stopped form is reported, never stored.
     pub fn stopped(mut self, stopped_at_ms: i64) -> Self {
+        self.stop(stopped_at_ms);
+        self
+    }
+
+    /// Stop usage tracking for this record IN PLACE, the form used where the record is
+    /// KEPT rather than removed — the entitlements a deletion of the whole environment
+    /// stops, which stay in the store so a later read still reports the stop.
+    ///
+    /// The same change [`Self::stopped`] reports, so one entitlement that stopped
+    /// tracking looks the same whichever call stopped it.
+    pub fn stop(&mut self, stopped_at_ms: i64) {
         self.status = ENTITLEMENT_DELETED.to_string();
         self.stopped_at_ms = Some(stopped_at_ms);
         self.pending = None;
-        self
     }
 
     /// Apply the owed status change if `now` has reached its due instant.
@@ -1195,6 +1205,13 @@ impl StoredEnvironment {
                 vlan.modified_at_ms = pending.due_at_ms;
             }
             self.pending = None;
+            if self.state == STATE_DELETED {
+                // The environment is gone as of this instant, so nothing that belongs
+                // to it is live any more — including a record that reached the
+                // environment after its deletion had started and so rode no transition
+                // of its own ([`Self::start_dependent_deletions`]).
+                self.finish_dependent_deletions(pending.due_at_ms);
+            }
         }
         // Each entitlement, connector and host runs on its own clock: one created after
         // the environment settled has no environment transition left to ride on.
@@ -1235,6 +1252,77 @@ impl StoredEnvironment {
                     .map(|pending| pending.due_at),
             )
             .min()
+    }
+
+    /// Start the deletion of every resource that BELONGS to this environment, as the
+    /// deletion of the environment itself does to it.
+    ///
+    /// A resource whose parent is going away does not outlive it: the connectors and the
+    /// entitlements are sub-resources of one environment (`Connector$environmentId`,
+    /// `VmEntitlement$environmentId`), so once the environment's own deletion is accepted
+    /// none of them is live any more and each moves to the terminal value its own status
+    /// enum declares for a record that is finished with.
+    ///
+    /// A connector's connection to its appliance still has to be torn down, so it is
+    /// `DELETING` now and `DELETED` when `deletion` — the environment's own transition —
+    /// comes due, which settles the environment and its connectors together. An
+    /// entitlement has no intermediate status, its enum declaring none between tracking
+    /// and stopped, so its usage tracking stops at `now_ms`, the instant the deletion was
+    /// accepted: a record whose environment is gone tracks no virtual machine's usage.
+    /// Records already finished with are left exactly as they stand, so nothing moves a
+    /// second time.
+    ///
+    /// The hosts need nothing here: "Amazon EVS environments will only be enabled for
+    /// deletion once the hosts are deleted" (`DeleteEnvironment` doc), so an accepted
+    /// deletion leaves no host that is not already terminal ([`Self::live_hosts`]).
+    pub fn start_dependent_deletions(&mut self, deletion: &PendingTransition, now_ms: i64) {
+        for connector in self.connectors.values_mut() {
+            if connector.state == CONNECTOR_DELETING || connector.state == CONNECTOR_DELETED {
+                continue;
+            }
+            connector.state = CONNECTOR_DELETING.to_string();
+            connector.modified_at_ms = now_ms;
+            connector.pending = Some(PendingConnectorState {
+                due_at: deletion.due_at,
+                due_at_ms: deletion.due_at_ms,
+                state: CONNECTOR_DELETED,
+            });
+        }
+        for entitlement in self.entitlements.values_mut() {
+            if entitlement.status == ENTITLEMENT_DELETED
+                || entitlement.status == ENTITLEMENT_REMOVED
+            {
+                continue;
+            }
+            entitlement.stop(now_ms);
+        }
+    }
+
+    /// Finish the deletion of every resource that belongs to this environment, as the
+    /// environment's own deletion coming due does to it: a `DELETED` environment holds
+    /// no live connector and no tracking entitlement at all.
+    ///
+    /// The terminal half of [`Self::start_dependent_deletions`], and what makes that
+    /// rule hold for a record that reached the environment while its deletion was
+    /// already in flight. The stamp written is the instant the deletion was owed at and
+    /// never the instant of the read, so two reads report one `modifiedAt`.
+    pub fn finish_dependent_deletions(&mut self, settled_at_ms: i64) {
+        for connector in self.connectors.values_mut() {
+            if connector.state == CONNECTOR_DELETED {
+                continue;
+            }
+            connector.state = CONNECTOR_DELETED.to_string();
+            connector.modified_at_ms = settled_at_ms;
+            connector.pending = None;
+        }
+        for entitlement in self.entitlements.values_mut() {
+            if entitlement.status == ENTITLEMENT_DELETED
+                || entitlement.status == ENTITLEMENT_REMOVED
+            {
+                continue;
+            }
+            entitlement.stop(settled_at_ms);
+        }
     }
 
     /// The VLAN that carries ESX host management traffic, the one every host of this

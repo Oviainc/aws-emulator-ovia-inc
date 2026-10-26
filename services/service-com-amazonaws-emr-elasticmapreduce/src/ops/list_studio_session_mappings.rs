@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStudioSessionMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStudioSessionMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the Studio session mappings this account holds from
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::studio_session_mappings`], a
+//! page at a time on `Marker`: the mappings of the `StudioId` the request names, or of
+//! every Studio when it names none, narrowed to one `IdentityType` when the request
+//! filters on one — "If not specified, the results include session mapping details for
+//! both users and groups" (`ListStudioSessionMappings$IdentityType` doc).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStudioSessionMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: the listing is a projection of what `CreateStudioSessionMapping`
+//! stored, `UpdateStudioSessionMapping` changed and `DeleteStudioSessionMapping` removed,
+//! so this handler writes nothing. The work one call costs is bounded twice over: the
+//! store holds at most
+//! [`crate::state::MAX_SESSION_MAPPINGS_PER_STUDIO`] mappings per Studio and
+//! [`crate::state::MAX_STUDIOS`] Studios, and the page it answers is at most
+//! [`crate::state::LIST_PAGE_SIZE`] entries whatever the request asks for.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +156,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStudioSessionMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStudioSessionMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStudioSessionMappings"))
+        // Nothing in the response depends on the request beyond its filters and
+        // `Marker`, and a listing attributes no change: it only reports.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListStudioSessionMappingsErrorModeled::InternalServerError(InternalServerError {})
+                    .into(),
+            );
+        };
+        let store = state.lock();
+
+        // A mapping belongs to a Studio, so a `StudioId` that names none is refused the
+        // way every Studio-scoped operation refuses it, rather than reported as a Studio
+        // with no mappings.
+        let studio_id = input.studio_id.filter(|id| !id.is_empty());
+        if let Some(studio_id) = studio_id.as_deref() {
+            if !store.studios.contains_key(studio_id) {
+                return Err(refuse(crate::state::unknown_studio_message()));
+            }
+        }
+
+        // The store is keyed by (studio, identity type, identity), so key order is the
+        // same order on every call — which is what makes a `Marker` walk repeatable.
+        let matched: Vec<&SessionMappingDetail> = store
+            .studio_session_mappings
+            .values()
+            .filter(|mapping| {
+                studio_id
+                    .as_deref()
+                    .is_none_or(|wanted| mapping.studio_id.as_deref() == Some(wanted))
+            })
+            .filter(|mapping| {
+                input
+                    .identity_type
+                    .as_deref()
+                    .is_none_or(|wanted| mapping.identity_type.as_deref() == Some(wanted))
+            })
+            .collect();
+
+        // The marker is the key of the first mapping the previous page did not report:
+        // a mapping is identified by its Studio, identity type and identity together, so
+        // the marker is that key rather than any one member of it.
+        let key_of = |mapping: &SessionMappingDetail| {
+            crate::state::session_mapping_key(
+                mapping.studio_id.as_deref().unwrap_or_default(),
+                mapping.identity_type.as_deref().unwrap_or_default(),
+                &mapping_identity(mapping),
+            )
+        };
+        let start = match input.marker.as_ref() {
+            Some(marker) => match matched
+                .iter()
+                .position(|mapping| key_of(mapping) == *marker)
+            {
+                Some(at) => at,
+                None => return Err(refuse(format!("Marker '{marker}' is not valid."))),
+            },
+            None => 0,
+        };
+        let end = matched.len().min(start + crate::state::LIST_PAGE_SIZE);
+        let session_mappings: Vec<SessionMappingSummary> = matched[start..end]
+            .iter()
+            .map(|mapping| SessionMappingSummary {
+                studio_id: mapping.studio_id.clone(),
+                identity_id: mapping.identity_id.clone(),
+                identity_name: mapping.identity_name.clone(),
+                identity_type: mapping.identity_type.clone(),
+                session_policy_arn: mapping.session_policy_arn.clone(),
+                creation_time: mapping.creation_time,
+            })
+            .collect();
+        let marker = matched.get(end).map(|mapping| key_of(mapping));
+
+        Ok(ListStudioSessionMappingsOutput {
+            session_mappings: Some(session_mappings),
+            marker,
+        })
     }
+}
+
+/// Refuse the request with this operation's modeled client error (HTTP 400).
+fn refuse(message: String) -> ListStudioSessionMappingsError {
+    ListStudioSessionMappingsErrorModeled::InvalidRequestException(InvalidRequestException {
+        error_code: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The identity a stored mapping names: "Either `IdentityName` or `IdentityId` must be
+/// specified, but not both" (`CreateStudioSessionMapping$IdentityId` doc), so exactly one
+/// of the two is what the mapping is keyed by.
+fn mapping_identity(mapping: &SessionMappingDetail) -> String {
+    mapping
+        .identity_id
+        .clone()
+        .or_else(|| mapping.identity_name.clone())
+        .unwrap_or_default()
 }

@@ -463,3 +463,9 @@ mod client_vpn_endpoints;
 // logging on for a resource, reading the flow logs back, and deleting them in batches.
 #[path = "all/flow_logs.rs"]
 mod flow_logs;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DescribeTransitGatewayPolicyTables` reports
+// out of the policy table store, and how the id list, the filters and the page size narrow
+// it.
+#[path = "all/transit_gateway_policy_tables.rs"]
+mod transit_gateway_policy_tables;

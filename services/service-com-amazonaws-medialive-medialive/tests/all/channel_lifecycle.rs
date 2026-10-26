@@ -220,17 +220,19 @@ async fn the_channel_lifecycle_runs_the_pipelines_the_class_gives_it() {
             deleted["pipelinesRunningCount"]
         );
 
-        // `DELETED` is terminal: a second delete is refused rather than
-        // starting the deletion over.
+        // `DELETED` is terminal and the id is dead: a second delete names no
+        // channel left to delete, so it is answered as not found rather than as
+        // a state conflict — the answer that tells a client to recreate the
+        // channel instead of retrying this id.
         let (status, again) = call(&router, "DELETE", &format!("/prod/channels/{id}"), None).await;
         assert_eq!(
-            status, 409,
-            "case {case:?}: expected deleting a DELETED channel to conflict, got {status}: {again}"
+            status, 404,
+            "case {case:?}: expected deleting a DELETED channel to be not found, got {status}: {again}"
         );
         assert_eq!(
             error_code(status, &again),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {again}"
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {again}"
         );
 
         // The deleted channel is still this account's record of it, so the list

@@ -38,7 +38,8 @@ use std::time::SystemTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::PACKAGE_TYPE_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    DOMAIN_PACKAGE_STATUS_ACTIVE, DOMAIN_PACKAGE_STATUS_ASSOCIATING, PACKAGE_TYPE_TXT_DICTIONARY,
+    DOMAIN_PACKAGE_STATUS_ACTIVE, DOMAIN_PACKAGE_STATUS_ASSOCIATING, PACKAGE_QUOTA,
+    PACKAGE_TYPE_TXT_DICTIONARY,
 };
 
 use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -714,6 +715,17 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
             json!({ "DomainName": "assoc-no-such-domain", "PackageList": [] }),
             400,
             "ValidationException",
+        ),
+        (
+            "more packages than the account holds",
+            json!({
+                "DomainName": domain,
+                "PackageList": (0..=PACKAGE_QUOTA)
+                    .map(|index| json!({ "PackageID": format!("pkg-{index:032x}") }))
+                    .collect::<Vec<Value>>(),
+            }),
+            409,
+            "ResourceNotFoundException",
         ),
     ];
 

@@ -11,7 +11,9 @@
 //!
 //! `clientToken` is `@idempotencyToken`, so a token already spent on this operation in
 //! this cluster does NOT mint a second endpoint: the same request replayed answers with
-//! the endpoint the first call minted.
+//! the endpoint the first call minted, and that same token carrying a DIFFERENT request
+//! is refused with the modelled `ValidationException`
+//! ([`crate::state::request_fingerprint`] is what tells the two apart).
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
         let scope = crate::state::create_managed_endpoint_scope(&input.virtual_cluster_id);
+        // The request this `clientToken` stands for, digested before the store is locked:
+        // it depends on nothing in state, and the lock is what serialises racing creates
+        // that share one token.
+        let fingerprint = crate::state::request_fingerprint(&input);
         let mut state = store.lock();
         state.settle();
 
@@ -205,13 +211,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the endpoint
-        // the first call minted rather than provisioning a second gateway.
+        // the first call minted rather than provisioning a second gateway. The same token
+        // carrying a DIFFERENT request is not a replay — answering it with the first
+        // endpoint would silently drop the parameters this call asked for — so it is
+        // refused.
         let replayed = state
             .replayed_idempotency(&region, &scope, &input.client_token)
             .cloned();
         if let Some(existing) =
             replayed.and_then(|id| state.managed_endpoint(&region, &input.virtual_cluster_id, &id))
         {
+            if existing.request_fingerprint != fingerprint {
+                return Err(CreateManagedEndpointErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "clientToken {} was already used to create managed endpoint {}, with different parameters",
+                            input.client_token, existing.id
+                        )),
+                    },
+                )
+                .into());
+            }
             return Ok(CreateManagedEndpointOutput {
                 id: Some(existing.id.clone()),
                 name: Some(existing.name.clone()),
@@ -264,6 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at_millis: crate::state::now_millis(),
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token,
+            request_fingerprint: fingerprint,
             sequence,
             pending: Some(crate::state::PendingTransition::due(
                 crate::state::ENDPOINT_ACTIVE,

@@ -162,13 +162,22 @@ impl Emulator {
 
     /// A knowledge base to associate, returned as (id, ARN).
     async fn knowledge_base(&self, name: &str, knowledge_base_type: &str) -> (String, String) {
-        let reply = self
-            .send(
-                "POST",
-                "/knowledgeBases",
-                Some(json!({ "name": name, "knowledgeBaseType": knowledge_base_type })),
-            )
-            .await;
+        let mut body = json!({ "name": name, "knowledgeBaseType": knowledge_base_type });
+        // An `EXTERNAL` knowledge base is its source, so the create carries one: the
+        // model documents `sourceConfiguration` as the source of "EXTERNAL or Managed"
+        // knowledge bases
+        // (`smithy_query(query="doc",shape="CreateKnowledgeBaseRequest",member="sourceConfiguration")`).
+        if knowledge_base_type == "EXTERNAL" {
+            body["sourceConfiguration"] = json!({
+                "appIntegrations": {
+                    "appIntegrationArn": format!(
+                        "arn:aws:app-integrations:{REGION}:{account}:data-integration/src",
+                        account = engine::EMULATOR_ACCOUNT_ID
+                    )
+                }
+            });
+        }
+        let reply = self.send("POST", "/knowledgeBases", Some(body)).await;
         assert_eq!(
             reply.status, 200,
             "case \"knowledge base {name}\": expected HTTP 200, got {} with {}",

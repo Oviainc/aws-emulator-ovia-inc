@@ -97,7 +97,10 @@ pub async fn update_group(router: &MultiServiceRouter, id: &str, body: Value) ->
 
 /// The `whitelistRules` projection of a list of CIDRs, as the wire carries it
 /// (`InputWhitelistRule$Cidr`, jsonName `cidr`).
-fn whitelist(cidrs: &[&str]) -> Value {
+///
+/// Shared with the `post_delete_mutation_classification` suite, so the two
+/// cannot disagree about how a whitelist reaches the wire.
+pub fn whitelist(cidrs: &[&str]) -> Value {
     Value::Array(cidrs.iter().map(|cidr| json!({ "cidr": cidr })).collect())
 }
 

@@ -449,18 +449,39 @@ impl JobState {
         matches!(self, Self::New)
     }
 
-    /// Whether a job in this state has a device an update file can be fetched for.
+    /// Whether a device has actually been prepared and shipped for a job in this state, so
+    /// the job has a Snow device of its own — and with it that device's files, its software
+    /// update file among them.
     ///
-    /// `GetSoftwareUpdates` answers a URL for "an update file associated with a specified
-    /// `JobId`" — the software the Snow device that job ordered is updated with. A
-    /// cancelled job is the one state in which no device is ever prepared for the job:
-    /// "You can only cancel a job before its `JobState` value changes to
-    /// `PreparingAppliance`" (`CancelJob`), so a job in `Cancelled` stopped short of
-    /// appliance preparation and no device of its own will ever be prepared, shipped or
-    /// updated. From every other state the order is still live and its device's update
-    /// file is available.
-    pub fn has_software_update(self) -> bool {
-        !matches!(self, Self::Cancelled)
+    /// `JobMetadata$SnowballId` is the "unique ID associated with a device", which a job
+    /// names only once a device exists for it, and the `JobState` values split on exactly
+    /// that. While the order is still being placed and made ready no device has been built
+    /// and sent for it: `New`, the state `CreateJob` mints, `PreparingAppliance`, in which
+    /// an appliance is still being prepared, and `PreparingShipment`, in which its shipment
+    /// is still being made up. `Cancelled` stops the order before any appliance is prepared
+    /// at all ("You can only cancel a job before its `JobState` value changes to
+    /// `PreparingAppliance`", `CancelJob`), so no device is ever built for it. `Listing` and
+    /// `Pending` are the states an export order's main job passes through while its objects
+    /// are listed and its job parts are still to come, and a main job is associated with no
+    /// device at all ("Main jobs aren't associated with any Snowballs", `JobListEntry$IsMaster`).
+    ///
+    /// Every remaining `JobState` value places a built device somewhere — on its way to the
+    /// caller, in the caller's hands, on its way back, at the sorting facility, or back at
+    /// Amazon Web Services with the transfer running or finished — so from those a device
+    /// exists for the job. [`Self::has_returnable_device`] and
+    /// [`Self::releases_device_credentials`] are narrower windows inside this one, each
+    /// fixed by what its own operation documents.
+    pub fn has_prepared_device(self) -> bool {
+        matches!(
+            self,
+            Self::InTransitToCustomer
+                | Self::WithCustomer
+                | Self::InTransitToAWS
+                | Self::WithAWSSortingFacility
+                | Self::WithAWS
+                | Self::InProgress
+                | Self::Complete
+        )
     }
 
     /// Whether a job in this state has a device that can still be returned to AWS.
@@ -741,8 +762,10 @@ impl StoredJob {
     /// `InProgress`, `JobLogInfo` only once a transfer has produced a report, and
     /// `SnowballId` only once a device is associated with the job — which for a main job
     /// is never ("Main jobs aren't associated with any Snowballs") and for every other
-    /// job, job parts included, is once an appliance has been prepared for it, i.e. once
-    /// it has left `New`.
+    /// job, job parts included, is once a device has been prepared and shipped for it
+    /// ([`JobState::has_prepared_device`]), the same window the job's device files are
+    /// published from. Nothing in this API assigns a device id, so the store holds none to
+    /// report and the member is absent.
     pub fn to_job_metadata(&self) -> JobMetadata {
         JobMetadata {
             job_id: Some(self.job_id.clone()),

@@ -45,6 +45,8 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/tag_key_rule_single_source.rs"]
 mod tag_key_rule_single_source;
+#[path = "all/update_deployment_dry_run_response.rs"]
+mod update_deployment_dry_run_response;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
 #[path = "all/workload_catalogue.rs"]

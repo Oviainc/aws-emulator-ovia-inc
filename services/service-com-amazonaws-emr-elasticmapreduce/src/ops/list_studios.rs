@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStudios
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStudios`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports "all Amazon EMR Studios associated with the Amazon Web Services account" from
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::studios`], a page at a time on
+//! `Marker`, each as the summary the model declares — "To fetch additional details such
+//! as subnets, IAM roles, security groups, and tags for the Studio, use the
+//! `DescribeStudio` API" (`StudioSummary` doc).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStudios::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: the listing is a projection of what `CreateStudio` stored,
+//! `UpdateStudio` changed and `DeleteStudio` removed, so this handler writes nothing. The
+//! work one call costs is bounded twice over: the store holds at most
+//! [`crate::state::MAX_STUDIOS`] Studios, and the page it answers is at most
+//! [`crate::state::LIST_PAGE_SIZE`] entries whatever the request asks for.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +146,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStudios` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStudiosErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStudios"))
+        // Nothing in the response depends on the request beyond its `Marker`, and a
+        // listing attributes no change: it only reports.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStudiosErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR studio store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Studio ids are minted from a monotonic sequence and the store is keyed by
+        // them, so key order is creation order — the same order on every call, which is
+        // what makes a `Marker` walk repeatable.
+        let held: Vec<&Studio> = store.studios.values().collect();
+
+        // The marker is the id of the first Studio the previous page did not report —
+        // the marker contract every listing of this service follows.
+        let start = match input.marker.as_ref() {
+            Some(marker) => {
+                match held
+                    .iter()
+                    .position(|studio| studio.studio_id.as_deref() == Some(marker.as_str()))
+                {
+                    Some(at) => at,
+                    None => {
+                        return Err(ListStudiosErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                error_code: None,
+                                message: Some(format!("Marker '{marker}' is not valid.")),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+            None => 0,
+        };
+        let end = held.len().min(start + crate::state::LIST_PAGE_SIZE);
+        let studios: Vec<StudioSummary> = held[start..end]
+            .iter()
+            .map(|studio| StudioSummary {
+                studio_id: studio.studio_id.clone(),
+                name: studio.name.clone(),
+                vpc_id: studio.vpc_id.clone(),
+                description: studio.description.clone(),
+                url: studio.url.clone(),
+                auth_mode: studio.auth_mode.clone(),
+                creation_time: studio.creation_time,
+            })
+            .collect();
+        let marker = held.get(end).and_then(|studio| studio.studio_id.clone());
+
+        Ok(ListStudiosOutput {
+            studios: Some(studios),
+            marker,
+        })
     }
 }

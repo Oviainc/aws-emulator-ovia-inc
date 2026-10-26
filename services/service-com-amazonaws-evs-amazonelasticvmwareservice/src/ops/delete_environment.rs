@@ -9,6 +9,9 @@
 //! associations its VLANs were holding on the account's own `Address` records
 //! ([`crate::state::ec2_resources::release_elastic_ips`]): an environment that is gone
 //! consumes none of the account's Elastic IP addresses, which stay allocated to it. The
+//! environment's own sub-resources go away with it on the same clock
+//! ([`crate::state::StoredEnvironment::start_dependent_deletions`]): its connectors are
+//! `DELETING` and then `DELETED`, and its entitlements stop tracking usage at once. The
 //! other half of that
 //! sentence, the "Amazon Web Services Secrets Manager secrets that Amazon EVS created",
 //! has nothing to delete: this emulator creates no VCF credential secret, which is why
@@ -233,18 +236,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // environment, so the association does too.
         let mut released_eips: Vec<(String, String)> = Vec::new();
         if !already_going_away {
+            // The instant the deletion was accepted, read once so the environment and
+            // every resource of it that goes away with it carry one stamp.
+            let accepted_at_ms = crate::state::now_ms();
             environment.state = crate::state::STATE_DELETING.to_string();
-            environment.modified_at_ms = crate::state::now_ms();
+            environment.modified_at_ms = accepted_at_ms;
             for vlan in &mut environment.vlans {
                 // "Environment deletion also deletes the associated Amazon EVS VLAN
                 // subnets": they go away with the environment.
                 vlan.vlan_state = crate::state::STATE_DELETING.to_string();
                 vlan.modified_at_ms = environment.modified_at_ms;
             }
-            environment.pending = Some(crate::state::PendingTransition::starting_now(
+            let deletion = crate::state::PendingTransition::starting_now(
                 crate::state::STATE_DELETED,
                 crate::state::STATE_DELETED,
-            ));
+            );
+            // The VLAN subnets are not the only resources of the environment the
+            // deletion takes with it: its connectors and its entitlements are
+            // sub-resources of this environment too, so none of them is live once this
+            // deletion is accepted. They settle on the environment's own clock.
+            environment.start_dependent_deletions(&deletion, accepted_at_ms);
+            environment.pending = Some(deletion);
             vlan_subnet_ids = environment
                 .vlans
                 .iter()

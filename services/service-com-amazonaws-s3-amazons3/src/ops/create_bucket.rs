@@ -351,14 +351,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // us-east-1: "For legacy compatibility, if you re-create an existing
                 // bucket that you already own in the North Virginia Region, Amazon S3
                 // returns 200 OK and resets the bucket access control lists (ACLs)"
-                // (`BucketAlreadyOwnedByYou`'s own documentation). The Region that
-                // decides it is the EXISTING bucket's, since that is the bucket being
-                // re-created.
+                // (`BucketAlreadyOwnedByYou`'s own documentation).
+                //
+                // That legacy 200 is a RE-CREATE of the bucket as it stands: it needs the
+                // Region this request asks for to be the one the existing bucket already
+                // lives in, and that Region to be North Virginia. A create asking for any
+                // OTHER Region is not re-creating the bucket, it is asking for a second
+                // bucket of that name somewhere else — and a general purpose bucket name
+                // is unique "across all Amazon Web Services accounts in all the Amazon Web
+                // Services Regions within a partition" (this operation's own
+                // documentation), so there is no Region left to mint it in and the create
+                // is refused. Nothing is written either way, so the existing bucket keeps
+                // the Region it was created in and `GetBucketLocation` keeps reporting it.
                 let existing_region = store
                     .bucket(&input.bucket)
                     .map(|bucket| bucket.region.clone())
                     .unwrap_or_default();
-                if existing_region != crate::state::DEFAULT_BUCKET_REGION {
+                if existing_region != crate::state::DEFAULT_BUCKET_REGION
+                    || region != existing_region
+                {
                     return Err(CreateBucketErrorModeled::BucketAlreadyOwnedByYou(
                         BucketAlreadyOwnedByYou {},
                     )
