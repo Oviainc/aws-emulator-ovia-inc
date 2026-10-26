@@ -231,6 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
+        // applies itself, so a request naming a key in it is refused before anything is
+        // recorded (see [`crate::state::reserved_tag_key_refusal`]).
+        if let Some(message) =
+            crate::state::reserved_tag_key_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(bad_request(&message));
+        }
+
         // "When creating a new custom vocabulary, you can either upload a text file
         // that contains your new entries, phrases, and terms into an Amazon S3 bucket
         // and include the URI in your request, or you can include a list of terms

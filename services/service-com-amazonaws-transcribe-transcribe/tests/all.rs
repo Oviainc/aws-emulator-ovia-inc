@@ -69,6 +69,8 @@ mod medical_vocabulary_constraints;
 mod medical_vocabulary_updates;
 #[path = "all/regional_resource_scoping.rs"]
 mod regional_resource_scoping;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/rpc_success_status.rs"]
 mod rpc_success_status;
 #[path = "all/service_claim.rs"]

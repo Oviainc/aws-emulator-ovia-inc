@@ -186,6 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
+        // applies itself, so a request naming a key in it is refused before anything is
+        // recorded (see [`crate::state::reserved_tag_key_refusal`]).
+        if let Some(message) =
+            crate::state::reserved_tag_key_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(bad_request(&message));
+        }
+
         // The co-requirement each time-range shape a rule's filter can carry documents
         // on both of its bounding members — see
         // [`crate::state::rule_time_range_error`]. A rule that bounds its search with

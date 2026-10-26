@@ -217,6 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
+        // applies itself, so a request naming a key in it is refused before anything is
+        // recorded (see [`crate::state::reserved_tag_key_refusal`]).
+        if let Some(message) =
+            crate::state::reserved_tag_key_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(bad_request(&message));
+        }
+
         // "You can use Words or VocabularyFilterFileUri, but you can't use both." The
         // model can express neither requirement, so the handler is where they are
         // refused.

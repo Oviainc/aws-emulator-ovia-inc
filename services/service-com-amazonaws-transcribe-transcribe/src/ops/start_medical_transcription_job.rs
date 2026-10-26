@@ -264,6 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
+        // applies itself, so a request naming a key in it is refused before anything is
+        // recorded (see [`crate::state::reserved_tag_key_refusal`]).
+        if let Some(message) =
+            crate::state::reserved_tag_key_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(bad_request(&message));
+        }
+
         // `Media` is required but every member of it is optional, so the boundary
         // validator cannot refuse a `Media` that names no media file. The operation
         // documents `Media (MediaFileUri)` as a required request parameter.

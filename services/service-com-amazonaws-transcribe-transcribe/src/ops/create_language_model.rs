@@ -212,6 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The `aws:` tag-key namespace is reserved for the tags Amazon Web Services
+        // applies itself, so a request naming a key in it is refused before anything is
+        // recorded (see [`crate::state::reserved_tag_key_refusal`]).
+        if let Some(message) =
+            crate::state::reserved_tag_key_refusal(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(bad_request(&message));
+        }
+
         // The Region this request is served in: Amazon Transcribe is regional, so the
         // model is created in — and only in — the Region the caller signed for.
         let region = crate::state::request_region(ctx.parts());
@@ -298,4 +307,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> CreateLanguageModelError {
+    CreateLanguageModelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

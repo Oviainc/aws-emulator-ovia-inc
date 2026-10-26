@@ -1048,6 +1048,48 @@ pub fn extend_language_id_references<'a>(
 /// repeated tagging calls, so a merge past it is refused rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix Amazon Web Services reserves for the tags it applies itself: a
+/// caller may not create or edit a tag whose key starts with it, in any service.
+///
+/// `TagKey` is modelled as a bare string, `length {min 1, max 128}` with no `@pattern`
+/// (`smithy_query(query="shape", shape="TagKey")`), so the request boundary cannot
+/// refuse such a key and the handlers that WRITE tags are where the reservation is
+/// enforced.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` claims the reserved namespace.
+///
+/// Compared case-INSENSITIVELY: what is reserved is the namespace, not one spelling of
+/// it. The comparison is over BYTES, because a tag key may be any UTF-8 text and
+/// slicing it by a character offset could fall inside a multi-byte character; a key
+/// whose first bytes are not that prefix simply does not claim the namespace.
+fn claims_reserved_tag_prefix(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Why a request's `Tags` cannot be written, or `None` when every key in it is a
+/// caller's to name.
+///
+/// One rule for every operation that persists caller-supplied tags — `TagResource` and
+/// each create/start whose input carries `Tags` — so none of them can store a key the
+/// standard tagging API never accepts. The refusal is computed BEFORE anything is
+/// written, so a request carrying a reserved key leaves the stored tag set, and the
+/// resource it named, exactly as they were.
+pub fn reserved_tag_key_refusal(tags: &[Tag]) -> Option<String> {
+    let key = tags
+        .iter()
+        .find(|tag| claims_reserved_tag_prefix(&tag.key))?;
+    Some(format!(
+        "Your request includes the tag key {key}, which uses the reserved \
+         {RESERVED_TAG_KEY_PREFIX} prefix. The {RESERVED_TAG_KEY_PREFIX} prefix is \
+         reserved for the tags Amazon Web Services applies itself. Rename the tag and \
+         try your request again.",
+        key = key.key,
+    ))
+}
+
 /// One resource family's store, Region by Region.
 ///
 /// Amazon Transcribe is a REGIONAL service: a request reaches the endpoint of exactly

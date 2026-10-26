@@ -162,6 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Request validation, before the ARN is resolved: the `aws:` namespace is
+        // reserved for the tags the service itself applies, so a request naming a key
+        // in it is refused and the resource's tag set is left untouched.
+        if let Some(message) = crate::state::reserved_tag_key_refusal(&input.tags) {
+            return Err(bad_request(&message));
+        }
+
         // The ARN's shape is already enforced by `TranscribeArn`'s `@pattern`, so
         // reaching here means it is well formed; what it names is what decides.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
