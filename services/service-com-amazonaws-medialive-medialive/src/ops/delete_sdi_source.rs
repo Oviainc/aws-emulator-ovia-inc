@@ -162,7 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         if !state.sdi_sources.contains_key(&input.sdi_source_id) {
             return Err(DeleteSdiSourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("SdiSource not found: {}", input.sdi_source_id)),
+                message: Some(crate::state::not_found_message(
+                    "SdiSource",
+                    &input.sdi_source_id,
+                )),
             })
             .into());
         }

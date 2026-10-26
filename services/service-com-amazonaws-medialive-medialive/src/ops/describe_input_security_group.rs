@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .input_security_group_description(&input.input_security_group_id)
             .ok_or_else(|| {
                 DescribeInputSecurityGroupErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Input security group not found: {}",
-                        input.input_security_group_id
+                    message: Some(crate::state::not_found_message(
+                        "Input security group",
+                        &input.input_security_group_id,
                     )),
                 })
             })?;

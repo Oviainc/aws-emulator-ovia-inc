@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .network_description(&input.network_id)
             .ok_or_else(|| {
                 DescribeNetworkErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("Network not found: {}", input.network_id)),
+                    message: Some(crate::state::not_found_message("Network", &input.network_id)),
                 })
             })?;
 

@@ -200,9 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // answered with a 404 no AWS path produces for it.
             return Err(UpdateInputSecurityGroupErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Input security group not found: {}",
-                        input.input_security_group_id
+                    message: Some(crate::state::not_found_message(
+                        "Input security group",
+                        &input.input_security_group_id,
                     )),
                 },
             )

@@ -254,6 +254,9 @@ mod node_listing;
 #[path = "all/node_settings_update.rs"]
 mod node_settings_update;
 
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
+
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 

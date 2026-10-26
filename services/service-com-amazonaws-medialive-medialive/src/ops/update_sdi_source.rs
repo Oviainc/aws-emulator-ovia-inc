@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.sdi_source_id
                     ))
                 } else {
-                    format!("SdiSource not found: {}", input.sdi_source_id)
+                    crate::state::not_found_message("SdiSource", &input.sdi_source_id)
                 };
                 return Err(UpdateSdiSourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(message),
