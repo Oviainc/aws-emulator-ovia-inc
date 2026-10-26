@@ -33,6 +33,8 @@ mod data_key_without_plaintext;
 mod decrypt_key_origin;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/get_key_policy_reads.rs"]
+mod get_key_policy_reads;
 #[path = "all/get_key_rotation_status_reads.rs"]
 mod get_key_rotation_status_reads;
 #[path = "all/grants.rs"]
