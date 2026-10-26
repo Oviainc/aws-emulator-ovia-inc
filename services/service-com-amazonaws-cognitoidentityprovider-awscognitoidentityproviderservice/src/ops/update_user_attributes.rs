@@ -267,286 +267,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (pool, user) = guard
                 .signed_in_user(&input.access_token, now)
                 .map_err(token_rejected)?;
-            plan_update(pool, user, &input.user_attributes)?
+            crate::state::plan_attribute_update(
+                pool,
+                user,
+                &input.user_attributes,
+                // The caller IS the user whose values these are, so a verified
+                // flag it submits is stored as the value of a `Boolean`
+                // attribute and asserts nothing about the value beside it.
+                crate::state::VerifiedFlagAuthority::Records,
+            )
+            .map_err(refused)?
         };
 
         let user = guard
             .pool_mut(&plan.user_pool_id)
             .and_then(|pool| pool.user_mut(&plan.username))
             .ok_or_else(internal_error)?;
-        for update in &plan.updates {
-            match &update.value {
-                // A blank value deletes the attribute, so neither a stored nor
-                // a pending value of it survives.
-                None => {
-                    user.attributes.remove(&update.name);
-                    user.pending_attributes.remove(&update.name);
-                }
-                // A pool that requires verification first keeps the stored
-                // value and holds the new one pending.
-                Some(value) if update.deferred => {
-                    user.pending_attributes
-                        .insert(update.name.clone(), value.clone());
-                }
-                Some(value) => {
-                    user.attributes.insert(update.name.clone(), value.clone());
-                    user.pending_attributes.remove(&update.name);
-                }
-            }
-            if let Some(flag) = update.stale_verified_flag {
-                if update.value.is_none() {
-                    // The attribute it vouches for is gone, so the flag has
-                    // nothing left to describe.
-                    user.attributes.remove(flag);
-                } else {
-                    user.attributes.insert(
-                        flag.to_string(),
-                        crate::state::FLAG_UNCONFIRMED.to_string(),
-                    );
-                }
-            }
-        }
-        // A call that names no attribute to change modifies nothing, so the
-        // user's last-modified instant stands.
-        if !plan.updates.is_empty() {
-            user.user_last_modified_date = now;
-        }
-
-        // A reported delivery is a code that was SENT, so each one is minted and
-        // recorded against the attribute it was sent for — which is the code
-        // `VerifyUserAttribute` accepts for it, and which supersedes any code
-        // outstanding for that attribute before. The destination is the value the
-        // message went to: the pending one where the pool holds the update until the
-        // user confirms it.
-        let mut deliveries = Vec::new();
-        for (attribute, value) in &plan.verifications {
-            let code = crate::state::VerificationCode::issued(attribute, value, now);
-            let stored = user.issue_code(
-                crate::state::CodePurpose::AttributeVerification(attribute.clone()),
-                code,
-            );
-            deliveries.extend(stored.delivery_details());
-        }
-
         // The member is PRESENT and empty when nothing was sent, which is what
         // a client reading the list sees.
         Ok(UpdateUserAttributesOutput {
-            code_delivery_details_list: Some(deliveries),
+            code_delivery_details_list: Some(user.apply_attribute_update(&plan, now)),
         })
     }
 }
 
-/// What one submitted attribute does to the stored user.
-#[derive(Debug)]
-struct AttributeUpdate {
-    /// The attribute the request named.
-    name: String,
-    /// The value to store, or `None` to delete the attribute (a blank value).
-    value: Option<String>,
-    /// Whether the value is held pending the user's confirmation rather than
-    /// stored over the confirmed one.
-    deferred: bool,
-    /// The verified flag this change leaves vouching for a value the user no
-    /// longer holds, when the request does not set that flag itself: it goes
-    /// unconfirmed beside a value that changed, and away with a value that was
-    /// deleted, since a deleted attribute has nothing to vouch for.
-    stale_verified_flag: Option<&'static str>,
-}
-
-/// The whole update: which stored user it applies to, what it does to that
-/// user's attributes and the verification messages it sends.
-#[derive(Debug)]
-struct Plan {
-    user_pool_id: String,
-    username: String,
-    updates: Vec<AttributeUpdate>,
-    /// One `(attribute, value)` per verification message this update sends: the
-    /// attribute the message is addressed to and the value it goes to, which is
-    /// what the code issued for it is recorded against.
-    verifications: Vec<(String, String)>,
-}
-
-/// Decide what `requested` does to `user` of `pool`, or the refusal it earns.
-///
-/// A pure read of the stored pool and user: it returns the plan rather than
-/// applying it, so a request refused halfway through leaves nothing written.
-///
-/// Every step below is bounded by the POOL's schema rather than by the length
-/// of the submitted list: the count is capped and repeated names are refused
-/// before any per-attribute work, so one request cannot drive work the caller
-/// chose the size of.
-fn plan_update(
-    pool: &crate::state::UserPool,
-    user: &crate::state::User,
-    requested: &[AttributeType],
-) -> Result<Plan, UpdateUserAttributesError> {
-    // A request cannot update more attributes than the pool declares: past
-    // that it either names one the schema does not declare or names one twice,
-    // both refused below. Checked FIRST, so nothing further is proportional to
-    // a list length the caller chose.
-    if requested.len() > pool.schema.len() {
-        return Err(invalid_parameter(format!(
-            "Invalid attributes given, at most {} attributes of this user pool can be updated in one request",
-            pool.schema.len()
-        )));
+/// This operation's answer to an attribute list that names no update to make,
+/// as [`crate::state::plan_attribute_update`] judged it.
+fn refused(refusal: crate::state::AttributeUpdateRefusal) -> UpdateUserAttributesError {
+    match refusal {
+        crate::state::AttributeUpdateRefusal::Invalid(message) => invalid_parameter(message),
+        crate::state::AttributeUpdateRefusal::AliasTaken(name) => alias_exists(&name),
     }
-    // Every attribute written has to be one the pool's schema declares. Asked
-    // of the submitted list as it arrived, so an undeclared attribute is
-    // reported as undeclared whatever else the list carries.
-    let names: Vec<String> = requested
-        .iter()
-        .map(|attribute| attribute.name.clone())
-        .collect();
-    if let Some(unknown) = pool.unknown_attribute(&names) {
-        return Err(invalid_parameter(format!(
-            "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
-        )));
-    }
-    // A user holds ONE value per attribute (`AttributeType` is "the name and
-    // value of a user attribute"), so a list naming the same attribute twice
-    // asks for two values of one attribute and names no single update to make.
-    // Keyed by name, so every lookup below is a lookup rather than a scan of
-    // the request.
-    let mut submitted: ::std::collections::BTreeMap<&str, &str> =
-        ::std::collections::BTreeMap::new();
-    for attribute in requested {
-        let value = attribute.value.as_deref().unwrap_or_default();
-        if submitted.insert(attribute.name.as_str(), value).is_some() {
-            return Err(invalid_parameter(format!(
-                "Invalid attributes given, {} was submitted more than once",
-                attribute.name
-            )));
-        }
-    }
-
-    let mut updates = Vec::new();
-    let mut verifications = Vec::new();
-    for (name, value) in &submitted {
-        let name = (*name).to_string();
-        // A verified flag whose attribute this same request DELETES has
-        // nothing left to record, so the deletion settles the flag (below)
-        // rather than the value submitted for it.
-        if verified_attribute_of(&name)
-            .is_some_and(|described| submitted.get(described).is_some_and(|value| value.is_empty()))
-        {
-            continue;
-        }
-        // `SchemaAttributeType.Mutable` is what says a stored value may change,
-        // so an attribute the schema freezes cannot be updated at all.
-        if !pool.attribute_mutable(&name) {
-            return Err(invalid_parameter(format!(
-                "Attribute {name} cannot be updated: this user pool's schema declares it immutable"
-            )));
-        }
-        let value = (*value).to_string();
-        if value.is_empty() {
-            // An attribute the schema marks required must hold a value, so it
-            // is not one a blank value may delete.
-            if pool.attribute_required(&name) {
-                return Err(invalid_parameter(format!(
-                    "Attribute {name} cannot be deleted: this user pool's schema declares it required"
-                )));
-            }
-            // A deleted email address or phone number leaves its verified flag
-            // vouching for a value the user no longer holds, so the flag goes
-            // with it.
-            let stale_verified_flag = crate::state::verified_flag(&name);
-            updates.push(AttributeUpdate {
-                name,
-                value: None,
-                deferred: false,
-                stale_verified_flag,
-            });
-            continue;
-        }
-
-        let unchanged = user
-            .attributes
-            .get(&name)
-            .is_some_and(|stored| stored == &value);
-        let verified_flag = crate::state::verified_flag(&name);
-        // A pool that requires verification before the update holds the new
-        // value pending instead of storing it over the confirmed one.
-        let deferred = verified_flag.is_some() && pool.requires_verification_before_update(&name);
-        if deferred && unchanged {
-            // The user already holds this value, confirmed: there is nothing
-            // to hold pending and nothing to confirm.
-            continue;
-        }
-        // A value that changed is no longer the one the verified flag vouched
-        // for — unless the request sets that flag itself, which is then the
-        // value stored for it.
-        let stale_verified_flag = verified_flag
-            .filter(|flag| !deferred && !unchanged && !submitted.contains_key(*flag));
-
-        // The value the user would hold may not be one another user already
-        // holds as an active alias, since an alias names ONE user of the pool.
-        // Only an alias attribute of the pool is looked up, and each is looked
-        // up once, so the pool's users are walked at most once per alias
-        // attribute the pool configures.
-        let becomes_active_alias = !deferred
-            && verified_flag
-                .is_none_or(|flag| flag_after_update(&submitted, user, flag, &stale_verified_flag));
-        if becomes_active_alias
-            && pool.is_alias_attribute(&name)
-            && pool.alias_taken(&name, &value, &user.username)
-        {
-            return Err(alias_exists(&name));
-        }
-
-        // A verification message goes to a NEW email address or phone number
-        // the pool verifies itself, and to one it holds pending until the user
-        // confirms it. One entry per attribute at most, since the attributes
-        // are the distinct ones submitted.
-        if !unchanged
-            && (deferred || pool.auto_verifies(&name))
-            && crate::state::delivery_medium(&name).is_some()
-        {
-            verifications.push((name.clone(), value.clone()));
-        }
-
-        updates.push(AttributeUpdate {
-            name,
-            value: Some(value),
-            deferred,
-            stale_verified_flag,
-        });
-    }
-
-    Ok(Plan {
-        user_pool_id: pool.id.clone(),
-        username: user.username.clone(),
-        updates,
-        verifications,
-    })
-}
-
-/// The attribute whose confirmation `flag` records, or `None` when `flag` is
-/// not one of the verified flags ([`crate::state::verified_flag`]).
-fn verified_attribute_of(flag: &str) -> Option<&'static str> {
-    ["email", "phone_number"]
-        .into_iter()
-        .find(|attribute| crate::state::verified_flag(attribute) == Some(flag))
-}
-
-/// Whether `flag` says "confirmed" once this request has been applied: the
-/// value the request sets for it if it names it, else `false` where the change
-/// makes the flag stale, else the value the user already holds.
-fn flag_after_update(
-    submitted: &::std::collections::BTreeMap<&str, &str>,
-    user: &crate::state::User,
-    flag: &str,
-    stale_verified_flag: &Option<&'static str>,
-) -> bool {
-    if let Some(value) = submitted.get(flag) {
-        return *value == crate::state::FLAG_CONFIRMED;
-    }
-    if stale_verified_flag.is_some() {
-        return false;
-    }
-    user.attributes
-        .get(flag)
-        .is_some_and(|value| value == crate::state::FLAG_CONFIRMED)
 }
 
 /// This operation's answer to an `AccessToken` that names no signed-in user.
