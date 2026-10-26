@@ -194,11 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let name = filter.name.as_deref().unwrap_or_default();
             // A filter name this operation does not document is refused whether or not any
             // peer would have matched it, so an unsupported filter can never read as "no
-            // results".
+            // results". This operation's request members are checked at the PARAMETER layer,
+            // so the refusal carries that layer's wording for every value it rejects, naming
+            // the member and the name the request sent — not the filter-resolving wording of
+            // the describes that own their filters (`state::invalid_filter_parameter_value`).
             if !CONNECT_PEER_FILTERS.contains(&name) {
-                return Err(state::invalid_parameter_value(format!(
-                    "The filter '{name}' is invalid"
-                )));
+                return Err(state::invalid_filter_parameter_value(name));
             }
             let values: &[String] = filter.values.as_deref().unwrap_or_default();
             if values.len() > MAX_FILTER_VALUES {
