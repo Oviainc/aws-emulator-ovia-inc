@@ -388,7 +388,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified_at: created_at,
                 tags: crate::state::to_btree_map(input.tags),
                 definitions,
-                status_summaries: vec![crate::state::StatusSummaryRecord::deployment(created_at)],
+                // One summary per modelled kind of work, each walking its phases on
+                // the clock from this instant.
+                status_summaries: crate::state::fresh_summaries(created_at),
                 // Nothing is being torn down: a freshly created manager has had no
                 // delete accepted for it.
                 deletes_at: None,

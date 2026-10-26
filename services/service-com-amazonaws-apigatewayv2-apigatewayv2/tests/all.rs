@@ -119,6 +119,8 @@ mod stage_lifecycle;
 mod stage_pagination;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_link_deletion.rs"]
+mod vpc_link_deletion;
 #[path = "all/vpc_link_lifecycle.rs"]
 mod vpc_link_lifecycle;
 #[path = "all/vpc_link_update.rs"]

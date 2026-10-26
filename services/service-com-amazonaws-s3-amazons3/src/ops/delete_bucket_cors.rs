@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketCors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketCors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketCors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named bucket's whole cors configuration and answers the modelled 204 with an
+//! empty body, so a later `GetBucketCors` reports it as absent again and `PutBucketCors` may
+//! configure it afresh. Idempotent: a bucket carrying no cors configuration is already in
+//! the asked-for state, so the call still succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -99,14 +95,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteBucketCorsOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteBucketCorsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteBucketCors")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteBucketCors")` reports `errors: []`), but
+// `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and AWS
+// answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`) — the same 404 `PutBucketCors` and `GetBucketCors` answer for that name,
+// which is why the shape is widened in here rather than a second rule invented.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteBucketCors",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteBucketCorsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -160,18 +163,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketCors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketCorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A delete needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`DeleteBucketCorsRequest$ExpectedBucketOwner`): this emulator serves one account,
+        // so that account owns every bucket it holds. Decided before the lookup, so a
+        // refused request reads nothing and writes nothing.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                // The text S3 publishes for this code, kept in the one place this crate
+                // holds it rather than spelled again here.
+                crate::scaffolded::documented_error_message("AccessDenied")
+                    .unwrap_or("Access Denied"),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be removed, and answering
+            // 204 would report a configuration withdrawn that was never there to withdraw,
+            // so this goes out as the server fault S3 publishes for a request it could not
+            // carry out (`InternalError`, HTTP 500) — the channel `PutBucketCors` and
+            // `GetBucketCors` use for the same case.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
+        // hold answers that rather than succeeding on a record that cannot exist — the order
+        // `PutBucketCors` and `GetBucketCors` keep.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(DeleteBucketCorsErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // "Deletes the cors configuration information set for the bucket" (this operation's
+        // own documentation): the whole configuration goes, which puts the bucket back in the
+        // state it was created in, so a later `GetBucketCors` answers
+        // `NoSuchCORSConfiguration` again and a later `PutBucketCors` configures it afresh.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketCors"))
+        // Idempotent: nothing in the contract distinguishes a bucket that carried a cors
+        // configuration from one that did not — the operation models no not-found and its
+        // output is `Unit` — so both end in the same state and answer the modelled 204. Only
+        // this bucket's cors configuration is cleared; its objects and its other
+        // subresources are left alone, as is every other bucket's record.
+        bucket.clear_cors();
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketCorsOutput)
     }
 }
+
+/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
+/// `DeleteBucketCorsRequest$ExpectedBucketOwner` documents.
+const ACCESS_DENIED_STATUS: u16 = 403;
+

@@ -52,6 +52,9 @@ const MAX_LINKED_ACCOUNT_IDS: usize = 30;
 /// payer account alone, so this is the world in which these calls are reachable.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so the suite can record the billing
+    /// transfers the organization has — see [`Emulator::designate_transfer`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -62,8 +65,14 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
+    /// seam [`crate::billing_transfer_identity::designate_transfer`].
+    fn designate_transfer(&self, arn: &str) -> String {
+        crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
     /// POST a JSON body to one of this service's routes and answer the status plus the
@@ -339,8 +348,12 @@ async fn a_primary_account_outside_the_grouping_is_refused_and_persists_nothing(
                 "Name": "TransferOutsidePrimary",
                 "AccountGrouping": {
                     "LinkedAccountIds": [account_id(6)],
-                    "ResponsibilityTransferArn":
-                        transfer_arn_of(account(), "abcd123456", "inbound", "1234abcd"),
+                    "ResponsibilityTransferArn": em.designate_transfer(&transfer_arn_of(
+                        account(),
+                        "abcd123456",
+                        "inbound",
+                        "1234abcd",
+                    )),
                 },
                 "ComputationPreference": { "PricingPlanArn": plan },
                 "PrimaryAccountId": account_id(7),
@@ -571,11 +584,20 @@ fn shift(offset: usize) -> impl Fn(String) -> String {
 async fn a_transfer_relationship_outside_this_organization_is_refused() {
     let em = Emulator::new();
     let plan = em.create_plan("TransferGroupingPlan").await;
+    // One transfer the organization really has, so every refused row below differs from a
+    // transfer that exists in exactly one segment of the ARN.
+    let held = em.designate_transfer(&transfer_arn_of(
+        account(),
+        "abcd123456",
+        "inbound",
+        "1234abcd",
+    ));
 
-    // Rows differ along the owner account of the transfer (another account of the same
-    // length, the all-zero account, the account the ARN pattern allows beside this one),
-    // the organization id, the direction and the transfer id — every segment the member's
-    // pattern admits, so the refusal follows the OWNER and nothing else.
+    // Rows differ along the segment of the transfer ARN that makes it name no transfer of
+    // this organization: the owner account (another account of the same length, an account
+    // nobody holds), the organization id, the direction and the transfer id — every
+    // segment the member's pattern spells is part of the transfer's identity, so a change
+    // in any ONE of them names a transfer the organization does not have.
     let foreign = [
         (
             "another organization's management account",
@@ -593,6 +615,18 @@ async fn a_transfer_relationship_outside_this_organization_is_refused() {
                 "inbound",
                 "0123456789abcdefghij0123456789ab",
             ),
+        ),
+        (
+            "this organization, but a transfer id nobody ever created",
+            transfer_arn_of(account(), "abcd123456", "inbound", "zzzzzzzz"),
+        ),
+        (
+            "the held transfer's id under another organization of this account",
+            transfer_arn_of(account(), "abcd123457", "inbound", "1234abcd"),
+        ),
+        (
+            "the held transfer with its direction flipped",
+            transfer_arn_of(account(), "abcd123456", "outbound", "1234abcd"),
         ),
     ];
 
@@ -644,13 +678,24 @@ async fn a_transfer_relationship_outside_this_organization_is_refused() {
     // transfer id it carries — and the group reads back as a transfer-billing group whose
     // billing owner is the relationship rather than an account.
     let owned = [
+        ("the transfer this organization already held", held),
         (
-            "an inbound transfer of this organization",
-            transfer_arn_of(account(), "abcd123456", "inbound", "1234abcd"),
+            "another inbound transfer of this organization",
+            em.designate_transfer(&transfer_arn_of(
+                account(),
+                "abcd123456",
+                "inbound",
+                "5678abcd",
+            )),
         ),
         (
             "an outbound transfer of this organization",
-            transfer_arn_of(account(), "zzzz999999", "outbound", "beef1234"),
+            em.designate_transfer(&transfer_arn_of(
+                account(),
+                "zzzz999999",
+                "outbound",
+                "beef1234",
+            )),
         ),
     ];
 

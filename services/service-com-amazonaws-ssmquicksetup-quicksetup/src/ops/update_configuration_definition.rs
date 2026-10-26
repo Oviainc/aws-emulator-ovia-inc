@@ -348,9 +348,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Monotonic: the stamp never moves backwards, whatever the host clock does.
         manager.last_modified_at = now.max(manager.last_modified_at);
-        // Updating a definition submits it for deployment again, so the deployment is
-        // reported in its transient status once more and settles the way the create's
-        // did — the one clock-owed transition this service models.
+        // Updating a definition submits it for deployment again, so every kind of work
+        // the manager reports starts over in its first phase and walks the rest the way
+        // the create's did.
         crate::state::restart_deployment(&mut manager.status_summaries, now);
 
         // A configuration IS the deployment of one definition in one account and

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBulkImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBulkImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBulkImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -202,20 +193,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBulkImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBulkImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBulkImportJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBulkImportJobError::Modeled(
+                CreateBulkImportJobErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A job ingests either into a session dataset of a workspace or into time
+        // series outside one, and the two members that name the dataset form ONE
+        // destination: `datasetId` is "the ID of the session dataset to ingest data
+        // into. Specify this field, together with workspaceName", and
+        // `workspaceName` is "the name of the workspace that contains the session
+        // dataset. Specify this field together with datasetId". So either both are
+        // named or neither is; one alone names no destination at all. Checked before
+        // anything is written, so a refused create starts no job.
+        let dataset = match (input.workspace_name.as_deref(), input.dataset_id.as_deref()) {
+            (Some(workspace), Some(dataset_id)) => Some((workspace, dataset_id)),
+            (None, None) => None,
+            _ => {
+                return Err(invalid_request(
+                    "Specify workspaceName together with datasetId.".to_string(),
+                ))
+            }
+        };
+
+        let mut store = state.lock();
+
+        match dataset {
+            Some((workspace, dataset_id)) => {
+                // The destination is a session dataset of a workspace, so both are
+                // resources of this service's own control plane: one this store does
+                // not hold is the absence every other operation addressing it
+                // reports.
+                if !store.workspaces.contains_key(workspace) {
+                    return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+                }
+                // `workspaceName` is "the name of the workspace that CONTAINS the
+                // session dataset", so the lookup is scoped to it: a dataset of
+                // another workspace, and one that belongs to no workspace at all,
+                // is not the dataset this request names — the same narrowing every
+                // other workspace-scoped lookup in this service applies.
+                if store
+                    .datasets
+                    .get(dataset_id)
+                    .is_none_or(|dataset| dataset.workspace_name.as_deref() != Some(workspace))
+                {
+                    return Err(not_found(crate::state::RESOURCE_DATASET, dataset_id));
+                }
+            }
+            None => {
+                // "Before you create a bulk import job that ingests data into time
+                // series outside of a workspace, you must enable IoT SiteWise warm
+                // tier or IoT SiteWise cold tier" — a precondition on the account's
+                // storage configuration, read from the configuration in force rather
+                // than from anything this call stores. The cold tier is the
+                // multi-layer storage type, the warm tier is its own enabled flag.
+                let configuration = store.storage_configuration(now);
+                let cold_tier =
+                    configuration.selection.storage_type == crate::state::STORAGE_TYPE_MULTI_LAYER;
+                let warm_tier = configuration.selection.warm_tier.as_deref()
+                    == Some(crate::state::STORAGE_STATE_ENABLED);
+                if !cold_tier && !warm_tier {
+                    return Err(invalid_request(
+                        "Before you create a bulk import job that ingests data into time series \
+                         outside of a workspace, you must enable IoT SiteWise warm tier or IoT \
+                         SiteWise cold tier."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        // "You can specify up to 100 files for each bulk import job": the list shape
+        // carries no length constraint, so the quota is enforced here, with the
+        // modelled quota refusal.
+        if input.files.len() > crate::state::MAX_FILES_PER_BULK_IMPORT_JOB {
+            return Err(limit_exceeded(format!(
+                "You can specify up to {} files for each bulk import job.",
+                crate::state::MAX_FILES_PER_BULK_IMPORT_JOB
+            )));
+        }
+
+        // The store is bounded: a create is the only thing that adds a job and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.bulk_import_jobs.len() >= crate::state::MAX_BULK_IMPORT_JOBS {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} bulk import jobs.",
+                crate::state::MAX_BULK_IMPORT_JOBS
+            )));
+        }
+
+        let job_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.bulk_import_jobs.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::BulkImportJobRecord {
+            job_id,
+            job_name: input.job_name.clone(),
+            job_role_arn: input.job_role_arn.clone(),
+            files: input.files.clone(),
+            error_report_location: input.error_report_location.clone(),
+            job_configuration: input.job_configuration.clone(),
+            adaptive_ingestion: input.adaptive_ingestion,
+            delete_files_after_import: input.delete_files_after_import,
+            dataset_id: input.dataset_id.clone(),
+            workspace_name: input.workspace_name.clone(),
+            // The job's whole lifecycle is owed from here; the status is derived from
+            // this instant rather than stored, and nothing is slept on.
+            created_at: now,
+        };
+
+        let output = CreateBulkImportJobOutput {
+            job_id: record.job_id.clone(),
+            job_name: record.job_name.clone(),
+            job_status: record.status(now).to_string(),
+        };
+        store.bulk_import_jobs.insert(record.job_id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateBulkImportJobError {
+    CreateBulkImportJobError::Modeled(
+        CreateBulkImportJobErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message` — the quota refusal this
+/// operation models ("You've reached the quota for a resource").
+///
+/// Two refusals use it: the documented file quota, whose message states the
+/// documented rule, and the bound on how many jobs this emulator holds, whose
+/// message is this emulator's own — no AWS quota corresponds to it, so it names
+/// the emulator rather than claiming a published limit.
+fn limit_exceeded(message: String) -> CreateBulkImportJobError {
+    CreateBulkImportJobError::Modeled(CreateBulkImportJobErrorModeled::LimitExceededException(
+        LimitExceededException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the request
+/// addressed and the identifier it supplied.
+fn not_found(resource: &str, requested: &str) -> CreateBulkImportJobError {
+    CreateBulkImportJobError::Modeled(
+        CreateBulkImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        }),
+    )
 }

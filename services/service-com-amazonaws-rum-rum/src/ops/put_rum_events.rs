@@ -9,6 +9,11 @@
 //! write is refused with the modelled `AccessDeniedException` (HTTP 403) rather than
 //! accepted.
 //!
+//! A monitor whose `CwLogEnabled` is on also stores copies of what it collects in
+//! CloudWatch Logs, so an accepted batch is written to the vended log group the monitor
+//! advertises as well as to the monitor's own buffer
+//! ([`crate::state::cw_log_delivery::deliver_events`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -211,31 +216,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-        // The monitor is resolved again under the write lock: the decision above held no
-        // lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
-        let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
-            return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
-                crate::state::app_monitor_not_found(&input.id),
-            )
-            .into());
-        };
-
         let batch_id = input.batch_id;
         let alias = input.alias;
         let app_monitor_details = input.app_monitor_details;
         let user_id = input.user_details.user_id;
         let session_id = input.user_details.session_id;
-        record.record_events(input.rum_events.iter().map(|event| {
-            crate::state::StoredRumEvent {
+        // Built once, as a Vec, because the batch has TWO destinations: this monitor's own
+        // buffer (what `GetAppMonitorData` reports) and — when the monitor stores copies in
+        // CloudWatch Logs — the vended log group it advertises. Both carry the same events,
+        // because they are the same delivery.
+        let delivered: Vec<crate::state::StoredRumEvent> = input
+            .rum_events
+            .iter()
+            .map(|event| crate::state::StoredRumEvent {
                 batch_id: batch_id.clone(),
                 alias: alias.clone(),
                 app_monitor_details: app_monitor_details.clone(),
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
                 event_json: event_json(event),
-            }
-        }));
+            })
+            .collect();
+
+        // The write, under a guard this BLOCK scopes: the delivery below awaits another
+        // service, and nothing in this service holds its store locked across an await.
+        let log_group = {
+            let mut store = state.lock();
+            // The monitor is resolved again under the write lock: the decision above held
+            // no lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
+            let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
+                return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.id),
+                )
+                .into());
+            };
+            record.record_events(delivered.iter().cloned());
+            // Whether this monitor stores copies, read off the SAME record the batch was
+            // just written to: `CwLogEnabled` is "whether RUM sends a copy of this
+            // telemetry data to Amazon CloudWatch Logs", so a monitor with delivery on owes
+            // the group a copy of what it just accepted.
+            record.cw_log_group()
+        };
+
+        if let Some(log_group) = log_group {
+            let region = crate::state::request_region(ctx.parts());
+            let log_stream = crate::state::cw_log_delivery::delivery_stream_name(
+                session_id.as_deref(),
+                &input.id,
+            );
+            crate::state::cw_log_delivery::deliver_events(
+                ctx,
+                &region,
+                &log_group,
+                &log_stream,
+                &delivered,
+            )
+            .await;
+        }
 
         // `PutRumEventsResponse` models no members: the 200 IS the acknowledgement.
         Ok(PutRumEventsOutput {})
