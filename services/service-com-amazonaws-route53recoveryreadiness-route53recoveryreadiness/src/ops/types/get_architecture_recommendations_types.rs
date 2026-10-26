@@ -19,12 +19,116 @@ pub struct GetArchitectureRecommendationsInput {
     pub recovery_group_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoveryreadiness#GetArchitectureRecommendationsResponse")]
+/// `GetArchitectureRecommendationsResponse`, with its schema and serializer written out
+/// rather than derived.
+///
+/// WHY: `LastAuditTimestamp` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="LastAuditTimestamp")`), which on restJson1 makes
+/// the RFC 3339 / ISO-8601 STRING the wire form of the member — the member's own
+/// documentation says so too ("in UTC ISO-8601 format"). The JSON codec picks the
+/// rendering from the member schema's format and falls back to the protocol default,
+/// epoch seconds as a JSON NUMBER, when the member schema reports none; the vendored
+/// codegen never emits `.with_timestamp_format(..)`, so the derived schema reports none
+/// and the instant would go out as a number, a type this member does not carry. `vendor/`
+/// is read-only from inside the emulator, so the one chain call it omits is attached by
+/// hand below. The generator gap itself is
+/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`;
+/// when it closes, put `#[smithy_macros::smithy(shape = ...)]` back on this structure.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
+/// an operation OUTPUT, which the server only ever serializes (`Operation::Output`
+/// requires `SerializableStruct`; only `Input` is deserialized), so a hand-written read
+/// path would be untested code with no caller.
 #[derive(Debug, Clone, Default)]
 pub struct GetArchitectureRecommendationsOutput {
     pub last_audit_timestamp: Option<::aws_smithy_types::DateTime>,
     pub next_token: Option<String>,
     pub recommendations: Option<Vec<Recommendation>>,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetArchitectureRecommendationsOutput {
+    const M_LAST_AUDIT_TIMESTAMP: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.route53recoveryreadiness#GetArchitectureRecommendationsResponse$LastAuditTimestamp",
+                "com.amazonaws.route53recoveryreadiness",
+                "LastAuditTimestamp",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "LastAuditTimestamp",
+            0,
+        )
+        .with_json_name("lastAuditTimestamp")
+        // The one chain call the vendored codegen omits; see the note above.
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    const M_NEXT_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoveryreadiness#GetArchitectureRecommendationsResponse$NextToken",
+            "com.amazonaws.route53recoveryreadiness",
+            "NextToken",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "NextToken",
+        1,
+    )
+    .with_json_name("nextToken");
+
+    const M_RECOMMENDATIONS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.route53recoveryreadiness#GetArchitectureRecommendationsResponse$Recommendations",
+                "com.amazonaws.route53recoveryreadiness",
+                "Recommendations",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "Recommendations",
+            2,
+        )
+        .with_json_name("recommendations");
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoveryreadiness#GetArchitectureRecommendationsResponse",
+            "com.amazonaws.route53recoveryreadiness",
+            "GetArchitectureRecommendationsResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_LAST_AUDIT_TIMESTAMP,
+            &Self::M_NEXT_TOKEN,
+            &Self::M_RECOMMENDATIONS,
+        ],
+    );
+}
+
+pub static GET_ARCHITECTURE_RECOMMENDATIONS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetArchitectureRecommendationsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetArchitectureRecommendationsOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.last_audit_timestamp.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_AUDIT_TIMESTAMP, value)?;
+        }
+        if let Some(value) = self.next_token.as_ref() {
+            serializer.write_string(&Self::M_NEXT_TOKEN, value.as_str())?;
+        }
+        if let Some(value) = self.recommendations.as_ref() {
+            // A list of structures writes each element against the ELEMENT shape's own
+            // schema, as the codegen does.
+            serializer.write_list(&Self::M_RECOMMENDATIONS, &|elements| {
+                for recommendation in value.iter() {
+                    elements.write_struct(&Recommendation::SCHEMA, recommendation)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.route53recoveryreadiness#Recommendation")]

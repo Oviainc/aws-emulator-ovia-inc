@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetArchitectureRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetArchitectureRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetArchitectureRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the architecture recommendations for the recovery group stored under this
+//! name — one recommendation per resilience criterion the group's stored architecture
+//! does not satisfy, paged like every other list of this service — together with the
+//! instant of the assessment they come from, or the modelled
+//! `ResourceNotFoundException` when this account has no recovery group by that name.
+//!
+//! The criteria, and the records each one reads, are
+//! [`crate::state::ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::assess_architecture`]'s:
+//! a group that satisfies all of them is reported with no recommendations at all.
+//! Reporting MATERIALISES an assessment that is already due (one never run, or run over
+//! a configuration that has since changed) and writes nothing else, so two reports over
+//! an unchanged store — timestamp included — are identical.
+//!
+//! THE ONE WRITE ON THIS READ PATH, deliberately: this emulator runs no background
+//! auditor, so the only moment an assessment of the current architecture can be dated is
+//! the moment it is asked for. Dating it from the clock per call instead would make two
+//! reports of an unchanged recovery group disagree about when it was last assessed, which
+//! is the one thing `LastAuditTimestamp` says. So the instant is recorded once per
+//! configuration and re-reported unchanged until the records the criteria read change:
+//! idempotent, bounded at one entry per stored recovery group, and visible only as this
+//! member.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +167,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetArchitectureRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetArchitectureRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetArchitectureRecommendations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetArchitectureRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        if !state.recovery_groups.contains_key(&input.recovery_group_name) {
+            return Err(
+                GetArchitectureRecommendationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The assessment, computed from the stored records and nothing else. Computing it
+        // writes nothing, so the page below can still refuse the request — which is also
+        // where a `NextToken` this service did not mint is refused.
+        let assessment = state.assess_architecture(&input.recovery_group_name);
+        let page = crate::state::page(
+            &assessment.recommendations,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|message| {
+            GetArchitectureRecommendationsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        // The instant this report comes from: the one already recorded for this group's
+        // configuration, or — when none is, because the group has never been assessed or
+        // its configuration has changed since it was — this instant, recorded here. Last,
+        // so a request that is refused leaves no assessment behind.
+        let assessed_at = state.record_architecture_assessment(
+            &input.recovery_group_name,
+            &assessment,
+            ::std::time::SystemTime::now(),
+        );
+
+        Ok(GetArchitectureRecommendationsOutput {
+            last_audit_timestamp: Some(::aws_smithy_types::DateTime::from(assessed_at)),
+            next_token: page.next_token,
+            recommendations: Some(
+                page.records
+                    .into_iter()
+                    .map(|text| Recommendation {
+                        recommendation_text: text.clone(),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

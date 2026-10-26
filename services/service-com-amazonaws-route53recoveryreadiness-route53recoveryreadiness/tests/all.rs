@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_gate_and_not_found.rs"]
 mod account_gate_and_not_found;
+#[path = "all/architecture_recommendations.rs"]
+mod architecture_recommendations;
 #[path = "all/builtin_readiness_rules.rs"]
 mod builtin_readiness_rules;
 #[path = "all/cell_containment_cardinality.rs"]

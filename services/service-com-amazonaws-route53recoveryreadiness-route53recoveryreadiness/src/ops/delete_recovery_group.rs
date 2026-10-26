@@ -178,6 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         state.arn_index.remove(&removed.arn);
+        // The architecture assessment of a group that no longer exists goes with it: a
+        // group later created under the same name is a NEW resource, and reporting the
+        // assessment of the deleted one would date it before that resource existed.
+        state.architecture_audits.remove(&input.recovery_group_name);
 
         Ok(DeleteRecoveryGroupOutput {})
     }

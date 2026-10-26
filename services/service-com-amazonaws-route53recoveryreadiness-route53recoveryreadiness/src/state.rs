@@ -9,6 +9,7 @@
 //! each instead of carrying a copy apiece that can drift apart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::SystemTime;
 
 use crate::ops::types::{
     CellOutput, ReadinessCheckOutput, ReadinessCheckSummary, RecoveryGroupOutput, Resource,
@@ -403,6 +404,93 @@ pub struct ReadinessSummary {
     pub next_token: Option<String>,
 }
 
+/// The number of cells below which a recovery group has nothing to fail over TO: a
+/// single-cell application has no second cell to shift traffic into, so the redundancy
+/// criterion of [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::assess_architecture`]
+/// is assessed against this count.
+pub const MIN_CELLS_PER_RECOVERY_GROUP: usize = 2;
+
+/// The criterion keys the architecture assessment files its recommendations under.
+///
+/// They are STORE KEYS, not wire values: they order the recommendations a report pages
+/// over (and therefore its cursor), and nothing serialises them. The numeric prefix is
+/// what puts the whole-group criteria ahead of the per-cell ones whatever a cell is
+/// named.
+const REDUNDANCY_CRITERION: &str = "01-cell-redundancy";
+const SYMMETRY_CRITERION: &str = "02-cell-symmetry";
+const COVERAGE_CRITERION: &str = "03-readiness-coverage";
+
+/// The recommendation a recovery group holding fewer than
+/// [`MIN_CELLS_PER_RECOVERY_GROUP`] cells earns.
+///
+/// The modelled `Recommendation` shape carries one free-text member and the model
+/// publishes no catalog of texts (`smithy_query(query="shape",
+/// shape="Recommendation")`), so the WORDING here is this emulator's own. What is not
+/// the emulator's own is WHEN the sentence is reported: it is reported exactly for a
+/// stored recovery group whose stored cells fail the criterion, and for no other.
+fn redundancy_recommendation(cells: usize) -> String {
+    format!(
+        "A recovery group should contain at least {MIN_CELLS_PER_RECOVERY_GROUP} cells, so that \
+         an application can fail over from one cell to another. This recovery group contains \
+         {cells}."
+    )
+}
+
+/// The recommendation a recovery group whose cells hold different types of resource
+/// earns: cells that are not symmetric cannot stand in for one another.
+const SYMMETRY_RECOMMENDATION: &str = "The cells of a recovery group should be symmetric: a \
+     cell that holds different types of resource than its sibling cells cannot take over their \
+     traffic. The cells of this recovery group hold different resource types.";
+
+/// The recommendation a member cell no readiness check watches earns: an un-audited cell
+/// has no readiness to report, so nothing says whether it could take a failover.
+fn coverage_recommendation(cell_arn: &str) -> String {
+    format!(
+        "No readiness check watches a resource scoped to cell {cell_arn}. Create a resource set \
+         whose resources name that cell in their readiness scopes, and a readiness check over \
+         that resource set, so that the readiness of the cell is audited."
+    )
+}
+
+/// What one MEMBER CELL of a recovery group contributes to its architecture: the types of
+/// resource held anywhere underneath it, and the names of the readiness checks that watch
+/// one of those resources.
+pub type CellContribution = (BTreeSet<String>, BTreeSet<String>);
+
+/// The configuration one architecture assessment ran over: what each member cell of the
+/// recovery group contributed, keyed by that cell's ARN.
+///
+/// The STRUCTURED records rather than a rendering of them, so "the same configuration" is
+/// decided by comparing the values the criteria read and depends on no formatting.
+pub type ArchitectureConfiguration = BTreeMap<String, CellContribution>;
+
+/// One recorded architecture assessment of one recovery group: WHEN it ran, and the
+/// configuration it ran over.
+///
+/// The instant is what a report answers as `LastAuditTimestamp`, which is why it is
+/// STORED rather than taken from the clock per call: two reports of an unchanged recovery
+/// group are two reports of the SAME assessment and carry the same instant. The
+/// configuration is what says whether a further assessment is due — see
+/// [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::record_architecture_assessment`].
+#[derive(Debug, Clone)]
+pub struct ArchitectureAudit {
+    pub assessed_at: SystemTime,
+    pub configuration: ArchitectureConfiguration,
+}
+
+/// What one walk of a recovery group's architecture produced: the configuration that was
+/// assessed, and the recommendation the group earns from each criterion it does not
+/// satisfy.
+///
+/// The recommendations are keyed by criterion so the order a report pages over them — and
+/// therefore its cursor — is the same on every call. Both halves come from ONE walk, so
+/// what decides whether to reassess cannot disagree with the findings that were reported.
+#[derive(Debug, Default)]
+pub struct ArchitectureAssessment {
+    pub configuration: ArchitectureConfiguration,
+    pub recommendations: BTreeMap<String, String>,
+}
+
 /// Per-service state for com-amazonaws-route53recoveryreadiness-route53recoveryreadiness. A handler reaches it through [`service_state`].
 ///
 /// `BTreeMap` everywhere, so list order — and therefore pagination — is the same on
@@ -438,6 +526,13 @@ pub struct ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     /// reports a bare list of those values): the same value cannot be authorized
     /// twice, and `BTreeSet` keeps list order — and therefore pagination — stable.
     pub cross_account_authorizations: BTreeSet<String>,
+    /// The last architecture assessment of each recovery group that has been assessed,
+    /// keyed by `RecoveryGroupName`.
+    ///
+    /// Holds at most one entry per stored recovery group: an entry is written only by
+    /// [`Self::record_architecture_assessment`], which refuses a name no recovery group is
+    /// stored under and first drops the entries of groups the store no longer holds.
+    pub architecture_audits: BTreeMap<String, ArchitectureAudit>,
     /// Whether THIS account may create readiness resources at all.
     ///
     /// The Route 53 Application Recovery Controller readiness feature is closed to
@@ -462,6 +557,7 @@ impl Default for ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessSta
             recovery_groups: BTreeMap::new(),
             arn_index: BTreeMap::new(),
             cross_account_authorizations: BTreeSet::new(),
+            architecture_audits: BTreeMap::new(),
             account_readiness_eligible: ::std::env::var(ACCOUNT_ELIGIBLE_ENV)
                 .is_ok_and(|setting| parse_account_eligible(&setting)),
         }
@@ -743,6 +839,144 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
             })
             .map(|check| check.name.clone())
             .collect()
+    }
+
+    /// The types of the resource sets holding a resource scoped to one of `scopes`.
+    ///
+    /// A resource names the scopes that contain it and its SET carries the type the
+    /// readiness rules apply to, so this is what a container holds, by type: the same
+    /// resource-to-scope match [`Self::readiness_check_names_in_scopes`] makes, read for
+    /// the type rather than for the watching check.
+    fn resource_types_in_scopes(&self, scopes: &BTreeSet<String>) -> BTreeSet<String> {
+        self.resource_sets
+            .values()
+            .filter(|set| {
+                set.resources.iter().any(|resource| {
+                    resource
+                        .readiness_scopes
+                        .iter()
+                        .flatten()
+                        .any(|scope| scopes.contains(scope))
+                })
+            })
+            .map(|set| set.resource_set_type.clone())
+            .collect()
+    }
+
+    /// Assess the architecture of the recovery group named `group_name` against this
+    /// emulator's resilience criteria, in one walk of the records underneath it.
+    ///
+    /// A criterion the group does not satisfy earns one recommendation; a group that
+    /// satisfies all of them earns NONE, and a name no recovery group is stored under
+    /// assesses nothing. The criteria are:
+    ///
+    /// * REDUNDANCY — fewer than [`MIN_CELLS_PER_RECOVERY_GROUP`] member cells, so there
+    ///   is no second cell to fail over to.
+    /// * SYMMETRY — member cells that hold different types of resource, so one cell
+    ///   cannot take over the traffic of another.
+    /// * COVERAGE — a member cell no readiness check watches, so nothing audits whether
+    ///   it is ready to take a failover.
+    ///
+    /// Each verdict is computed from the stored cells, resource sets and readiness checks
+    /// and from nothing else, which is why the same store always yields the same
+    /// recommendations. A pure READ: pair it with
+    /// [`Self::record_architecture_assessment`] to report the instant it belongs to.
+    pub fn assess_architecture(&self, group_name: &str) -> ArchitectureAssessment {
+        let Some(group) = self.recovery_groups.get(group_name) else {
+            return ArchitectureAssessment::default();
+        };
+
+        // What each MEMBER CELL contributes to the architecture: the types of resource
+        // held anywhere underneath it (the cell itself or a cell nested inside it,
+        // transitively), and the readiness checks that watch one of those resources.
+        // Keyed by cell ARN, so a cell named twice in one group counts once and the
+        // per-cell findings come out in one order. This map IS the configuration the
+        // criteria below read, which is why it is what the assessment records.
+        let mut cells: ArchitectureConfiguration = BTreeMap::new();
+        for cell_arn in &group.cell_arns {
+            let scopes = self.expand_scope_arns([cell_arn.clone()]);
+            cells.insert(
+                cell_arn.clone(),
+                (
+                    self.resource_types_in_scopes(&scopes),
+                    self.readiness_check_names_in_scopes(&scopes),
+                ),
+            );
+        }
+
+        let mut recommendations: BTreeMap<String, String> = BTreeMap::new();
+        if cells.len() < MIN_CELLS_PER_RECOVERY_GROUP {
+            recommendations.insert(
+                REDUNDANCY_CRITERION.to_string(),
+                redundancy_recommendation(cells.len()),
+            );
+        }
+
+        // Symmetry is a property of the SET of member cells: more than one distinct
+        // collection of resource types among them means they are not interchangeable. One
+        // cell (or none) is trivially symmetric.
+        let distinct_type_sets: BTreeSet<&BTreeSet<String>> =
+            cells.values().map(|(types, _)| types).collect();
+        if distinct_type_sets.len() > 1 {
+            recommendations.insert(
+                SYMMETRY_CRITERION.to_string(),
+                SYMMETRY_RECOMMENDATION.to_string(),
+            );
+        }
+
+        for (cell_arn, (_, checks)) in cells.iter() {
+            if checks.is_empty() {
+                recommendations.insert(
+                    format!("{COVERAGE_CRITERION}-{cell_arn}"),
+                    coverage_recommendation(cell_arn),
+                );
+            }
+        }
+
+        ArchitectureAssessment {
+            configuration: cells,
+            recommendations,
+        }
+    }
+
+    /// The instant the assessment being reported ran, recording `assessment` first when it
+    /// is one the clock already owed: when this group's configuration has never been
+    /// assessed, or has changed since it last was.
+    ///
+    /// An assessment that is not due is left exactly as it stood, so reporting it twice
+    /// over an unchanged store answers the same instant twice and a read changes nothing
+    /// else a later caller sees. A name no recovery group is stored under records nothing:
+    /// the audit map holds at most one entry per stored recovery group.
+    pub fn record_architecture_assessment(
+        &mut self,
+        group_name: &str,
+        assessment: &ArchitectureAssessment,
+        now: SystemTime,
+    ) -> SystemTime {
+        if !self.recovery_groups.contains_key(group_name) {
+            return now;
+        }
+
+        // An assessment of a recovery group the store no longer holds can never be
+        // reported again, so its record goes when the group does rather than keeping an
+        // entry per name a caller has cycled through.
+        let groups = &self.recovery_groups;
+        self.architecture_audits
+            .retain(|name, _| groups.contains_key(name));
+
+        let audit = self
+            .architecture_audits
+            .entry(group_name.to_string())
+            .or_insert_with(|| ArchitectureAudit {
+                assessed_at: now,
+                configuration: assessment.configuration.clone(),
+            });
+        if audit.configuration != assessment.configuration {
+            audit.assessed_at = now;
+            audit.configuration = assessment.configuration.clone();
+        }
+
+        audit.assessed_at
     }
 }
 
