@@ -228,7 +228,11 @@ async fn a_listed_payment_request_is_reported_from_what_was_sent() {
         Round {
             case: "the longest name the model admits, and a long integer part",
             name: "Milestone payment request with a sixty-four character long name!",
-            charge_amount: "98765432109876",
+            // A long amount that, with the rows above it, still fits under the
+            // ceiling the accepted `VariablePaymentTerm` publishes — a send
+            // past that ceiling is refused, which
+            // `payment_request_balance.rs` is about.
+            charge_amount: "9876543",
             description: Some("a large whole amount"),
         },
     ];
@@ -1147,7 +1151,9 @@ async fn a_payment_request_is_reported_in_full_from_what_was_sent() {
         Round {
             case: "the longest name the model admits, and a long integer part",
             name: "Milestone payment request with a sixty-four character long name!",
-            charge_amount: "98765432109876",
+            // See the same row of the round-trip table above: the amount stays
+            // under the term's published ceiling.
+            charge_amount: "9876543",
             description: Some("a large whole amount"),
         },
     ];

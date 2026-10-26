@@ -260,20 +260,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The amount requested to be charged to the buyer, positive decimal
-        // value in the currency of the accepted term."
-        //
-        // The other bound the service states — "must not exceed the remaining
-        // available balance under the VariablePaymentTerm maxTotalChargeAmount"
-        // — is measured against `VariablePaymentTerm$maxTotalChargeAmount`,
-        // which belongs to the agreement proposal this emulator does not hold
-        // (see `crate::state`'s module docs). No accepted term carries that
-        // maximum, so there is no balance to measure an amount against, and
-        // nothing is refused on a limit the emulator would have had to invent.
-        if !crate::state::is_positive_amount(&input.charge_amount) {
-            return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
-                crate::state::validation_exception("INVALID_CHARGE_AMOUNT", "chargeAmount"),
-            )
-            .into());
+        // value in the currency of the accepted term", which "must not exceed
+        // the remaining available balance under the VariablePaymentTerm
+        // maxTotalChargeAmount": one refusal on one member, measured against
+        // the ceiling the accepted term publishes and the requests already sent
+        // under it (`crate::state::...::payment_charge_refusal`).
+        if let Some(refusal) =
+            store.payment_charge_refusal(&agreement.id, term, &input.charge_amount)
+        {
+            return Err(
+                SendAgreementPaymentRequestErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         let currency_code = term.currency_code.clone();

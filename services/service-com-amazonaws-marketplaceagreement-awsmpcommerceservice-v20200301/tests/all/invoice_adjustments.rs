@@ -230,7 +230,7 @@ async fn an_entry_is_resolved_against_the_invoice_it_adjusts() {
         },
         Row {
             case: "an amount longer than this service accepts an amount being",
-            // Past `state::BILLING_ADJUSTMENT_AMOUNT_MAX_LEN`, which is what
+            // Past `state::AMOUNT_MAX_LEN`, which is what
             // stands in for the `@length` `PositiveAmountUpto8Decimals` does
             // not declare.
             invoice: Invoice::Own,

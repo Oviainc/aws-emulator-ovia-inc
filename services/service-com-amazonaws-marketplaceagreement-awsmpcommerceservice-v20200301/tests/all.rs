@@ -47,6 +47,8 @@ mod invoice_adjustments;
 mod invoice_line_item_listing;
 #[path = "all/payment_request_approval.rs"]
 mod payment_request_approval;
+#[path = "all/payment_request_balance.rs"]
+mod payment_request_balance;
 #[path = "all/payment_request_cancellation.rs"]
 mod payment_request_cancellation;
 #[path = "all/payment_request_rejection.rs"]

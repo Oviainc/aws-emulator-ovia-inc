@@ -129,7 +129,10 @@ fn rows() -> Vec<Row> {
         Row {
             case: "the longest PaymentRequestName, 64 characters, and a long integer part",
             name: format!("n{}", "o".repeat(63)),
-            charge_amount: "987654321098765",
+            // A long amount that still fits under the ceiling the accepted
+            // `VariablePaymentTerm` publishes; a send past that ceiling is
+            // refused, which `payment_request_balance.rs` is about.
+            charge_amount: "9876543",
             description: Some("x".to_string()),
         },
     ]

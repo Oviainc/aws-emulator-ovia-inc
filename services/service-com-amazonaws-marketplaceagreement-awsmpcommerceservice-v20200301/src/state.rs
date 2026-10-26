@@ -644,7 +644,9 @@ pub const REASON_EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT: &str =
 /// an amount at all (the modelled `INVALID_ADJUSTMENT_AMOUNT`).
 pub const REASON_INVALID_ADJUSTMENT_AMOUNT: &str = "INVALID_ADJUSTMENT_AMOUNT";
 
-/// How many characters of `adjustmentAmount` this service accepts.
+/// How many characters of an amount a request names this service accepts, for
+/// EVERY member that carries one (`adjustmentAmount`, `chargeAmount` — both
+/// target `PositiveAmountUpto8Decimals`).
 ///
 /// `PositiveAmountUpto8Decimals` carries a pattern but no `@length`, so the only
 /// bound on how long a submitted amount may be is this service's own, and one is
@@ -652,17 +654,18 @@ pub const REASON_INVALID_ADJUSTMENT_AMOUNT: &str = "INVALID_ADJUSTMENT_AMOUNT";
 /// caller would otherwise choose the size of. The bound leaves room for the
 /// eight fraction digits the shape is named for, the decimal point, and more
 /// integer digits than any amount this service can bill — so no amount of a
-/// real invoice is near it — and makes parsing one constant work.
-pub const BILLING_ADJUSTMENT_AMOUNT_MAX_LEN: usize = 32;
+/// real invoice or of a real charge is near it — and makes parsing one constant
+/// work.
+pub const AMOUNT_MAX_LEN: usize = 32;
 
-/// Whether `amount` is an amount this service accepts on a batch entry: short
-/// enough to be an amount at all ([`BILLING_ADJUSTMENT_AMOUNT_MAX_LEN`]) and
-/// positive ([`is_positive_amount`]).
+/// Whether `amount` is an amount this service accepts on a request at all:
+/// short enough to be an amount ([`AMOUNT_MAX_LEN`]) and positive
+/// ([`is_positive_amount`]).
 ///
 /// The length is checked FIRST, so nothing reads or parses a string past the
 /// bound.
-pub fn is_acceptable_adjustment_amount(amount: &str) -> bool {
-    amount.len() <= BILLING_ADJUSTMENT_AMOUNT_MAX_LEN && is_positive_amount(amount)
+pub fn is_acceptable_amount(amount: &str) -> bool {
+    amount.len() <= AMOUNT_MAX_LEN && is_positive_amount(amount)
 }
 
 /// How a per-entry refusal of `BatchCreateBillingAdjustmentRequest` states the
@@ -693,7 +696,7 @@ pub fn is_positive_amount(amount: &str) -> bool {
 /// Amounts cross this API as decimal STRINGS of at most eight fraction digits
 /// (`PositiveAmountUpto8Decimals`'s `^[0-9]*(\.[0-9]{0,8})?$`, which the
 /// boundary already enforced) whose length a handler bounds before reading one
-/// ([`BILLING_ADJUSTMENT_AMOUNT_MAX_LEN`]). The SCALE is therefore fixed by the
+/// ([`AMOUNT_MAX_LEN`]). The SCALE is therefore fixed by the
 /// model: such a value is an exact whole number of 10^-8 currency units, so
 /// comparing and subtracting two of them is integer arithmetic and no money is
 /// lost to a binary float. `None` for a value outside that shape, and for one
@@ -737,6 +740,30 @@ pub fn amount_of_units(units: u128) -> String {
         fraction.pop();
     }
     format!("{whole}.{fraction}", whole = units / AMOUNT_UNITS_PER_CURRENCY_UNIT)
+}
+
+/// The `ValidationExceptionReason` for a `chargeAmount` a payment request
+/// cannot be sent for: "A `ValidationException` is returned if the
+/// `chargeAmount` exceeds the available balance" — the member at fault is the
+/// amount, and `INVALID_CHARGE_AMOUNT` is the one value
+/// `ValidationExceptionReason` publishes about it
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")`).
+pub const REASON_INVALID_CHARGE_AMOUNT: &str = "INVALID_CHARGE_AMOUNT";
+
+/// The ceiling `term` publishes, in the units [`amount_units`] counts, or `None`
+/// for a term that publishes no ceiling an amount can be measured against.
+///
+/// `VariablePaymentTerm$maxTotalChargeAmount` is "the maximum total amount that
+/// can be charged to the customer through variable payment requests under this
+/// term". It targets `BoundedString` rather than an amount shape, so a term may
+/// carry a value that is not an amount this service can count — and a ceiling
+/// that cannot be counted bounds nothing, rather than refusing every charge.
+pub fn term_ceiling_units(term: &VariablePaymentTerm) -> Option<u128> {
+    let published = term.max_total_charge_amount.as_deref()?;
+    if published.len() > AMOUNT_MAX_LEN {
+        return None;
+    }
+    amount_units(published)
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1104,14 @@ pub const PAYMENT_REQUEST_STATUS_CANCELLED: &str = "CANCELLED";
 /// conflict rather than a second transition.
 pub const PAYMENT_REQUEST_STATUS_REJECTED: &str = "REJECTED";
 
+/// The `PaymentRequestStatus` a payment request that did not pass validation
+/// carries. No stored request of this service reaches it: a send is validated
+/// before anything is stored, so a request that fails validation is answered
+/// with the operation's modelled `ValidationException` and no record is created
+/// for it. It is named here because it is the third status whose request can
+/// never be charged ([`PaymentRequest::holds_term_balance`]).
+pub const PAYMENT_REQUEST_STATUS_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+
 /// Every value a `partyType` admits. `PartyType` is modelled a plain string
 /// (`@length(1, 32)`, `^[A-Za-z]+$`), not an enum, so the boundary validator
 /// cannot refuse a party type that is neither of these — the handler does, with
@@ -1268,6 +1303,10 @@ pub struct OfferDocument {
     /// `VariablePaymentTerm$maxTotalChargeAmount`, "the maximum total amount
     /// that can be charged to the customer through variable payment requests
     /// under this term", in minor units of [`CURRENCY_CODE`].
+    ///
+    /// It is the ceiling every send under an accepted term of this offer is
+    /// measured against ([`term_ceiling_units`]), so it is published here
+    /// rather than being left for a handler to invent per request.
     pub max_total_charge_amount: u64,
     /// `DocumentItem$type` of the one legal document the offer proposes. A
     /// standard contract "is managed by AWS Marketplace", so the document
@@ -1290,7 +1329,7 @@ pub const OFFER_DOCUMENT: OfferDocument = OfferDocument {
     lockout_period: "P30D",
     max_renewals: 3,
     grant_max_quantity: 10,
-    max_total_charge_amount: 1_000_000,
+    max_total_charge_amount: 1_000_000_000,
     eula_type: "StandardEula",
     eula_version: "1.0",
     installments: 4,
@@ -2368,6 +2407,32 @@ impl PaymentRequest {
         self.charge_id
             .as_deref()
             .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED)
+    }
+
+    /// This request's `chargeAmount`, in the units [`amount_units`] counts, and
+    /// zero for an amount this service cannot count at all — which no stored
+    /// request carries, because a send naming one is refused before anything is
+    /// stored.
+    pub fn charge_units(&self) -> u128 {
+        amount_units(&self.charge_amount).unwrap_or_default()
+    }
+
+    /// Whether this request still stands against the ceiling of the term it was
+    /// sent under — whether its amount is part of what has been or may yet be
+    /// charged under that term.
+    ///
+    /// A request awaiting the buyer's decision may still be charged, and an
+    /// approved one already has been ("the charge will be processed"). A request
+    /// in a status no charge can follow — cancelled, rejected, or one whose
+    /// validation failed — will never be charged, so its amount is available to
+    /// the term again.
+    pub fn holds_term_balance(&self) -> bool {
+        !matches!(
+            self.status.as_str(),
+            PAYMENT_REQUEST_STATUS_CANCELLED
+                | PAYMENT_REQUEST_STATUS_REJECTED
+                | PAYMENT_REQUEST_STATUS_VALIDATION_FAILED
+        )
     }
 
     /// The `ListAgreementPaymentRequests` projection of this payment request.
@@ -4132,6 +4197,66 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         self.payment_requests
             .values()
             .find(|request| request.client_token.as_deref() == Some(token))
+    }
+
+    /// What the payment requests already sent under one `VariablePaymentTerm` of
+    /// one agreement stand to charge, in the units [`amount_units`] counts.
+    ///
+    /// The ceiling is "the maximum total amount that can be charged to the
+    /// customer through variable payment requests under this term", so what
+    /// consumes it is the amount of every request of that term that has been or
+    /// may yet be charged ([`PaymentRequest::holds_term_balance`]) — read off
+    /// the stored requests themselves, so no running total can drift from them.
+    pub fn charged_payment_units(&self, agreement_id: &str, term_id: &str) -> u128 {
+        self.payment_requests
+            .values()
+            .filter(|request| request.agreement_id == agreement_id && request.term_id == term_id)
+            .filter(|request| request.holds_term_balance())
+            .fold(0u128, |total, request| {
+                total.saturating_add(request.charge_units())
+            })
+    }
+
+    /// Refuse a `chargeAmount` that cannot be charged under the
+    /// `VariablePaymentTerm` `term` of the agreement `agreement_id`.
+    ///
+    /// `SendAgreementPaymentRequest` states both bounds on the member and the
+    /// one refusal they share: the amount is a "positive decimal value in the
+    /// currency of the accepted term" and it "must not exceed the remaining
+    /// available balance under the `VariablePaymentTerm`
+    /// `maxTotalChargeAmount`", and "a `ValidationException` is returned if the
+    /// `chargeAmount` exceeds the available balance". So an amount that is not
+    /// positive or is not one this service can count ([`is_acceptable_amount`]),
+    /// and one that would take the requests of that term past its ceiling
+    /// ([`term_ceiling_units`], [`Self::charged_payment_units`]), are the same
+    /// input fault on the same member.
+    ///
+    /// The remaining balance, not the single amount, is what bounds a send: a
+    /// request within the ceiling on its own is still refused once the term's
+    /// earlier requests have consumed it. `None` — nothing to refuse — when the
+    /// term publishes no ceiling that can be measured against.
+    pub fn payment_charge_refusal(
+        &self,
+        agreement_id: &str,
+        term: &VariablePaymentTerm,
+        charge_amount: &str,
+    ) -> Option<ValidationException> {
+        let refused =
+            || Some(validation_exception(REASON_INVALID_CHARGE_AMOUNT, "chargeAmount"));
+        if !is_acceptable_amount(charge_amount) {
+            return refused();
+        }
+        let Some(requested) = amount_units(charge_amount) else {
+            return refused();
+        };
+        let (Some(ceiling), Some(term_id)) = (term_ceiling_units(term), term.id.as_deref()) else {
+            return None;
+        };
+        let charged = self.charged_payment_units(agreement_id, term_id);
+        if charged.saturating_add(requested) > ceiling {
+            return refused();
+        }
+        None
     }
 
     /// Approve the payment request `payment_request_id` names at `now`,

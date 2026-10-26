@@ -283,14 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
 
-            if !crate::state::is_acceptable_adjustment_amount(&entry.adjustment_amount) {
+            if !crate::state::is_acceptable_amount(&entry.adjustment_amount) {
                 errors.push(BatchCreateBillingAdjustmentError {
                     code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
                     message: crate::state::billing_adjustment_entry_message(
                         crate::state::REASON_INVALID_ADJUSTMENT_AMOUNT,
                         format!(
                             "adjustmentAmount must be a positive amount of at most {} characters",
-                            crate::state::BILLING_ADJUSTMENT_AMOUNT_MAX_LEN
+                            crate::state::AMOUNT_MAX_LEN
                         ),
                     ),
                     client_token: entry.client_token.clone(),
