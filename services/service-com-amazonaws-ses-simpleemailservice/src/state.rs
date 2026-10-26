@@ -18,7 +18,12 @@
 //! at the account's own 24-hour quota, with the window's expiry applied on
 //! append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`]) and
 //! [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
-//! capped at [`MAX_LOGGED_TEXT`].
+//! capped at [`MAX_LOGGED_TEXT`]. The template store is bounded the same way, at
+//! [`MAX_TEMPLATES`].
+//!
+//! A listing this store serves a page at a time hands the caller an OPAQUE,
+//! self-verifying cursor ([`encode_page_token`]), so a token this service never
+//! issued is refused instead of being read as some arbitrary position.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -57,6 +62,12 @@ pub const MAX_IDENTITIES: usize = 10_000;
 /// append, so this is the backstop that still bounds the store if the stored
 /// quota is raised later.
 pub const MAX_SENT_LOG_ENTRIES: usize = 1_000;
+
+/// The email templates one account may hold, and so the ceiling on the template
+/// store: SES documents a limit of 10,000 email templates per account, and a
+/// creation past it is refused rather than letting caller input grow this store
+/// without end.
+pub const MAX_TEMPLATES: usize = 10_000;
 
 /// The bytes one sending-authorization policy document may carry.
 ///
@@ -223,6 +234,26 @@ impl Default for AccountSettings {
     }
 }
 
+/// One email template in the account's template store.
+///
+/// The members are the model's own `Template` shape: a name, and the subject,
+/// text and HTML parts a send renders. `created_at` is the instant the template
+/// was recorded, which `ListTemplates` reports as
+/// `TemplateMetadata$CreatedTimestamp`.
+#[derive(Debug, Clone)]
+pub struct EmailTemplate {
+    /// The template's name, which is its key in the store.
+    pub name: String,
+    /// `Template$SubjectPart` — "The subject line of the email."
+    pub subject_part: Option<String>,
+    /// `Template$TextPart` — the body shown to clients that display no HTML.
+    pub text_part: Option<String>,
+    /// `Template$HtmlPart` — "The HTML body of the email."
+    pub html_part: Option<String>,
+    /// When the template was recorded.
+    pub created_at: SystemTime,
+}
+
 /// A configuration set a send may name.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigurationSet {
@@ -248,6 +279,10 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     pub account: AccountSettings,
     /// The configuration sets, keyed by name.
     pub configuration_sets: BTreeMap<String, ConfigurationSet>,
+    /// The email templates, keyed by name. A `BTreeMap` so every listing is in
+    /// one stable (lexicographic) order, which is what makes `ListTemplates`'
+    /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
+    pub templates: BTreeMap<String, EmailTemplate>,
     /// How many opaque ids this store has minted, which is what makes the next
     /// one UNIQUE rather than merely unlikely to repeat: every id digests this
     /// counter, and the counter is never reused. Written only by
@@ -305,6 +340,22 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     verified_at: SystemTime::now(),
                 }),
         )
+    }
+
+    /// Record `template` under its own name, replacing any template already
+    /// stored under that name, and hand back the stored record.
+    ///
+    /// `None` when the store already holds [`MAX_TEMPLATES`] templates and this
+    /// is a new one: the caller refuses the request rather than growing the store
+    /// past the account's limit. Replacing a template already in the store always
+    /// succeeds, since it adds nothing.
+    pub fn put_template(&mut self, template: EmailTemplate) -> Option<&EmailTemplate> {
+        let name = template.name.clone();
+        if !self.templates.contains_key(&name) && self.templates.len() >= MAX_TEMPLATES {
+            return None;
+        }
+        self.templates.insert(name.clone(), template);
+        self.templates.get(&name)
     }
 
     /// Append an accepted message to the send log, bounding it as it grows.
@@ -459,6 +510,58 @@ impl ComAmazonawsSesSimpleemailserviceState {
     pub fn new_verification_token(&mut self) -> String {
         self.mint_token()[..44].to_string()
     }
+}
+
+/// The listing name stamped into a `ListTemplates` page token, so a cursor cut
+/// from the template list cannot resume another listing of this service.
+pub const LISTING_TEMPLATES: &str = "ListTemplates";
+
+/// The bytes every page token of this service digests before the listing and the
+/// key, so a token of this service is not a token of any other.
+const PAGE_TOKEN_DOMAIN: &[u8] = b"com.amazonaws.ses#page-token\0";
+
+/// The leading bytes of the digest a page token carries as its integrity tag.
+/// Eight bytes is enough that a value the caller made up does not carry a
+/// matching tag, while keeping the token short.
+const PAGE_TOKEN_TAG_LEN: usize = 8;
+
+/// The integrity tag of `key` for `listing`: the leading [`PAGE_TOKEN_TAG_LEN`]
+/// bytes of SHA-256 over this service's domain separator, the listing, and the
+/// key. Hashed with the `sha2` crate rather than a hand-written digest.
+fn page_token_tag(listing: &str, key: &str) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(PAGE_TOKEN_DOMAIN);
+    digest.update(listing.as_bytes());
+    digest.update(b"\0");
+    digest.update(key.as_bytes());
+    digest.finalize()[..PAGE_TOKEN_TAG_LEN].to_vec()
+}
+
+/// A page token naming the `key` the NEXT page of `listing` starts at: the
+/// integrity tag followed by the key, hex-encoded.
+///
+/// Opaque — a caller cannot read a position out of it and hands it back verbatim
+/// — and self-verifying, so a token this listing never issued is refused by
+/// [`decode_page_token`] instead of being read as an arbitrary position in it.
+pub fn encode_page_token(listing: &str, key: &str) -> String {
+    let mut bytes = page_token_tag(listing, key);
+    bytes.extend_from_slice(key.as_bytes());
+    ::hex::encode(bytes)
+}
+
+/// The key a token of `listing` resumes at, or `None` when `token` is not one
+/// this service issued for that listing: not hex, too short to carry a tag, not
+/// UTF-8, carrying no key, or carrying a tag that does not match the listing and
+/// position it claims. The caller refuses such a token rather than restarting
+/// the listing at some other position.
+pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
+    let bytes = ::hex::decode(token).ok()?;
+    if bytes.len() <= PAGE_TOKEN_TAG_LEN {
+        return None;
+    }
+    let (tag, key) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
+    let key = String::from_utf8(key.to_vec()).ok()?;
+    (page_token_tag(listing, &key) == tag).then_some(key)
 }
 
 /// The addr-spec of a `Source`/recipient value, which may arrive either bare
