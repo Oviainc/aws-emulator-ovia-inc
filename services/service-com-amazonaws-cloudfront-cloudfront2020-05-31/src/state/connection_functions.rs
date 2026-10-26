@@ -26,7 +26,8 @@
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ConnectionFunctionSummary, EntityAlreadyExists, EntityNotFound, FunctionConfig,
+    ConnectionFunctionSummary, DistributionConfig, EntityAlreadyExists, EntityNotFound,
+    FunctionConfig,
 };
 
 use super::{
@@ -225,13 +226,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// published stage reports [`super::FUNCTION_STATUS_ASSOCIATED`] or
     /// [`super::FUNCTION_STATUS_UNASSOCIATED`].
     pub fn connection_function_is_associated(&self, id: &str) -> bool {
-        self.distributions.values().any(|distribution| {
-            distribution
-                .config
-                .connection_function_association
-                .as_ref()
-                .is_some_and(|association| association.id == id)
-        })
+        self.distributions
+            .values()
+            .any(|distribution| references_connection_function(&distribution.config, id))
     }
 
     /// Copy the `DEVELOPMENT` stage of the connection function `id` names into its `LIVE`
@@ -280,6 +277,21 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 }
 
+/// Whether `config` attaches the connection function `id` names.
+///
+/// A distribution attaches a connection function through its `ConnectionFunctionAssociation`,
+/// whose `Id` is "The association's ID" — the connection function's own `Id` — and a
+/// configuration carries at most one, so a distribution is attached to the function exactly
+/// when that member names it. ONE rule, read from the STORED configuration, behind both the
+/// status a published stage reports and the listing of the distributions a connection function
+/// serves, so the two can never disagree about an attachment.
+pub fn references_connection_function(config: &DistributionConfig, id: &str) -> bool {
+    config
+        .connection_function_association
+        .as_ref()
+        .is_some_and(|association| association.id == id)
+}
+
 /// The ARN of a connection function. CloudFront is a GLOBAL service, so the ARN's region
 /// segment is empty: `arn:aws:cloudfront::<account>:connection-function/<Id>`. The resource
 /// part is the minted id, which is the identifier every mutating connection function
@@ -306,6 +318,23 @@ pub fn connection_function_not_found(identifier: &str, stage: &str) -> EntityNot
     EntityNotFound {
         message: Some(format!(
             "The entity was not found: no connection function {identifier} in the {stage} stage"
+        )),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for an identifier no stored connection function
+/// answers to — neither by its id, nor by the name it was created under, nor by the ARN
+/// minted for it.
+///
+/// The sentence is the one the model states on the shape — "The entity was not found." —
+/// followed by the identifier that was asked for, which is built from the request and is
+/// what tells a caller which resource was addressed. Where a read also names a STAGE, the
+/// refusal that names it ([`connection_function_not_found`]) is the one to answer with.
+pub fn connection_function_identifier_not_found(identifier: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!(
+            "The entity was not found: no connection function {identifier} in this Amazon Web \
+             Services account"
         )),
     }
 }
