@@ -191,32 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Rules the model cannot express, so the protocol boundary let them
-        // through. Each is refused with the only client-input error this
-        // operation declares, worded by the service's one validation reporter
-        // (`crate::state::constraint_report`), which echoes no request value.
-        //
-        // `recommendedActionTypes` is required and names the action types to
-        // include, so an empty list selects nothing at all — judged by the one
-        // check every operation taking the member shares.
-        if let Some(report) =
-            crate::state::recommended_action_types_violation(&input.recommended_action_types)
-        {
-            return Err(invalid_parameter(report));
-        }
-        // `organizationScope` names the accounts of an ORGANIZATION preview; an
-        // account-scoped rule previews only the account it lives in, so a scope
-        // sent with it is refused rather than ignored.
-        if input.rule_type != "OrganizationRule" && input.organization_scope.is_some() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "organizationScope",
-                "Member is valid only for the OrganizationRule rule type",
-            )));
-        }
-        if let Some(report) = input
-            .criteria
-            .as_ref()
-            .and_then(crate::state::criteria_violation)
-        {
+        // through, judged by the one check both preview operations share
+        // (`crate::state::preview_selection_violation`, beside the
+        // `previewed_actions` it guards) so that a request this operation
+        // cannot evaluate is refused the same way by its sibling. Reported with
+        // the only client-input error this operation declares, worded by the
+        // service's one validation reporter, which echoes no request value.
+        if let Some(report) = crate::state::preview_selection_violation(
+            &input.rule_type,
+            input.organization_scope.as_ref(),
+            &input.recommended_action_types,
+            input.criteria.as_ref(),
+        ) {
             return Err(invalid_parameter(report));
         }
 
@@ -224,13 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with, so resuming a walk with a different scope, action-type list or
         // criteria — or with another operation's token — is refused instead of
         // answered with a page of a different result set.
-        let selection_fingerprint = crate::state::fingerprint(&(
+        let selection_fingerprint = crate::state::preview_selection_fingerprint(
             Self::NAME,
             &input.rule_type,
-            &input.organization_scope,
+            input.organization_scope.as_ref(),
             &input.recommended_action_types,
-            &input.criteria,
-        ));
+            input.criteria.as_ref(),
+        );
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
