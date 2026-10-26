@@ -16,7 +16,10 @@
 //! Every tag-sync task lives in a second map,
 //! [`ComAmazonawsResourcegroupsArdiState::tag_sync_tasks`], keyed by the task's own
 //! ARN — the identifier `GetTagSyncTask` and `CancelTagSyncTask` address a task by —
-//! so `StartTagSyncTask` and every reader of a task read one record.
+//! so `StartTagSyncTask` and every reader of a task read one record. A task is
+//! nested inside the group it syncs into, so it lives exactly as long as that
+//! group: deleting the group drops its tasks with it
+//! ([`ComAmazonawsResourcegroupsArdiState::remove_tag_sync_tasks_of`]).
 //!
 //! The account's optional-feature settings live beside both in
 //! [`ComAmazonawsResourcegroupsArdiState::account_settings`], which
@@ -178,6 +181,22 @@ impl ComAmazonawsResourcegroupsArdiState {
             .range(GroupKey::first_in(region)..)
             .take_while(move |(key, _)| key.region == region)
             .map(|(_, record)| record)
+    }
+
+    /// Drop every tag-sync task of the group `key` names, and report how many
+    /// went with it.
+    ///
+    /// A tag-sync task is a resource NESTED INSIDE the group it syncs into — the
+    /// modelled `TagSyncTaskArn` writes it as that group's own ARN followed by
+    /// `/tag-sync-task/<id>` — so it cannot outlive that group: the one path
+    /// that removes a group removes its tasks here, in the same critical
+    /// section, so no reader is left reporting a task whose group the store no
+    /// longer holds and no later group created under the same name inherits the
+    /// tasks of its predecessor.
+    pub fn remove_tag_sync_tasks_of(&mut self, key: &GroupKey) -> usize {
+        let before = self.tag_sync_tasks.len();
+        self.tag_sync_tasks.retain(|_, task| !task.syncs_into(key));
+        before - self.tag_sync_tasks.len()
     }
 
     /// The optional-feature settings `region` reports at `now`.
@@ -1111,6 +1130,15 @@ pub struct TagSyncTaskRecord {
 }
 
 impl TagSyncTaskRecord {
+    /// Whether this task syncs resources into the group `key` names.
+    ///
+    /// A group is identified by its region and its name (see [`GroupKey`]) — the
+    /// two this record stores — so the answer does not depend on which of the
+    /// identifier forms the group can be addressed by was used to reach it.
+    pub fn syncs_into(&self, key: &GroupKey) -> bool {
+        self.region == key.region && self.group_name == key.name
+    }
+
     /// The modelled `ResourceQuery` for this record, if it was started with one.
     pub fn to_resource_query(&self) -> Option<ResourceQuery> {
         self.resource_query.as_ref().map(|q| ResourceQuery {

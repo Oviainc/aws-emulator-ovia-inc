@@ -3,10 +3,11 @@
 //! @op DeleteGroup
 //!
 //! Removes the group that `Group` (a name or a group ARN) or the deprecated `GroupName`
-//! names — with its static memberships and its tags, which are held on the same record —
+//! names — with its static memberships and its tags, which are held on the same record,
+//! and with the tag-sync tasks nested inside it, which are held in the task store —
 //! and reports the group as it was at the moment it was deleted. A group whose own stored
 //! service configuration protects it from deletion while it still contains resources is
-//! refused instead, and keeps its memberships and its tags.
+//! refused instead, and keeps its memberships, its tags and its tasks.
 //!
 //! ## Shape of an operation
 //!
@@ -228,6 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing the record removes the group's memberships and tags with it:
         // both are held on the record itself.
         let removed = store.groups.remove(&key).ok_or_else(not_found)?;
+        // A tag-sync task is a resource NESTED INSIDE the group it syncs into, so
+        // it cannot outlive that group: the tasks of the group just removed go
+        // with it, in the same critical section, so no reader is left reporting a
+        // task of a group that is gone and no group later created under this name
+        // inherits them.
+        let tasks = store.remove_tag_sync_tasks_of(&key);
         // Everything below is owned, so the store lock is released before the record
         // is formatted: the critical section covers the state change only.
         drop(store);
@@ -243,6 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group = ?removed.name,
             resources = removed.members.len(),
             tags = removed.tags.len(),
+            tag_sync_tasks = tasks,
             outcome = "deleted",
             "resource group deleted",
         );
