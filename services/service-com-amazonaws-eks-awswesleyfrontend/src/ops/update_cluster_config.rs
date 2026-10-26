@@ -332,17 +332,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One update at a time per cluster: while another is running the cluster is in
-        // use, which is exactly what `ResourceInUseException` reports.
+        // use, which is exactly what `ResourceInUseException` reports, worded by
+        // [`crate::state::update_in_progress`] for the update type this call would have
+        // minted. A body this operation would go on to refuse names no category of
+        // change, so it is reported as the generic cluster configuration update.
         if let Some(in_flight) = record.in_flight_update() {
+            let attempted = requested_change(&input, record)
+                .map(|change| change.update_type)
+                .unwrap_or(UPDATE_TYPE_CONFIG);
             return Err(
-                UpdateClusterConfigErrorModeled::ResourceInUseException(ResourceInUseException {
-                    cluster_name: Some(cluster_name.clone()),
-                    message: Some(format!(
-                        "Cluster {cluster_name} already has update {} in progress",
-                        in_flight.id
-                    )),
-                    ..Default::default()
-                })
+                UpdateClusterConfigErrorModeled::ResourceInUseException(
+                    crate::state::update_in_progress(attempted, &cluster_name, in_flight),
+                )
                 .into(),
             );
         }
