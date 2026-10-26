@@ -322,3 +322,8 @@ mod review_template_imported_lens_review;
 // agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_context_deletion.rs"]
 mod agent_context_deletion;
+
+// Declared last for the same reason as the declaration above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/create_agent_profile.rs"]
+mod create_agent_profile;
