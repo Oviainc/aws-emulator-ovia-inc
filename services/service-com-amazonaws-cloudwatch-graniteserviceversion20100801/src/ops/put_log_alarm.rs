@@ -279,13 +279,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a refused request leaves it exactly as it was.
         validate(&input)?;
 
+        let region = crate::state::request_region(ctx.parts());
+        // An alarm's actions are executed in the Region the alarm lives in, so one naming
+        // another Region could never run: the request is refused before the store is touched,
+        // so nothing is created and an alarm this call would have replaced keeps its actions.
+        if let Some(message) = crate::state::foreign_action_region_error(
+            [
+                input.ok_actions.as_deref(),
+                input.alarm_actions.as_deref(),
+                input.insufficient_data_actions.as_deref(),
+            ],
+            &region,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutLogAlarmErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch alarm store is unavailable".into()),
             })
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_secs();
         let mut store = state.lock();
 

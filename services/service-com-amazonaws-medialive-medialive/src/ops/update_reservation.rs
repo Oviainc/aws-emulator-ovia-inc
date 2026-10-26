@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReservation"))
+        // `ctx` carries request metadata only: a reservation stays in the region
+        // it was purchased in — that region is on the record and in its ARN — so
+        // this write reads nothing off the region the update was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `Name` targets bare `__string`, so the request boundary refuses nothing
+        // for it: the bounds every caller-chosen name of this service is held to
+        // are applied here, exactly as the purchase applies them to the name it
+        // stores. Both ends are this emulator's own convention rather than a
+        // modelled constraint — the model states no length for the member — so a
+        // rename is held to the same bounds the name was created under.
+        bounded(
+            "name",
+            input.name.as_deref(),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+
+        // `RenewalSettings$RenewalCount` is "Count for the reservation renewal",
+        // targeting `__integerMin1`: fewer than one renewal is nothing to renew,
+        // so it is refused here, where the request boundary lets the modelled
+        // minimum through.
+        at_least_one(
+            "renewalSettings.renewalCount",
+            input
+                .renewal_settings
+                .as_ref()
+                .and_then(|settings| settings.renewal_count),
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // `settle` first, as every operation does: it materialises only what the
+        // clock had already made due, so it never changes what a later caller
+        // would otherwise have seen.
+        state.settle(now);
+
+        // "Update reservation": the settings the request CARRIES replace the
+        // stored ones and the settings it omits are left as they were, so an
+        // update changes only what it named. An id naming no reservation this
+        // account holds leaves nothing to change, which is this operation's
+        // modelled 404 — and the store is left untouched.
+        let reservation = state
+            .update_reservation(
+                &input.reservation_id,
+                crate::state::ReservationUpdate {
+                    name: input.name,
+                    renewal_settings: input.renewal_settings,
+                },
+                now,
+            )
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    "Reservation",
+                    &input.reservation_id,
+                ))
+            })?;
+
+        // Read back out of the STORED reservation through the one projection
+        // every reader of this service answers from, so what this update reports
+        // is what a later `DescribeReservation` reports.
+        Ok(UpdateReservationOutput {
+            reservation: Some(reservation),
+        })
     }
+}
+
+/// Refuse a member whose length is outside the bounds every caller-chosen string
+/// of this service is held to, with this operation's own modelled client error.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), UpdateReservationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{member} must be between {min} and {max} characters long, but was {len}"
+    )))
+}
+
+/// Refuse a count below the one the model's `__integerMin1` sets as its floor,
+/// with this operation's own modelled client error. A member the request did not
+/// carry is not a count at all, so it is not refused.
+fn at_least_one(member: &str, value: Option<i32>) -> Result<(), UpdateReservationError> {
+    match value {
+        Some(count) if count < 1 => Err(bad_request(format!(
+            "{member} must be at least 1, got {count}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A request this operation cannot serve as asked, as the 400
+/// `BadRequestException` it models. The message names the member, the rule and
+/// the value the request carried, so a caller can fix the request from that text
+/// alone.
+fn bad_request(message: String) -> UpdateReservationError {
+    UpdateReservationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A `ReservationId` naming no reservation this account holds, as the 404
+/// `NotFoundException` this operation models.
+fn not_found(message: String) -> UpdateReservationError {
+    UpdateReservationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the reservation in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateReservationError {
+    UpdateReservationErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

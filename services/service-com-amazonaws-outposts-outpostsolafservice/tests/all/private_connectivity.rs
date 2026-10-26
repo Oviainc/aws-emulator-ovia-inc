@@ -36,7 +36,7 @@ use crate::site_and_outpost_lifecycle::{
 /// The route both operations are bound to:
 /// `(GET|POST) /outposts/{OutpostId}/privateConnectivity`, from
 /// `smithy_query(query="operation",operation="GetPrivateConnectivityConfig,CreatePrivateConnectivityConfig")`.
-fn route(identifier: &str) -> String {
+pub(crate) fn route(identifier: &str) -> String {
     format!("/outposts/{}/privateConnectivity", segment(identifier))
 }
 
@@ -50,14 +50,14 @@ const ENABLED: &str = "ENABLED";
 
 /// The modelled `SubnetIds` maximum (`@length(min: 1, max: 10)`), from
 /// `smithy_query(query="shape",shape="SubnetIds")`.
-const MAX_SUBNET_IDS: usize = 10;
+pub(crate) const MAX_SUBNET_IDS: usize = 10;
 
 /// The modelled `VpcId` / `SubnetId` maximum length (`@length(min: 1, max: 25)`).
 const MAX_VPC_ID_LENGTH: usize = 25;
 
 /// `count` distinct subnet ids of the modelled `SubnetId` form (`^[a-z0-9-]+$`,
 /// len 1..25).
-fn subnet_ids(count: usize) -> Vec<String> {
+pub(crate) fn subnet_ids(count: usize) -> Vec<String> {
     (0..count)
         .map(|index| format!("subnet-{index:016x}"))
         .collect()
@@ -65,7 +65,11 @@ fn subnet_ids(count: usize) -> Vec<String> {
 
 /// One `VpcInformation` entry carrying exactly the members a case names — every
 /// member of the shape is optional, so an entry may carry any subset of them.
-fn vpc_information(vpc_id: Option<&str>, subnets: Option<usize>, endpoint: Option<&str>) -> Value {
+pub(crate) fn vpc_information(
+    vpc_id: Option<&str>,
+    subnets: Option<usize>,
+    endpoint: Option<&str>,
+) -> Value {
     let mut entry = json!({});
     let object = entry.as_object_mut().expect("a JSON object");
     if let Some(vpc_id) = vpc_id {
@@ -83,7 +87,7 @@ fn vpc_information(vpc_id: Option<&str>, subnets: Option<usize>, endpoint: Optio
 /// A `CreatePrivateConnectivityConfig` payload around one `VpcInformation` entry.
 /// The modelled `VpcInformationList` is `@length(min: 1, max: 1)`, so a valid
 /// request carries exactly one.
-fn request(entry: Value) -> Value {
+pub(crate) fn request(entry: Value) -> Value {
     json!({ "VpcInformationList": [entry] })
 }
 
@@ -112,7 +116,7 @@ async fn get_config(outposts: &Outposts, identifier: &str) -> Value {
 
 /// The `PrivateConnectivityConfig` member of an output, or [`Value::Null`] when the
 /// output carries none.
-fn config_of(output: &Value) -> Value {
+pub(crate) fn config_of(output: &Value) -> Value {
     output
         .get("PrivateConnectivityConfig")
         .cloned()

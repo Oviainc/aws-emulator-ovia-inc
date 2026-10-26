@@ -251,6 +251,9 @@ mod rejection_messages;
 #[path = "all/reservation_purchase.rs"]
 mod reservation_purchase;
 
+#[path = "all/reservation_update.rs"]
+mod reservation_update;
+
 #[path = "all/reserved_tag_namespace.rs"]
 mod reserved_tag_namespace;
 

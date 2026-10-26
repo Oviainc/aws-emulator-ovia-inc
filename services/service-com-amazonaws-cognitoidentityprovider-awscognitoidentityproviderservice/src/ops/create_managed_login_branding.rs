@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateManagedLoginBranding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateManagedLoginBranding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateManagedLoginBranding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -191,20 +182,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateManagedLoginBranding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateManagedLoginBrandingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateManagedLoginBranding"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // "To create a new style with default settings, set
+        // UseCognitoProvidedValues to true and don't provide values for any
+        // other options ... When you specify true for this option, you must
+        // also omit values for Settings and Assets in the request."
+        // (`CreateManagedLoginBranding` and its `UseCognitoProvidedValues`
+        // member): a request that asks for the Cognito-managed defaults AND
+        // supplies customizations asks for two different styles at once. An
+        // `Assets` list carrying no element supplies no image file, so only a
+        // non-empty one is a value for `Assets`.
+        let supplies_assets = input.assets.as_ref().is_some_and(|assets| !assets.is_empty());
+        if input.use_cognito_provided_values && (input.settings.is_some() || supplies_assets) {
+            return Err(cognito_provided_values_conflict());
+        }
+
+        // "This operation has a 2-megabyte request-size limit and include the
+        // CSS settings and image assets for your app client ... If your request
+        // is larger than 2MB, separate it into multiple requests"
+        // (`CreateManagedLoginBranding`): a style whose settings and images
+        // exceed that together is one no single request may carry.
+        let payload = crate::state::branding_payload_bytes(
+            input.settings.as_ref(),
+            input.assets.as_deref().unwrap_or_default(),
+        );
+        if payload > crate::state::MAX_BRANDING_PAYLOAD_BYTES {
+            return Err(payload_too_large(payload));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "The app client that you want to create the branding style for"
+        // (`CreateManagedLoginBranding.ClientId`): the style is assigned to an
+        // app client of the NAMED pool, so an id that pool does not hold names
+        // nothing to assign it to.
+        if !pool.clients.contains_key(&input.client_id) {
+            return Err(client_not_found(&input.client_id));
+        }
+
+        // "This exception is thrown when you attempt to apply a managed login
+        // branding style to an app client that already has an assigned style"
+        // (`ManagedLoginBrandingExistsException`): the stored style stays
+        // exactly as it was and the second create is refused.
+        if pool.branding_for_client(&input.client_id).is_some() {
+            return Err(branding_exists(&input.client_id));
+        }
+
+        let branding_id = crate::state::new_uuid();
+        let branding = crate::state::ManagedLoginBranding {
+            branding_id: branding_id.clone(),
+            user_pool_id: pool.id.clone(),
+            client_id: input.client_id.clone(),
+            use_cognito_provided_values: input.use_cognito_provided_values,
+            settings: input.settings.clone(),
+            assets: input.assets.clone().unwrap_or_default(),
+            creation_date: now,
+            last_modified_date: now,
+        };
+        // Rendered from the record this call STORED, so the response is what a
+        // later read sees. The id was just minted, so the entry cannot
+        // pre-exist: this stores the new style and hands it straight back.
+        let stored = pool
+            .managed_login_branding
+            .entry(branding_id)
+            .or_insert(branding)
+            .to_managed_login_branding_type();
+        Ok(CreateManagedLoginBrandingOutput {
+            managed_login_branding: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+fn client_not_found(client_id: &str) -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ManagedLoginBrandingExistsException` for an app client that
+/// already has an assigned style, naming the app client whose style is in the
+/// way.
+fn branding_exists(client_id: &str) -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::ManagedLoginBrandingExistsException(
+        ManagedLoginBrandingExistsException {
+            message: Some(format!(
+                "Managed login branding already exists for Client {client_id}."
+            )),
+        },
+    )
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a request that asks for the
+/// Cognito-managed default style and supplies customizations as well.
+fn cognito_provided_values_conflict() -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "Settings and Assets must be omitted when UseCognitoProvidedValues is true."
+                .to_string(),
+        ),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a style whose settings and
+/// image files exceed the documented request-size limit together.
+///
+/// The 2-megabyte limit is the model's own ("This operation has a 2-megabyte
+/// request-size limit"); which error AWS answers a request past it with is NOT
+/// stated there, so this names the modelled error for exceeding "the limit for
+/// a requested Amazon Web Services resource" — the error CODE is inferred where
+/// the limit is documented.
+fn payload_too_large(payload: usize) -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(format!(
+            "Settings and Assets must not exceed {} bytes together, got {payload}.",
+            crate::state::MAX_BRANDING_PAYLOAD_BYTES
+        )),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateManagedLoginBrandingError {
+    CreateManagedLoginBrandingErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

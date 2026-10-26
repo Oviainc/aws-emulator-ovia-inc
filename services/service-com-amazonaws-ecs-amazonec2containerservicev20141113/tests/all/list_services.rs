@@ -606,8 +606,9 @@ async fn a_deleted_service_leaves_the_listing_but_is_still_describable() {
         "case {case:?}: both stored services must be listed before the delete"
     );
 
-    // The service wants no task, so nothing has to be cleaned up and the delete takes it
-    // straight to INACTIVE.
+    // "The service status moves from ACTIVE to DRAINING, and the service is no longer
+    // visible in the console or in the ListServices API operation": the delete drops the
+    // service from this listing where it starts the drain, not where the drain finishes.
     let deleted = ok(
         &router,
         "DeleteService",
@@ -617,8 +618,8 @@ async fn a_deleted_service_leaves_the_listing_but_is_still_describable() {
     .await;
     assert_eq!(
         string(&deleted["service"], "status", case),
-        "INACTIVE",
-        "case {case:?}: a service with no tasks to clean up is deleted outright"
+        "DRAINING",
+        "case {case:?}: a deleted service is left draining"
     );
 
     let listed = all_pages(&router, json!({ "cluster": "deleting" }), case).await;
@@ -643,9 +644,10 @@ async fn a_deleted_service_leaves_the_listing_but_is_still_describable() {
         1,
         "case {case:?}: DescribeServices must still report the deleted service, got {described}"
     );
-    assert_eq!(
-        string(&services[0], "status", case),
-        "INACTIVE",
-        "case {case:?}: the described record keeps the status the delete left"
+    let described_status = string(&services[0], "status", case);
+    assert!(
+        described_status == "DRAINING" || described_status == "INACTIVE",
+        "case {case:?}: the described record keeps the status the delete left, got \
+         {described_status:?}"
     );
 }

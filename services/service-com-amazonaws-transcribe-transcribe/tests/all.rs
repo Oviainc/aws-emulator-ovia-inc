@@ -15,6 +15,8 @@
 mod call_analytics_categories;
 #[path = "all/call_analytics_category_listing.rs"]
 mod call_analytics_category_listing;
+#[path = "all/call_analytics_category_update_rule_validation.rs"]
+mod call_analytics_category_update_rule_validation;
 #[path = "all/call_analytics_category_updates.rs"]
 mod call_analytics_category_updates;
 #[path = "all/call_analytics_job_delete.rs"]

@@ -47,6 +47,8 @@ mod error_payloads;
 mod not_found_wording;
 #[path = "all/page_token_refusals.rs"]
 mod page_token_refusals;
+#[path = "all/preview_selection_guard.rs"]
+mod preview_selection_guard;
 #[path = "all/recommended_action_inventory.rs"]
 mod recommended_action_inventory;
 #[path = "all/recommended_action_summaries.rs"]

@@ -8051,19 +8051,38 @@ pub fn container_image_registry_url(endpoint: &str, region: &str) -> String {
     format!("https://{endpoint}{CONTAINER_IMAGE_REGISTRY_PATH_PREFIX}/{region}")
 }
 
-/// The region whose registry a request to a published registry address
-/// addresses, or `None` when the path is not one
-/// [`container_image_registry_url`] publishes.
+/// Which registry a request to a published registry address addresses, and what
+/// inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerImageRegistryTarget {
+    /// The region whose registry the announced address names.
+    pub region: String,
+    /// What the client appended BENEATH that address: the registry protocol's
+    /// own request target (`/v2/…` for a container image registry client), its
+    /// leading `/` included, or the empty string where the client appended
+    /// nothing at all.
+    pub path: String,
+}
+
+/// The registry a request to a published registry address addresses, or `None`
+/// when the path is not one [`container_image_registry_url`] publishes.
 ///
 /// Anything the caller appended BENEATH the region is the registry protocol's
-/// own path (`/v2/…` for a Docker client): it names no part of this service, so
-/// it addresses the same registry as the announced address itself.
-pub fn parse_container_image_registry_path(path: &str) -> Option<String> {
+/// own path (`/v2/…` for a container image registry client): it names no part of
+/// this service's modelled URI space, so it is carried through to the registry
+/// the address names.
+pub fn parse_container_image_registry_path(path: &str) -> Option<ContainerImageRegistryTarget> {
     let rest = path
         .strip_prefix(CONTAINER_IMAGE_REGISTRY_PATH_PREFIX)?
         .strip_prefix('/')?;
-    let region = rest.split('/').next().unwrap_or_default();
-    (!region.is_empty()).then(|| region.to_string())
+    let (region, beneath) = match rest.find('/') {
+        Some(cut) => rest.split_at(cut),
+        None => (rest, ""),
+    };
+    (!region.is_empty()).then(|| ContainerImageRegistryTarget {
+        region: region.to_string(),
+        path: beneath.to_string(),
+    })
 }
 
 /// The most sets of registry log in credentials this store keeps per region.
@@ -8128,29 +8147,542 @@ fn registry_password_digest(password: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// One container image registered to a container service: the digest that was
-/// pushed, the name this service assigned it, and when it was registered.
+// ---------------------------------------------------------------------------
+// What a push put IN the container image registry of the account
+// ---------------------------------------------------------------------------
+
+/// The algorithm the registry addresses its content by, which is the one the
+/// registry protocol's digests name.
+pub const REGISTRY_DIGEST_ALGORITHM: &str = "sha256";
+
+/// The number of hex characters a [`REGISTRY_DIGEST_ALGORITHM`] digest is
+/// written with: SHA-256 is 32 bytes, two characters each.
+const REGISTRY_DIGEST_HEX_LEN: usize = 64;
+
+/// The digest of `content`, spelled the way the registry protocol spells one:
+/// the algorithm, a colon, and the hex of the digest over exactly those bytes.
 ///
-/// The assigned name has the form the modelled
-/// `RegisterContainerImageRequest$label` documentation gives — "if the name of
-/// your container service is `mycontainerservice`, and the label that you specify
-/// is `mystaticwebsite`, then the name of the registered container image will be
-/// `:mycontainerservice.mystaticwebsite.1`", the trailing number being the
-/// version of the images sharing that label.
+/// This is computed over the content that arrived, never taken from what a
+/// client claimed: it is what makes the registry content-addressed, so a stored
+/// blob or manifest is reachable only under the digest of its own bytes.
+pub fn registry_digest(content: &[u8]) -> String {
+    format!(
+        "{REGISTRY_DIGEST_ALGORITHM}:{}",
+        hex::encode(Sha256::digest(content))
+    )
+}
+
+/// Whether `digest` is spelled the way this registry addresses content: the
+/// algorithm it holds content under, a colon, and that algorithm's number of
+/// lower-case hex characters.
+pub fn is_registry_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix(REGISTRY_DIGEST_ALGORITHM)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|hex| {
+            hex.len() == REGISTRY_DIGEST_HEX_LEN
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// The most bytes one blob may put in the registry.
+///
+/// An emulator resource guard, NOT a registry limit: the registry protocol caps
+/// a blob nowhere, and a real image layer is far larger than this. The registry
+/// here holds every byte it accepts in this process's memory, so what one caller
+/// can make it hold has to be bounded — a push past this is refused rather than
+/// half-stored.
+pub const MAX_REGISTRY_BLOB_BYTES: usize = 32 * 1024 * 1024;
+
+/// The most bytes one region's registry holds at once — blobs, manifests and
+/// in-flight uploads together. The same guard as [`MAX_REGISTRY_BLOB_BYTES`],
+/// for the total rather than one blob.
+pub const MAX_REGISTRY_BYTES_PER_REGION: usize = 128 * 1024 * 1024;
+
+/// The most blob uploads one region's registry keeps in flight at once.
+///
+/// An emulator resource guard as well: an upload session holds what has been
+/// sent to it so far, and a client that starts sessions without finishing them
+/// would otherwise keep them all. The session dropped is the OLDEST, which is
+/// the one most likely already abandoned; a client whose session is gone is
+/// answered that it is unknown and can start another.
+pub const MAX_REGISTRY_UPLOADS_PER_REGION: usize = 64;
+
+/// The most container images one container service's registry holds at once.
+///
+/// An emulator resource guard, not an AWS quota: a service accumulates one
+/// entry per registration, so the count a caller can drive has to be bounded.
+/// The entry dropped is the oldest registration.
+pub const MAX_CONTAINER_IMAGES_PER_SERVICE: usize = 500;
+
+/// One blob the registry holds: the bytes that were pushed, and when they
+/// arrived.
+#[derive(Debug, Clone)]
+pub struct StoredRegistryBlob {
+    /// The bytes themselves, held verbatim so a later read answers what was
+    /// pushed rather than something built to look like it.
+    pub content: Vec<u8>,
+    pub pushed_at_ms: i64,
+}
+
+/// One image manifest the registry holds: the bytes that were pushed, the media
+/// type they were pushed as, the repository they were pushed to, and when.
+#[derive(Debug, Clone)]
+pub struct StoredRegistryManifest {
+    pub content: Vec<u8>,
+    /// The media type the manifest is held in, which is what a read of it
+    /// answers with.
+    ///
+    /// One of the manifest media types the registry stores, as the plane that
+    /// accepted the push resolved it — never the spelling a client sent, so a
+    /// value held here is always a media type this registry chose.
+    pub media_type: String,
+    pub repository: String,
+    pub pushed_at_ms: i64,
+}
+
+/// One blob upload in flight: the repository it was started against, what has
+/// been sent to it so far, and when it started.
+#[derive(Debug, Clone)]
+pub struct StoredBlobUpload {
+    pub repository: String,
+    pub content: Vec<u8>,
+    pub started_at_ms: i64,
+}
+
+/// What the registry answered to content offered to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryWrite {
+    /// The content is held, addressed by this digest.
+    Stored(String),
+    /// Holding it would take this region's registry past `limit` bytes.
+    OutOfSpace { limit: usize },
+}
+
+/// What the registry answered to bytes offered to an upload session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadAppend {
+    /// The session now holds `held` bytes.
+    Appended { held: usize },
+    /// No such upload session: never started, started against another
+    /// repository, already finished, or dropped to keep the region within
+    /// [`MAX_REGISTRY_UPLOADS_PER_REGION`].
+    Unknown,
+    /// Taking them would pass `limit` bytes.
+    OutOfSpace { limit: usize },
+}
+
+/// What the registry answered to a request finishing an upload session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadFinish {
+    /// The whole blob is held, addressed by this digest.
+    Stored(String),
+    /// What the session holds has this digest, not the one the request claimed,
+    /// so nothing was stored and the session is untouched.
+    DigestMismatch { computed: String },
+    /// No such upload session — see [`UploadAppend::Unknown`].
+    Unknown,
+    /// Holding it would pass `limit` bytes.
+    OutOfSpace { limit: usize },
+}
+
+/// The container image registry of the account in ONE region: the blobs and
+/// image manifests pushed to it, the tag each repository's tags resolve to, and
+/// the uploads in flight.
+///
+/// Content-addressed, as the registry protocol is: a blob and a manifest are
+/// held under the digest of their own bytes, so the registry can only answer
+/// with what was actually pushed to it.
+#[derive(Debug, Default)]
+pub struct StoredImageRegistry {
+    /// Every blob, keyed by its digest. Keyed registry-wide and not per
+    /// repository because the digest IS the identity of the content.
+    pub blobs: BTreeMap<String, StoredRegistryBlob>,
+    /// Every image manifest, keyed by its digest — the digest a `docker push`
+    /// reports and `RegisterContainerImage` takes.
+    pub manifests: BTreeMap<String, StoredRegistryManifest>,
+    /// The manifest digest each repository's tags name, keyed by the repository
+    /// and the tag.
+    pub tags: BTreeMap<(String, String), String>,
+    /// The blob uploads in flight, keyed by the session id the registry minted
+    /// for each.
+    pub uploads: BTreeMap<String, StoredBlobUpload>,
+}
+
+impl StoredImageRegistry {
+    /// How many bytes this registry holds: its blobs, its manifests, the tags
+    /// pointing at them, and what its in-flight uploads have taken so far.
+    ///
+    /// A tag is counted too, because a tag pointing at a manifest the registry
+    /// already holds costs no manifest bytes — so without counting them a
+    /// client could grow this registry by tagging one manifest over and over.
+    pub fn bytes_held(&self) -> usize {
+        let blobs: usize = self
+            .blobs
+            .values()
+            .map(|blob| blob.content.len())
+            .fold(0, usize::saturating_add);
+        let manifests: usize = self
+            .manifests
+            .values()
+            .map(|manifest| manifest.content.len())
+            .fold(0, usize::saturating_add);
+        let tags: usize = self
+            .tags
+            .iter()
+            .map(|((repository, tag), digest)| {
+                repository.len().saturating_add(tag.len()).saturating_add(digest.len())
+            })
+            .fold(0, usize::saturating_add);
+        let uploads: usize = self
+            .uploads
+            .values()
+            .map(|upload| upload.content.len())
+            .fold(0, usize::saturating_add);
+        blobs
+            .saturating_add(manifests)
+            .saturating_add(tags)
+            .saturating_add(uploads)
+    }
+
+    /// Whether this registry holds the blob `digest` names.
+    pub fn has_blob(&self, digest: &str) -> bool {
+        self.blobs.contains_key(digest)
+    }
+
+    /// The blob `digest` names.
+    pub fn blob(&self, digest: &str) -> Option<&StoredRegistryBlob> {
+        self.blobs.get(digest)
+    }
+
+    /// Whether this registry holds the image manifest `digest` names.
+    pub fn has_manifest(&self, digest: &str) -> bool {
+        self.manifests.contains_key(digest)
+    }
+
+    /// The digest the `reference` of `repository` resolves to: a reference that
+    /// IS a digest names content directly, and any other reference is a tag,
+    /// which names whatever manifest was last pushed under it.
+    ///
+    /// A DIGEST is resolved registry-wide, by design: the registry is the
+    /// ACCOUNT's and content-addressed, so a digest names the same content
+    /// whichever repository path addresses it (the property that lets a client
+    /// mount content it has already pushed instead of sending it again). A TAG
+    /// is the repository's own, so it resolves only under the repository it was
+    /// pushed to.
+    pub fn resolve_reference(&self, repository: &str, reference: &str) -> Option<String> {
+        if self.manifests.contains_key(reference) {
+            return Some(reference.to_string());
+        }
+        self.tags
+            .get(&(repository.to_string(), reference.to_string()))
+            .cloned()
+    }
+
+    /// The manifest the `reference` of `repository` resolves to.
+    pub fn manifest(&self, repository: &str, reference: &str) -> Option<&StoredRegistryManifest> {
+        let digest = self.resolve_reference(repository, reference)?;
+        self.manifests.get(&digest)
+    }
+
+    /// The tags `repository` holds, in one stable order.
+    pub fn tags_of(&self, repository: &str) -> Vec<String> {
+        self.tags
+            .keys()
+            .filter(|(held, _)| held == repository)
+            .map(|(_, tag)| tag.clone())
+            .collect()
+    }
+
+    /// Whether anything was pushed to `repository` — a manifest of its own, or
+    /// a tag naming one.
+    pub fn holds_repository(&self, repository: &str) -> bool {
+        self.manifests
+            .values()
+            .any(|manifest| manifest.repository == repository)
+            || self.tags.keys().any(|(held, _)| held == repository)
+    }
+
+    /// Hold `content` as a blob, addressed by the digest of its own bytes.
+    ///
+    /// Content the registry already holds costs it nothing: the digest names
+    /// those exact bytes, so a re-push of them is the blob that is already
+    /// there.
+    pub fn put_blob(&mut self, content: Vec<u8>, now_ms: i64) -> RegistryWrite {
+        let digest = registry_digest(&content);
+        if self.blobs.contains_key(&digest) {
+            return RegistryWrite::Stored(digest);
+        }
+        if !self.can_hold(content.len()) {
+            return RegistryWrite::OutOfSpace {
+                limit: MAX_REGISTRY_BYTES_PER_REGION,
+            };
+        }
+        self.blobs.insert(
+            digest.clone(),
+            StoredRegistryBlob {
+                content,
+                pushed_at_ms: now_ms,
+            },
+        );
+        RegistryWrite::Stored(digest)
+    }
+
+    /// Hold `content` as an image manifest of `repository`, addressed by the
+    /// digest of its own bytes, and point `tag` at it when the push named one.
+    ///
+    /// What the write needs is judged for the manifest and the tag TOGETHER,
+    /// before either is held: content the registry already holds and a tag it
+    /// already has cost it nothing.
+    pub fn put_manifest(
+        &mut self,
+        repository: &str,
+        tag: Option<&str>,
+        content: Vec<u8>,
+        media_type: &str,
+        now_ms: i64,
+    ) -> RegistryWrite {
+        let digest = registry_digest(&content);
+        let fresh_manifest = !self.manifests.contains_key(&digest);
+        let tag_key = tag.map(|tag| (repository.to_string(), tag.to_string()));
+        let fresh_tag = tag_key
+            .as_ref()
+            .is_some_and(|key| !self.tags.contains_key(key));
+        let needed = if fresh_manifest { content.len() } else { 0 }.saturating_add(
+            tag_key
+                .as_ref()
+                .filter(|_| fresh_tag)
+                .map_or(0, |(repository, tag)| {
+                    repository
+                        .len()
+                        .saturating_add(tag.len())
+                        .saturating_add(digest.len())
+                }),
+        );
+        if !self.can_hold(needed) {
+            return RegistryWrite::OutOfSpace {
+                limit: MAX_REGISTRY_BYTES_PER_REGION,
+            };
+        }
+        if fresh_manifest {
+            self.manifests.insert(
+                digest.clone(),
+                StoredRegistryManifest {
+                    content,
+                    media_type: media_type.to_string(),
+                    repository: repository.to_string(),
+                    pushed_at_ms: now_ms,
+                },
+            );
+        }
+        if let Some(key) = tag_key {
+            // A tag is a MOVING reference: pushing to one that is taken points
+            // it at the manifest just pushed, which is what the protocol says a
+            // tag is.
+            self.tags.insert(key, digest.clone());
+        }
+        RegistryWrite::Stored(digest)
+    }
+
+    /// Record one blob upload started against `repository` under the session id
+    /// `session`, dropping the oldest session once this region holds
+    /// [`MAX_REGISTRY_UPLOADS_PER_REGION`].
+    pub fn start_upload(&mut self, session: String, repository: &str, now_ms: i64) {
+        self.uploads.insert(
+            session,
+            StoredBlobUpload {
+                repository: repository.to_string(),
+                content: Vec::new(),
+                started_at_ms: now_ms,
+            },
+        );
+        while self.uploads.len() > MAX_REGISTRY_UPLOADS_PER_REGION {
+            let oldest = self
+                .uploads
+                .iter()
+                .min_by(|left, right| {
+                    left.1
+                        .started_at_ms
+                        .cmp(&right.1.started_at_ms)
+                        .then_with(|| left.0.cmp(right.0))
+                })
+                .map(|(id, _)| id.clone());
+            let Some(oldest) = oldest else { break };
+            // A session dropped early stops accepting the bytes its client was
+            // sending it, so the eviction is traceable rather than a silent
+            // surprise. Only the session id is logged; no uploaded byte is.
+            ::tracing::warn!(
+                session = %oldest,
+                limit = MAX_REGISTRY_UPLOADS_PER_REGION,
+                "the oldest container image blob upload was dropped to keep this region's \
+                 registry within the store's bound"
+            );
+            self.uploads.remove(&oldest);
+        }
+    }
+
+    /// The upload session `session` of `repository` names.
+    ///
+    /// Scoped by the repository too: a session was started against ONE
+    /// repository, so the same id under another repository's path names no
+    /// session of it.
+    pub fn upload(&self, session: &str, repository: &str) -> Option<&StoredBlobUpload> {
+        self.uploads
+            .get(session)
+            .filter(|upload| upload.repository == repository)
+    }
+
+    /// Take `content` into the upload session `session` of `repository`.
+    pub fn append_to_upload(
+        &mut self,
+        session: &str,
+        repository: &str,
+        content: &[u8],
+    ) -> UploadAppend {
+        if self.upload(session, repository).is_none() {
+            return UploadAppend::Unknown;
+        }
+        let held_elsewhere = self
+            .bytes_held()
+            .saturating_sub(self.uploads.get(session).map_or(0, |u| u.content.len()));
+        let Some(upload) = self.uploads.get_mut(session) else {
+            return UploadAppend::Unknown;
+        };
+        let would_hold = upload.content.len().saturating_add(content.len());
+        // Both bounds are judged BEFORE the bytes are taken, so a session that
+        // cannot take them keeps exactly what it had.
+        if would_hold > MAX_REGISTRY_BLOB_BYTES {
+            return UploadAppend::OutOfSpace {
+                limit: MAX_REGISTRY_BLOB_BYTES,
+            };
+        }
+        if held_elsewhere.saturating_add(would_hold) > MAX_REGISTRY_BYTES_PER_REGION {
+            return UploadAppend::OutOfSpace {
+                limit: MAX_REGISTRY_BYTES_PER_REGION,
+            };
+        }
+        upload.content.extend_from_slice(content);
+        UploadAppend::Appended {
+            held: upload.content.len(),
+        }
+    }
+
+    /// Finish the upload session `session` of `repository` with the trailing
+    /// `content` a client sent on the finishing request, holding the whole blob
+    /// as one only when `claimed` is the digest of everything that session
+    /// holds.
+    ///
+    /// The session SURVIVES every answer but a stored one — a claimed digest
+    /// that is not the content's leaves the bytes where they were, so the
+    /// client can carry on with that session rather than start again.
+    pub fn finish_upload(
+        &mut self,
+        session: &str,
+        repository: &str,
+        content: &[u8],
+        claimed: &str,
+        now_ms: i64,
+    ) -> UploadFinish {
+        let Some(upload) = self.upload(session, repository) else {
+            return UploadFinish::Unknown;
+        };
+        let would_hold = upload.content.len().saturating_add(content.len());
+        let held_elsewhere = self.bytes_held().saturating_sub(upload.content.len());
+        if would_hold > MAX_REGISTRY_BLOB_BYTES {
+            return UploadFinish::OutOfSpace {
+                limit: MAX_REGISTRY_BLOB_BYTES,
+            };
+        }
+        if held_elsewhere.saturating_add(would_hold) > MAX_REGISTRY_BYTES_PER_REGION {
+            return UploadFinish::OutOfSpace {
+                limit: MAX_REGISTRY_BYTES_PER_REGION,
+            };
+        }
+        // The digest of everything the blob would be, taken over the session's
+        // own bytes and the trailing ones in order and WITHOUT joining them
+        // first: the digest of the content is what decides, so it is computed
+        // before anything is stored or dropped.
+        let mut hasher = Sha256::new();
+        hasher.update(&upload.content);
+        hasher.update(content);
+        let computed = format!(
+            "{REGISTRY_DIGEST_ALGORITHM}:{}",
+            hex::encode(hasher.finalize())
+        );
+        if computed != claimed {
+            return UploadFinish::DigestMismatch { computed };
+        }
+        let Some(mut upload) = self.uploads.remove(session) else {
+            return UploadFinish::Unknown;
+        };
+        upload.content.extend_from_slice(content);
+        match self.put_blob(upload.content, now_ms) {
+            RegistryWrite::Stored(digest) => UploadFinish::Stored(digest),
+            RegistryWrite::OutOfSpace { limit } => UploadFinish::OutOfSpace { limit },
+        }
+    }
+
+    /// Take the upload session `session` of `repository` out of this registry —
+    /// what cancelling an upload does with it.
+    pub fn take_upload(&mut self, session: &str, repository: &str) -> Option<StoredBlobUpload> {
+        // The session has to be one of THIS repository's; `?` answers `None`
+        // for any other, which is what a caller asking for one reads.
+        self.upload(session, repository)?;
+        self.uploads.remove(session)
+    }
+
+    /// Whether this registry can take `additional` more bytes and stay within
+    /// [`MAX_REGISTRY_BYTES_PER_REGION`].
+    fn can_hold(&self, additional: usize) -> bool {
+        self.bytes_held().saturating_add(additional) <= MAX_REGISTRY_BYTES_PER_REGION
+    }
+}
+
+/// The name a container service assigns an image registered to it as the
+/// `version`-th of `label`.
+///
+/// The form is the one the modelled `RegisterContainerImageRequest$label`
+/// documentation gives: "if the name of your container service is
+/// `mycontainerservice`, and the label that you specify is `mystaticwebsite`,
+/// then the name of the registered container image will be
+/// `:mycontainerservice.mystaticwebsite.1`".
+pub fn container_image_name(service_name: &str, label: &str, version: i32) -> String {
+    format!(":{service_name}.{label}.{version}")
+}
+
+/// One container image registered to a container service: the label it was
+/// registered under, which version of that label it is, the digest that was
+/// pushed, and when it was registered.
+///
+/// The assigned NAME is not stored beside them: it is
+/// [`container_image_name`] of the holding service's name, the label and the
+/// version, so one record cannot disagree with the name it is reported under.
 #[derive(Debug, Clone)]
 pub struct StoredContainerImage {
-    /// The name the service assigned the image.
-    pub image: String,
+    /// The label the registering request named.
+    pub label: String,
+    /// Which version of that label this image is — 1 for the first image
+    /// registered under it, and one more for each after, as the modelled
+    /// `RegisterContainerImageRequest$label` documentation describes.
+    pub version: i32,
     /// The digest of the pushed image, kept verbatim.
     pub digest: String,
     pub created_at_ms: i64,
 }
 
 impl StoredContainerImage {
-    /// This record as the modelled `ContainerImage`.
-    pub fn view(&self) -> ContainerImage {
+    /// The name the container service `service_name` assigned this image.
+    pub fn name(&self, service_name: &str) -> String {
+        container_image_name(service_name, &self.label, self.version)
+    }
+
+    /// This record as the modelled `ContainerImage`, as the container service
+    /// `service_name` reports it.
+    pub fn view(&self, service_name: &str) -> ContainerImage {
         ContainerImage {
-            image: Some(self.image.clone()),
+            image: Some(self.name(service_name)),
             digest: Some(self.digest.clone()),
             created_at: Some(timestamp(self.created_at_ms)),
         }
@@ -8232,19 +8764,71 @@ pub struct StoredContainerService {
     ///
     /// A `Vec` and not a map: the modelled `ContainerImageList` documents no
     /// order, so registration order is the one stable total order the store has,
-    /// and the assigned name already keys each entry uniquely.
+    /// and the label and version of each entry already key it uniquely.
     ///
-    /// It stays EMPTY for as long as this emulator serves no container image
-    /// registry to push to: an image is registered only after a `docker push`
-    /// puts it in the service's private registry, which is why
-    /// `RegisterContainerImage` refuses every digest (see that handler). Whoever
-    /// serves that registry fills this field.
+    /// An entry gets here only through `RegisterContainerImage`, which takes
+    /// the digest of an image that was PUSHED to the container image registry
+    /// of the account (`StoredImageRegistry`) — so a registered image always
+    /// names content this emulator holds.
     pub images: Vec<StoredContainerImage>,
     /// The phases the clock still owes this service, soonest first.
     pub owed: VecDeque<OwedPhase>,
 }
 
 impl StoredContainerService {
+    /// Register the pushed image `digest` to this service under `label`, and
+    /// answer the record that was stored.
+    ///
+    /// The version assigned is one past the highest this label's registered
+    /// images carry, which is the rule the modelled
+    /// `RegisterContainerImageRequest$label` documentation states: "If you push
+    /// and register another container image to the same Lightsail container
+    /// service, with the same label, then the version number for the new
+    /// registered container image will be `2`. If you push and register another
+    /// container image, the version number will be `3`, and so on." Two labels
+    /// are counted independently, each starting at 1, and the version keeps the
+    /// name of every image this registry holds distinct.
+    ///
+    /// The registry is bounded by [`MAX_CONTAINER_IMAGES_PER_SERVICE`]: past
+    /// that, the oldest registration is dropped.
+    pub fn register_image(
+        &mut self,
+        label: &str,
+        digest: &str,
+        now_ms: i64,
+    ) -> StoredContainerImage {
+        let version = self
+            .images
+            .iter()
+            .filter(|image| image.label == label)
+            .map(|image| image.version)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let registered = StoredContainerImage {
+            label: label.to_string(),
+            version,
+            digest: digest.to_string(),
+            created_at_ms: now_ms,
+        };
+        self.images.push(registered.clone());
+        if let Some(excess) = self.images.len().checked_sub(MAX_CONTAINER_IMAGES_PER_SERVICE) {
+            for evicted in self.images.drain(..excess) {
+                // An image the store had to forget stops being reported before
+                // anything deleted it, so the eviction is traceable rather than
+                // a silent surprise.
+                ::tracing::warn!(
+                    service = %self.name,
+                    image = %evicted.name(&self.name),
+                    limit = MAX_CONTAINER_IMAGES_PER_SERVICE,
+                    "the oldest registered container image was dropped to keep this container \
+                     service within the store's bound"
+                );
+            }
+        }
+        registered
+    }
+
     /// This record as the modelled `ContainerService`, announced to a caller that
     /// reached this emulator at `endpoint` (its `Host`/`:authority`, as
     /// [`request_endpoint`] reads it).
@@ -10522,6 +11106,20 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// its credentials at. The clock forgets a set 12 hours after it was created
     /// (see [`Self::advance_clock`]), so every set held here is still valid.
     pub registry_logins: BTreeMap<String, Vec<StoredRegistryLogin>>,
+    /// The container image registry of the account, keyed by the region whose
+    /// announced address a push reached it at.
+    ///
+    /// One registry per region, for the same reason the log in credentials are
+    /// held per region: the address `CreateContainerServiceRegistryLogin` hands
+    /// out carries the region the creating request was made in, so that is the
+    /// registry a push and the `RegisterContainerImage` after it address. A
+    /// region nothing has ever pushed to holds no entry. Each registry is
+    /// bounded by [`MAX_REGISTRY_BYTES_PER_REGION`], and the number of them by
+    /// the modelled `RegionName` enum: an entry is created only for a region a
+    /// push authenticated in, and a set of log in credentials is held under the
+    /// region [`request_region`] answers, which is always one of that enum's
+    /// values.
+    pub container_image_registries: BTreeMap<String, StoredImageRegistry>,
     /// The peering of each Region's Lightsail VPC with the account's default VPC
     /// there, keyed by the Region's name. A Region with no entry is one whose
     /// Lightsail VPC nothing has ever asked to peer.
@@ -11849,6 +12447,47 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 );
             }
         }
+    }
+
+    /// The container image registry of the account in `region`, for a reporting
+    /// read. `None` where nothing has ever been pushed to it: a region with no
+    /// registry answers every read about its content the same way an empty one
+    /// does, so no read creates one.
+    pub fn image_registry(&self, region: &str) -> Option<&StoredImageRegistry> {
+        self.container_image_registries.get(region)
+    }
+
+    /// The container image registry of the account in `region`, for a push,
+    /// which is what creates that region's registry the first time something is
+    /// pushed to it.
+    pub fn image_registry_mut(&mut self, region: &str) -> &mut StoredImageRegistry {
+        self.container_image_registries
+            .entry(region.to_string())
+            .or_default()
+    }
+
+    /// Whether the registry in `region` holds the image `digest` names — the
+    /// question `RegisterContainerImage` asks of the digest a caller presents.
+    ///
+    /// The digest of an IMAGE is the digest of its manifest, which is what a
+    /// push reports and what the caller registers; a blob of the image (a layer
+    /// or its configuration) is content of the image rather than the image, so
+    /// it is not one.
+    pub fn image_registry_holds_image(&self, region: &str, digest: &str) -> bool {
+        self.image_registry(region)
+            .is_some_and(|registry| registry.has_manifest(digest))
+    }
+
+    /// Start one blob upload against `repository` in `region`'s registry, and
+    /// answer the session id the registry minted for it.
+    ///
+    /// The id comes from this store's own minting (see [`Self::mint_uuid`]), so
+    /// nothing a client sends names a session.
+    pub fn start_blob_upload(&mut self, region: &str, repository: &str, now_ms: i64) -> String {
+        let session = self.mint_uuid();
+        self.image_registry_mut(region)
+            .start_upload(session.clone(), repository, now_ms);
+        session
     }
 
     /// Build and record an operation of `operation_type` against `resource_name`.
@@ -13437,6 +14076,181 @@ mod tests {
                     == CREATED_AT_MS + REGISTRY_LOGIN_LIFETIME_MS),
             "case the credentials it was created with: expected the set to be recognised, \
              expiring 12 hours after it was created"
+        );
+    }
+
+    /// RULE: what one region's registry holds is accounted for in BYTES —
+    /// content it already holds and a tag it already has cost it nothing, and a
+    /// fresh tag of a manifest it already holds costs what that tag takes — so
+    /// nothing a client repeats grows it without bound.
+    #[test]
+    fn a_registry_accounts_for_every_byte_it_holds() {
+        let mut registry = StoredImageRegistry::default();
+        let layer = b"a layer of image content".to_vec();
+        let manifest = br#"{"schemaVersion":2,"layers":[]}"#.to_vec();
+        let (layer_len, manifest_len) = (layer.len(), manifest.len());
+
+        assert_eq!(
+            registry.bytes_held(),
+            0,
+            "case an empty registry: expected it to hold nothing"
+        );
+        let stored = registry.put_blob(layer.clone(), CREATED_AT_MS);
+        assert_eq!(
+            (stored, registry.bytes_held()),
+            (
+                RegistryWrite::Stored(registry_digest(&layer)),
+                layer_len
+            ),
+            "case one pushed layer: expected its own bytes to be held under its own digest"
+        );
+        // The SAME bytes again are the blob that is already there.
+        registry.put_blob(layer.clone(), CREATED_AT_MS + 1);
+        assert_eq!(
+            (registry.blobs.len(), registry.bytes_held()),
+            (1, layer_len),
+            "case the same layer pushed twice: expected one blob and no growth"
+        );
+
+        let digest = registry_digest(&manifest);
+        for (case, tag, want_tags, want_bytes) in [
+            (
+                "the manifest under its first tag",
+                "latest",
+                1,
+                layer_len + manifest_len + "app".len() + "latest".len() + digest.len(),
+            ),
+            (
+                "the same manifest under the same tag again",
+                "latest",
+                1,
+                layer_len + manifest_len + "app".len() + "latest".len() + digest.len(),
+            ),
+            (
+                "the same manifest under a second tag",
+                "v1",
+                2,
+                layer_len
+                    + manifest_len
+                    + "app".len()
+                    + "latest".len()
+                    + "app".len()
+                    + "v1".len()
+                    + 2 * digest.len(),
+            ),
+        ] {
+            let stored = registry.put_manifest(
+                "app",
+                Some(tag),
+                manifest.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+                CREATED_AT_MS,
+            );
+            assert_eq!(
+                stored,
+                RegistryWrite::Stored(digest.clone()),
+                "case {case}: expected it to be held under the digest of its own bytes"
+            );
+            assert_eq!(
+                (registry.manifests.len(), registry.tags.len(), registry.bytes_held()),
+                (1, want_tags, want_bytes),
+                "case {case}: expected one manifest, {want_tags} tags and {want_bytes} bytes"
+            );
+        }
+    }
+
+    /// RULE: the store's own per-region bound keeps the blob uploads in flight
+    /// finite: past [`MAX_REGISTRY_UPLOADS_PER_REGION`] the OLDEST session is
+    /// the one dropped, and every younger session is still there to send to.
+    #[test]
+    fn the_oldest_blob_upload_is_the_one_the_bound_drops() {
+        let mut registry = StoredImageRegistry::default();
+        // One session past the bound, each a millisecond younger than the last
+        // so "oldest" is well defined.
+        let total = MAX_REGISTRY_UPLOADS_PER_REGION + 1;
+        let session = |index: usize| format!("session-{index:04}");
+        for index in 0..total {
+            registry.start_upload(
+                session(index),
+                "app",
+                CREATED_AT_MS + i64::try_from(index).expect("the index fits"),
+            );
+        }
+
+        assert_eq!(
+            registry.uploads.len(),
+            MAX_REGISTRY_UPLOADS_PER_REGION,
+            "case the region at its bound: expected {MAX_REGISTRY_UPLOADS_PER_REGION} sessions"
+        );
+        assert_eq!(
+            registry.append_to_upload(&session(0), "app", b"bytes for a dropped session"),
+            UploadAppend::Unknown,
+            "case the oldest session: expected it to have been dropped"
+        );
+        for index in 1..total {
+            assert_eq!(
+                registry.append_to_upload(&session(index), "app", b"ab"),
+                UploadAppend::Appended { held: 2 },
+                "case the session started {index} milliseconds in: expected it to take bytes"
+            );
+        }
+    }
+
+    /// RULE: a label's version is one past the highest that label's registered
+    /// images carry — 1 for the first, 2 for the next, and counted per label —
+    /// which is what keeps the name of every image a service holds distinct.
+    #[test]
+    fn a_registered_image_takes_the_next_version_of_its_label() {
+        let mut service = StoredContainerService {
+            name: "svc".to_string(),
+            arn: String::new(),
+            created_at_ms: CREATED_AT_MS,
+            location: StoredLocation {
+                region_name: REGION.to_string(),
+                availability_zone: Some(format!("{REGION}a")),
+            },
+            tags: Vec::new(),
+            power: "nano".to_string(),
+            power_id: "nano-1".to_string(),
+            scale: 1,
+            state: CONTAINER_SERVICE_READY,
+            is_disabled: false,
+            domain_token: "token".to_string(),
+            principal_arn: String::new(),
+            public_domain_names: BTreeMap::new(),
+            ecr_image_puller_role_active: false,
+            current_deployment: None,
+            next_deployment: None,
+            next_deployment_version: 1,
+            images: Vec::new(),
+            owed: VecDeque::new(),
+        };
+
+        // (the label registered, the name the service must assign)
+        let cases = [
+            ("web", ":svc.web.1"),
+            ("web", ":svc.web.2"),
+            ("api", ":svc.api.1"),
+            ("web", ":svc.web.3"),
+            ("api", ":svc.api.2"),
+        ];
+        for (label, want) in cases {
+            let registered = service.register_image(label, "sha256:abc", CREATED_AT_MS);
+            assert_eq!(
+                registered.name(&service.name),
+                want,
+                "case registering {label:?}: expected the name {want}"
+            );
+        }
+        let held: Vec<String> = service
+            .images
+            .iter()
+            .map(|image| image.name(&service.name))
+            .collect();
+        assert_eq!(
+            held,
+            cases.iter().map(|(_, name)| (*name).to_string()).collect::<Vec<_>>(),
+            "case the whole registry: expected the images in registration order"
         );
     }
 }

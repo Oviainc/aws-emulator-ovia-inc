@@ -1385,6 +1385,68 @@ pub fn previewed_actions<'store>(
         .filter(move |action| action_matches_criteria(action, criteria))
 }
 
+/// Why this preview request's selection cannot be evaluated, if it cannot, as
+/// the service's own validation report ([`constraint_report`], which echoes no
+/// request value).
+///
+/// The selection a preview request names is read by both preview operations
+/// ([`previewed_actions`]), so what makes a selection refusable is judged here
+/// once as well: a request one preview operation cannot evaluate is one the
+/// other cannot evaluate either, and the two cannot drift apart over which
+/// requests they refuse or how they word the refusal. The clauses are ordered
+/// from the required member outwards: the list of action types to include, then
+/// the scope that member list is read in, then the conditions applied inside it.
+///
+/// * an EMPTY `recommendedActionTypes` selects no action type at all
+///   ([`recommended_action_types_violation`]);
+/// * an `organizationScope` is the set of accounts of an ORGANIZATION-wide
+///   preview, so it names nothing for a rule type scoped to one account, and
+///   silently ignoring a member the caller sent would be worse than reporting
+///   it;
+/// * a `criteria` this service cannot evaluate ([`criteria_violation`]).
+pub fn preview_selection_violation(
+    rule_type: &str,
+    organization_scope: Option<&OrganizationScope>,
+    recommended_action_types: &[String],
+    criteria: Option<&Criteria>,
+) -> Option<String> {
+    if let Some(report) = recommended_action_types_violation(recommended_action_types) {
+        return Some(report);
+    }
+    if rule_type != "OrganizationRule" && organization_scope.is_some() {
+        return Some(constraint_report(
+            "organizationScope",
+            "Member is valid only for the OrganizationRule rule type",
+        ));
+    }
+    criteria.and_then(criteria_violation)
+}
+
+/// The fingerprint a preview page token carries: the operation that issued it
+/// and the whole selection it was taken with.
+///
+/// Bound into the token ([`PageCursor::filter_fingerprint`]) so that resuming a
+/// walk with a different rule type, scope, action-type list or criteria — or
+/// with the other preview operation's token — is refused instead of answered
+/// with a page of a different result set. It digests exactly the members
+/// [`previewed_actions`] selects by, so the two preview operations cannot
+/// disagree about which requests continue one walk.
+pub fn preview_selection_fingerprint(
+    operation: &str,
+    rule_type: &str,
+    organization_scope: Option<&OrganizationScope>,
+    recommended_action_types: &[String],
+    criteria: Option<&Criteria>,
+) -> String {
+    fingerprint(&(
+        operation,
+        rule_type,
+        organization_scope,
+        recommended_action_types,
+        criteria,
+    ))
+}
+
 /// One group of summarised items a summaries list reports as a row — of
 /// recommended actions, or of automation events: the grouping key and what the
 /// items under it accumulate.

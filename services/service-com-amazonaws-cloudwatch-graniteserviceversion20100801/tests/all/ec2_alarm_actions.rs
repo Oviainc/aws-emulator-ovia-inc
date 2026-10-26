@@ -11,6 +11,11 @@
 //! the `Metrics` query-array form — so the recorded `automate:...:ec2:stop` case with no
 //! dimensions is one row among many. Every alarm an accepted row creates is read back
 //! through `DescribeAlarms`, and every refused one is shown to be absent from it.
+//!
+//! Every ACCEPTED row's actions name the Region its request is signed for, because an action
+//! in another Region is refused on its own account (`alarm_action_region.rs`); the refused
+//! rows show this precondition is reported first, including for an action in another partition
+//! and Region.
 
 use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
@@ -26,14 +31,14 @@ const EC2_ACTION_REFUSAL: &str = "Invalid use of EC2 action. An EC2 action can o
 /// arn:aws:swf:region:account-id:action/actions/AWS_EC2.InstanceId.Stop/1.0 …"
 /// (`smithy_query(query="doc", shape="PutMetricAlarmInput", member="AlarmActions")`).
 const EC2_ACTION_ARNS: [&str; 8] = [
-    "arn:aws:automate:us-west-2:ec2:stop",
-    "arn:aws:automate:us-west-2:ec2:terminate",
-    "arn:aws:automate:us-west-2:ec2:reboot",
-    "arn:aws:automate:us-west-2:ec2:recover",
-    "arn:aws:swf:us-west-2:123456789012:action/actions/AWS_EC2.InstanceId.Stop/1.0",
-    "arn:aws:swf:us-west-2:123456789012:action/actions/AWS_EC2.InstanceId.Terminate/1.0",
-    "arn:aws:swf:us-west-2:123456789012:action/actions/AWS_EC2.InstanceId.Reboot/1.0",
-    "arn:aws:swf:us-west-2:123456789012:action/actions/AWS_EC2.InstanceId.Recover/1.0",
+    "arn:aws:automate:us-east-1:ec2:stop",
+    "arn:aws:automate:us-east-1:ec2:terminate",
+    "arn:aws:automate:us-east-1:ec2:reboot",
+    "arn:aws:automate:us-east-1:ec2:recover",
+    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_EC2.InstanceId.Stop/1.0",
+    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_EC2.InstanceId.Terminate/1.0",
+    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_EC2.InstanceId.Reboot/1.0",
+    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_EC2.InstanceId.Recover/1.0",
 ];
 
 /// The three action-list members an alarm action can ride in; each one's documentation
@@ -119,7 +124,7 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
                 "Namespace": "AWS/EC2",
                 "MetricName": "CPUUtilization",
                 "Dimensions": [],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:stop"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:stop"],
             }),
         ),
         (
@@ -131,7 +136,7 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
                     {"Name": "AutoScalingGroupName", "Value": "web"},
                     {"Name": "ImageId", "Value": "ami-0123456789abcdef0"},
                 ],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:terminate"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:terminate"],
             }),
         ),
         (
@@ -140,7 +145,7 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
                 "Namespace": "Custom",
                 "MetricName": "Depth",
                 "Dimensions": [{"Name": "InstanceIdentity", "Value": "i-0123456789abcdef0"}],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:reboot"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:reboot"],
             }),
         ),
         (
@@ -157,8 +162,8 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
                 "Namespace": "AWS/EC2",
                 "MetricName": "CPUUtilization",
                 "AlarmActions": [
-                    "arn:aws:sns:us-west-2:123456789012:ops",
-                    "arn:aws:automate:us-west-2:ec2:recover",
+                    "arn:aws:sns:us-east-1:123456789012:ops",
+                    "arn:aws:automate:us-east-1:ec2:recover",
                 ],
             }),
         ),
@@ -166,7 +171,7 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
             "a Metrics query whose metric has no InstanceId dimension".to_string(),
             json!({
                 "Metrics": [metric_query("m1", json!([]))],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:stop"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:stop"],
             }),
         ),
         (
@@ -176,14 +181,14 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
                     metric_query("m1", json!([{"Name": "InstanceId", "Value": "i-0123456789abcdef0"}])),
                     metric_query("m2", json!([{"Name": "AutoScalingGroupName", "Value": "web"}])),
                 ],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:terminate"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:terminate"],
             }),
         ),
         (
             "a Metrics array that only computes an expression".to_string(),
             json!({
                 "Metrics": [{"Id": "e1", "Expression": "100", "ReturnData": true}],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:stop"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:stop"],
             }),
         ),
     ]);
@@ -248,7 +253,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
                     {"Name": "AutoScalingGroupName", "Value": "web"},
                     {"Name": "InstanceId", "Value": "i-0123456789abcdef0"},
                 ],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:stop"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:stop"],
             }),
         ),
         (
@@ -258,7 +263,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
                     metric_query("m1", json!([{"Name": "InstanceId", "Value": "i-0123456789abcdef0"}])),
                     metric_query("m2", json!([{"Name": "InstanceId", "Value": "i-0fedcba9876543210"}])),
                 ],
-                "AlarmActions": ["arn:aws:automate:us-west-2:ec2:reboot"],
+                "AlarmActions": ["arn:aws:automate:us-east-1:ec2:reboot"],
             }),
         ),
         (
@@ -266,7 +271,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
             json!({
                 "Namespace": "AWS/EC2",
                 "MetricName": "CPUUtilization",
-                "AlarmActions": ["arn:aws:sns:us-west-2:123456789012:ops"],
+                "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
             }),
         ),
         (
@@ -276,7 +281,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
                 "MetricName": "RequestCount",
                 "Dimensions": [{"Name": "LoadBalancer", "Value": "app/web/0123456789abcdef"}],
                 "OKActions": [
-                    "arn:aws:autoscaling:us-west-2:123456789012:scalingPolicy:\
+                    "arn:aws:autoscaling:us-east-1:123456789012:scalingPolicy:\
                      7bb0e3a5-0000-4000-8000-000000000000:autoScalingGroupName/web:policyName/out"
                 ],
             }),
@@ -287,7 +292,7 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
                 "Namespace": "Custom",
                 "MetricName": "Depth",
                 "AlarmActions": [
-                    "arn:aws:swf:us-west-2:123456789012:action/actions/AWS_SNS.Publish/1.0"
+                    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_SNS.Publish/1.0"
                 ],
             }),
         ),

@@ -1,0 +1,714 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Server-side encryption of a queue: which of the two options a queue is on, and —
+//! for a queue on a customer managed KMS key — whether the caller may have the key
+//! used on its behalf.
+//!
+//! # The two options are exclusive, and one of them is the default
+//!
+//! A queue is encrypted at rest either with a key Amazon SQS owns (SSE-SQS, the
+//! `SqsManagedSseEnabled` attribute) or with a KMS key the account names
+//! (SSE-KMS, the `KmsMasterKeyId` attribute), and "only one server-side encryption
+//! option is supported per queue" (the `SqsManagedSseEnabled` entry of the
+//! `SetQueueAttributes` `Attributes` documentation). So:
+//!
+//! * the option a request CHOOSES takes the queue off the other one
+//!   ([`apply_encryption_choice`]), and a request that names both at once is refused
+//!   ([`encryption_choice_refusal`]);
+//! * what a queue REPORTS follows from the option it is on ([`report`]): a queue on the
+//!   SQS-owned key reports `SqsManagedSseEnabled` and no KMS attribute, and a queue on a
+//!   KMS key reports that key, `SqsManagedSseEnabled` of `false`, and the data key reuse
+//!   period that key is used under.
+//!
+//! # A queue on a customer managed key
+//!
+//! Amazon SQS does not hold the key: it asks KMS to generate a data key when a producer
+//! sends a message and to decrypt one when a consumer receives it, as the CALLER, so a
+//! caller the key does not permit cannot have the queue's key used for it and the call
+//! is refused with the KMS error KMS itself would answer — which is why every one of
+//! those operations models the `Kms*` family. [`authorize_master_key`] is that one step,
+//! for each of them.
+//!
+//! The key is resolved in the KMS service's OWN store, so this reads exactly what KMS's
+//! handlers wrote and the two cannot disagree about a key's existence, its state or its
+//! policy. A queue on an Amazon Web Services managed key (the predefined `alias/aws/sqs`
+//! and anything else whose `KeyManager` is not the customer's) needs no grant from the
+//! caller: AWS manages that key's policy for the service.
+//!
+//! The decision itself is [`::service_common::iam_authorization`], the tree's one
+//! evaluation of policy documents against `(action, resource, principal)`, over the
+//! three things a KMS access decision is made from:
+//!
+//! 1. **who** — the principal the request's access key id speaks for, from STS's own
+//!    resolver (the place `sts:GetCallerIdentity` answers from), else the IAM user that
+//!    owns the long-term key, else the account's own published credential;
+//! 2. **what the key permits** — the key's own key policy, which for a KMS key is the
+//!    document that must allow the use: a key policy naming the ACCOUNT ROOT delegates
+//!    the decision to IAM, which is what makes the caller's identity-based policies part
+//!    of it;
+//! 3. **the decision** — an explicit `Deny` refuses; otherwise the call is allowed when
+//!    the key policy allows this principal directly, or it delegates to IAM and the
+//!    principal's identity-based policies allow it.
+//!
+//! Two callers are not judged on documents at all, exactly as every other service in this
+//! tree that authorizes reads them: the account's own published credential, which holds no
+//! IAM policies — the position the account's administrator is in — and a principal
+//! carrying a policy document this emulator cannot read (an AWS-managed policy), which may
+//! hold the grant. Neither is refused on evidence nobody has.
+//!
+//! Amazon SQS does not word these refusals itself: it relays the error its KMS call
+//! failed with, so each message is KMS's own sentence with the metadata block an AWS error
+//! carries — see [`relayed`].
+//!
+//! When no KMS service is mounted beside this one the lookup answers nothing about the
+//! key, and the call proceeds: a condition nobody attributed to the key never refuses a
+//! send or a receive.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
+
+use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+use ::service_com_amazonaws_kms_trentservice::state as kms_store;
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
+use ::service_common::iam_authorization::{self as iam, Decision};
+
+use crate::ops::types::InvalidAttributeName;
+
+/// `SqsManagedSseEnabled`: "enables server-side queue encryption using SQS owned
+/// encryption keys."
+pub const SQS_MANAGED_SSE_ENABLED: &str = "SqsManagedSseEnabled";
+
+/// `KmsMasterKeyId`: "the ID of an Amazon Web Services managed customer master key
+/// (CMK) for Amazon SQS or a custom CMK."
+pub const KMS_MASTER_KEY_ID: &str = "KmsMasterKeyId";
+
+/// `KmsDataKeyReusePeriodSeconds`: "the length of time, in seconds, for which Amazon SQS
+/// can reuse a data key to encrypt or decrypt messages before calling KMS again."
+pub const KMS_DATA_KEY_REUSE_PERIOD_SECONDS: &str = "KmsDataKeyReusePeriodSeconds";
+
+/// The documented default of [`KMS_DATA_KEY_REUSE_PERIOD_SECONDS`]: "an integer
+/// representing seconds, between 60 seconds (1 minute) and 86,400 seconds (24 hours).
+/// Default: 300 (5 minutes)." It is the period a KMS key is used under, so it is
+/// reported for a queue that is ON a KMS key.
+pub const DEFAULT_DATA_KEY_REUSE_PERIOD_SECONDS: &str = "300";
+
+/// The KMS action a producer performs on the queue's key: Amazon SQS generates the data
+/// key the message is encrypted under, which is the grant "you must have the
+/// `kms:GenerateDataKey` permission" names.
+pub const GENERATE_DATA_KEY_ACTION: &str = "kms:GenerateDataKey";
+
+/// The KMS action a consumer performs on the queue's key: the data key the message was
+/// encrypted under has to be decrypted before the body can be handed over.
+pub const DECRYPT_ACTION: &str = "kms:Decrypt";
+
+/// The condition key naming the service a KMS request was made THROUGH, which is how a
+/// key policy scopes a grant to one service's use of the key. Its value is the service's
+/// regional endpoint name.
+const VIA_SERVICE_CONDITION_KEY: &str = "kms:ViaService";
+
+/// The condition key naming the account whose principal is making the KMS request.
+const CALLER_ACCOUNT_CONDITION_KEY: &str = "kms:CallerAccount";
+
+/// The encryption context entry Amazon SQS seals a queue's messages under: the queue's
+/// own ARN, under the `aws:sqs:arn` key. A key policy may be conditioned on it, so the
+/// decision carries it.
+const QUEUE_ENCRYPTION_CONTEXT_KEY: &str = "kms:EncryptionContext:aws:sqs:arn";
+
+/// The customer master key a queue's attribute set puts it on, or `None` for a queue
+/// encrypted with an Amazon SQS owned key.
+///
+/// An empty value is no key: an empty `KmsMasterKeyId` is how a caller takes a queue off
+/// its KMS key, so nothing downstream treats the empty string as a key id.
+pub fn configured_master_key(attributes: &BTreeMap<String, String>) -> Option<&str> {
+    attributes
+        .get(KMS_MASTER_KEY_ID)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+/// Apply the exclusivity of the two encryption options to the attribute set a call would
+/// leave a queue carrying.
+///
+/// `carried` is that set — the queue's attributes with what this call supplied overlaid —
+/// and `supplied` is what the call itself named, which is what says WHICH option it
+/// chose: an attribute the call did not name chooses nothing.
+///
+/// * a call naming a `KmsMasterKeyId` puts the queue on that key, which takes it OFF the
+///   SQS-owned one — so the queue carries `SqsManagedSseEnabled` of `false`, and goes on
+///   carrying it once it is off the KMS key too: a queue taken off the SQS-owned key is
+///   not put back on it by dropping its KMS key;
+/// * a call clearing `KmsMasterKeyId` (an empty value) takes the queue off its KMS key,
+///   and with it the reuse period that key was used under;
+/// * a call enabling `SqsManagedSseEnabled` puts the queue on the SQS-owned key, so it
+///   takes the queue off any KMS key it was on, the reuse period included.
+pub fn apply_encryption_choice(
+    carried: &mut BTreeMap<String, String>,
+    supplied: &HashMap<String, String>,
+) {
+    match supplied.get(KMS_MASTER_KEY_ID) {
+        Some(key) if key.trim().is_empty() => {
+            carried.remove(KMS_MASTER_KEY_ID);
+            carried.remove(KMS_DATA_KEY_REUSE_PERIOD_SECONDS);
+        }
+        Some(_) => {
+            carried.insert(SQS_MANAGED_SSE_ENABLED.to_string(), "false".to_string());
+        }
+        None => {
+            if supplied
+                .get(SQS_MANAGED_SSE_ENABLED)
+                .is_some_and(|value| value == "true")
+            {
+                carried.remove(KMS_MASTER_KEY_ID);
+                carried.remove(KMS_DATA_KEY_REUSE_PERIOD_SECONDS);
+            }
+        }
+    }
+}
+
+/// Why a request naming BOTH encryption options cannot be served, or `None` when it names
+/// at most one of them.
+///
+/// "Only one server-side encryption option is supported per queue (for example, SSE-KMS or
+/// SSE-SQS)" (the `SqsManagedSseEnabled` entry of the `Attributes` documentation), so a
+/// request that asks for a KMS key AND for the Amazon SQS owned key at once asks for
+/// something no queue can be. Amazon SQS refuses it as an attribute NAME rather than an
+/// attribute value: each value on its own is one the attribute accepts, and what the
+/// request got wrong is naming the second attribute at all.
+pub fn encryption_choice_refusal(
+    supplied: &HashMap<String, String>,
+) -> Option<InvalidAttributeName> {
+    let names_a_key = supplied
+        .get(KMS_MASTER_KEY_ID)
+        .is_some_and(|key| !key.trim().is_empty());
+    let enables_sqs_managed = supplied
+        .get(SQS_MANAGED_SSE_ENABLED)
+        .is_some_and(|value| value == "true");
+    (names_a_key && enables_sqs_managed).then(|| InvalidAttributeName {
+        message: Some(format!(
+            "You can specify either {KMS_MASTER_KEY_ID} or {SQS_MANAGED_SSE_ENABLED}, \
+             but not both."
+        )),
+    })
+}
+
+/// Report the encryption a queue carrying `attributes` has, into the attribute map
+/// `reported` a queue reader answers with.
+///
+/// A queue is always on one of the two options, so `SqsManagedSseEnabled` is always
+/// reported: `true` for a queue on the Amazon SQS owned key, which is what a queue whose
+/// create named no encryption attribute is on, and `false` for a queue something took off
+/// it — a queue on a KMS key, and one that was on a KMS key and no longer is.
+///
+/// `KmsMasterKeyId` is reported only for a queue that is ON a KMS key, so a cleared key id
+/// is not reported at all. The data key reuse period is the period such a key is used
+/// under, so a queue on a KMS key reports it — the value the queue carries, else the
+/// documented default — and a queue on no KMS key reports only a value it actually
+/// carries, the attribute being one a caller may set either way.
+pub fn report(attributes: &BTreeMap<String, String>, reported: &mut BTreeMap<String, String>) {
+    match configured_master_key(attributes) {
+        Some(key) => {
+            reported.insert(KMS_MASTER_KEY_ID.to_string(), key.to_string());
+            reported.insert(SQS_MANAGED_SSE_ENABLED.to_string(), "false".to_string());
+            reported.insert(
+                KMS_DATA_KEY_REUSE_PERIOD_SECONDS.to_string(),
+                attributes
+                    .get(KMS_DATA_KEY_REUSE_PERIOD_SECONDS)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_DATA_KEY_REUSE_PERIOD_SECONDS.to_string()),
+            );
+        }
+        None => {
+            reported.remove(KMS_MASTER_KEY_ID);
+            let sse_sqs = attributes
+                .get(SQS_MANAGED_SSE_ENABLED)
+                .cloned()
+                .unwrap_or_else(|| "true".to_string());
+            reported.insert(SQS_MANAGED_SSE_ENABLED.to_string(), sse_sqs);
+        }
+    }
+}
+
+/// Why the queue's customer master key cannot be used for this call, in the KMS error
+/// class each operation answers with. The payload is the message, as KMS answered it.
+#[derive(Debug, Clone)]
+pub enum KeyRefusal {
+    /// The queue's `KmsMasterKeyId` resolves to no key — `KMS.NotFoundException`.
+    NotFound(String),
+    /// The key is disabled — `KMS.DisabledException`.
+    Disabled(String),
+    /// The key is in a state no cryptographic operation can use —
+    /// `KMS.InvalidStateException`.
+    InvalidState(String),
+    /// The key cannot encrypt or decrypt at all — `KMS.InvalidKeyUsageException`.
+    InvalidKeyUsage(String),
+    /// The caller holds no permission for the KMS action this call performs —
+    /// `KMS.AccessDeniedException`.
+    AccessDenied(String),
+}
+
+/// The service name KMS's own error metadata carries.
+const KMS_SERVICE_NAME: &str = "AWSKMS";
+
+/// The status KMS answers each of these refusals with, which is also the status the
+/// `Kms*` shapes this service relays them as carry.
+const KMS_REFUSAL_STATUS: u16 = 400;
+
+/// A refusal KMS answered, as the caller sees it: Amazon SQS does not word these refusals
+/// itself, it RELAYS what its KMS call failed with, so the message is KMS's own sentence
+/// followed by the metadata block an AWS error carries — the service that refused, the
+/// status, the error code, and the id of the request that was refused.
+///
+/// `code` is KMS's own error code for the class, which is not the `KMS.*` code this
+/// service answers with: the first names the shape KMS returned, the second the shape SQS
+/// relays it as.
+fn relayed(message: &str, code: &str) -> String {
+    format!(
+        "{message} (Service: {KMS_SERVICE_NAME}; Status Code: {KMS_REFUSAL_STATUS}; \
+         Error Code: {code}; Request ID: {}; Proxy: null)",
+        ::uuid::Uuid::new_v4()
+    )
+}
+
+/// Whether the queue at `queue_url` may have its key used for `action` on behalf of this
+/// request's caller — the step a send and a receive each run BEFORE they touch the
+/// message plane, so a call the key does not permit changes nothing.
+///
+/// `Ok(())` for a url that addresses no queue and for a queue on the Amazon SQS owned
+/// key: neither needs anything of KMS, and a url naming no queue is what the operation's
+/// own `QueueDoesNotExist` reports, out of the store it goes on to read.
+pub fn authorize_queue_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    queue_url: &str,
+    action: &str,
+) -> Result<(), KeyRefusal> {
+    let Some(store) = crate::state::service_state(engine) else {
+        return Ok(());
+    };
+    // The lock is released before KMS is consulted: nothing of this service's state is
+    // read or written while the decision is being made.
+    let configured = {
+        let state = store.lock();
+        state.queue_by_url(queue_url).and_then(|queue| {
+            queue
+                .master_key_id()
+                .map(|key| (queue.arn.clone(), key.to_string()))
+        })
+    };
+    let Some((queue_arn, master_key_id)) = configured else {
+        return Ok(());
+    };
+    let region = crate::state::request_region(ctx.parts());
+    authorize_master_key(engine, ctx, &region, &queue_arn, &master_key_id, action)
+}
+
+/// Whether the queue's customer master key may be used for `action` on behalf of this
+/// request's caller, which is what a send (generating a data key) and a receive
+/// (decrypting one) each need before they touch the message plane.
+///
+/// `master_key_id` is the queue's `KmsMasterKeyId` in any form KMS accepts — a key id, a
+/// key ARN, an alias or an alias ARN — `region` the Region the request is signed for, and
+/// `queue_arn` the queue whose messages the key seals, which is the encryption context a
+/// conditioned key policy is decided against.
+///
+/// `Ok(())` for a queue whose key KMS can use for this caller, and for a lookup that says
+/// nothing about the key (no KMS mounted beside this service). See the module docs for
+/// the rule.
+pub fn authorize_master_key<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    queue_arn: &str,
+    master_key_id: &str,
+    action: &str,
+) -> Result<(), KeyRefusal> {
+    let Some(kms) = kms_store::service_state(engine) else {
+        // Visible to an operator: a lookup nothing answered is accepted, so without
+        // this line it would be indistinguishable from a key KMS permitted.
+        ::tracing::warn!(
+            master_key_id,
+            action,
+            "no KMS service is mounted beside Amazon SQS; the queue's key is accepted"
+        );
+        return Ok(());
+    };
+    let key = {
+        let mut store = kms.lock();
+        let resolved = match store.resolve(region, master_key_id) {
+            kms_store::KeyRef::Found(key) => Some(KeySnapshot::of(key)),
+            // An identifier KMS cannot parse names no key either, and this service
+            // models no "invalid ARN" refusal, so it is reported as not found — the
+            // reading KMS's own `Encrypt`/`Decrypt` take of such an identifier.
+            kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => None,
+        };
+        match resolved {
+            Some(key) => key,
+            // "Amazon Web Services services use DescribeKey to create Amazon Web
+            // Services managed keys from a predefined Amazon Web Services alias with no
+            // key ID": a queue on `alias/aws/sqs` is on the Amazon Web Services managed
+            // key that alias names, and the first use of it is what associates the two.
+            None => match kms_store::alias_named_by(region, master_key_id).and_then(|alias| {
+                store
+                    .associate_predefined_aws_alias(region, &alias)
+                    .map(KeySnapshot::of)
+            }) {
+                Some(key) => key,
+                None => {
+                    return Err(KeyRefusal::NotFound(relayed(
+                        &kms_store::key_not_found_message(region, master_key_id),
+                        "NotFoundException",
+                    )))
+                }
+            },
+        }
+    };
+
+    if key.state == kms_store::KEY_STATE_DISABLED {
+        return Err(KeyRefusal::Disabled(relayed(
+            &key.state_message,
+            "DisabledException",
+        )));
+    }
+    if !key.usable {
+        return Err(KeyRefusal::InvalidState(relayed(
+            &key.state_message,
+            "KMSInvalidStateException",
+        )));
+    }
+    // "For encrypting, decrypting, re-encrypting, and generating data keys, the KeyUsage
+    // must be ENCRYPT_DECRYPT", and a data key is generated under a symmetric encryption
+    // key, so a key that is neither cannot seal this queue's messages.
+    if !key.encrypt_decrypt {
+        return Err(KeyRefusal::InvalidKeyUsage(relayed(
+            &format!(
+                "{} cannot be used to encrypt or decrypt a message; its KeyUsage must be \
+                 {} and its key spec a symmetric encryption spec.",
+                key.arn,
+                kms_store::KEY_USAGE_ENCRYPT_DECRYPT
+            ),
+            "InvalidKeyUsageException",
+        )));
+    }
+    // An Amazon Web Services managed key's policy is managed by AWS for the service that
+    // owns the alias, so the caller needs no grant of its own on it.
+    if key.aws_managed {
+        return Ok(());
+    }
+
+    let caller = caller(engine, ctx);
+    let context = [
+        (
+            VIA_SERVICE_CONDITION_KEY.to_string(),
+            format!("{}.{region}.amazonaws.com", crate::state::ARN_SERVICE),
+        ),
+        (
+            CALLER_ACCOUNT_CONDITION_KEY.to_string(),
+            caller.account.clone(),
+        ),
+        (
+            QUEUE_ENCRYPTION_CONTEXT_KEY.to_string(),
+            queue_arn.to_string(),
+        ),
+    ];
+    match withheld_by(&key, &caller, action, &context) {
+        None => Ok(()),
+        // The sentence IAM gives for a principal that may not perform an action on a
+        // resource: who asked, what for, on what, and which document withheld it.
+        Some(reason) => Err(KeyRefusal::AccessDenied(relayed(
+            &format!(
+                "User: {} is not authorized to perform: {action} on resource: {} {reason}",
+                caller.arn, key.arn
+            ),
+            "AccessDeniedException",
+        ))),
+    }
+}
+
+/// Which document withholds `action` on the key from `caller`, as the reason clause the
+/// refusal states, or `None` when the key lets the call through.
+fn withheld_by(
+    key: &KeySnapshot,
+    caller: &Caller,
+    action: &str,
+    context: &[(String, String)],
+) -> Option<String> {
+    let request = iam::Request::new(action, &key.arn, &caller.principals).with_context(context);
+    // The account's own published credential holds no IAM policies, and a principal
+    // carrying a document this emulator cannot read may hold the grant: neither is judged
+    // on documents at all — the position the account's administrator is in — so neither is
+    // refused on evidence nobody has.
+    if caller.account_credential || caller.unreadable_attachment {
+        return None;
+    }
+    let stated = iam::resource_decision(&key.policy, &request);
+    if stated == Decision::Denied {
+        return Some("with an explicit deny in a resource-based policy".to_string());
+    }
+    if stated == Decision::Allowed {
+        return None;
+    }
+    // "The default key policy ... gives the Amazon Web Services account that owns the KMS
+    // key permission to use it in all cryptographic operations": a statement naming the
+    // account root does not grant to a principal, it hands the decision to that account's
+    // own identity-based policies. The root is spelled as the KEY's account, so a key
+    // policy delegating to another account's IAM does not delegate to this caller's.
+    let delegates = key.account_root().is_some_and(|root| {
+        iam::resource_decision(
+            &key.policy,
+            &iam::Request::new(action, &key.arn, &root).with_context(context),
+        ) == Decision::Allowed
+    });
+    if !delegates || caller.account != key.account {
+        return Some(format!(
+            "because no resource-based policy allows the {action} action"
+        ));
+    }
+    match iam::identity_decision(&caller.documents, &request) {
+        Decision::Allowed => None,
+        Decision::Denied => {
+            Some("with an explicit deny in an identity-based policy".to_string())
+        }
+        Decision::NotStated => Some(format!(
+            "because no identity-based policy allows the {action} action"
+        )),
+    }
+}
+
+/// Everything a KMS access decision is made about the key itself, taken out of the KMS
+/// store so the decision is made without its lock held.
+#[derive(Debug, Clone)]
+struct KeySnapshot {
+    /// The key's ARN: the resource a policy statement's `Resource` names, and what a
+    /// refusal names.
+    arn: String,
+    /// The account that owns the key.
+    account: String,
+    /// The key's `KeyState`.
+    state: String,
+    /// How KMS words a refusal caused by that key state.
+    state_message: String,
+    /// Whether the key can be used in a cryptographic operation at all right now.
+    usable: bool,
+    /// Whether the key is a symmetric encryption key, which is the only kind a data key
+    /// is generated under.
+    encrypt_decrypt: bool,
+    /// Whether AWS manages the key, and therefore its policy.
+    aws_managed: bool,
+    /// The key's key policy document.
+    policy: String,
+}
+
+impl KeySnapshot {
+    fn of(key: &kms_store::Cmk) -> Self {
+        Self {
+            arn: key.arn.clone(),
+            account: key.aws_account_id.clone(),
+            state: key.key_state.clone(),
+            state_message: kms_store::invalid_state_message(key),
+            usable: key.is_usable(),
+            encrypt_decrypt: key.key_usage == kms_store::KEY_USAGE_ENCRYPT_DECRYPT
+                && key.is_symmetric_encryption(),
+            aws_managed: key.key_manager != kms_store::KEY_MANAGER_CUSTOMER,
+            policy: key.policy.clone(),
+        }
+    }
+
+    /// The principal spellings a key policy delegating to IAM names: the owning
+    /// account's root user, and the account id, which IAM reads as that same root.
+    fn account_root(&self) -> Option<Vec<String>> {
+        let partition = ::service_common::arn::parse(&self.arn)?.partition.to_string();
+        Some(vec![
+            format!("arn:{partition}:iam::{}:root", self.account),
+            self.account.clone(),
+        ])
+    }
+}
+
+/// The principal a request speaks for, with everything the decision is made from.
+#[derive(Debug, Clone)]
+struct Caller {
+    /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
+    arn: String,
+    /// The account the principal belongs to.
+    account: String,
+    /// Every spelling of the principal: the session ARN STS reports, and the ARN of the
+    /// IAM role behind an assumed-role session.
+    principals: Vec<String>,
+    /// The identity-based policy documents in force on the principal.
+    documents: Vec<String>,
+    /// Set when this request presents the account's own published credential, which holds
+    /// no IAM policies.
+    account_credential: bool,
+    /// Set when the principal has a policy attached whose document the IAM store does not
+    /// hold — an AWS-managed policy, which is owned by AWS rather than by the account.
+    unreadable_attachment: bool,
+}
+
+/// The principal this request speaks for, and the identity-based policies in force on it.
+///
+/// The same three sources every service in this tree that authorizes reads: STS's own
+/// caller resolver for a session credential, the IAM store's access key map for a
+/// long-term key, and the account's own published credential for a key neither holds.
+fn caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Caller {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let identity = match sts_store::service_state(engine) {
+        Some(sts) => sts_store::resolve_caller(
+            &mut sts.lock(),
+            &access_key_id,
+            SystemTime::now(),
+            ctx.credential_store(),
+        ),
+        // No STS store on this engine: the only identity a request can present is the
+        // account's own published credential.
+        None => Ok(sts_store::ambient_identity()),
+    };
+    let identity = match identity {
+        Ok(identity) => identity,
+        // The session credential has expired, so it speaks for nobody: it carries no
+        // documents and no principal spelling, and every action it asks for is refused.
+        Err(expired) => {
+            return Caller {
+                arn: format!("an expired session credential ({})", expired.access_key_id),
+                account: String::new(),
+                principals: Vec::new(),
+                documents: Vec::new(),
+                account_credential: false,
+                unreadable_attachment: false,
+            }
+        }
+    };
+
+    let mut caller = Caller {
+        account_credential: identity.arn == sts_store::ambient_identity().arn,
+        principals: vec![identity.arn.clone()],
+        arn: identity.arn,
+        account: identity.account,
+        documents: Vec::new(),
+        unreadable_attachment: false,
+    };
+    let Some(iam) = iam_store::service_state(engine) else {
+        return caller;
+    };
+    let store = iam.lock();
+    // A LONG-TERM access key: STS's store holds SESSIONS, so its answer for a key it
+    // never minted is the account's ambient identity — but IAM's store maps an access key
+    // id to the user that owns it, so a request signed with one speaks for THAT user and
+    // is judged on the user's policies.
+    if caller.account_credential {
+        if let Some(user) = store
+            .access_keys
+            .get(&access_key_id)
+            .and_then(|record| store.users.get(&record.user_key))
+        {
+            caller.account_credential = false;
+            caller.arn = user.arn.clone();
+            caller.principals = vec![user.arn.clone()];
+        }
+    }
+    // The documents in force on the principal: its inline policies and the default
+    // versions of the managed policies attached to it, whichever kind of principal it is —
+    // a grant in an attachment is a grant whether it is a role's or a user's.
+    let (inline, attached) = if let Some(role_name) = assumed_role_name(&caller.arn) {
+        let role_key = iam_store::name_key(role_name);
+        // A key policy may name the ROLE rather than the session, so both spellings of the
+        // principal are presented to the decision.
+        if let Some(held) = store.roles.get(&role_key) {
+            caller.principals.push(held.arn.clone());
+        }
+        (
+            inline_documents(&store.role_inline_policies, &role_key),
+            store.role_attached_policies.get(&role_key),
+        )
+    } else if let Some(user_name) = iam_user_name(&caller.arn) {
+        let user_key = iam_store::name_key(user_name);
+        (
+            inline_documents(&store.user_inline_policies, &user_key),
+            store.user_attached_policies.get(&user_key),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    caller.documents.extend(inline);
+    for attachment in attached.into_iter().flatten() {
+        match store
+            .policy_by_arn(attachment)
+            .and_then(default_version_document)
+        {
+            Some(document) => caller.documents.push(document),
+            // Only an AWS-MANAGED policy is a grant this emulator cannot read: an
+            // attachment naming a customer-managed policy the account does not hold grants
+            // nothing, because the account is the authority on its own.
+            None if is_aws_managed_policy(attachment) => caller.unreadable_attachment = true,
+            None => {}
+        }
+    }
+    caller
+}
+
+/// Whether `arn` names an AWS-MANAGED policy: one whose account segment is IAM's `aws`,
+/// so it belongs to AWS rather than to this account and the IAM store holds no document
+/// for it. Read through IAM's own ARN parser, so this service and IAM agree on what an
+/// AWS-managed policy ARN is.
+fn is_aws_managed_policy(arn: &str) -> bool {
+    iam_store::parse_policy_arn(arn)
+        .is_some_and(|policy| policy.account == iam_store::AWS_MANAGED_POLICY_ACCOUNT)
+}
+
+/// The role name an STS assumed-role session ARN names:
+/// `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`.
+fn assumed_role_name(arn: &str) -> Option<&str> {
+    let resource = arn_resource(arn, "sts")?;
+    let tail = resource.strip_prefix("assumed-role/")?;
+    let name = tail.split('/').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The user name an IAM user ARN names: the LAST segment of `user/<path…>/<name>`, since
+/// the path is optional and only the last segment is the name.
+fn iam_user_name(arn: &str) -> Option<&str> {
+    let resource = arn_resource(arn, "iam")?;
+    let name = resource.strip_prefix("user/")?.split('/').next_back()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The resource part of an ARN whose service segment is `service`.
+fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    (parsed.vendor == service).then_some(parsed.resource)
+}
+
+/// The inline policy documents one entity holds, from the IAM store's
+/// `<entity> -> <policy name> -> policy` map.
+fn inline_documents(
+    policies: &BTreeMap<String, BTreeMap<String, iam_store::InlinePolicy>>,
+    entity_key: &str,
+) -> Vec<String> {
+    policies
+        .get(entity_key)
+        .map(|held| {
+            held.values()
+                .map(|policy| policy.policy_document.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The document of a managed policy's DEFAULT version — the one in force on every entity
+/// it is attached to. `None` when the store holds no document for it.
+fn default_version_document(managed: &iam_store::ManagedPolicy) -> Option<String> {
+    let default = managed.policy.default_version_id.as_deref();
+    managed
+        .versions
+        .values()
+        .find(|version| default.is_some() && version.version_id.as_deref() == default)
+        .or_else(|| {
+            managed
+                .versions
+                .values()
+                .find(|version| version.is_default_version)
+        })
+        .and_then(|version| version.document.clone())
+}
