@@ -221,8 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled not-found fault for a value that names no instance in the request's
 /// region, worded as this service words it in a report (`DescribeDBInstances` answers
-/// "DBInstance <name> not found." where the mutating operations answer "DB instance not
-/// found: <name>").
+/// "DBInstance <name> not found.", as do `StopDBInstance` and `StartDBInstance`, where
+/// `ModifyDBInstance` answers "DB instance not found: <name>" — RDS words this fault per
+/// operation, and each handler answers the wording recorded for it).
 fn not_found(named: &str) -> DescribeValidDBInstanceModificationsError {
     DescribeValidDBInstanceModificationsErrorModeled::DBInstanceNotFoundFault(
         DBInstanceNotFoundFault {

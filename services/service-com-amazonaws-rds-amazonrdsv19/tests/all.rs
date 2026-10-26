@@ -79,6 +79,8 @@ mod existence_and_parameter_guards;
 mod export_tasks;
 #[path = "all/global_clusters.rs"]
 mod global_clusters;
+#[path = "all/lifecycle_poll_loops.rs"]
+mod lifecycle_poll_loops;
 #[path = "all/modify_custom_db_engine_version.rs"]
 mod modify_custom_db_engine_version;
 #[path = "all/modify_event_subscription.rs"]

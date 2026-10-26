@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +105,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The statuses a start moves a DB instance through, and the one it is accepted from.
+///
+/// Starting is not instantaneous on the real service — the instance reports `starting`
+/// while the database engine comes up and `available` once it is up — so the accepted
+/// start reports the transient status and the clock owes the settled one
+/// ([`crate::state::STATUS_TRANSITION_DELAY`] later). A caller that reads straight after
+/// this call therefore still sees `starting`, exactly as it would against RDS. All three
+/// are the crate's own definitions, so this operation and `StopDBInstance` cannot
+/// disagree about the statuses they hand each other.
+use crate::state::{
+    DB_INSTANCE_STATUS_AVAILABLE, DB_INSTANCE_STATUS_STARTING, DB_INSTANCE_STATUS_STOPPED,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -195,18 +199,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDBInstance"))
+        let region = crate::state::request_region(ctx).map_err(StartDBInstanceError::validation)?;
+        // `DBInstanceIdentifier` names "the user-supplied instance identifier", which RDS
+        // stores as a lowercase string, so the lookup folds the way the stored key does.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never a start
+        // nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this start is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // The instance this call ADDRESSES is resolved FIRST: a resource that does not
+        // exist has no start for the other members to qualify, and the operation models
+        // `DBInstanceNotFoundFault` for exactly this. RDS is regional, so only the region
+        // the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&key) else {
+            return Err(StartDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    // The wording is the one the recorded instance-lifecycle flow shows
+                    // for the start and stop of a DB instance ("DBInstance <id> not
+                    // found."), and the name is the request's. It is this PAIR of
+                    // operations' wording, not one phrasing for the whole fault: RDS words
+                    // the same fault differently elsewhere, which is why
+                    // `ModifyDBInstance` keeps the wording ITS recording shows.
+                    message: Some(format!("DBInstance {identifier} not found.")),
+                },
+            )
+            .into());
+        };
+
+        // "This command doesn't apply to RDS Custom, Aurora MySQL, and Aurora
+        // PostgreSQL": an instance of one of those engines has no individual start at
+        // all, whatever status it is in, so it is the modelled instance state fault rather
+        // than a start this emulator invented for it.
+        if !crate::state::has_instance_level_start_stop(&instance.engine) {
+            let engine = instance.engine.clone();
+            return Err(StartDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} runs engine {engine}, which can't be \
+                         started with StartDBInstance"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "For Aurora DB clusters, use StartDBCluster instead": an instance that BELONGS
+        // to a DB cluster has no running state of its own to start — the cluster's start
+        // is what starts its members — so starting one individually is refused with the
+        // cluster state fault this operation models.
+        if let Some(cluster_identifier) = instance.db_cluster_identifier.clone() {
+            return Err(StartDBInstanceErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is a member of DB cluster \
+                         {cluster_identifier} and can't be started individually; start the \
+                         DB cluster instead"
+                    )),
+                },
+            )
+            .into());
+        }
+        // This operation "starts an Amazon RDS DB instance that was stopped", so there has
+        // to be a stopped instance to start: one still coming up, already running, on its
+        // way out or still shutting down cannot take a start. The status the clock has yet
+        // to settle is real.
+        if instance.status != DB_INSTANCE_STATUS_STOPPED {
+            let status = instance.status.clone();
+            return Err(StartDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is not stopped, so it can't be started \
+                         (status {status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `DBCapacityReservationIdentifier` names "the identifier or the name of the DB
+        // capacity reservation for the DB instance to use after it starts". No operation of
+        // this emulator mints a DB capacity reservation
+        // (`CreateDBCapacityReservation` is still a scaffold), so no name can resolve to
+        // one and the modelled not-found fault is the honest answer — never a start that
+        // silently ignores the reservation the caller asked for.
+        if let Some(reservation) = &input.db_capacity_reservation_identifier {
+            return Err(
+                StartDBInstanceErrorModeled::DBCapacityReservationNotFoundFault(
+                    DBCapacityReservationNotFoundFault {
+                        message: Some(format!("DBCapacityReservation {reservation} not found.")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = store
+            .db_instances
+            .get_mut(&key)
+            .expect("the instance was found above and the store is locked");
+        // The start is accepted: the instance reports `starting` now and the clock owes it
+        // `available`. Nothing else about the record changes — a stop "retains the DB
+        // instance's metadata, including its endpoint, DB parameter group, and option
+        // group membership", so the started instance reads back exactly as it did before
+        // it was stopped, bar its status.
+        record.status = DB_INSTANCE_STATUS_STARTING.to_string();
+        record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+            DB_INSTANCE_STATUS_AVAILABLE,
+        ));
+        Ok(StartDBInstanceOutput {
+            db_instance: Some(record.to_wire()),
+        })
     }
 }

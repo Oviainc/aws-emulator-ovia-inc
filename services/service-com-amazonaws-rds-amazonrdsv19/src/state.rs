@@ -168,6 +168,24 @@ pub const DB_CLUSTER_AUTOMATED_BACKUP_STATUS_ACTIVE: &str = "active";
 /// the instance is removed [`STATUS_TRANSITION_DELAY`] later, and then it is not found.
 pub const DB_INSTANCE_STATUS_DELETING: &str = "deleting";
 
+/// The status a DB instance reports while it is running, and the one both an accepted
+/// `StartDBInstance` and an accepted `RebootDBInstance` settle it on.
+pub const DB_INSTANCE_STATUS_AVAILABLE: &str = "available";
+
+/// The status an accepted `StopDBInstance` reports while the database engine shuts down.
+/// Transient: the clock owes [`DB_INSTANCE_STATUS_STOPPED`] [`STATUS_TRANSITION_DELAY`]
+/// later.
+pub const DB_INSTANCE_STATUS_STOPPING: &str = "stopping";
+
+/// The status of a DB instance whose stop has run its course, and the one status a
+/// `StartDBInstance` is accepted from.
+pub const DB_INSTANCE_STATUS_STOPPED: &str = "stopped";
+
+/// The status an accepted `StartDBInstance` reports while the database engine comes up.
+/// Transient: the clock owes [`DB_INSTANCE_STATUS_AVAILABLE`]
+/// [`STATUS_TRANSITION_DELAY`] later.
+pub const DB_INSTANCE_STATUS_STARTING: &str = "starting";
+
 /// The ARN namespace and sigv4 signing name of this service, as its Smithy model's
 /// `aws.api#service` trait declares them (`arnNamespace: rds`).
 const ARN_NAMESPACE: &str = "rds";
@@ -4510,6 +4528,27 @@ pub const DEFAULT_MAX_RECORDS: usize = 100;
 /// branch on (`aurora-mysql`, `aurora-postgresql`).
 pub fn is_aurora(engine: &str) -> bool {
     engine.to_ascii_lowercase().starts_with("aurora")
+}
+
+/// The engine prefixes an instance-level start or stop does not apply to, from the
+/// documentation `StartDBInstance` and `StopDBInstance` share: "This command doesn't
+/// apply to RDS Custom, Aurora MySQL, and Aurora PostgreSQL. For Aurora DB clusters,
+/// use StartDBCluster / StopDBCluster instead."
+///
+/// RDS Custom is every `custom-` engine of [`DB_INSTANCE_ENGINES`], and Aurora MySQL and
+/// Aurora PostgreSQL are its two `aurora-` engines, so the rule is carried as the two
+/// prefixes rather than as a list a further engine of either family would fall out of.
+const ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_START_OR_STOP: [&str; 2] = ["aurora-", "custom-"];
+
+/// Whether an instance running `engine` can be started and stopped on its own, as
+/// opposed to only through its DB cluster — see
+/// [`ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_START_OR_STOP`]. One predicate for both
+/// operations, so the two cannot disagree about which engines they apply to.
+pub fn has_instance_level_start_stop(engine: &str) -> bool {
+    let engine = engine.to_ascii_lowercase();
+    !ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_START_OR_STOP
+        .iter()
+        .any(|prefix| engine.starts_with(prefix))
 }
 
 /// The documented default for `PubliclyAccessible` when the request omits it.

@@ -97,32 +97,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The status a DB instance reports once a stop has been accepted for it, and the one it
-/// reaches when the stop has run.
+/// The statuses a stop moves a DB instance through, and the one it is accepted from.
 ///
 /// Stopping is not instantaneous on the real service — the instance reports `stopping`
 /// while it shuts down and `stopped` once it is down — so the accepted stop reports the
 /// transient status and the clock owes the settled one
 /// ([`crate::state::STATUS_TRANSITION_DELAY`] later). A caller that reads straight after
-/// this call therefore still sees `stopping`, exactly as it would against RDS.
-const DB_INSTANCE_STATUS_STOPPING: &str = "stopping";
-
-/// The status of a DB instance whose stop has run its course. `StartDBInstance` is what
-/// takes it back out of this status.
-const DB_INSTANCE_STATUS_STOPPED: &str = "stopped";
-
-/// The one status a stop is accepted from: stopping shuts the database engine down, so
-/// there has to be a running engine to shut down. Every other status — one the clock has
-/// yet to settle included — is the modelled state fault.
-const DB_INSTANCE_STATUS_AVAILABLE: &str = "available";
-
-/// The engine prefixes this operation does not apply to, from its own documentation:
-/// "This command doesn't apply to RDS Custom, Aurora MySQL, and Aurora PostgreSQL. For
-/// Aurora clusters, use StopDBCluster instead." RDS Custom is every `custom-` engine of
-/// [`crate::state::DB_INSTANCE_ENGINES`], and Aurora MySQL and Aurora PostgreSQL are its
-/// two `aurora-` engines, so the rule is carried as the two prefixes rather than as a
-/// list a further engine of either family would fall out of.
-const ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_STOP: [&str; 2] = ["aurora-", "custom-"];
+/// this call therefore still sees `stopping`, exactly as it would against RDS. All three
+/// are the crate's own definitions, so this operation and `StartDBInstance` cannot
+/// disagree about the statuses they hand each other: stopping shuts the database engine
+/// down, so a stop is accepted only from `available`, and every other status — one the
+/// clock has yet to settle included — is the modelled state fault.
+use crate::state::{
+    DB_INSTANCE_STATUS_AVAILABLE, DB_INSTANCE_STATUS_STOPPED, DB_INSTANCE_STATUS_STOPPING,
+};
 
 /// The longest a `DBSnapshotIdentifier` may be, as the member's own constraints state
 /// ("Must contain from 1 to 255 letters, numbers, or hyphens") — the same bound
@@ -226,7 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(instance) = store.db_instances.get(&key) else {
             return Err(StopDBInstanceErrorModeled::DBInstanceNotFoundFault(
                 DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance not found: {identifier}")),
+                    // The wording is the one the recorded instance-lifecycle flow shows
+                    // for the stop and start of a DB instance ("DBInstance <id> not
+                    // found."), and the name is the request's — the same wording
+                    // `StartDBInstance` answers, since the two are one flow's pair of
+                    // verbs. RDS words this fault differently in other operations, which
+                    // is why `ModifyDBInstance` keeps the wording ITS recording shows.
+                    message: Some(format!("DBInstance {identifier} not found.")),
                 },
             )
             .into());
@@ -248,10 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // PostgreSQL": an instance of one of those engines has no individual stop at all,
         // whatever status it is in, so it is the modelled instance state fault rather than
         // a stop this emulator invented for it.
-        if ENGINE_PREFIXES_WITHOUT_AN_INSTANCE_STOP
-            .iter()
-            .any(|prefix| instance.engine.starts_with(prefix))
-        {
+        if !crate::state::has_instance_level_start_stop(&instance.engine) {
             let engine = instance.engine.clone();
             return Err(StopDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
