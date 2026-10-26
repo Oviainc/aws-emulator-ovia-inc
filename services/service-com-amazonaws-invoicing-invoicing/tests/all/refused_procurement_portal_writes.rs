@@ -17,16 +17,25 @@
 //! Each test is a table rather than one request: the rows span the refusal classes this
 //! plane answers (the two validation calls, the configuration update, the status update
 //! and a conflicting create — 400 and 409 alike), the portals a preference can route to,
-//! and the ORDER refusals and successful writes arrive in.
+//! the ORDER refusals and successful writes arrive in, and — for the validation flow,
+//! whose refusal keeps a failed-attempt count of its own — whether a validation code is
+//! OUTSTANDING when the submitted one is refused. That last state no wire call of this
+//! emulator can reach, because `SendProcurementPortalValidation` cannot confirm delivery
+//! of the test e-invoice and so issues no code, so the code is issued through the state
+//! the verify reads (as `retired_units_and_portal_validation.rs` does).
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
+use service_com_amazonaws_invoicing_invoicing::state::{
+    self, ComAmazonawsInvoicingInvoicingState, IssuedPortalValidation,
+};
+
 /// Every value `ProcurementPortalName` accepts (`smithy_query(query="shape",
 /// shape="ProcurementPortalName")`).
-const PORTAL_NAMES: &[&str] = &["ZIP", "SAP_BUSINESS_NETWORK", "JAGGAER", "COUPA"];
+pub(crate) const PORTAL_NAMES: &[&str] = &["ZIP", "SAP_BUSINESS_NETWORK", "JAGGAER", "COUPA"];
 
 /// The portal whose Marketplace PunchOut configuration the model documents as required
 /// (`MarketplacePunchOutPreference`: "Required for Coupa when MarketplacePunchOutEnabled
@@ -38,21 +47,39 @@ const PORTAL_REQUIRING_PUNCH_OUT_CONFIG: &str = "COUPA";
 /// shape="ProcurementPortalPreferenceStatus")`).
 const STATUS_ACTIVE: &str = "ACTIVE";
 
+/// How many submissions of a validation code a refusal of this service counts against —
+/// the budget AWS's recorded refusal states.
+const VERIFICATION_ATTEMPT_BUDGET: u32 = 3;
+
+/// How many times a row repeats its refused submission: past that budget, so a row
+/// crosses it and the rule under test still holds.
+const REPEATED_SUBMISSIONS: u32 = 4;
+
 /// A router carrying only this service, over one shared engine — the same assembly the
-/// production router performs, minus the other services.
-fn emulator() -> MultiServiceRouter {
+/// production router performs, minus the other services. The engine is handed back for
+/// the one thing no wire carries: the validation code the portal flow issues.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signing is the router's concern, not this slice's: drive the operations unsigned.
     router.set_request_authentication(false);
     router.register_service(service_com_amazonaws_invoicing_invoicing::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
+}
+
+/// The same router, when the test has no reason to reach state.
+fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
 }
 
 /// One awsJson1_0 request, returning the HTTP status and the parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -73,7 +100,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The same call, asserting it succeeded.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -95,7 +122,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `ProcurementPortalPreferenceArn` of a response that carries one.
-fn arn_of(body: &Value) -> String {
+pub(crate) fn arn_of(body: &Value) -> String {
     body.get("ProcurementPortalPreferenceArn")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a ProcurementPortalPreferenceArn in {body}"))
@@ -109,7 +136,7 @@ fn contact(name: &str) -> Value {
 
 /// A create request for the portal and buyer/supplier pair that identify a preference,
 /// carrying only the members the model marks required.
-fn minimal_create(portal: &str, buyer: &str, supplier: &str) -> Value {
+pub(crate) fn minimal_create(portal: &str, buyer: &str, supplier: &str) -> Value {
     json!({
         "ProcurementPortalName": portal,
         "BuyerDomain": "NetworkID",
@@ -123,7 +150,7 @@ fn minimal_create(portal: &str, buyer: &str, supplier: &str) -> Value {
 }
 
 /// The preference `arn` names, as `GetProcurementPortalPreference` reports it.
-async fn get_preference(router: &MultiServiceRouter, arn: &str) -> Value {
+pub(crate) async fn get_preference(router: &MultiServiceRouter, arn: &str) -> Value {
     let body = ok(
         router,
         "GetProcurementPortalPreference",
@@ -611,5 +638,325 @@ async fn the_version_counts_the_successful_writes_only() {
                 step.label
             );
         }
+    }
+}
+
+/// Make a validation code outstanding for `arn`, as a CONFIRMED delivery of the test
+/// e-invoice would.
+///
+/// `SendProcurementPortalValidation` cannot confirm that delivery in this emulator — it
+/// performs no outbound delivery and hosts no procurement portal, so the send answers the
+/// modelled 400 (one of the refusal rows above). A suite that needs a code that IS
+/// outstanding issues it through the state the verify reads, from the same generator the
+/// service mints one with.
+pub(crate) fn issue_code(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
+    let handle = engine.state::<ComAmazonawsInvoicingInvoicingState>();
+    let mut store = handle.lock();
+    let code = store.issue_portal_validation_code();
+    let issued_at = state::now();
+    store
+        .procurement_portal_preferences
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("case issue a code: {arn} must name a created preference"))
+        .validation = Some(IssuedPortalValidation {
+        code: code.clone(),
+        issued_at,
+        verified_at: None,
+    });
+    code
+}
+
+/// The validation code this service issued for `arn` and has not seen back yet, read from
+/// state because no modelled response carries it.
+pub(crate) fn outstanding_code(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<String> {
+    engine
+        .state::<ComAmazonawsInvoicingInvoicingState>()
+        .lock()
+        .procurement_portal_preferences
+        .get(arn)
+        .and_then(|stored| stored.validation.as_ref())
+        .filter(|validation| validation.verified_at.is_none())
+        .map(|validation| validation.code.clone())
+}
+
+/// `code` with every digit shifted by one — a copy of an issued code that is wrong in
+/// every position, so a refusal of it is not about the code's shape.
+pub(crate) fn shifted(code: &str) -> String {
+    code.chars()
+        .map(|digit| {
+            char::from_digit((digit.to_digit(10).unwrap_or_default() + 1) % 10, 10).unwrap_or('0')
+        })
+        .collect()
+}
+
+/// The whole sentence a refused submission of a validation code carries: it states that
+/// the code is not valid and WHICH attempt failed out of the budget, and past the budget
+/// it points at the call that issues a fresh code instead of inviting another try.
+fn invalid_code_sentence(attempt: u32) -> String {
+    let budget = VERIFICATION_ATTEMPT_BUDGET;
+    let tail = if attempt < budget {
+        "Please try again."
+    } else {
+        "Request a new validation code with SendProcurementPortalValidation."
+    };
+    format!("The code you entered is invalid. Attempt {attempt} of {budget} failed. {tail}")
+}
+
+/// A configuration update that SUCCEEDS, naming its contact after `round` so successive
+/// writes are distinguishable.
+pub(crate) fn accepted_update_round(arn: &str, round: i64) -> Value {
+    json!({
+        "ProcurementPortalPreferenceArn": arn,
+        "Contacts": contact(&format!("Updated Contact {round}")),
+        "EinvoiceDeliveryEnabled": true,
+        "PurchaseOrderRetrievalEnabled": true,
+    })
+}
+
+/// The text of a failure body, under either key an error of this service may travel with.
+fn error_text(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One row of the validation-flow table: a preference reached through a chosen number of
+/// successful writes, with or without an outstanding code, and the wrong code submitted
+/// against it.
+struct RejectedCode {
+    label: &'static str,
+    portal: &'static str,
+    /// How many SUCCESSFUL configuration writes follow the create, which is what the
+    /// reported version counts on top of it.
+    writes_after_create: i64,
+    /// Whether those writes are status updates rather than configuration updates, so both
+    /// writing operations are exercised as the thing the version counts.
+    write_with_status_update: bool,
+    /// Whether a code is outstanding when the wrong code is submitted.
+    issue_a_code: bool,
+    /// The wrong code, built from the issued one when there is one.
+    wrong_code: fn(Option<&str>) -> String,
+}
+
+/// Each row's wrong code, named once here so a row is just a combination.
+fn a_shifted_copy_of_the_issued_code(issued: Option<&str>) -> String {
+    issued.map(shifted).unwrap_or_else(|| "000000".to_string())
+}
+
+fn a_longer_code(_issued: Option<&str>) -> String {
+    "12345678".to_string()
+}
+
+fn a_non_digit_code(_issued: Option<&str>) -> String {
+    "not-a-code".to_string()
+}
+
+fn a_one_character_code(_issued: Option<&str>) -> String {
+    "7".to_string()
+}
+
+/// The rows: both outstanding-code states, at several version counts, across the portals
+/// the enum admits and the forms a submitted code can be wrong in.
+fn rejected_code_rows() -> Vec<RejectedCode> {
+    vec![
+        RejectedCode {
+            label: "no code outstanding, straight after the create",
+            portal: PORTAL_NAMES[0],
+            writes_after_create: 0,
+            write_with_status_update: false,
+            issue_a_code: false,
+            wrong_code: a_shifted_copy_of_the_issued_code,
+        },
+        RejectedCode {
+            label: "no code outstanding, after one configuration update",
+            portal: PORTAL_NAMES[1],
+            writes_after_create: 1,
+            write_with_status_update: false,
+            issue_a_code: false,
+            wrong_code: a_non_digit_code,
+        },
+        RejectedCode {
+            label: "a code outstanding, straight after the create",
+            portal: PORTAL_NAMES[2],
+            writes_after_create: 0,
+            write_with_status_update: false,
+            issue_a_code: true,
+            wrong_code: a_shifted_copy_of_the_issued_code,
+        },
+        RejectedCode {
+            label: "a code outstanding, after one status update",
+            portal: PORTAL_NAMES[3],
+            writes_after_create: 1,
+            write_with_status_update: true,
+            issue_a_code: true,
+            wrong_code: a_longer_code,
+        },
+        RejectedCode {
+            label: "a code outstanding, after two configuration updates",
+            portal: PORTAL_NAMES[0],
+            writes_after_create: 2,
+            write_with_status_update: false,
+            issue_a_code: true,
+            wrong_code: a_one_character_code,
+        },
+        RejectedCode {
+            label: "no code outstanding, after two configuration updates",
+            portal: PORTAL_NAMES[2],
+            writes_after_create: 2,
+            write_with_status_update: false,
+            issue_a_code: false,
+            wrong_code: a_longer_code,
+        },
+    ]
+}
+
+/// RULE (the same one, over the state the validation flow keeps): a submitted validation
+/// code that is REFUSED writes no configuration, so the preference a reader reports —
+/// `Version` and `LastUpdateDate` with it — stays exactly where the last successful write
+/// left it, however many submissions are refused; the failed-attempt count the refusal
+/// states is service-side bookkeeping no modelled member carries, so it is what advances
+/// instead.
+///
+/// The rows add the dimension the table above cannot reach: whether a code really is
+/// outstanding when the submitted one is wrong, which is the OTP retry a client makes.
+#[tokio::test]
+async fn a_rejected_validation_code_writes_no_configuration() {
+    let (router, engine) = emulator_with_engine();
+
+    for (index, row) in rejected_code_rows().iter().enumerate() {
+        let buyer = format!("BUYER-REJECTED-{index}");
+        let supplier = format!("SUPPLIER-REJECTED-{index}");
+        let arn = arn_of(
+            &ok(
+                &router,
+                "CreateProcurementPortalPreference",
+                &minimal_create(row.portal, &buyer, &supplier),
+            )
+            .await,
+        );
+
+        // Reach the version this row submits its wrong code at, through the calls that
+        // really do write the configuration.
+        for round in 0..row.writes_after_create {
+            if row.write_with_status_update {
+                ok(
+                    &router,
+                    "UpdateProcurementPortalPreferenceStatus",
+                    &json!({
+                        "ProcurementPortalPreferenceArn": arn,
+                        "EinvoiceDeliveryPreferenceStatus": STATUS_ACTIVE,
+                    }),
+                )
+                .await;
+            } else {
+                ok(
+                    &router,
+                    "PutProcurementPortalPreference",
+                    &accepted_update_round(&arn, round),
+                )
+                .await;
+            }
+        }
+
+        let issued = row.issue_a_code.then(|| issue_code(&engine, &arn));
+        let before = get_preference(&router, &arn).await;
+        let before_summary = listed_summary(&router, &arn).await;
+        let expected_version = 1 + row.writes_after_create;
+        assert_eq!(
+            version(&before),
+            expected_version,
+            "case {}: the create and {} successful writes leave Version \
+             {expected_version}, got {before}",
+            row.label,
+            row.writes_after_create
+        );
+
+        let wrong = (row.wrong_code)(issued.as_deref());
+        assert_ne!(
+            Some(wrong.as_str()),
+            issued.as_deref(),
+            "case {}: the row's code has to be the wrong one, got {wrong:?}",
+            row.label
+        );
+
+        // Repeated past the attempt budget, because the defect this pins showed up as a
+        // version that drifted one step per refused submission: a client retrying an OTP
+        // must see no configuration change at all.
+        for attempt in 1..=REPEATED_SUBMISSIONS {
+            let (status, body) = call(
+                &router,
+                "VerifyProcurementPortalValidation",
+                &json!({"ProcurementPortalPreferenceArn": arn, "Code": wrong}),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {} attempt {attempt} with {wrong:?}: expected HTTP 400, got {status} {body}",
+                row.label
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {} attempt {attempt} with {wrong:?}: expected the modelled \
+                 ValidationException, got {body}",
+                row.label
+            );
+            // The count the refusal states is the one thing a refused submission moves,
+            // and it is REPORTED rather than persisted into the resource.
+            assert_eq!(
+                error_text(&body),
+                invalid_code_sentence(attempt),
+                "case {} attempt {attempt} with {wrong:?}: the refusal states which \
+                 attempt failed out of the budget, got {body}",
+                row.label
+            );
+
+            let after = get_preference(&router, &arn).await;
+            assert_eq!(
+                after, before,
+                "case {} attempt {attempt} with {wrong:?}: a refused code must leave every \
+                 reported member as it was, got {after}",
+                row.label
+            );
+            let after_summary = listed_summary(&router, &arn).await;
+            assert_eq!(
+                after_summary, before_summary,
+                "case {} attempt {attempt} with {wrong:?}: the listing must report the same \
+                 summary, got {after_summary}",
+                row.label
+            );
+            assert_eq!(
+                outstanding_code(&engine, &arn),
+                issued,
+                "case {} attempt {attempt} with {wrong:?}: a refused code neither issues \
+                 nor retires one",
+                row.label
+            );
+        }
+
+        // The configuration the refusals left untouched is still writable, and THAT write
+        // is what advances the version — so the rule is not "this resource stopped
+        // versioning".
+        ok(
+            &router,
+            "PutProcurementPortalPreference",
+            &accepted_update_round(&arn, row.writes_after_create + 1),
+        )
+        .await;
+        let after_write = get_preference(&router, &arn).await;
+        assert_eq!(
+            version(&after_write),
+            expected_version + 1,
+            "case {}: the successful write after the refusals advances Version by exactly \
+             one, got {after_write}",
+            row.label
+        );
+        assert!(
+            last_update(&after_write) >= last_update(&before),
+            "case {}: that write stamps the instant it changed at, got {after_write}",
+            row.label
+        );
     }
 }

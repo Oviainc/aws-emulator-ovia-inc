@@ -39,6 +39,8 @@ mod procurement_portal_suppliers;
 mod procurement_portals;
 #[path = "all/refused_procurement_portal_writes.rs"]
 mod refused_procurement_portal_writes;
+#[path = "all/rejected_validation_code_keeps_the_version.rs"]
+mod rejected_validation_code_keeps_the_version;
 #[path = "all/retired_units_and_portal_validation.rs"]
 mod retired_units_and_portal_validation;
 #[path = "all/state_roundtrip.rs"]
