@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let (site_id, sequence) = store.mint_id("os");
+        let (site_id, sequence) = store.mint_id(crate::state::SITE_ID_PREFIX);
         let site_arn = crate::state::site_arn(&region, &site_id);
         let (country_code, state_or_region, city) =
             crate::state::operating_address_projection(input.operating_address.as_ref());

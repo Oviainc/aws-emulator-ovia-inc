@@ -177,16 +177,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `OutpostIdentifier` is optional: "If not specified, the quote is created
         // without an Outpost association." When it IS named it accepts the bare id
-        // or the full Outpost ARN, both naming the same stored Outpost.
+        // or the full Outpost ARN. A bare id names an Outpost of the inventory this
+        // endpoint serves; an ARN carries a partition, a Region and an account of its
+        // own, and one that is not this endpoint's names no Outpost it holds — so
+        // there is no Outpost here for the quote to be associated with.
         let outpost_identifier = crate::state::non_empty(input.outpost_identifier);
         let outpost_id = match outpost_identifier.as_deref() {
-            Some(identifier) => {
-                Some(crate::state::resolve_outpost_id(identifier).ok_or_else(|| {
-                    CreateQuoteErrorModeled::ValidationException(ValidationException {
-                        message: Some(crate::state::outpost_identifier_pattern_report()),
-                    })
-                })?)
-            }
+            Some(identifier) => Some(
+                crate::state::resolve_outpost_id(identifier, &region)
+                    .ok_or_else(|| {
+                        CreateQuoteErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::outpost_identifier_pattern_report()),
+                        })
+                    })?
+                    .here()
+                    .ok_or_else(|| {
+                        CreateQuoteErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::identifier_not_found(
+                                crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                                identifier,
+                            )),
+                        })
+                    })?
+                    .to_string(),
+            ),
             None => None,
         };
 
@@ -238,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let (quote_id, sequence) = store.mint_id("oq");
+        let (quote_id, sequence) = store.mint_id(crate::state::QUOTE_ID_PREFIX);
         // The configuration-and-pricing options this service answers the requested
         // capacity with, and the checks an order submitted from the quote has to
         // satisfy. Both are derived HERE, from the configuration this request
