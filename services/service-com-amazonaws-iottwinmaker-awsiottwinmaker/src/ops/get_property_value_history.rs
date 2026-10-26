@@ -798,9 +798,8 @@ fn selected_properties(
             )));
         }
         if !crate::state::property_is_time_series(definition) {
-            return Err(invalid(format!(
-                "selectedProperties {property_name} is not a time series property, so it has no \
-                 value history"
+            return Err(invalid(crate::state::property_not_time_series_message(
+                property_name,
             )));
         }
     }

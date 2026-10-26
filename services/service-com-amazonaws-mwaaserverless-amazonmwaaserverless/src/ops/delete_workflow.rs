@@ -12,7 +12,11 @@
 //! execution history"), so the record is not dropped inside the request: it reports
 //! the modelled `WorkflowStatus` `DELETING` and the clock owes its removal
 //! `crate::state::WORKFLOW_DELETED_AFTER` later, which every handler materialises
-//! through `crate::state::…::reap_deleted_workflows`. An ARN (or a version) the store
+//! through `crate::state::…::reap_deleted_workflows`. The executions of what is
+//! being removed are stopped as part of that cleanup — every unfinished run of the
+//! workflow (or, for a version-scoped delete, of that version) enters the
+//! `STOPPING` -> `STOPPED` shutdown `StopWorkflowRun` describes. An ARN (or a
+//! version) the store
 //! does not hold is the modelled `ResourceNotFoundException`, answered with the status
 //! the recorded service answers it with and naming the entity that did not resolve
 //! (see `crate::state::unresolved`).
@@ -261,6 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // this request: it moves to `DELETING` and the clock owes its removal
             // (`crate::state::WORKFLOW_DELETED_AFTER` later), which is what makes
             // the modelled `DELETING` status observable to a describe or a list.
+            // The running executions of what is being removed are stopped as part
+            // of that cleanup (`crate::state::Workflow::stop_runs`), so no run of a
+            // definition on its way out keeps progressing on its pre-delete
+            // schedule.
             let last_version_left = workflow.versions.len() <= 1;
             match requested {
                 // No version named: every version goes, so the whole record goes.
@@ -269,8 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(_) if last_version_left => workflow.begin_deletion(now),
                 Some(version) => {
                     // One version of several is a change to the workflow, not its
-                    // teardown: that version goes now and the workflow stays.
+                    // teardown: that version goes now and the workflow stays. What
+                    // goes with it is what the cleanup covers — the executions of
+                    // THAT version, and no run of a version this delete keeps.
                     workflow.versions.retain(|rec| rec.version != version);
+                    workflow.stop_runs(Some(version), now);
                     // Deleting the latest version promotes the newest one left, which
                     // is what the workflow then reports as its current configuration.
                     if !workflow.versions.iter().any(|rec| rec.is_latest) {

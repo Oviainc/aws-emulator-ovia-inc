@@ -38,18 +38,21 @@ use smithy_server_runtime::MultiServiceRouter;
 /// Read member by member rather than tag by tag, so each summary's logical id stays
 /// paired with its own physical id, status and timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WireSummary {
-    logical_id: Option<String>,
+pub(crate) struct WireSummary {
+    pub(crate) logical_id: Option<String>,
     physical_id: Option<String>,
-    resource_type: Option<String>,
-    status: Option<String>,
-    status_reason: Option<String>,
-    last_updated: Option<String>,
+    pub(crate) resource_type: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) status_reason: Option<String>,
+    pub(crate) last_updated: Option<String>,
     drift_status: Option<String>,
 }
 
 /// Every `StackResourceSummary` in a `ListStackResources` response, in wire order.
-fn wire_summaries(xml: &str) -> Vec<WireSummary> {
+///
+/// Shared with `rolled_back_resource_records.rs`, which drains the pages of one stack's
+/// summaries the same way.
+pub(crate) fn wire_summaries(xml: &str) -> Vec<WireSummary> {
     let Some(start) = xml.find("<StackResourceSummaries>") else {
         return Vec::new();
     };
@@ -87,7 +90,7 @@ fn wire_summaries(xml: &str) -> Vec<WireSummary> {
     summaries
 }
 
-async fn list_stack_resources(
+pub(crate) async fn list_stack_resources(
     router: &MultiServiceRouter,
     members: &[(String, String)],
 ) -> (u16, String) {

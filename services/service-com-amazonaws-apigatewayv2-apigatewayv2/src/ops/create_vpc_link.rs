@@ -186,6 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // Links whose deprovisioning the clock already finished are no longer held by
+        // the account, so they are dropped before the quota is counted: a gone link
+        // occupies no slot.
+        store.purge_deprovisioned_vpc_links();
+
         // Bound the growth a caller drives: API Gateway's published quota is 10 VPC
         // links per account per Region, and `TooManyRequestsException` is the modelled
         // error for "a limit has been exceeded" (it carries the limit's name in
@@ -216,6 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // record is due to become available one span from now: a transition the
             // CLOCK owes, stored as its due instant rather than slept for.
             available_at: ::std::time::Instant::now() + crate::state::VPC_LINK_CREATE_SPAN,
+            // Nothing has asked for this link to go away yet.
+            deprovisioned_at: ::std::option::Option::None,
         };
 
         // `vpc_link_id` comes from the store's own id bijection, so it names no existing

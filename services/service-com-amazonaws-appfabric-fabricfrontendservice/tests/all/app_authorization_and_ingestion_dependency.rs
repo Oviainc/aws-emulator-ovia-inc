@@ -218,7 +218,7 @@ pub(crate) async fn stop_ingestion(emulator: &Emulator, bundle: &str, ingestion:
         .await
 }
 
-async fn create_destination(
+pub(crate) async fn create_destination(
     emulator: &Emulator,
     bundle: &str,
     ingestion: &str,

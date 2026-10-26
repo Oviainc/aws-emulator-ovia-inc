@@ -753,26 +753,44 @@ async fn a_statement_naming_only_a_session_runs_on_that_session_s_connection() {
     );
 
     // A SessionId no session carries names no connection at all.
-    for request in [
-        json!({"SessionId": "3dc6a4b5-5e2b-4b5a-9f1d-6b6d2b6c7a8e", "Sql": "SELECT 1"}),
-        json!({
-            "SessionId": "3dc6a4b5-5e2b-4b5a-9f1d-6b6d2b6c7a8e",
-            "ClusterIdentifier": "my-cluster",
-            "Database": "dev",
-            "Sql": "SELECT 1",
-        }),
-    ] {
-        let (status, response) = emulator.call("ExecuteStatement", &request).await;
-        assert_eq!(
-            status, 404,
-            "case {request}: a SessionId naming no session is not found, got {status} {response}"
-        );
-        assert_eq!(
-            error_code(&response),
-            "ResourceNotFoundException",
-            "case {request}: expected ResourceNotFoundException, got {response}"
-        );
-    }
+    let (status, response) = emulator
+        .call(
+            "ExecuteStatement",
+            &json!({"SessionId": "3dc6a4b5-5e2b-4b5a-9f1d-6b6d2b6c7a8e", "Sql": "SELECT 1"}),
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "a SessionId naming no session is not found, got {status} {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {response}"
+    );
+
+    // And a session named BESIDE a warehouse names two targets, which is
+    // refused before any session is looked up at all.
+    let (status, response) = emulator
+        .call(
+            "ExecuteStatement",
+            &json!({
+                "SessionId": "3dc6a4b5-5e2b-4b5a-9f1d-6b6d2b6c7a8e",
+                "ClusterIdentifier": "my-cluster",
+                "Database": "dev",
+                "Sql": "SELECT 1",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "a session beside a cluster names two targets, got {status} {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ValidationException",
+        "expected ValidationException, got {response}"
+    );
 
     // The session this suite opened is still the only one, so nothing above
     // created one on the way past.

@@ -318,11 +318,9 @@ fn plan_entry(
         )));
     }
     if !crate::state::property_is_time_series(definition) {
-        return Err(invalid_entry(format!(
-            "Property {property_name} of component {} of entity {} is not a time series \
-             property.",
-            addressed.component_name, addressed.entity_id
-        )));
+        return Err(invalid_entry(
+            crate::state::property_not_time_series_message(property_name),
+        ));
     }
 
     let requested = entry.property_values.as_deref().unwrap_or_default();

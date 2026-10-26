@@ -2,8 +2,8 @@
 
 //! @op ListConnectors
 //!
-//! Enumerates the stored connectors as `ConnectorSummary` records in ARN order, honouring
-//! `MaxResults` and the opaque `NextToken` this service mints.
+//! Enumerates the connectors of the Region the request was signed for, as `ConnectorSummary`
+//! records in ARN order, honouring `MaxResults` and the opaque `NextToken` this service mints.
 //!
 //! ## Shape of an operation
 //!
@@ -158,16 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional, so a listing reports the connectors of the Region the
+        // request was signed for and no others.
+        let region = crate::state::request_region(ctx);
 
         // A `NextToken` this service never minted names no position to resume from. The
         // operation models no pagination-specific error, and `ValidationException`'s own
-        // doc names "an invalid pagination token" as one of its cases.
-        let after = crate::state::decode_cursor(
-            crate::state::CURSOR_SCOPE_CONNECTORS,
-            input.next_token.as_deref(),
-        )
+        // doc names "an invalid pagination token" as one of its cases. The cursor is scoped
+        // to this Region's listing, so a token another Region's endpoint minted names no
+        // position here.
+        let scope = crate::state::cursor_scope_connectors(&region);
+        let after = crate::state::decode_cursor(&scope, input.next_token.as_deref())
         .map_err(|_| {
             ListConnectorsErrorModeled::ValidationException(ValidationException {
                 message: "Invalid pagination token: it was not issued by this service"
@@ -182,16 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let ordered: Vec<(String, ConnectorSummary)> = store
-            .connectors
-            .iter()
+            .connectors_in(&region)
             .map(|(arn, connector)| (arn.clone(), connector.to_summary()))
             .collect();
-        let page = crate::state::page_of(
-            crate::state::CURSOR_SCOPE_CONNECTORS,
-            ordered,
-            after.as_deref(),
-            input.max_results,
-        );
+        let page = crate::state::page_of(&scope, ordered, after.as_deref(), input.max_results);
 
         Ok(ListConnectorsOutput {
             connectors: Some(page.items),

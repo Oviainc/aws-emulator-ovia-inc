@@ -133,7 +133,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{to_timestamp, Statement};
+use crate::state::{to_timestamp, Statement, UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -219,13 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialise_due_transitions();
         let Some(statement) = store.statement(&input.id) else {
-            return Err(DescribeStatementErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Query does not exist: {}", input.id),
-                    resource_id: input.id.clone(),
-                },
-            )
-            .into());
+            return Err(no_such_query(&input.id));
         };
 
         Ok(DescribeStatementOutput {
@@ -274,6 +268,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_mode: Some(statement.execution_mode().to_string()),
         })
     }
+}
+
+/// Refuse an `Id` this service holds no query for.
+///
+/// The missing-resource error the Data API carries this refusal in, in the fixed
+/// words it states for every reader of a statement — no part of the id reaches
+/// the message — served at the status the service answers this path with
+/// ([`UNKNOWN_QUERY_STATUS`]) rather than at the shape's own `@httpError`.
+fn no_such_query(id: &str) -> DescribeStatementError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        DescribeStatementErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: UNKNOWN_QUERY_MESSAGE.to_string(),
+            resource_id: id.to_string(),
+        }),
+        UNKNOWN_QUERY_STATUS,
+    )
 }
 
 /// One entry of `SubStatements`: one statement of a batch, reported from what

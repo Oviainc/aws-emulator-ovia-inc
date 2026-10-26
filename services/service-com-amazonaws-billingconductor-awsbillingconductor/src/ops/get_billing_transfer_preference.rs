@@ -167,14 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let transfer_arn = input.responsibility_transfer_arn;
 
-        // The transfer has to be one of THIS organization's: its ARN carries the
-        // management account of the organization that owns it, and the only organization
-        // this store can answer for is the one whose management account it records as
-        // the payer (see `crate::state::transfer_belongs_to_this_organization`). An ARN
-        // owned by any other account names a transfer this organization does not have,
-        // which is this operation's modelled 404 — "The request references a resource
-        // that doesn't exist."
-        if !state.transfer_belongs_to_this_organization(&transfer_arn) {
+        // The transfer has to be one this organization HAS. A billing transfer is an AWS
+        // Organizations resource whose ARN names its whole identity — the management
+        // account, the organization, the direction and the transfer id — and Billing
+        // Conductor creates none, so a transfer exists here only when the store holds a
+        // record of it (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::billing_transfer`).
+        // An ARN that conforms to the pattern but names no transfer the organization has
+        // is this operation's modelled 404 — "The request references a resource that
+        // doesn't exist."
+        if !state.billing_transfer_exists(&transfer_arn) {
             return Err(GetBillingTransferPreferenceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: "the billing transfer does not exist".to_string(),

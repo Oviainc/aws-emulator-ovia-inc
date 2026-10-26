@@ -1676,16 +1676,119 @@ pub struct BillingTransferPreferenceRecord {
     pub last_modified_time_millis: i64,
 }
 
-/// The account segment of a `ResponsibilityTransferArn`: the management account of the
-/// organization that owns the billing transfer.
+/// ONE billing transfer of an organization, as its `ResponsibilityTransferArn` spells it.
 ///
-/// The modelled pattern spells a billing transfer as an AWS Organizations resource ARN
-/// (`^arn:[a-z0-9][a-z0-9-.]{0,62}:organizations::\d{12}:transfer/o-…`), whose account
-/// segment is the organization's management account — the fifth colon-separated field,
-/// the same position [`parse_taggable_arn`] reads an account id from.
-pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
-    arn.split(':').nth(4).filter(|account| !account.is_empty())
+/// A billing transfer is an AWS Organizations resource, and the modelled pattern spells
+/// its whole identity:
+/// `^arn:[a-z0-9][a-z0-9-.]{0,62}:organizations::\d{12}:transfer/o-[a-z0-9]{10,32}/(billing)/(inbound|outbound)/rt-[0-9a-z]{8,32}$`
+/// — the organization's management account, the organization, the direction the
+/// responsibility travels in and the transfer's own id. EVERY one of those segments is
+/// part of the identity, so two ARNs differing in any of them name two different
+/// transfers, and a store that holds one of them holds nothing about the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingTransferRecord {
+    /// The full ARN — this record's identity, and the key the store holds it under.
+    pub arn: String,
+    /// The account segment: the management account of the organization that owns the
+    /// transfer.
+    pub management_account_id: String,
+    /// The `o-…` organization id the transfer belongs to.
+    pub organization_id: String,
+    /// `inbound` or `outbound`: which way the billing responsibility travels.
+    pub direction: String,
+    /// The `rt-…` id of the transfer itself.
+    pub transfer_id: String,
 }
+
+/// Read a `ResponsibilityTransferArn` into the transfer it names, `None` when the value
+/// is not a billing transfer ARN at all.
+///
+/// Every segment the modelled pattern spells is checked here, because this is the point
+/// that decides what transfer a caller-supplied string names: the partition, the
+/// `organizations` service with its empty region, the 12-digit management account, and
+/// the `transfer/o-<organization>/billing/<direction>/rt-<id>` resource with the
+/// organization id, the billing direction and the transfer id the pattern bounds.
+pub fn parse_responsibility_transfer_arn(arn: &str) -> Option<BillingTransferRecord> {
+    let mut segments = arn.strip_prefix("arn:")?.splitn(5, ':');
+    let partition = segments.next()?;
+    let service = segments.next()?;
+    let region = segments.next()?;
+    let account = segments.next()?;
+    let resource = segments.next()?;
+    if !partition_is_modelled(partition) || service != TRANSFER_ARN_SERVICE || !region.is_empty() {
+        return None;
+    }
+    if account.len() != 12 || !account.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let mut parts = resource.split('/');
+    if parts.next()? != TRANSFER_RESOURCE_TYPE {
+        return None;
+    }
+    let organization_id = parts.next()?;
+    let transfer_type = parts.next()?;
+    let direction = parts.next()?;
+    let transfer_id = parts.next()?;
+    if parts.next().is_some() || transfer_type != TRANSFER_TYPE_BILLING {
+        return None;
+    }
+    if !bounded_lowercase_id(organization_id, "o-", 10, 32)
+        || !bounded_lowercase_id(transfer_id, "rt-", 8, 32)
+        || !TRANSFER_DIRECTIONS.contains(&direction)
+    {
+        return None;
+    }
+    Some(BillingTransferRecord {
+        arn: arn.to_string(),
+        management_account_id: account.to_string(),
+        organization_id: organization_id.to_string(),
+        direction: direction.to_string(),
+        transfer_id: transfer_id.to_string(),
+    })
+}
+
+/// Whether `partition` is a partition segment the modelled transfer pattern admits
+/// (`[a-z0-9][a-z0-9-.]{0,62}`): a lowercase alphanumeric first character, then up to 62
+/// more that may also be `-` or `.`.
+fn partition_is_modelled(partition: &str) -> bool {
+    let mut bytes = partition.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    partition.len() <= 63
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+        })
+}
+
+/// Whether `value` is `prefix` followed by `min..=max` lowercase alphanumerics — the form
+/// the modelled transfer pattern spells an organization id (`o-[a-z0-9]{10,32}`) and a
+/// transfer id (`rt-[0-9a-z]{8,32}`) in.
+fn bounded_lowercase_id(value: &str, prefix: &str, min: usize, max: usize) -> bool {
+    let Some(body) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    (min..=max).contains(&body.len())
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// The service segment a billing transfer's ARN carries: a transfer is an AWS
+/// Organizations resource, not one of this service's.
+const TRANSFER_ARN_SERVICE: &str = "organizations";
+
+/// The resource-type segment of a billing transfer's ARN.
+const TRANSFER_RESOURCE_TYPE: &str = "transfer";
+
+/// The one responsibility type the modelled pattern admits.
+const TRANSFER_TYPE_BILLING: &str = "billing";
+
+/// The directions a billing transfer runs in, as the modelled pattern enumerates them.
+const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 
 /// Per-service state for com-amazonaws-billingconductor-awsbillingconductor. A handler reaches it through [`service_state`].
 ///
@@ -1732,6 +1835,9 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 ///   item also carries the generations
 ///   of it that later writes superseded, at most [`MAX_CUSTOM_LINE_ITEM_VERSIONS`],
 ///   oldest dropped first.
+/// * `billing_transfers` holds one entry per billing transfer the organization has, at
+///   most [`MAX_BILLING_TRANSFERS`]; nothing in this API creates or deletes one, so a
+///   transfer past the cap is refused rather than recorded.
 /// * `billing_transfer_preferences` holds one entry per billing transfer whose
 ///   preference was set, at most [`MAX_BILLING_TRANSFER_PREFERENCES`]; nothing in this
 ///   API deletes a billing transfer, so that store evicts the oldest-set preference
@@ -1790,6 +1896,19 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// [`Self::billing_group_sizes_in`], so that cap and the one-live-membership
     /// invariant hold wherever a membership changes.
     pub account_associations: BTreeMap<String, Vec<AccountAssociationRecord>>,
+    /// The billing transfers THIS organization has, keyed by full `ResponsibilityTransferArn`,
+    /// at most [`MAX_BILLING_TRANSFERS`]. This is the set every operation that addresses a
+    /// billing transfer resolves one in, so a transfer no entry here names does not exist
+    /// as far as this store is concerned.
+    ///
+    /// A billing transfer is an AWS Organizations resource, and Billing Conductor creates
+    /// none: the transfers an organization has are whatever the Organizations surface
+    /// minted for it, so this map is empty until something records one, the same way
+    /// `payer_account_id` holds no account until something designates one. Private so a
+    /// handler cannot insert past the cap: reach it through
+    /// [`Self::billing_transfer`], [`Self::billing_transfer_exists`] and
+    /// [`Self::record_billing_transfer`].
+    billing_transfers: BTreeMap<String, BillingTransferRecord>,
     /// The auto billing group creation preference of every billing transfer that has
     /// one, keyed by its `ResponsibilityTransferArn`. At most
     /// [`MAX_BILLING_TRANSFER_PREFERENCES`]. Private so the cap below cannot be
@@ -1938,26 +2057,62 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .collect()
     }
 
-    /// Whether the billing transfer `arn` names is one of THIS organization's.
+    /// The billing transfer `arn` names, or `None` when this organization has no such
+    /// transfer.
     ///
-    /// A billing transfer is an AWS Organizations resource and its ARN carries the
-    /// management account of the organization that owns it
-    /// ([`responsibility_transfer_owner_account`]). Billing Conductor's control plane is
-    /// the payer (management) account's alone, so the one organization this store can
-    /// answer for is the one whose management account it records as the payer
-    /// ([`Self::payer_account_id`]): an ARN owned by any other account names a transfer
-    /// this organization does not have.
+    /// The whole ARN is the key, so every segment the modelled pattern spells — the
+    /// management account, the organization, the direction and the transfer id — has to
+    /// match a transfer the store holds. A pattern-conforming ARN is not a transfer.
     ///
     /// Fails CLOSED, like the authorization gate: a store that records no payer account
-    /// records no organization, so it owns no transfer.
-    pub fn transfer_belongs_to_this_organization(&self, arn: &str) -> bool {
-        match (
-            self.payer_account_id.as_deref(),
-            responsibility_transfer_owner_account(arn),
-        ) {
-            (Some(management), Some(owner)) => management == owner,
-            _ => false,
+    /// records no organization, so it owns no transfer, and a transfer whose management
+    /// account is not the payer belongs to another organization than the one this store
+    /// answers for.
+    pub fn billing_transfer(&self, arn: &str) -> Option<&BillingTransferRecord> {
+        let record = self.billing_transfers.get(arn)?;
+        if self.payer_account_id.as_deref() == Some(record.management_account_id.as_str()) {
+            Some(record)
+        } else {
+            None
         }
+    }
+
+    /// Whether this organization has the billing transfer `arn` names — the existence
+    /// decision behind the modelled `ResourceNotFoundException` of every operation that
+    /// addresses one. See [`Self::billing_transfer`].
+    pub fn billing_transfer_exists(&self, arn: &str) -> bool {
+        self.billing_transfer(arn).is_some()
+    }
+
+    /// Record a billing transfer the organization HAS, answering whether the store holds
+    /// it afterwards.
+    ///
+    /// This is the seam the transfer universe enters the store through: Billing Conductor
+    /// creates no billing transfer — an Organizations surface does — so the transfers this
+    /// store can answer for are the ones recorded here, and a value that is not a billing
+    /// transfer ARN at all records nothing. Recording an already-held transfer changes
+    /// nothing.
+    ///
+    /// A create past [`MAX_BILLING_TRANSFERS`] is REFUSED rather than served by evicting a
+    /// transfer, because a transfer the store forgot would start answering not-found for
+    /// a resource the organization still has.
+    pub fn record_billing_transfer(&mut self, arn: &str) -> bool {
+        let Some(record) = parse_responsibility_transfer_arn(arn) else {
+            return false;
+        };
+        if self.billing_transfers.contains_key(&record.arn) {
+            return true;
+        }
+        if self.billing_transfers.len() >= MAX_BILLING_TRANSFERS {
+            ::tracing::warn!(
+                responsibility_transfer_arn = %record.arn,
+                cap = MAX_BILLING_TRANSFERS,
+                "a billing transfer was not recorded: the store is at its cap"
+            );
+            return false;
+        }
+        self.billing_transfers.insert(record.arn.clone(), record);
+        true
     }
 
     /// Record a linked account that belongs to no billing group, so a later
@@ -2809,6 +2964,16 @@ fn idempotency_key(operation: &str, token: &str) -> String {
 /// a caller replaying a token it used long ago creates a new resource instead of
 /// growing this map without limit.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 1024;
+
+/// How many billing transfers of its organization this service remembers.
+///
+/// A CHOSEN bound, not an AWS limit: nothing in THIS API creates or deletes a billing
+/// transfer, so the set recorded through
+/// [`ComAmazonawsBillingconductorAwsbillingconductorState::record_billing_transfer`] is
+/// bounded by nothing this store can see. A transfer past the cap is refused rather than
+/// recorded, because evicting one would make the store answer not-found for a transfer
+/// the organization still has.
+pub const MAX_BILLING_TRANSFERS: usize = 1000;
 
 /// How many billing transfer preferences this service remembers.
 ///
