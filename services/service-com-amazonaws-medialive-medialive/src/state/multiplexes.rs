@@ -527,6 +527,23 @@ pub enum MultiplexProgramUpdateRefusal {
     Settings(MultiplexProgramSettingsRefusal),
 }
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::remove_multiplex_program`]
+/// deleted nothing. Each variant is one refusal `DeleteMultiplexProgram`
+/// models — the same set the update makes minus the ones only new settings can
+/// cause, since a delete carries no settings and no `ProgramNumber`.
+#[derive(Debug)]
+pub enum MultiplexProgramDeleteRefusal {
+    /// No multiplex in the store has the id the request named.
+    MultiplexNotFound,
+    /// The multiplex exists but holds no program of that `ProgramName`.
+    ProgramNotFound,
+    /// The multiplex the request named is going away (`DELETING`) or gone
+    /// (`DELETED`), so its programs are no longer a caller's to remove: a
+    /// delete has already been accepted for that id. Carries its current
+    /// `MultiplexState`, so the refusal can name it.
+    MultiplexGone(String),
+}
+
 /// The first `MultiplexProgramSettings` member whose value falls outside the
 /// range the model publishes for it, if any.
 ///
@@ -1508,6 +1525,63 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(())
     }
 
+    /// Take the program `program_name` out of the multiplex `multiplex_id`, or
+    /// refuse — answering with the program as it stood when the delete removed
+    /// it.
+    ///
+    /// A multiplex program has no lifecycle state of its own (the model
+    /// declares none), so a deleted program leaves the store rather than
+    /// staying behind in a terminal state the way a channel, an input or a
+    /// multiplex does: the multiplex's derived `ProgramCount` stops counting
+    /// it, a list stops reporting it and a describe of it is a not-found from
+    /// then on.
+    ///
+    /// The state check, the lookup and the removal live together here for the
+    /// same reason as in
+    /// [`ComAmazonawsMedialiveMedialiveState::update_multiplex_program`]: a
+    /// handler cannot check one rule and write past another. The refusals are
+    /// ordered outside in — the multiplex, then its state, then the program —
+    /// so a program of a multiplex that is going away is refused for the
+    /// MULTIPLEX whether or not that program exists.
+    ///
+    /// The description is taken BEFORE the removal, out of the state the
+    /// program is still in, because that is what the response reports; it also
+    /// means a program is never taken out without the caller being answered
+    /// with it.
+    pub fn remove_multiplex_program(
+        &mut self,
+        multiplex_id: &str,
+        program_name: &str,
+    ) -> Result<MultiplexProgram, MultiplexProgramDeleteRefusal> {
+        let multiplex = self
+            .multiplexes
+            .get(multiplex_id)
+            .ok_or(MultiplexProgramDeleteRefusal::MultiplexNotFound)?;
+        // A multiplex that is going away or gone carries no program a caller
+        // may still remove, the same state rule the create and the update
+        // apply.
+        if !multiplex.accepts_programs() {
+            return Err(MultiplexProgramDeleteRefusal::MultiplexGone(
+                multiplex.state.clone(),
+            ));
+        }
+
+        // The ONE lookup of the program itself: it is both the existence check
+        // and what the response reports, so there is no second, unreachable
+        // resolution of it.
+        let program = self
+            .multiplex_program_description(multiplex_id, program_name)
+            .ok_or(MultiplexProgramDeleteRefusal::ProgramNotFound)?;
+        // The id resolved a moment ago, so this reaches that same multiplex;
+        // a store that no longer held it would be the one refusal above rather
+        // than a panic.
+        let Some(multiplex) = self.multiplexes.get_mut(multiplex_id) else {
+            return Err(MultiplexProgramDeleteRefusal::MultiplexNotFound);
+        };
+        multiplex.programs.remove(program_name);
+        Ok(program)
+    }
+
     /// Record `token` as having created the program `program_name` of the
     /// multiplex `multiplex_id`, evicting the oldest token first if that would
     /// push the map past [`MAX_MULTIPLEX_PROGRAM_TOKENS`].
@@ -1771,6 +1845,27 @@ const MULTIPLEX_PROGRAM_KEY_SEPARATOR: char = '/';
 /// records a token against, read back by `multiplex_program_for_token`.
 fn multiplex_program_key(multiplex_id: &str, program_name: &str) -> String {
     format!("{multiplex_id}{MULTIPLEX_PROGRAM_KEY_SEPARATOR}{program_name}")
+}
+
+/// The message a refusal about a multiplex PROGRAM that is not there carries.
+///
+/// A program has no id of its own: it is identified by the multiplex it lives in
+/// together with its `ProgramName`, which is also how its URI names it
+/// (`/prod/multiplexes/{MultiplexId}/programs/{ProgramName}`). So the identifier
+/// a refusal about one names is that PAIR, and never the program name alone —
+/// which on its own names a program of every multiplex and of none. The
+/// composition is the one [`crate::state::not_found_message`] every not-found of
+/// this service is worded by.
+///
+/// One helper, so the four operations that resolve a program by that pair —
+/// `DescribeMultiplexProgram`, `UpdateMultiplexProgram`,
+/// `DeleteMultiplexProgram` and `UpdateMultiplex`'s `PacketIdentifiersMapping` —
+/// cannot word the same refusal four ways.
+pub fn multiplex_program_not_found_message(multiplex_id: &str, program_name: &str) -> String {
+    crate::state::not_found_message(
+        "Multiplex program",
+        &multiplex_program_key(multiplex_id, program_name),
+    )
 }
 
 /// Project a `Multiplex` onto one of the structurally identical per-operation

@@ -4495,6 +4495,50 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// Forget an IoT SiteWise Monitor project and the dashboards created in it.
+    ///
+    /// A dashboard is created IN a project and names that project on every read —
+    /// the create refuses a project this store does not hold — so one whose
+    /// project is gone could never have been created. The project's tags go with
+    /// its record, which owns them. The access policies that name the project are
+    /// left alone: a policy is a resource of its own, addressed by its own id and
+    /// removed by `DeleteAccessPolicy`.
+    ///
+    /// The one place this containment rule is stated: `DeleteProject` removes one
+    /// project through it and [`Self::forget_portal`] removes every project of a
+    /// portal through it, so the two cannot drift.
+    pub fn forget_project(&mut self, project_id: &str) -> Option<ProjectRecord> {
+        let record = self.projects.remove(project_id)?;
+        self.dashboards
+            .retain(|_, dashboard| dashboard.project_id != project_id);
+        Some(record)
+    }
+
+    /// Forget an IoT SiteWise Monitor portal and everything this service holds
+    /// only as a part of it: the projects created in it and the dashboards
+    /// created in those projects.
+    ///
+    /// A project is created IN a portal — the create refuses a portal this store
+    /// does not hold — so a portal the service no longer holds can leave none of
+    /// its projects addressable behind. Dropping them here is what keeps a later
+    /// read from resolving to a project or a dashboard whose portal is gone, the
+    /// same reason [`Self::forget_asset`] drops what is keyed off an asset. Each
+    /// project goes through [`Self::forget_project`], so a portal's delete and a
+    /// project's own delete take exactly the same things with them.
+    pub fn forget_portal(&mut self, portal_id: &str) -> Option<PortalRecord> {
+        let record = self.portals.remove(portal_id)?;
+        let projects: Vec<String> = self
+            .projects
+            .values()
+            .filter(|project| project.portal_id == portal_id)
+            .map(|project| project.id.clone())
+            .collect();
+        for project in projects {
+            self.forget_project(&project);
+        }
+        Some(record)
+    }
+
     /// Forget an asset model, its external-id entry and every interface
     /// relationship it stood on either side of.
     ///

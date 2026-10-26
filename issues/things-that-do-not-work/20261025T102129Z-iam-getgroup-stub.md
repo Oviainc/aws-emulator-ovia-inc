@@ -31,3 +31,11 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the iam emulator
 Call GetGroup and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status update
+`GetGroup` has since been implemented and its scaffold marker removed, as the reader the
+`DeleteGroup` fix (`20261025T102129Z-iam-deletegroup-stub.md`) proves a release through:
+the handler reports the stored `Group` and its member list, or `NoSuchEntity` for a name
+the account does not hold. The two units named above were NOT replayed by that fix, so
+this report stays open until its own fixer confirms them; the member list stays empty
+while `AddUserToGroup` persists no membership, which is that operation's own issue.

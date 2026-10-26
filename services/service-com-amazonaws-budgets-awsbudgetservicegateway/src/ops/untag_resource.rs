@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // Which resource the ARN names, resolved exactly as the tag-write and tag-read
+        // paths resolve it, so a tag is deleted from the resource it was written to. A
+        // string the model accepts as an `AmazonResourceName` but that is not an ARN of a
+        // resource this service holds is an input value this operation cannot act on,
+        // which is what `InvalidParameterException` ("Typically, the cause is an invalid
+        // input value") names, not a missing resource.
+        let target = crate::state::parse_resource_arn(&input.resource_arn).map_err(|message| {
+            UntagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
+        let held = crate::state::resource_tags_mut(&mut store, &target).ok_or_else(|| {
+            UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(match &target {
+                    crate::state::TaggedResource::Budget { .. } => {
+                        "Unable to untag resource: the budget the ResourceARN names doesn't \
+                         exist."
+                            .to_string()
+                    }
+                    crate::state::TaggedResource::Action { .. } => {
+                        "Unable to untag resource: the budget action the ResourceARN names \
+                         doesn't exist."
+                            .to_string()
+                    }
+                }),
+            })
+        })?;
+
+        // "Deletes tags associated with a budget or budget action resource": a key names
+        // at most one tag of the resource ("each key must be unique for the resource"),
+        // so naming the key is enough to delete that tag, and a key the resource does not
+        // carry leaves it in exactly the state the request asks for — there is nothing
+        // held under that key to delete. A key repeated in one request therefore states
+        // the same deletion twice rather than two conflicting ones, which is why this
+        // operation has no counterpart to the tag-write path's duplicate-key refusal.
+        // The tags that stay keep their order, so a read still reports them in the order
+        // their keys were created in.
+        crate::state::remove_tag_keys(held, &input.resource_tag_keys);
+        Ok(UntagResourceOutput {})
     }
 }

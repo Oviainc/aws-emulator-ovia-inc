@@ -69,6 +69,8 @@ mod single_package_association;
 mod state_roundtrip;
 #[path = "all/upgrade_history.rs"]
 mod upgrade_history;
+#[path = "all/upgrade_status.rs"]
+mod upgrade_status;
 #[path = "all/version_catalog.rs"]
 mod version_catalog;
 #[path = "all/vpc_endpoint_access.rs"]

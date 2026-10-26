@@ -672,13 +672,14 @@ fn resolve_series(
     let period_secs = query.period.unwrap_or(stat.period);
     check_period(period_secs)?;
 
+    let key = crate::state::MetricKey {
+        namespace: namespace.clone(),
+        metric_name: metric_name.clone(),
+        dimensions: crate::state::dimension_set(stat.metric.dimensions.as_deref()),
+    };
     let points = fold_series(
         store,
-        &crate::state::MetricKey {
-            namespace: namespace.clone(),
-            metric_name: metric_name.clone(),
-            dimensions: crate::state::dimension_set(stat.metric.dimensions.as_deref()),
-        },
+        &key,
         &stat.stat,
         stat.unit.as_deref(),
         period_secs,
@@ -691,7 +692,16 @@ fn resolve_series(
     // which is the label every read of one series reports it under.
     let label = query.label.clone().unwrap_or_else(|| metric_name.clone());
 
-    Ok(MathSeries::new(label, points))
+    // The series still IS this metric's series, which is what an anomaly detector is created
+    // for, so the identity it was retrieved under travels with it.
+    Ok(
+        MathSeries::new(label, points).of_metric(crate::state::metric_math::SeriesMetric {
+            namespace: key.namespace,
+            metric_name: key.metric_name,
+            dimensions: key.dimensions,
+            stat: stat.stat.clone(),
+        }),
+    )
 }
 
 /// One stored series folded into the `period`-wide windows of `[start, end)` by `statistic`.
@@ -1111,6 +1121,14 @@ impl crate::state::metric_math::SeriesSource for StoreSearch<'_> {
                             self.now,
                         ),
                     )
+                    // A discovered series is still that metric's series, so a band over the
+                    // one series a search found is drawn from its detector's model.
+                    .of_metric(crate::state::metric_math::SeriesMetric {
+                        namespace: key.namespace.clone(),
+                        metric_name: key.metric_name.clone(),
+                        dimensions: key.dimensions.clone(),
+                        stat: stat.to_string(),
+                    })
                 })
                 .collect(),
             // What the search COST its caller: every series of the store was matched against
@@ -1124,12 +1142,14 @@ impl crate::state::metric_math::SeriesSource for StoreSearch<'_> {
         &self,
         series: &MathSeries,
     ) -> Option<crate::state::metric_math::AnomalyModel> {
-        // The model is the DETECTOR's, and `PutAnomalyDetector` — the only operation that
-        // creates one — is scaffolded, so this store holds no detector to look up for any
-        // series and every lookup comes back empty. Once a detector is stored, the model it
-        // trained is read here and the band is drawn from it.
-        let _ = series;
-        None
+        // The model is the DETECTOR's: only a detector created for this metric and statistic
+        // trained one, so the metric the series was retrieved for is what the lookup is keyed
+        // on, under the identity the write that stored the detector was keyed by. A series
+        // computed from others is no metric's series and no detector's.
+        let metric = series.metric.as_ref()?;
+        let detector_id = crate::state::AnomalyDetectorForm::of_series_metric(metric).detector_id();
+        let stored = self.store.anomaly_detectors.get(&detector_id)?;
+        crate::state::anomaly_model_of(stored, &series.points, self.now)
     }
 }
 

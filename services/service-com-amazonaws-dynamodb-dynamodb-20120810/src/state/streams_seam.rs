@@ -234,9 +234,7 @@ pub fn publish_item_changes<Eng: Send + Sync + 'static>(
 ///
 /// The two services model the same `AttributeValue` union, but each generates its own
 /// type from its own model, so an image crossing the seam is rebuilt member for member
-/// rather than transmuted. Recursion is bounded by the nesting limit every image is
-/// held to before it is stored ([`crate::state::check_attribute_value`]), and the
-/// registry checks the same limit again on append.
+/// rather than transmuted.
 fn streams_image(
     image: &crate::state::Item,
 ) -> ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::AttributeMap {
@@ -247,29 +245,116 @@ fn streams_image(
 }
 
 /// One stored attribute value, as the STREAMS service's own `AttributeValue`.
+///
+/// ITERATIVE, over an explicit worklist, for the reason the streams store gives for
+/// its own walks over an image: `M` and `L` nest, and a recursive walk over a nesting
+/// depth a client chose overflows the thread stack — which in Rust aborts the process
+/// instead of unwinding. Every write path holds a value to
+/// [`crate::state::MAX_ATTRIBUTE_DEPTH`] before it is stored, and the registry checks
+/// the same limit again on append; this walk does not have to rely on either of them.
+///
+/// A nesting value is met twice: once to put its members on the worklist, and once to
+/// rebuild it from the members converted since. A map's names are CARRIED from the
+/// pass that pushed its members rather than read off the map a second time, so the
+/// pairing does not depend on two iterations of one map agreeing. The members of a
+/// container occupy the top of `converted` when it is rebuilt, in the reverse of the
+/// order they were pushed in, which is why each is read back reversed.
 fn streams_value(
-    value: &crate::ops::types::AttributeValue,
+    root: &crate::ops::types::AttributeValue,
 ) -> ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::AttributeValue {
     use crate::ops::types::AttributeValue as Stored;
     use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::AttributeValue as Published;
 
-    match value {
-        Stored::S(text) => Published::S(text.clone()),
-        Stored::N(number) => Published::N(number.clone()),
-        Stored::B(bytes) => Published::B(bytes.clone()),
-        Stored::Ss(members) => Published::Ss(members.clone()),
-        Stored::Ns(members) => Published::Ns(members.clone()),
-        Stored::Bs(members) => Published::Bs(members.clone()),
-        Stored::M(members) => Published::M(
-            members
-                .iter()
-                .map(|(name, nested)| (name.clone(), streams_value(nested)))
-                .collect(),
-        ),
-        Stored::L(members) => Published::L(members.iter().map(streams_value).collect()),
-        Stored::Null(is_null) => Published::Null(*is_null),
-        Stored::Bool(flag) => Published::Bool(*flag),
+    /// What the walk still owes: a value to convert, or a container to rebuild from
+    /// the members already converted — a map from the names its members were pushed
+    /// under, a list from how many it pushed.
+    enum Step<'a> {
+        Convert(&'a Stored),
+        RebuildMap(Vec<&'a String>),
+        RebuildList(usize),
     }
+
+    let mut worklist = vec![Step::Convert(root)];
+    let mut converted: Vec<Published> = Vec::new();
+    while let Some(step) = worklist.pop() {
+        match step {
+            Step::Convert(Stored::M(members)) => {
+                // ONE pass over the map: the names go on the rebuild step and their
+                // values on the worklist, in the same order.
+                let mut names = Vec::with_capacity(members.len());
+                let mut values = Vec::with_capacity(members.len());
+                for (name, nested) in members {
+                    names.push(name);
+                    values.push(nested);
+                }
+                worklist.push(Step::RebuildMap(names));
+                worklist.extend(values.into_iter().map(Step::Convert));
+            }
+            Step::Convert(Stored::L(members)) => {
+                worklist.push(Step::RebuildList(members.len()));
+                worklist.extend(members.iter().map(Step::Convert));
+            }
+            // Every other member holds no nested value, so it converts on its own.
+            Step::Convert(Stored::S(text)) => converted.push(Published::S(text.clone())),
+            Step::Convert(Stored::N(number)) => converted.push(Published::N(number.clone())),
+            Step::Convert(Stored::B(bytes)) => converted.push(Published::B(bytes.clone())),
+            Step::Convert(Stored::Ss(members)) => converted.push(Published::Ss(members.clone())),
+            Step::Convert(Stored::Ns(members)) => converted.push(Published::Ns(members.clone())),
+            Step::Convert(Stored::Bs(members)) => converted.push(Published::Bs(members.clone())),
+            Step::Convert(Stored::Null(is_null)) => converted.push(Published::Null(*is_null)),
+            Step::Convert(Stored::Bool(flag)) => converted.push(Published::Bool(*flag)),
+            Step::RebuildMap(names) => {
+                let nested = take_members(&mut converted, names.len());
+                converted.push(Published::M(
+                    names
+                        .into_iter()
+                        .cloned()
+                        .zip(nested.into_iter().rev())
+                        .collect(),
+                ));
+            }
+            Step::RebuildList(count) => {
+                let mut nested = take_members(&mut converted, count);
+                nested.reverse();
+                converted.push(Published::L(nested));
+            }
+        }
+    }
+    // The walk pushes exactly one value for the root, so this is it. A `NULL` stands in
+    // only for a state this construction cannot reach, rather than letting the seam
+    // panic inside a request that has already written its item; reaching it would be a
+    // defect in the walk above, so it is reported as one.
+    debug_assert_eq!(
+        converted.len(),
+        1,
+        "the walk leaves exactly the root's converted value"
+    );
+    converted.pop().unwrap_or_else(|| {
+        ::tracing::error!("an attribute value converted to no value for its stream record");
+        Published::Null(true)
+    })
+}
+
+/// The `count` values a container's members converted to, taken off the top of the
+/// walk's stack.
+///
+/// Every `Step::Convert` pushes exactly one value, so the top `count` are this
+/// container's. A shorter stack would be a defect in that invariant, so it is reported
+/// rather than silently truncating the container the caller is about to publish.
+fn take_members<T>(converted: &mut Vec<T>, count: usize) -> Vec<T> {
+    if converted.len() < count {
+        ::tracing::error!(
+            converted = converted.len(),
+            members = count,
+            "fewer converted values than the attribute's members"
+        );
+    }
+    debug_assert!(
+        converted.len() >= count,
+        "every member converts to exactly one value"
+    );
+    let from = converted.len().saturating_sub(count);
+    converted.split_off(from)
 }
 
 /// Turn a table's stream OFF in the DynamoDB Streams store.

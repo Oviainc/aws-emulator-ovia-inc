@@ -246,6 +246,12 @@ mod list_asset_models;
 mod list_pipelines;
 #[path = "all/logging_options.rs"]
 mod logging_options;
+// In the sorted list, in its alphabetical place beside the other portal suite,
+// rather than appended after the list: the END of this file is where every
+// concurrent iotsitewise change appends a declaration of its own, and each
+// append there collided with this one.
+#[path = "all/portal_delete.rs"]
+mod portal_delete;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
 #[path = "all/property_value_history.rs"]

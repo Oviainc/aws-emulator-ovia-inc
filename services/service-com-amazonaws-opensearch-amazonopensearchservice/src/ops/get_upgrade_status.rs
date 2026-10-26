@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUpgradeStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUpgradeStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUpgradeStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports where the most recent engine version upgrade — or upgrade eligibility check
+//! — of a domain has got to: the step it is performing and that step's status.
+//!
+//! The run reported on is the last [`crate::state::UpgradeRun`] `UpgradeDomain` recorded
+//! on the domain, and the step comes from [`crate::state::UpgradeRun::current_step`] —
+//! the same derivation `GetUpgradeHistory` reports every step of that run from, so a
+//! poll and the history cannot disagree about how far the run got.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUpgradeStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUpgradeStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUpgradeStatus"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "The domain of the domain to get upgrade status information for": the status
+        // belongs to the domain the request names, so a name the account holds no domain
+        // under has no status to report. Settling that domain is the only write this
+        // report makes, and it writes only what the clock already owed it at this
+        // instant had nobody called — the landing of an upgrade whose span has passed
+        // among them.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            GetUpgradeStatusErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // "The most recent status of the last upgrade or upgrade eligibility check
+        // performed on" the domain: a domain nothing has ever upgraded or checked has no
+        // such run, and every member of this response is optional — so there is nothing
+        // to report rather than a step some run is on.
+        let Some(run) = domain.latest_upgrade() else {
+            return Ok(GetUpgradeStatusOutput {
+                upgrade_step: None,
+                step_status: None,
+                upgrade_name: None,
+            });
+        };
+
+        // "One of three steps that an upgrade or upgrade eligibility check goes through"
+        // and "the status of the current step that an upgrade is on": the step the run is
+        // performing right now, which for a run whose span has passed is the last step it
+        // performed.
+        let current = run.current_step(now);
+        Ok(GetUpgradeStatusOutput {
+            upgrade_step: current.map(|(step, _)| step.to_string()),
+            step_status: current.map(|(_, status)| status.to_string()),
+            // "A string that describes the update": the same description
+            // `GetUpgradeHistory` reports this run under, so the two name one run
+            // identically.
+            upgrade_name: Some(run.upgrade_name()),
+        })
     }
 }

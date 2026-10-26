@@ -126,3 +126,5 @@ mod recorded_resource_arn;
 mod remediation_execution_failed_items;
 #[path = "all/resource_config_deletion.rs"]
 mod resource_config_deletion;
+#[path = "all/compliance_by_resource.rs"]
+mod compliance_by_resource;

@@ -209,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.clusters.contains_key(&input.cluster_arn) {
             return Err(CreateControlPanelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                    message: crate::state::not_found_message(
+                        crate::state::CLUSTER_NOUN,
+                        &input.cluster_arn,
+                    ),
                 },
             )
             .into());
