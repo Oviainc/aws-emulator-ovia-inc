@@ -368,6 +368,10 @@ pub const LAST_VPC_ASSOCIATION_MESSAGE: &str =
 /// value of Version is always 1."
 pub const FIRST_TRAFFIC_POLICY_VERSION: i32 = 1;
 
+/// The creation position the account's first traffic policy takes, which orders
+/// a listing of them (see [`StoredTrafficPolicy::created_position`]).
+pub const FIRST_TRAFFIC_POLICY_POSITION: u64 = 1;
+
 /// The highest version number one traffic policy can reach.
 ///
 /// `CreateTrafficPolicyVersion`'s own documentation: "You can create a maximum
@@ -1281,6 +1285,14 @@ pub struct StoredTrafficPolicy {
     pub id: String,
     /// The `Name` the policy was created with, shared by every version of it.
     pub name: String,
+    /// This policy's place in the order the account's policies were created in,
+    /// which is the order `ListTrafficPolicies` reports them in ("Policies are
+    /// listed in the order that they were created in").
+    ///
+    /// A policy id is minted opaque, so the order of the ids is NOT the order of
+    /// the creates: the position has to be recorded when the policy is created
+    /// ([`ComAmazonawsRoute53Awsdnsv20130401State::next_traffic_policy_position`]).
+    pub created_position: u64,
     /// This policy's versions, keyed (and therefore ordered) by version number.
     pub versions: BTreeMap<i32, StoredTrafficPolicyVersion>,
 }
@@ -1315,6 +1327,19 @@ impl StoredTrafficPolicy {
             .keys()
             .next_back()
             .map_or(FIRST_TRAFFIC_POLICY_VERSION, |highest| highest + 1)
+    }
+
+    /// The highest version number this policy holds — its LATEST version, the
+    /// one a listing reports — or `None` for a policy holding no version.
+    pub fn latest_version(&self) -> Option<i32> {
+        self.versions.keys().next_back().copied()
+    }
+
+    /// How many versions this policy holds, as the `TrafficPolicyVersion` the
+    /// count shapes carry (`range 1..1000`, which is also
+    /// [`MAX_TRAFFIC_POLICY_VERSION`], so the count cannot leave that range).
+    pub fn version_count(&self) -> i32 {
+        i32::try_from(self.versions.len()).unwrap_or(MAX_TRAFFIC_POLICY_VERSION)
     }
 }
 
@@ -1527,6 +1552,38 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         self.traffic_policies
             .values()
             .find(|policy| policy.name == name)
+    }
+
+    /// The creation position the account's NEXT traffic policy takes: one past
+    /// the highest any policy it holds carries.
+    ///
+    /// Read off the policies rather than tracked in a counter beside them, so
+    /// the positions cannot disagree with the policies the account actually
+    /// holds. A position freed by a delete may be handed out again, which leaves
+    /// the ORDER of the surviving policies untouched: every one of them was
+    /// created before the policy taking the new position.
+    pub fn next_traffic_policy_position(&self) -> u64 {
+        self.traffic_policies
+            .values()
+            .map(|policy| policy.created_position)
+            .max()
+            .map_or(FIRST_TRAFFIC_POLICY_POSITION, |highest| highest + 1)
+    }
+
+    /// Every traffic policy the account holds, in the order they were created
+    /// in — the order `ListTrafficPolicies` reports them in.
+    ///
+    /// The creation position is unique among the policies the account holds, so
+    /// the id breaks a tie only for completeness: the order is TOTAL, which is
+    /// what lets a page resume at one place.
+    pub fn traffic_policies_in_creation_order(&self) -> Vec<&StoredTrafficPolicy> {
+        let mut ordered: Vec<&StoredTrafficPolicy> = self.traffic_policies.values().collect();
+        ordered.sort_by(|left, right| {
+            left.created_position
+                .cmp(&right.created_position)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        ordered
     }
 
     /// Record a newly submitted change and return it, so the caller can render

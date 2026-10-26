@@ -215,6 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_traffic_policy_id();
+        // A listing reports the account's policies in the order they were
+        // created in, and a minted id carries no order, so the position this
+        // create takes in that sequence is recorded with the policy.
+        let created_position = store.next_traffic_policy_position();
         let mut versions = BTreeMap::new();
         versions.insert(
             FIRST_TRAFFIC_POLICY_VERSION,
@@ -229,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             StoredTrafficPolicy {
                 id: id.clone(),
                 name: input.name,
+                created_position,
                 versions,
             },
         );

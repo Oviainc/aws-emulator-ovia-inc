@@ -52,7 +52,10 @@ const COMMENT_MAX_LEN: usize = 1024;
 
 /// Create a further version of the policy `id` names. `comment` of `None`
 /// sends no `Comment` element.
-async fn create_version(
+///
+/// `pub(crate)` so the listing suite builds its multi-version policies through
+/// the SAME request rather than growing a second copy of it.
+pub(crate) async fn create_version(
     router: &MultiServiceRouter,
     id: &str,
     document: &str,

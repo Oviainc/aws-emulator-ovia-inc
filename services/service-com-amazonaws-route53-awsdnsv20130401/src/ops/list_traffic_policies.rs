@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrafficPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrafficPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrafficPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the LATEST version of every traffic policy the account holds, as one
+//! page of a listing ordered the way the policies were created: a minted policy
+//! id carries no order, so each create records its place in that sequence
+//! (`StoredTrafficPolicy::created_position`) and this walk sorts by it. A page
+//! stops after `MaxItems` summaries, with `TrafficPolicyIdMarker` naming the
+//! first policy of the next page. A pure read — nothing here writes to the
+//! store.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +90,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredTrafficPolicy, MAX_TRAFFIC_POLICIES};
+
+/// The most traffic policy summaries one response carries.
+///
+/// `ListTrafficPoliciesRequest$MaxItems` publishes no ceiling of its own, and
+/// the whole listing is bounded by the account's traffic policy quota
+/// ([`MAX_TRAFFIC_POLICIES`]) — the account cannot hold more policies than that
+/// — so no page can be larger than it, whatever `maxitems` asks for.
+const MAX_PAGE_SIZE: i32 = MAX_TRAFFIC_POLICIES as i32;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -121,6 +130,28 @@ impl From<ListTrafficPoliciesErrorModeled> for ListTrafficPoliciesError {
     fn from(modeled: ListTrafficPoliciesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The summary of one traffic policy: its id and name, and the `Type` of its
+/// LATEST version, which is the version this listing reports ("information
+/// about the latest version for every traffic policy"). `None` for a policy
+/// holding no version at all, which has no latest version to summarise.
+///
+/// `TrafficPolicyCount` is the number of versions this policy holds: the member
+/// targets `TrafficPolicyVersion` (`range 1..1000`), the per-policy version
+/// ceiling, while the account can hold at most [`MAX_TRAFFIC_POLICIES`]
+/// policies — and it sits INSIDE a per-policy summary, where one number for the
+/// whole account would repeat in every element of it.
+fn traffic_policy_summary(policy: &StoredTrafficPolicy) -> Option<TrafficPolicySummary> {
+    let latest_version = policy.latest_version()?;
+    let latest = policy.versions.get(&latest_version)?;
+    Some(TrafficPolicySummary {
+        id: policy.id.clone(),
+        name: policy.name.clone(),
+        r#type: latest.record_type.clone(),
+        latest_version,
+        traffic_policy_count: policy.version_count(),
+    })
 }
 
 /// The `ListTrafficPolicies` operation.
@@ -157,20 +188,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrafficPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrafficPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrafficPolicies"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListTrafficPoliciesErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let marker = input
+            .traffic_policy_id_marker
+            .as_deref()
+            .filter(|id| !id.is_empty());
+
+        // A pure read: nothing below writes to the store.
+        let store = state.lock();
+        // "Policies are listed in the order that they were created in", which is
+        // the order this walk is sorted in — and a total one, so a marker always
+        // resumes at the same place.
+        let ordered = store.traffic_policies_in_creation_order();
+
+        // The marker is "the ID of the first traffic policy in the next group",
+        // so it names the policy the page RESUMES at. An id naming no policy of
+        // the account positions nothing: the caller is told so rather than
+        // handed a page starting somewhere else.
+        let start = match marker {
+            None => 0,
+            Some(marker) => ordered
+                .iter()
+                .position(|policy| policy.id == marker)
+                .ok_or_else(|| {
+                    ListTrafficPoliciesErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "trafficpolicyid {marker:?} names no traffic policy of the current \
+                             account; the marker positions the listing at a policy, so it has to \
+                             be the TrafficPolicyIdMarker a previous ListTrafficPolicies response \
+                             returned"
+                        )),
+                    })
+                })?,
+        };
+
+        let mut traffic_policy_summaries = Vec::new();
+        let mut next_marker = None;
+        // `skip` rather than a slice index: `start` came from the request, and
+        // a walk that skips can never index past the end of the listing.
+        for policy in ordered.iter().skip(start) {
+            // A policy holding no version has no latest version to report.
+            let Some(summary) = traffic_policy_summary(policy) else {
+                continue;
+            };
+            if traffic_policy_summaries.len() >= page_size as usize {
+                next_marker = Some(summary.id);
+                break;
+            }
+            traffic_policy_summaries.push(summary);
+        }
+
+        Ok(ListTrafficPoliciesOutput {
+            traffic_policy_summaries,
+            is_truncated: next_marker.is_some(),
+            // "If the value of IsTruncated is true, TrafficPolicyIdMarker is the
+            // ID of the first traffic policy in the next group" — so a listing
+            // that ends here names no policy to resume at.
+            traffic_policy_id_marker: next_marker.unwrap_or_default(),
+            // The echoed `maxitems`, so a request outside the page bound reads
+            // its own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }
