@@ -170,7 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetMilestoneOutput {
             workload_id: Some(record.workload.workload_id.clone()),
-            milestone: Some(record.to_milestone()),
+            // The content of the lenses the RECORDED workload reviews, resolved from the
+            // whole lens catalog: a custom lens's imported questions are counted in the
+            // frozen workload's roll-up exactly as an official lens's are.
+            milestone: Some(
+                record.to_milestone(&store.reviewed_lens_content(&record.workload.lenses)),
+            ),
         })
     }
 }

@@ -214,7 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let milestone_summaries: Vec<MilestoneSummary> = page
             .iter()
-            .map(|record| record.to_summary())
+            // Each recorded workload's roll-up is counted over the content of the lenses IT
+            // reviews, resolved from the whole lens catalog.
+            .map(|record| {
+                record.to_summary(&store.reviewed_lens_content(&record.workload.lenses))
+            })
             .collect();
 
         Ok(ListMilestonesOutput {
