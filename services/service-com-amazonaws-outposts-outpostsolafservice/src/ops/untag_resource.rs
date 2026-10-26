@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the tag keys the request names from the tags of the stored
+//! resource the `ResourceArn` names — dropping a key the resource carries and ignoring
+//! one it does not, and leaving every key the request does not name alone — so every
+//! later read of that resource (`ListTagsForResource`, `GetSite`, `GetOutpost`, the
+//! lists) answers the tags as they now stand. Naming a key the resource does not carry
+//! is not a failure: the request states which keys must be gone, so repeating it is
+//! accepted and changes nothing further. An ARN naming a resource this store does not
+//! hold is `NotFoundException` (404); a change that empties the map leaves the resource
+//! carrying no tags; an ARN that is not an Outposts resource ARN is refused at the
+//! boundary with HTTP 400 `BadRequestException` (see `EmulatedService::override_refusal`).
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +138,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: a resource is part of its own
+        // region's inventory and of no other's, so that is where the ARN is
+        // resolved — one region's endpoint cannot untag another region's resource.
+        let region = crate::state::request_region(ctx.parts());
+        // The same reading of `ResourceArn` every tagging operation does. The
+        // modelled `Arn` pattern pins it to `arn:…:outposts:…:<type>/<id>`, so the
+        // boundary has already refused every value this cannot read — with the
+        // ARN-syntax code this service names for it
+        // (`EmulatedService::override_refusal`). The handler still does not assume
+        // that; it states the refusal through an error this OPERATION models, since
+        // `BadRequestException` is not one of them.
+        let (resource_type, resource_id) = crate::state::resource_arn_parts(&input.resource_arn)
+            .ok_or_else(|| {
+                UntagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::resource_arn_pattern_report()),
+                })
+            })?;
+
+        let mut store = state.lock();
+        // Tags live on the resource they were applied to, so this writes them onto
+        // that stored record, through the one place that knows which resource kinds
+        // this store holds tags for. Any other kind is a resource this store cannot
+        // hold, which is the not-found error this operation models; its body is the
+        // identifier echo every not-found body of this service carries.
+        let tags = store
+            .tags_mut(&region, &resource_type, &resource_id)
+            .ok_or_else(|| {
+                UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::RESOURCE_ARN_MEMBER,
+                        &input.resource_arn,
+                    )),
+                })
+            })?;
+
+        // The change itself: the request states which keys must be GONE, so each one
+        // is dropped and a key the resource never carried is already in that state.
+        // Nothing else about the map moves, and a removal can only shrink it, so no
+        // bound of the modelled `TagMap` can be crossed here.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }
+
