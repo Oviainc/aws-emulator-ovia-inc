@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIngestConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIngestConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIngestConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +72,8 @@
 //!   this action.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the only honest answer when the shared engine hands back no store for this service.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,10 +89,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `ListIngestConfigurationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#ListIngestConfigurations")]
+//
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// (every other listing of this service lists it) but this operation's own `errors` list
+// omits it, and it is the only honest answer for "this service is mounted on an engine
+// that holds no store" — a 400 would blame the caller's request and a 501 would claim the
+// operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#ListIngestConfigurations",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListIngestConfigurationsErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -149,23 +152,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_INGEST_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report a page of the ingest configurations this account holds.
+    ///
+    /// A pure read over the stored configurations (`@readonly` in the model, and "Lists
+    /// all IngestConfigurations in your account"); nothing is written, so paging through
+    /// the listing cannot itself change what a later caller sees.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIngestConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIngestConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIngestConfigurations"))
+        // Nothing here reads request metadata: the page this reports is named entirely by
+        // the request's own members, whose modelled lengths, patterns and ranges the
+        // framework's constraint walk refuses with a 400 `ValidationException` before
+        // `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                ListIngestConfigurationsErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // "Only one filter (by stage ARN or by state) can be used at a time", as both
+        // filter members' own doc states it. A request carrying both is refused rather
+        // than served by applying both, the same way `ListParticipants` refuses two of
+        // its four — one rule, one wording.
+        let supplied: Vec<&str> = [
+            ("filterByStageArn", input.filter_by_stage_arn.is_some()),
+            ("filterByState", input.filter_by_state.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, provided)| *provided)
+        .map(|(member, _)| member)
+        .collect();
+        if supplied.len() > 1 {
+            return Err(crate::state::validation_failed(
+                ListIngestConfigurationsErrorModeled::ValidationException,
+                crate::state::mutually_exclusive_members_message(
+                    Self::NAME,
+                    &supplied,
+                    &EXCLUSIVE_FILTERS,
+                ),
+            ));
+        }
+
+        // A `nextToken` this listing did not issue names no position, so it is refused
+        // rather than read as "start from the beginning" — including a token from this
+        // service's other listings, which name a position among records these pages do
+        // not hold.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_ingest_configuration_page_token(token).ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListIngestConfigurationsErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            // "Maximum number of results to return. Default: 50", as
+            // `ListIngestConfigurationsRequest$maxResults` documents it — the default
+            // every listing of this service states.
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE)
+            // Unreachable defence, not an accepted-and-adjusted input: the modelled
+            // `MaxIngestConfigurationResults` range (1..100) refuses a non-positive
+            // `maxResults` with a 400 before this handler runs. It is here only so a page
+            // size of zero can never make pagination loop forever.
+            .max(1);
+
+        let store = state.lock();
+        // Creation order, so a configuration created or deleted mid-pagination cannot
+        // shift a later page onto an already-returned one, and the filter the request
+        // carries narrows the list by the member's own doc: `filterByStageArn` keeps the
+        // configurations associated with that stage, `filterByState` the ones in that
+        // state right now. A request carrying neither asks for every configuration. A
+        // filter nothing matches selects nothing — this operation models no
+        // `ResourceNotFoundException`, and an empty page is what "nothing matches" is.
+        let matching: Vec<&crate::state::IngestConfigurationRecord> = store
+            .ingest_configurations_in_order()
+            .into_iter()
+            .filter(|record| {
+                input
+                    .filter_by_stage_arn
+                    .as_deref()
+                    .is_none_or(|stage_arn| record.stage_arn == stage_arn)
+            })
+            .filter(|record| {
+                input
+                    .filter_by_state
+                    .as_deref()
+                    // The state a configuration reports is the one its publishers make
+                    // true at this instant, read through the same accessor the full read
+                    // reports, so a filter and a read cannot disagree.
+                    .is_none_or(|wanted| record.state(&store) == wanted)
+            })
+            .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
+            .collect();
+        let ingest_configurations: Vec<IngestConfigurationSummary> = matching
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_summary(&store))
+            .collect();
+        // A token only when a configuration is left over, and it names the position this
+        // page ended at: the last page carries none.
+        let next_token = (matching.len() > page_size).then(|| {
+            crate::state::encode_ingest_configuration_page_token(matching[page_size - 1].sequence)
+        });
+
+        Ok(ListIngestConfigurationsOutput {
+            ingest_configurations,
+            next_token,
+        })
     }
 }
+
+/// The two filter members, in the order the model's own doc names them, only one of which
+/// one request may carry ("Only one filter (by stage ARN or by state) can be used at a
+/// time").
+const EXCLUSIVE_FILTERS: [&str; 2] = ["filterByStageArn", "filterByState"];

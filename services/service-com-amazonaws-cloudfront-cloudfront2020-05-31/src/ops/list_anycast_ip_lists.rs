@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnycastIpLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnycastIpLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnycastIpLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every Anycast static IP list a caller can see was created by `CreateAnycastIpList`, so
+//! this listing answers from the records the store holds: a store that holds none lists
+//! none, and otherwise it reports each list exactly once, in the one total order over
+//! the ids they are held under, paging that order with `MaxItems` and `Marker`.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +71,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,20 +144,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // This listing answers from the store alone, so no request metadata is read.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnycastIpLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnycastIpListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnycastIpLists"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of Anycast static IP lists that you want returned in the
+        // response" — a page holds at least one item, so a non-positive size names no page
+        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // same one every listing of this service is bounded by, while the answer echoes the
+        // size ASKED FOR.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListAnycastIpListsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state, so no item
+        // reports a stale status.
+        store.settle(SystemTime::now());
+
+        // "The response includes items in the list that occur after the marker": the resume
+        // point names where the previous page ENDED, so this page starts strictly after it
+        // and walking the pages enumerates every list exactly once. The records are held
+        // under their ids, so the resume point is a range bound rather than a scan. The
+        // model constrains this parameter to no shape at all — an Anycast static IP list's
+        // `Id` carries no pattern — so no value is outside it: a marker no stored list
+        // carries is still a position in the one id order, and the page after it is served
+        // rather than refused.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<AnycastIpListSummary> = Vec::new();
+        let mut is_truncated = false;
+        for (_, stored) in store.anycast_ip_lists.range::<str, _>((start, Bound::Unbounded)) {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            // Read from the one stored record — the abbreviated projection of it, which
+            // "omits the allocated static IP addresses".
+            items.push(stored.to_summary());
+        }
+
+        Ok(ListAnycastIpListsOutput {
+            // "Root level tag for the AnycastIpLists parameters."
+            anycast_ip_lists: Some(AnycastIpListCollection {
+                // "Use this field when paginating results to indicate where to begin in
+                // your list": the resume point the request named, echoed. The member is
+                // required on the wire, so a request that named none reports the empty one.
+                marker: input.marker.unwrap_or_default(),
+                // "Indicates the next page of the Anycast static IP list collection":
+                // present exactly when lists remain, carrying the id this page ended at.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of Anycast static IP list collections that you want
+                // returned in the response" — what the request asked for, or the default
+                // this service pages at.
+                max_items,
+                // "If there are more items in the list collection than are in this
+                // response, this value is true."
+                is_truncated,
+                // "The quantity of Anycast static IP lists in the collection": the length
+                // of this page.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // "Items in the Anycast static IP list collection. Each item is of the
+                // AnycastIpListSummary structure type"
+                // (`smithy_query(query="doc",shape="AnycastIpListCollection",member="Items")`):
+                // nothing makes the element conditional, and the recorded contract reads it
+                // on a page of no lists at all, so it is part of every answer this
+                // collection serves and carries nothing when the page lists nothing. The
+                // older collections of this service, whose own operation documentation
+                // states that the call "doesn't return the Items element" for an account
+                // using none, leave it out instead.
+                items: Some(items),
+            }),
+        })
     }
 }

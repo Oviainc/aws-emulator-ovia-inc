@@ -58,7 +58,7 @@ use std::time::{Duration, SystemTime};
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, Aliases, AllowedMethods, AnycastIpList,
-    CacheBehavior, CacheBehaviors,
+    AnycastIpListSummary, CacheBehavior, CacheBehaviors,
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
     CloudFrontOriginAccessIdentitySummary,
@@ -1754,6 +1754,26 @@ impl StoredAnycastIpList {
             anycast_ips: self.anycast_ips.clone(),
             ip_count: self.ip_count,
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+        }
+    }
+
+    /// The `AnycastIpListSummary` projection `ListAnycastIpLists` serves, read from the one
+    /// stored record: "an abbreviated version of the `AnycastIpList` structure. Omits the
+    /// allocated static IP addresses (`AnycastIpList$AnycastIps`)." It is the only
+    /// projection that carries the version token, as `AnycastIpListSummary$ETag` — "the
+    /// current version (ETag value) of the Anycast static IP list" — which the full
+    /// structure reports in the `ETag` header instead.
+    pub fn to_summary(&self) -> AnycastIpListSummary {
+        AnycastIpListSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            status: self.status.clone(),
+            arn: self.arn.clone(),
+            ip_count: self.ip_count,
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            ip_address_type: Some(self.ip_address_type.clone()),
+            e_tag: Some(self.etag.clone()),
+            ipam_config: self.to_ipam_config(),
         }
     }
 }
@@ -3452,6 +3472,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         for streaming_distribution in self.streaming_distributions.values_mut() {
             streaming_distribution.settle(now);
+        }
+        for anycast_ip_list in self.anycast_ip_lists.values_mut() {
+            anycast_ip_list.settle(now);
         }
     }
 
