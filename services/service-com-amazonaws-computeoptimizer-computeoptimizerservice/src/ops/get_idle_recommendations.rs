@@ -291,12 +291,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // enrollment started, which came due one analysis span after the enrollment record
         // was written. Derived from the store, so every read reports the same instant — the
         // same rule the other recommendation readers of this service report their refresh
-        // with.
-        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
-            ::aws_smithy_types::DateTime::from_secs_f64(
-                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
-            )
-        });
+        // with ([`crate::state::Enrollment::last_analysis_refresh`]).
+        let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
         // Every idle resource recommendation this endpoint has to report: the analysis the
         // store holds, as the endpoint in this Region reports it — which a caller sees only

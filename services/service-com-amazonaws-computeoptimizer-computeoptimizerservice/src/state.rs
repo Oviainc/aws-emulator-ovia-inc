@@ -246,6 +246,22 @@ impl Enrollment {
             .as_ref()
             .is_some_and(|written| now - written.as_secs_f64() >= ANALYSIS_DELAY.as_secs_f64())
     }
+
+    /// When the analysis this enrollment started was generated: one analysis span
+    /// ([`ANALYSIS_DELAY`]) after the enrollment record was written, and `None` for an account
+    /// that never enrolled, which has no analysis to report a refresh for.
+    ///
+    /// This is the instant every recommendation reader of this service reports as its
+    /// `lastRefreshTimestamp` and every export file states in its `LastRefreshTimestamp`
+    /// column. Derived from the store rather than read off the clock, so every read of one
+    /// analysis reports the same instant, and stated ONCE here so a reader and an export of
+    /// the same analysis cannot disagree about it.
+    pub fn last_analysis_refresh(&self) -> Option<DateTime> {
+        let written = self.last_updated_timestamp.as_ref()?.as_secs_f64();
+        Some(DateTime::from_secs_f64(
+            written + ANALYSIS_DELAY.as_secs_f64(),
+        ))
+    }
 }
 
 /// Why an account is in the status its enrollment record holds — the `statusReason` the
@@ -6046,7 +6062,8 @@ impl ObservedInstance {
 /// analysis would size DOWN (so its recommendation saves, and one of its candidates is a
 /// Graviton type, which a request may ask for on its own), one it would size UP (whose
 /// recommendation therefore saves nothing) and one it would leave as it is (which has no
-/// candidate to project onto).
+/// candidate to project onto). They differ in whether Amazon EC2 names them — an instance is
+/// named by its `Name` tag, and one carries none.
 ///
 /// The prices and capacities are the public on-demand Linux prices of these instance types
 /// in the `us-east-1` Region, as the Amazon EC2 On-Demand pricing page lists them: `m5.large`

@@ -77,5 +77,7 @@ mod recommendation_summaries;
 mod reported_defaults_and_preference_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestamp_probe.rs"]
+mod timestamp_probe;
 #[path = "all/unrestricted_preference_resource_types.rs"]
 mod unrestricted_preference_resource_types;

@@ -62,11 +62,11 @@ use super::{
     look_back_period_in_days, parse_resource_arn, percentage_of, rds_finding_members,
     reason_codes_in, round_hundredths, AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
-    GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, ANALYSIS_DELAY,
-    CURRENCY_USD, IDLE_FALSE, IDLE_TRUE, RESOURCE_TYPE_AUTO_SCALING_GROUP,
-    RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE,
-    RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE,
-    RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
+    GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, CURRENCY_USD, IDLE_FALSE,
+    IDLE_TRUE, RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME,
+    RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE,
+    RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE,
+    SAVINGS_ESTIMATION_SOURCE,
 };
 use crate::ops::types::{
     EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
@@ -795,10 +795,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         if !self.enrollment.is_opted_in() || !self.enrollment.analysis_due() {
             return Vec::new();
         }
+        // When the analysis these rows are of was generated: the instant every reader of this
+        // service reports for it ([`Enrollment::last_analysis_refresh`]), so a file states the
+        // same instant the reader reports.
         let last_refresh = self
             .enrollment
-            .last_updated_timestamp
-            .map(|written| written.as_secs_f64() + ANALYSIS_DELAY.as_secs_f64());
+            .last_analysis_refresh()
+            .map(|generated| generated.as_secs_f64());
         let mut rows = match plan.resource_type.as_str() {
             RESOURCE_TYPE_AUTO_SCALING_GROUP => self.auto_scaling_group_export_rows(last_refresh),
             RESOURCE_TYPE_IDLE => self.idle_export_rows(&plan.region, last_refresh),

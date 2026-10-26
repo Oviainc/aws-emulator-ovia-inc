@@ -268,12 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // When these recommendations were last generated: the analysis the account's
         // enrollment started, which came due one analysis span after the enrollment record
         // was written. Derived from the store, so every read reports the same instant — the
-        // rule every recommendation reader of this service reports its refresh with.
-        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
-            ::aws_smithy_types::DateTime::from_secs_f64(
-                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
-            )
-        });
+        // rule every recommendation reader of this service reports its refresh with
+        // ([`crate::state::Enrollment::last_analysis_refresh`]).
+        let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
         // The instances this request asks about: the account's whole analysed inventory in
         // this Region — which a caller sees only once the analysis its enrollment started is
