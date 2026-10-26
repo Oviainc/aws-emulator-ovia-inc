@@ -14,13 +14,15 @@
 //! owed at that instant whether or not anybody called, so no caller's read
 //! causes it. Nothing else here mutates state.
 //!
-//! Inheritance is not FLATTENED: `extendsFrom` is reported as stored, and the
-//! property definitions, functions and property groups reported are the
-//! component type's OWN (`isInherited` false throughout) — resolving an
-//! inherited definition onto a child is its own issue. The parents themselves
-//! do resolve: a workspace is provisioned with the service's built-in component
-//! types ([`crate::state::built_in_component_types`]), so a read of one answers
-//! with its abstractness and its own definitions.
+//! Inheritance IS resolved: `extendsFrom` is reported as stored, and the
+//! property definitions, functions, property groups and composite component
+//! types reported are the ones the component type EFFECTIVELY has — its own
+//! declarations folded over the ones its `extendsFrom` chain contributes
+//! ([`crate::state::Workspace::inherited_component_types`]), each marked
+//! `isInherited` exactly when the chain declares it. A workspace is provisioned
+//! with the service's built-in component types
+//! ([`crate::state::built_in_component_types`]), so a type extending one really
+//! has a parent whose declarations this read resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -221,24 +223,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(component_type) = workspace.component_types.get_mut(&input.component_type_id)
-        else {
-            return Err(GetComponentTypeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::component_type_not_found_message(
-                        &input.workspace_id,
-                        &input.component_type_id,
-                    )),
-                },
-            )
-            .into());
-        };
 
         // The clock, not this call, is what moves the component type on: the
         // transition was due at `settles_at`, so reporting the state without
         // materialising it would report a state that stopped being true before
-        // the request arrived.
-        component_type.settle(::std::time::SystemTime::now());
+        // the request arrived. A component type the workspace does not hold has
+        // nothing to settle; the read below is what refuses the request.
+        if let Some(component_type) = workspace.component_types.get_mut(&input.component_type_id) {
+            component_type.settle(::std::time::SystemTime::now());
+        }
+
+        // Everything below READS: the settled record and, through the same
+        // workspace, the component types its `extendsFrom` chain reaches — the
+        // declarations it inherits live in records of their own, so the schema
+        // is resolved over the workspace rather than off this record alone.
+        let workspace = &*workspace;
+        let Some(component_type) = workspace.component_types.get(&input.component_type_id) else {
+            return Err(component_type_not_found(
+                &input.workspace_id,
+                &input.component_type_id,
+            ));
+        };
+        let inherited = workspace.inherited_component_types(component_type);
 
         Ok(GetComponentTypeOutput {
             workspace_id: component_type.workspace_id.clone(),
@@ -251,52 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // choice `GetEntity` makes for an entity's components, so a client
             // that walks `propertyDefinitions` needs no null guard.
             extends_from: Some(component_type.extends_from.clone()),
-            property_definitions: Some(
-                component_type
-                    .property_definitions
-                    .iter()
-                    .filter_map(|(property_name, definition)| {
-                        // The component type's OWN definitions: a definition
-                        // this record carries was declared on it, which is what
-                        // makes it not inherited.
-                        crate::state::property_definition_response(definition, false)
-                            .map(|response| (property_name.clone(), response))
-                    })
-                    .collect(),
-            ),
-            functions: Some(
-                component_type
-                    .functions
-                    .iter()
-                    .map(|(function_name, function)| {
-                        (function_name.clone(), function_response(function))
-                    })
-                    .collect(),
-            ),
-            property_groups: Some(
-                component_type
-                    .property_groups
-                    .iter()
-                    .map(|(group_name, group)| {
-                        (group_name.clone(), property_group_response(group))
-                    })
-                    .collect(),
-            ),
-            composite_component_types: Some(
-                component_type
-                    .composite_component_types
-                    .iter()
-                    .map(|(name, composite)| {
-                        (
-                            name.clone(),
-                            CompositeComponentTypeResponse {
-                                component_type_id: composite.component_type_id.clone(),
-                                is_inherited: Some(false),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            property_definitions: Some(property_definitions_response(component_type, &inherited)),
+            functions: Some(functions_response(component_type, &inherited)),
+            property_groups: Some(property_groups_response(component_type, &inherited)),
+            composite_component_types: Some(composite_component_types_response(
+                component_type,
+                &inherited,
+            )),
             creation_date_time: crate::state::timestamp(component_type.creation_date_time),
             update_date_time: crate::state::timestamp(component_type.update_date_time),
             // `isAbstract` is read off the stored record, which is also what a
@@ -306,9 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service's own built-ins.
             is_abstract: Some(component_type.is_abstract),
             // "Whether the component type has a schema initializer and that the
-            // schema initializer has run" — see
+            // schema initializer has run" — of the functions it EFFECTIVELY
+            // has, so an initializer it inherits counts as much as its own; see
             // `ComponentType::is_schema_initialized`.
-            is_schema_initialized: Some(component_type.is_schema_initialized()),
+            is_schema_initialized: Some(component_type.is_schema_initialized(&inherited)),
             // Carries BOTH its modelled members: the stored state (settled
             // above) and the `error` structure every reported status carries.
             status: Some(component_type.status()),
@@ -319,32 +287,256 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One stored function as the modelled `FunctionResponse`.
-///
-/// `isInherited` is false: inheritance from a parent component type is not
-/// resolved here, so every function reported is the component type's own.
-fn function_response(function: &FunctionRequest) -> FunctionResponse {
-    FunctionResponse {
-        required_properties: function.required_properties.clone(),
-        scope: function.scope.clone(),
-        implemented_by: function.implemented_by.clone(),
-        is_inherited: Some(false),
-    }
+/// The modelled `ResourceNotFoundException` for a component type this workspace
+/// does not hold.
+fn component_type_not_found(workspace_id: &str, component_type_id: &str) -> GetComponentTypeError {
+    GetComponentTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::component_type_not_found_message(
+            workspace_id,
+            component_type_id,
+        )),
+    })
+    .into()
 }
 
-/// One stored property group as the modelled `PropertyGroupResponse`.
+/// One of a component type's four schema maps, as the resolution below reaches
+/// it: the caller passes an accessor of this shape to say which map — property
+/// definitions, functions, property groups or composite component types — a step
+/// of the resolution runs over, so one rule is applied to all four.
+type SchemaMap<'a, Entry> = &'a ::std::collections::BTreeMap<String, Entry>;
+
+/// The four accessors a step of the resolution is pointed at — one per part of
+/// a component type's schema. Named functions rather than closures so each one
+/// states that the map it hands back borrows from the record it was given.
+fn property_definition_map(
+    record: &crate::state::ComponentType,
+) -> SchemaMap<'_, PropertyDefinitionRequest> {
+    &record.property_definitions
+}
+
+/// See [`property_definition_map`].
+fn function_map(record: &crate::state::ComponentType) -> SchemaMap<'_, FunctionRequest> {
+    &record.functions
+}
+
+/// See [`property_definition_map`].
+fn property_group_map(
+    record: &crate::state::ComponentType,
+) -> SchemaMap<'_, crate::state::PropertyGroupRecord> {
+    &record.property_groups
+}
+
+/// See [`property_definition_map`].
+fn composite_component_type_map(
+    record: &crate::state::ComponentType,
+) -> SchemaMap<'_, CompositeComponentTypeRequest> {
+    &record.composite_component_types
+}
+
+/// Every name the component type or some component type it inherits from
+/// declares an entry under, in name order.
+///
+/// What the component type EFFECTIVELY has is the union: a declaration it never
+/// restated reaches it through `extendsFrom`, and one it restated refines the
+/// inherited one rather than adding a second entry under the same name.
+fn declared_names<'a, Entry: 'a>(
+    component_type: &'a crate::state::ComponentType,
+    inherited: &[&'a crate::state::ComponentType],
+    keyed: impl Fn(&'a crate::state::ComponentType) -> SchemaMap<'a, Entry>,
+) -> ::std::collections::BTreeSet<&'a String> {
+    let mut names: ::std::collections::BTreeSet<&String> = keyed(component_type).keys().collect();
+    for ancestor in inherited {
+        names.extend(keyed(ancestor).keys());
+    }
+    names
+}
+
+/// Every declaration that reaches the entry `name`, NEAREST first: the component
+/// type's own where it has one, then the ones its `extendsFrom` chain
+/// contributes, nearest ancestor first — the order each part of the schema is
+/// folded in.
+fn declarations<'a, Entry: 'a>(
+    component_type: &'a crate::state::ComponentType,
+    inherited: &'a [&'a crate::state::ComponentType],
+    keyed: impl Fn(&'a crate::state::ComponentType) -> SchemaMap<'a, Entry> + Copy + 'a,
+    name: &'a str,
+) -> impl Iterator<Item = &'a Entry> + 'a {
+    keyed(component_type).get(name).into_iter().chain(
+        inherited
+            .iter()
+            .filter_map(move |ancestor| keyed(ancestor).get(name)),
+    )
+}
+
+/// Whether the entry reported under `name` is INHERITED: some component type on
+/// the `extendsFrom` chain declares it, so the entry reaches this component type
+/// through its inheritance whether or not the type also refines it.
+fn is_inherited<'a, Entry: 'a>(
+    inherited: &[&'a crate::state::ComponentType],
+    keyed: impl Fn(&'a crate::state::ComponentType) -> SchemaMap<'a, Entry>,
+    name: &str,
+) -> bool {
+    inherited
+        .iter()
+        .any(|ancestor| keyed(ancestor).contains_key(name))
+}
+
+/// The component type's EFFECTIVE property definitions: every property it or its
+/// `extendsFrom` chain declares, each resolved over the declarations that reach
+/// it — nearest first, so a declaration that refines an inherited one carries
+/// the inherited values of the members it left alone
+/// ([`crate::state::refined_property_definition`]) — and marked `isInherited`
+/// when the chain declares it.
+fn property_definitions_response(
+    component_type: &crate::state::ComponentType,
+    inherited: &[&crate::state::ComponentType],
+) -> ::std::collections::HashMap<String, PropertyDefinitionResponse> {
+    let keyed = property_definition_map;
+    declared_names(component_type, inherited, keyed)
+        .into_iter()
+        .filter_map(|property_name| {
+            let resolved = crate::state::refined_property_definition(declarations(
+                component_type,
+                inherited,
+                keyed,
+                property_name,
+            ))?;
+            let response = crate::state::property_definition_response(
+                &resolved,
+                is_inherited(inherited, keyed, property_name),
+            )?;
+            Some((property_name.clone(), response))
+        })
+        .collect()
+}
+
+/// The component type's EFFECTIVE functions, resolved the same way its property
+/// definitions are: each member of a function is the value the nearest
+/// declaration that sets it gives, and a function the `extendsFrom` chain
+/// declares is reported as inherited.
+fn functions_response(
+    component_type: &crate::state::ComponentType,
+    inherited: &[&crate::state::ComponentType],
+) -> ::std::collections::HashMap<String, FunctionResponse> {
+    let keyed = function_map;
+    declared_names(component_type, inherited, keyed)
+        .into_iter()
+        .filter_map(|function_name| {
+            let response = function_response(
+                declarations(component_type, inherited, keyed, function_name),
+                is_inherited(inherited, keyed, function_name),
+            )?;
+            Some((function_name.clone(), response))
+        })
+        .collect()
+}
+
+/// The component type's EFFECTIVE property groups, resolved the same way its
+/// property definitions are, and marked inherited when the `extendsFrom` chain
+/// declares the group.
+fn property_groups_response(
+    component_type: &crate::state::ComponentType,
+    inherited: &[&crate::state::ComponentType],
+) -> ::std::collections::HashMap<String, PropertyGroupResponse> {
+    let keyed = property_group_map;
+    declared_names(component_type, inherited, keyed)
+        .into_iter()
+        .filter_map(|group_name| {
+            let response = property_group_response(
+                declarations(component_type, inherited, keyed, group_name),
+                is_inherited(inherited, keyed, group_name),
+            )?;
+            Some((group_name.clone(), response))
+        })
+        .collect()
+}
+
+/// The component type's EFFECTIVE composite component types, resolved the same
+/// way its property definitions are: the id reported is the one the nearest
+/// declaration that names any refers to, and the entry is marked inherited when
+/// the `extendsFrom` chain declares it.
+fn composite_component_types_response(
+    component_type: &crate::state::ComponentType,
+    inherited: &[&crate::state::ComponentType],
+) -> ::std::collections::HashMap<String, CompositeComponentTypeResponse> {
+    let keyed = composite_component_type_map;
+    declared_names(component_type, inherited, keyed)
+        .into_iter()
+        .map(|name| {
+            let referenced = declarations(component_type, inherited, keyed, name)
+                .find_map(|composite| composite.component_type_id.clone());
+            (
+                name.clone(),
+                CompositeComponentTypeResponse {
+                    component_type_id: referenced,
+                    is_inherited: Some(is_inherited(inherited, keyed, name)),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The declarations that reach one function, nearest first, as the modelled
+/// `FunctionResponse` — `None` when there are none.
+///
+/// Each member is the value the nearest declaration that SETS it gives, the
+/// same fold [`crate::state::refined_property_definition`] performs for a
+/// property definition: every member of `FunctionRequest` is optional, so a
+/// component type may restate only the part of an inherited function it
+/// changes — its data connector, say — and keep the rest.
+fn function_response<'a>(
+    declarations: impl IntoIterator<Item = &'a FunctionRequest>,
+    is_inherited: bool,
+) -> Option<FunctionResponse> {
+    let mut required_properties: Option<Vec<String>> = None;
+    let mut scope: Option<String> = None;
+    let mut implemented_by: Option<DataConnector> = None;
+    let mut declared = false;
+    for declaration in declarations {
+        declared = true;
+        required_properties =
+            required_properties.or_else(|| declaration.required_properties.clone());
+        scope = scope.or_else(|| declaration.scope.clone());
+        implemented_by = implemented_by.or_else(|| declaration.implemented_by.clone());
+    }
+    declared.then_some(FunctionResponse {
+        required_properties,
+        scope,
+        implemented_by,
+        is_inherited: Some(is_inherited),
+    })
+}
+
+/// The declarations that reach one property group, nearest first, as the
+/// modelled `PropertyGroupResponse` — `None` when there are none.
+///
+/// The same fold the other parts of the schema get: `groupType` is the one the
+/// nearest declaration that carries it names, and `propertyNames` the list of
+/// the nearest declaration that carries any — the record stores an absent list
+/// as the empty one, so a declaration with no names sets nothing and leaves the
+/// inherited group's names standing.
 ///
 /// `groupType` is required on the response but optional on the request; the
 /// model's `GroupType` enum admits exactly one value
-/// ([`crate::state::TABULAR_GROUP_TYPE`]), so a group stored without one
+/// ([`crate::state::TABULAR_GROUP_TYPE`]), so a group no declaration gives one
 /// reports that value.
-fn property_group_response(group: &crate::state::PropertyGroupRecord) -> PropertyGroupResponse {
-    PropertyGroupResponse {
-        group_type: group
-            .group_type
-            .clone()
-            .unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
-        property_names: group.property_names.clone(),
-        is_inherited: false,
+fn property_group_response<'a>(
+    declarations: impl IntoIterator<Item = &'a crate::state::PropertyGroupRecord>,
+    is_inherited: bool,
+) -> Option<PropertyGroupResponse> {
+    let mut group_type: Option<String> = None;
+    let mut property_names: Option<Vec<String>> = None;
+    let mut declared = false;
+    for declaration in declarations {
+        declared = true;
+        group_type = group_type.or_else(|| declaration.group_type.clone());
+        if property_names.is_none() && !declaration.property_names.is_empty() {
+            property_names = Some(declaration.property_names.clone());
+        }
     }
+    declared.then(|| PropertyGroupResponse {
+        group_type: group_type.unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
+        property_names: property_names.unwrap_or_default(),
+        is_inherited,
+    })
 }

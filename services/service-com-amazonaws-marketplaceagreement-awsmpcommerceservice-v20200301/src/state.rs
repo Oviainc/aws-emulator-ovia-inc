@@ -1945,6 +1945,43 @@ pub struct Agreement {
 }
 
 impl Agreement {
+    /// The purchase order reference recorded for the charge `charge_id` of this
+    /// agreement, if an association records one.
+    ///
+    /// "The purchase order reference associated with the charge, if any"
+    /// (`Charge$purchaseOrderReference`): the associations this agreement holds
+    /// are the one copy of them, so every report of a charge reads the reference
+    /// from here.
+    pub fn purchase_order_reference_of(&self, charge_id: &str) -> Option<String> {
+        self.purchase_orders
+            .iter()
+            .find(|order| order.charge_id == charge_id)
+            .and_then(|order| order.purchase_order_reference.clone())
+    }
+
+    /// Record `association` as the purchase order of the charge it names, at
+    /// `now`.
+    ///
+    /// A charge carries ONE purchase order reference, so associating a charge
+    /// that already carries one REPLACES it rather than standing beside it. The
+    /// single writer of this agreement's associations, which both
+    /// `UpdatePurchaseOrders` ("associate purchase orders with agreement charges
+    /// after an agreement is created") and the approval of a payment request go
+    /// through, so a charge cannot end up carrying two. The agreement's own
+    /// record changed, which is what `AgreementViewSummary$lastUpdateTime`
+    /// reports.
+    pub fn associate_purchase_order(&mut self, association: PurchaseOrder, now: SystemTime) {
+        match self
+            .purchase_orders
+            .iter_mut()
+            .find(|held| held.charge_id == association.charge_id)
+        {
+            Some(held) => *held = association,
+            None => self.purchase_orders.push(association),
+        }
+        self.updated_at = now;
+    }
+
     /// Cancel this agreement at `now`: the one transition to
     /// [`STATUS_CANCELLED`], which both the acceptor's direct `CancelAgreement`
     /// and the approval of a cancellation request
@@ -2219,8 +2256,11 @@ pub struct PaymentRequest {
     pub status_message: Option<String>,
     /// "The unique identifier of the charge created after the payment request is
     /// approved. This field is only present for approved payment requests" —
-    /// approving one is `AcceptAgreementPaymentRequest`, still a scaffold stub,
-    /// so no stored request carries a charge yet.
+    /// approving one is `AcceptAgreementPaymentRequest`, which mints the charge
+    /// its approval creates ([`PaymentRequest::approve`]), so a request no
+    /// approval has moved carries none. Read through
+    /// [`PaymentRequest::created_charge_id`], which is what decides whether a
+    /// stored charge is reportable.
     pub charge_id: Option<String>,
     /// The account that submitted the request, which is its proposer: "Allows
     /// sellers (proposers) to submit a payment request to buyers (acceptors)".
@@ -2289,6 +2329,37 @@ impl PaymentRequest {
         self.updated_at = now;
     }
 
+    /// Approve this payment request at `now`, the charge its approval created
+    /// being `charge_id`: the one transition to
+    /// [`PAYMENT_REQUEST_STATUS_APPROVED`], so the status, the charge and the
+    /// `updated_at` that go with them have exactly one writer.
+    ///
+    /// "Once accepted, the payment request transitions to APPROVED status and
+    /// the charge will be processed", and `chargeId` is "the unique identifier
+    /// of the charge created after the payment request is approved" — so the
+    /// charge is recorded here and nowhere else. `updatedAt` is "the date and
+    /// time when the payment request was accepted", so it becomes this instant
+    /// while `created_at` keeps the one the send recorded. Callers check
+    /// [`PaymentRequest::is_pending_approval`] first and refuse anything else
+    /// as a conflict.
+    pub fn approve(&mut self, now: SystemTime, charge_id: String) {
+        self.status = PAYMENT_REQUEST_STATUS_APPROVED.to_string();
+        self.charge_id = Some(charge_id);
+        self.updated_at = now;
+    }
+
+    /// The charge this request's approval created, if an approval created one.
+    ///
+    /// `chargeId` is "only present for approved payment requests", so this is
+    /// the one place that decides whether a stored charge is reportable, and
+    /// every projection of this record — and every report of the charge itself
+    /// — reads it through here.
+    pub fn created_charge_id(&self) -> Option<&str> {
+        self.charge_id
+            .as_deref()
+            .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED)
+    }
+
     /// The `ListAgreementPaymentRequests` projection of this payment request.
     pub fn to_summary(&self) -> PaymentRequestSummary {
         PaymentRequestSummary {
@@ -2297,10 +2368,7 @@ impl PaymentRequest {
             status: Some(self.status.clone()),
             name: Some(self.name.clone()),
             // Only an approved request has a charge; see `charge_id`.
-            charge_id: self
-                .charge_id
-                .clone()
-                .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED),
+            charge_id: self.created_charge_id().map(str::to_string),
             charge_amount: Some(self.charge_amount.clone()),
             currency_code: self.currency_code.clone(),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
@@ -2332,10 +2400,7 @@ impl PaymentRequest {
             name: Some(self.name.clone()),
             description: self.description.clone(),
             // Only an approved request has a charge; see `charge_id`.
-            charge_id: self
-                .charge_id
-                .clone()
-                .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED),
+            charge_id: self.created_charge_id().map(str::to_string),
             charge_amount: Some(self.charge_amount.clone()),
             currency_code: self.currency_code.clone(),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
@@ -3978,6 +4043,58 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
             .find(|request| request.client_token.as_deref() == Some(token))
     }
 
+    /// Approve the payment request `payment_request_id` names at `now`,
+    /// answering the approved record.
+    ///
+    /// Approving one is what CREATES its charge: `chargeId` is "the unique
+    /// identifier of the charge created after the payment request is approved",
+    /// so the charge is minted here from the store's single id counter
+    /// ([`Self::mint_charge_id`]) and is from then on a charge of the agreement
+    /// the request was sent under ([`Self::charges_of`]). The buyer's optional
+    /// purchase order reference — what they "can provide to associate the
+    /// payment request with their internal purchase order system" — is recorded
+    /// as that charge's own association
+    /// ([`Agreement::associate_purchase_order`]), which is the one place this
+    /// service holds a charge's purchase order, so `ListAgreementCharges`
+    /// reports it and `UpdatePurchaseOrders` replaces it later rather than
+    /// there being a second copy to keep in step.
+    ///
+    /// Answers `None` when no stored request carries that id: callers resolve
+    /// the request and check [`PaymentRequest::is_pending_approval`] first.
+    pub fn approve_payment_request(
+        &mut self,
+        payment_request_id: &str,
+        purchase_order_reference: Option<String>,
+        now: SystemTime,
+    ) -> Option<PaymentRequest> {
+        if !self.payment_requests.contains_key(payment_request_id) {
+            return None;
+        }
+        let charge_id = self.mint_charge_id();
+        let request = self.payment_requests.get_mut(payment_request_id)?;
+        request.approve(now, charge_id.clone());
+        let approved = request.clone();
+        let Some(reference) = purchase_order_reference else {
+            return Some(approved);
+        };
+        if let Some(agreement) = self.agreements.get_mut(&approved.agreement_id) {
+            agreement.associate_purchase_order(
+                PurchaseOrder {
+                    charge_id,
+                    // The charge was just minted, so it is at its first
+                    // revision ([`INITIAL_CHARGE_REVISION`]).
+                    charge_revision: Some(INITIAL_CHARGE_REVISION),
+                    // "The unique identifier of the agreement associated with
+                    // this charge": the agreement the request was sent under.
+                    agreement_id: Some(approved.agreement_id.clone()),
+                    purchase_order_reference: Some(reference),
+                },
+                now,
+            );
+        }
+        Some(approved)
+    }
+
     /// The stored billing adjustment request submitted under `token`, if any.
     ///
     /// The token is held on the request itself rather than in a second index, so
@@ -4014,12 +4131,42 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// an agreement are the `ChargeSummary$expectedCharges` of the agreement
     /// request it was accepted from ([`expected_charge_ids`]), which is the one
     /// copy of them this store keeps — nothing re-derives a charge id, so a
-    /// charge cannot be reported under two identities.
-    pub fn charge_ids_of<'a>(&'a self, agreement: &Agreement) -> BTreeSet<&'a str> {
-        self.agreement_requests
+    /// charge cannot be reported under two identities. Beside them stand the
+    /// charges the approved payment requests of the agreement created
+    /// ([`Self::approved_payment_requests_of`]), each minted once by the
+    /// approval that created it.
+    pub fn charge_ids_of<'a>(&'a self, agreement: &'a Agreement) -> BTreeSet<&'a str> {
+        let mut ids = self
+            .agreement_requests
             .get(&agreement.agreement_request_id)
             .map(|request| expected_charge_ids(&request.charge_summary))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        ids.extend(
+            self.approved_payment_requests_of(agreement)
+                .filter_map(PaymentRequest::created_charge_id),
+        );
+        ids
+    }
+
+    /// The payment requests of `agreement` whose approval created a charge, in
+    /// the order they were sent.
+    ///
+    /// A payment request carries a charge only once it has been approved
+    /// ([`PaymentRequest::created_charge_id`]), and that charge is a charge of
+    /// the agreement the request was sent under: `chargeId` is "the unique
+    /// identifier of the charge created after the payment request is approved"
+    /// and `Charge$id` is the "unique identifier of the charge for a given
+    /// agreement". The order is the store's own over payment request ids, which
+    /// are minted from one counter, so it is the order the requests were sent
+    /// in.
+    fn approved_payment_requests_of<'a>(
+        &'a self,
+        agreement: &'a Agreement,
+    ) -> impl Iterator<Item = &'a PaymentRequest> + 'a {
+        self.payment_requests
+            .values()
+            .filter(|request| request.agreement_id == agreement.id)
+            .filter(|request| request.created_charge_id().is_some())
     }
 
     /// Every charge this store holds, mapped to the id of the agreement holding
@@ -4040,7 +4187,8 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         owners
     }
 
-    /// The charges of `agreement`, in the order its quote minted them, as
+    /// The charges of `agreement`, in the order its quote minted them followed
+    /// by the order its payment requests were approved in, as
     /// `ListAgreementCharges` reports them.
     ///
     /// Every member is read from the one copy of the resource it belongs to:
@@ -4049,49 +4197,83 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// reference from the association recorded on that agreement's charge —
     /// absent while the charge carries none, which is what "The purchase order
     /// reference associated with the charge, if any" states.
+    ///
+    /// The approval of a payment request creates a charge of the same agreement
+    /// ([`Self::approved_payment_requests_of`]), so it is reported here too,
+    /// read from the one payment request record that holds it.
     pub fn charges_of(&self, agreement: &Agreement) -> Vec<Charge> {
-        let Some(request) = self.agreement_requests.get(&agreement.agreement_request_id) else {
-            return Vec::new();
-        };
-        request
-            .charge_summary
-            .expected_charges
-            .iter()
-            .flatten()
-            .filter_map(|expected| {
-                let id = expected.id.as_deref()?;
-                Some(Charge {
-                    id: Some(id.to_string()),
-                    revision: Some(INITIAL_CHARGE_REVISION),
-                    agreement_id: Some(agreement.id.clone()),
-                    agreement_type: Some(agreement.agreement_type.clone()),
-                    purchase_order_reference: agreement
-                        .purchase_orders
-                        .iter()
-                        .find(|order| order.charge_id == id)
-                        .and_then(|order| order.purchase_order_reference.clone()),
-                    // "The currency code for the charge amount" and "the amount
-                    // of the charge": both are read from the quote's own charge,
-                    // which priced it once (see the module docs), so a charge is
-                    // never re-priced into a second amount.
-                    currency_code: request.charge_summary.currency_code.clone(),
-                    amount: expected.amount.clone(),
-                    // "The date and time when the charge will be incurred. This
-                    // is available only when the charge date is known." A charge
-                    // timed `ON_ACCEPTANCE` is "charged immediately when the
-                    // agreement request is accepted", so this agreement's
-                    // acceptance is its date. One timed on a billing period or
-                    // on the proposal's payment schedule is dated by a billing
-                    // cycle or a schedule this service does not model, so its
-                    // date stays unknown.
-                    time: expected.time.or_else(|| {
-                        (expected.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE)).then(|| {
-                            ::aws_smithy_types::DateTime::from(agreement.acceptance_time)
+        let mut charges: Vec<Charge> = Vec::new();
+        if let Some(request) = self.agreement_requests.get(&agreement.agreement_request_id) {
+            charges.extend(
+                request
+                    .charge_summary
+                    .expected_charges
+                    .iter()
+                    .flatten()
+                    .filter_map(|expected| {
+                        let id = expected.id.as_deref()?;
+                        Some(Charge {
+                            id: Some(id.to_string()),
+                            revision: Some(INITIAL_CHARGE_REVISION),
+                            agreement_id: Some(agreement.id.clone()),
+                            agreement_type: Some(agreement.agreement_type.clone()),
+                            purchase_order_reference: agreement.purchase_order_reference_of(id),
+                            // "The currency code for the charge amount" and "the
+                            // amount of the charge": both are read from the
+                            // quote's own charge, which priced it once (see the
+                            // module docs), so a charge is never re-priced into a
+                            // second amount.
+                            currency_code: request.charge_summary.currency_code.clone(),
+                            amount: expected.amount.clone(),
+                            // "The date and time when the charge will be
+                            // incurred. This is available only when the charge
+                            // date is known." A charge timed `ON_ACCEPTANCE` is
+                            // "charged immediately when the agreement request is
+                            // accepted", so this agreement's acceptance is its
+                            // date. One timed on a billing period or on the
+                            // proposal's payment schedule is dated by a billing
+                            // cycle or a schedule this service does not model, so
+                            // its date stays unknown.
+                            time: expected.time.or_else(|| {
+                                (expected.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE)).then(
+                                    || {
+                                        ::aws_smithy_types::DateTime::from(
+                                            agreement.acceptance_time,
+                                        )
+                                    },
+                                )
+                            }),
                         })
                     }),
-                })
-            })
-            .collect()
+            );
+        }
+        charges.extend(
+            self.approved_payment_requests_of(agreement)
+                .filter_map(|request| {
+                    let id = request.created_charge_id()?;
+                    Some(Charge {
+                        id: Some(id.to_string()),
+                        revision: Some(INITIAL_CHARGE_REVISION),
+                        agreement_id: Some(agreement.id.clone()),
+                        agreement_type: Some(agreement.agreement_type.clone()),
+                        purchase_order_reference: agreement.purchase_order_reference_of(id),
+                        // "The amount of the charge" and "the currency code for
+                        // the charge amount": the amount the seller requested and
+                        // the currency of the term it was requested under, read
+                        // from the payment request the approval moved rather than
+                        // restated here.
+                        currency_code: request.currency_code.clone(),
+                        amount: Some(request.charge_amount.clone()),
+                        // The approval is what created this charge — "once
+                        // accepted… the charge will be processed" — so the instant
+                        // it moved the request is the date the charge is incurred,
+                        // and `updated_at` holds it: APPROVED is the request's
+                        // last transition.
+                        time: Some(::aws_smithy_types::DateTime::from(request.updated_at)),
+                    })
+                }),
+        );
+        charges
     }
 
     /// The agreement's estimated cost, as `DescribeAgreement` reports it.

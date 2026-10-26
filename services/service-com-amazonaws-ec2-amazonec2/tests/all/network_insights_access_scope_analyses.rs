@@ -37,7 +37,8 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use ec2::ops::types::{ANALYSIS_STATUS_VALUES, FINDINGS_FOUND_VALUES};
 use ec2::state::{
-    ANALYSIS_STATUS_FAILED, ANALYSIS_STATUS_RUNNING, ANALYSIS_UNSUPPORTED_STATUS_MESSAGE,
+    AccessScopePaths, ANALYSIS_STATUS_FAILED, ANALYSIS_STATUS_RUNNING,
+    ANALYSIS_UNSUPPORTED_STATUS_MESSAGE,
     ComAmazonawsEc2Amazonec2State as Ec2State, FINDINGS_FOUND_UNKNOWN,
     IDEMPOTENT_PARAMETER_MISMATCH, INVALID_FILTER, MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES,
     NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX, NetworkInsightsAccessScopeAnalysisSpec,
@@ -103,15 +104,16 @@ async fn describe(router: &MultiServiceRouter, params: &[Param]) -> (u16, String
 
 /// A Network Access Scope of the account, as its id.
 ///
-/// `CreateNetworkInsightsAccessScope` is still a scaffold stub (its own issue,
-/// `ec2-createnetworkinsightsaccessscope-stub`), so the scope a start resolves is written
-/// through the store's own one insertion path — the same path that create will use — rather
-/// than through a second hand-built copy of the modelled shape.
+/// Written through the store's own one insertion path — the same path
+/// `CreateNetworkInsightsAccessScope` writes through — rather than through a second
+/// hand-built copy of the modelled shape. This suite is about the ANALYSES started against a
+/// scope, so the scope it resolves carries no content paths of its own; what the create
+/// stores is covered by `network_insights_access_scope_content`.
 fn seed_scope(engine: &engine::InMemoryEngine) -> String {
     engine
         .state::<Ec2State>()
         .lock()
-        .insert_network_insights_access_scope(REGION, Vec::new())
+        .insert_network_insights_access_scope(REGION, Vec::new(), AccessScopePaths::default(), None)
         .expect("the store holds room for the suite's scopes")
 }
 

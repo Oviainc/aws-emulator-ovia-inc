@@ -38,6 +38,9 @@ mod list_subscriptions;
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 
+#[path = "all/phone_number_opt_out_listing.rs"]
+mod phone_number_opt_out_listing;
+
 #[path = "all/platform_applications.rs"]
 mod platform_applications;
 

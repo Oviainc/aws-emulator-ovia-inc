@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cleanrooms#CreateConfiguredTableAssociationInput")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cleanrooms#CreateConfiguredTableAssociationInput",
+    // `skip_validation = ["roleArn"]`: the published `RoleArn` syntax is NOT what Clean
+    // Rooms refuses a bad role on. The service takes the value as a role to assume
+    // ("the service will assume this role to access catalog metadata and query the
+    // table"), so a value it cannot pass is an AUTHORIZATION failure — the
+    // `AccessDeniedException` (HTTP 403) the operation models — and not the boundary's
+    // `ValidationException` (HTTP 400). The constraint traits are therefore kept off the
+    // generated member schema and the handler judges the value itself; every other member
+    // of this input keeps its modelled constraints.
+    skip_validation = ["roleArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateConfiguredTableAssociationInput {
     pub name: String,

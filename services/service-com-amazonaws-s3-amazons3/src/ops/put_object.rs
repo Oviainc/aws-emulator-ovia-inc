@@ -553,6 +553,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested
         };
 
+        // The ACL this write puts on the object it stores, and the rules it is judged
+        // against — all of it decided before anything is written, so a refused write leaves
+        // whatever was at the key exactly as it was.
+        //
+        // "When adding a new object, you can use headers to grant ACL-based permissions …
+        // These permissions are then added to the ACL on the object. By default, all
+        // objects are private. Only the owner has full access control"
+        // (`PutObjectRequest$ACL`) — so a write that names an ACL stores it on the version
+        // it writes, and one that names none leaves the object with the default every
+        // reader derives. A write REPLACES the whole object, so the ACL of the object it
+        // replaces goes with it, exactly as its tag set does.
+        let acl = requested_acl(&input)?;
+        if let Some(grants) = acl.as_deref() {
+            // "Buckets that use this setting only accept PUT requests that don't specify an
+            // ACL or PUT requests that specify bucket owner full control ACLs … PUT
+            // requests that contain other ACLs … fail and return a 400 error with the error
+            // code AccessControlListNotSupported" (same member documentation), which is the
+            // ACL the bucket owner already has: the owner's `FULL_CONTROL` and nothing
+            // else.
+            if bucket_record.acls_disabled() && grants != crate::state::default_acl_grants() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ACL_NOT_SUPPORTED_CODE,
+                    crate::state::ACL_REFUSAL_STATUS,
+                    crate::state::ACL_NOT_SUPPORTED_MESSAGE,
+                ));
+            }
+            crate::state::validate_acl_grants(grants, &bucket_record.region).map_err(
+                |rejection| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        rejection.code(),
+                        rejection.status(),
+                        rejection.to_string(),
+                    )
+                },
+            )?;
+            // Block Public Access: with `BlockPublicAcls` on, "PUT Object calls fail if the
+            // request includes a public ACL" (Amazon S3 User Guide, Block Public Access) —
+            // the same guardrail `PutObjectAcl` answers for a later ACL write, refused with
+            // the same `AccessDenied` naming the principal, the action, the resource and
+            // the setting that prevented it.
+            if bucket_record
+                .public_access_block()
+                .is_some_and(|settings| settings.block_public_acls)
+                && crate::state::acl_grants_public_access(grants)
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    ACCESS_DENIED_CODE,
+                    ACCESS_DENIED_STATUS,
+                    crate::state::block_public_acls_denial(
+                        PUT_OBJECT_ACTION,
+                        &crate::state::object_arn(&input.bucket, &input.key),
+                    ),
+                ));
+            }
+        }
+
         let etag = crate::state::object_etag(&input.body);
         let object = crate::state::Object {
             etag: etag.clone(),
@@ -606,6 +662,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // object it replaces takes its annotations with it, and
             // `PutObjectAnnotation` is what attaches one to the version this write stores.
             annotations: ::std::collections::BTreeMap::new(),
+            // The ACL this write named, or none at all — in which case the object carries
+            // the ACL every object starts with, the owner's `FULL_CONTROL`, which a reader
+            // derives rather than this writing.
+            acl,
             body: input.body,
         };
 
@@ -711,6 +771,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The ACL this write names, `None` when it names none, or the refusal it earns.
+///
+/// Two of the three ways S3 takes an ACL reach a write: "Specify a canned ACL with the
+/// x-amz-acl request header … If you use this header, you cannot use other access
+/// control-specific headers in your request", or "specify access permissions explicitly
+/// with the x-amz-grant-read, x-amz-grant-read-acp, x-amz-grant-write-acp, and
+/// x-amz-grant-full-control headers … If you use these ACL-specific headers, you cannot
+/// use x-amz-acl header to set a canned ACL" (`PutObject`'s own documentation) — there is
+/// no `AccessControlPolicy` body on a write, whose payload is the object's bytes. So a
+/// request naming both is refused, and the one it does name is expanded into the grants
+/// the object stores, through the same canned table and the same header parser
+/// `PutObjectAcl` uses.
+fn requested_acl(
+    input: &PutObjectInput,
+) -> Result<Option<Vec<crate::state::AclGrant>>, PutObjectError> {
+    // The four explicit-grant headers this operation carries, each with the ONE
+    // `Permission` it stands for, in the model's own member order
+    // (`smithy_query(query="operation",operation="PutObject")`: GrantFullControl,
+    // GrantRead, GrantReadACP, GrantWriteACP — a write names no `x-amz-grant-write`,
+    // because WRITE is a permission on a bucket) — which is the order the grants they name
+    // are applied in.
+    let grant_headers: [(&str, Option<&str>, &str); 4] = [
+        (
+            "x-amz-grant-full-control",
+            input.grant_full_control.as_deref(),
+            crate::state::PERMISSION_FULL_CONTROL,
+        ),
+        (
+            "x-amz-grant-read",
+            input.grant_read.as_deref(),
+            crate::state::PERMISSION_READ,
+        ),
+        (
+            "x-amz-grant-read-acp",
+            input.grant_read_acp.as_deref(),
+            crate::state::PERMISSION_READ_ACP,
+        ),
+        (
+            "x-amz-grant-write-acp",
+            input.grant_write_acp.as_deref(),
+            crate::state::PERMISSION_WRITE_ACP,
+        ),
+    ];
+    let headers_name_an_acl = grant_headers.iter().any(|(_, value, _)| value.is_some());
+
+    if input.acl.is_some() && headers_name_an_acl {
+        return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+    }
+
+    if headers_name_an_acl {
+        // Explicit grant headers put exactly the grants they name on the object: they
+        // carry "explicit access permissions and grantees", with no canned expansion
+        // behind them, so a write that names one and not the owner's own grant leaves the
+        // object with that grant alone.
+        let mut grants: Vec<crate::state::AclGrant> = Vec::new();
+        for (header, value, permission) in grant_headers {
+            let Some(value) = value else { continue };
+            match crate::state::acl_grants_from_header(value, permission) {
+                Ok(parsed) => grants.extend(parsed),
+                Err(pair) => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "{header} names the grantee {pair:?}, which is not a type=value \
+                             pair whose type is id, uri or emailAddress"
+                        ),
+                    ))
+                }
+            }
+        }
+        return Ok(Some(grants));
+    }
+
+    if let Some(canned) = input.acl.as_deref() {
+        // `ACL` targets the `ObjectCannedACL` enum, so the boundary has already refused a
+        // value outside `OBJECT_CANNED_A_C_L_VALUES` before this handler ran; the refusal
+        // below is what keeps that true if the expansion table and the enum ever part.
+        return crate::state::object_canned_acl_grants(canned)
+            .map(Some)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "x-amz-acl must name one of {:?}, got {canned:?}",
+                        crate::state::OBJECT_CANNED_A_C_L_VALUES
+                    ),
+                )
+            });
+    }
+
+    // No canned ACL and no grant header: the write names no ACL, so none is stored and the
+    // object carries the default every reader derives.
+    Ok(None)
+}
+
+/// The code and status the Block Public Access guardrail denies a write carrying a public
+/// ACL with; the message is the guardrail's own
+/// ([`crate::state::block_public_acls_denial`]).
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The IAM action this operation is performed under — `s3:<OperationName>`, as the IAM
+/// Service Authorization Reference names the actions of Amazon S3 — which is what a refusal
+/// of this call names.
+const PUT_OBJECT_ACTION: &str = "s3:PutObject";
 
 /// The version id the object stored at `bucket`/`key` is addressable by, or `None` when
 /// it is the `null` version — one written while the bucket's versioning status was not

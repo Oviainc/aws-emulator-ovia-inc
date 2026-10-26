@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOpenIdToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOpenIdToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an OpenID Connect token for an identity this service already holds — the token
+//! half of the classic (basic) authentication flow, which a caller then exchanges with STS
+//! for a session of the pool's role.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOpenIdToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The identity is the one the request names, so the token is minted from STORED state:
+//! the identity's own pool is its audience and the identity is its subject. The `Logins`
+//! the call presents are additional logins OF that identity ("Supplying multiple logins
+//! creates an implicit link"), so each is linked to it in the same login index `GetId`
+//! keys a federated login by; a login this pool has already linked to a DIFFERENT identity
+//! belongs to another account and is refused with the modelled
+//! `ResourceConflictException`.
+//!
+//! Which authentication methods the token names is decided by the logins THIS call
+//! presented ([`crate::state::authentication_methods`]), exactly as the flow of a vend is:
+//! a call presenting a login is an authenticated one, a call presenting none is an
+//! unauthenticated one. The issuance is recorded in `open_id_tokens`, so the service can
+//! later say which identity a token it issued names and until when.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +97,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How long the token this operation mints stays valid. From this operation's own
+/// documentation: "The OpenID token is valid for 10 minutes."
+/// (`smithy_query(query="operation",operation="GetOpenIdToken")`). This operation models
+/// no `TokenDuration`, so every token it mints carries that window.
+const TOKEN_VALIDITY: ::std::time::Duration = ::std::time::Duration::from_secs(600);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +177,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOpenIdToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOpenIdTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOpenIdToken"))
+        // "This is a public API. You do not need any credentials to call this API" (this
+        // operation's own doc), so no principal is resolved and no identity-based policy is
+        // consulted: `ctx` carries nothing this handler needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetOpenIdTokenErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let logins = input.logins.unwrap_or_default();
+        let mut store = state.lock();
+
+        // "using a known Cognito ID. This known Cognito ID is returned by GetId": the token
+        // is minted FOR a stored identity, so one this service does not hold has no token.
+        let Some(identity) = store.identities.get(&input.identity_id) else {
+            return Err(GetOpenIdTokenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                },
+            )
+            .into());
+        };
+        let identity_pool_id = identity.identity_pool_id.clone();
+
+        // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
+        // wherever else this service is handed one: an entry naming an Amazon Cognito user
+        // pool carries its issuer in the provider name, so a token minted by a user pool
+        // that is none of this pool's `CognitoIdentityProviders` authenticates nobody here.
+        let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+            return Err(GetOpenIdTokenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+        if logins
+            .keys()
+            .any(|provider| !pool.accepts_login_provider(provider))
+        {
+            return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every login the call presents, and the provider names among them, in a stable
+        // order. The `Logins` member is a MAP, so one provider carries one login per call.
+        let mut presented: Vec<(String, String)> = logins
+            .iter()
+            .map(|(provider, login)| (provider.clone(), login.clone()))
+            .collect();
+        presented.sort();
+        let mut providers: Vec<String> = logins.keys().cloned().collect();
+        providers.sort();
+
+        // The logins presented name the identity the request names, so one this pool has
+        // already linked to another identity cannot be part of it — "a user tries to use a
+        // login which is already linked to another account".
+        for (provider, login) in &presented {
+            let linked = store.linked_identity(&identity_pool_id, provider, login);
+            if let Some(linked) = linked.filter(|linked| linked.as_str() != input.identity_id) {
+                return Err(GetOpenIdTokenErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(format!(
+                            "The login for provider '{provider}' is already linked to identity \
+                             '{linked}'."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The stores an implicit link grows carry THIS emulator's own ceilings
+        // (`crate::state`), checked before anything is written. This operation models no
+        // limit error, so a link the emulator cannot store is refused with the modelled
+        // throttle rather than written past the ceiling.
+        if store.pool_login_index_would_overflow(&identity_pool_id, &presented) {
+            return Err(GetOpenIdTokenErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "The maximum number of logins ({}) for the identity pool \
+                         '{identity_pool_id}' has been reached.",
+                        crate::state::MAX_LOGINS_PER_POOL
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.identity_providers_would_overflow(&input.identity_id, &providers) {
+            return Err(GetOpenIdTokenErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "The maximum number of linked login providers ({}) for the identity \
+                         '{}' has been reached.",
+                        crate::state::MAX_LOGIN_PROVIDERS_PER_IDENTITY,
+                        input.identity_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You can optionally add additional logins for the identity. Supplying multiple
+        // logins creates an implicit link": every presented login now resolves to this
+        // identity, so a later `GetId` presenting it answers the same one.
+        for (provider, login) in &presented {
+            store.link_login(&identity_pool_id, provider, login, &input.identity_id);
+        }
+
+        // A provider this identity had not been linked to before is a change to the
+        // identity, so it is recorded with the instant it happened.
+        if let Some(identity) = store.identities.get_mut(&input.identity_id) {
+            let linked_before = identity.logins.len();
+            for provider in &providers {
+                if !identity.logins.contains(provider) {
+                    identity.logins.push(provider.clone());
+                }
+            }
+            if identity.logins.len() != linked_before {
+                identity.logins.sort();
+                identity.last_modified_date = now;
+            }
+        }
+
+        let expiration = now + TOKEN_VALIDITY;
+        let token = crate::state::open_id_token(
+            &identity_pool_id,
+            &input.identity_id,
+            &providers,
+            now,
+            expiration,
+        );
+
+        // What the clock has already expired is forgotten here, and the store is kept
+        // inside this emulator's own ceiling on outstanding tokens; then this issuance is
+        // recorded, which is what lets the service say later which identity the token it
+        // handed out names. This call carries no `PrincipalTags` member, so the record
+        // names none rather than an empty map.
+        store.record_open_id_token(
+            token.clone(),
+            crate::state::IssuedOpenIdToken {
+                identity_id: input.identity_id.clone(),
+                identity_pool_id,
+                issued_at: now,
+                expiration,
+                principal_tags: None,
+            },
+            now,
+        );
+
+        Ok(GetOpenIdTokenOutput {
+            identity_id: Some(input.identity_id),
+            token: Some(token),
+        })
     }
 }

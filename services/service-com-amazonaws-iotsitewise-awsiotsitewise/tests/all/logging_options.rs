@@ -29,7 +29,11 @@ const MODELLED_LEVELS: [&str; 3] = ["ERROR", "INFO", "OFF"];
 
 /// Put `level` on `workspace` (`None` for the account-wide scope) and return
 /// `(status, body)`.
-async fn put_level(
+///
+/// `pub(crate)` for the reason `describe` below is: the sibling
+/// `describe_logging_options_reads` suite drives the same binding, so the
+/// spelling of `PUT /logging` lives here once.
+pub(crate) async fn put_level(
     router: &smithy_server_runtime::MultiServiceRouter,
     workspace: Option<&str>,
     level: &str,
@@ -43,7 +47,11 @@ async fn put_level(
 
 /// Describe `workspace`'s logging options (`None` for the account-wide scope) and
 /// return `(status, body)`.
-async fn describe(
+///
+/// `pub(crate)` because the sibling `describe_logging_options_reads` suite reads
+/// the same setting over the same wire form: the spelling of the `GET /logging`
+/// binding lives here once, so the two suites cannot drift on it.
+pub(crate) async fn describe(
     router: &smithy_server_runtime::MultiServiceRouter,
     workspace: Option<&str>,
 ) -> (u16, Value) {
@@ -55,12 +63,12 @@ async fn describe(
 }
 
 /// The `level` a describe reported, or `""`.
-fn reported_level(body: &Value) -> &str {
+pub(crate) fn reported_level(body: &Value) -> &str {
     body["loggingOptions"]["level"].as_str().unwrap_or("")
 }
 
 /// The scope a case addresses, spelled as it reads in a case label.
-fn scope_label(workspace: Option<&str>) -> String {
+pub(crate) fn scope_label(workspace: Option<&str>) -> String {
     match workspace {
         Some(name) => format!("workspace {name}"),
         None => "the account-wide scope".to_string(),

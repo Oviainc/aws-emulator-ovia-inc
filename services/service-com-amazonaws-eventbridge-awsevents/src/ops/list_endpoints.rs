@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the global endpoints `CreateEndpoint` wrote
+//! ([`crate::state::EndpointRecord`]), one page at a time. This is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +144,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEndpoints"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEndpointsErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        // A page token is a position this service issued; one it did not issue
+        // names no position to resume from. The model declares no client-input
+        // error for this operation, so the refusal travels on the 400
+        // `ValidationException` channel, as it does for every other listing of
+        // this service.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Parameter NextToken is not valid. Reason: it is not a token this \
+                         service issued.",
+                    ))
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        // The one write a listing makes: finish the transitions the clock already
+        // owed, so the states reported are the ones the endpoints are in at the
+        // instant of the read.
+        store.settle_endpoints(::std::time::SystemTime::now());
+
+        // Filtered in the name order the ordered map keeps; the page token is a
+        // position in that same order, so resuming means "every name strictly
+        // after it". `HomeRegion` selects on the Region the endpoint is homed in,
+        // the same member `DescribeEndpoint` selects one endpoint by.
+        let matched: Vec<&crate::state::EndpointRecord> = store
+            .endpoints
+            .iter()
+            .filter(|(name, endpoint)| {
+                let filtered_out = input
+                    .name_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !name.starts_with(prefix))
+                    || input
+                        .home_region
+                        .as_deref()
+                        .is_some_and(|region| endpoint.home_region != region);
+                let already_returned = resume_after
+                    .as_deref()
+                    .is_some_and(|after| name.as_str() <= after);
+                !filtered_out && !already_returned
+            })
+            .map(|(_, endpoint)| endpoint)
+            .collect();
+
+        let limit = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE, |max| {
+                usize::try_from(max)
+                    .unwrap_or(crate::state::MAX_LIST_PAGE)
+                    .clamp(1, crate::state::MAX_LIST_PAGE)
+            });
+        let page_len = matched.len().min(limit);
+        let page = &matched[..page_len];
+        let has_more = matched.len() > page_len;
+
+        Ok(ListEndpointsOutput {
+            endpoints: Some(
+                page.iter()
+                    .map(|endpoint| crate::state::EndpointRecord::to_summary(endpoint))
+                    .collect(),
+            ),
+            // A token only when there IS a next page: "if there are no more
+            // results, no token is included in the response"
+            // (`ListEndpoints$NextToken`).
+            next_token: page
+                .last()
+                .filter(|_| has_more)
+                .map(|endpoint| crate::state::encode_page_token(&endpoint.name)),
+        })
     }
 }

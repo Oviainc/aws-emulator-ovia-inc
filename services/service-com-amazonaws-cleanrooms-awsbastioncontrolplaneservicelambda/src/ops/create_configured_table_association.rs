@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguredTableAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguredTableAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguredTableAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Links a stored configured table to the collaboration a stored membership belongs to,
+//! and persists the association in [`crate::state`]; the response is the stored record,
+//! which `GetConfiguredTableAssociation` reads back unchanged.
+//!
+//! What the SERVICE decides, rather than echoes, is whether the `roleArn` can be used at
+//! all. The member's modelled syntax is NOT the refusal path (it carries
+//! `skip_validation` on the input struct): the service "will assume this role to access
+//! catalog metadata and query the table", so the value is judged as a ROLE — one that
+//! names no IAM role of the caller's own account cannot be passed to the service, which is
+//! the `AccessDeniedException` (HTTP 403) this operation models, not a 400. The modelled
+//! `@length` bound is still enforced here, rendered in the boundary's own envelope, so the
+//! only constraint the handler takes over is the one AWS does not refuse on.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +103,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::LazyLock;
+
+use ::aws_smithy_schema::serde::ShapeSerializer as _;
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{LengthTrait, ValidatingSerializer};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,18 +183,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguredTableAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfiguredTableAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguredTableAssociation"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let caller = st::caller_account_id();
+        let region = st::request_region(ctx.parts());
+        let membership_id = input.membership_identifier;
+
+        // The modelled `RoleArn` `@length` the boundary no longer checks (see
+        // `skip_validation` in `super::types::create_configured_table_association_types`):
+        // a value outside the declared bound is a member-value fault, so it keeps the
+        // 400 the boundary would have answered, in the boundary's own wording.
+        if let Some(message) = role_arn_length_refusal(&input.role_arn) {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: ROLE_ARN_MEMBER.to_string(),
+                            message: format!(
+                                "must be between {} and {} characters long",
+                                ROLE_ARN_LENGTH.0, ROLE_ARN_LENGTH.1
+                            ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // "The configured table is associated to the collaboration that this membership
+        // belongs to", so an unknown membership names no collaboration to associate into.
+        let Some(membership) = store.memberships.get(&membership_id).cloned() else {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::membership_not_found_message(&membership_id, caller),
+                        resource_id: membership_id,
+                        resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A membership outlives the collaboration behind it (its status records that),
+        // and a collaboration that is gone can hold no new association.
+        if !store.collaborations.contains_key(&membership.collaboration_id) {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "collaboration {} of membership {} not found",
+                            membership.collaboration_id, membership.id
+                        ),
+                        resource_id: membership.collaboration_id.clone(),
+                        resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The association refers to a stored configured table: the identifier "accepts a
+        // configured table ID", so one no create minted refers to nothing.
+        let Some(configured_table) = store
+            .configured_tables
+            .get(&input.configured_table_identifier)
+            .cloned()
+        else {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No such configured table: {}",
+                            input.configured_table_identifier
+                        ),
+                        resource_id: input.configured_table_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The pass-role decision: the service assumes this role, so what decides is
+        // whether the value names a role THIS account can pass, not whether its text
+        // matches the published syntax.
+        if !st::role_arn_is_passable(&input.role_arn, caller) {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(st::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string()),
+                        reason: Some(
+                            st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The alias is "used to query the underlying configured table", so two
+        // associations of one membership cannot share one: a repeat create collides with
+        // the association already stored under the name.
+        if let Some(existing) =
+            store.configured_table_association_named(&membership.id, &input.name)
+        {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(st::configured_table_association_exists_message(
+                            &input.name,
+                            &membership.id,
+                        )),
+                        resource_id: Some(existing.id.clone()),
+                        resource_type: Some(
+                            st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),
+                        ),
+                        reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Last, AFTER the resource-identity checks, so an unknown membership still
+        // answers 404 and a repeat create still answers 409 even at the cap: the store
+        // grows by one association per call and lives for the life of the process, so past
+        // the cap the service answers the quota error it models rather than accepting
+        // another entry. See `st::MAX_CONFIGURED_TABLE_ASSOCIATIONS` — the cap and these
+        // quota identifiers are the emulator's own, not values AWS publishes.
+        if store.configured_table_associations.len() >= st::MAX_CONFIGURED_TABLE_ASSOCIATIONS {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the number of configured table associations would exceed the limit \
+                             of {}",
+                            st::MAX_CONFIGURED_TABLE_ASSOCIATIONS
+                        ),
+                        quota_name: "ConfiguredTableAssociations".to_string(),
+                        quota_value: st::MAX_CONFIGURED_TABLE_ASSOCIATIONS as f64,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = st::new_uuid();
+        let arn = st::configured_table_association_arn(&region, &membership.id, &id);
+        let created_at = st::now();
+        let association = ConfiguredTableAssociation {
+            id: id.clone(),
+            arn: arn.clone(),
+            configured_table_id: configured_table.id.clone(),
+            configured_table_arn: configured_table.arn.clone(),
+            membership_id: membership.id.clone(),
+            membership_arn: membership.arn.clone(),
+            role_arn: input.role_arn,
+            name: input.name.clone(),
+            description: input.description,
+            // An association is created with no analysis rules of its own; the
+            // association analysis-rule operations are what add a type to this list.
+            analysis_rule_types: Some(Vec::new()),
+            create_time: created_at,
+            update_time: created_at,
+            // `childResources` are "the child resources that depend on this configured
+            // table association", and a fresh association has none.
+            child_resources: Some(Vec::new()),
+        };
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn, tags);
+        }
+        store
+            .configured_table_associations
+            .insert(id.clone(), association);
+        store.configured_table_association_order.push(id.clone());
+        store
+            .configured_table_association_by_name
+            .insert((membership.id.clone(), input.name), id.clone());
+
+        // Answer from the store, so the response is the persisted resource rather than a
+        // value computed beside it.
+        let Some(configured_table_association) =
+            store.configured_table_associations.get(&id).cloned()
+        else {
+            return Err(
+                CreateConfiguredTableAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "configured table association {id} was not persisted"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateConfiguredTableAssociationOutput {
+            configured_table_association,
+        })
     }
+}
+
+/// The input member whose constraints this operation enforces itself.
+const ROLE_ARN_MEMBER: &str = "roleArn";
+
+/// The modelled `RoleArn` `@length` bound (min 32, max 512), which the handler keeps
+/// enforcing after `skip_validation` takes it off the generated member schema.
+const ROLE_ARN_LENGTH: (i64, i64) = (32, 512);
+
+/// The constraint traits the service still enforces on a `roleArn`: the modelled
+/// `@length` and nothing else. The `@pattern` is deliberately absent — the pass-role
+/// decision in the handler takes its place.
+static ROLE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(
+        Some(ROLE_ARN_LENGTH.0),
+        Some(ROLE_ARN_LENGTH.1),
+    )));
+    traits
+});
+
+/// `roleArn` as a MEMBER schema carrying [`ROLE_ARN_TRAITS`], so the check itself is the
+/// framework's walk rather than this module's and the violation it reports — its kind, its
+/// path and its ceiling on how much of the rejected value is echoed — is the framework's
+/// too.
+static ROLE_ARN_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.cleanrooms#CreateConfiguredTableAssociationInput$roleArn",
+            "com.amazonaws.cleanrooms",
+            "RoleArn",
+        ),
+        ShapeType::String,
+        ROLE_ARN_MEMBER,
+        0,
+    )
+    .with_traits(&ROLE_ARN_TRAITS)
+});
+
+/// The message refusing `role_arn` for its LENGTH, or `None` when it satisfies the
+/// modelled bound.
+///
+/// Rendered by the same envelope the boundary uses, so a member-value refusal this
+/// operation words itself cannot drift from the boundary's wording for every other member.
+fn role_arn_length_refusal(role_arn: &str) -> Option<String> {
+    let mut validator = ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(&ROLE_ARN_SCHEMA, role_arn);
+    ::aws_smithy_schema_server::envelope(&validator.into_violations())
 }

@@ -9,19 +9,28 @@
 //!
 //! * a reporting read answers from PERSISTED state — an endpoint a create
 //!   stored reads back under its name with every member it was created with, and
-//!   a name no create stored is `ResourceNotFoundException` (HTTP 400);
+//!   a name no create stored is `ResourceNotFoundException` (HTTP 400) whose
+//!   message names the endpoint AND the Region it was looked for in;
+//! * `UpdateEndpoint` applies exactly the members its request carries to the
+//!   stored endpoint, leaves every member it does not carry alone, never moves
+//!   the identity the create minted, and reports the merged record — which a
+//!   later read reports identically;
 //! * a request the service refuses stores NOTHING, so the read that follows any
 //!   refused create reports the endpoint as missing — whatever the request was
-//!   wrong about;
+//!   wrong about — and a refused write leaves the stored endpoint exactly as it
+//!   was;
 //! * an endpoint AWS answers in a non-terminal state reaches its next one on its
-//!   own: `CREATING` -> `ACTIVE`, and a caller reading straight after the create
-//!   still observes `CREATING`;
+//!   own: `CREATING` -> `ACTIVE` and `UPDATING` -> `ACTIVE`, and a caller
+//!   reading straight after the call still observes the transient state;
 //! * a read changes nothing a later caller sees, and the identity a create minted
 //!   (the ARN, the subdomain and the URL built from it) is reported unchanged by
 //!   every read;
 //! * `HomeRegion` SELECTS the endpoint the read is about: a read naming the
 //!   Region the endpoint was created in finds it, and one naming another Region
 //!   finds nothing;
+//! * a listing reports the endpoints PERSISTED, in name order, narrowed by the
+//!   members the request carries, each exactly as the single-endpoint read
+//!   reports it, one page at a time, with a token only while a page remains;
 //! * the endpoint's name is its identity (a second create is
 //!   `ResourceAlreadyExistsException`, and the stored endpoint survives it).
 //!
@@ -422,6 +431,16 @@ async fn a_read_finds_the_endpoint_only_in_its_home_region() {
                 "ResourceNotFoundException",
                 "case {home_region:?}: expected ResourceNotFoundException, got {body}"
             );
+            // The Region the refusal names is the one it searched: the
+            // `HomeRegion` the read asked for, not the endpoint's own.
+            let searched = home_region.unwrap_or(REGION);
+            assert_eq!(
+                body["message"],
+                json!(format!(
+                    "Endpoint {name} does not exist in region {searched}."
+                )),
+                "case {home_region:?}: expected the Region searched to be named, got {body}"
+            );
         }
     }
 }
@@ -459,8 +478,9 @@ async fn an_endpoint_no_create_stored_is_reported_missing() {
         );
         assert_eq!(
             body["message"],
-            json!(format!("Endpoint {name} does not exist.")),
-            "case {name:?}: expected the missing endpoint to be named, got {body}"
+            json!(format!("Endpoint {name} does not exist in region {REGION}.")),
+            "case {name:?}: expected the missing endpoint and the Region searched to be \
+             named, got {body}"
         );
     }
 }
@@ -595,8 +615,9 @@ async fn a_refused_create_stores_no_endpoint() {
         );
         assert_eq!(
             absent["message"],
-            json!(format!("Endpoint {name} does not exist.")),
-            "case {case:?}: expected the missing endpoint to be named, got {absent}"
+            json!(format!("Endpoint {name} does not exist in region {REGION}.")),
+            "case {case:?}: expected the missing endpoint and the Region searched to be \
+             named, got {absent}"
         );
     }
 }
@@ -653,4 +674,631 @@ async fn a_second_create_under_one_name_is_refused_and_changes_nothing() {
             "{member} must survive a refused second create, got {again}"
         );
     }
+}
+
+/// The `CreateEndpoint` request every write table below starts from: one
+/// endpoint carrying a description, a failover policy, a bus pair and
+/// replication switched off, so each row can show a write reaching exactly the
+/// members it names.
+fn base_create(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "Description": "the original description",
+        "RoutingConfig": routing_config("abcdef0123456789", "us-west-2"),
+        "EventBuses": event_buses("orders", "us-west-2"),
+        "ReplicationConfig": { "State": state::REPLICATION_STATE_DISABLED },
+    })
+}
+
+/// Create that endpoint and read it back once the clock has settled it, so each
+/// write below is applied to an endpoint that is serving.
+async fn settled_endpoint(router: &MultiServiceRouter, name: &str) -> Value {
+    let (status, created) = events(router, "CreateEndpoint", &base_create(name)).await;
+    assert_eq!(status, 200, "CreateEndpoint answered {status} {created}");
+    tokio::time::sleep(past_the_transition(state::ENDPOINT_TRANSITION)).await;
+    let (status, stored) = events(router, "DescribeEndpoint", &json!({ "Name": name })).await;
+    assert_eq!(status, 200, "DescribeEndpoint answered {status} {stored}");
+    stored
+}
+
+/// One `UpdateEndpoint` request and the configuration the endpoint must hold
+/// afterwards.
+struct WriteCase {
+    case: &'static str,
+    /// The members of the write beyond the endpoint's name.
+    request: Value,
+    /// Every member the merged endpoint must report — those the write named and
+    /// those it left to the create.
+    expect: Value,
+}
+
+/// A write applies the members it carries, leaves every member it does not carry
+/// alone, answers the endpoint's transient state, and is reported identically by
+/// the read that follows once the clock has settled it.
+#[tokio::test]
+async fn a_write_applies_the_members_it_carries_and_leaves_the_rest() {
+    let base_routing = routing_config("abcdef0123456789", "us-west-2");
+    let base_buses = event_buses("orders", "us-west-2");
+    let new_routing = routing_config("0123456789abcdef", "ap-southeast-1");
+    let new_buses = event_buses("shipments.v2", OTHER_REGION);
+    let replication_role = role_arn("global-endpoint-replication");
+    let cases = [
+        WriteCase {
+            case: "a new description, and nothing else",
+            request: json!({ "Description": "the updated description" }),
+            expect: json!({
+                "Description": "the updated description",
+                "RoutingConfig": base_routing,
+                "EventBuses": base_buses,
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_DISABLED },
+                "RoleArn": null,
+            }),
+        },
+        WriteCase {
+            case: "a description emptied, which the modelled length admits",
+            request: json!({ "Description": "" }),
+            expect: json!({
+                "Description": "",
+                "RoutingConfig": base_routing,
+                "EventBuses": base_buses,
+            }),
+        },
+        WriteCase {
+            case: "another failover policy: another health check and another secondary Region",
+            request: json!({ "RoutingConfig": new_routing }),
+            expect: json!({
+                "Description": "the original description",
+                "RoutingConfig": new_routing,
+                "EventBuses": base_buses,
+            }),
+        },
+        WriteCase {
+            case: "another bus pair, in another pair of Regions",
+            request: json!({ "EventBuses": new_buses }),
+            expect: json!({
+                "Description": "the original description",
+                "RoutingConfig": base_routing,
+                "EventBuses": new_buses,
+            }),
+        },
+        WriteCase {
+            case: "replication switched on, with the role it runs as",
+            request: json!({
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_ENABLED },
+                "RoleArn": replication_role,
+            }),
+            expect: json!({
+                "Description": "the original description",
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_ENABLED },
+                "RoleArn": replication_role,
+            }),
+        },
+        WriteCase {
+            case: "a role for a replication that stays switched off",
+            request: json!({ "RoleArn": role_arn("standby") }),
+            expect: json!({
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_DISABLED },
+                "RoleArn": role_arn("standby"),
+            }),
+        },
+        WriteCase {
+            case: "every member the write can carry, at once",
+            request: json!({
+                "Description": "everything replaced",
+                "RoutingConfig": new_routing,
+                "EventBuses": new_buses,
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_ENABLED },
+                "RoleArn": replication_role,
+            }),
+            expect: json!({
+                "Description": "everything replaced",
+                "RoutingConfig": new_routing,
+                "EventBuses": new_buses,
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_ENABLED },
+                "RoleArn": replication_role,
+            }),
+        },
+    ];
+
+    for WriteCase {
+        case,
+        request,
+        expect,
+    } in cases
+    {
+        let router = emulator();
+        let name = "written-endpoint";
+        let stored = settled_endpoint(&router, name).await;
+
+        let mut body = json!({ "Name": name });
+        for (member, value) in request.as_object().expect("the write is an object") {
+            body[member] = value.clone();
+        }
+        let (status, written) = events(&router, "UpdateEndpoint", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateEndpoint answered {status} {written}"
+        );
+        assert_eq!(
+            written["State"],
+            json!(state::ENDPOINT_STATE_UPDATING),
+            "case {case:?}: a written endpoint is answered in {}, got {written}",
+            state::ENDPOINT_STATE_UPDATING
+        );
+        for (member, value) in expect.as_object().expect("the expectation is an object") {
+            // `UpdateEndpointResponse` models no `Description` member (its
+            // members are Name, Arn, RoutingConfig, ReplicationConfig,
+            // EventBuses, RoleArn, EndpointId, EndpointUrl and State), so the
+            // description is asserted on the read below.
+            if member == "Description" {
+                continue;
+            }
+            assert_eq!(
+                &written[member], value,
+                "case {case:?}: expected {member} to be {value}, got {written}"
+            );
+        }
+        // The endpoint's identity is not a member of the write, so a write never
+        // moves it.
+        for member in ["Name", "Arn", "EndpointId", "EndpointUrl"] {
+            assert_eq!(
+                written[member], stored[member],
+                "case {case:?}: {member} must not change because the endpoint was \
+                 written, got {written}"
+            );
+        }
+
+        // The transient state is OBSERVABLE: a read taken straight after the
+        // write still sees it.
+        let (status, transient) =
+            events(&router, "DescribeEndpoint", &json!({ "Name": name })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeEndpoint answered {status} {transient}"
+        );
+        assert_eq!(
+            transient["State"],
+            json!(state::ENDPOINT_STATE_UPDATING),
+            "case {case:?}: a read taken at once still reports {}, got {transient}",
+            state::ENDPOINT_STATE_UPDATING
+        );
+
+        tokio::time::sleep(past_the_transition(state::ENDPOINT_TRANSITION)).await;
+        let (status, settled) = events(&router, "DescribeEndpoint", &json!({ "Name": name })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeEndpoint answered {status} {settled}"
+        );
+        assert_eq!(
+            settled["State"],
+            json!(state::ENDPOINT_STATE_ACTIVE),
+            "case {case:?}: the clock owes the written endpoint {}, got {settled}",
+            state::ENDPOINT_STATE_ACTIVE
+        );
+        // The rule this table is about: the read reports what the write merged.
+        for (member, value) in expect.as_object().expect("the expectation is an object") {
+            assert_eq!(
+                &settled[member], value,
+                "case {case:?}: expected a read to report {member} as {value}, got {settled}"
+            );
+        }
+        assert_eq!(
+            settled["CreationTime"], stored["CreationTime"],
+            "case {case:?}: a write does not re-create the endpoint, got {settled}"
+        );
+        let (before, after) = (
+            stored["LastModifiedTime"].as_f64().unwrap_or_default(),
+            settled["LastModifiedTime"].as_f64().unwrap_or_default(),
+        );
+        assert!(
+            after > before,
+            "case {case:?}: expected the write to move LastModifiedTime past \
+             {before}, got {after}"
+        );
+    }
+}
+
+/// A write to a name no create stored changes nothing and is refused with the
+/// modelled missing-resource error, naming the endpoint and the Region searched.
+#[tokio::test]
+async fn a_write_to_an_endpoint_no_create_stored_is_refused() {
+    let router = emulator();
+    let stored_name = "stored-endpoint";
+    let stored = settled_endpoint(&router, stored_name).await;
+
+    for name in [
+        "never-created",
+        "stored-endpoint.suffix",
+        "Stored-Endpoint",
+        "a",
+    ] {
+        let (status, refused) = events(
+            &router,
+            "UpdateEndpoint",
+            &json!({ "Name": name, "Description": "should not apply" }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {name:?}: expected ResourceNotFoundException, got {refused}"
+        );
+        assert_eq!(
+            refused["message"],
+            json!(format!("Endpoint {name} does not exist in region {REGION}.")),
+            "case {name:?}: expected the missing endpoint and the Region searched to be \
+             named, got {refused}"
+        );
+    }
+
+    // A refused write reaches no other endpoint either.
+    let (status, again) = events(
+        &router,
+        "DescribeEndpoint",
+        &json!({ "Name": stored_name }),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeEndpoint answered {status} {again}");
+    assert_eq!(
+        again, stored,
+        "a write to a name no create stored must leave every endpoint alone, got {again}"
+    );
+}
+
+/// A write the service refuses stores NOTHING: the stored endpoint reads back
+/// exactly as it was, whatever the write was wrong about.
+#[tokio::test]
+async fn a_refused_write_changes_nothing() {
+    let cases = [
+        RefusalCase {
+            case: "a replication state outside the modelled enum",
+            request: json!({ "ReplicationConfig": { "State": "SOMETIMES" } }),
+        },
+        RefusalCase {
+            case: "replication switched on with no role to replicate as",
+            request: json!({
+                "ReplicationConfig": { "State": state::REPLICATION_STATE_ENABLED },
+            }),
+        },
+        RefusalCase {
+            case: "one event bus instead of the pair the model requires",
+            request: json!({ "EventBuses": [{ "EventBusArn": bus_arn(REGION, "orders") }] }),
+        },
+        RefusalCase {
+            case: "two differently named event buses",
+            request: json!({
+                "EventBuses": [
+                    { "EventBusArn": bus_arn(REGION, "orders") },
+                    { "EventBusArn": bus_arn("us-west-2", "shipments") },
+                ],
+            }),
+        },
+        RefusalCase {
+            case: "both event buses in one Region",
+            request: json!({
+                "EventBuses": [
+                    { "EventBusArn": bus_arn(REGION, "orders") },
+                    { "EventBusArn": bus_arn(REGION, "orders") },
+                ],
+            }),
+        },
+        RefusalCase {
+            case: "a health check that is not a Route 53 health-check ARN",
+            request: json!({
+                "RoutingConfig": {
+                    "FailoverConfig": {
+                        "Primary": { "HealthCheck": "not-a-health-check" },
+                        "Secondary": { "Route": "us-west-2" },
+                    },
+                },
+            }),
+        },
+        RefusalCase {
+            case: "a routing policy with no failover configuration",
+            request: json!({ "RoutingConfig": {} }),
+        },
+        RefusalCase {
+            case: "a secondary route that is not a Region",
+            request: json!({ "RoutingConfig": routing_config("abcdef0123456789", "US-WEST-2") }),
+        },
+    ];
+
+    for RefusalCase { case, request } in cases {
+        let router = emulator();
+        let name = "unwritten-endpoint";
+        let stored = settled_endpoint(&router, name).await;
+
+        let mut body = json!({ "Name": name });
+        for (member, value) in request.as_object().expect("the write is an object") {
+            body[member] = value.clone();
+        }
+        let (status, refused) = events(&router, "UpdateEndpoint", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the write to be refused with HTTP 400, got \
+             {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused}"
+        );
+
+        let (status, again) = events(&router, "DescribeEndpoint", &json!({ "Name": name })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeEndpoint answered {status} {again}"
+        );
+        assert_eq!(
+            again, stored,
+            "case {case:?}: a refused write must change nothing, got {again}"
+        );
+    }
+}
+
+/// The endpoints the listing table below creates, in an order that is NOT the
+/// order a listing reports them in, so the ordering asserted is the listing's
+/// own.
+const LISTED: [&str; 4] = ["zeta-endpoint", "alpha-endpoint", "alpha.two", "beta"];
+
+/// The same names in the order a listing walks them: the byte order of the name,
+/// which is the order the store keeps and the order a page token resumes in.
+const LISTED_IN_ORDER: [&str; 4] = ["alpha-endpoint", "alpha.two", "beta", "zeta-endpoint"];
+
+/// The names a listing reported, in the order it reported them.
+fn listed_names(listing: &Value) -> Vec<String> {
+    listing["Endpoints"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry["Name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One listing request and the endpoints it must report.
+struct ListingCase {
+    case: &'static str,
+    /// The members of the `ListEndpoints` request.
+    request: Value,
+    /// The names it must report, in the order it must report them.
+    expect: Vec<&'static str>,
+    /// Whether endpoints the request matched are left for a next page, which is
+    /// the only condition a page token is reported under.
+    truncated: bool,
+}
+
+/// A listing reports the endpoints PERSISTED, in name order, narrowed by the
+/// members the request carries, and reports each one exactly as a single-endpoint
+/// read does.
+#[tokio::test]
+async fn a_listing_reports_the_stored_endpoints_narrowed_by_the_request() {
+    let router = emulator();
+    for name in LISTED {
+        let (status, created) = events(&router, "CreateEndpoint", &base_create(name)).await;
+        assert_eq!(
+            status, 200,
+            "CreateEndpoint {name:?} answered {status} {created}"
+        );
+    }
+    tokio::time::sleep(past_the_transition(state::ENDPOINT_TRANSITION)).await;
+
+    let cases = [
+        ListingCase {
+            case: "no filter at all, which reports every endpoint",
+            request: json!({}),
+            expect: LISTED_IN_ORDER.to_vec(),
+            truncated: false,
+        },
+        ListingCase {
+            case: "a prefix two names share",
+            request: json!({ "NamePrefix": "alpha" }),
+            expect: vec!["alpha-endpoint", "alpha.two"],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a prefix only one name carries",
+            request: json!({ "NamePrefix": "alpha-" }),
+            expect: vec!["alpha-endpoint"],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a whole name as the prefix",
+            request: json!({ "NamePrefix": "zeta-endpoint" }),
+            expect: vec!["zeta-endpoint"],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a prefix no name carries",
+            request: json!({ "NamePrefix": "gamma" }),
+            expect: vec![],
+            truncated: false,
+        },
+        ListingCase {
+            case: "the Region the endpoints are homed in",
+            request: json!({ "HomeRegion": REGION }),
+            expect: LISTED_IN_ORDER.to_vec(),
+            truncated: false,
+        },
+        ListingCase {
+            case: "a Region no endpoint is homed in",
+            request: json!({ "HomeRegion": OTHER_REGION }),
+            expect: vec![],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a prefix and the home Region together",
+            request: json!({ "NamePrefix": "beta", "HomeRegion": REGION }),
+            expect: vec!["beta"],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a prefix in a Region those endpoints are not homed in",
+            request: json!({ "NamePrefix": "alpha", "HomeRegion": "ap-southeast-1" }),
+            expect: vec![],
+            truncated: false,
+        },
+        ListingCase {
+            case: "a page smaller than the number of endpoints",
+            request: json!({ "MaxResults": 2 }),
+            expect: vec!["alpha-endpoint", "alpha.two"],
+            truncated: true,
+        },
+        ListingCase {
+            case: "a page exactly as large as the number of endpoints",
+            request: json!({ "MaxResults": LISTED.len() }),
+            expect: LISTED_IN_ORDER.to_vec(),
+            truncated: false,
+        },
+        ListingCase {
+            case: "a page as large as the modelled maximum",
+            request: json!({ "MaxResults": 100 }),
+            expect: LISTED_IN_ORDER.to_vec(),
+            truncated: false,
+        },
+        ListingCase {
+            case: "the smallest page the modelled range admits, narrowed by a prefix",
+            request: json!({ "MaxResults": 1, "NamePrefix": "alpha" }),
+            expect: vec!["alpha-endpoint"],
+            truncated: true,
+        },
+    ];
+
+    for ListingCase {
+        case,
+        request,
+        expect,
+        truncated,
+    } in cases
+    {
+        let (status, listing) = events(&router, "ListEndpoints", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListEndpoints answered {status} {listing}"
+        );
+        assert_eq!(
+            listed_names(&listing),
+            expect,
+            "case {case:?}: expected exactly {expect:?}, got {listing}"
+        );
+        // A token is reported only when a next page exists.
+        assert_eq!(
+            listing["NextToken"].is_null(),
+            !truncated,
+            "case {case:?}: a token is reported only when a page remains, got {listing}"
+        );
+    }
+
+    // A listing reports each endpoint exactly as the single-endpoint read does:
+    // both are built from the one stored record.
+    let (_, listing) = events(&router, "ListEndpoints", &json!({})).await;
+    let entries = listing["Endpoints"]
+        .as_array()
+        .expect("the listing reports an array")
+        .clone();
+    for entry in entries {
+        let name = entry["Name"].as_str().unwrap_or_default();
+        let (status, described) = events(&router, "DescribeEndpoint", &json!({ "Name": name })).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: DescribeEndpoint answered {status} {described}"
+        );
+        for member in [
+            "Name",
+            "Arn",
+            "Description",
+            "RoutingConfig",
+            "EventBuses",
+            "ReplicationConfig",
+            "RoleArn",
+            "EndpointId",
+            "EndpointUrl",
+            "State",
+            "CreationTime",
+            "LastModifiedTime",
+        ] {
+            assert_eq!(
+                entry[member], described[member],
+                "case {name:?}: the listing and the read must agree on {member}, got \
+                 {entry} then {described}"
+            );
+        }
+    }
+}
+
+/// A listing walks every endpoint one page at a time, each page resuming strictly
+/// after the last name of the one before, and the last page carries no token.
+#[tokio::test]
+async fn a_listing_pages_through_every_endpoint() {
+    let router = emulator();
+    for name in LISTED {
+        let (status, created) = events(&router, "CreateEndpoint", &base_create(name)).await;
+        assert_eq!(
+            status, 200,
+            "CreateEndpoint {name:?} answered {status} {created}"
+        );
+    }
+
+    for page_size in 1..=LISTED.len() + 1 {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        for page in 0..=LISTED.len() {
+            let mut request = json!({ "MaxResults": page_size });
+            if let Some(token) = &token {
+                request["NextToken"] = json!(token);
+            }
+            let (status, listing) = events(&router, "ListEndpoints", &request).await;
+            assert_eq!(
+                status, 200,
+                "case page size {page_size}: ListEndpoints answered {status} {listing}"
+            );
+            let names = listed_names(&listing);
+            assert!(
+                names.len() <= page_size,
+                "case page size {page_size}: a page must hold at most {page_size} \
+                 endpoints, got {listing}"
+            );
+            walked.extend(names);
+            token = listing["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+            assert!(
+                page < LISTED.len(),
+                "case page size {page_size}: the walk must end, got {listing}"
+            );
+        }
+        assert!(
+            token.is_none(),
+            "case page size {page_size}: the last page carries no token, got {token:?}"
+        );
+        assert_eq!(
+            walked, LISTED_IN_ORDER,
+            "case page size {page_size}: expected the walk to report every endpoint once, \
+             in name order"
+        );
+    }
+
+    // A token this service did not issue names no position to resume from.
+    let (status, refused) = events(
+        &router,
+        "ListEndpoints",
+        &json!({ "NextToken": "not-a-token-this-service-issued" }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an unissued page token is refused, got {status} {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "expected ValidationException, got {refused}"
+    );
 }

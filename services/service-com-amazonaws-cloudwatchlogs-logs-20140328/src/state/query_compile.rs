@@ -21,7 +21,10 @@
 //!   earlier command of the same pipeline already defined — whether it defines it with an
 //!   `as` clause, with a named capture group of a `parse` expression, or by listing it in a
 //!   `fields` command — because the two definitions would name one field;
-//! * a `limit` command's count, which is a positive integer.
+//! * a `limit` command's count, which is a positive integer;
+//! * the lookup table each `lookup` command reads, which that command's first argument names
+//!   and which the caller resolves against the account's lookup tables
+//!   ([`CompiledQuery::lookup_tables`]).
 //!
 //! It judges nothing about the DATA: which fields a record carries, and whether a filter
 //! expression selects anything, are questions about log events rather than about the query
@@ -63,6 +66,11 @@ pub struct CompiledQuery {
     pub commands: Vec<String>,
     /// The ephemeral fields the pipeline defines, in no particular order.
     pub defined_fields: BTreeSet<String>,
+    /// The lookup tables the pipeline's `lookup` commands read, each named once and in the
+    /// order the pipeline names them. The query string says only which table a stage reads;
+    /// whether the account HOLDS that table is a question about state, so the caller resolves
+    /// these names against the stored lookup tables.
+    pub lookup_tables: Vec<String>,
 }
 
 impl CompiledQuery {
@@ -80,9 +88,9 @@ impl CompiledQuery {
 /// query syntax `StartQuery` refers to ("For more information, see CloudWatch Logs Insights
 /// Query Syntax"), which defines the query commands `display`, `fields`, `filter`, `stats`,
 /// `sort`, `limit`, `parse`, `pattern`, `diff`, `dedup` and `unmask`.
-pub const COMMANDS: [&str; 12] = [
+pub const COMMANDS: [&str; 13] = [
     SOURCE, "display", "fields", "filter", "stats", "sort", "limit", "parse", "pattern", "diff",
-    "dedup", "unmask",
+    "dedup", "unmask", LOOKUP,
 ];
 
 /// The command that selects the log groups a query reads, as `StartQuery` spells it.
@@ -100,6 +108,16 @@ const FIELDS: &str = "fields";
 
 /// The command that bounds how many records the pipeline returns.
 const LIMIT: &str = "limit";
+
+/// The command that enriches each record of the pipeline from a lookup table — the reference
+/// data `CreateLookupTable` uploads — by joining the table's rows on a key of the record:
+/// `lookup <lookupTableName> <keyField>[ AS <tableKeyField>] [OUTPUT <tableField>[ AS
+/// <newField>], …]`.
+const LOOKUP: &str = "lookup";
+
+/// The keyword that opens the list of lookup-table columns a `lookup` command joins onto each
+/// record.
+const OUTPUT: &str = "output";
 
 /// The keyword that names the field a command's expression is assigned to.
 const AS: &str = "as";
@@ -161,6 +179,15 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
         }
         if lowercased == LIMIT {
             check_limit_count(arguments, arguments_offset)?;
+        }
+        // A `lookup` command reads one lookup table, which its first argument names. The name
+        // is collected here and resolved against state by the caller, so a table this
+        // account does hold makes the query a query of it.
+        if lowercased == LOOKUP {
+            let table = lookup_table_name(arguments, arguments_offset)?;
+            if !compiled.lookup_tables.contains(&table) {
+                compiled.lookup_tables.push(table);
+            }
         }
         // A `fields` command DEFINES the fields it lists — "use the fields command to get
         // specific fields, or to create a new ephemeral field" — so a field an earlier
@@ -455,6 +482,41 @@ fn regex_literal(arguments: &str, arguments_offset: usize) -> Option<RegexLitera
     })
 }
 
+/// The lookup table a `lookup` command reads: its first argument, which the command requires
+/// (`lookup <lookupTableName> <keyField> …`), so a `lookup` naming none is not a `lookup`.
+///
+/// A name may be written quoted, which the quotes are not part of.
+fn lookup_table_name(
+    arguments: &str,
+    arguments_offset: usize,
+) -> Result<String, QueryCompileFailure> {
+    let missing = || QueryCompileFailure {
+        message: "The lookup command must name a lookup table.".to_string(),
+        start_char_offset: arguments_offset,
+        end_char_offset: arguments_offset + arguments.chars().count(),
+    };
+    let token = tokens(arguments).into_iter().next().ok_or_else(missing)?;
+    let name = token
+        .text
+        .trim_matches(|character| matches!(character, '"' | '\'' | ','));
+    if name.is_empty() {
+        return Err(missing());
+    }
+    Ok(name.to_string())
+}
+
+/// The text of a `lookup` command's `OUTPUT` list and the character offset that text starts
+/// at, or `None` when the command carries no `OUTPUT` clause — which is optional, a `lookup`
+/// without one joining every column of the table.
+fn output_clause(arguments: &str, arguments_offset: usize) -> Option<(String, usize)> {
+    let keyword = tokens(arguments)
+        .into_iter()
+        .find(|token| token.text.to_lowercase() == OUTPUT)?;
+    let after = keyword.offset + keyword.text.chars().count();
+    let text: String = arguments.chars().skip(after).collect();
+    Some((text, arguments_offset + after))
+}
+
 /// Check a `limit` command's count: "limit — Specify the number of log events returned", so
 /// the argument is one positive integer and nothing else.
 fn check_limit_count(
@@ -491,6 +553,17 @@ fn defined_fields(
         if let Some(literal) = regex_literal(arguments, arguments_offset) {
             defined.extend(capture_group_names(&literal.pattern, literal.offset + 1));
         }
+    }
+    // A `lookup` command's two halves name different things. Before `OUTPUT` an `as` clause
+    // renames the record's key to a COLUMN OF THE TABLE, which defines no field of the
+    // pipeline; inside the `OUTPUT` list an `as` clause does name a new ephemeral field. The
+    // columns the `OUTPUT` list itself names are the table's own, joined onto each record, so
+    // a pipeline that already names one of them is not defining it twice.
+    if command == LOOKUP {
+        if let Some((output, offset)) = output_clause(arguments, arguments_offset) {
+            defined.extend(alias_names(&output, offset));
+        }
+        return defined;
     }
     defined.extend(alias_names(arguments, arguments_offset));
     defined

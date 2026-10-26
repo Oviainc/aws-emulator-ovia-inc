@@ -177,6 +177,23 @@ pub(crate) fn minimal_schema(partition_key: &str) -> Value {
     })
 }
 
+/// Create the keyspace `name`, tolerating a name a suite already took: a suite that
+/// shares a keyspace across its cases calls this per case rather than tracking which one
+/// created it.
+///
+/// Shared with the other suites of this test binary, so there is ONE create-or-exists
+/// helper for this service rather than a copy per file.
+pub(crate) async fn ensure_keyspace(emulator: &Emulator, name: &str) {
+    let (status, body) = emulator
+        .call("CreateKeyspace", json!({"keyspaceName": name}))
+        .await;
+    assert!(
+        status == 200 || error_code(&body) == "ConflictException",
+        "case {name:?}: expected the keyspace to be created or to already exist, got \
+         {status} {body}"
+    );
+}
+
 /// RULE 1, for keyspaces: `CreateKeyspace` stores the keyspace and answers with the ARN
 /// of what it stored, and a name already taken conflicts.
 ///

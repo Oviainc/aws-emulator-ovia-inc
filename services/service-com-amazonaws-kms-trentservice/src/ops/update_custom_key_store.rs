@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomKeyStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCustomKeyStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: changes the properties of the custom key store a `CustomKeyStoreId`
+//! names. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCustomKeyStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The target is resolved FIRST, and a `CustomKeyStoreId` that names no key store of
+//! this account and Region is one answer whatever is wrong with it — see
+//! [`crate::state::ComAmazonawsKmsTrentserviceState::custom_key_store_in`], the one
+//! resolver this operation shares with `DescribeCustomKeyStores`, so the two can never
+//! disagree about which ids name nothing.
+//!
+//! Each property is changed only on a key store of the type it belongs to, and the
+//! result is read back through `DescribeCustomKeyStores`: "this operation does not
+//! return any property values. To verify the updated property values, use the
+//! DescribeCustomKeyStores operation."
 //!
 //! ## Shape of an operation
 //!
@@ -333,18 +337,254 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCustomKeyStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCustomKeyStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCustomKeyStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCustomKeyStoreErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // The connection state this operation judges is the one the CLOCK owes, not the
+        // transient one the call that started a connection change left behind — the
+        // same first step every operation that reports or moves a connection state
+        // takes.
+        state.settle_custom_key_stores();
+
+        // "Use the required CustomKeyStoreId parameter to identify the custom key
+        // store" (the operation doc): the target is resolved BEFORE any property is
+        // judged, so nothing about any key store is changed by a request that names
+        // none. An id that names no key store of this account and Region is the one
+        // refusal, whether it is a well-formed id nothing holds or a value that is not
+        // a key store id at all — the service does not split malformed from absent, and
+        // the refusal carries the error code alone, as the key-store refusals recorded
+        // on the wire do.
+        let Some(store) = state.custom_key_store_in(&region, &input.custom_key_store_id) else {
+            return Err(not_found());
+        };
+        let custom_key_store_type = store.custom_key_store_type();
+        let connected = store.connection_state == crate::state::CONNECTION_STATE_CONNECTED;
+
+        // Every property but the name belongs to ONE key store type: the CloudHSM
+        // cluster and the kmsuser password are "valid only for custom key stores with a
+        // CustomKeyStoreType of AWS_CLOUDHSM", and every XKS proxy property "only for
+        // custom key stores with a CustomKeyStoreType of EXTERNAL_KEY_STORE" (the
+        // members' own documentation). A property the key store cannot hold is a
+        // request this operation models no error for, so it is refused as invalid and
+        // nothing is changed.
+        let cloud_hsm_properties = input.cloud_hsm_cluster_id.is_some() || input.key_store_password.is_some();
+        let xks_properties = input.xks_proxy_uri_endpoint.is_some()
+            || input.xks_proxy_uri_path.is_some()
+            || input.xks_proxy_connectivity.is_some()
+            || input.xks_proxy_vpc_endpoint_service_name.is_some()
+            || input.xks_proxy_vpc_endpoint_service_owner.is_some()
+            || input.xks_proxy_authentication_credential.is_some();
+        let is_cloud_hsm =
+            custom_key_store_type == crate::state::CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM;
+        if cloud_hsm_properties && !is_cloud_hsm {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "CloudHsmClusterId and KeyStorePassword are valid only for a custom key \
+                 store with a CustomKeyStoreType of {}; {} has {custom_key_store_type}.",
+                crate::state::CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM,
+                input.custom_key_store_id
+            )));
+        }
+        if xks_properties && is_cloud_hsm {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The XksProxy properties are valid only for a custom key store with a \
+                 CustomKeyStoreType of {}; {} has {custom_key_store_type}.",
+                crate::state::CUSTOM_KEY_STORE_TYPE_EXTERNAL_KEY_STORE,
+                input.custom_key_store_id
+            )));
+        }
+
+        // "To update most properties of an CloudHSM key store, the ConnectionState of
+        // the CloudHSM key store must be DISCONNECTED. However, you can update the
+        // CustomKeyStoreName of an AWS CloudHSM key store when it is in the CONNECTED or
+        // DISCONNECTED state" (the operation doc), which is what
+        // `CustomKeyStoreInvalidStateException` — "the request was rejected because of
+        // the ConnectionState of the custom key store" — reports. The name is the one
+        // property a connected key store accepts.
+        if connected && (cloud_hsm_properties || xks_properties) {
+            return Err(UpdateCustomKeyStoreErrorModeled::CustomKeyStoreInvalidStateException(
+                CustomKeyStoreInvalidStateException {
+                    message: Some(format!(
+                        "{} is {}. To update this property, the custom key store must be {}.",
+                        input.custom_key_store_id,
+                        crate::state::CONNECTION_STATE_CONNECTED,
+                        crate::state::CONNECTION_STATE_DISCONNECTED
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The custom key store name must be unique in the Amazon Web Services
+        // account" (`NewCustomKeyStoreName`), and a name "already assigned to another
+        // custom key store in the account" is `CustomKeyStoreNameInUseException`. The
+        // key store's OWN name is not another key store's, so renaming it to what it is
+        // already called is not a conflict.
+        if let Some(new_name) = input.new_custom_key_store_name.as_deref() {
+            let taken = state.custom_key_stores.values().any(|other| {
+                other.custom_key_store_name == new_name
+                    && other.custom_key_store_id != input.custom_key_store_id
+            });
+            if taken {
+                return Err(
+                    UpdateCustomKeyStoreErrorModeled::CustomKeyStoreNameInUseException(
+                        CustomKeyStoreNameInUseException {
+                            message: Some(format!(
+                                "The custom key store name {new_name} is already assigned to \
+                                 another custom key store in the account."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The combined XksProxyUriEndpoint and XksProxyUriPath values must be unique in
+        // the Amazon Web Services account and Region"
+        // (`smithy_query(query="doc",shape="UpdateCustomKeyStoreRequest",member="XksProxyUriPath")`),
+        // which is what `XksProxyUriInUseException` reports. The combination is judged
+        // against what this update WOULD leave the key store with, since either half may
+        // be the one the request changes.
+        if input.xks_proxy_uri_endpoint.is_some() || input.xks_proxy_uri_path.is_some() {
+            let (endpoint, path) = match &store.backing {
+                crate::state::CustomKeyStoreBacking::External(proxy) => (
+                    input
+                        .xks_proxy_uri_endpoint
+                        .clone()
+                        .unwrap_or_else(|| proxy.uri_endpoint.clone()),
+                    input
+                        .xks_proxy_uri_path
+                        .clone()
+                        .unwrap_or_else(|| proxy.uri_path.clone()),
+                ),
+                crate::state::CustomKeyStoreBacking::CloudHsm(_) => (String::new(), String::new()),
+            };
+            let taken = state.custom_key_stores_in(&region).into_iter().any(|other| {
+                other.custom_key_store_id != input.custom_key_store_id
+                    && matches!(
+                        &other.backing,
+                        crate::state::CustomKeyStoreBacking::External(proxy)
+                            if proxy.uri_endpoint == endpoint && proxy.uri_path == path
+                    )
+            });
+            if taken {
+                return Err(UpdateCustomKeyStoreErrorModeled::XksProxyUriInUseException(
+                    XksProxyUriInUseException {
+                        message: Some(format!(
+                            "The external key store proxy URI {endpoint}{path} is already \
+                             associated with another external key store in this account and \
+                             Region."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "If you change the XksProxyConnectivity to VPC_ENDPOINT_SERVICE, you must also
+        // change the XksProxyUriEndpoint and add an XksProxyVpcEndpointServiceName
+        // value" (the member's documentation), so a connectivity change that leaves the
+        // key store without the endpoint service it would then be reached through is a
+        // configuration this operation cannot apply — the modelled
+        // `XksProxyVpcEndpointServiceInvalidConfigurationException`.
+        if input.xks_proxy_connectivity.as_deref()
+            == Some(crate::state::XKS_PROXY_CONNECTIVITY_VPC_ENDPOINT_SERVICE)
+        {
+            let named_here = input.xks_proxy_vpc_endpoint_service_name.is_some();
+            let named_already = matches!(
+                &store.backing,
+                crate::state::CustomKeyStoreBacking::External(proxy)
+                    if proxy.vpc_endpoint_service_name.is_some()
+            );
+            if !named_here && !named_already {
+                return Err(
+                    UpdateCustomKeyStoreErrorModeled::XksProxyVpcEndpointServiceInvalidConfigurationException(
+                        XksProxyVpcEndpointServiceInvalidConfigurationException {
+                            message: Some(format!(
+                                "Changing XksProxyConnectivity to {} requires an \
+                                 XksProxyVpcEndpointServiceName.",
+                                crate::state::XKS_PROXY_CONNECTIVITY_VPC_ENDPOINT_SERVICE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every check above has passed, so the properties the request names are applied
+        // to the one key store record every reader serves from.
+        let Some(store) = state.custom_key_store_mut(&region, &input.custom_key_store_id) else {
+            return Err(not_found());
+        };
+        if let Some(new_name) = input.new_custom_key_store_name {
+            store.custom_key_store_name = new_name;
+        }
+        match &mut store.backing {
+            // "Associate the custom key store with a different, but related, CloudHSM
+            // cluster" (the operation doc): clusters that share a backup history "have
+            // the same cluster certificate", so the trust anchor certificate the key
+            // store reports is the certificate of the related cluster too and is left
+            // exactly as it is.
+            crate::state::CustomKeyStoreBacking::CloudHsm(cluster) => {
+                if let Some(cloud_hsm_cluster_id) = input.cloud_hsm_cluster_id {
+                    cluster.cloud_hsm_cluster_id = cloud_hsm_cluster_id;
+                }
+                // `KeyStorePassword` "tells KMS the current password of the kmsuser
+                // crypto user. It does not set or change the password of any users in
+                // the CloudHSM cluster", and no reader reports it, so it changes nothing
+                // about the key store record.
+            }
+            crate::state::CustomKeyStoreBacking::External(proxy) => {
+                if let Some(uri_endpoint) = input.xks_proxy_uri_endpoint {
+                    proxy.uri_endpoint = uri_endpoint;
+                }
+                if let Some(uri_path) = input.xks_proxy_uri_path {
+                    proxy.uri_path = uri_path;
+                }
+                if let Some(connectivity) = input.xks_proxy_connectivity {
+                    proxy.connectivity = connectivity;
+                }
+                if let Some(service_name) = input.xks_proxy_vpc_endpoint_service_name {
+                    proxy.vpc_endpoint_service_name = Some(service_name);
+                }
+                if let Some(service_owner) = input.xks_proxy_vpc_endpoint_service_owner {
+                    proxy.vpc_endpoint_service_owner = Some(service_owner);
+                }
+                // "You must specify both the AccessKeyId and SecretAccessKey value in
+                // the authentication credential, even if you are only updating one
+                // value": the access key id is the half `DescribeCustomKeyStores`
+                // reports, and the secret is held by the proxy, not by KMS, so it is not
+                // stored here.
+                if let Some(credential) = input.xks_proxy_authentication_credential {
+                    proxy.access_key_id = credential.access_key_id;
+                }
+            }
+        }
+
+        // "This operation does not return any property values" — an empty 200.
+        Ok(UpdateCustomKeyStoreOutput {})
     }
+}
+
+/// How a `CustomKeyStoreId` naming no custom key store of this account and Region is
+/// refused: "KMS cannot find a custom key store with the specified key store name or
+/// ID" (`CustomKeyStoreNotFoundException`).
+///
+/// The refusal carries NO message member, the way `DescribeCustomKeyStores` answers the
+/// same absence, so a client that resolves a key store through either operation sees
+/// one answer.
+fn not_found() -> UpdateCustomKeyStoreError {
+    UpdateCustomKeyStoreErrorModeled::CustomKeyStoreNotFoundException(
+        CustomKeyStoreNotFoundException { message: None },
+    )
+    .into()
 }

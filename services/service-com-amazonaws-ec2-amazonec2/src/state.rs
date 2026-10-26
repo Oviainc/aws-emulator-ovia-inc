@@ -572,6 +572,20 @@
 //! `StartNetworkInsightsAccessScopeAnalysis` resolves the scope a caller asks to analyze,
 //! so a scope the account does not hold is refused rather than analyzed.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_contents`] holds the
+//! CONTENT of each of those scopes — the modelled [`NetworkInsightsAccessScopeContent`]
+//! shape itself — under the SAME `NetworkInsightsAccessScopeId`, because
+//! [`NetworkInsightsAccessScope`] carries no member for the paths a scope is made of while
+//! `CreateNetworkInsightsAccessScope` and `GetNetworkInsightsAccessScopeContent` both answer
+//! with them. One writer stores the scope and its content together
+//! ([`ComAmazonawsEc2Amazonec2State::insert_network_insights_access_scope`]), so a scope the
+//! account holds always has exactly one content and the create cannot report paths the get
+//! would not.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_client_tokens`] maps one
+//! create's `ClientToken` to the scope it created, so a replay of the same request answers
+//! that scope instead of creating a second one.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analyses`] holds the
 //! analyses that start has started, keyed by `NetworkInsightsAccessScopeAnalysisId`, as
 //! [`NetworkInsightsAccessScopeAnalysisRecord`]s: the modelled
@@ -1687,8 +1701,19 @@ pub const INVALID_FILTER: &str = "InvalidFilter";
 
 /// EC2's error code for a request that reuses a `ClientToken` with a different request —
 /// "The request uses the same client token as a previous, but non-identical request" (EC2
-/// API error codes). Answered through [`idempotent_parameter_mismatch`].
+/// API error codes). Answered through [`idempotent_parameter_mismatch`], with the message
+/// EC2 itself answers ([`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`]) rather than with that
+/// description of the condition.
 pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
+
+/// The message EC2 answers beside [`IDEMPOTENT_PARAMETER_MISMATCH`].
+///
+/// FIXED text: it states the condition and names nothing of the request — not the token, not
+/// the member that differs — so it is the whole rule rather than one run's sample of a
+/// varying text. Named here so the refusal and the suites that assert it cannot drift apart.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "The request has the same client token as a previous request, but the request parameters \
+     are not the same.";
 
 /// EC2's error code for a request that leaves out a member the action requires.
 pub const MISSING_PARAMETER: &str = "MissingParameter";
@@ -2281,6 +2306,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `StartNetworkInsightsAccessScopeAnalysis` resolves the scope it is asked to analyze
     /// here; `CreateNetworkInsightsAccessScope` is its writer.
     pub network_insights_access_scopes: BTreeMap<String, NetworkInsightsAccessScope>,
+    /// The content of each of those scopes, by the SAME `NetworkInsightsAccessScopeId` — the
+    /// modelled [`NetworkInsightsAccessScopeContent`] shape itself, since the scope shape
+    /// carries no member for the paths it is made of. See the module docs.
+    ///
+    /// [`Self::insert_network_insights_access_scope`] is the one writer of both maps, so
+    /// every stored scope has exactly one stored content; an operation that removes a scope
+    /// removes its content here too, and gives back the bytes
+    /// [`network_insights_access_scope_payload_bytes`] charged for it.
+    pub network_insights_access_scope_contents:
+        BTreeMap<String, crate::ops::types::NetworkInsightsAccessScopeContent>,
+    /// A `CreateNetworkInsightsAccessScope` `ClientToken` and the scope id that request
+    /// created, so a repeat of the same request answers with that scope instead of creating a
+    /// second one: "Unique, case-sensitive identifier that you provide to ensure the
+    /// idempotency of the request"
+    /// (`CreateNetworkInsightsAccessScopeRequest$ClientToken`).
+    pub network_insights_access_scope_client_tokens: HashMap<String, String>,
     /// Every Network Access Scope analysis the account has started, by
     /// `NetworkInsightsAccessScopeAnalysisId` — see the module docs. Ordered by id, which is
     /// the order `DescribeNetworkInsightsAccessScopeAnalyses` reports and pages over.
@@ -3097,6 +3138,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has bought nothing, so it holds no Reserved Instances.
             reserved_instances: BTreeMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
+            network_insights_access_scope_contents: BTreeMap::new(),
+            network_insights_access_scope_client_tokens: HashMap::new(),
             network_insights_access_scope_analyses: BTreeMap::new(),
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
@@ -9481,15 +9524,13 @@ pub fn invalid_filter<E>(supported: &[&str]) -> crate::scaffolded::Scaffolded<E>
 /// Refuse a request that reuses an idempotency token for a request that is not the one that
 /// token already named, the way EC2 does: HTTP 400 [`IDEMPOTENT_PARAMETER_MISMATCH`].
 ///
-/// The message is EC2's own documented wording for the code, which says what the caller has
-/// to change rather than echoing what it sent.
+/// The message is EC2's own ([`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`]), which states what
+/// is wrong rather than echoing what the request sent.
 pub fn idempotent_parameter_mismatch<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         IDEMPOTENT_PARAMETER_MISMATCH,
         400,
-        "The request uses the same client token as a previous, but non-identical request. \
-         Do not reuse a client token with different requests, unless the requests are \
-         identical.",
+        IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
     )
 }
 
@@ -28583,6 +28624,53 @@ pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE: &str = "network-insights-
 /// the predicate the start path asks before inserting.
 pub const MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES: usize = MAX_STORED_RECORDS_PER_STORE;
 
+/// The most paths one `MatchPaths` or one `ExcludePaths` list of a Network Access Scope's
+/// content may carry.
+///
+/// Each path is a caller-chosen structure of caller-chosen strings kept for the life of the
+/// store, so the list is bounded before any work proportional to it is done. Like
+/// [`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`], it is a capacity bound on this process's
+/// memory rather than an AWS quota; what the paths THEMSELVES hold is bounded by the byte
+/// budget every store of this crate shares ([`MAX_STORED_BYTES`]), charged through
+/// [`network_insights_access_scope_payload_bytes`].
+pub const MAX_ACCESS_SCOPE_PATHS: usize = 100;
+
+/// The two path lists one Network Access Scope's content is made of, as
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_insights_access_scope`] takes them.
+///
+/// The modelled RESPONSE shapes, so the store holds the paths exactly as every reader of a
+/// content answers with them rather than as the request shapes one writer happened to
+/// receive.
+#[derive(Debug, Clone, Default)]
+pub struct AccessScopePaths {
+    /// "The paths to match" (`NetworkInsightsAccessScopeContent$MatchPaths`).
+    pub match_paths: Vec<crate::ops::types::AccessScopePath>,
+    /// "The paths to exclude" (`NetworkInsightsAccessScopeContent$ExcludePaths`).
+    pub exclude_paths: Vec<crate::ops::types::AccessScopePath>,
+}
+
+/// The caller-chosen bytes one stored Network Access Scope holds: its tags, the client token
+/// that names it from now on, and the paths of its content, on top of the record's own fixed
+/// overhead ([`STORED_RECORD_OVERHEAD_BYTES`]) — so a scope with neither tags nor paths is
+/// not free against [`MAX_STORED_BYTES`]. Everything else on the record is derived by this
+/// module (the id, the ARN, the dates), so it is fixed-size.
+///
+/// The ONE definition of that charge, so a writer cannot ask one number and charge another.
+/// The paths are a nested structure of caller-chosen strings this module reads no member of,
+/// so they are charged by the length of their rendered form — never less than the bytes of
+/// the strings they hold — the way [`launch_template_payload_bytes`] charges a launch
+/// template's data.
+pub fn network_insights_access_scope_payload_bytes(
+    tags: &[Tag],
+    client_token: Option<&str>,
+    paths: &AccessScopePaths,
+) -> usize {
+    tag_list_bytes(tags)
+        .saturating_add(client_token.unwrap_or_default().len())
+        .saturating_add(format!("{paths:?}").len())
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
 /// The code EC2 answers for a Network Access Scope id the account holds no scope under.
 ///
 /// The same `Invalid<Resource>Id.NotFound` convention as
@@ -28659,6 +28747,28 @@ pub fn invalid_network_insights_access_scope_id_not_found<E>(scope_id: &str) -> 
     )
 }
 
+/// Refuse a Network Access Scope id `GetNetworkInsightsAccessScopeContent` cannot resolve:
+/// HTTP 400 `InvalidParameterValue`, naming the member that carried it and the value.
+///
+/// EC2 answers an id it cannot resolve in one of two ways, and WHICH one is a fact of the
+/// operation rather than of the id — the split [`invalid_id_parameter_value`] records: the
+/// describes answer this resource's own
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`], while the content get states that
+/// the id it was given is not a valid one — one answer for every id it cannot resolve,
+/// whatever its form. This is the ONE place that second wording lives, so the operation and
+/// the suite that asserts it cannot drift apart.
+///
+/// The wording is this operation's own and is NOT
+/// [`invalid_id_parameter_value`]'s ("Value (…) for parameter … is invalid. Expected: …"),
+/// which is what an operation validating an id LIST as a request parameter answers: EC2
+/// states here that the `NetworkInsightsAccessScopeId` it was given is not a valid one, so
+/// the two helpers must not be collapsed into one.
+pub fn invalid_network_insights_access_scope_id_value<E>(scope_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "NetworkInsightsAccessScopeId ({scope_id}) is not valid"
+    ))
+}
+
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
 /// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND`].
 pub fn invalid_network_insights_access_scope_analysis_id_not_found<E>(
@@ -28691,25 +28801,35 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_access_scopes.len() < MAX_STORED_RECORDS_PER_STORE
     }
 
-    /// Store a Network Access Scope, as the one way a scope enters the store, and answer
-    /// the `NetworkInsightsAccessScopeId` it was given — or `None` when the store is at
-    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    /// Store a Network Access Scope AND its content, as the one way a scope enters the
+    /// store, and answer the `NetworkInsightsAccessScopeId` they were given — or `None` when
+    /// the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
     ///
-    /// Reached from `StartNetworkInsightsAccessScopeAnalysis`'s own suite today and from
-    /// `CreateNetworkInsightsAccessScope` once that scaffold is implemented (its stub issue
-    /// is `20261022T235108Z-ec2-createnetworkinsightsaccessscope-stub`): it is the ONE path
-    /// a scope enters the store by, so the create has nothing of its own to derive.
+    /// Reached from `CreateNetworkInsightsAccessScope`, the operation that creates a scope,
+    /// and from the suites that seed one: it is the ONE path a scope enters the store by, so
+    /// the create has nothing of its own to derive, and no scope the account holds is without
+    /// the content [`Self::network_insights_access_scope_contents`] reports for it.
     ///
     /// Everything the service owns is derived here rather than taken from the caller — the
     /// id, the ARN built from it and the creation date — so no two writers can report the
-    /// same scope differently. A scope AWS hands back is ready, so it has no clock-owed
-    /// move: only the analyses started against it do. The caller-chosen bytes it holds are
-    /// charged on top of [`STORED_RECORD_OVERHEAD_BYTES`], so an untagged scope is not free
-    /// against [`MAX_STORED_BYTES`] either.
+    /// same scope differently. The paths come from the caller and are stored as they were
+    /// given, since they are what a content IS; a list naming no path at all is stored as
+    /// absent rather than as an empty set, there being no path to report. `client_token`, when
+    /// the writer has one, names this scope from now on in
+    /// [`Self::network_insights_access_scope_client_tokens`], so a replay of the request that
+    /// created it answers that scope rather than creating a second one.
+    ///
+    /// A scope AWS hands back is ready, so it has no clock-owed move: only the analyses
+    /// started against it do. The caller-chosen bytes it holds are charged on top of
+    /// [`STORED_RECORD_OVERHEAD_BYTES`] by the one definition of that charge
+    /// ([`network_insights_access_scope_payload_bytes`]), so a scope with neither tags nor
+    /// paths is not free against [`MAX_STORED_BYTES`] either.
     pub fn insert_network_insights_access_scope(
         &mut self,
         region: &str,
         tags: Vec<Tag>,
+        paths: AccessScopePaths,
+        client_token: Option<&str>,
     ) -> Option<String> {
         if !self.has_network_insights_access_scope_capacity() {
             return None;
@@ -28729,10 +28849,22 @@ impl ComAmazonawsEc2Amazonec2State {
             updated_date: Some(created_date),
             tags: Some(tags),
         };
-        self.add_stored_bytes(
-            tag_list_bytes(scope.tags.as_deref().unwrap_or_default())
-                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
-        );
+        self.add_stored_bytes(network_insights_access_scope_payload_bytes(
+            scope.tags.as_deref().unwrap_or_default(),
+            client_token,
+            &paths,
+        ));
+        let content = crate::ops::types::NetworkInsightsAccessScopeContent {
+            network_insights_access_scope_id: Some(scope_id.clone()),
+            match_paths: (!paths.match_paths.is_empty()).then_some(paths.match_paths),
+            exclude_paths: (!paths.exclude_paths.is_empty()).then_some(paths.exclude_paths),
+        };
+        self.network_insights_access_scope_contents
+            .insert(scope_id.clone(), content);
+        if let Some(client_token) = client_token {
+            self.network_insights_access_scope_client_tokens
+                .insert(client_token.to_string(), scope_id.clone());
+        }
         self.network_insights_access_scopes
             .insert(scope_id.clone(), scope);
         Some(scope_id)

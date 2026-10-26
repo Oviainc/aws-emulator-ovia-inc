@@ -559,6 +559,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The IAM action this operation's authorization refusal names. It is the same value
+/// the `impl Operation` carries as `NAME`, needed here because the judgment below is a
+/// free function rather than a method on it.
+const OPERATION_NAME: &str = "GenerateDataKeyPairWithoutPlaintext";
+
 /// The key `identifier` names, provided it can encrypt the private key in a data key
 /// pair — the whole of what this operation requires of the store.
 ///
@@ -573,6 +578,12 @@ fn sealing_key<'a>(
     // the same way as an identifier that names nothing: the key is not found.
     let key = match state.resolve(region, identifier) {
         crate::state::KeyRef::Found(key) => key,
+        crate::state::KeyRef::UnauthorizedAccount => {
+            return Err(crate::state::unauthorized_account(
+                OPERATION_NAME,
+                identifier,
+            ));
+        }
         crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
             return Err(
                 GenerateDataKeyPairWithoutPlaintextErrorModeled::NotFoundException(

@@ -26,6 +26,9 @@ mod component_type_create_references;
 #[path = "all/component_type_delete.rs"]
 mod component_type_delete;
 
+#[path = "all/component_type_inherited_schema.rs"]
+mod component_type_inherited_schema;
+
 #[path = "all/component_type_lifecycle.rs"]
 mod component_type_lifecycle;
 

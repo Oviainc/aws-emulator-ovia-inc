@@ -2296,8 +2296,7 @@ pub fn opt_in_too_soon_message() -> String {
 pub struct PhoneNumberRecord {
     /// The phone number, as the opt-out that created the record spelled it. The model
     /// marks every phone-number member `@sensitive`, so it belongs in a modelled
-    /// listing — `ListPhoneNumbersOptedOut`, still a scaffold stub, is what will read
-    /// it — and in no error string.
+    /// listing — `ListPhoneNumbersOptedOut` is what reads it — and in no error string.
     pub phone_number: String,
     /// When the number opted out of receiving SMS messages from this account —
     /// `None` once it has been opted back in.
@@ -2489,7 +2488,7 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// itself. NOT caller-grown, so it needs no ceiling of its own: a record appears
     /// when a number opts OUT, which the recipient does out of band and no SNS API
     /// performs — `OptInPhoneNumber` only clears and annotates a record already here,
-    /// and `CheckIfPhoneNumberIsOptedOut` only reads one.
+    /// and `CheckIfPhoneNumberIsOptedOut` and `ListPhoneNumbersOptedOut` only read.
     pub phone_numbers: HashMap<String, PhoneNumberRecord>,
     /// The device endpoints of this account's platform applications, keyed by the
     /// endpoint's own ARN: what `DeleteEndpoint` removes one of. A caller-grown store,
@@ -2574,6 +2573,29 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         found.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
+                .then_with(|| a.phone_number.cmp(&b.phone_number))
+        });
+        found
+    }
+
+    /// Every phone number this account currently holds an uncleared opt-out for,
+    /// oldest opt-out first (the number itself breaking a tie), so a listing and its
+    /// pagination token are stable across calls — see [`Self::subscriptions_of`].
+    ///
+    /// Selects on the record's opt-out state, not on the record's existence: a record
+    /// that `OptInPhoneNumber` cleared stays in the store (it carries the instant the
+    /// once-per-interval rule is measured from) but the number is no longer opted out,
+    /// so it is not listed — the same state [`PhoneNumberRecord::is_opted_out`] is what
+    /// a check of one number reports.
+    pub fn opted_out_numbers_in_order(&self) -> Vec<&PhoneNumberRecord> {
+        let mut found: Vec<&PhoneNumberRecord> = self
+            .phone_numbers
+            .values()
+            .filter(|record| record.is_opted_out())
+            .collect();
+        found.sort_by(|a, b| {
+            a.opted_out_at
+                .cmp(&b.opted_out_at)
                 .then_with(|| a.phone_number.cmp(&b.phone_number))
         });
         found

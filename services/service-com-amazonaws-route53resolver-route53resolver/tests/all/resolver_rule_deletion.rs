@@ -25,7 +25,10 @@ use super::harness::{call, emulator, expect_error, ok, string_member};
 
 /// Create a Resolver endpoint a FORWARD rule can route its queries through, and
 /// return its `Id`.
-async fn outbound_endpoint(router: &MultiServiceRouter, creator: &str) -> String {
+///
+/// `pub` because [`super::resolver_rule_error_bodies`] drives the same slice and
+/// so needs the same fixtures.
+pub async fn outbound_endpoint(router: &MultiServiceRouter, creator: &str) -> String {
     let created = ok(
         router,
         "CreateResolverEndpoint",
@@ -49,7 +52,9 @@ async fn outbound_endpoint(router: &MultiServiceRouter, creator: &str) -> String
 }
 
 /// Create a FORWARD rule through `endpoint` under `creator`, and return its `Id`.
-async fn forward_rule(
+///
+/// `pub` for the same reason as [`outbound_endpoint`].
+pub async fn forward_rule(
     router: &MultiServiceRouter,
     creator: &str,
     domain: &str,
@@ -77,7 +82,9 @@ async fn forward_rule(
 }
 
 /// Associate `rule` with `vpc` and return the association's `Id`.
-async fn associate(router: &MultiServiceRouter, rule: &str, vpc: &str) -> String {
+///
+/// `pub` for the same reason as [`outbound_endpoint`].
+pub async fn associate(router: &MultiServiceRouter, rule: &str, vpc: &str) -> String {
     let created = ok(
         router,
         "AssociateResolverRule",
@@ -122,8 +129,9 @@ const DELETE_CASES: &[DeleteCase] = &[
 
 /// A rule is deleted only once every VPC it is associated with has been
 /// disassociated: until then the delete is refused with the
-/// `ResourceInUseException` the operation models, naming how many associations
-/// are still in the way, and the rule stays readable.
+/// `ResourceInUseException` the operation models, and the rule stays readable.
+/// The body that refusal carries is asserted in
+/// [`super::resolver_rule_error_bodies`].
 ///
 /// The rows differ along what the rule generalises over: how many VPCs use the
 /// rule (none, one, several). Each association is then removed one at a time, so
@@ -167,11 +175,9 @@ async fn a_rule_is_deleted_once_no_vpc_is_associated_with_it() {
             );
             let message = string_member(&refused, "Message");
             assert!(
-                message.contains(&rule_id)
-                    && message.contains(&format!("{} VPC(s)", associations.len())),
-                "case {case:?}: the refusal must name the rule and how many associations are \
-                 still in the way ({}), got {message:?}",
-                associations.len()
+                message.starts_with("[RSLVR-"),
+                "case {case:?}: the refusal must carry the service error code Resolver words \
+                 every message with, got {message:?}"
             );
             assert_eq!(
                 string_member(

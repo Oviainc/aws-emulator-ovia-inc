@@ -31,11 +31,16 @@
 //! the list operations page deterministically and a pagination token stays valid across
 //! calls.
 //!
-//! The privacy budget template a collaboration holds is stored the same way the
+//! The privacy budget templates a collaboration holds are stored the same way the
 //! modelled [`Membership`] is — as the modelled `PrivacyBudgetTemplate`, because every
 //! one of its members is absolute — plus the
-//! `privacy_budget_template_by_collaboration` index that makes "each collaboration can
-//! have only one privacy budget template" a lookup rather than a scan.
+//! `privacy_budget_template_by_collaboration` index, keyed by the collaboration AND the
+//! budget type, that makes "one template per `PrivacyBudgetType`" a lookup rather than a
+//! scan.
+//!
+//! A configured table association is stored the same way, under the membership it was
+//! created for, with `configured_table_association_by_name` as the index that makes a
+//! repeat create under one table alias a conflict rather than a second resource.
 //!
 //! A collaboration change request is likewise stored as the modelled
 //! [`CollaborationChangeRequest`]; what the service COMPUTES about one — the change
@@ -65,7 +70,8 @@ use crate::ops::types::{
     AnalysisTemplate, AnalysisTemplateSummary, ApprovalStatusDetails, Change, ChangeSpecification,
     Collaboration, CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration,
     ConfiguredTable, ConfiguredTableAnalysisRule, ConfiguredTableAnalysisRulePolicy,
-    ConfiguredTableAnalysisRulePolicyV1, DataEncryptionMetadata,
+    ConfiguredTableAnalysisRulePolicyV1, ConfiguredTableAssociation,
+    ConfiguredTableAssociationSummary, DataEncryptionMetadata,
     DifferentialPrivacyTemplateParametersOutput, ErrorMessageConfiguration, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
     MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
@@ -545,6 +551,11 @@ pub const ANALYSIS_PARSE_TIME_BUDGET: Duration = Duration::from_secs(2);
 /// `CreateConfiguredTable` declares.
 pub const MAX_CONFIGURED_TABLES: usize = 5_000;
 
+/// See [`MAX_COLLABORATIONS`]: the same EMULATOR-enforced bound on the configured-table
+/// association store, reported through the `ServiceQuotaExceededException` (HTTP 402)
+/// `CreateConfiguredTableAssociation` declares.
+pub const MAX_CONFIGURED_TABLE_ASSOCIATIONS: usize = 5_000;
+
 /// The largest number of protected queries the store holds, for the same reason as
 /// [`MAX_COLLABORATIONS`]: `StartProtectedQuery` is the only operation that adds one,
 /// every one it adds lives for the life of the process so `GetProtectedQuery` can still
@@ -709,10 +720,27 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// Privacy budget template ids in creation order — the order a list operation
     /// pages in.
     pub privacy_budget_template_order: Vec<String>,
-    /// `collaboration id -> privacy budget template id`: the index that makes
-    /// "each collaboration can have only one privacy budget template" (the
-    /// `CreatePrivacyBudgetTemplate` doc) computable instead of guessed.
-    pub privacy_budget_template_by_collaboration: HashMap<String, String>,
+    /// `(collaboration id, privacyBudgetType) -> privacy budget template id`: the index
+    /// that makes "a collaboration holds at most one privacy budget template of a given
+    /// budget type" computable instead of guessed.
+    ///
+    /// The budget TYPE is part of the key because a template is created FOR one type:
+    /// `CreatePrivacyBudgetTemplate$privacyBudgetType` is required and names exactly one
+    /// member of the parameters union, so a template of another type configures another
+    /// budget rather than restating the same one.
+    pub privacy_budget_template_by_collaboration: HashMap<(String, String), String>,
+    /// Configured table associations by `ConfiguredTableAssociation.id`. The modelled
+    /// shape is stored as-is: every one of its members is absolute, so nothing is derived
+    /// per caller.
+    pub configured_table_associations: HashMap<String, ConfiguredTableAssociation>,
+    /// Configured table association ids in creation order — the order a listing pages in.
+    pub configured_table_association_order: Vec<String>,
+    /// `(membership id, table alias) -> configured table association id`: the index that
+    /// makes a repeat create under one alias a conflict rather than a second resource.
+    /// The alias is "used to query the underlying configured table"
+    /// (`CreateConfiguredTableAssociationInput$name`), so two associations of one
+    /// membership cannot share one.
+    pub configured_table_association_by_name: HashMap<(String, String), String>,
     /// Protected queries by `ProtectedQuery.id`.
     pub protected_queries: HashMap<String, ProtectedQueryRecord>,
     /// Protected query ids in start order — the order a listing pages in.
@@ -942,18 +970,51 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .insert((configured_table_id, rule_type), rule);
     }
 
-    /// The privacy budget template `collaboration_id` holds, if any.
+    /// The privacy budget template `collaboration_id` holds for `privacy_budget_type`,
+    /// if any.
     ///
-    /// `CreatePrivacyBudgetTemplate` documents "Each collaboration can have only one
-    /// privacy budget template", so this is the record a second create collides with.
-    pub fn privacy_budget_template_of_collaboration(
+    /// A privacy budget template configures the budget of ONE `PrivacyBudgetType` (that
+    /// member is required on the create and names exactly one member of the parameters
+    /// union), so this — the template of the SAME type — is the record a second create
+    /// collides with, and a template of another type is a different resource.
+    pub fn privacy_budget_template_of_type(
         &self,
         collaboration_id: &str,
+        privacy_budget_type: &str,
     ) -> Option<&PrivacyBudgetTemplate> {
-        let id = self
-            .privacy_budget_template_by_collaboration
-            .get(collaboration_id)?;
+        let id = self.privacy_budget_template_by_collaboration.get(&(
+            collaboration_id.to_string(),
+            privacy_budget_type.to_string(),
+        ))?;
         self.privacy_budget_templates.get(id)
+    }
+
+    /// The configured table association `membership_id` already holds under the table
+    /// alias `name`, if any — the record a repeat create collides with.
+    pub fn configured_table_association_named(
+        &self,
+        membership_id: &str,
+        name: &str,
+    ) -> Option<&ConfiguredTableAssociation> {
+        let id = self
+            .configured_table_association_by_name
+            .get(&(membership_id.to_string(), name.to_string()))?;
+        self.configured_table_associations.get(id)
+    }
+
+    /// The stored configured table association `association_id`, but only when it belongs
+    /// to `membership_id`: an association is a sub-resource of one membership (both
+    /// operations address it as
+    /// `/memberships/{membershipIdentifier}/configuredTableAssociations/{id}`), so one of
+    /// another membership is not visible through this one.
+    pub fn configured_table_association_in(
+        &self,
+        membership_id: &str,
+        association_id: &str,
+    ) -> Option<&ConfiguredTableAssociation> {
+        self.configured_table_associations
+            .get(association_id)
+            .filter(|association| association.membership_id == membership_id)
     }
 
     /// The stored template `template_id`, but only when it belongs to
@@ -1001,6 +1062,34 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
                 .privacy_budget_templates
                 .values()
                 .any(|template| template.arn == resource_arn)
+            || self
+                .configured_table_associations
+                .values()
+                .any(|association| association.arn == resource_arn)
+    }
+
+    /// Drop every configured table association of `membership_id` — the records, their
+    /// order entries, their name index entries and their tags.
+    ///
+    /// An association is a sub-resource of ONE membership (both of its operations address
+    /// it under that membership), so it is not reachable once the membership is gone: it
+    /// goes with it rather than staying behind, counting against the store's cap and
+    /// holding its tags alive.
+    pub fn remove_configured_table_associations_of(&mut self, membership_id: &str) {
+        let ids: Vec<String> = self
+            .configured_table_associations
+            .values()
+            .filter(|association| association.membership_id == membership_id)
+            .map(|association| association.id.clone())
+            .collect();
+        for id in ids {
+            if let Some(association) = self.configured_table_associations.remove(&id) {
+                self.tags.remove(&association.arn);
+            }
+            self.configured_table_association_order.retain(|held| held != &id);
+        }
+        self.configured_table_association_by_name
+            .retain(|(membership, _), _| membership != membership_id);
     }
 
     /// The tags stored for `resource_arn`: the empty map for a resource nobody has
@@ -1454,24 +1543,61 @@ pub fn analysis_template_summary(template: &AnalysisTemplate) -> AnalysisTemplat
     }
 }
 
+/// The modelled `ConfiguredTableAssociationSummary` projection of a stored
+/// `ConfiguredTableAssociation` — the same record, narrowed to the members the summary
+/// shape declares.
+pub fn configured_table_association_summary(
+    association: &ConfiguredTableAssociation,
+) -> ConfiguredTableAssociationSummary {
+    ConfiguredTableAssociationSummary {
+        id: association.id.clone(),
+        arn: association.arn.clone(),
+        configured_table_id: association.configured_table_id.clone(),
+        membership_id: association.membership_id.clone(),
+        membership_arn: association.membership_arn.clone(),
+        name: association.name.clone(),
+        create_time: association.create_time,
+        update_time: association.update_time,
+        analysis_rule_types: association.analysis_rule_types.clone(),
+    }
+}
+
 /// The account id every emulated caller presents, from the vendored runtime's single
 /// source of truth. Never a literal.
 pub fn caller_account_id() -> &'static str {
     ::engine::emulator_account_id()
 }
 
-/// The message an operation reports when the caller has no authorization to the
-/// `collaborationIdentifier` it sent — see
-/// [`CleanRoomsState::collaboration_grant`] for the cases that reach it.
+/// The principal every request to this emulator is authenticated as: the one IAM user of
+/// the single account it serves.
 ///
-/// Composed from the request's collaboration identifier and the resolved caller
-/// account: those two are what the authorization decision was made on, and naming them
-/// is what tells a caller the collaboration is not reachable from THIS account rather
-/// than that the id is malformed. It deliberately does not say whether a collaboration
-/// is stored under the id.
-pub fn collaboration_access_denied_message(collaboration_id: &str, account_id: &str) -> String {
+/// The emulator verifies a request's signature but holds no IAM directory behind the
+/// credential it was signed with, so there is one principal an authorization decision can
+/// name — the identity `sts:GetCallerIdentity` answers with for a credential that names
+/// no session, which every other service of this emulator names the same way.
+pub fn caller_principal() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The resource an authorization failure names when the operation it refused addresses no
+/// single resource — one whose identifiers all travel in the body, so the decision was
+/// taken on the action and not on a resource.
+pub const UNSCOPED_RESOURCE: &str = "*";
+
+/// The message an operation reports when the caller is not authorized to perform it —
+/// see [`CleanRoomsState::collaboration_grant`] for the cases that reach it.
+///
+/// One wording for the whole class, in the three parts an authorization failure is made
+/// of: WHO was refused (the calling principal's ARN), WHAT was asked for (this service's
+/// IAM action, the service prefix plus the operation name) and WHICH resource it was asked
+/// for (that resource's ARN, or [`UNSCOPED_RESOURCE`] where the operation addresses no
+/// single resource). Those three are what a caller reads a denial for, so each is a fact
+/// of THIS request and nothing is kept from one and replayed into another. It
+/// deliberately does not say whether a resource is stored under the identifier.
+pub fn authorization_denied_message(operation: &str, resource: &str) -> String {
     format!(
-        "Account {account_id} is not authorized to access collaboration: {collaboration_id}"
+        "User: {} is not authorized to perform: {ARN_SERVICE}:{operation} on resource: {resource}",
+        caller_principal()
     )
 }
 
@@ -1485,16 +1611,136 @@ pub fn membership_not_found_message(membership_id: &str, account_id: &str) -> St
     format!("No such membership: {membership_id} for account {account_id}")
 }
 
-/// The message `CreateMembership` reports when the caller already holds a membership in
-/// the collaboration it asked to join.
+/// The message `CreateMembership` reports when the account it would create a membership
+/// for is not [`MEMBER_STATUS_INVITED`] to the collaboration — because it already holds
+/// one, so it is [`MEMBER_STATUS_ACTIVE`].
 ///
-/// Composed from the resolved caller account and the request's collaboration
-/// identifier: one account holds at most one membership per collaboration, so the
-/// account the membership would be created for is the value that fails validation.
-pub fn duplicate_membership_message(account_id: &str, collaboration_id: &str) -> String {
+/// Composed from the resolved caller account plus the precondition that account fails: a
+/// membership is creatable only for a member the collaboration still has outstanding, so
+/// the account is the value that fails validation and the INVITED state is what would
+/// make the call succeed.
+pub fn membership_not_invited_message(account_id: &str) -> String {
     format!(
         "Cannot create membership for account: {account_id}. \
-         The account is already a member of collaboration: {collaboration_id}"
+         Memberships can only be created for members in {MEMBER_STATUS_INVITED} state"
+    )
+}
+
+/// The message `DeleteMembership` reports when the membership it addresses is the one the
+/// collaboration's own creator holds in a collaboration that still exists.
+///
+/// Composed from the membership and the collaboration that depends on it, plus what would
+/// make the call succeed: deleting the collaboration, which is the only thing that removes
+/// its creator's membership.
+pub fn creator_membership_not_deletable_message(
+    membership_id: &str,
+    collaboration_id: &str,
+) -> String {
+    format!(
+        "Cannot delete membership {membership_id} while collaboration {collaboration_id} \
+         exists. The collaboration creator's membership is removed by deleting the \
+         collaboration"
+    )
+}
+
+/// The message `CreatePrivacyBudgetTemplate` reports when the collaboration already holds
+/// a template of the budget type the request asks for.
+///
+/// Composed from the request's `privacyBudgetType` and the collaboration the membership
+/// belongs to: those two are the uniqueness key the create collides on, so naming them is
+/// what tells a caller that a template of ANOTHER budget type would still be accepted.
+pub fn privacy_budget_template_exists_message(
+    privacy_budget_type: &str,
+    collaboration_id: &str,
+) -> String {
+    format!(
+        "A Privacy Budget Template for {} already exists in collaboration {collaboration_id}.",
+        privacy_budget_type_display(privacy_budget_type)
+    )
+}
+
+/// A `PrivacyBudgetType` as prose: the catalog value's underscore-separated words, each
+/// capitalised (DIFFERENTIAL_PRIVACY -> "Differential Privacy"). The whole catalog is
+/// covered, so a value added to `PrivacyBudgetType` reads correctly without a second
+/// table to maintain.
+pub fn privacy_budget_type_display(privacy_budget_type: &str) -> String {
+    privacy_budget_type
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &characters.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// The account segment of `role_arn`, when the value is an IAM role ARN at all.
+///
+/// The form is the one the model's `RoleArn` pattern declares,
+/// `arn:aws:iam::<account>:role/<name>`: six colon-separated fields, an empty region
+/// (IAM is global), and a resource segment introduced by `role/`. A role name carries no
+/// colon (the pattern admits `[\w+=./@-]+`), so a value with more fields than that names
+/// no role. `None` means the value is not an IAM role ARN.
+pub fn iam_role_arn_account(role_arn: &str) -> Option<&str> {
+    let mut fields = role_arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some("aws"),
+        Some("iam"),
+        Some(""),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    let name = resource.strip_prefix("role/")?;
+    let account_is_word = !account.is_empty()
+        && account
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let name_is_role = !name.is_empty() && !name.contains(':');
+    (account_is_word && name_is_role).then_some(account)
+}
+
+/// Whether `role_arn` names a role `account_id` can pass to this service.
+///
+/// The service "will assume this role to access catalog metadata and query the table"
+/// (`CreateConfiguredTableAssociationInput$roleArn`), so the value is used as a role
+/// rather than parsed as a string: what decides is whether it names a role OF THE
+/// CALLER'S OWN account. A value that names no IAM role names no role in this account
+/// either, so both it and a role of another account are roles this caller cannot pass.
+pub fn role_arn_is_passable(role_arn: &str, account_id: &str) -> bool {
+    iam_role_arn_account(role_arn).is_some_and(|account| account == account_id)
+}
+
+/// The message an operation reports when the `roleArn` it was given is not a role the
+/// caller can pass to the service. Fixed text: the refusal is about the pass-role
+/// decision, which names no value of the request.
+pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// The message `CreateConfiguredTableAssociation` reports when the membership already
+/// holds an association under the table alias the request carries.
+///
+/// Composed from the alias and the membership: the alias is "used to query the underlying
+/// configured table", so it is the value whose uniqueness the create collides on.
+pub fn configured_table_association_exists_message(name: &str, membership_id: &str) -> String {
+    format!(
+        "A configured table association named {name} already exists in membership \
+         {membership_id}"
     )
 }
 
@@ -1666,6 +1912,18 @@ pub fn effective_template_auto_refresh(requested: Option<String>) -> String {
 /// (`^arn:aws:[\w]+:[\w]{2}-[\w]{4,9}-[\d]:[\d]{12}:configuredtable/[\d\w-]+$`).
 pub fn configured_table_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("configuredtable/{id}"))
+}
+
+/// `arn:aws:cleanrooms:<region>:<account>:configuredtableassociation/<membership id>/<id>`,
+/// the form the model's `ConfiguredTableAssociationArn` pattern declares — an association
+/// is a sub-resource of the membership it was created under, so its ARN is nested in that
+/// membership's id.
+pub fn configured_table_association_arn(region: &str, membership_id: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("configuredtableassociation/{membership_id}/{id}"),
+    )
 }
 
 /// The `tableType` a configured table reports: the `TableReferenceType` of the

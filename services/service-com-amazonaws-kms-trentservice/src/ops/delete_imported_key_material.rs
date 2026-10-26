@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteImportedKeyMaterial
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteImportedKeyMaterial`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the imported key material of the KMS key a `KeyId` names,
+//! which leaves that key waiting for key material again. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteImportedKeyMaterial::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Imported key material only exists on a key created with no key material, so this
+//! operation's precondition is the key's ORIGIN: a key whose material KMS generated has
+//! no imported material to delete, and is refused without being touched — the same gate
+//! `GetParametersForImport` applies, so the two cannot disagree about which keys the
+//! import path is for.
+//!
+//! `ImportKeyMaterial` is what gives a key the material this operation deletes, so the
+//! two are inverses: a key that has been given material is usable, and deleting that
+//! material leaves it waiting for material again.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +189,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteImportedKeyMaterial` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteImportedKeyMaterialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteImportedKeyMaterialErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="DeleteImportedKeyMaterialRequest",member="KeyId")`):
+        // an alias is not an identifier this operation accepts, which is what its
+        // modelled `InvalidArnException` reports — as it does for an ARN that is not a
+        // KMS ARN at all.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(invalid_arn(&input.key_id));
+        }
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(invalid_arn(&input.key_id));
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(DeleteImportedKeyMaterialErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "The Origin of the KMS key must be EXTERNAL" (the `KeyId` member's
+        // documentation): a key whose key material KMS generated holds no IMPORTED
+        // material, so it is "a specified resource [that] is not valid for this
+        // operation" — the modelled `UnsupportedOperationException`, worded from the key
+        // and the origin that refuses the call, exactly as `GetParametersForImport`
+        // words the same refusal. Nothing about the key is changed.
+        if key.origin != crate::state::ORIGIN_EXTERNAL {
+            return Err(
+                DeleteImportedKeyMaterialErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "{} origin is {} which is not valid for this operation.",
+                            key.arn, key.origin
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If no KeyMaterialId is specified, KMS deletes the current key material"
+        // (that member's documentation). A `KeyMaterialId` that names no key material
+        // this key holds — neither the current version nor one a rotation retained —
+        // identifies nothing to delete, which is the modelled `NotFoundException`.
+        let requested = input.key_material_id.as_deref();
+        let current = key.current_key_material_id.clone();
+        let names_current = requested.is_none() || requested == current.as_deref();
+        if !names_current && !key.retains_key_material(requested.unwrap_or_default()) {
+            return Err(DeleteImportedKeyMaterialErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "{} has no key material with the identifier {}.",
+                        key.arn,
+                        requested.unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "This operation makes the specified KMS key temporarily unusable. To restore
+        // the usability of the KMS key, reimport the same key material": deleting the
+        // CURRENT material is what leaves the key with none, and "when the specified KMS
+        // key is in the PendingDeletion state, this operation does not change the KMS
+        // key's state. Otherwise, it changes the KMS key's state to PendingImport."
+        // Deleting a version a rotation retained leaves the material the key encrypts
+        // under, and so leaves the key usable.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteImportedKeyMaterial"))
+        // `BackingKeyIdResponseType` is `@length(0, 64)` where the request member is
+        // `@length(64, 64)` (`smithy_query(query="operation",operation="DeleteImportedKeyMaterial")`),
+        // so a call that found no material to delete reports the empty identifier rather
+        // than refusing: the key already has no imported key material, which is the
+        // state this call asks for.
+        let deleted = if names_current {
+            key.delete_current_key_material()
+        } else {
+            key.forget_key_material(requested.unwrap_or_default())
+        };
+
+        Ok(DeleteImportedKeyMaterialOutput {
+            // KMS answers with the key ARN, not the identifier the request used.
+            key_id: Some(key.arn.clone()),
+            key_material_id: Some(deleted.unwrap_or_default()),
+        })
     }
+}
+
+/// Refuse an identifier this operation cannot resolve to a key: `InvalidArnException`
+/// names the identifier the request gave.
+fn invalid_arn(requested: &str) -> DeleteImportedKeyMaterialError {
+    DeleteImportedKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::invalid_arn_message(requested)),
+    })
+    .into()
 }

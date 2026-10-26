@@ -49,6 +49,8 @@ mod replication_region_catalog;
 mod resource_tagging;
 #[path = "all/restore_table.rs"]
 mod restore_table;
+#[path = "all/restore_table_restoring_status.rs"]
+mod restore_table_restoring_status;
 #[path = "all/service_managed_catalog.rs"]
 mod service_managed_catalog;
 #[path = "all/single_region_replication.rs"]
