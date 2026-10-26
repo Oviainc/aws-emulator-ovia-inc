@@ -46,6 +46,15 @@
 //! reason; nothing invents a result, a log tail or a duration for a function that did
 //! not run.
 //!
+//! The durable-execution slice hangs off the same record too, in
+//! [`FunctionRecord::durable_executions`]: one [`DurableExecutionRecord`] per execution
+//! started against the function, keyed by the execution name, which "must be unique
+//! within the function". `ListDurableExecutionsByFunction` reports those records —
+//! filtered and paged exactly as its own members ask — and never an execution nothing
+//! started. An execution has a lifetime of its own: it starts `RUNNING`, and the move to
+//! `TIMED_OUT` is owed by the CLOCK once the `ExecutionTimeout` of the function's
+//! `DurableConfig` falls due (see [`DurableExecutionRecord::materialize`]).
+//!
 //! The runtime-management slice hangs off the same record, one entry per version:
 //! `PutRuntimeManagementConfig` "sets the runtime management configuration for a
 //! function's version", so what it persists lives on
@@ -144,7 +153,7 @@ use crate::ops::types::{
     CodeSigningPolicies, Cors, CreateAliasOutput, CreateEventSourceMappingOutput,
     CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
     DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
-    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, FileSystemConfig,
+    EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, Execution, FileSystemConfig,
     FilterCriteria, FunctionCodeLocation, FunctionScalingConfig, GetFunctionScalingConfigOutput,
     GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
     ImageConfig, ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput,
@@ -1628,6 +1637,119 @@ pub const ASYNC_NOT_EXECUTED_REASON: &str =
 /// the event was queued, and no operation reads the queue back out.
 pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
 
+/// The model's `ExecutionStatus` value a durable execution carries while it is still
+/// running (`smithy_query(query="shape", shape="ExecutionStatus")`: `RUNNING`,
+/// `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED`).
+pub const EXECUTION_STATUS_RUNNING: &str = "RUNNING";
+
+/// The `ExecutionStatus` of an execution that finished its work; see
+/// [`EXECUTION_STATUS_RUNNING`].
+pub const EXECUTION_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The `ExecutionStatus` of an execution that ended in an error; see
+/// [`EXECUTION_STATUS_RUNNING`].
+pub const EXECUTION_STATUS_FAILED: &str = "FAILED";
+
+/// The `ExecutionStatus` of an execution that ran past its `ExecutionTimeout`; see
+/// [`EXECUTION_STATUS_RUNNING`] and [`DurableExecutionRecord::timeout_due`].
+pub const EXECUTION_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// The `ExecutionStatus` of an execution a caller stopped; see
+/// [`EXECUTION_STATUS_RUNNING`].
+pub const EXECUTION_STATUS_STOPPED: &str = "STOPPED";
+
+/// The ARN infix a durable execution's own ARN carries, from the model's
+/// `DurableExecutionArn` pattern
+/// (`…:function:<name>:<qualifier>/durable-execution/<execution-name>/<execution-id>`).
+pub const DURABLE_EXECUTION_ARN_INFIX: &str = "durable-execution";
+
+/// One durable execution of a function.
+///
+/// Held per function on [`FunctionRecord::durable_executions`] and keyed by its name,
+/// because a durable execution's name identifies it within the function it belongs to:
+/// `Invoke`'s own `DurableExecutionAlreadyStartedException` says "Each durable execution
+/// name must be unique within the function".
+///
+/// The execution is a resource with a lifetime of its own. It starts
+/// [`EXECUTION_STATUS_RUNNING`], and the move to [`EXECUTION_STATUS_TIMED_OUT`] is owed
+/// by the CLOCK rather than by anybody calling: `DurableConfig$ExecutionTimeout` is "the
+/// maximum time (in seconds) that a durable execution can run before timing out. This
+/// timeout applies to the entire durable execution", so the record stores the instant
+/// that timeout falls due and [`DurableExecutionRecord::materialize`] applies whatever
+/// the clock has already made due. Nothing here ever reports a result the execution did
+/// not produce.
+#[derive(Debug, Clone)]
+pub struct DurableExecutionRecord {
+    /// The execution's name, as the call that started it named it.
+    pub name: String,
+    /// The id this emulator minted for the execution, which its ARN carries beside the
+    /// name; see [`mint_durable_execution_id`].
+    pub execution_id: String,
+    /// The version label the execution runs under (`$LATEST` or a published version),
+    /// which its ARN carries and which `ListDurableExecutionsByFunction`'s `Qualifier`
+    /// filters on.
+    pub version: String,
+    /// The model's `ExecutionStatus` the execution currently carries.
+    pub status: String,
+    /// When the execution started, which the model's `StartTimestamp` reports.
+    pub started: SystemTime,
+    /// When the execution ended, once it reached a terminal status; the model's
+    /// `EndTimestamp`, which is absent while it is still running.
+    pub ended: Option<SystemTime>,
+    /// The customer managed key the function's `DurableConfig` named for the execution's
+    /// payload data, when it named one.
+    pub kms_key_arn: Option<String>,
+    /// When the execution's `ExecutionTimeout` falls due, while it is running and the
+    /// function's `DurableConfig` set one.
+    pub timeout_due: Option<SystemTime>,
+}
+
+impl DurableExecutionRecord {
+    /// Bring this record up to whatever the clock has already made due.
+    ///
+    /// The ONLY transition it applies is the one the clock owed at `now`: a running
+    /// execution whose `ExecutionTimeout` has fallen due has run past "the maximum time
+    /// (in seconds) that a durable execution can run before timing out", so it is
+    /// [`EXECUTION_STATUS_TIMED_OUT`] and it ended when that timeout fell due. It would
+    /// have been owed at the same instant even if nobody had called.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.status != EXECUTION_STATUS_RUNNING {
+            return;
+        }
+        if let Some(due) = self.timeout_due.filter(|due| now >= *due) {
+            self.status = EXECUTION_STATUS_TIMED_OUT.to_string();
+            self.ended = Some(due);
+            self.timeout_due = None;
+        }
+    }
+
+    /// Whether this execution started strictly after `at`, which is what
+    /// `ListDurableExecutionsByFunction`'s `StartedAfter` selects ("Filter executions
+    /// that started after this timestamp").
+    #[must_use]
+    pub fn started_after(&self, at: ::aws_smithy_types::DateTime) -> bool {
+        ::aws_smithy_types::DateTime::from(self.started).as_secs_f64() > at.as_secs_f64()
+    }
+
+    /// Whether this execution started strictly before `at`, which is what
+    /// `ListDurableExecutionsByFunction`'s `StartedBefore` selects ("Filter executions
+    /// that started before this timestamp").
+    #[must_use]
+    pub fn started_before(&self, at: ::aws_smithy_types::DateTime) -> bool {
+        ::aws_smithy_types::DateTime::from(self.started).as_secs_f64() < at.as_secs_f64()
+    }
+}
+
+/// A fresh durable execution id.
+///
+/// The model's `DurableExecutionArn` pattern ends in
+/// `/durable-execution/<execution-name>/([a-zA-Z0-9_-]+)`, so the id is the lower-case
+/// hexadecimal of a fresh UUID: unique per execution and inside that pattern.
+#[must_use]
+pub fn mint_durable_execution_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
+}
+
 /// The most aliases this emulator keeps for one function.
 ///
 /// An EMULATOR-CHOSEN ceiling, in the sense [`MAX_FUNCTIONS`] is: the store is in memory
@@ -1804,6 +1926,11 @@ pub struct FunctionRecord {
     /// The asynchronous invocations accepted for this function, oldest first, bounded
     /// by [`MAX_QUEUED_ASYNC_INVOCATIONS`].
     pub async_invocations: VecDeque<AsyncInvocationRecord>,
+    /// The durable executions of this function, keyed by execution name — the name
+    /// "must be unique within the function"
+    /// (`Invoke$DurableExecutionAlreadyStartedException`), so one name names one
+    /// execution however it is addressed, and the map's order is stable.
+    pub durable_executions: BTreeMap<String, DurableExecutionRecord>,
     /// The runtime management configuration of each version that has had one stored,
     /// keyed by the version label it belongs to — [`VERSION_LATEST`] or a published
     /// version number. A version with no entry carries
@@ -1872,6 +1999,11 @@ impl FunctionRecord {
         // the clock has already made due are the ones in effect.
         for config in self.function_scaling_configs.values_mut() {
             config.materialize(now);
+        }
+        // And the same rule for every durable execution: one whose `ExecutionTimeout`
+        // the clock has already made due has run past it, so it timed out.
+        for execution in self.durable_executions.values_mut() {
+            execution.materialize(now);
         }
     }
 
@@ -1958,6 +2090,80 @@ impl FunctionRecord {
             self.arn.clone()
         } else {
             format!("{}:{}", self.arn, version)
+        }
+    }
+
+    /// Start a durable execution named `name` against `version` at `now`, answering the
+    /// ARN it is addressed by, or `None` when this function already holds an execution
+    /// of that name — the state `Invoke`'s `DurableExecutionAlreadyStartedException`
+    /// describes ("Each durable execution name must be unique within the function"), so
+    /// a start never replaces an execution already held.
+    ///
+    /// The execution's settings come from the function's own `DurableConfig`: the key it
+    /// encrypts payload data under, and the `ExecutionTimeout` whose due instant is
+    /// stored here once rather than recomputed on every read.
+    pub fn start_durable_execution(
+        &mut self,
+        name: &str,
+        version: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        if self.durable_executions.contains_key(name) {
+            return None;
+        }
+        let durable_config = self
+            .config_of(version)
+            .and_then(|config| config.durable_config.clone());
+        let execution = DurableExecutionRecord {
+            name: name.to_string(),
+            execution_id: mint_durable_execution_id(),
+            version: version.to_string(),
+            status: EXECUTION_STATUS_RUNNING.to_string(),
+            started: now,
+            ended: None,
+            kms_key_arn: durable_config
+                .as_ref()
+                .and_then(|config| config.kms_key_arn.clone()),
+            timeout_due: durable_config
+                .as_ref()
+                .and_then(|config| config.execution_timeout)
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                // CHECKED, because the seconds come from a stored configuration: a
+                // timeout no `SystemTime` can represent falls due at no instant rather
+                // than at a panic.
+                .and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
+        };
+        let arn = self.durable_execution_arn(&execution);
+        self.durable_executions.insert(name.to_string(), execution);
+        Some(arn)
+    }
+
+    /// The ARN `execution` is addressed by, in the one form the model's
+    /// `DurableExecutionArn` pattern admits: the function ARN qualified by the version
+    /// the execution runs under — qualified even for `$LATEST`, which that pattern
+    /// requires — then the execution's name and id under
+    /// [`DURABLE_EXECUTION_ARN_INFIX`].
+    #[must_use]
+    pub fn durable_execution_arn(&self, execution: &DurableExecutionRecord) -> String {
+        format!(
+            "{}:{}/{DURABLE_EXECUTION_ARN_INFIX}/{}/{}",
+            self.arn, execution.version, execution.name, execution.execution_id
+        )
+    }
+
+    /// The `Execution` the wire reports for `execution`, built entirely out of what is
+    /// stored: the ARN it is addressed by, the function version it runs under, its
+    /// status and the instants it started and (once it has one) ended.
+    #[must_use]
+    pub fn listed_durable_execution(&self, execution: &DurableExecutionRecord) -> Execution {
+        Execution {
+            durable_execution_arn: self.durable_execution_arn(execution),
+            durable_execution_name: execution.name.clone(),
+            function_arn: self.versioned_arn(&execution.version),
+            status: execution.status.clone(),
+            start_timestamp: ::aws_smithy_types::DateTime::from(execution.started),
+            end_timestamp: execution.ended.map(::aws_smithy_types::DateTime::from),
+            kms_key_arn: execution.kms_key_arn.clone(),
         }
     }
 

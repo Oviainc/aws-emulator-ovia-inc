@@ -592,6 +592,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             aliases: ::std::collections::BTreeMap::new(),
             // ... and nothing queued for it until an invocation is accepted.
             async_invocations: ::std::collections::VecDeque::new(),
+            // ... and no durable execution until an invocation starts one.
+            durable_executions: ::std::collections::BTreeMap::new(),
             // ... and no stored runtime management configuration until
             // `PutRuntimeManagementConfig` stores one, so every version reports the
             // documented `Auto` default until then.

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDurableExecutionsByFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDurableExecutionsByFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDurableExecutionsByFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the durable executions the function record [`crate::state`] holds — one per
+//! execution started against the function — so a function nobody has started an
+//! execution on lists nothing, and no execution is reported that nothing started.
+//!
+//! `FunctionName` (and the `Qualifier` it may be paired with) resolves the function
+//! exactly as every other operation on this service resolves one; each of
+//! `DurableExecutionName`, `Statuses`, `StartedAfter` and `StartedBefore` narrows the
+//! set; `ReverseOrder` picks the direction of the start-time order the remainder is
+//! reported in; and `MaxItems`/`Marker` cut that order into pages whose marker is the ARN
+//! of the last execution the previous page reported.
+//!
+//! This is a REPORTING operation (`@readonly`): the only thing it writes is the
+//! transition the CLOCK already made due (see
+//! [`crate::state::DurableExecutionRecord::materialize`]).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +178,191 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDurableExecutionsByFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDurableExecutionsByFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDurableExecutionsByFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDurableExecutionsByFunctionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Maximum number of executions to return (1-1000). Default is 100." The model
+        // declares `MaxItems` `@range(min: 0, max: 1000)` with a default of 0, so the
+        // boundary validator has already refused anything outside that range and a
+        // request that names no limit arrives carrying the default — which is the
+        // documented 100 executions rather than none at all.
+        let page_size = match usize::try_from(input.max_items).unwrap_or(0) {
+            0 => DEFAULT_PAGE_SIZE,
+            requested => requested.min(MAX_PAGE_SIZE),
+        };
+
+        // "The function version to filter executions by. If you don't specify a
+        // qualifier, this operation returns executions across all versions of the Lambda
+        // function." The qualifier may come from the `Qualifier` parameter or from the
+        // `FunctionName` itself, and an unqualified request names none at all — which is
+        // not the same as naming `$LATEST`, the version an unqualified request RESOLVES
+        // to.
+        let named_qualifier =
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref());
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "The name or ARN of the Lambda function": the executions listed are those of
+        // the one function the name resolves to, resolved exactly the way every other
+        // operation on this service resolves a `FunctionName`. A qualifier naming a
+        // version or an alias the function does not have resolves to no function, so it
+        // is refused rather than answered with an empty page.
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+            crate::state::ResolveFailure::NotFound(message) => not_found(message),
+        })?;
+        let record = &*record;
+        // An alias names the version it invokes, so filtering by an alias filters by
+        // that version — the version the execution was started against.
+        let version_filter = named_qualifier.is_some().then_some(version);
+
+        // Every execution the function holds that satisfies each filter the request
+        // named. The filters are independent, so an execution is reported only when it
+        // satisfies all of them.
+        let mut entries: Vec<(String, Execution)> = record
+            .durable_executions
+            .values()
+            .filter(|execution| {
+                version_filter
+                    .as_deref()
+                    .is_none_or(|filter| execution.version == filter)
+            })
+            // "Filter executions by name. Only executions with names that matches this
+            // string are returned."
+            .filter(|execution| {
+                input
+                    .durable_execution_name
+                    .as_deref()
+                    .is_none_or(|name| execution.name == name)
+            })
+            // "Filter executions by status."
+            .filter(|execution| {
+                input
+                    .statuses
+                    .as_deref()
+                    .is_none_or(|statuses| statuses.contains(&execution.status))
+            })
+            // "Filter executions that started after this timestamp" / "before this
+            // timestamp".
+            .filter(|execution| {
+                input
+                    .started_after
+                    .is_none_or(|after| execution.started_after(after))
+                    && input
+                        .started_before
+                        .is_none_or(|before| execution.started_before(before))
+            })
+            .map(|execution| {
+                (
+                    record.durable_execution_arn(execution),
+                    record.listed_durable_execution(execution),
+                )
+            })
+            .collect();
+
+        // The executions are ordered by the instant they started, which is the order
+        // both documented directions are of: "Set to true to return results in
+        // chronological order (oldest first). Default is false", so the default is the
+        // newest first. The tie-break is the execution's ARN, so two executions started
+        // inside the same instant still have ONE order, which is what lets a marker
+        // continue a page without skipping or repeating an entry.
+        entries.sort_by(|(left_arn, left), (right_arn, right)| {
+            left.start_timestamp
+                .as_secs_f64()
+                .total_cmp(&right.start_timestamp.as_secs_f64())
+                .then_with(|| left_arn.cmp(right_arn))
+        });
+        if !input.reverse_order.unwrap_or(false) {
+            entries.reverse();
+        }
+
+        // "Pagination token from a previous request to continue retrieving results": the
+        // marker is the ARN of the last execution the previous page reported, so this
+        // page starts at the one ordered directly after it. A value that names no
+        // execution in this order names no place to continue from.
+        let start = match input.marker.as_deref() {
+            Some(marker) => {
+                entries
+                    .iter()
+                    .position(|(arn, _)| arn == marker)
+                    .ok_or_else(|| {
+                        invalid_parameter(format!(
+                            "1 validation error detected: Value '{marker}' at 'marker' failed \
+                             to satisfy constraint: Member must be the durable execution ARN of \
+                             a previous page's last entry"
+                        ))
+                    })?
+                    + 1
+            }
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListDurableExecutionsByFunctionOutput {
+            durable_executions: Some(
+                page.iter()
+                    .map(|(_, execution)| execution.clone())
+                    .collect(),
+            ),
+            // "Pagination token for retrieving additional results. Present only if there
+            // are more results available" — so it is absent on the last page, and it is
+            // the ARN of the last execution THIS page reported, which is what the next
+            // page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(arn, _)| arn.clone()),
+        })
     }
+}
+
+/// The number of executions reported to a caller that names no `MaxItems`, which the
+/// member's own documentation states: "Maximum number of executions to return (1-1000).
+/// Default is 100."
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The most executions one page reports, from the same sentence and from the member's
+/// own `@range(min: 0, max: 1000)`.
+const MAX_PAGE_SIZE: usize = 1_000;
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListDurableExecutionsByFunctionError {
+    ListDurableExecutionsByFunctionErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a function this emulator does not hold.
+fn not_found(message: String) -> ListDurableExecutionsByFunctionError {
+    ListDurableExecutionsByFunctionErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }
