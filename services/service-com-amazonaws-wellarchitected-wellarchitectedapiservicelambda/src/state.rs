@@ -36,7 +36,10 @@
 //! (`CreateProfileShare`, `ListProfileShares`, `DeleteProfileShare`) are held like a
 //! workload's, keyed by the `ProfileArn` they share then by the share's own `ShareId`, and
 //! each raises the invitation `ListShareInvitations` reports to the principal it was
-//! offered to. The agent profiles
+//! offered to. The shares of a REVIEW TEMPLATE (`CreateTemplateShare`,
+//! `ListTemplateShares`) are held the same way, keyed by the `TemplateArn` they share then
+//! by the share's own `ShareId`, and raise an invitation of their own kind through that
+//! same enumeration. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `UpdateAgentGoal`,
 //! `DeleteAgentGoal`) are backed the same way,
@@ -115,7 +118,8 @@ use crate::ops::types::{
     ProfileShareSummary, ProfileSummary, Progress, ResourceNotFoundException, ReviewTemplate,
     ReviewTemplateAnswer, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
     ReviewTemplateSummary, Scope,
-    ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
+    ShareInvitation, ShareInvitationSummary, Tag, TemplateShareSummary, Workload,
+    WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
     CRITICALITY_VALUES, QUESTION_VALUES, RISK_VALUES,
@@ -1033,6 +1037,16 @@ pub const MAX_SHARES_PER_LENS: usize = 1_000;
 /// value read off a doc page. It bounds the profile-share map's growth — one share per
 /// principal per profile, and every create token is 1:1 with a live share.
 pub const MAX_SHARES_PER_PROFILE: usize = 1_000;
+
+/// The most shares one REVIEW TEMPLATE holds in this emulator.
+///
+/// The same reasoning as [`MAX_SHARES_PER_WORKLOAD`], for the review template:
+/// `CreateTemplateShare` models `ServiceQuotaExceededException` (HTTP 402, "The user has
+/// reached their resource quota") for the metered case and the real quota is adjustable
+/// through Service Quotas, so the number is this emulator's own ceiling rather than a
+/// value read off a doc page. It bounds the template-share map's growth — one share per
+/// principal per template, and every create token is 1:1 with a live share.
+pub const MAX_SHARES_PER_REVIEW_TEMPLATE: usize = 1_000;
 
 /// `ResourceNotFoundException$ResourceType` for the review of one lens in one workload
 /// — the resource `ListAnswers` and the other per-lens reads resolve. The modelled
@@ -2911,8 +2925,8 @@ impl ReviewTemplateRecord {
             tags: Some(self.tags.clone().into_iter().collect()),
             update_status: Some(update_status.to_string()),
             // "The ID assigned to the template share invitation": only a template reached
-            // through a share invitation carries one, and template shares are still a
-            // stub.
+            // THROUGH a share invitation carries one, which is the recipient's reading of
+            // a shared template; the owner reading a template it shared out carries none.
             share_invitation_id: None,
         }
     }
@@ -4151,6 +4165,94 @@ impl ProfileShareRecord {
 #[derive(Debug, Clone)]
 pub struct CreateProfileShareToken {
     pub profile_arn: String,
+    pub share_id: String,
+    pub fingerprint: String,
+}
+
+/// One stored share of a REVIEW TEMPLATE: the principal the template was shared WITH and
+/// where the share stands.
+///
+/// The review-template counterpart of [`WorkloadShareRecord`], and recorded for the same
+/// reasons: a share is its own resource identified by its `ShareId`, it belongs to the
+/// template it shares, and `shared_by` is that template's owning account
+/// ([`ReviewTemplateRecord::owner`]) — the principal that did the sharing, which
+/// `ShareInvitationSummary$SharedBy` reports. A template share carries NO permission:
+/// `CreateTemplateShare` takes none (`smithy_query(query="operation",
+/// operation="CreateTemplateShare")` publishes only `TemplateArn`, `SharedWith` and
+/// `ClientRequestToken`), so a template invitation reports none either.
+///
+/// `share_invitation_id` is the id of the invitation the recipient has to answer. It is
+/// 1:1 with the share and exists from the moment the share is created — "Shared access to
+/// a review template is not removed until the review template share invitation is
+/// deleted" (`CreateTemplateShare` doc) — but it is a resource of its OWN, named by its
+/// own `ShareInvitationId`, so it is minted and recorded beside the `ShareId`.
+///
+/// The template's NAME is not held here: the template owns it and `UpdateReviewTemplate`
+/// can change it, so an invitation reads it off the template record at projection time
+/// rather than from a copy that could go stale.
+#[derive(Debug, Clone)]
+pub struct TemplateShareRecord {
+    pub share_id: String,
+    pub share_invitation_id: String,
+    /// The `TemplateArn` the share belongs to — the key of [`ReviewTemplateRecord`] in
+    /// the store.
+    pub template_arn: String,
+    pub shared_by: String,
+    pub shared_with: String,
+    pub status: String,
+    pub status_message: Option<String>,
+}
+
+impl TemplateShareRecord {
+    /// The `TemplateShareSummary` projection `ListTemplateShares` pages over.
+    ///
+    /// `TemplateShareSummary` declares exactly `ShareId`, `SharedWith`, `Status` and
+    /// `StatusMessage` (`smithy_query(query="shape", shape="TemplateShareSummary")`) — no
+    /// permission, because a review-template share grants none.
+    pub fn to_summary(&self) -> TemplateShareSummary {
+        TemplateShareSummary {
+            share_id: Some(self.share_id.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            status: Some(self.status.clone()),
+            // "Review template share invitation status message"
+            // (`TemplateShareSummary$StatusMessage` doc): a share that is simply waiting
+            // on its invitation has nothing to add to its status.
+            status_message: self.status_message.clone(),
+        }
+    }
+
+    /// The `ShareInvitationSummary` projection `ListShareInvitations` pages over: this
+    /// share seen as the invitation its recipient was offered.
+    ///
+    /// `template_name` is the name of the review template the share shares, read off the
+    /// template record by the caller rather than off the share; it is `None` for a
+    /// template this store no longer holds. Only the members of the shared resource KIND
+    /// are filled, and a template share grants no permission, so `PermissionType` is left
+    /// off too.
+    pub fn to_invitation_summary(&self, template_name: Option<&str>) -> ShareInvitationSummary {
+        ShareInvitationSummary {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            shared_by: Some(self.shared_by.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: None,
+            share_resource_type: Some(TEMPLATE_SHARE_RESOURCE_TYPE.to_string()),
+            workload_name: None,
+            workload_id: None,
+            lens_name: None,
+            lens_arn: None,
+            profile_name: None,
+            profile_arn: None,
+            template_name: template_name.map(ToString::to_string),
+            template_arn: Some(self.template_arn.clone()),
+        }
+    }
+}
+
+/// What a `CreateTemplateShare` idempotency token resolves to: the share the original
+/// request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateTemplateShareToken {
+    pub template_arn: String,
     pub share_id: String,
     pub fingerprint: String,
 }
@@ -5402,6 +5504,14 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// completed delete does, and a retry carrying the token answers that success rather
     /// than the not-found the original request's own work produced.
     pub delete_profile_share_tokens: TokenLedger<CompletedDeleteToken>,
+    /// Every share recorded against a review template, keyed by that template's
+    /// `TemplateArn` then by `ShareId`. A `BTreeMap` because `ShareId` order is the
+    /// stable order `ListTemplateShares` pages over, exactly as
+    /// [`Self::workload_shares`] is ordered.
+    pub template_shares: HashMap<String, BTreeMap<String, TemplateShareRecord>>,
+    /// `CreateTemplateShare`'s `ClientRequestToken` -> what the original request created.
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_template_share_tokens: TokenLedger<CreateTemplateShareToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -5552,6 +5662,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 .profile_shares
                 .values()
                 .any(|shares| shares.contains_key(share_id))
+            || self
+                .template_shares
+                .values()
+                .any(|shares| shares.contains_key(share_id))
     }
 
     /// A fresh `ShareInvitationId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$`
@@ -5576,6 +5690,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     .any(|share| share.share_invitation_id == id)
                 || self
                     .profile_shares
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .any(|share| share.share_invitation_id == id)
+                || self
+                    .template_shares
                     .values()
                     .flat_map(BTreeMap::values)
                     .any(|share| share.share_invitation_id == id);
@@ -6605,6 +6724,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // outlive it either: the next request carrying one acts afresh.
         self.upgrade_review_template_lens_review_tokens
             .retain(|token| token.resource_id != template_arn);
+        // A share shares THIS template, so it cannot outlive it either — the same rule
+        // [`Self::remove_workload`] applies to a workload's shares.
+        self.template_shares.remove(template_arn);
+        self.create_template_share_tokens
+            .retain(|token| token.template_arn != template_arn);
         Some(record)
     }
 
@@ -6798,9 +6922,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// answered it. `ShareInvitationId` order is the stable order the pages are cut on,
     /// which is why the enumeration sorts here rather than at the caller.
     ///
-    /// Workload, LENS and PROFILE invitations can exist in this emulator: a
-    /// review-template share has no store yet because `CreateTemplateShare` is still a
-    /// stub with its own issue.
+    /// Workload, LENS, PROFILE and REVIEW-TEMPLATE invitations can exist in this
+    /// emulator, and every kind is reported through this one enumeration.
     pub fn pending_share_invitations_for(&self, principal: &str) -> Vec<ShareInvitationSummary> {
         let mut invitations: Vec<ShareInvitationSummary> = self
             .workload_shares
@@ -6856,6 +6979,26 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                         .get(&share.profile_arn)
                         .map(|profile| profile.profile_name.as_str());
                     share.to_invitation_summary(profile_name)
+                }),
+        );
+        // A review-template share raises an invitation of its own kind, reported through
+        // the same enumeration for the same reason.
+        invitations.extend(
+            self.template_shares
+                .values()
+                .flat_map(|shares| shares.values())
+                .filter(|share| {
+                    share.shared_with == principal && share.status == DEFAULT_SHARE_STATUS
+                })
+                .map(|share| {
+                    // The template's NAME is the template's own, which
+                    // `UpdateReviewTemplate` can change, so it is read here rather than
+                    // copied onto the share.
+                    let template_name = self
+                        .review_templates
+                        .get(&share.template_arn)
+                        .map(|template| template.template_name.as_str());
+                    share.to_invitation_summary(template_name)
                 }),
         );
         invitations.sort_by(|left, right| {
@@ -6935,6 +7078,39 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     ) -> Option<&ProfileShareRecord> {
         self.profile_shares
             .get(profile_arn)?
+            .values()
+            .find(|share| share.shared_with == shared_with)
+    }
+
+    /// Every share recorded against the review template `template_arn`, in `ShareId`
+    /// order — the review-template counterpart of [`Self::workload_shares_of`].
+    pub fn template_shares_of(&self, template_arn: &str) -> Vec<&TemplateShareRecord> {
+        self.template_shares
+            .get(template_arn)
+            .map(|shares| shares.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// The share `share_id` of the review template `template_arn`, if the template holds
+    /// it.
+    pub fn template_share(
+        &self,
+        template_arn: &str,
+        share_id: &str,
+    ) -> Option<&TemplateShareRecord> {
+        self.template_shares.get(template_arn)?.get(share_id)
+    }
+
+    /// The share of the review template `template_arn` the principal `shared_with`
+    /// already holds, if it holds one: a principal holds at most one share of one
+    /// template, so this is what a second share request for it collides with.
+    pub fn template_share_with(
+        &self,
+        template_arn: &str,
+        shared_with: &str,
+    ) -> Option<&TemplateShareRecord> {
+        self.template_shares
+            .get(template_arn)?
             .values()
             .find(|share| share.shared_with == shared_with)
     }
@@ -8590,6 +8766,22 @@ pub fn profile_share_conflict(existing: &ProfileShareRecord) -> ConflictExceptio
         &format!(
             "The profile with ARN {} is already shared with {}.",
             existing.profile_arn, existing.shared_with
+        ),
+    )
+}
+
+/// [`conflict`] for a principal a REVIEW TEMPLATE is already shared with — the
+/// review-template counterpart of [`workload_share_conflict`], for the same reason: a
+/// share is the grant of access to one template to one principal, so the principal
+/// already holding one is what a second share request for it collides with. `existing` is
+/// the share that is in the way, which `resource_id` names so the caller can delete it.
+pub fn template_share_conflict(existing: &TemplateShareRecord) -> ConflictException {
+    conflict(
+        TEMPLATE_SHARE_RESOURCE_TYPE,
+        existing.share_id.clone(),
+        &format!(
+            "The review template with ARN {} is already shared with {}.",
+            existing.template_arn, existing.shared_with
         ),
     )
 }
