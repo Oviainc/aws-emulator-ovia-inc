@@ -25,9 +25,9 @@ use crate::user_lifecycle::{account_id, call, element, elements, error_code, rou
 
 /// The three values the model's `PolicyEvaluationDecisionType` enum declares
 /// (`smithy_query(query="shape",shape="PolicyEvaluationDecisionType")`).
-const ALLOWED: &str = "allowed";
-const EXPLICIT_DENY: &str = "explicitDeny";
-const IMPLICIT_DENY: &str = "implicitDeny";
+pub(crate) const ALLOWED: &str = "allowed";
+pub(crate) const EXPLICIT_DENY: &str = "explicitDeny";
+pub(crate) const IMPLICIT_DENY: &str = "implicitDeny";
 
 /// Create a user carrying `policies`, answering the ARN the account holds it under.
 async fn principal(
@@ -63,7 +63,11 @@ async fn principal(
 
 /// One `SimulatePrincipalPolicy` call, with the list members the query protocol
 /// flattens into `<member>.N` parameters.
-async fn simulate(
+///
+/// Shared with the sibling simulation suite
+/// (`tests/all/simulated_principal_sources.rs`), so a simulation request is built
+/// exactly one way.
+pub(crate) async fn simulate(
     router: &MultiServiceRouter,
     policy_source_arn: &str,
     actions: &[&str],
@@ -96,7 +100,7 @@ async fn simulate(
 
 /// The `(EvalActionName, EvalDecision)` pairs a simulation reports, in document
 /// order — one per action the page carries.
-fn reported(body: &str) -> Vec<(String, String)> {
+pub(crate) fn reported(body: &str) -> Vec<(String, String)> {
     let actions = elements(body, "EvalActionName");
     let decisions = elements(body, "EvalDecision");
     assert_eq!(

@@ -149,6 +149,8 @@ mod service_specific_credential_reset;
 mod service_specific_credential_status;
 #[path = "all/service_specific_credentials.rs"]
 mod service_specific_credentials;
+#[path = "all/simulated_principal_sources.rs"]
+mod simulated_principal_sources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/user_attached_policies.rs"]
