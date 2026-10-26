@@ -303,6 +303,12 @@ mod logging_options;
 mod portal_delete;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
+// In the sorted list too, beside the sibling portal suites rather than appended
+// after the list: the END of this file is where every concurrent iotsitewise
+// change appends a declaration of its own, and three appends there lost the
+// squash race with this one.
+#[path = "all/portal_update.rs"]
+mod portal_update;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/resource_tags.rs"]

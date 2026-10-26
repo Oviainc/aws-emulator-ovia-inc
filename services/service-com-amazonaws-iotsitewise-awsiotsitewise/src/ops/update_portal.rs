@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the portal the request addresses from the members that request
+//! carries and leaves it `UPDATING` until the transition the call owes falls due;
+//! `DescribePortal` reads the new state back.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +182,272 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePortalError::Modeled(UpdatePortalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `Image` is a choice spelled as a structure of optional members, so a request
+        // naming neither or both of them names no single image. Decided before the
+        // store is touched, as the client-input error this operation MODELS: its error
+        // list declares no `ValidationException`, so a malformed request can only be
+        // `InvalidRequestException` (400).
+        if let Some(image) = input.portal_logo_image.as_ref() {
+            check_logo_image(image).map_err(invalid_request)?;
+        }
+
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports that portal's status and writes nothing — it does not
+        // restart the UPDATING transition the first call owes; a token already spent on
+        // a DIFFERENT request belongs to another call, which is the modelled conflict.
+        // It is the FIRST thing decided against the store, because the call it repeats
+        // was already accepted and it is that very call which left the portal UPDATING.
+        let mut store = state.lock();
+
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.portal_id,
+                &input.portal_name,
+                &input.portal_description,
+                &input.portal_contact_email,
+                &input.role_arn,
+                &input.notification_sender_email,
+                &input.alarms,
+                &input.portal_type,
+                &portal_type_configuration_fingerprint(input.portal_type_configuration.as_ref()),
+                &logo_image_fingerprint(input.portal_logo_image.as_ref()),
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // A portal deleted since leaves the retry nothing to answer from, so
+                // that retry is served as the fresh update it now is — which is the
+                // not-found refusal below.
+                if let Some(portal) = store.portals.get(&replayed) {
+                    return Ok(UpdatePortalOutput {
+                        portal_status: portal.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored portal CARRIES,
+                // read back from the record rather than rebuilt, so the refusal cannot
+                // name an ARN no portal of this store has. A portal removed since the
+                // token was spent leaves only its id to build one from.
+                let conflicting_arn = store
+                    .portals
+                    .get(&spent_on)
+                    .map(|portal| portal.arn.clone())
+                    .unwrap_or_else(|| crate::state::portal_arn(&region, &spent_on));
+                return Err(token_spent(conflicting_arn, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
+        // A portal is addressed by its own id, so an id this store holds no portal
+        // under is the modelled 404 — and nothing is written for it.
+        let portal = store
+            .portals
+            .get_mut(&input.portal_id)
+            .ok_or_else(|| not_found(&input.portal_id))?;
+
+        // Which image the portal carries after this call, from the one alternative the
+        // request named:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePortal"))
+        // * a file — "An image file. Choose this option to upload a new image" — is a
+        //   NEW image, so it is given an id of its own, from which the location every
+        //   reader reports is derived;
+        // * an id — "The ID of an existing image. Choose this option to keep an
+        //   existing image" — keeps the image that id names. An image is reached only
+        //   through the portal holding it, so an id that is not this portal's own logo
+        //   names no image at all and is the modelled 404 rather than a location
+        //   fabricated for an image nothing holds;
+        // * no `portalLogoImage` at all leaves the portal without a logo, by the same
+        //   rule every other member of this request follows below.
+        let requested_image = input.portal_logo_image.as_ref();
+        let logo_image_id = match (
+            requested_image.and_then(|image| image.file.as_ref()),
+            requested_image.and_then(|image| image.id.as_deref()),
+        ) {
+            (Some(_), _) => Some(crate::state::new_id()),
+            (None, Some(kept)) if portal.logo_image_id.as_deref() == Some(kept) => {
+                Some(kept.to_string())
+            }
+            (None, Some(kept)) => return Err(image_not_found(kept)),
+            (None, None) => None,
+        };
+
+        // The caller-owned members are REPLACED by what this request carries, so an
+        // omitted optional member clears the stored one: the request describes the
+        // portal's new state rather than patching selected members — which is why
+        // `portalLogoImage` has an option for keeping the existing image at all. The
+        // portal's identity and provenance — its id, its ARN, its start URL, its
+        // authentication mode and the IAM Identity Center identifiers that go with it,
+        // its tags and its creation date — are not this call's to change, and no member
+        // of its input carries them.
+        portal.name = input.portal_name.clone();
+        portal.description = input.portal_description.clone();
+        portal.contact_email = input.portal_contact_email.clone();
+        portal.role_arn = Some(input.role_arn.clone());
+        portal.notification_sender_email = input.notification_sender_email.clone();
+        portal.alarms = input.alarms.clone();
+        portal.portal_type = input.portal_type.clone();
+        portal.portal_type_configuration = input.portal_type_configuration.clone();
+        portal.logo_image_id = logo_image_id;
+        portal.last_update_date = now;
+        // "The status of the portal, which contains a state (UPDATING after successfully
+        // calling this operation)": the portal reports that state until the transition
+        // this call owes falls due, and `ACTIVE` from then on. The due instant is
+        // STORED, never slept on — the span and the deriving rule are the store's own
+        // ([`crate::state::ACTIVATION_DELAY`], `PortalRecord::state`) — so this call
+        // returns at once and a read taken straight afterwards still sees `UPDATING`.
+        portal.settling_state = crate::state::STATE_UPDATING.to_string();
+        portal.active_at = now + crate::state::ACTIVATION_DELAY;
+        let output = UpdatePortalOutput {
+            portal_status: portal.status(now),
+        };
+
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.portal_id,
+            now,
+        );
+
+        Ok(output)
     }
+}
+
+/// The members of the `Image` shape, in the order it declares them. Source:
+/// `smithy_query(query="shape", shape="Image")`.
+const IMAGE_MEMBERS: [&str; 2] = ["id", "file"];
+
+/// The resource kind a not-found refusal names for a portal's logo image — the image
+/// an `Image$id` addresses when an update asks to keep the one a portal already has.
+///
+/// Local to this operation, beside [`IMAGE_MEMBERS`], because an image is not a
+/// resource of its own in this API: it is reached only through the portal that holds
+/// it, and `portalLogoImage` is the only member of the whole service that addresses
+/// one. The WORDING still comes from the service's one not-found rule
+/// ([`crate::state::not_found_message`]).
+const RESOURCE_IMAGE: &str = "Image";
+
+/// How a member the request did not carry renders in a fingerprint. No rendering of
+/// a member it DID carry can collide with it: both renderings below are a `Debug`
+/// form, which starts with a bracket or a member name.
+const ABSENT: &str = "<absent>";
+
+/// Refuse a `portalLogoImage` that does not name EXACTLY ONE of its alternatives.
+///
+/// `Image` is a choice spelled as a structure of optional members — "Contains an
+/// image that is one of the following: An image file. Choose this option to upload a
+/// new image. The ID of an existing image. Choose this option to keep an existing
+/// image." — so a request naming neither of them, or both, names no single image for
+/// the portal to carry. The `Err` carries the refusal message, which the caller lifts
+/// into this operation's modelled client error.
+fn check_logo_image(image: &Image) -> Result<(), String> {
+    let named = usize::from(image.id.is_some()) + usize::from(image.file.is_some());
+    if named == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "portalLogoImage must name exactly one of {}; this request named {named}.",
+        crate::state::catalog_names(IMAGE_MEMBERS.into_iter())
+    ))
+}
+
+/// A canonical rendering of the `portalTypeConfiguration` a request carried, for the
+/// idempotency fingerprint of that request.
+///
+/// The configuration is a MAP, which has no order of its own, so its entries go in
+/// SORTED by key: a retry of one call has to render identically to it whatever order
+/// either request's map happens to iterate in.
+fn portal_type_configuration_fingerprint(
+    configuration: Option<&::std::collections::HashMap<String, PortalTypeEntry>>,
+) -> String {
+    match configuration {
+        None => ABSENT.to_string(),
+        Some(configuration) => {
+            let mut entries: Vec<(&String, &PortalTypeEntry)> = configuration.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            format!("{entries:?}")
+        }
+    }
+}
+
+/// A canonical and BOUNDED rendering of the `portalLogoImage` a request carried, for
+/// the idempotency fingerprint of that request.
+///
+/// The image's own BYTES are not rendered: `ImageFile$data` admits up to 1.5 MB and a
+/// fingerprint is kept for as long as the token it was spent under, so an uploaded
+/// file goes in as the SHA-256 digest of its contents beside its file type. Two
+/// different files still render differently and the same file renders identically,
+/// which is all a retry has to be told apart by.
+fn logo_image_fingerprint(image: Option<&Image>) -> String {
+    match image {
+        None => ABSENT.to_string(),
+        Some(image) => {
+            // Both alternatives are rendered although exactly one of them is set by
+            // the time this runs: which one the request named is itself part of what
+            // tells two requests apart, so neither is left out of the rendering.
+            let file = image.file.as_ref().map(|file| {
+                let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(&file.data);
+                format!("{}:{}", file.r#type, ::hex::encode(digest))
+            });
+            format!("id={:?},file={file:?}", image.id)
+        }
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares, the way every sibling handler reports a malformed
+/// request.
+fn invalid_request(message: String) -> UpdatePortalError {
+    UpdatePortalError::Modeled(UpdatePortalErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(portal_id: &str) -> UpdatePortalError {
+    UpdatePortalError::Modeled(UpdatePortalErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PORTAL, portal_id),
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` for an `Image$id` naming no image the portal
+/// holds, worded by the same not-found rule and echoing the id the request supplied.
+fn image_not_found(image_id: &str) -> UpdatePortalError {
+    UpdatePortalError::Modeled(UpdatePortalErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(RESOURCE_IMAGE, image_id),
+        },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT request
+/// already spent: the conflict is with the portal that request updated, so
+/// `resourceId`/`resourceArn` name it.
+fn token_spent(resource_arn: String, portal_id: &str) -> UpdatePortalError {
+    UpdatePortalError::Modeled(UpdatePortalErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("portal", "clientToken"),
+            resource_id: portal_id.to_string(),
+            resource_arn,
+        },
+    ))
 }
