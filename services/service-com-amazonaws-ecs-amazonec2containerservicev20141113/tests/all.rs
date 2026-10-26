@@ -45,6 +45,8 @@ mod describe_failure_identifiers;
 mod ecs_wire;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/express_gateway_services.rs"]
+mod express_gateway_services;
 #[path = "all/invalid_request_refusals.rs"]
 mod invalid_request_refusals;
 #[path = "all/list_attributes.rs"]

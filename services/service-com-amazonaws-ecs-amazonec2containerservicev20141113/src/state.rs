@@ -62,7 +62,10 @@ use crate::ops::types::{
     ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
     DaemonDeploymentConfiguration, DaemonSummary,
     DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
-    DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController, EphemeralStorage,
+    DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController,
+    ECSExpressGatewayService, EphemeralStorage, ExpressGatewayContainer,
+    ExpressGatewayScalingTarget, ExpressGatewayServiceConfiguration,
+    ExpressGatewayServiceNetworkConfiguration, ExpressGatewayServiceStatus,
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkBinding,
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
@@ -70,7 +73,8 @@ use crate::ops::types::{
     Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,    ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
     TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
-    ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
+    ThresholdConfiguration, UpdatedExpressGatewayService, VersionInfo, Volume,
+    VpcLatticeConfiguration,
     CLUSTER_SETTING_NAME_VALUES,
 };
 
@@ -3055,6 +3059,385 @@ impl AttachmentRecord {
     }
 }
 
+/// `ExpressGatewayServiceStatusCode` of an Express service that is serving traffic.
+pub const EXPRESS_GATEWAY_ACTIVE: &str = "ACTIVE";
+
+/// `ExpressGatewayServiceStatusCode` of an Express service a delete has started tearing
+/// down — the `DeleteExpressGatewayService` doc: "The service enters a DRAINING state
+/// where existing tasks complete current requests without starting new tasks. After all
+/// tasks stop, the service and infrastructure are permanently removed."
+pub const EXPRESS_GATEWAY_DRAINING: &str = "DRAINING";
+
+/// The CPU units an Express service's task takes when the request names none —
+/// `CreateExpressGatewayService$cpu`: "The default value for an Express service is 256
+/// (.25 vCPU)."
+pub const DEFAULT_EXPRESS_CPU: &str = "256";
+
+/// The memory (MiB) an Express service's task takes when the request names none —
+/// `CreateExpressGatewayService$memory`: "The default value for an express service is
+/// 512 MiB."
+pub const DEFAULT_EXPRESS_MEMORY: &str = "512";
+
+/// The CPU architecture an Express service's task runs on when the request names none —
+/// `CreateExpressGatewayService$cpuArchitecture`: "If you don't specify a value, the
+/// default is X86_64."
+pub const DEFAULT_EXPRESS_CPU_ARCHITECTURE: &str = "X86_64";
+
+/// The load balancer's health-check path when the request names none —
+/// `CreateExpressGatewayService$healthCheckPath`: "If not specified, the default health
+/// check path is /ping."
+pub const DEFAULT_EXPRESS_HEALTH_CHECK_PATH: &str = "/ping";
+
+/// The container port the load balancer sends traffic to when the request names none —
+/// `CreateExpressGatewayService$primaryContainer`: "You can also configure the container
+/// port (defaults to 80)".
+pub const DEFAULT_EXPRESS_CONTAINER_PORT: i32 = 80;
+
+/// The auto-scaling target value when the request names none —
+/// `CreateExpressGatewayService$scalingTarget`: "If not specified, the default target
+/// value for an Express service is 60."
+pub const DEFAULT_EXPRESS_SCALING_TARGET_VALUE: i32 = 60;
+
+/// The refusal for a `healthCheckPath` that is not a path —
+/// `CreateExpressGatewayService$healthCheckPath`: "The health check path must start with
+/// a forward slash and can include query parameters."
+pub fn express_health_check_path_message(path: &str) -> String {
+    format!("The health check path must start with a forward slash, but was {path}")
+}
+
+/// The refusal for an Express service that is not there, as the recorded
+/// `DeleteExpressGatewayService` refusal words it — the Express operations' fixed text
+/// for the class, with no trailing period and no part of it from the request.
+pub const EXPRESS_GATEWAY_SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found";
+
+/// The refusal for an Express service ARN that resolves to no service, as the recorded
+/// `UpdateExpressGatewayService` refusal words it: the fixed `Resource not found: `
+/// followed by the identifier the request named.
+pub fn express_resource_not_found_message(reference: &str) -> String {
+    format!("Resource not found: {reference}")
+}
+
+/// The refusal for an operation on an Express service whose status is not
+/// [`EXPRESS_GATEWAY_ACTIVE`] — the `ServiceNotActiveException` doc: "The specified
+/// service isn't active."
+pub fn express_gateway_not_active_message(name: &str, status: &str) -> String {
+    format!("The Express service {name} is {status} and can not be changed")
+}
+
+/// The members `taskDefinitionArn` cannot be combined with, in the order the
+/// `taskDefinitionArn` doc lists them: "If you provide a task definition ARN, you cannot
+/// also specify primaryContainer, executionRoleArn, taskRoleArn, cpu, memory, or
+/// cpuArchitecture."
+pub const EXPRESS_TASK_DEFINITION_EXCLUSIVE_MEMBERS: [&str; 6] = [
+    "primaryContainer",
+    "executionRoleArn",
+    "taskRoleArn",
+    "cpu",
+    "memory",
+    "cpuArchitecture",
+];
+
+/// The configuration members a `CreateExpressGatewayService` or
+/// `UpdateExpressGatewayService` request carries, as the two operations share them.
+///
+/// Both calls RENDER one service revision's configuration out of these
+/// (`UpdateExpressGatewayService`: "Amazon ECS creates a new service revision with
+/// updated configuration"), so the defaults, the task-definition exclusivity and the
+/// "keep what the service already runs" merge live here once rather than in each handler.
+#[derive(Debug, Clone, Default)]
+pub struct ExpressGatewayConfigurationRequest {
+    pub execution_role_arn: Option<String>,
+    pub task_role_arn: Option<String>,
+    pub task_definition_arn: Option<String>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub cpu_architecture: Option<String>,
+    pub network_configuration: Option<ExpressGatewayServiceNetworkConfiguration>,
+    pub health_check_path: Option<String>,
+    pub primary_container: Option<ExpressGatewayContainer>,
+    pub scaling_target: Option<ExpressGatewayScalingTarget>,
+}
+
+impl ExpressGatewayConfigurationRequest {
+    /// The members of [`EXPRESS_TASK_DEFINITION_EXCLUSIVE_MEMBERS`] this request names,
+    /// in that order — the ones a caller-managed task definition already carries.
+    fn named_exclusive_members(&self) -> Vec<&'static str> {
+        [
+            self.primary_container.is_some(),
+            self.execution_role_arn.is_some(),
+            self.task_role_arn.is_some(),
+            self.cpu.is_some(),
+            self.memory.is_some(),
+            self.cpu_architecture.is_some(),
+        ]
+        .into_iter()
+        .zip(EXPRESS_TASK_DEFINITION_EXCLUSIVE_MEMBERS)
+        .filter_map(|(named, member)| named.then_some(member))
+        .collect()
+    }
+
+    /// The refusal for a request that names `taskDefinitionArn` beside a member the task
+    /// definition itself carries, naming the ones it did: "If you provide a task
+    /// definition ARN, you cannot also specify primaryContainer, executionRoleArn,
+    /// taskRoleArn, cpu, memory, or cpuArchitecture."
+    pub fn task_definition_conflict(&self) -> Option<String> {
+        self.task_definition_arn.as_ref()?;
+        let named = self.named_exclusive_members();
+        if named.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "taskDefinitionArn can not be specified with {}",
+            named.join(", ")
+        ))
+    }
+
+    /// The configuration of the revision this request produces, given the configuration
+    /// the service runs NOW (`None` for a create).
+    ///
+    /// A member the request names is the one it named; a member it leaves out keeps what
+    /// the service already ran ("If you don't specify a value, the service keeps its
+    /// current architecture"), and falls back to the documented default where it ran
+    /// none. A revision runs EITHER a task definition the caller manages or the container
+    /// this service renders one for, never both, so the two member sets never appear in
+    /// one configuration.
+    pub fn resolve(
+        &self,
+        current: Option<&ExpressGatewayServiceConfiguration>,
+        service_revision_arn: String,
+        created_at: DateTime,
+    ) -> ExpressGatewayServiceConfiguration {
+        let kept = |pick: fn(&ExpressGatewayServiceConfiguration) -> Option<String>| {
+            current.and_then(pick)
+        };
+        let network_configuration = self
+            .network_configuration
+            .clone()
+            .or_else(|| current.and_then(|held| held.network_configuration.clone()));
+        let health_check_path = self
+            .health_check_path
+            .clone()
+            .or_else(|| kept(|held| held.health_check_path.clone()))
+            .unwrap_or_else(|| DEFAULT_EXPRESS_HEALTH_CHECK_PATH.to_string());
+        let scaling_target = express_scaling_target(
+            self.scaling_target.as_ref(),
+            current.and_then(|held| held.scaling_target.as_ref()),
+        );
+
+        // The request's own `taskDefinitionArn` puts the revision on a caller-managed
+        // task definition; naming any container member moves it OFF one, and naming
+        // neither keeps whichever the service already ran.
+        let task_definition_arn = match (&self.task_definition_arn, self.named_exclusive_members()) {
+            (Some(arn), _) => Some(arn.clone()),
+            (None, named) if named.is_empty() => kept(|held| held.task_definition_arn.clone()),
+            (None, _) => None,
+        };
+        if let Some(task_definition_arn) = task_definition_arn {
+            return ExpressGatewayServiceConfiguration {
+                service_revision_arn: Some(service_revision_arn),
+                task_definition_arn: Some(task_definition_arn),
+                network_configuration,
+                health_check_path: Some(health_check_path),
+                scaling_target: Some(scaling_target),
+                created_at: Some(created_at),
+                ..ExpressGatewayServiceConfiguration::default()
+            };
+        }
+
+        ExpressGatewayServiceConfiguration {
+            service_revision_arn: Some(service_revision_arn),
+            execution_role_arn: self
+                .execution_role_arn
+                .clone()
+                .or_else(|| kept(|held| held.execution_role_arn.clone())),
+            task_role_arn: self
+                .task_role_arn
+                .clone()
+                .or_else(|| kept(|held| held.task_role_arn.clone())),
+            task_definition_arn: None,
+            cpu: Some(
+                self.cpu
+                    .clone()
+                    .or_else(|| kept(|held| held.cpu.clone()))
+                    .unwrap_or_else(|| DEFAULT_EXPRESS_CPU.to_string()),
+            ),
+            memory: Some(
+                self.memory
+                    .clone()
+                    .or_else(|| kept(|held| held.memory.clone()))
+                    .unwrap_or_else(|| DEFAULT_EXPRESS_MEMORY.to_string()),
+            ),
+            cpu_architecture: Some(
+                self.cpu_architecture
+                    .clone()
+                    .or_else(|| kept(|held| held.cpu_architecture.clone()))
+                    .unwrap_or_else(|| DEFAULT_EXPRESS_CPU_ARCHITECTURE.to_string()),
+            ),
+            network_configuration,
+            health_check_path: Some(health_check_path),
+            primary_container: express_primary_container(
+                self.primary_container.as_ref(),
+                current.and_then(|held| held.primary_container.as_ref()),
+            ),
+            scaling_target: Some(scaling_target),
+            // `ingressPaths` is "the entry point into this service revision": nothing here
+            // provisions the Application Load Balancer that would answer at one, so the
+            // revision reports no entry point rather than an endpoint no client can reach.
+            ingress_paths: None,
+            created_at: Some(created_at),
+        }
+    }
+}
+
+/// The primary container a revision runs: the one the request named, else the one the
+/// service already ran, with the container port defaulted ("defaults to 80").
+pub fn express_primary_container(
+    requested: Option<&ExpressGatewayContainer>,
+    current: Option<&ExpressGatewayContainer>,
+) -> Option<ExpressGatewayContainer> {
+    let mut container = requested.or(current)?.clone();
+    container.container_port =
+        Some(container.container_port.unwrap_or(DEFAULT_EXPRESS_CONTAINER_PORT));
+    Some(container)
+}
+
+/// The auto-scaling configuration a revision runs: the one the request named, else the
+/// one the service already ran, with the target value defaulted
+/// ([`DEFAULT_EXPRESS_SCALING_TARGET_VALUE`]).
+pub fn express_scaling_target(
+    requested: Option<&ExpressGatewayScalingTarget>,
+    current: Option<&ExpressGatewayScalingTarget>,
+) -> ExpressGatewayScalingTarget {
+    let mut target = requested.or(current).cloned().unwrap_or_default();
+    target.auto_scaling_target_value = Some(
+        target
+            .auto_scaling_target_value
+            .unwrap_or(DEFAULT_EXPRESS_SCALING_TARGET_VALUE),
+    );
+    target
+}
+
+/// The CLUSTER and the SERVICE NAME an Express service's `serviceArn` names.
+///
+/// An ECS service ARN carries the cluster that hosts it in its resource segment
+/// (`service/<cluster>/<name>`), so the ARN names the cluster as well as the service —
+/// which is what lets the three Express operations that take only a `serviceArn` resolve
+/// the cluster they act in. Read with [`cluster_and_service_from_reference`], the crate's
+/// one reader for that pair, so a reference is accepted here exactly where it is accepted
+/// by the operations that take a `service` member; a value that names no
+/// cluster-and-service pair resolves to nothing.
+pub fn express_gateway_reference(reference: &str) -> Option<(String, String)> {
+    let (cluster_name, name) = cluster_and_service_from_reference(reference);
+    let cluster_name = cluster_name.filter(|cluster| !cluster.is_empty())?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((cluster_name, name))
+}
+
+/// Why a `serviceArn` resolves to no stored Express service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressGatewayRefusal {
+    /// The ARN names a cluster this account does not hold.
+    ClusterNotFound,
+    /// The ARN names no Express service of this account: the cluster it names holds none
+    /// of that name, or the value names no cluster-and-service pair at all.
+    NotFound,
+}
+
+/// One EXPRESS service: the record `CreateExpressGatewayService` wrote and the calls and
+/// the clock since have left.
+///
+/// `ECSExpressGatewayService`: "Express services use a service revision architecture where
+/// each service can have multiple active configurations, enabling blue-green deployments
+/// and gradual rollouts", so the record holds the configurations themselves, newest
+/// first, and every response is projected off them.
+#[derive(Debug, Clone)]
+pub struct ExpressGatewayServiceRecord {
+    pub arn: String,
+    pub name: String,
+    pub cluster_name: String,
+    pub cluster_arn: String,
+    pub infrastructure_role_arn: String,
+    pub status_code: String,
+    /// The configurations that are ACTIVE for this service, newest first. A rolling
+    /// deployment holds the one it is replacing beside the one it rolls out until the
+    /// rollout is due.
+    pub configurations: Vec<ExpressGatewayServiceConfiguration>,
+    pub current_deployment: String,
+    pub tags: Vec<Tag>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    /// When the rolling deployment an update started finishes, after which only the
+    /// configuration it rolled out is still active. Stored, never slept on:
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]
+    /// materialises it.
+    pub rollout_due_at: Option<SystemTime>,
+    /// When the drain a delete started finishes — "After all tasks stop, the service and
+    /// infrastructure are permanently removed", which is when the record goes.
+    pub removal_due_at: Option<SystemTime>,
+}
+
+impl ExpressGatewayServiceRecord {
+    /// At most this many configurations are active at once: the one a rolling deployment
+    /// rolls out and the one it is replacing.
+    pub const MAX_ACTIVE_CONFIGURATIONS: usize = 2;
+
+    /// The configuration this service is rolling out — the newest one.
+    pub fn target_configuration(&self) -> Option<&ExpressGatewayServiceConfiguration> {
+        self.configurations.first()
+    }
+
+    /// Whether this service is still in a status a call may change it from.
+    pub fn is_active(&self) -> bool {
+        self.status_code == EXPRESS_GATEWAY_ACTIVE
+    }
+
+    /// The `ExpressGatewayServiceStatus` every projection of this record reports.
+    fn status(&self) -> ExpressGatewayServiceStatus {
+        ExpressGatewayServiceStatus {
+            status_code: Some(self.status_code.clone()),
+            // `statusReason` explains a status that needs explaining; nothing here has
+            // left this service in one.
+            status_reason: None,
+        }
+    }
+
+    /// The `ECSExpressGatewayService` the create, describe and delete operations report.
+    ///
+    /// `include_tags` is what `DescribeExpressGatewayService$include` gates ("Valid values
+    /// are TAGS to include resource tags associated with the Express service"); an
+    /// operation with no `include` member reports the full description, tags and all.
+    pub fn view(&self, include_tags: bool) -> ECSExpressGatewayService {
+        ECSExpressGatewayService {
+            cluster: Some(self.cluster_arn.clone()),
+            service_name: Some(self.name.clone()),
+            service_arn: Some(self.arn.clone()),
+            infrastructure_role_arn: Some(self.infrastructure_role_arn.clone()),
+            status: Some(self.status()),
+            current_deployment: Some(self.current_deployment.clone()),
+            active_configurations: Some(self.configurations.clone()),
+            tags: include_tags.then(|| self.tags.clone()),
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+        }
+    }
+
+    /// The `UpdatedExpressGatewayService` an update reports: the service, plus the
+    /// configuration the deployment it started is rolling out.
+    pub fn updated_view(&self) -> UpdatedExpressGatewayService {
+        UpdatedExpressGatewayService {
+            service_arn: Some(self.arn.clone()),
+            cluster: Some(self.cluster_arn.clone()),
+            service_name: Some(self.name.clone()),
+            status: Some(self.status()),
+            target_configuration: self.target_configuration().cloned(),
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+        }
+    }
+}
+
 /// What one pass over the task map counts for ONE service.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServiceTally {
@@ -3111,6 +3494,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// finished deployments as well as the one under way) and the key is the ARN the
     /// listing reports.
     pub service_deployments: HashMap<String, ServiceDeploymentRecord>,
+    /// `(clusterName, serviceName)` -> the EXPRESS service. Keyed like `services`
+    /// because an Express service's name is unique within its cluster the same way, and
+    /// held BESIDE them because the two are different resources: an Express service is
+    /// managed by Amazon ECS (it owns a load balancer, target groups and scaling
+    /// policies) and is addressed only by the Express operations.
+    pub express_gateway_services: HashMap<(String, String), ExpressGatewayServiceRecord>,
     /// `(principalArn, settingName)` -> the account setting value stored for that ONE
     /// principal by `PutAccountSetting`. An entry here shadows the account-wide default
     /// for that principal alone (`ListAccountSettings$effectiveSettings`: "the account
@@ -3147,6 +3536,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     next_daemon_deployment_seq: u64,
     /// Monotonic source of attachment ids, so every attachment of every task is distinct.
     next_attachment_seq: u64,
+    /// Monotonic source of the names Amazon ECS generates for an Express service whose
+    /// request named none, so every generated name is distinct.
+    next_express_gateway_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -3217,6 +3609,23 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        // The rolling deployment an `UpdateExpressGatewayService` started ("performs a
+        // rolling deployment to replace existing tasks"): once it is due the revision it
+        // rolled out has replaced the one before it, so only the newest configuration is
+        // still active.
+        for service in self.express_gateway_services.values_mut() {
+            if let Some(due) = service.rollout_due_at {
+                if due <= now {
+                    service.rollout_due_at = None;
+                    service.configurations.truncate(1);
+                }
+            }
+        }
+        // The drain a `DeleteExpressGatewayService` started: "After all tasks stop, the
+        // service and infrastructure are permanently removed", so once the drain is due
+        // the record is gone — whether or not anybody called to look.
+        self.express_gateway_services
+            .retain(|_, service| service.removal_due_at.is_none_or(|due| due > now));
         // The container-agent update `UpdateContainerAgent` accepted: once it is due the
         // agent has been updated, whether or not anybody called to look, so the instance
         // reports the version it was brought to and the terminal stage of the update.
@@ -3507,6 +3916,104 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn next_container_instance_id(&mut self) -> String {
         self.next_container_instance_seq += 1;
         format!("{:032x}", self.next_container_instance_seq)
+    }
+
+    /// Materialise the DEFAULT cluster, where nobody has created one.
+    ///
+    /// An account holds the default cluster without anybody creating it — the Amazon ECS
+    /// clusters doc: "When you first use Amazon ECS, a default cluster is created for
+    /// you" — which is what makes "If you do not specify a cluster, the default cluster
+    /// is assumed" resolve to a cluster that is there. A `default` cluster the store
+    /// already holds is left exactly as the calls so far left it, tombstone included: this
+    /// materialises the one nobody created, it never re-creates a deleted one.
+    ///
+    /// It is materialised on use rather than seeded when the store is built because the
+    /// ARN a cluster carries is REGIONAL and the store is built before any request's
+    /// Region is known, so the cluster has to take the Region of the call that first
+    /// resolves it. Called today only by `CreateExpressGatewayService`, whose recorded
+    /// units resolve the default cluster with no `CreateCluster` before them; the other
+    /// operations that assume the default cluster each have their own recorded refusals
+    /// and their own open issues, so they adopt this call as those are fixed rather than
+    /// having their answers changed from here.
+    pub fn ensure_default_cluster(&mut self, region: &str) {
+        if self.clusters.contains_key(DEFAULT_CLUSTER_NAME) {
+            return;
+        }
+        self.clusters.insert(
+            DEFAULT_CLUSTER_NAME.to_string(),
+            ClusterRecord {
+                name: DEFAULT_CLUSTER_NAME.to_string(),
+                arn: cluster_arn(region, DEFAULT_CLUSTER_NAME),
+                status: CLUSTER_ACTIVE.to_string(),
+                // Nothing created it, so nothing has tagged, configured or associated
+                // anything with it.
+                tags: Vec::new(),
+                settings: Vec::new(),
+                configuration: None,
+                capacity_providers: Vec::new(),
+                default_capacity_provider_strategy: Vec::new(),
+                service_connect_defaults: None,
+                attachments_status: None,
+                attachments_update_due_at: None,
+            },
+        );
+    }
+
+    /// Mint the name Amazon ECS generates for an Express service whose request named
+    /// none — `CreateExpressGatewayService$serviceName`: "If you don't specify a service
+    /// name, Amazon ECS generates a unique name for the service." The counter is what
+    /// makes it unique.
+    pub fn next_express_gateway_service_name(&mut self) -> String {
+        self.next_express_gateway_seq += 1;
+        format!("express-{:019}", self.next_express_gateway_seq)
+    }
+
+    /// The `(cluster, name)` key a `serviceArn` resolves to, or WHY it resolves to no
+    /// stored Express service.
+    ///
+    /// The three Express operations that address a service by ARN alone resolve it the
+    /// same way, so the cluster the ARN names is checked before the service it names: a
+    /// cluster that is not there is reported as that, exactly as it is for the operations
+    /// that take a `cluster` member.
+    pub fn express_gateway_key(
+        &self,
+        reference: &str,
+    ) -> Result<(String, String), ExpressGatewayRefusal> {
+        let Some((cluster_name, name)) = express_gateway_reference(reference) else {
+            // A value that names no cluster-and-service pair names no service, which is
+            // the same answer as a cluster that holds no service of that name.
+            return Err(ExpressGatewayRefusal::NotFound);
+        };
+        if !self.has_active_cluster(&cluster_name) {
+            return Err(ExpressGatewayRefusal::ClusterNotFound);
+        }
+        let key = (cluster_name, name);
+        if !self.express_gateway_services.contains_key(&key) {
+            return Err(ExpressGatewayRefusal::NotFound);
+        }
+        Ok(key)
+    }
+
+    /// The stored Express service a `serviceArn` names, for a reporting operation.
+    pub fn express_gateway_service(
+        &self,
+        reference: &str,
+    ) -> Result<&ExpressGatewayServiceRecord, ExpressGatewayRefusal> {
+        let key = self.express_gateway_key(reference)?;
+        self.express_gateway_services
+            .get(&key)
+            .ok_or(ExpressGatewayRefusal::NotFound)
+    }
+
+    /// The stored Express service a `serviceArn` names, for an operation that changes it.
+    pub fn express_gateway_service_mut(
+        &mut self,
+        reference: &str,
+    ) -> Result<&mut ExpressGatewayServiceRecord, ExpressGatewayRefusal> {
+        let key = self.express_gateway_key(reference)?;
+        self.express_gateway_services
+            .get_mut(&key)
+            .ok_or(ExpressGatewayRefusal::NotFound)
     }
 
     /// Mint the id of a service's next deployment. `Deployment$id` is an `ecs-svc/`
@@ -6222,6 +6729,12 @@ pub fn client_token_violation(token: &str) -> Option<String> {
     ))
 }
 
+/// The refusal for a service name the cluster already holds a service under. Shared by
+/// every create that takes one, so the operations cannot word the class differently.
+pub fn service_name_taken_message(service_name: &str, cluster_name: &str) -> String {
+    format!("service {service_name:?} already exists in cluster {cluster_name:?}")
+}
+
 /// The ARN of a service: `arn:aws:ecs:<region>:<account>:service/<cluster>/<name>`.
 pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> String {
     ::engine::emulator_arn(
@@ -6305,6 +6818,15 @@ pub fn is_valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The pattern a name [`is_valid_name`] accepts, spelled as a refusal quotes it.
+pub const RESOURCE_NAME_PATTERN: &str = r"^[a-zA-Z0-9\-_]{1,255}$";
+
+/// The refusal for a name outside [`RESOURCE_NAME_PATTERN`]: the member as AWS names it
+/// in the message, the pattern itself, and the value the request spelled.
+pub fn name_pattern_message(subject: &str, name: &str) -> String {
+    format!("{subject} must match {RESOURCE_NAME_PATTERN}, but was {name}")
 }
 
 /// The ARN of a capacity provider: `arn:aws:ecs:<region>:<account>:capacity-provider/<name>`.
@@ -6870,8 +7392,9 @@ pub fn orphan_target_group_refusal(arns: &[String], unattached: &[String]) -> Op
 ///
 /// Every ECS `include` member targets a closed `…Field` enum that declares `TAGS`
 /// (`CapacityProviderField`, `ClusterField`, `ContainerInstanceField`, `ServiceField`,
-/// `TaskField`), and a field outside the enum cannot reach a handler — the boundary
-/// validator refuses it — so the question is only whether `TAGS` is among them.
+/// `TaskField`, `ExpressGatewayServiceInclude`), and a field outside the enum cannot
+/// reach a handler — the boundary validator refuses it — so the question is only whether
+/// `TAGS` is among them.
 pub fn include_requests_tags(include: Option<&Vec<String>>) -> bool {
     include
         .into_iter()
