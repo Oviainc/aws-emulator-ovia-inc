@@ -2215,6 +2215,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon ECR Public `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 2, max: 205)`, lowercase (Amazon ECR Public's own Smithy model).
         ECR_PUBLIC_REPOSITORY => rules(205, Characters::LowercaseAlphanumeric),
+        // CodeCommit `CreateRepository.repositoryName`: `RepositoryName`,
+        // `@length(min: 1, max: 100)` with pattern `^[\w\.-]+$` (CodeCommit's own Smithy
+        // model), which a generated name is already inside — letters, digits and the hyphen
+        // are all admitted — but may be longer than.
+        CODECOMMIT_REPOSITORY => rules(100, Characters::AsGenerated),
         // CodePipeline `PipelineDeclaration.name`: `PipelineName`,
         // `@length(min: 1, max: 100)` (CodePipeline's own Smithy model).
         "AWS::CodePipeline::Pipeline" => rules(100, Characters::AsGenerated),
@@ -4000,6 +4005,21 @@ pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 
 /// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
 pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
+
+/// An AWS CodeCommit repository's resource type (that model:
+/// `awsService.cloudFormationName: CodeCommit`). This is the type `super::provisioning`
+/// creates in CodeCommit itself, through that service's own `CreateRepository`.
+///
+/// It deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the repository's NAME — which is that type's published return
+/// value ("Ref returns the repository name") and the identifier every CodeCommit operation
+/// addresses a repository by (`repositoryName`, on `GetRepository`,
+/// `PutRepositoryTriggers` and `DeleteRepository` alike). Its published attributes are not
+/// computed here either: the ARN and the two clone URLs are the ones CodeCommit itself
+/// answered the create with — the clone URLs name the endpoint this emulator serves the
+/// repository's git transport on, which no pattern here could mint — and the provisioner
+/// records them on the resource.
+pub const CODECOMMIT_REPOSITORY: &str = "AWS::CodeCommit::Repository";
 
 /// The type of an Amazon Cognito user-pool group: the cognito-idp model carries
 /// `awsService.cloudFormationName: Cognito`.

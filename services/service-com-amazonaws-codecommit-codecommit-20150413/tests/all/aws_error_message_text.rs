@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::comment_lifecycle::{fixture, PATH};
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{emulator, ok, string_at};
+use crate::repository_lifecycle::{emulator, ok, string_at, REGION};
 
 /// The HTTP status every error asserted here models (`errorKind: client`,
 /// `httpError: 400` on each of these error shapes).
@@ -1096,5 +1096,114 @@ async fn comment_content_required_message_is_a_constant() {
         string_at(&read_back, "/comment/content"),
         "the comment an edit will try to empty",
         "a refused edit must leave the stored comment alone, got {read_back}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// InvalidRepositoryTriggerDestinationArnException
+// ---------------------------------------------------------------------------
+
+/// The message is a CONSTANT: it names neither the malformed value the caller sent,
+/// nor the trigger it belongs to, nor the repository the configuration was for.
+///
+/// The rows differ along WHERE the destination stops being an ARN a trigger can
+/// target — not an ARN at all, too few fields, another vendor's ARN, the vendor in
+/// the wrong case, an account that is not 12 digits, an empty region, an empty
+/// resource, a URL — and each one is refused with the same text. `crate::state`'s
+/// trigger validator is shared with `TestRepositoryTriggers`, which is still a 501
+/// stub (`src/ops/test_repository_triggers.rs` carries the scaffold header), so the
+/// put path is the only operation that can be asserted here.
+#[tokio::test]
+async fn invalid_repository_trigger_destination_arn_message_is_a_constant() {
+    let router = emulator();
+    const EXPECTED: &str = "Repository trigger destination arn is incorrectly formatted";
+    let repository = "repo-for-trigger-destinations";
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": repository }),
+    )
+    .await;
+
+    let account = engine::emulator_account_id();
+    let destinations = [
+        "not-a-valid-sns-arn".to_string(),
+        "arn".to_string(),
+        "arn:aws:sns".to_string(),
+        format!("arn:aws:s3:::{account}-bucket"),
+        format!("arn:aws:SNS:{REGION}:{account}:releases"),
+        format!("arn:aws:sns:{REGION}:12345:releases"),
+        format!("arn:aws:sns::{account}:releases"),
+        format!("arn:aws:sns:{REGION}:{account}:"),
+        format!("https://sns.{REGION}.amazonaws.com/releases"),
+    ];
+    for destination in &destinations {
+        let (code, message) = error_with_message(
+            &router,
+            "PutRepositoryTriggers",
+            &json!({
+                "repositoryName": repository,
+                "triggers": [{
+                    "name": "a-trigger",
+                    "destinationArn": destination,
+                    "events": ["all"],
+                    "branches": [],
+                }],
+            }),
+            CLIENT_ERROR_STATUS,
+        )
+        .await;
+        assert_eq!(
+            code, "InvalidRepositoryTriggerDestinationArnException",
+            "case {destination:?}: expected code \
+             InvalidRepositoryTriggerDestinationArnException, got {code:?}"
+        );
+        assert_eq!(
+            message, EXPECTED,
+            "case {destination:?}: expected message {EXPECTED:?}, got {message:?}"
+        );
+
+        // Nothing was stored for the refused configuration.
+        let held = ok(
+            &router,
+            "GetRepositoryTriggers",
+            &json!({ "repositoryName": repository }),
+        )
+        .await;
+        assert_eq!(
+            held.get("triggers"),
+            Some(&json!([])),
+            "case {destination:?}: a refused put must leave the configuration empty, got {held}"
+        );
+    }
+
+    // And a trigger of the same shape whose destination IS an ARN of a service a
+    // trigger can target still applies afterwards.
+    let good = json!([{
+        "name": "a-trigger",
+        "destinationArn": format!("arn:aws:sns:{REGION}:{account}:releases"),
+        "events": ["all"],
+        "branches": [],
+    }]);
+    let written = ok(
+        &router,
+        "PutRepositoryTriggers",
+        &json!({ "repositoryName": repository, "triggers": good }),
+    )
+    .await;
+    assert!(
+        !string_at(&written, "/configurationId").is_empty(),
+        "a put that applies must mint a configurationId, got {written}"
+    );
+    let held = ok(
+        &router,
+        "GetRepositoryTriggers",
+        &json!({ "repositoryName": repository }),
+    )
+    .await;
+    assert_eq!(
+        held.get("triggers"),
+        Some(&good),
+        "expected the applied configuration to be read back, got {held}"
     );
 }

@@ -220,6 +220,16 @@
 //!   association Amazon EKS refuses leaves no half-configured entry behind, because the
 //!   entry this arm just created is removed before the refusal is reported.
 //!
+//! * `AWS::CodeCommit::Repository`'s properties are `CreateRepository`'s own members with a
+//!   lower-case initial (`RepositoryDescription`, `KmsKeyId`), with the repository's name
+//!   the one CloudFormation decides and `Tags` sent as that create's tag MAP. `Triggers` is
+//!   no member of that create at all: the list it declares IS the repository's trigger
+//!   configuration, so it is a `PutRepositoryTriggers` of its own on the repository just
+//!   created — the same second call a client makes — and a trigger CodeCommit refuses fails
+//!   the resource rather than leaving a repository with no triggers behind. The `Code`
+//!   property, which commits a bundle from Amazon S3 into the new repository, is mapped onto
+//!   no call here and is REFUSED rather than dropped.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -259,8 +269,8 @@ use super::provisioning::{
 use super::template::{
     ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
-    CLOUDWATCH_METRIC_STREAM, CODEDEPLOY_APPLICATION, CODEDEPLOY_DEPLOYMENT_CONFIG,
-    CODEDEPLOY_DEPLOYMENT_GROUP,
+    CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
+    CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -376,6 +386,7 @@ pub(super) enum Provisioner {
     BatchJobQueue,
     BatchServiceEnvironment,
     EksAccessEntry,
+    CodeCommitRepository,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -436,6 +447,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BATCH_JOB_QUEUE => Some(Provisioner::BatchJobQueue),
         BATCH_SERVICE_ENVIRONMENT => Some(Provisioner::BatchServiceEnvironment),
         EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
+        CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         _ => None,
     }
 }
@@ -639,6 +651,9 @@ impl Provisioner {
                 create_service_environment(ctx, region, resource, propagated).await
             }
             Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
+            Self::CodeCommitRepository => {
+                create_codecommit_repository(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -662,7 +677,8 @@ impl Provisioner {
     /// `state::tag_refusal`, the one check both `CreateQueue`'s `tags` map and `TagQueue`
     /// run — and Amazon Data Firehose's `CreateDeliveryStream`, whose `TagKey` shape is
     /// modelled with the reserved prefix excluded, the same check its `TagDeliveryStream`
-    /// makes.
+    /// makes. CodeCommit's `CreateRepository` is in the same position: a tag key in that
+    /// namespace is its `InvalidSystemTagUsageException`.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -677,6 +693,7 @@ impl Provisioner {
                 | Self::MskCluster
                 | Self::MskServerlessCluster
                 | Self::SqsQueue
+                | Self::CodeCommitRepository
         );
         propagated
             .iter()
@@ -985,6 +1002,9 @@ impl Provisioner {
             // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
             // halves of which are on the resource's own declaration.
             Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
+            Self::CodeCommitRepository => {
+                delete_codecommit_repository(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -1180,6 +1200,9 @@ impl Provisioner {
             }
             // Read back by the same cluster-and-principal pair the delete uses.
             Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
+            Self::CodeCommitRepository => {
+                describe_codecommit_repository(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -11818,6 +11841,239 @@ fn access_policy_request(resource: &StoredResource, declared: &Value) -> Result<
         mapped_members(scope, EKS_ACCESS_SCOPE_MEMBERS),
     );
     Ok(Value::Object(request))
+}
+
+// ---------------------------------------------------------------------------
+// AWS CodeCommit: AWS::CodeCommit::Repository
+// ---------------------------------------------------------------------------
+
+/// CodeCommit's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: codecommit`, service shape `CodeCommit_20150413`), which speaks
+/// `awsJson1_1`.
+const CODECOMMIT_SIGNING_NAME: &str = "codecommit";
+const CODECOMMIT_TARGET_PREFIX: &str = "CodeCommit_20150413";
+
+/// The error code CodeCommit answers for a repository name no repository answers to
+/// (`RepositoryDoesNotExistException`, the modelled refusal of `GetRepository`).
+const CODECOMMIT_REPOSITORY_DOES_NOT_EXIST: &str = "RepositoryDoesNotExistException";
+
+/// The `AWS::CodeCommit::Repository` properties `CreateRepository` takes under its own
+/// member name, as `(property, member)` pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against that call's
+/// `repositoryDescription` and `kmsKeyId` members — the same members under a lower-case
+/// initial. `RepositoryName` is not here because it is the one value CloudFormation
+/// decides, `Tags` is not because the create takes a tag MAP while the type publishes a tag
+/// LIST, and `Triggers` is not because it is no member of that create at all.
+const CODECOMMIT_REPOSITORY_MEMBERS: &[(&str, &str)] = &[
+    ("RepositoryDescription", "repositoryDescription"),
+    ("KmsKeyId", "kmsKeyId"),
+];
+
+/// The property that asks for CODE to be committed into the repository a stack creates: an
+/// Amazon S3 bundle and the branch to commit it on. It is mapped onto no call here, so a
+/// declaration that states it is refused rather than deployed as a repository holding
+/// nothing.
+const CODECOMMIT_CODE_PROPERTY: &str = "Code";
+
+/// The property whose list IS the repository's trigger configuration, which
+/// `PutRepositoryTriggers` writes.
+const CODECOMMIT_TRIGGERS_PROPERTY: &str = "Triggers";
+
+/// The members of one declared `Triggers` entry, as `RepositoryTrigger`'s own members: each
+/// one the property with its initial letter lower-cased. A member no pair names is no member
+/// of that shape, so it is not sent.
+const CODECOMMIT_TRIGGER_MEMBERS: &[(&str, &str)] = &[
+    ("Name", "name"),
+    ("DestinationArn", "destinationArn"),
+    ("CustomData", "customData"),
+    ("Branches", "branches"),
+    ("Events", "events"),
+];
+
+/// The `RepositoryMetadata` members CodeCommit answers a create with, under the attribute
+/// names this type's published return values give them (`Arn`, `CloneUrlHttp`,
+/// `CloneUrlSsh`, `KmsKeyId`, `Name`).
+///
+/// They are reported back as the resource's attributes rather than computed here: the clone
+/// URLs name the endpoint this emulator serves the repository's git transport on, which no
+/// pattern could mint, and the ARN is the one that service itself keyed the repository by.
+const CODECOMMIT_REPORTED_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Arn", "Arn"),
+    ("CloneUrlHttp", "cloneUrlHttp"),
+    ("CloneUrlSsh", "cloneUrlSsh"),
+    ("KmsKeyId", "kmsKeyId"),
+    ("Name", "repositoryName"),
+];
+
+/// The members `GetRepository` reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// `Triggers` is not among them: a repository's trigger configuration is answered by
+/// `GetRepositoryTriggers`, a read of its own, and a property the read does not report is
+/// not evidence of anything ([`super::drift`]). `Tags` is left out for the same reason as
+/// everywhere else here — the tags a resource carries change independently of its
+/// declaration.
+const CODECOMMIT_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("RepositoryName", "repositoryName"),
+    ("RepositoryDescription", "repositoryDescription"),
+    ("KmsKeyId", "kmsKeyId"),
+];
+
+/// Create the repository an `AWS::CodeCommit::Repository` declares, and write the trigger
+/// configuration it declares on it — so a client that deployed the stack and then calls
+/// `codecommit GetRepository` or `GetRepositoryTriggers` with the name the stack publishes
+/// reads the repository and its triggers back rather than a
+/// `RepositoryDoesNotExistException`.
+///
+/// "Ref returns the repository name", which is this resource's physical id and the
+/// identifier every CodeCommit operation addresses a repository by, so the repository is
+/// created under it and the id the stack already computed stays in force.
+///
+/// `Triggers` is no member of the create: "Replaces all triggers for a repository" is what
+/// writes a repository's trigger configuration, so the declared list reaches CodeCommit
+/// through that call on the repository just created — the same second call a client makes.
+/// The resource the template declares is the repository AND those triggers, so a
+/// configuration CodeCommit refuses fails the resource, and the repository this arm already
+/// created is removed before that refusal propagates (the stack records no physical id for a
+/// resource whose create failed, so nothing else would ever delete it).
+///
+/// The repository carries the tags the declaration asks for plus the stack's own
+/// ([`tags_of`]), as `CreateRepository`'s own tag MAP.
+async fn create_codecommit_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    if properties.contains_key(CODECOMMIT_CODE_PROPERTY) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not implement the {CODECOMMIT_CODE_PROPERTY} property of {}",
+                resource.resource_type
+            ),
+        });
+    }
+
+    let name = resource.physical_resource_id.clone();
+    let mut request = Map::new();
+    request.insert("repositoryName".to_string(), Value::String(name.clone()));
+    copy_members(&properties, CODECOMMIT_REPOSITORY_MEMBERS, &mut request);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered =
+        call_codecommit(ctx, region, "CreateRepository", &Value::Object(request)).await?;
+    let metadata = reported_member(&answered, "repositoryMetadata");
+
+    let triggers = declared_triggers(&properties);
+    if !triggers.is_empty() {
+        let request = serde_json::json!({
+            "repositoryName": name,
+            "triggers": Value::Array(triggers),
+        });
+        if let Err(refusal) =
+            call_codecommit(ctx, region, "PutRepositoryTriggers", &request).await
+        {
+            delete_codecommit_repository(ctx, region, &name)
+                .await
+                .map_err(|failure| Refusal {
+                    code: refusal.code.clone(),
+                    message: format!(
+                        "{refusal}; the repository it created was left behind: {failure}"
+                    ),
+                })?;
+            return Err(refusal);
+        }
+    }
+
+    let attributes = CODECOMMIT_REPORTED_ATTRIBUTES
+        .iter()
+        .filter_map(|(attribute, member)| {
+            let value = metadata.get(*member).and_then(scalar_text)?;
+            (!value.is_empty()).then(|| ((*attribute).to_string(), value))
+        })
+        .collect();
+    Ok(Created::attributes(attributes))
+}
+
+/// The triggers a declaration asks for, as the `RepositoryTriggersList`
+/// `PutRepositoryTriggers` takes: each declared entry under that shape's own member names
+/// ([`CODECOMMIT_TRIGGER_MEMBERS`]).
+///
+/// Empty for a declaration that states no `Triggers` at all, which is a repository with no
+/// trigger configuration — nothing is asked of CodeCommit for one.
+fn declared_triggers(properties: &Map<String, Value>) -> Vec<Value> {
+    properties
+        .get(CODECOMMIT_TRIGGERS_PROPERTY)
+        .and_then(Value::as_array)
+        .map(|triggers| {
+            triggers
+                .iter()
+                .map(|trigger| mapped_members(trigger, CODECOMMIT_TRIGGER_MEMBERS))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Delete the repository a stack created, addressed by its NAME — this resource's physical
+/// id, which is what `Ref` returns for the type.
+///
+/// `DeleteRepository` models no does-not-exist error at all ("If a specified repository was
+/// already deleted, a null repository ID is returned"), so a repository CodeCommit no longer
+/// holds is already in the state the delete asks for and the call says so itself.
+async fn delete_codecommit_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "repositoryName": physical_resource_id });
+    call_codecommit(ctx, region, "DeleteRepository", &request).await?;
+    Ok(())
+}
+
+/// The repository's configuration as CodeCommit reports it, for drift detection. One it no
+/// longer holds (`RepositoryDoesNotExistException`, judged on the CODE and never on a
+/// message that carries the request's own name) was deleted.
+async fn describe_codecommit_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "repositoryName": physical_resource_id });
+    match call_codecommit(ctx, region, "GetRepository", &request).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &reported_member(&answer, "repositoryMetadata"),
+            CODECOMMIT_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == CODECOMMIT_REPOSITORY_DOES_NOT_EXIST => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Call one CodeCommit operation on the awsJson1_1 wire its model declares.
+async fn call_codecommit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        CODECOMMIT_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODECOMMIT_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -4385,6 +4385,17 @@ const TRIGGER_DESTINATION_NAMESPACES: &[&str] = &["sns", "lambda"];
 pub const REPOSITORY_TRIGGERS_LIST_REQUIRED_MESSAGE: &str =
     "The list of triggers for the repository is required, but was not specified.";
 
+/// `InvalidRepositoryTriggerDestinationArnException`'s message: the text the
+/// service itself answers a destination that is not an ARN with, which is
+/// entirely FIXED — it names neither the offending value, nor the trigger, nor
+/// the repository, so nothing about it is read off the request.
+///
+/// It is not the error shape's documented sentence: that sentence is prose about
+/// the error class for a reader of the API reference, and a client branching on
+/// the message a trigger refusal carries matches this one.
+pub const TRIGGER_DESTINATION_ARN_MALFORMED_MESSAGE: &str =
+    "Repository trigger destination arn is incorrectly formatted";
+
 /// Why a trigger in a `RepositoryTriggersList` cannot be stored for a
 /// repository. Each variant is the modelled error the trigger operations answer
 /// for it, and [`TriggerProblem::message`] is the text that comes with it.
@@ -4431,11 +4442,15 @@ pub enum TriggerProblem {
 impl TriggerProblem {
     /// The message the error for this problem carries.
     ///
-    /// Each is the documented sentence of the error shape the problem names (the
-    /// `//! ## Errors` list in `src/ops/put_repository_triggers.rs`), stated here
+    /// The text is the one the service answers for that error CLASS, stated here
     /// once so the operations that take a `RepositoryTriggersList` cannot word
-    /// the same code differently; the two bounded problems state the bound they
-    /// tripped over, as this crate's other quota refusals do.
+    /// the same code differently — a malformed destination ARN carries
+    /// [`TRIGGER_DESTINATION_ARN_MALFORMED_MESSAGE`], which is fixed text with no
+    /// part of it read off the request. For the problems whose own wording is not
+    /// recorded anywhere this crate can read it, the text is the documented
+    /// sentence of the error shape the problem names (the `//! ## Errors` list in
+    /// `src/ops/put_repository_triggers.rs`); the two bounded problems state the
+    /// bound they tripped over, as this crate's other quota refusals do.
     pub fn message(self) -> String {
         match self {
             Self::TooManyTriggers => format!(
@@ -4453,10 +4468,7 @@ impl TriggerProblem {
                                             trigger is required, but was not specified."
                 .to_string(),
             Self::DestinationArnInvalid => {
-                "The Amazon Resource Name (ARN) for the trigger is not valid for the specified \
-                 destination. The most common reason for this error is that the ARN does not \
-                 meet the requirements for the service type."
-                    .to_string()
+                TRIGGER_DESTINATION_ARN_MALFORMED_MESSAGE.to_string()
             }
             Self::DestinationRegion => {
                 "The Amazon Web Services Region for the trigger target does not match the Amazon \
