@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/amplify_registry.rs"]
+mod amplify_registry;
 #[path = "all/app_registration_gate.rs"]
 mod app_registration_gate;
 #[path = "all/backend_job_listing.rs"]
@@ -23,6 +25,8 @@ mod backend_lifecycle;
 mod backend_storage;
 #[path = "all/challenge_tokens.rs"]
 mod challenge_tokens;
+#[path = "all/control_plane_fidelity.rs"]
+mod control_plane_fidelity;
 #[path = "all/remove_all_backends.rs"]
 mod remove_all_backends;
 #[path = "all/s3_buckets.rs"]

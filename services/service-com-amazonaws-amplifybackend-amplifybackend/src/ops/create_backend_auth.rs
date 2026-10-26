@@ -2,25 +2,30 @@
 
 //! @op CreateBackendAuth
 //!
-//! Stores the submitted `CreateBackendAuthResourceConfig` VERBATIM under
-//! (AppId, BackendEnvironmentName, ResourceName) so `GetBackendAuth` reports exactly
-//! what was given, and records an async job for the call. An app or environment that
-//! was never created answers `NotFoundException` (404); an `AppId` that identifies no
-//! registered Amplify app is refused with HTTP 400 `ValidationException` before any
-//! lookup ([`crate::state::require_registered_app`]).
+//! WITHDRAWN from SDK and AWS CLI callers by AWS: every call is refused, deterministically
+//! and input-independently, with HTTP 400, the error code `ValidationException` and the
+//! fixed message [`crate::state::studio_only_message`] — the operation is reachable only
+//! through Amplify Studio. Nothing is read and nothing is stored, so no auth resource, no
+//! job record and no `JobId` comes into being for a caller on this channel, and a later
+//! `GetBackendAuth` reports no such resource.
 //!
-//! Two DELIBERATE scope boundaries of this first slice, so a reader can tell a decision
-//! from a gap:
+//! Recorded behaviour, not modelled: the model describes `CreateBackendAuth` as an
+//! ordinary 200 operation answering a job record (`AppId`, `BackendEnvironmentName`,
+//! `JobId`, `Operation`, `Status`), and declares no `ValidationException` at all — so the
+//! refusal is raised through [`crate::state::studio_only`], the crate's own channel for a
+//! client-input error this service's model does not carry. It is the same refusal
+//! `CreateBackendStorage` answers, from the same recorded family of Studio-only mutations,
+//! and the emulator serves SDK/CLI callers exclusively.
 //!
-//! * the configuration is accepted as the model constrains it (required members, enum
-//!   values and bounds are refused before this handler runs) and is NOT inspected for
-//!   internal consistency beyond that — a config the real service would refuse on
-//!   semantic grounds is stored here;
-//! * a second call for the same `ResourceName` REPLACES the stored configuration rather
-//!   than refusing, which is also what makes it the natural update path while
-//!   `UpdateBackendAuth` is still scaffolded.
+//! This is NOT the scaffold's 501: a 501 says "nobody has written this yet", while this
+//! refusal is the operation's real, permanent answer on this channel — a client that
+//! branches on `ValidationException`, or retries a 5xx, has to see the AWS answer.
 //!
-//! Both belong to their own gap issues rather than to this bootstrap.
+//! What is deliberately NOT here, so a reader can tell a decision from a gap: no app or
+//! environment lookup, no `ResourceName` or `ResourceConfig` validation and no quota
+//! check. The refusal precedes all of them on the recorded path, so adding one would make
+//! a withdrawn operation answer a second error code for some inputs and leak whether a
+//! resource exists.
 //!
 //! ## Shape of an operation
 //!
@@ -164,89 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateBackendAuthError::from(CreateBackendAuthErrorModeled::GatewayTimeoutException(
-                crate::state::store_unavailable(),
-            ))
-        })?;
-
-        let now = std::time::SystemTime::now();
-
-        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
-        // that identifies no registered Amplify app is a client-input error (400
-        // `ValidationException`), not a missing backend.
-        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
-
-        let mut store = state.lock();
-
-        // The identifier that keys the stored resource is length-bounded before anything
-        // is inserted, so a bounded COUNT of auth resources cannot hold an unbounded
-        // amount of caller text.
-        if let Err(bad_request) =
-            crate::state::bound_identifier("resourceName", &input.resource_name)
-        {
-            return Err(CreateBackendAuthErrorModeled::BadRequestException(bad_request).into());
-        }
-
-        let app = store.app_mut(&input.app_id).ok_or_else(|| {
-            CreateBackendAuthError::from(CreateBackendAuthErrorModeled::NotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
-                ),
-            ))
-        })?;
-        let environment = app
-            .environment_mut(&input.backend_environment_name)
-            .ok_or_else(|| {
-                CreateBackendAuthError::from(CreateBackendAuthErrorModeled::NotFoundException(
-                    crate::state::not_found(
-                        crate::state::RESOURCE_TYPE_BACKEND_ENVIRONMENT,
-                        format!(
-                            "backend environment {} does not exist for app {}",
-                            input.backend_environment_name, input.app_id
-                        ),
-                    ),
-                ))
-            })?;
-
-        // The store this call grows is count-bounded BEFORE the insert: a caller must
-        // not be able to configure unboundedly many auth resources in one environment.
-        if !environment.has_room_for_new_auth_resource(&input.resource_name) {
-            return Err(CreateBackendAuthErrorModeled::TooManyRequestsException(
-                crate::state::limit_exceeded(
-                    crate::state::LIMIT_TYPE_AUTH_RESOURCES,
-                    format!(
-                        "backend environment {} may hold at most {} auth resources",
-                        input.backend_environment_name,
-                        crate::state::MAX_AUTH_RESOURCES_PER_ENVIRONMENT
-                    ),
-                ),
-            )
-            .into());
-        }
-
-        environment
-            .auth
-            .insert(input.resource_name.clone(), input.resource_config.clone());
-        // The app's job map is bounded here, before the record is added:
-        // `reclaim_job_capacity` reclaims the app's OLDEST jobs until there is room for
-        // one more, so the map holds at most `MAX_RETAINED_JOBS_PER_APP` records however
-        // often this operation is called.
-        app.reclaim_job_capacity();
-        let job = app.record_job(
-            &input.backend_environment_name,
-            crate::state::OPERATION_CREATE_BACKEND_AUTH,
-            now,
-        );
-        Ok(CreateBackendAuthOutput {
-            app_id: Some(job.app_id.clone()),
-            backend_environment_name: Some(job.backend_environment_name.clone()),
-            error: job.error.clone(),
-            job_id: Some(job.job_id.clone()),
-            operation: Some(job.operation.clone()),
-            status: Some(job.status.clone()),
-        })
+        // The refusal is input-independent: it is the answer to the OPERATION, on every
+        // SDK/CLI call, so neither the request nor the store decides anything here. The
+        // engine is left untouched, which is what "the call stores nothing" means.
+        let _ = (&input, ctx, &self.engine);
+        Err(crate::state::studio_only())
     }
 }

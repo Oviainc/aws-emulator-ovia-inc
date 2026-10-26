@@ -2,11 +2,21 @@
 
 //! @op GetBackendAuth
 //!
-//! Reports the `CreateBackendAuthResourceConfig` stored by `CreateBackendAuth`, exactly
-//! as it was submitted. A missing app, environment or resource name answers
-//! `NotFoundException` (404); an `AppId` that identifies no registered Amplify app is
-//! refused with HTTP 400 `ValidationException` before any lookup
-//! ([`crate::state::require_registered_app`]). Reporting only — it writes nothing.
+//! Reports the auth resource stored under (AppId, BackendEnvironmentName, ResourceName),
+//! exactly as it was submitted. An address that resolves to no auth resource — an app with
+//! no backend here, an environment that was never created, or a resource name nothing was
+//! stored under — answers HTTP 404 with the error code `ResourceNotFoundException` and one
+//! fixed sentence ([`crate::state::AUTH_MISSING_SENTENCE`]): recorded behaviour, and the
+//! service does not say WHICH part of the address was wrong, so neither does this handler.
+//! An `AppId` that identifies no Amplify app at all is refused earlier, with HTTP 400
+//! `ValidationException` ([`crate::state::require_registered_app`]). Reporting only — it
+//! writes nothing.
+//!
+//! It reports what the STORE holds, and the operation that used to write that store,
+//! `CreateBackendAuth`, is withdrawn from SDK/CLI callers by AWS (see
+//! `src/ops/create_backend_auth.rs`) — so on this channel the resource is created through
+//! no operation of this service and this read answers the recorded not-found, which is
+//! exactly what the recording of the pair shows.
 //!
 //! ## Shape of an operation
 //!
@@ -161,44 +171,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let store = state.lock();
-        let app = store.app(&input.app_id).ok_or_else(|| {
-            GetBackendAuthError::from(GetBackendAuthErrorModeled::NotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
-                ),
-            ))
-        })?;
-        let environment = app
-            .environment(&input.backend_environment_name)
-            .ok_or_else(|| {
-                GetBackendAuthError::from(GetBackendAuthErrorModeled::NotFoundException(
-                    crate::state::not_found(
-                        crate::state::RESOURCE_TYPE_BACKEND_ENVIRONMENT,
-                        format!(
-                            "backend environment {} does not exist for app {}",
-                            input.backend_environment_name, input.app_id
-                        ),
-                    ),
-                ))
-            })?;
-        let resource_config = environment.auth.get(&input.resource_name).ok_or_else(|| {
-            GetBackendAuthError::from(GetBackendAuthErrorModeled::NotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_BACKEND_AUTH,
-                    format!(
-                        "no auth resource {} exists in backend environment {} of app {}",
-                        input.resource_name, input.backend_environment_name, input.app_id
-                    ),
-                ),
-            ))
+        // ONE refusal for the whole (app, environment, resource) address, for the same
+        // reason as `GetBackendJob`: the service answers the same "not found" whichever
+        // link is missing, so the branches are collapsed rather than telling a caller
+        // which one it was.
+        let stored = store
+            .app(&input.app_id)
+            .and_then(|app| app.environment(&input.backend_environment_name))
+            .and_then(|environment| {
+                environment
+                    .auth
+                    .get(&input.resource_name)
+                    .map(|config| (environment.name.clone(), config.clone()))
+            });
+        let (environment_name, resource_config) = stored.ok_or_else(|| {
+            crate::state::resource_not_found::<GetBackendAuthErrorModeled>(
+                crate::state::AUTH_MISSING_SENTENCE,
+            )
         })?;
 
         Ok(GetBackendAuthOutput {
-            app_id: Some(app.app_id.clone()),
-            backend_environment_name: Some(environment.name.clone()),
+            app_id: Some(input.app_id.clone()),
+            backend_environment_name: Some(environment_name),
             error: None,
-            resource_config: Some(resource_config.clone()),
+            resource_config: Some(resource_config),
             resource_name: Some(input.resource_name.clone()),
         })
     }

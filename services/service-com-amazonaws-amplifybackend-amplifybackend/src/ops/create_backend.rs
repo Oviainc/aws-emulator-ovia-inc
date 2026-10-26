@@ -2,7 +2,9 @@
 
 //! @op CreateBackend
 //!
-//! Creates the app record if absent, creates the named backend environment, records an
+//! Settles the app's identity against Amplify's app registry, refuses a
+//! `BackendEnvironmentName` outside the form the service creates, then creates this
+//! service's backend record for the app, creates the named backend environment, records an
 //! async job for the call, and answers with that STORED job. Nothing here is canned:
 //! the job id is minted once and inserted into the app's job map, which is the same map
 //! `GetBackendJob` reads.
@@ -158,13 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // EVERY caller-supplied identifier this call stores is length-bounded, and every
-        // store it can grow is count-bounded, BEFORE anything is inserted: a caller must
-        // not be able to grow the emulator's state without limit. The app bound is
-        // checked first, then the environment bound for an app that already exists (a new
-        // app starts with no environments, so it cannot be over that one).
+        // EVERY caller-supplied identifier this call stores is length-bounded BEFORE
+        // anything else: a caller must not be able to key a record by unbounded text, and
+        // the guard is this emulator's, so it answers before any rule of the service's.
         for (member, value) in [
             ("appId", input.app_id.as_str()),
             ("appName", input.app_name.as_str()),
@@ -176,12 +175,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateBackendErrorModeled::BadRequestException(bad_request).into());
             }
         }
+
+        // The app's IDENTITY is settled before any environment work: an `AppId` Amplify
+        // holds no app for is the missing app it names (404 `NotFoundException`), so a
+        // mistyped or deleted app id can never bring a backend of its own into being.
+        // Read with no store guard held — see `crate::state::app_is_registered`.
+        if let Err(missing) = crate::state::require_existing_app(&*self.engine, &input.app_id) {
+            return Err(CreateBackendErrorModeled::NotFoundException(missing).into());
+        }
+
+        // Then the form of the name this call would CREATE: a name outside it is client
+        // input the service refuses (400 `ValidationException`), not a name it provisions.
+        crate::state::require_environment_name(&input.backend_environment_name)?;
+
+        let mut store = state.lock();
+
+        // Every store this call can grow is count-bounded BEFORE anything is inserted. The
+        // app bound is checked first, then the environment bound for an app that already
+        // has a backend record (a new record starts with no environments, so it cannot be
+        // over that one).
         if !store.has_room_for_new_app(&input.app_id) {
             return Err(CreateBackendErrorModeled::TooManyRequestsException(
                 crate::state::limit_exceeded(
                     crate::state::LIMIT_TYPE_APPS,
                     format!(
-                        "this emulator holds a backend for at most {} apps",
+                        "This emulator holds a backend for at most {} apps.",
                         crate::state::MAX_APPS
                     ),
                 ),
@@ -195,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::limit_exceeded(
                     crate::state::LIMIT_TYPE_ENVIRONMENTS,
                     format!(
-                        "app {} may hold at most {} backend environments",
+                        "App {} may hold at most {} backend environments.",
                         input.app_id,
                         crate::state::MAX_ENVIRONMENTS_PER_APP
                     ),

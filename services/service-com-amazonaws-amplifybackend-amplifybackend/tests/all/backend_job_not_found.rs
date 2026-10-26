@@ -46,9 +46,14 @@ const OTHER_ENVIRONMENT: &str = "preview";
 /// A second registered app, so a job id can be addressed under the wrong app.
 const OTHER_APP: &str = "dreadjob9z8y7x";
 
-/// A router with just this service mounted, and the shared engine it was mounted on.
+/// A router with just this service mounted, and the shared engine it was mounted on, with
+/// an Amplify app registered for both app ids the cases address — the registry
+/// `CreateBackend` settles an app's identity against (`crate::amplify_registry`).
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    for app_id in [APP, OTHER_APP] {
+        crate::amplify_registry::register_amplify_app(&engine, app_id, "job reads");
+    }
     let mut router = MultiServiceRouter::new();
     // These tests exercise the service, not SigV4: requests carry no signature.
     router.set_request_authentication(false);

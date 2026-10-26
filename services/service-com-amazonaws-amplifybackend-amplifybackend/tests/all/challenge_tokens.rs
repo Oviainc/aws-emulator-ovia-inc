@@ -51,7 +51,8 @@ const HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
 /// (recorded behaviour; not a shape this service's model declares).
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// A router with just this service mounted, and the shared engine it was mounted on.
+/// A router with just this service mounted, and the shared engine it was mounted on — the
+/// one the Amplify app registry is read from (`crate::amplify_registry`).
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -59,11 +60,6 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
-}
-
-/// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
-    router_with_engine().0
 }
 
 /// Send one request and read back `(status, body)`. `body` is `Value::Null` when the
@@ -136,10 +132,14 @@ async fn delete_token(router: &MultiServiceRouter, app_id: &str, session_id: &st
     .await
 }
 
-/// Register `app_id` as an Amplify app this emulator knows, by creating a backend for
-/// it: every token operation gates on the app's IDENTITY first, and `CreateBackend` is
-/// the one registry reachable with this service mounted alone.
-async fn register_app(router: &MultiServiceRouter, app_id: &str) {
+/// Put `app_id` in the Amplify app store — the registry every token operation gates on
+/// the app's IDENTITY against — and create this service's backend for it.
+async fn register_app(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    app_id: &str,
+) {
+    crate::amplify_registry::register_amplify_app(engine, app_id, "tokens");
     let (status, body) = call(
         router,
         "POST",
@@ -272,14 +272,14 @@ struct Minted {
 #[tokio::test]
 async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
     for case in cases() {
-        let router = router();
+        let (router, engine) = router_with_engine();
         let Case {
             name,
             app_id,
             extra_environment,
             tokens,
         } = case;
-        register_app(&router, &app_id).await;
+        register_app(&router, &engine, &app_id).await;
         if extra_environment {
             let (status, body) = call(
                 &router,
@@ -402,14 +402,14 @@ async fn a_challenge_token_round_trips_and_is_reclaimed_by_delete() {
 /// across apps — and each one resolves to its own challenge code.
 #[tokio::test]
 async fn every_minted_session_id_is_unique() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     // Two apps, so uniqueness is not merely per-app, and enough tokens that a collision
     // would be likely if ids were derived from anything but the mint itself.
     let apps = ["dsharedone001", "dsharedtwo002"];
     let per_app = 12;
     let mut all: Vec<(String, String, String)> = Vec::new();
     for app_id in apps {
-        register_app(&router, app_id).await;
+        register_app(&router, &engine, app_id).await;
         for index in 0..per_app {
             let (status, body) = create_token(&router, app_id).await;
             assert_eq!(
@@ -450,12 +450,12 @@ async fn every_minted_session_id_is_unique() {
 /// resolve under another, and the mismatched call — read or delete — leaves it alone.
 #[tokio::test]
 async fn a_token_lookup_is_scoped_to_its_app() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     let (owner, other) = ("downerapp0001", "dotherapp0002");
     // BOTH apps are registered: the lookup under `other` must miss on the TOKEN, which
     // is what this case is about, not on the app's identity.
-    register_app(&router, owner).await;
-    register_app(&router, other).await;
+    register_app(&router, &engine, owner).await;
+    register_app(&router, &engine, other).await;
     let (status, body) = create_token(&router, owner).await;
     assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
     let session_id = field(&body, "sessionId").to_string();
@@ -494,7 +494,7 @@ async fn a_token_lookup_is_scoped_to_its_app() {
 async fn a_token_stops_resolving_once_its_ttl_has_passed() {
     let (router, engine) = router_with_engine();
     let app_id = "dexpiryapp0001";
-    register_app(&router, app_id).await;
+    register_app(&router, &engine, app_id).await;
     let now = SystemTime::now();
     // (case, when the token expires, whether it still resolves)
     let rows = [
@@ -568,7 +568,7 @@ async fn a_token_stops_resolving_once_its_ttl_has_passed() {
 /// tokens, so reclaiming one makes room again.
 #[tokio::test]
 async fn the_token_store_is_bounded() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     // An over-long app id is refused by the LENGTH bound before the app-identity gate
     // runs: it is malformed input, and the refusal names the member so the caller can
     // fix it.
@@ -584,7 +584,7 @@ async fn the_token_store_is_bounded() {
     );
 
     let app_id = "dboundedapp001";
-    register_app(&router, app_id).await;
+    register_app(&router, &engine, app_id).await;
     let mut sessions = Vec::new();
     for index in 0..MAX_CHALLENGE_TOKENS_PER_APP {
         let (status, body) = create_token(&router, app_id).await;
@@ -642,7 +642,7 @@ struct TtlCase {
 async fn the_read_path_reports_no_ttl() {
     let (router, engine) = router_with_engine();
     let app_id = "dreadpathttl01";
-    register_app(&router, app_id).await;
+    register_app(&router, &engine, app_id).await;
 
     // The MINT half of the rule: `CreateToken` reports the lifetime it granted.
     let (status, body) = create_token(&router, app_id).await;
@@ -780,9 +780,9 @@ fn unheld_session_ids() -> Vec<(&'static str, String)> {
 /// because this path inserts nothing.
 #[tokio::test]
 async fn delete_token_is_idempotent_over_session_ids() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     let app_id = "didempotent001";
-    register_app(&router, app_id).await;
+    register_app(&router, &engine, app_id).await;
     // A live token of the same app, so every row also proves the no-op reclaims nothing.
     let (status, body) = create_token(&router, app_id).await;
     assert_eq!(status, 200, "seeding CreateToken expected 200, got {body}");
@@ -843,8 +843,8 @@ async fn a_session_that_does_not_resolve_is_one_resource_not_found() {
     let (router, engine) = router_with_engine();
     let app_id = "dnotfound00001";
     let other_app = "dotherowner001";
-    register_app(&router, app_id).await;
-    register_app(&router, other_app).await;
+    register_app(&router, &engine, app_id).await;
+    register_app(&router, &engine, other_app).await;
 
     let mut rows: Vec<(String, String)> = unheld_session_ids()
         .into_iter()

@@ -52,9 +52,12 @@ const STORAGE_NOT_FOUND_MESSAGE: &str = "An error occurred while processing your
 const APP: &str = "d1ab2cd3ef4gh5";
 const ENVIRONMENT: &str = "staging";
 
-/// A router with just this service mounted, and the shared engine it was mounted on.
+/// A router with just this service mounted, and the shared engine it was mounted on, with
+/// an Amplify app registered under `APP` — the registry the app-identity gate reads
+/// (`crate::amplify_registry`).
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::amplify_registry::register_amplify_app(&engine, APP, "storage tests");
     let mut router = MultiServiceRouter::new();
     // These tests exercise the service, not SigV4: requests carry no signature.
     router.set_request_authentication(false);
@@ -99,8 +102,9 @@ fn field<'a>(body: &'a Value, name: &str) -> &'a str {
     body.get(name).and_then(Value::as_str).unwrap_or_default()
 }
 
-/// Register `APP` with one backend environment through `CreateBackend` — the only app
-/// registry reachable with this service mounted alone.
+/// Create `APP`'s backend with one environment through `CreateBackend`. The app itself is
+/// registered in the Amplify store by `router_with_engine`, which is what lets this call
+/// through.
 async fn register_app(router: &MultiServiceRouter) {
     let (status, body) = call(
         router,

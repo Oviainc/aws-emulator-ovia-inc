@@ -16,12 +16,14 @@
 //!    beside `message`, declares `application/json; charset=utf-8`, and carries an `ETag`
 //!    derived from the response body.
 //!
-//! An app is registered when this service holds an app record for it, which
-//! `CreateBackend` is what writes (`crate::state::app_is_registered`'s doc covers the one
-//! known gap: an app Amplify minted with no backend here). Every case drives
+//! An app EXISTS when the Amplify service's app store holds a record for it, which is
+//! where an `AppId` is minted (`crate::state::app_is_registered`); these rows put one
+//! there through `crate::amplify_registry` and then create this service's backend for it
+//! with `CreateBackend`. Every case drives
 //! `MultiServiceRouter::dispatch`, so the gate and the envelope are exercised on the same
 //! wire path a served request takes; the same rule with the Amplify control plane mounted
-//! beside this service is `core/router/tests/all/amplifybackend_app_registration.rs`.
+//! beside this service, and its app minted by Amplify's own `CreateApp`, is
+//! `core/router/tests/all/amplifybackend_app_registration.rs`.
 
 use std::sync::Arc;
 
@@ -49,9 +51,11 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 const REGISTERED_APP: &str = "d1ab2cd3ef4gh5";
 const ENVIRONMENT: &str = "staging";
 
-/// A router with just this service mounted, and the shared engine it was mounted on.
+/// A router with just this service mounted, and the shared engine it was mounted on, with
+/// an Amplify app registered under `REGISTERED_APP` — the registry the gate reads.
 fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::amplify_registry::register_amplify_app(&engine, REGISTERED_APP, "gate");
     let mut router = MultiServiceRouter::new();
     // These tests exercise the service, not SigV4: requests carry no signature.
     router.set_request_authentication(false);
@@ -139,21 +143,6 @@ async fn call(
     }
 }
 
-/// A minimal valid `CreateBackendAuthResourceConfig`, as the wire document. The enum
-/// values come from the model's own value lists (`AuthResources`, `Service`,
-/// `SignInMethod`, `RequiredSignUpAttributesElement` in `src/ops/types/shared_types.rs`).
-fn auth_config() -> Value {
-    json!({
-        "authResources": "USER_POOL_ONLY",
-        "service": "COGNITO",
-        "userPoolConfigs": {
-            "requiredSignUpAttributes": ["EMAIL"],
-            "signInMethod": "EMAIL",
-            "userPoolName": "gatePool"
-        }
-    })
-}
-
 /// One operation of this service that addresses an app, as a request template.
 struct Op {
     name: &'static str,
@@ -174,11 +163,13 @@ struct Op {
 
 /// Every operation this service implements that addresses an existing app, with the
 /// request filled in for `app_id`. The URIs are the model's own
-/// (`smithy_query(query="digest")` http bindings); `CreateBackend` is NOT here — it is
-/// the operation that brings an app record into being, so it has no app to address, and
-/// neither is `RemoveAllBackends`, which resolves the app against the registry that mints
-/// an `AppId` (Amplify's own) as well as this service's backend records, so an app this
-/// gate refuses can still be one it serves — its own suite,
+/// (`smithy_query(query="digest")` http bindings); `CreateBackend` is NOT here — it
+/// answers an app that does not exist as the missing app it is (404), which is its own
+/// rule — neither are the operations AWS has withdrawn from this channel
+/// (`CreateBackendAuth`, `CreateBackendStorage`, `CloneBackend`), which refuse every
+/// request before they look at the app at all, and neither is `RemoveAllBackends`, which
+/// resolves the app against this service's backend records as well as Amplify's registry,
+/// so an app this gate refuses can still be one it serves — its own suite,
 /// `tests/all/remove_all_backends.rs`, is where both answers are pinned. `GetBackendJob`
 /// is not here either: its whole address is state, so it answers ONE job-absent refusal
 /// for an unknown app exactly as for an unknown job — `tests/all/backend_job_not_found.rs`
@@ -214,21 +205,11 @@ fn operations(app_id: &str) -> Vec<Op> {
             method: "POST",
             path: format!("/backend/{app_id}/auth/{ENVIRONMENT}/details"),
             body: Some(json!({ "resourceName": "authone" })),
-            // The app and the environment exist; no auth resource was created.
+            // The app and the environment exist; no auth resource was created. That read
+            // answers the recorded `ResourceNotFoundException`, not the modelled shape —
+            // see `src/ops/get_backend_auth.rs`.
             registered_status: 404,
-            registered_code: "NotFoundException",
-        },
-        Op {
-            name: "CreateBackendAuth",
-            method: "POST",
-            path: format!("/backend/{app_id}/auth"),
-            body: Some(json!({
-                "backendEnvironmentName": ENVIRONMENT,
-                "resourceName": "authone",
-                "resourceConfig": auth_config(),
-            })),
-            registered_status: 200,
-            registered_code: "",
+            registered_code: "ResourceNotFoundException",
         },
         Op {
             name: "GetBackendStorage",
@@ -305,8 +286,9 @@ fn unregistered_app_ids() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Register `REGISTERED_APP` with one environment through `CreateBackend` — the only app
-/// registry reachable with this service mounted alone.
+/// Create `REGISTERED_APP`'s backend with one environment through `CreateBackend`. The app
+/// itself is registered in the Amplify store by `router_with_engine`, which is what lets
+/// this call through.
 async fn register_app(router: &MultiServiceRouter) {
     let answer = call(
         router,
@@ -496,8 +478,8 @@ async fn every_error_response_carries_the_code_and_the_service_headers() {
             status: 404,
             code: "NotFoundException",
             method: "POST",
-            path: format!("/backend/{REGISTERED_APP}/auth/nosuchenv/details"),
-            body: Some(json!({ "resourceName": "authone" })),
+            path: format!("/backend/{REGISTERED_APP}/environments/nosuchenv/remove"),
+            body: Some(json!({})),
         },
         ErrorCase {
             name: "an app id past this emulator's identifier bound",

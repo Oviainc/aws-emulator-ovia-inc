@@ -24,14 +24,15 @@ tracing = { workspace = true }
 # `hex` renders the opaque `ListBackendJobs` pagination token, so a position in this
 # service's own job order travels as bytes the caller cannot read as a job id.
 hex = { workspace = true }
+# The Amplify control plane's app store: an `AppId` is minted by Amplify's `CreateApp` and
+# by nothing else, so the app-identity gate reads that store through the shared engine
+# rather than keeping a second app registry here, and `RemoveAllBackends` with
+# `CleanAmplifyApp` set removes the Console app from it rather than from a copy.
+service-com-amazonaws-amplify-amplify = { workspace = true }
 # The S3 service's bucket store: `ListS3Buckets` reports the S3 buckets the account
 # holds, which S3 owns, so it is read from S3's own state in the shared engine rather
 # than kept a second time here.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
-# The Amplify control plane's app store: `RemoveAllBackends` with `CleanAmplifyApp` set
-# cleans up the Amplify Console app, which Amplify owns, so it is removed from Amplify's
-# own state in the shared engine rather than mirrored here.
-service-com-amazonaws-amplify-amplify = { workspace = true }
 # `sha2` derives the `ETag` validator this service puts on an error response from the
 # response bytes themselves (see `service.rs`).
 sha2 = { workspace = true }

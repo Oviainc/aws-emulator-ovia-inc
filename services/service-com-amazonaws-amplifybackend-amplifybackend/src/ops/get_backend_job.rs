@@ -10,7 +10,7 @@
 //! malformed request. Jobs outlive the environment they ran against, so a lookup after
 //! `DeleteBackend` still resolves.
 //!
-//! Reporting, with ONE write: it materialises the completion the clock already made
+//! Reporting, with ONE write: it materialises the progress the clock already made
 //! due (see `BackendJob::settle`), which was owed at that instant whether or not
 //! anybody read the job.
 //!

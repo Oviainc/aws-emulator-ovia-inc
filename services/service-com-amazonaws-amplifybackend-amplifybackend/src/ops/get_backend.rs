@@ -165,11 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let store = state.lock();
+        // The sentence is this emulator's own, behind the service's recorded prefix: no
+        // recording fixes the wording for an app that exists with no backend, so it says
+        // what was asked for, built from the request. The modelled `NotFoundException`
+        // carries the resource type with it.
         let app = store.app(&input.app_id).ok_or_else(|| {
             GetBackendError::from(GetBackendErrorModeled::NotFoundException(
                 crate::state::not_found(
                     crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
+                    format!("Backend for app {} does not exist.", input.app_id),
                 ),
             ))
         })?;

@@ -4,10 +4,14 @@
 //!
 //! Removes the named backend environment — and with it every auth, API and storage
 //! resource created inside it — and records an async job for the call. The app's JOBS
-//! are retained, so a `GetBackendJob` for this or an earlier job still resolves. A
-//! missing app or environment answers `NotFoundException` (404) — unless the `AppId`
-//! identifies no registered Amplify app at all, which is refused with HTTP 400
-//! `ValidationException` before any lookup ([`crate::state::require_registered_app`]).
+//! are retained, so a `GetBackendJob` for this or an earlier job still resolves. An
+//! environment this app does not have — never created, or already removed by an earlier
+//! call — answers the modelled `NotFoundException` (404) with the recorded sentence
+//! ([`crate::state::environment_missing_sentence`]), which names the environment from the
+//! request and nothing else; an app with no backend record here answers the same, since
+//! an app that holds no backend holds no environment either. An `AppId` that identifies no
+//! Amplify app at all is refused earlier, with HTTP 400 `ValidationException`
+//! ([`crate::state::require_registered_app`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,31 +166,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
-        let app = store.app_mut(&input.app_id).ok_or_else(|| {
-            DeleteBackendError::from(DeleteBackendErrorModeled::NotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
-                ),
-            ))
-        })?;
-
         // Removing the environment record removes the auth, API and storage resources it
         // owns with it: they are held INSIDE the environment, not in a map beside it.
-        if app
-            .environments
-            .remove(&input.backend_environment_name)
-            .is_none()
-        {
+        //
+        // ONE refusal for "this app does not have that environment", whether the app has
+        // no backend record at all or just not this environment: both mean the environment
+        // the request named does not exist, which is what the recorded sentence says.
+        let removed = store.app_mut(&input.app_id).and_then(|app| {
+            app.environments
+                .remove(&input.backend_environment_name)
+                .map(|_| app)
+        });
+        let Some(app) = removed else {
             return Err(DeleteBackendErrorModeled::NotFoundException(crate::state::not_found(
                 crate::state::RESOURCE_TYPE_BACKEND_ENVIRONMENT,
-                format!(
-                    "backend environment {} does not exist for app {}",
-                    input.backend_environment_name, input.app_id
-                ),
+                crate::state::environment_missing_sentence(&input.backend_environment_name),
             ))
             .into());
-        }
+        };
 
         // The environment is gone, so the job records what the call DID. Its own jobs
         // stay in the app's job map, which is why a `GetBackendJob` for this job (or an

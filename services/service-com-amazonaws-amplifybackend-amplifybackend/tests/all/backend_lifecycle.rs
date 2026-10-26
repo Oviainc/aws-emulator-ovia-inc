@@ -14,10 +14,9 @@ use aws_smithy_types::date_time::{DateTime, Format};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_amplifybackend_amplifybackend::state::{
-    JOB_COMPLETION_DELAY, JOB_STATUS_COMPLETED, JOB_STATUS_IN_PROGRESS, LIMIT_TYPE_APPS,
-    LIMIT_TYPE_AUTH_RESOURCES, LIMIT_TYPE_ENVIRONMENTS, MAX_APPS,
-    MAX_AUTH_RESOURCES_PER_ENVIRONMENT, MAX_ENVIRONMENTS_PER_APP, MAX_IDENTIFIER_CHARS,
-    MAX_RETAINED_JOBS_PER_APP,
+    studio_only_message, ERROR_MESSAGE_PREFIX, JOB_COMPLETION_DELAY, JOB_STATUS_COMPLETED,
+    JOB_STATUS_PENDING, JOB_STATUS_RUNNING, LIMIT_TYPE_APPS, LIMIT_TYPE_ENVIRONMENTS, MAX_APPS,
+    MAX_ENVIRONMENTS_PER_APP, MAX_IDENTIFIER_CHARS, MAX_RETAINED_JOBS_PER_APP,
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -26,9 +25,18 @@ use smithy_server_runtime::MultiServiceRouter;
 /// key the router claims the request by.
 const HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
 
-/// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+/// A router with just this service mounted on a fresh shared engine, with an Amplify app
+/// registered for every id in `app_ids`.
+///
+/// The Amplify app store is the registry `CreateBackend` settles an app's identity
+/// against, so a case that creates a backend has to name an app that exists there — see
+/// `crate::amplify_registry`. An id left out of this list names no app, and every
+/// operation refuses it.
+fn router_with_apps<S: AsRef<str>>(app_ids: &[S]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    for app_id in app_ids {
+        crate::amplify_registry::register_amplify_app(&engine, app_id.as_ref(), "lifecycle");
+    }
     let mut router = MultiServiceRouter::new();
     // These tests exercise the service, not SigV4: requests carry no signature.
     router.set_request_authentication(false);
@@ -66,22 +74,6 @@ async fn call(
         serde_json::from_slice(&payload).unwrap_or(Value::Null)
     };
     (status, document)
-}
-
-/// The same JSON document with every number read as `f64`, so a `double` that
-/// round-trips as `12` rather than `12.0` still compares equal.
-fn canonical(value: &Value) -> Value {
-    match value {
-        Value::Number(number) => json!(number.as_f64().unwrap_or_default()),
-        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
-        Value::Object(members) => Value::Object(
-            members
-                .iter()
-                .map(|(name, member)| (name.clone(), canonical(member)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
 }
 
 /// A string member of a response, for an assertion that names the case.
@@ -181,10 +173,10 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
-            name: "two environments, username sign-in with OAuth and SMS verification",
+            name: "two environments at the shortest and longest name the service creates",
             app_id: "d00000000000zz",
             app_name: "an app name with spaces",
-            environments: &["sandbox-2", "sandbox-1"],
+            environments: &["zz", "abcdefghij"],
             resource_name: "sandboxAuth",
             resource_config: || {
                 json!({
@@ -220,12 +212,13 @@ fn cases() -> Vec<Case> {
 }
 
 /// The whole slice, over every case: create the environments, read the backend back,
-/// configure auth, read it back verbatim, read the job back, then delete the
-/// environment and prove it is gone while its jobs remain.
+/// watch `CreateBackendAuth` refuse the configuration AWS serves only through Studio,
+/// read the job back, then delete the environment and prove it is gone while its jobs
+/// remain.
 #[tokio::test]
 async fn backend_environment_lifecycle_round_trips_through_state() {
     for case in cases() {
-        let router = router();
+        let router = router_with_apps(&[case.app_id]);
         let label = case.name;
         let mut create_job_ids = Vec::new();
 
@@ -262,8 +255,8 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
             );
             assert_eq!(
                 field(&body, "status"),
-                JOB_STATUS_IN_PROGRESS,
-                "case {label:?}: a freshly recorded job is not finished yet, got {body}"
+                JOB_STATUS_PENDING,
+                "case {label:?}: a freshly recorded job has not started yet, got {body}"
             );
             assert!(
                 body.get("error").is_none(),
@@ -337,7 +330,8 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
             "case {label:?}: GetBackend must not name an environment that does not exist, got {body}"
         );
 
-        // CreateBackendAuth stores the submitted configuration verbatim.
+        // CreateBackendAuth is withdrawn from this channel: the configuration is refused
+        // whatever shape it has, and nothing is stored for it.
         let submitted = (case.resource_config)();
         let (status, body) = call(
             &router,
@@ -351,21 +345,23 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: CreateBackendAuth expected 200, got {status} {body}"
+            status, 400,
+            "case {label:?}: CreateBackendAuth is refused on this channel, got {status} {body}"
         );
         assert_eq!(
-            field(&body, "operation"),
-            "CreateBackendAuth",
-            "case {label:?}: expected Operation=CreateBackendAuth, got {body}"
+            field(&body, "message"),
+            studio_only_message(),
+            "case {label:?}: the refusal names the channel the operation is reachable through, got {body}"
         );
-        let auth_job_id = field(&body, "jobId").to_string();
-        assert!(
-            !auth_job_id.is_empty() && !create_job_ids.contains(&auth_job_id),
-            "case {label:?}: CreateBackendAuth must record its own fresh job, got {body}"
-        );
+        for member in ["jobId", "status", "operation"] {
+            assert!(
+                body.get(member).is_none(),
+                "case {label:?}: a refused create reports no {member}, got {body}"
+            );
+        }
 
-        // GetBackendAuth reports exactly what was stored.
+        // …so the read of that resource answers the recorded not-found, not a resource the
+        // refused call left behind.
         let auth_details = format!("/backend/{}/auth/{first}/details", case.app_id);
         let (status, body) = call(
             &router,
@@ -375,23 +371,20 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: GetBackendAuth expected 200, got {status} {body}"
+            status, 404,
+            "case {label:?}: GetBackendAuth expected 404 for a resource nothing created, got {status} {body}"
         );
-        assert_eq!(
-            field(&body, "resourceName"),
-            case.resource_name,
-            "case {label:?}: GetBackendAuth must report the resource asked for, got {body}"
-        );
-        let returned = body.get("resourceConfig").cloned().unwrap_or(Value::Null);
-        assert_eq!(
-            canonical(&returned),
-            canonical(&submitted),
-            "case {label:?}: GetBackendAuth must return the stored ResourceConfig unchanged, got {returned}"
+        assert!(
+            field(&body, "message").starts_with(ERROR_MESSAGE_PREFIX),
+            "case {label:?}: the refusal carries this service's fixed prefix, got {body}"
         );
 
         // GetBackendJob reads the stored job back.
-        let job_path = format!("/backend/{}/job/{first}/{auth_job_id}", case.app_id);
+        let first_job_id = create_job_ids
+            .first()
+            .cloned()
+            .expect("CreateBackend recorded a job for every environment of the case");
+        let job_path = format!("/backend/{}/job/{first}/{first_job_id}", case.app_id);
         let (status, body) = call(&router, "GET", &job_path, None).await;
         assert_eq!(
             status, 200,
@@ -399,12 +392,12 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
         );
         assert_eq!(
             field(&body, "jobId"),
-            auth_job_id,
+            first_job_id,
             "case {label:?}: GetBackendJob must report the job asked for, got {body}"
         );
         assert_eq!(
             field(&body, "operation"),
-            "CreateBackendAuth",
+            "CreateBackend",
             "case {label:?}: the stored job must remember its operation, got {body}"
         );
         let create_time = field(&body, "createTime").to_string();
@@ -437,7 +430,7 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
         );
         let delete_job_id = field(&body, "jobId").to_string();
         assert!(
-            !delete_job_id.is_empty() && delete_job_id != auth_job_id,
+            !delete_job_id.is_empty() && !create_job_ids.contains(&delete_job_id),
             "case {label:?}: DeleteBackend must record its own fresh job, got {body}"
         );
 
@@ -484,11 +477,12 @@ async fn backend_environment_lifecycle_round_trips_through_state() {
     }
 }
 
-/// A job is recorded `IN_PROGRESS` and becomes `COMPLETED` once the instant its work is
-/// due has passed — and a settled job reports the SAME `UpdateTime` on every later read.
+/// A job is recorded `PENDING`, reports `RUNNING` once its work has started and
+/// `COMPLETED` once the instant its work is due has passed — and a settled job reports
+/// the SAME `UpdateTime` on every later read.
 #[tokio::test]
 async fn a_job_completes_once_the_clock_makes_it_due() {
-    let router = router();
+    let router = router_with_apps(&["djob1"]);
     let (status, body) = call(
         &router,
         "POST",
@@ -501,10 +495,9 @@ async fn a_job_completes_once_the_clock_makes_it_due() {
     let job_path = format!("/backend/djob1/job/staging/{job_id}");
 
     let (_, body) = call(&router, "GET", &job_path, None).await;
-    assert_eq!(
-        field(&body, "status"),
-        JOB_STATUS_IN_PROGRESS,
-        "a caller reading straight after the call still sees the transient status, got {body}"
+    assert!(
+        [JOB_STATUS_PENDING, JOB_STATUS_RUNNING].contains(&field(&body, "status")),
+        "a caller reading straight after the call still sees the job in flight, got {body}"
     );
 
     tokio::time::sleep(JOB_COMPLETION_DELAY + Duration::from_millis(100)).await;
@@ -532,7 +525,7 @@ async fn a_job_completes_once_the_clock_makes_it_due() {
 /// is not found under another.
 #[tokio::test]
 async fn a_job_lookup_is_scoped_to_its_environment() {
-    let router = router();
+    let router = router_with_apps(&["dscope"]);
     for environment in ["one", "two"] {
         let (status, _) = call(
             &router,
@@ -568,23 +561,23 @@ async fn a_job_lookup_is_scoped_to_its_environment() {
     );
 }
 
-/// Every lookup of a resource that does not exist answers the modelled
-/// `NotFoundException` (404) — never 501 and never an empty 200 — whichever part of the
-/// address is unknown.
+/// Every lookup of a resource that does not exist answers 404 — never 501 and never an
+/// empty 200 — whichever part of the address is unknown, with the error code that kind of
+/// lookup answers: the recorded `ResourceNotFoundException` for a resource READ, the
+/// modelled `NotFoundException` (which names the resource type) for the environment a
+/// mutation addresses.
 ///
-/// The APP is not one of those parts: an `AppId` that identifies no registered Amplify
-/// app is refused earlier, as HTTP 400 `ValidationException` (see
-/// `app_registration_gate.rs`), so every row below names a registered app and is unknown
-/// in some part BELOW it.
-///
-/// `GetBackendJob` is not a row here: a job read answers the recorded
-/// `ResourceNotFoundException` for its whole address rather than the modelled shape, and
-/// `backend_job_not_found.rs` is where that rule is pinned.
+/// The APP is not one of those parts for the operations below: an `AppId` that identifies
+/// no Amplify app at all is refused earlier, as HTTP 400 `ValidationException` (see
+/// `app_registration_gate.rs`), so every row below names an app that exists and is unknown
+/// in some part BELOW it. A job read is the exception — its whole address is state, so an
+/// unknown app answers the same job-absent refusal as an unknown job, which
+/// `backend_job_not_found.rs` pins over every part of that address.
 #[tokio::test]
-async fn an_unknown_resource_is_a_modelled_not_found() {
-    let router = router();
-    // Seed one app, one environment, one auth resource, so each row below is unknown in
-    // exactly one respect.
+async fn an_unknown_resource_is_a_not_found() {
+    let router = router_with_apps(&["dknown"]);
+    // Seed one app with one environment, so each row below is unknown in exactly one
+    // respect.
     let (status, _) = call(
         &router,
         "POST",
@@ -593,81 +586,67 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
     )
     .await;
     assert_eq!(status, 200, "seeding CreateBackend expected 200");
-    let (status, _) = call(
-        &router,
-        "POST",
-        "/backend/dknown/auth",
-        Some(json!({
-            "backendEnvironmentName": "staging",
-            "resourceName": "authknown",
-            "resourceConfig": {
-                "authResources": "USER_POOL_ONLY",
-                "service": "COGNITO",
-                "userPoolConfigs": {
-                    "requiredSignUpAttributes": ["EMAIL"],
-                    "signInMethod": "EMAIL",
-                    "userPoolName": "knownPool"
-                }
-            }
-        })),
-    )
-    .await;
-    assert_eq!(status, 200, "seeding CreateBackendAuth expected 200");
 
-    // (what is unknown, method, path, body)
-    let rows: Vec<(&str, &str, String, Option<Value>)> = vec![
+    // (what is unknown, the error code it answers, method, path, body)
+    let rows: Vec<(&str, &str, &str, String, Option<Value>)> = vec![
         (
             "the environment, on GetBackendAuth",
+            "ResourceNotFoundException",
             "POST",
             "/backend/dknown/auth/unknownenv/details".to_string(),
             Some(json!({ "resourceName": "authknown" })),
         ),
         (
             "the resource name, on GetBackendAuth",
+            "ResourceNotFoundException",
             "POST",
             "/backend/dknown/auth/staging/details".to_string(),
             Some(json!({ "resourceName": "unknownresource" })),
         ),
         (
-            "the environment, on CreateBackendAuth",
-            "POST",
-            "/backend/dknown/auth".to_string(),
-            Some(json!({
-                "backendEnvironmentName": "unknownenv",
-                "resourceName": "authknown",
-                "resourceConfig": {
-                    "authResources": "USER_POOL_ONLY",
-                    "service": "COGNITO",
-                    "userPoolConfigs": {
-                        "requiredSignUpAttributes": ["EMAIL"],
-                        "signInMethod": "EMAIL",
-                        "userPoolName": "knownPool"
-                    }
-                }
-            })),
+            "the job id, on GetBackendJob",
+            "ResourceNotFoundException",
+            "GET",
+            "/backend/dknown/job/staging/999".to_string(),
+            None,
+        ),
+        (
+            "the environment, on GetBackendJob",
+            "ResourceNotFoundException",
+            "GET",
+            "/backend/dknown/job/unknownenv/999".to_string(),
+            None,
         ),
         (
             "the environment, on DeleteBackend",
+            "NotFoundException",
             "POST",
             "/backend/dknown/environments/unknownenv/remove".to_string(),
             Some(json!({})),
         ),
     ];
 
-    for (unknown, method, path, body) in rows {
+    for (unknown, code, method, path, body) in rows {
         let (status, response) = call(&router, method, &path, body).await;
         assert_eq!(
             status, 404,
             "case {unknown:?}: expected 404, got {status} {response}"
         );
-        assert!(
-            !field(&response, "resourceType").is_empty(),
-            "case {unknown:?}: NotFoundException names the resource type, got {response}"
+        assert_eq!(
+            field(&response, "code"),
+            code,
+            "case {unknown:?}: expected code {code:?}, got {response}"
         );
         assert!(
-            !field(&response, "message").is_empty(),
-            "case {unknown:?}: NotFoundException carries a message, got {response}"
+            field(&response, "message").starts_with(ERROR_MESSAGE_PREFIX),
+            "case {unknown:?}: the message carries this service's fixed prefix, got {response}"
         );
+        if code == "NotFoundException" {
+            assert!(
+                !field(&response, "resourceType").is_empty(),
+                "case {unknown:?}: NotFoundException names the resource type, got {response}"
+            );
+        }
     }
 }
 
@@ -675,7 +654,7 @@ async fn an_unknown_resource_is_a_modelled_not_found() {
 /// client-input error, `BadRequestException` (400), naming the member.
 #[tokio::test]
 async fn a_missing_required_member_is_a_bad_request() {
-    let router = router();
+    let router = router_with_apps(&["dreq"]);
     let full = json!({ "appId": "dreq", "appName": "required", "backendEnvironmentName": "staging" });
 
     for absent in ["appId", "appName", "backendEnvironmentName"] {
@@ -702,7 +681,9 @@ async fn a_missing_required_member_is_a_bad_request() {
         );
     }
 
-    // The same holds inside a nested required structure.
+    // The same holds inside a nested required structure: the boundary validator refuses
+    // the request before the handler runs, so it is the modelled `BadRequestException`
+    // and not the withdrawal `CreateBackendAuth` answers a well-formed request with.
     let (status, response) = call(
         &router,
         "POST",
@@ -721,12 +702,20 @@ async fn a_missing_required_member_is_a_bad_request() {
         status, 400,
         "case \"userPoolConfigs absent\": expected 400, got {status} {response}"
     );
+    let code = response
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        code.ends_with("BadRequestException"),
+        "case \"userPoolConfigs absent\": expected BadRequestException, got {code:?} in {response}"
+    );
 }
 
 /// A value outside a modelled enum is refused before any state is touched.
 #[tokio::test]
 async fn a_value_outside_a_modelled_enum_is_refused() {
-    let router = router();
+    let router = router_with_apps(&["denum"]);
     let (status, _) = call(
         &router,
         "POST",
@@ -768,6 +757,15 @@ async fn a_value_outside_a_modelled_enum_is_refused() {
             status, 400,
             "case {member:?}={bad}: expected 400, got {status} {response}"
         );
+        let code = response
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            code.ends_with("BadRequestException"),
+            "case {member:?}={bad}: the boundary validator refuses the value before the \
+             handler answers its own refusal, got {code:?} in {response}"
+        );
     }
 }
 
@@ -776,7 +774,7 @@ async fn a_value_outside_a_modelled_enum_is_refused() {
 /// limit, while the jobs a caller is still polling stay readable.
 #[tokio::test]
 async fn job_retention_is_bounded_and_drops_the_oldest_first() {
-    let router = router();
+    let router = router_with_apps(&["dbound"]);
     let create = json!({
         "appId": "dbound",
         "appName": "bounded",
@@ -825,25 +823,21 @@ async fn job_retention_is_bounded_and_drops_the_oldest_first() {
 /// neither grow the emulator's state without limit nor key a record by unbounded text.
 #[tokio::test]
 async fn caller_driven_stores_are_bounded() {
-    let router = router();
-    let auth_config = json!({
-        "authResources": "USER_POOL_ONLY",
-        "service": "COGNITO",
-        "userPoolConfigs": {
-            "requiredSignUpAttributes": ["EMAIL"],
-            "signInMethod": "EMAIL",
-            "userPoolName": "boundedPool"
-        }
-    });
+    // Every app id below exists in the Amplify registry, including the one past the cap,
+    // so the refusal under test is this service's own bound and not the identity gate.
+    let app_ids: Vec<String> = (0..MAX_APPS).map(|index| format!("dapp{index}")).collect();
+    let mut registered = app_ids.clone();
+    registered.push("donetoomany".to_string());
+    let router = router_with_apps(&registered);
 
     // (1) apps. Fill the store with distinct app ids, then one more.
-    for index in 0..MAX_APPS {
+    for (index, app_id) in app_ids.iter().enumerate() {
         let (status, body) = call(
             &router,
             "POST",
             "/backend",
             Some(json!({
-                "appId": format!("dapp{index}"),
+                "appId": app_id,
                 "appName": "bounded",
                 "backendEnvironmentName": "staging",
             })),
@@ -859,7 +853,7 @@ async fn caller_driven_stores_are_bounded() {
         "POST",
         "/backend",
         Some(json!({
-            "appId": "done-too-many",
+            "appId": "donetoomany",
             "appName": "bounded",
             "backendEnvironmentName": "staging",
         })),
@@ -891,7 +885,14 @@ async fn caller_driven_stores_are_bounded() {
         "case \"apps bound, existing app\": expected 200, got {status} {body}"
     );
 
-    // (2) environments per app. `dapp0` already has one.
+    // (2) environments per app. `dapp0` already has one, and every name here is inside
+    // the form the service creates (2-10 lowercase letters), so the only refusal left is
+    // the cap.
+    let environment_name = |index: usize| -> String {
+        let first = char::from(b'a' + u8::try_from(index / 26).unwrap_or_default());
+        let second = char::from(b'a' + u8::try_from(index % 26).unwrap_or_default());
+        format!("{first}{second}")
+    };
     for index in 1..MAX_ENVIRONMENTS_PER_APP {
         let (status, body) = call(
             &router,
@@ -900,7 +901,7 @@ async fn caller_driven_stores_are_bounded() {
             Some(json!({
                 "appId": "dapp0",
                 "appName": "bounded",
-                "backendEnvironmentName": format!("env{index}"),
+                "backendEnvironmentName": environment_name(index),
             })),
         )
         .await;
@@ -916,7 +917,7 @@ async fn caller_driven_stores_are_bounded() {
         Some(json!({
             "appId": "dapp0",
             "appName": "bounded",
-            "backendEnvironmentName": "one-too-many",
+            "backendEnvironmentName": "onetoomany",
         })),
     )
     .await;
@@ -930,62 +931,9 @@ async fn caller_driven_stores_are_bounded() {
         "case \"environments bound\": the refusal names which limit was hit, got {body}"
     );
 
-    // (3) auth resources per environment.
-    for index in 0..MAX_AUTH_RESOURCES_PER_ENVIRONMENT {
-        let (status, body) = call(
-            &router,
-            "POST",
-            "/backend/dapp0/auth",
-            Some(json!({
-                "backendEnvironmentName": "staging",
-                "resourceName": format!("auth{index}"),
-                "resourceConfig": auth_config,
-            })),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case \"auth resource {index}\": expected 200 under the bound, got {status} {body}"
-        );
-    }
-    let (status, body) = call(
-        &router,
-        "POST",
-        "/backend/dapp0/auth",
-        Some(json!({
-            "backendEnvironmentName": "staging",
-            "resourceName": "one-too-many",
-            "resourceConfig": auth_config,
-        })),
-    )
-    .await;
-    assert_eq!(
-        status, 429,
-        "case \"auth resources bound\": a new resource past the cap is refused, got {status} {body}"
-    );
-    assert_eq!(
-        field(&body, "limitType"),
-        LIMIT_TYPE_AUTH_RESOURCES,
-        "case \"auth resources bound\": the refusal names which limit was hit, got {body}"
-    );
-    // Replacing an existing resource still works: nothing grows.
-    let (status, body) = call(
-        &router,
-        "POST",
-        "/backend/dapp0/auth",
-        Some(json!({
-            "backendEnvironmentName": "staging",
-            "resourceName": "auth0",
-            "resourceConfig": auth_config,
-        })),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case \"auth resources bound, existing resource\": expected 200, got {status} {body}"
-    );
-
-    // (4) identifier length, at the bound and one past it.
+    // (3) identifier length, at the bound and one past it. `appName` carries the at-bound
+    // case: it is length-bounded like every stored identifier but, unlike an environment
+    // name, is not narrowed further by the form the service creates.
     let at_bound = "a".repeat(MAX_IDENTIFIER_CHARS);
     let over_bound = "a".repeat(MAX_IDENTIFIER_CHARS + 1);
     let (status, body) = call(
@@ -994,8 +942,8 @@ async fn caller_driven_stores_are_bounded() {
         "/backend",
         Some(json!({
             "appId": "dapp0",
-            "appName": "bounded",
-            "backendEnvironmentName": at_bound,
+            "appName": at_bound,
+            "backendEnvironmentName": "onetoomany",
         })),
     )
     .await;
@@ -1009,6 +957,14 @@ async fn caller_driven_stores_are_bounded() {
             json!({
                 "appId": over_bound,
                 "appName": "bounded",
+                "backendEnvironmentName": "staging",
+            }),
+        ),
+        (
+            "appName",
+            json!({
+                "appId": "dapp0",
+                "appName": over_bound,
                 "backendEnvironmentName": "staging",
             }),
         ),
@@ -1037,7 +993,7 @@ async fn caller_driven_stores_are_bounded() {
 /// operation must not look like an empty success.
 #[tokio::test]
 async fn operations_outside_this_slice_still_answer_501() {
-    let router = router();
+    let router = router_with_apps(&["dstub"]);
     let (status, _) = call(
         &router,
         "POST",
@@ -1049,12 +1005,6 @@ async fn operations_outside_this_slice_still_answer_501() {
 
     let rows: Vec<(&str, &str, &str, Option<Value>)> = vec![
         (
-            "CloneBackend",
-            "POST",
-            "/backend/dstub/environments/staging/clone",
-            Some(json!({ "targetEnvironmentName": "copy" })),
-        ),
-        (
             "CreateBackendAPI",
             "POST",
             "/backend/dstub/api",
@@ -1063,6 +1013,12 @@ async fn operations_outside_this_slice_still_answer_501() {
                 "resourceName": "apione",
                 "resourceConfig": { "service": "AppSync" },
             })),
+        ),
+        (
+            "CreateBackendConfig",
+            "POST",
+            "/backend/dstub/config",
+            Some(json!({})),
         ),
     ];
     for (operation, method, path, body) in rows {

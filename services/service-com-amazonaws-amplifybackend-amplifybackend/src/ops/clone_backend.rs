@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CloneBackend
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CloneBackend`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CloneBackend::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WITHDRAWN from SDK and AWS CLI callers by AWS: every call is refused, deterministically
+//! and input-independently, with HTTP 400, the error code `ValidationException` and the
+//! fixed message [`crate::state::amplify_cli_only_message`] — the work is done by the
+//! Amplify CLI command sequence that message names. Nothing is read and nothing is stored,
+//! so no target environment, no job record and no `JobId` comes into being for a caller on
+//! this channel.
+//!
+//! Recorded behaviour, not modelled: the model describes `CloneBackend` as an ordinary 200
+//! operation answering a job record (`AppId`, `BackendEnvironmentName`, `JobId`,
+//! `Operation`, `Status`), and declares no `ValidationException` at all — so the refusal is
+//! raised through [`crate::state::amplify_cli_only`], the crate's own channel for a
+//! client-input error this service's model does not carry. The recordings show the SAME
+//! refusal, to the letter, for a `TargetEnvironmentName` that is free and for one already
+//! in use, so the refusal precedes every target-name check, and no environment is created
+//! either way.
+//!
+//! This is NOT the scaffold's 501, which is what this operation used to answer: a 501 says
+//! "nobody has written this yet", while this refusal is the operation's real, permanent
+//! answer on this channel — a client that branches on `ValidationException`, or retries a
+//! 5xx as transient, has to see the AWS answer.
+//!
+//! What is deliberately NOT here, so a reader can tell a decision from a gap: no app or
+//! environment lookup, no target-name validation and no clone semantics. The refusal
+//! precedes all of them on the recorded path, so adding one would make a withdrawn
+//! operation answer a second error code for some inputs and leak whether an environment
+//! exists.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // The refusal is input-independent: it is the answer to the OPERATION, on every
+        // SDK/CLI call, so neither the request nor the store decides anything here — not
+        // even a word of the message. The engine is left untouched, which is what "the
+        // call creates no environment" means.
         let _ = (&input, ctx, &self.engine);
-        // Implement `CloneBackend` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CloneBackendErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CloneBackend"))
+        Err(crate::state::amplify_cli_only())
     }
 }

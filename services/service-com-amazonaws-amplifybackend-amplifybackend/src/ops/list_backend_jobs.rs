@@ -182,11 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
+        // As in `GetBackend`, the sentence is this emulator's own behind the service's
+        // recorded prefix: no recording fixes the wording for an app that exists with no
+        // backend, so it says what was asked for, built from the request.
         let app = store.app_mut(&input.app_id).ok_or_else(|| {
             ListBackendJobsError::from(ListBackendJobsErrorModeled::NotFoundException(
                 crate::state::not_found(
                     crate::state::RESOURCE_TYPE_BACKEND,
-                    format!("no backend exists for app {}", input.app_id),
+                    format!("Backend for app {} does not exist.", input.app_id),
                 ),
             ))
         })?;

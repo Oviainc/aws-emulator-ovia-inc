@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::limit_exceeded(
                     crate::state::LIMIT_TYPE_APPS,
                     format!(
-                        "this emulator holds challenge tokens for at most {} apps",
+                        "This emulator holds challenge tokens for at most {} apps.",
                         crate::state::MAX_APPS
                     ),
                 ),
@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::limit_exceeded(
                     crate::state::LIMIT_TYPE_CHALLENGE_TOKENS,
                     format!(
-                        "app {} may hold at most {} live challenge tokens",
+                        "App {} may hold at most {} live challenge tokens.",
                         input.app_id,
                         crate::state::MAX_CHALLENGE_TOKENS_PER_APP
                     ),

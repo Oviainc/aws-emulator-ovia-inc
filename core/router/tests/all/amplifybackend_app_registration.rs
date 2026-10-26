@@ -3,20 +3,17 @@
 //! AmplifyBackend's app-identity gate through the ROUTER, with the Amplify control plane
 //! mounted beside it on the one shared engine.
 //!
-//! Every operation that addresses an existing Amplify app refuses an `AppId` the service
-//! has no app record for with HTTP 400 and the error code `ValidationException`, before
-//! any per-resource lookup; an app it does hold reaches its own resources. This suite
-//! pins that rule where every service is mounted together — the router is what a client
-//! actually talks to — and it pins which STORE decides: AmplifyBackend answers from its
-//! own app records, so mounting Amplify beside it (same engine, same account) changes
-//! none of the answers below.
+//! An `AppId` is minted by Amplify's `CreateApp` and by nothing else, so Amplify's app
+//! store is the registry AmplifyBackend settles identity against. This suite pins that
+//! rule where every service is mounted together — the router is what a client actually
+//! talks to — and it pins which STORE decides:
 //!
-//! The registry AWS mints an `AppId` in is Amplify's `CreateApp`, so the faithful gate
-//! would also accept an app that exists there with no backend here; reading that store
-//! needs the app-identity decision the open `CreateBackend` issue owns
-//! (`20261022T052247Z-amplifybackend-control-plane-7-fidelity-divergences-no-environment`,
-//! Cause 2), and `crate::state::app_is_registered` is the single place that would widen.
-//! Nothing here asserts an answer for that case, in either direction.
+//! * an id Amplify holds no app for is refused, by every operation that addresses an
+//!   existing app with HTTP 400 `ValidationException`, and by `CreateBackend` as the
+//!   missing app it names (404 `NotFoundException`);
+//! * an app Amplify DID mint is reached: `CreateBackend` creates its backend, and before
+//!   that backend exists the app's own resource reads answer the recorded
+//!   `ResourceNotFoundException` rather than the identity refusal.
 //!
 //! The gate's own table — every app-addressing operation × every form of unregistered app
 //! id, with the error envelope — is
@@ -137,22 +134,14 @@ async fn get_backend(router: &MultiServiceRouter, app_id: &str) -> Answer {
     .await
 }
 
-/// An app id AmplifyBackend holds no app record for is refused as invalid INPUT — 400
-/// with the code `ValidationException` and this service's error envelope — however
-/// well-formed it is, and whatever the Amplify control plane mounted beside it holds.
-#[tokio::test]
-async fn an_unregistered_app_id_is_refused_through_the_router() {
-    let router = router();
-
-    // An app Amplify minted. AmplifyBackend has no backend for it, so it does not decide
-    // any answer below — the row is here to show the refusals are not an artefact of an
-    // empty engine.
+/// Create an app through Amplify's own `CreateApp` and hand back the `appId` it minted.
+async fn create_amplify_app(router: &MultiServiceRouter, name: &str) -> String {
     let created = call(
-        &router,
+        router,
         AMPLIFY_HOST,
         "POST",
         "/apps",
-        Some(json!({ "name": "router-app" })),
+        Some(json!({ "name": name })),
     )
     .await;
     assert_eq!(
@@ -160,9 +149,35 @@ async fn an_unregistered_app_id_is_refused_through_the_router() {
         "seeding Amplify CreateApp expected 200, got {} {}",
         created.status, created.body
     );
+    let app_id = created
+        .body
+        .get("app")
+        .and_then(|app| app.get("appId"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !app_id.is_empty(),
+        "seeding Amplify CreateApp must report the id it minted, got {}",
+        created.body
+    );
+    app_id
+}
 
-    // (case, app id) — the rows differ in the FORM and SIZE of the id; none is a
-    // registered app of this service.
+/// An app id Amplify holds no app for is refused as invalid INPUT — 400 with the code
+/// `ValidationException` and this service's error envelope — however well-formed it is,
+/// and whatever else the Amplify control plane mounted beside it holds.
+#[tokio::test]
+async fn an_unregistered_app_id_is_refused_through_the_router() {
+    let router = router();
+
+    // An app Amplify minted. None of the ids below is it, so none of them decides any
+    // answer here — the row is what shows the refusals are not an artefact of an empty
+    // engine.
+    let minted = create_amplify_app(&router, "router-app").await;
+
+    // (case, app id) — the rows differ in the FORM and SIZE of the id; Amplify holds no
+    // app for any of them.
     let rows: Vec<(&str, String)> = vec![
         ("an id no app ever had", "d12440e142099".to_string()),
         ("the shortest id Amplify's pattern allows", "d0".to_string()),
@@ -170,6 +185,7 @@ async fn an_unregistered_app_id_is_refused_through_the_router() {
             "an id outside Amplify's pattern altogether",
             "not-an-app-id".to_string(),
         ),
+        ("one character past the minted id", format!("{minted}9")),
     ];
 
     for (case, app_id) in rows {
@@ -203,13 +219,37 @@ async fn an_unregistered_app_id_is_refused_through_the_router() {
     }
 }
 
-/// An app AmplifyBackend DOES hold reaches its own resources through the same router: the
-/// gate narrows nothing but the app id, and the app's own answer is computed from the
-/// record `CreateBackend` stored.
+/// An app AMPLIFY minted reaches its own resources through the same router: the gate
+/// narrows nothing but the app id, the reads of an app that has no backend YET answer the
+/// missing resource rather than the identity refusal, and `GetBackend`'s answer is
+/// computed from the record `CreateBackend` stored.
 #[tokio::test]
 async fn a_registered_app_reaches_its_backend_through_the_router() {
     let router = router();
-    let app_id = "d1ab2cd3ef4gh5";
+    let app_id = create_amplify_app(&router, "router").await;
+
+    // Before any backend exists for it, the app is NOT refused as a bad app id: the
+    // resource the request addresses is what is missing, which is the recorded
+    // `ResourceNotFoundException` for a resource read.
+    let before = call(
+        &router,
+        BACKEND_HOST,
+        "GET",
+        &format!("/backend/{app_id}/job/staging/999"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        before.status, 404,
+        "case \"app with no backend yet\": GetBackendJob expected 404, got {} {}",
+        before.status, before.body
+    );
+    assert_eq!(
+        before.code(),
+        "ResourceNotFoundException",
+        "case \"app with no backend yet\": expected code ResourceNotFoundException, got {}",
+        before.body
+    );
 
     let created = call(
         &router,
@@ -229,7 +269,7 @@ async fn a_registered_app_reaches_its_backend_through_the_router() {
         created.status, created.body
     );
 
-    let answer = get_backend(&router, app_id).await;
+    let answer = get_backend(&router, &app_id).await;
     assert_eq!(
         answer.status, 200,
         "case \"registered app\": GetBackend expected 200, got {} {}",
@@ -258,8 +298,8 @@ async fn a_registered_app_reaches_its_backend_through_the_router() {
         answer.body
     );
 
-    // A resource missing INSIDE the registered app is the modelled `NotFoundException`,
-    // not the identity refusal — the distinction the gate exists to make.
+    // A resource missing INSIDE the app is the not-found of that resource, not the
+    // identity refusal — the distinction the gate exists to make.
     let missing = call(
         &router,
         BACKEND_HOST,
@@ -275,13 +315,39 @@ async fn a_registered_app_reaches_its_backend_through_the_router() {
     );
     assert_eq!(
         missing.code(),
-        "NotFoundException",
-        "case \"missing environment\": expected code NotFoundException, got {}",
+        "ResourceNotFoundException",
+        "case \"missing environment\": expected code ResourceNotFoundException, got {}",
         missing.body
     );
     assert_eq!(
         missing.content_type, JSON_CONTENT_TYPE,
         "case \"missing environment\": expected content-type {JSON_CONTENT_TYPE:?}, got {:?}",
         missing.content_type
+    );
+
+    // And an id Amplify minted no app for is the missing APP on the create path: a
+    // backend is never created for an app that does not exist.
+    let unknown = call(
+        &router,
+        BACKEND_HOST,
+        "POST",
+        "/backend",
+        Some(json!({
+            "appId": format!("{app_id}9"),
+            "appName": "router",
+            "backendEnvironmentName": "staging",
+        })),
+    )
+    .await;
+    assert_eq!(
+        unknown.status, 404,
+        "case \"CreateBackend for an app Amplify never minted\": expected 404, got {} {}",
+        unknown.status, unknown.body
+    );
+    assert_eq!(
+        unknown.code(),
+        "NotFoundException",
+        "case \"CreateBackend for an app Amplify never minted\": expected code NotFoundException, got {}",
+        unknown.body
     );
 }

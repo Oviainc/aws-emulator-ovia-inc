@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A mutation of this service is asynchronous, so the job a call hands
                     // back is never already finished — the same status a recorded job
                     // starts in.
-                    status: Some(crate::state::JOB_STATUS_IN_PROGRESS.to_string()),
+                    status: Some(crate::state::JOB_STATUS_PENDING.to_string()),
                 },
             };
 

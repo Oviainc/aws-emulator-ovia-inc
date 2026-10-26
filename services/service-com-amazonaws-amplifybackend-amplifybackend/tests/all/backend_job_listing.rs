@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_amplifybackend_amplifybackend::state::{
-    JOB_COMPLETION_DELAY, JOB_STATUS_COMPLETED, JOB_STATUS_FAILED, JOB_STATUS_IN_PROGRESS,
-    OPERATION_CREATE_BACKEND, OPERATION_CREATE_BACKEND_AUTH, OPERATION_DELETE_BACKEND,
+    JOB_COMPLETION_DELAY, JOB_STATUS_COMPLETED, JOB_STATUS_FAILED, JOB_STATUS_PENDING,
+    JOB_STATUS_RUNNING, OPERATION_CREATE_BACKEND, OPERATION_CREATE_BACKEND_AUTH,
+    OPERATION_DELETE_BACKEND,
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -31,9 +32,17 @@ const HOST: &str = "amplifybackend.us-east-1.amazonaws.com";
 const MIN_MAX_RESULTS: i64 = 1;
 const MAX_MAX_RESULTS: i64 = 25;
 
-/// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+/// A router with just this service mounted on a fresh shared engine, with an Amplify app
+/// registered for every id in `app_ids`.
+///
+/// The Amplify app store is the registry `CreateBackend` settles an app's identity
+/// against, so a case that records a job for an app has to name one that exists there —
+/// see `crate::amplify_registry`.
+fn router_with_apps<S: AsRef<str>>(app_ids: &[S]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    for app_id in app_ids {
+        crate::amplify_registry::register_amplify_app(&engine, app_id.as_ref(), "listing");
+    }
     let mut router = MultiServiceRouter::new();
     // These tests exercise the service, not SigV4: requests carry no signature.
     router.set_request_authentication(false);
@@ -94,27 +103,15 @@ fn listed_ids(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// A minimal valid `CreateBackendAuthResourceConfig`, as the wire document. The enum
-/// values come from the model's own value lists (`AuthResources`, `Service`,
-/// `SignInMethod`, `RequiredSignUpAttributesElement` in `src/ops/types/shared_types.rs`).
-fn auth_config(user_pool_name: &str) -> Value {
-    json!({
-        "authResources": "USER_POOL_ONLY",
-        "service": "COGNITO",
-        "userPoolConfigs": {
-            "requiredSignUpAttributes": ["EMAIL"],
-            "signInMethod": "EMAIL",
-            "userPoolName": user_pool_name
-        }
-    })
-}
-
 /// One mutating AmplifyBackend operation this slice implements. Each one answers with a
 /// job record, which is what `ListBackendJobs` enumerates.
+///
+/// `CreateBackendAuth` is NOT one of them: AWS has withdrawn it from this channel, so it
+/// records no job (see `src/ops/create_backend_auth.rs`) — its operation name is used
+/// below as a filter value NO record carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seed {
     CreateBackend,
-    CreateBackendAuth,
     DeleteBackend,
 }
 
@@ -123,20 +120,17 @@ impl Seed {
     fn operation(self) -> &'static str {
         match self {
             Seed::CreateBackend => OPERATION_CREATE_BACKEND,
-            Seed::CreateBackendAuth => OPERATION_CREATE_BACKEND_AUTH,
             Seed::DeleteBackend => OPERATION_DELETE_BACKEND,
         }
     }
 }
 
 /// Run one seed call against `app_id`/`environment` and hand back the `JobId` it minted.
-/// `index` keeps the auth resource names distinct within one case.
 async fn seed(
     router: &MultiServiceRouter,
     label: &str,
     app_id: &str,
     environment: &str,
-    index: usize,
     step: Seed,
 ) -> String {
     let (method, path, body) = match step {
@@ -147,15 +141,6 @@ async fn seed(
                 "appId": app_id,
                 "appName": format!("{app_id}-app"),
                 "backendEnvironmentName": environment
-            }),
-        ),
-        Seed::CreateBackendAuth => (
-            "POST",
-            format!("/backend/{app_id}/auth"),
-            json!({
-                "backendEnvironmentName": environment,
-                "resourceName": format!("auth{index}"),
-                "resourceConfig": auth_config(&format!("pool{index}"))
             }),
         ),
         Seed::DeleteBackend => (
@@ -186,8 +171,8 @@ async fn seed_all(
     steps: &[Seed],
 ) -> Vec<String> {
     let mut ids = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        ids.push(seed(router, label, app_id, environment, index, *step).await);
+    for step in steps {
+        ids.push(seed(router, label, app_id, environment, *step).await);
     }
     ids
 }
@@ -233,7 +218,7 @@ struct Case {
 /// The listing cases. They differ along what the rule generalises over: HOW MANY records
 /// an environment has accumulated, WHICH operations recorded them (one kind, several
 /// kinds, the same kind repeated), the environment name, and whether the environment the
-/// jobs belong to still exists at listing time (the last case deletes it).
+/// jobs belong to still exists at listing time (the fourth case deletes it).
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -245,13 +230,13 @@ fn cases() -> Vec<Case> {
         Case {
             name: "two records, two operations",
             app_id: "dlist2",
-            environment: "integration",
-            steps: &[Seed::CreateBackend, Seed::CreateBackendAuth],
+            environment: "integ",
+            steps: &[Seed::CreateBackend, Seed::DeleteBackend],
         },
         Case {
             name: "the same operation repeated",
             app_id: "dlist3",
-            environment: "p",
+            environment: "pp",
             steps: &[
                 Seed::CreateBackend,
                 Seed::CreateBackend,
@@ -262,21 +247,17 @@ fn cases() -> Vec<Case> {
             name: "records of a deleted environment",
             app_id: "dlist4",
             environment: "ephemeral",
-            steps: &[
-                Seed::CreateBackend,
-                Seed::CreateBackendAuth,
-                Seed::DeleteBackend,
-            ],
+            steps: &[Seed::CreateBackend, Seed::DeleteBackend],
         },
         Case {
             name: "many records, interleaved operations",
             app_id: "dlist5",
-            environment: "dev-2",
+            environment: "devtwo",
             steps: &[
                 Seed::CreateBackend,
-                Seed::CreateBackendAuth,
+                Seed::DeleteBackend,
                 Seed::CreateBackend,
-                Seed::CreateBackendAuth,
+                Seed::DeleteBackend,
                 Seed::CreateBackend,
             ],
         },
@@ -289,18 +270,17 @@ fn cases() -> Vec<Case> {
 #[tokio::test]
 async fn a_listing_reports_every_recorded_job_newest_first() {
     for case in cases() {
-        let router = router();
+        let router = router_with_apps(&[case.app_id]);
         let label = case.name;
         let seeded = seed_all(&router, label, case.app_id, case.environment, case.steps).await;
 
-        // The job just minted is still transient: a caller listing straight after the
-        // mutating call observes it IN_PROGRESS, and it is reported FIRST.
+        // The job just minted is still in flight: a caller listing straight after the
+        // mutating call observes it PENDING or RUNNING, and it is reported FIRST.
         let body = list(&router, label, case.app_id, case.environment, json!({})).await;
         let first = listed(&body).first().cloned().unwrap_or(Value::Null);
-        assert_eq!(
-            field(&first, "status"),
-            JOB_STATUS_IN_PROGRESS,
-            "case {label:?}: the newest record is still in progress, got {first}"
+        assert!(
+            [JOB_STATUS_PENDING, JOB_STATUS_RUNNING].contains(&field(&first, "status")),
+            "case {label:?}: the newest record is still in flight, got {first}"
         );
 
         settle().await;
@@ -375,13 +355,13 @@ async fn a_listing_reports_every_recorded_job_newest_first() {
 /// listing does not change what a later reader sees.
 #[tokio::test]
 async fn listing_twice_reports_the_same_records() {
-    let router = router();
+    let router = router_with_apps(&["drepeat"]);
     let seeded = seed_all(
         &router,
         "repeat",
         "drepeat",
         "staging",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     settle().await;
@@ -411,28 +391,41 @@ async fn listing_twice_reports_the_same_records() {
 /// nothing answers an EMPTY list, never a refusal and never the unfiltered set.
 #[tokio::test]
 async fn the_filters_narrow_the_reported_records() {
-    let router = router();
+    let router = router_with_apps(&["dfilter"]);
     let label = "filters";
     // Two records are seeded and allowed to settle, so a third seeded afterwards is the
-    // only one still in progress: the `Status` rows below then span both states.
+    // only one still in flight: the `Status` rows below then span both states.
     let settled = seed_all(
         &router,
         label,
         "dfilter",
         "staging",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     settle().await;
-    let in_progress = seed(&router, label, "dfilter", "staging", 9, Seed::CreateBackend).await;
+    let in_flight = seed(&router, label, "dfilter", "staging", Seed::CreateBackend).await;
 
-    let (create_backend_job, create_auth_job) = (settled[0].clone(), settled[1].clone());
-    // Newest first: the in-progress record, then the auth record, then the first create.
+    let (create_backend_job, delete_backend_job) = (settled[0].clone(), settled[1].clone());
+    // Newest first: the in-flight record, then the delete record, then the first create.
     let all = vec![
-        in_progress.clone(),
-        create_auth_job.clone(),
+        in_flight.clone(),
+        delete_backend_job.clone(),
         create_backend_job.clone(),
     ];
+
+    // Which in-flight status the newest record reports depends on how far the clock has
+    // moved since it was recorded, so the status rows below assert the PARTITION the
+    // filter makes rather than naming the phase the record is in.
+    let unfiltered = list(&router, label, "dfilter", "staging", json!({})).await;
+    let in_flight_status = listed(&unfiltered)
+        .first()
+        .map(|record| field(record, "status").to_string())
+        .unwrap_or_default();
+    assert!(
+        [JOB_STATUS_PENDING, JOB_STATUS_RUNNING].contains(&in_flight_status.as_str()),
+        "case \"the newest record\": a job that has not settled reports an in-flight status, got {in_flight_status:?}"
+    );
 
     // Each row is a filter document and the job ids it must report, newest first.
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
@@ -444,8 +437,8 @@ async fn the_filters_narrow_the_reported_records() {
         ),
         (
             "jobId of the newest record",
-            json!({ "jobId": in_progress }),
-            vec![in_progress.clone()],
+            json!({ "jobId": in_flight }),
+            vec![in_flight.clone()],
         ),
         (
             "jobId no record carries",
@@ -455,27 +448,17 @@ async fn the_filters_narrow_the_reported_records() {
         (
             "operation CreateBackend",
             json!({ "operation": OPERATION_CREATE_BACKEND }),
-            vec![in_progress.clone(), create_backend_job.clone()],
+            vec![in_flight.clone(), create_backend_job.clone()],
         ),
         (
-            "operation CreateBackendAuth",
-            json!({ "operation": OPERATION_CREATE_BACKEND_AUTH }),
-            vec![create_auth_job.clone()],
+            "operation DeleteBackend",
+            json!({ "operation": OPERATION_DELETE_BACKEND }),
+            vec![delete_backend_job.clone()],
         ),
         (
             "operation no record carries",
-            json!({ "operation": OPERATION_DELETE_BACKEND }),
+            json!({ "operation": OPERATION_CREATE_BACKEND_AUTH }),
             Vec::new(),
-        ),
-        (
-            "status COMPLETED",
-            json!({ "status": JOB_STATUS_COMPLETED }),
-            vec![create_auth_job.clone(), create_backend_job.clone()],
-        ),
-        (
-            "status IN_PROGRESS",
-            json!({ "status": JOB_STATUS_IN_PROGRESS }),
-            vec![in_progress.clone()],
         ),
         (
             "status no record carries",
@@ -484,12 +467,12 @@ async fn the_filters_narrow_the_reported_records() {
         ),
         (
             "operation and status together",
-            json!({ "operation": OPERATION_CREATE_BACKEND, "status": JOB_STATUS_COMPLETED }),
-            vec![create_backend_job.clone()],
+            json!({ "operation": OPERATION_DELETE_BACKEND, "status": JOB_STATUS_COMPLETED }),
+            vec![delete_backend_job.clone()],
         ),
         (
             "a jobId that the status filter excludes",
-            json!({ "jobId": in_progress, "status": JOB_STATUS_COMPLETED }),
+            json!({ "jobId": create_backend_job, "status": JOB_STATUS_FAILED }),
             Vec::new(),
         ),
     ];
@@ -502,13 +485,57 @@ async fn the_filters_narrow_the_reported_records() {
             "case {row:?} ({request}): expected {expected:?}, got {body}"
         );
     }
+
+    // The `Status` filter PARTITIONS the records: every record a status row reports
+    // carries that status, the two records that have settled are reported for COMPLETED,
+    // and the record still in flight is reported by exactly ONE status — whichever phase
+    // the clock has moved it to by then, which is why these rows read the partition rather
+    // than naming the phase.
+    let mut in_flight_hits = 0usize;
+    for status in [
+        JOB_STATUS_PENDING,
+        JOB_STATUS_RUNNING,
+        JOB_STATUS_COMPLETED,
+    ] {
+        let body = list(
+            &router,
+            status,
+            "dfilter",
+            "staging",
+            json!({ "status": status }),
+        )
+        .await;
+        for record in listed(&body) {
+            assert_eq!(
+                field(&record, "status"),
+                status,
+                "case {status:?}: every record reported for a status carries it, got {record}"
+            );
+        }
+        let reported = listed_ids(&body);
+        if status == JOB_STATUS_COMPLETED {
+            for settled_id in [&create_backend_job, &delete_backend_job] {
+                assert!(
+                    reported.contains(settled_id),
+                    "case {status:?}: a record that has settled is reported, got {reported:?}"
+                );
+            }
+        }
+        if reported.contains(&in_flight) {
+            in_flight_hits += 1;
+        }
+    }
+    assert_eq!(
+        in_flight_hits, 1,
+        "the record in flight is reported by exactly one status filter, got {in_flight_hits}"
+    );
 }
 
 /// Jobs are addressed within one (app, environment): a listing reports only the records
 /// of the environment it names, and only of the app it names.
 #[tokio::test]
 async fn a_listing_is_scoped_to_its_app_and_environment() {
-    let router = router();
+    let router = router_with_apps(&["dscopea", "dscopeb"]);
     let label = "scope";
     let one = seed_all(&router, label, "dscopea", "one", &[Seed::CreateBackend]).await;
     let two = seed_all(
@@ -516,7 +543,7 @@ async fn a_listing_is_scoped_to_its_app_and_environment() {
         label,
         "dscopea",
         "two",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     let other_app = seed_all(&router, label, "dscopeb", "one", &[Seed::CreateBackend]).await;
@@ -555,7 +582,7 @@ async fn paging_walks_every_record_exactly_once() {
     // The published bounds of `MaxResults` (1 and 25) and sizes between them: a size
     // smaller than the record count, one equal to it, and ones larger.
     for page_size in [MIN_MAX_RESULTS, 2, 3, total as i64, MAX_MAX_RESULTS] {
-        let router = router();
+        let router = router_with_apps(&["dpage"]);
         let label = "paging";
         let steps = vec![Seed::CreateBackend; total];
         let seeded = seed_all(&router, label, "dpage", "staging", &steps).await;
@@ -615,7 +642,7 @@ async fn paging_walks_every_record_exactly_once() {
 /// step past each published bound.
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
-    let router = router();
+    let router = router_with_apps(&["drange"]);
     let _ = seed_all(&router, "range", "drange", "staging", &[Seed::CreateBackend]).await;
 
     for value in [MIN_MAX_RESULTS - 1, MAX_MAX_RESULTS + 1] {
@@ -651,14 +678,14 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 /// the modelled `BadRequestException`, never served by silently restarting the walk.
 #[tokio::test]
 async fn a_next_token_it_did_not_issue_is_refused() {
-    let router = router();
+    let router = router_with_apps(&["dtoka", "dtokb"]);
     let label = "tokens";
     seed_all(
         &router,
         label,
         "dtoka",
         "one",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     seed_all(
@@ -666,7 +693,7 @@ async fn a_next_token_it_did_not_issue_is_refused() {
         label,
         "dtoka",
         "two",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     seed_all(
@@ -674,7 +701,7 @@ async fn a_next_token_it_did_not_issue_is_refused() {
         label,
         "dtokb",
         "one",
-        &[Seed::CreateBackend, Seed::CreateBackendAuth],
+        &[Seed::CreateBackend, Seed::DeleteBackend],
     )
     .await;
     settle().await;
@@ -748,13 +775,13 @@ async fn a_next_token_it_did_not_issue_is_refused() {
     }
 }
 
-/// Listing the jobs of an app this service holds no app record for is the app-identity
+/// Listing the jobs of an app no Amplify app record exists for is the app-identity
 /// refusal — HTTP 400 with the error code `ValidationException`, not a missing resource
 /// and not an empty 200. The whole gate, over every app-addressing operation, is
 /// `app_registration_gate.rs`.
 #[tokio::test]
 async fn listing_an_unregistered_app_is_a_validation_exception() {
-    let router = router();
+    let router = router_with_apps(&["dknownapp"]);
     let (status, body) = call(
         &router,
         "POST",

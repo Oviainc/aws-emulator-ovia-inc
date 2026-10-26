@@ -24,6 +24,8 @@ use crate::ops::types::{
     TooManyRequestsException,
 };
 
+/// `NotFoundException::ResourceType` for an `AppId` that identifies no Amplify app.
+pub const RESOURCE_TYPE_APP: &str = "app";
 /// `NotFoundException::ResourceType` for an app no backend was ever created for.
 pub const RESOURCE_TYPE_BACKEND: &str = "backend";
 /// `NotFoundException::ResourceType` for a backend environment that does not exist.
@@ -34,24 +36,95 @@ pub const RESOURCE_TYPE_BACKEND_AUTH: &str = "backend-auth";
 /// The modelled `NotFoundException` payload for a resource that does not exist.
 ///
 /// `resource_type` names the KIND of resource the lookup failed on (the
-/// `RESOURCE_TYPE_*` constants above); the message says which one was asked for, built
-/// from the request so the caller can see what it addressed.
-pub fn not_found(resource_type: &str, message: impl Into<String>) -> NotFoundException {
+/// `RESOURCE_TYPE_*` constants above); `sentence` is the service's own sentence, WITHOUT
+/// the prefix, which this function adds — so every message this service renders carries
+/// [`ERROR_MESSAGE_PREFIX`] and no call site can forget it.
+pub fn not_found(resource_type: &str, sentence: impl AsRef<str>) -> NotFoundException {
     NotFoundException {
-        message: Some(message.into()),
+        message: Some(format!("{ERROR_MESSAGE_PREFIX}{}", sentence.as_ref())),
         resource_type: Some(resource_type.to_string()),
     }
 }
 
-/// The fixed prefix AmplifyBackend puts in front of the app-identity refusal's message.
+/// The fixed prefix AmplifyBackend puts in front of EVERY error message it renders.
 ///
-/// Recorded behaviour, not modelled: the refusal for an unregistered app id reads
-/// "An error occurred while processing your request: Invalid appId passed.", so this
-/// prefix plus an appId-invalid sentence is the requirement for THAT message. It is not
-/// claimed for the others: no recording fixes the text of this service's per-resource or
-/// bound refusals ([`not_found`], [`limit_exceeded`], [`bound_identifier`]), so each of
-/// those says what was asked for, built from the request, and none is prefixed here.
+/// Recorded behaviour, not modelled: each recorded AmplifyBackend failure reads
+/// "An error occurred while processing your request: " followed by the service's own
+/// sentence, whatever the error code — "Invalid appId passed.", "App <appId> not found.",
+/// "BackendEnvironment <name> does not exist." — and where that sentence names a resource
+/// it names it from the request. The prefix is therefore applied by the message builders
+/// themselves ([`not_found`], [`resource_not_found`], [`limit_exceeded`],
+/// [`bound_identifier`], and the fixed-message refusals below), so a handler passes the
+/// SENTENCE and never the whole message.
 pub const ERROR_MESSAGE_PREFIX: &str = "An error occurred while processing your request: ";
+
+/// The sentence a lookup of a backend environment that does not exist answers with:
+/// recorded behaviour, naming the environment from the request.
+///
+/// One sentence for "never created" and "already removed" alike — the service does not
+/// distinguish them, and neither does the caller's address.
+pub fn environment_missing_sentence(environment_name: &str) -> String {
+    format!("BackendEnvironment {environment_name} does not exist.")
+}
+
+/// The sentence an auth-resource read that does not resolve answers with: recorded
+/// behaviour, naming nothing from the request for the same reason as
+/// [`UNRESOLVABLE_JOB_SENTENCE`].
+pub const AUTH_MISSING_SENTENCE: &str = "Amplify auth parameters file not found.";
+
+/// The longest and shortest a `BackendEnvironmentName` this service will CREATE may be,
+/// and the alphabet it is drawn from.
+///
+/// Recorded behaviour, not modelled: `CreateBackend$BackendEnvironmentName` targets a
+/// bare `__string` with no `@length` and no `@pattern`, and the operation models no
+/// client-input error for it, but the recorded service refuses a name outside 2-10
+/// lowercase letters with HTTP 400 and the error code `ValidationException`. The bound is
+/// on the name a create brings into being; a name a request merely ADDRESSES is not
+/// checked against it (a read of an environment outside the form answers the same
+/// not-found as any other environment that does not exist).
+pub const ENVIRONMENT_NAME_MIN_CHARS: usize = 2;
+/// See [`ENVIRONMENT_NAME_MIN_CHARS`].
+pub const ENVIRONMENT_NAME_MAX_CHARS: usize = 10;
+
+/// Whether `name` is a backend environment name this service may create: between
+/// [`ENVIRONMENT_NAME_MIN_CHARS`] and [`ENVIRONMENT_NAME_MAX_CHARS`] characters, every one
+/// of them a lowercase letter.
+pub fn environment_name_is_valid(name: &str) -> bool {
+    let characters = name.chars().count();
+    (ENVIRONMENT_NAME_MIN_CHARS..=ENVIRONMENT_NAME_MAX_CHARS).contains(&characters)
+        && name.chars().all(|character| character.is_ascii_lowercase())
+}
+
+/// The message a `BackendEnvironmentName` outside the form is refused with: the fixed
+/// prefix plus the sentence that states the rule it broke.
+///
+/// The sentence states the RULE and quotes nothing back: it is the same text for every
+/// name that breaks it, which is what the recording shows.
+pub fn environment_name_message() -> String {
+    format!(
+        "{ERROR_MESSAGE_PREFIX}Environment name must be between \
+         {ENVIRONMENT_NAME_MIN_CHARS} and {ENVIRONMENT_NAME_MAX_CHARS} characters, \
+         and lowercase only."
+    )
+}
+
+/// Refuse the request unless `name` is a backend environment name this service may create
+/// ([`environment_name_is_valid`]): HTTP 400 with the error code `ValidationException`,
+/// which the model does not declare, so it is raised through the crate's own
+/// [`crate::scaffolded::Scaffolded::validation`] channel — the same channel every other
+/// recorded client-input refusal of this service uses.
+///
+/// Generic over the operation's modelled error enum, so one rule serves every operation
+/// that creates an environment and cannot be worded two ways.
+pub fn require_environment_name<E>(name: &str) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if environment_name_is_valid(name) {
+        Ok(())
+    } else {
+        Err(crate::scaffolded::Scaffolded::validation(
+            environment_name_message(),
+        ))
+    }
+}
 
 /// The message a request whose `AppId` identifies no registered Amplify app is refused
 /// with: [`ERROR_MESSAGE_PREFIX`] plus the sentence that says the app id is the problem.
@@ -61,6 +134,33 @@ pub const ERROR_MESSAGE_PREFIX: &str = "An error occurred while processing your 
 /// unregistered app id.
 pub fn invalid_app_id_message() -> String {
     format!("{ERROR_MESSAGE_PREFIX}Invalid appId passed.")
+}
+
+/// The message an operation AWS has withdrawn from SDK and AWS CLI callers IN FAVOUR OF
+/// THE AMPLIFY CLI answers with: [`ERROR_MESSAGE_PREFIX`], the same "not supported
+/// through SDK/AWS CLI" sentence as [`studio_only_message`], and then the Amplify CLI
+/// command sequence that does the same work.
+///
+/// Recorded behaviour, not modelled: the refusal is input-independent down to its TEXT.
+/// The recordings show the identical message for a `TargetEnvironmentName` that is free
+/// and for one already in use, and the service's own command hint is fixed text — the
+/// `<appId>` placeholder and the sample environment name are the words AWS puts in it, not
+/// values read from the request, so nothing here is built from the request either. The
+/// status (400) and the error code (`ValidationException`) come from the same recordings.
+pub fn amplify_cli_only_message() -> String {
+    format!(
+        "{ERROR_MESSAGE_PREFIX}Operation not supported through SDK/AWS CLI. \
+         Please use \"amplify pull --appId <appId> --envName staging \
+         && amplify add env && amplify push\" from Amplify CLI"
+    )
+}
+
+/// Refuse an operation AWS serves only through the Amplify CLI, with
+/// [`amplify_cli_only_message`]. As [`studio_only`], the refusal is the operation's WHOLE
+/// behaviour: it is answered before the request is read or any state is touched, so the
+/// call is deterministic in the operation alone and leaves nothing behind.
+pub fn amplify_cli_only<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::validation(amplify_cli_only_message())
 }
 
 /// The message every AmplifyBackend operation AWS has WITHDRAWN from SDK and AWS CLI
@@ -139,70 +239,89 @@ pub fn job_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
     resource_not_found(UNRESOLVABLE_JOB_SENTENCE)
 }
 
-/// Whether `app_id` identifies an Amplify app this emulator has registered.
+/// Whether `app_id` identifies an Amplify app that EXISTS.
 ///
-/// The registry is this service's own `apps` map: `CreateBackend` is the one operation in
-/// this crate that brings an app record into being, and every other operation that
-/// addresses an app answers from that same record, so an id the map does not hold is an
-/// id this emulator knows no app by.
+/// The registry is the Amplify service's own app store, read through the one shared
+/// engine: an `AppId` is minted by Amplify's `CreateApp` and by nothing else, so that
+/// store is the only place that knows whether an app exists. This crate keeps no second
+/// copy of it — an app created or deleted over the Amplify API decides this answer with no
+/// propagation step — and it is the same one-directional cross-service read
+/// `ListS3Buckets` performs for S3's buckets.
 ///
-/// It is deliberately a registry LOOKUP and not "does this resource exist": the two
-/// answers differ, which is the whole point of the gate. An app id the map does not hold
-/// is refused as invalid INPUT (see [`require_registered_app`]), while a resource missing
-/// INSIDE a registered app is answered as the missing resource it is — the modelled
-/// `NotFoundException` for an environment or an auth resource, the recorded
-/// `ResourceNotFoundException` ([`resource_not_found`]) for the reads that answer it, and
-/// `IsSuccess: true` on `DeleteToken`, which validates nothing but the app.
+/// It is deliberately an app-identity LOOKUP and not "does this resource exist": the two
+/// answers differ, which is the whole point of the gate. An app id Amplify holds no app
+/// for is refused as invalid INPUT (see [`require_registered_app`]) or as the missing app
+/// it is (see [`require_existing_app`]), while a resource missing INSIDE an app that does
+/// exist is answered as the missing resource it is — the modelled `NotFoundException` for
+/// an environment, the recorded `ResourceNotFoundException` ([`resource_not_found`]) for
+/// the reads that answer it, and `IsSuccess: true` on `DeleteToken`, which validates
+/// nothing but the app. An app Amplify holds that has no backend here therefore reaches
+/// its own per-resource answers rather than the identity refusal.
 ///
 /// A JOB READ is not gated at all: its whole address is state, so it answers one
 /// job-absent refusal ([`job_not_found`]) whichever part of it does not resolve.
 ///
-/// What it is NOT, and the one known gap: an `AppId` is minted by Amplify's `CreateApp`,
-/// so the authoritative registry is the Amplify service's app store, and an app that
-/// exists there but has no backend here is refused by this gate where the real service
-/// would answer about the resource. That store is reachable —
-/// [`amplify_console_app_exists`] reads it, the way `ListS3Buckets` reads S3's buckets, and
-/// `RemoveAllBackends` resolves its app against it — but WHICH refusal each operation owes
-/// for an app of that kind is what the recordings decide one operation at a time, and for
-/// the operations gated here they show this refusal. Widening the gate itself is what the
-/// open app-identity issue for `CreateBackend`
-/// (`20261022T052247Z-amplifybackend-control-plane-7-fidelity-divergences-no-environment`,
-/// Cause 2) has to settle — it decides whether `CreateBackend` may register an app at
-/// all. This function is the single place that answers the question, so widening it to a
-/// second registry changes nothing else in the crate.
+/// `false` when that store is unreachable as well (the engine is not the shared in-memory
+/// one), which no caller can observe: every handler resolves its own [`service_state`] and
+/// answers the modelled `GatewayTimeoutException` BEFORE running the gate.
 ///
-/// `false` when the store is unreachable as well, which no caller can observe: every
-/// handler resolves its own [`service_state`] and answers the modelled
-/// `GatewayTimeoutException` BEFORE running the gate.
+/// The one question it does NOT answer is whether THIS service holds a backend record for
+/// the app: that is [`backend_record_exists`], which only an operation addressing the
+/// Amplify project rather than a backend resource has reason to ask (see
+/// [`require_known_app`]).
 ///
-/// LOCK ORDER: the store's lock is taken and released here, and this is called with NO
-/// store guard held, so it cannot be part of a lock cycle.
+/// LOCK ORDER: the Amplify store's lock is taken and released here, and this is called
+/// with NO guard of this service's store held, so the cross-service read stays
+/// one-directional and cannot be part of a lock cycle.
 pub fn app_is_registered<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
-    service_state(engine).is_some_and(|state| state.lock().apps.contains_key(app_id))
-}
-
-/// Whether the Amplify control plane holds an app under `app_id`, read from Amplify's own
-/// store through the one shared engine.
-///
-/// The authoritative registry for an `AppId` is Amplify's `CreateApp`, not this service:
-/// an Amplify project can exist with no backend here at all. An operation that addresses
-/// the PROJECT — `RemoveAllBackends`, which removes the project's backend environments and,
-/// when asked, the Console app itself — therefore resolves the app against this registry as
-/// well as [`app_is_registered`], which answers the narrower question of whether this
-/// service holds a backend record (and is what the operations whose recordings show the
-/// 400 `ValidationException` refusal use).
-///
-/// `false` when Amplify's store is unreachable (the engine is not the shared in-memory
-/// one), which is the same answer as "no such app": nothing is assumed about an app this
-/// emulator cannot see.
-///
-/// LOCK ORDER: this takes Amplify's store lock and holds no other while it does, and it
-/// hands back an owned value rather than a guard — so it is called with NO store guard of
-/// this service held. Keeping the cross-service access one-directional and guard-free is
-/// what makes a lock cycle between the two stores unreachable.
-pub fn amplify_console_app_exists<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
     ::service_com_amazonaws_amplify_amplify::state::service_state(engine)
         .is_some_and(|state| state.lock().apps.contains_key(app_id))
+}
+
+/// The modelled `NotFoundException` payload for an `AppId` that identifies no Amplify app.
+///
+/// Recorded behaviour, not modelled: the create path answers HTTP 404 with the modelled
+/// `NotFoundException` and the sentence that names the app id the request carried — the
+/// request asked for work on an app that does not exist, so the app is the missing
+/// resource.
+pub fn app_not_found(app_id: &str) -> NotFoundException {
+    not_found(RESOURCE_TYPE_APP, format!("App {app_id} not found."))
+}
+
+/// Refuse the request unless `app_id` identifies an app Amplify holds
+/// ([`app_is_registered`]), with the modelled `NotFoundException` ([`app_not_found`]).
+///
+/// The app-identity gate for an operation that CREATES this service's state for an app:
+/// app identity is settled before any environment work, so a mistyped or deleted app id
+/// can never bring a backend of its own into being. The refusal `Err` carries is the
+/// modelled payload, which the caller lifts into its own error channel.
+pub fn require_existing_app<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    app_id: &str,
+) -> Result<(), NotFoundException> {
+    if app_is_registered(engine, app_id) {
+        Ok(())
+    } else {
+        Err(app_not_found(app_id))
+    }
+}
+
+/// Whether THIS service holds a backend record for `app_id` — the narrower question
+/// [`app_is_registered`] does not answer.
+///
+/// `CreateBackend` is the one operation that brings such a record into being, and it only
+/// does so for an app Amplify holds, so this is "the app has a backend here" and not "the
+/// app exists": the two differ for an app whose Amplify record was deleted after its
+/// backend was created, which is the case [`require_known_app`] keeps serving.
+///
+/// `false` when this service's own store is unreachable, which no caller can observe: every
+/// handler resolves [`service_state`] and answers the modelled `GatewayTimeoutException`
+/// first.
+///
+/// LOCK ORDER: this service's lock only, taken and released here, with no other guard
+/// held.
+pub fn backend_record_exists<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
+    service_state(engine).is_some_and(|state| state.lock().apps.contains_key(app_id))
 }
 
 /// Clean up the Amplify Console app `app_id` identifies, answering whether one was held.
@@ -214,7 +333,7 @@ pub fn amplify_console_app_exists<Eng: Send + Sync + 'static>(engine: &Eng, app_
 /// than from a second copy of it kept here. Nothing is created: an app Amplify does not
 /// hold leaves this a no-op.
 ///
-/// LOCK ORDER: as [`amplify_console_app_exists`] — Amplify's lock only, no guard of this
+/// LOCK ORDER: as [`app_is_registered`] — Amplify's lock only, no guard of this
 /// service held.
 pub fn remove_amplify_console_app<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
     let Some(state) = ::service_com_amazonaws_amplify_amplify::state::service_state(engine) else {
@@ -247,10 +366,10 @@ pub fn remove_amplify_console_app<Eng: Send + Sync + 'static>(engine: &Eng, app_
 /// `Scaffolded<{Op}ErrorModeled>`, so one gate serves them all and cannot word the same
 /// refusal two ways.
 ///
-/// The gate is only as strong as the registry it reads: `CreateBackend` writes this
-/// service's `apps` map without consulting Amplify, so a caller can still bring an app id
-/// into being that Amplify never minted and then pass this gate with it — see
-/// [`app_is_registered`] for that gap and the issue that owns it.
+/// NOT the gate a CREATE runs: the recorded refusal of an operation that creates state for
+/// an app is the modelled 404 `NotFoundException` naming the app (see
+/// [`require_existing_app`]), while the operations that address an app's EXISTING
+/// resources answer this 400. Both read the same registry; only the answer differs.
 pub fn require_registered_app<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     app_id: &str,
@@ -265,14 +384,14 @@ pub fn require_registered_app<Eng: Send + Sync + 'static, E>(
 }
 
 /// Refuse the request unless `app_id` identifies an app EITHER registry knows: the Amplify
-/// control plane's app store, which is what mints an `AppId`, or this service's own backend
-/// records.
+/// control plane's app store, which is what mints an `AppId` ([`app_is_registered`]), or a
+/// backend record this service still holds for it ([`backend_record_exists`]).
 ///
 /// The gate for an operation that addresses the Amplify PROJECT rather than one of this
 /// service's resources — `RemoveAllBackends`, which removes the project's backend
-/// environments and, when asked, the Console app itself. A project can exist with no
-/// backend here, and such a call has something to answer about it, so the narrower
-/// [`require_registered_app`] would refuse a request the real service serves.
+/// environments and, when asked, the Console app itself. The second registry is what keeps
+/// such a call serving a project whose Amplify record is already gone while its backend
+/// records are not, which [`require_registered_app`] refuses.
 ///
 /// The REFUSAL is the same one: an app id neither registry holds is answered HTTP 400 with
 /// the error code `ValidationException` and [`invalid_app_id_message`], which is what the
@@ -285,7 +404,7 @@ pub fn require_known_app<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     app_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if amplify_console_app_exists(engine, app_id) || app_is_registered(engine, app_id) {
+    if app_is_registered(engine, app_id) || backend_record_exists(engine, app_id) {
         Ok(())
     } else {
         Err(crate::scaffolded::Scaffolded::validation(
@@ -303,8 +422,22 @@ pub fn store_unavailable() -> GatewayTimeoutException {
     }
 }
 
-/// A job the service has accepted but whose work is not yet due.
-pub const JOB_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+// ---------------------------------------------------------------------------
+// Job status vocabulary
+//
+// Recorded behaviour, not modelled: `GetBackendJob$Status` is a bare `__string`, and the
+// recorded service reports a job that is accepted but not finished as PENDING and then
+// RUNNING, and a finished one as COMPLETED, or FAILED when it carries an `Error`. The
+// values are what a client's own state machine branches on — "keep polling while the
+// status is PENDING or RUNNING" — so an in-flight value outside this vocabulary reads as
+// terminal to the caller.
+// ---------------------------------------------------------------------------
+
+/// A job the service has accepted and not started yet.
+pub const JOB_STATUS_PENDING: &str = "PENDING";
+
+/// A job whose work has started and is not finished.
+pub const JOB_STATUS_RUNNING: &str = "RUNNING";
 
 /// A job whose work the clock has made due.
 pub const JOB_STATUS_COMPLETED: &str = "COMPLETED";
@@ -312,13 +445,23 @@ pub const JOB_STATUS_COMPLETED: &str = "COMPLETED";
 /// A job that ended with an `Error`.
 pub const JOB_STATUS_FAILED: &str = "FAILED";
 
-/// How long a freshly recorded job stays [`JOB_STATUS_IN_PROGRESS`].
+/// How long a freshly recorded job stays [`JOB_STATUS_PENDING`] before it reports
+/// [`JOB_STATUS_RUNNING`].
+///
+/// AWS documents no duration for either phase, so this span is CHOSEN: long enough that a
+/// caller reading straight after the call still observes the job in the status the call
+/// itself reported, short enough that the whole job settles inside
+/// [`JOB_COMPLETION_DELAY`].
+pub const JOB_START_DELAY: Duration = Duration::from_millis(250);
+
+/// How long a freshly recorded job stays unfinished ([`JOB_STATUS_PENDING`], then
+/// [`JOB_STATUS_RUNNING`]) before it reports [`JOB_STATUS_COMPLETED`].
 ///
 /// AmplifyBackend mutations are asynchronous — that is why each one answers with a
 /// `JobId` and why `GetBackendJob` exists — so a job is never already finished when
 /// its own call returns. AWS documents no duration for the work, so this span is
 /// CHOSEN: long enough that a caller polling straight after the call still observes
-/// the transient status, short enough that a test need not wait long for completion.
+/// the transient statuses, short enough that a test need not wait long for completion.
 pub const JOB_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
 /// How many job records one app retains.
@@ -362,6 +505,12 @@ pub const MAX_ENVIRONMENTS_PER_APP: usize = 50;
 
 /// Emulator resource guard, NOT an AWS quota: the most auth resources one backend
 /// environment may hold at once.
+///
+/// Not reached on this channel today: `CreateBackendAuth` is withdrawn from SDK and AWS
+/// CLI callers (see `src/ops/create_backend_auth.rs`) and the importing and updating
+/// siblings are still scaffolded, so nothing writes [`BackendEnvironment::auth`] and
+/// `GetBackendAuth` answers the recorded not-found. The bound stays beside the map it
+/// guards, for whichever operation writes it next.
 pub const MAX_AUTH_RESOURCES_PER_ENVIRONMENT: usize = 25;
 
 /// Emulator resource guard, NOT an AWS quota: the most API resources one backend
@@ -398,17 +547,20 @@ pub const LIMIT_TYPE_CHALLENGE_TOKENS: &str = "challenge-tokens-per-app";
 
 /// The modelled `TooManyRequestsException` for a request that would grow a store past
 /// its cap — "An error that is returned when a limit of a specific type has been
-/// exceeded". `limit_type` names WHICH limit, as the modelled member asks; the message is
-/// built from the bound so the caller can see what it hit.
-pub fn limit_exceeded(limit_type: &str, message: impl Into<String>) -> TooManyRequestsException {
+/// exceeded". `limit_type` names WHICH limit, as the modelled member asks; `sentence` is
+/// this emulator's own sentence, built from the bound so the caller can see what it hit,
+/// and this function puts the service's fixed [`ERROR_MESSAGE_PREFIX`] in front of it.
+pub fn limit_exceeded(limit_type: &str, sentence: impl AsRef<str>) -> TooManyRequestsException {
     TooManyRequestsException {
         limit_type: Some(limit_type.to_string()),
-        message: Some(message.into()),
+        message: Some(format!("{ERROR_MESSAGE_PREFIX}{}", sentence.as_ref())),
     }
 }
 
 /// Refuse an identifier longer than [`MAX_IDENTIFIER_CHARS`], naming the member and the
-/// bound it broke so the caller can fix the request from the message alone.
+/// bound it broke so the caller can fix the request from the message alone — behind the
+/// service's fixed [`ERROR_MESSAGE_PREFIX`], like every other message this service
+/// renders.
 ///
 /// `Err` carries the modelled `BadRequestException` payload: an over-long identifier is a
 /// request that is "not formed properly", which is what that error says.
@@ -417,7 +569,8 @@ pub fn bound_identifier(member: &str, value: &str) -> Result<(), BadRequestExcep
     if chars > MAX_IDENTIFIER_CHARS {
         return Err(BadRequestException {
             message: Some(format!(
-                "{member} may be at most {MAX_IDENTIFIER_CHARS} characters, got {chars}"
+                "{ERROR_MESSAGE_PREFIX}{member} may be at most {MAX_IDENTIFIER_CHARS} \
+                 characters, got {chars}."
             )),
         });
     }
@@ -633,7 +786,12 @@ impl ComAmazonawsAmplifybackendAmplifybackendState {
 
     /// The app `app_id` names, created with `app_name` when absent. `CreateBackend` is
     /// the only operation that may bring an app record into being — every other one
-    /// answers `NotFoundException` for an app that was never created.
+    /// answers for an app that has no backend record as the missing resource it is.
+    ///
+    /// The record is this service's BACKEND record for the app, not the app itself: the
+    /// app's existence is settled against Amplify's registry before this is reached
+    /// ([`require_existing_app`]), so a record here is only ever created for an app that
+    /// exists.
     pub fn app_or_create(&mut self, app_id: &str, app_name: &str) -> &mut BackendApp {
         let app = self
             .apps
@@ -854,9 +1012,10 @@ impl BackendApp {
     }
 
     /// Record a job for `operation` against `environment_name`, minting and STORING its
-    /// id, and hand back the stored record. The job starts
-    /// [`JOB_STATUS_IN_PROGRESS`] and becomes [`JOB_STATUS_COMPLETED`] once
-    /// [`JOB_COMPLETION_DELAY`] has passed (see [`BackendJob::settle`]).
+    /// id, and hand back the stored record. The job starts [`JOB_STATUS_PENDING`], reports
+    /// [`JOB_STATUS_RUNNING`] once [`JOB_START_DELAY`] has passed and
+    /// [`JOB_STATUS_COMPLETED`] once [`JOB_COMPLETION_DELAY`] has (see
+    /// [`BackendJob::settle`]).
     ///
     /// The job map is BOUNDED, not growing: recording a job first reclaims the app's
     /// oldest ones through [`Self::reclaim_job_capacity`], so the map holds at most
@@ -873,10 +1032,11 @@ impl BackendApp {
             app_id: self.app_id.clone(),
             backend_environment_name: environment_name.to_string(),
             operation: operation.to_string(),
-            status: JOB_STATUS_IN_PROGRESS.to_string(),
+            status: JOB_STATUS_PENDING.to_string(),
             error: None,
             create_time: now,
             update_time: now,
+            starts_at: now + JOB_START_DELAY,
             completes_at: now + JOB_COMPLETION_DELAY,
         };
         // Reclaim BEFORE inserting, leaving room for this one record, so the job being
@@ -1012,8 +1172,8 @@ pub struct BackendJob {
     pub backend_environment_name: String,
     /// The AmplifyBackend operation that recorded the job.
     pub operation: String,
-    /// The job's status: see [`JOB_STATUS_IN_PROGRESS`], [`JOB_STATUS_COMPLETED`] and
-    /// [`JOB_STATUS_FAILED`].
+    /// The job's status: see [`JOB_STATUS_PENDING`], [`JOB_STATUS_RUNNING`],
+    /// [`JOB_STATUS_COMPLETED`] and [`JOB_STATUS_FAILED`].
     pub status: String,
     /// Why the job failed, absent while it has not.
     pub error: Option<String>,
@@ -1021,23 +1181,32 @@ pub struct BackendJob {
     pub create_time: SystemTime,
     /// When the job last changed. Never earlier than [`Self::create_time`].
     pub update_time: SystemTime,
-    /// The instant the job's work becomes due; until then it reports
-    /// [`JOB_STATUS_IN_PROGRESS`].
+    /// The instant the job's work starts; until then it reports [`JOB_STATUS_PENDING`].
+    pub starts_at: SystemTime,
+    /// The instant the job's work becomes due; between [`Self::starts_at`] and this one it
+    /// reports [`JOB_STATUS_RUNNING`].
     pub completes_at: SystemTime,
 }
 
 impl BackendJob {
-    /// Materialise the completion the clock has ALREADY made due.
+    /// Materialise the progress the clock has ALREADY made due: the start of the work at
+    /// [`Self::starts_at`] and its completion at [`Self::completes_at`].
     ///
-    /// This is the one write a reporting operation performs: the transition was owed at
-    /// `completes_at` whether or not anybody read the job, so a reader only records
-    /// what the clock decided. Idempotent, and it never moves a failed job.
-    /// `update_time` is set to the instant the job became due — not to "now" — so two
-    /// reads of a settled job report the same value.
+    /// This is the one write a reporting operation performs: each transition was owed at
+    /// its own instant whether or not anybody read the job, so a reader only records
+    /// what the clock decided. Idempotent, and it never moves a job that has reached a
+    /// terminal status. `update_time` is set to the instant the transition became due —
+    /// not to "now" — so two reads of a job in the same phase report the same value.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.status == JOB_STATUS_IN_PROGRESS && now >= self.completes_at {
+        if self.status != JOB_STATUS_PENDING && self.status != JOB_STATUS_RUNNING {
+            return;
+        }
+        if now >= self.completes_at {
             self.status = JOB_STATUS_COMPLETED.to_string();
             self.update_time = self.completes_at;
+        } else if now >= self.starts_at {
+            self.status = JOB_STATUS_RUNNING.to_string();
+            self.update_time = self.starts_at;
         }
     }
 }

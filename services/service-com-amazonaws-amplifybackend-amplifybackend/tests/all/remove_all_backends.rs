@@ -38,7 +38,7 @@ use service_com_amazonaws_amplifybackend_amplifybackend::ops::types::{
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::state::{
     invalid_app_id_message, ComAmazonawsAmplifybackendAmplifybackendState,
-    JOB_ENVIRONMENT_APP_WIDE, JOB_STATUS_IN_PROGRESS, MAX_IDENTIFIER_CHARS,
+    JOB_ENVIRONMENT_APP_WIDE, JOB_STATUS_PENDING, MAX_IDENTIFIER_CHARS,
     OPERATION_REMOVE_ALL_BACKENDS,
 };
 use service_com_amazonaws_amplifybackend_amplifybackend::EmulatedService;
@@ -321,6 +321,9 @@ async fn seed_case(
     engine: &Arc<engine::InMemoryEngine>,
     case: &Case,
 ) {
+    // An app's identity is settled against Amplify's registry before a backend can be
+    // created for it, so the case's app goes there first (`crate::amplify_registry`).
+    crate::amplify_registry::register_amplify_app(engine, case.app_id, "removeall");
     let created: &[&str] = if case.environments.is_empty() {
         &["dev"]
     } else {
@@ -385,8 +388,8 @@ async fn remove_all_backends_removes_every_environment_the_app_holds() {
         );
         assert_eq!(
             field(&body, "status"),
-            JOB_STATUS_IN_PROGRESS,
-            "case {:?}: a freshly recorded job is not finished yet, got {body}",
+            JOB_STATUS_PENDING,
+            "case {:?}: a freshly recorded job has not started yet, got {body}",
             case.name
         );
         let job_id = field(&body, "jobId").to_string();
@@ -491,6 +494,7 @@ async fn the_resources_inside_a_removed_environment_are_gone() {
     let app_id = "d7st8uv9wx0yz1";
     let environments: &[&str] = &["dev", "staging"];
     let (router, engine) = router_with_engine();
+    crate::amplify_registry::register_amplify_app(&engine, app_id, "removeall");
     for environment in environments {
         let status = create_backend(&router, app_id, environment).await;
         assert_eq!(status, 200, "seeding CreateBackend expected 200, got {status}");
@@ -558,6 +562,7 @@ async fn the_resources_inside_a_removed_environment_are_gone() {
 async fn removing_all_backends_twice_succeeds_and_records_two_jobs() {
     let app_id = "d8ab9cd0ef1gh2";
     let (router, engine) = router_with_engine();
+    crate::amplify_registry::register_amplify_app(&engine, app_id, "removeall");
     for environment in ["dev", "staging"] {
         let status = create_backend(&router, app_id, environment).await;
         assert_eq!(status, 200, "seeding CreateBackend expected 200, got {status}");
@@ -757,8 +762,8 @@ async fn an_amplify_project_with_no_backend_here_is_answered() {
     );
     assert_eq!(
         field(&body, "status"),
-        JOB_STATUS_IN_PROGRESS,
-        "case \"project with no backend\": the job is not finished yet, got {body}"
+        JOB_STATUS_PENDING,
+        "case \"project with no backend\": the job has not started yet, got {body}"
     );
     let first_job_id = field(&body, "jobId").to_string();
     assert!(
@@ -775,9 +780,15 @@ async fn an_amplify_project_with_no_backend_here_is_answered() {
     );
     let (read_status, read_body) = get_backend(&router, &app_id).await;
     assert_eq!(
-        read_status, 400,
-        "case \"project with no backend\": GetBackend still answers about a project with no \
-         backend, got {read_status} {read_body}"
+        read_status, 404,
+        "case \"project with no backend\": GetBackend answers about the backend the project \
+         does not have, got {read_status} {read_body}"
+    );
+    assert_eq!(
+        field(&read_body, "code"),
+        "NotFoundException",
+        "case \"project with no backend\": a project Amplify holds is not refused as a bad \
+         app id — the BACKEND is what is missing, got {read_body}"
     );
 
     // A second call is the same answer with its own job id: the store is unchanged, so
