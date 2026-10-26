@@ -656,6 +656,12 @@ pub const ANOMALY_DETECTOR_STATUS_TRAINING: &str = "TRAINING";
 /// moves a detector out of this status, so the clock owes it nothing further.
 pub const ANOMALY_DETECTOR_STATUS_ANALYZING: &str = "ANALYZING";
 
+/// The status a log anomaly detector a call has PAUSED sits in, from the model's
+/// `AnomalyDetectorStatus` enum: `UpdateLogAnomalyDetector$enabled` is used "to pause or
+/// restart the anomaly detector", so a detector paused that way is not initializing,
+/// training or analyzing, and only another call restarts it — the clock owes it nothing.
+pub const ANOMALY_DETECTOR_STATUS_PAUSED: &str = "PAUSED";
+
 /// How long after it is created a log anomaly detector takes to leave
 /// [`ANOMALY_DETECTOR_STATUS_INITIALIZING`] for [`ANOMALY_DETECTOR_STATUS_TRAINING`].
 ///
@@ -2895,6 +2901,15 @@ pub struct AnomalyDetectorRecord {
     /// ([`AnomalyDetectorRecord::materialize_due_transitions`]). `None` once the detector is
     /// in a status the clock owes nothing after.
     pub status_due_ms: Option<i64>,
+    /// The status a PAUSED detector returns to when a later call restarts it, and how much
+    /// of the span to its next status was still outstanding when it was paused — so a
+    /// detector paused mid-lifecycle resumes that lifecycle instead of jumping ahead of it
+    /// or starting it over. `None` for a detector no call has paused.
+    pub resume_status: Option<String>,
+    /// What was left of [`AnomalyDetectorRecord::status_due_ms`] when this detector was
+    /// paused, re-armed against the clock by the call that restarts it. `None` when the
+    /// status it was paused in is one the clock owed nothing after.
+    pub resume_due_in_ms: Option<i64>,
     /// The anomalies this detector has REPORTED, keyed by `anomalyId`: the set
     /// `ListAnomalies` enumerates and every suppression request resolves its
     /// `anomalyId` / `patternId` against.
@@ -2967,6 +2982,9 @@ impl AnomalyDetectorRecord {
             anomaly_visibility_time: None,
             tags: BTreeMap::new(),
             status_due_ms: Some(creation_time_ms.saturating_add(ANOMALY_DETECTOR_TRAINING_DELAY_MS)),
+            // Nothing has paused a detector the create just stored.
+            resume_status: None,
+            resume_due_in_ms: None,
             // A detector that has not run a pass over its log groups yet has reported
             // nothing, so it has no finding to suppress either.
             anomalies: BTreeMap::new(),
@@ -3122,6 +3140,49 @@ impl AnomalyDetectorRecord {
                 // because a call put the detector there.
                 _ => self.status_due_ms = None,
             }
+        }
+    }
+
+    /// Pause this detector, or restart a paused one: "Use this parameter to pause or restart
+    /// the anomaly detector." (`UpdateLogAnomalyDetector$enabled`)
+    ///
+    /// Pausing takes the detector out of the status the clock had it in and into
+    /// [`ANOMALY_DETECTOR_STATUS_PAUSED`], which only another call leaves. What the clock
+    /// still owed it is kept rather than discarded, so restarting resumes the lifecycle from
+    /// where the pause interrupted it — the remaining span is re-armed against the clock at
+    /// the restart — instead of jumping a detector that was still initializing straight to
+    /// analyzing. A detector the clock had already carried to its last status restarts into
+    /// that status with nothing further owed.
+    ///
+    /// Asking for the state the detector is already in changes no status: pausing a paused
+    /// detector keeps the one pause, and restarting a running one leaves the clock's own
+    /// progression alone.
+    pub fn set_enabled(&mut self, enabled: bool, now_ms: i64) {
+        // What the clock already made due happened before this call, so it is materialised
+        // first: the status this call pauses, and the span it keeps, are the ones in force at
+        // the instant the call arrived.
+        self.materialize_due_transitions(now_ms);
+        let paused = self.status == ANOMALY_DETECTOR_STATUS_PAUSED;
+        match (enabled, paused) {
+            (false, false) => {
+                self.resume_status = Some(self.status.clone());
+                self.resume_due_in_ms = self
+                    .status_due_ms
+                    .map(|due| due.saturating_sub(now_ms).max(0));
+                self.status = ANOMALY_DETECTOR_STATUS_PAUSED.to_string();
+                self.status_due_ms = None;
+            }
+            (true, true) => {
+                self.status = self
+                    .resume_status
+                    .take()
+                    .unwrap_or_else(|| ANOMALY_DETECTOR_STATUS_ANALYZING.to_string());
+                self.status_due_ms = self
+                    .resume_due_in_ms
+                    .take()
+                    .map(|remaining| now_ms.saturating_add(remaining));
+            }
+            _ => {}
         }
     }
 }

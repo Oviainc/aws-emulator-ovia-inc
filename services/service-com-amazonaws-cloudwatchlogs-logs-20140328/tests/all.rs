@@ -81,6 +81,8 @@ mod insights_queries;
 mod integrations;
 #[path = "all/log_anomaly_detector_removal.rs"]
 mod log_anomaly_detector_removal;
+#[path = "all/log_anomaly_detector_updates.rs"]
+mod log_anomaly_detector_updates;
 #[path = "all/log_anomaly_detectors.rs"]
 mod log_anomaly_detectors;
 #[path = "all/log_core_loop.rs"]

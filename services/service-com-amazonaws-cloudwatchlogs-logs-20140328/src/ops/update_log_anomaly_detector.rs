@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLogAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLogAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the configuration members the request names onto the stored anomaly
+//! detector the ARN identifies, pauses or restarts it as the request asks, and stamps it as
+//! modified — or refuses an ARN no detector of this account is stored under, and a filter
+//! pattern the filter-pattern syntax does not admit. This is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`UpdateLogAnomalyDetector::handle`] with real behaviour and
@@ -173,18 +175,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLogAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLogAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLogAnomalyDetector"))
+        // The engine is reachable from `&self` (constructor-injected); `ctx` carries request
+        // metadata, which this operation needs none of: the ARN the request names identifies
+        // the detector on its own, the Region and the account it was created in included.
+        let _ = ctx;
+
+        // The filter pattern limits "the anomaly detection model to examine only log events
+        // that match the pattern you specify here", in the filter-pattern syntax every other
+        // pattern member of this service carries, so an update is held to the same rule the
+        // create holds the member to rather than storing a pattern that can never match. It
+        // is checked before the store is touched, so a refused update changes nothing.
+        if let Some(pattern) = input.filter_pattern.as_deref() {
+            if let Err(message) = crate::state::validate_filter_pattern(pattern) {
+                return Err(invalid_parameter(message));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLogAnomalyDetectorError::from(
+                UpdateLogAnomalyDetectorErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "The ARN of the anomaly detector that you want to update": the detector updated is
+        // the one the account holds under that ARN, resolved the way every other operation
+        // that identifies this resource by `anomalyDetectorArn` resolves one — by whether a
+        // detector is stored under it. So an ARN nothing minted, another Region's or another
+        // account's detector, and one a delete already removed all name a resource that is
+        // not there, rather than creating a detector or being a silent success.
+        let Some(detector) = store.anomaly_detectors.get_mut(&input.anomaly_detector_arn) else {
+            return Err(not_found("anomaly detector"));
+        };
+
+        let now = crate::state::now_ms();
+
+        // "Updates an existing log anomaly detector": each configuration member the request
+        // names replaces the value the detector holds, and a member it does not name leaves
+        // that value as it was — the operation documents no way to clear one, so an omitted
+        // member is not a request to drop what the detector was configured with.
+        if let Some(evaluation_frequency) = &input.evaluation_frequency {
+            detector.evaluation_frequency = Some(evaluation_frequency.clone());
+        }
+        if let Some(filter_pattern) = &input.filter_pattern {
+            detector.filter_pattern = Some(filter_pattern.clone());
+        }
+        if let Some(anomaly_visibility_time) = input.anomaly_visibility_time {
+            detector.anomaly_visibility_time = Some(anomaly_visibility_time);
+        }
+
+        // "Use this parameter to pause or restart the anomaly detector" — the one member
+        // besides the ARN this operation requires, so every accepted update states which of
+        // the two the detector is to be in, and the stored status follows it.
+        detector.set_enabled(input.enabled, now);
+
+        // This call modified the detector, which is what `lastModifiedTimeStamp` — "when this
+        // anomaly detector was most recently modified" — reports, so the stamp moves on the
+        // accepted update, unlike a status the clock owed.
+        detector.last_modified_time_ms = now;
+
+        Ok(UpdateLogAnomalyDetectorOutput)
     }
+}
+
+/// Refuse a request this operation models `InvalidParameterException` for — "A parameter is
+/// specified incorrectly."
+fn invalid_parameter(message: String) -> UpdateLogAnomalyDetectorError {
+    UpdateLogAnomalyDetectorErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a resource this account does not hold, in the one sentence form
+/// this service refuses a missing resource with.
+fn not_found(resource_kind: &str) -> UpdateLogAnomalyDetectorError {
+    UpdateLogAnomalyDetectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::resource_not_found_message(resource_kind)),
+    })
+    .into()
 }
