@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetServiceSpecificCredential
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetServiceSpecificCredential`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetServiceSpecificCredential::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetServiceSpecificCredential` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetServiceSpecificCredentialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetServiceSpecificCredential"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault
+            // (`smithy_query(query="operation", operation="ResetServiceSpecificCredential")`
+            // lists only `NoSuchEntityException`), and an engine this service was not
+            // mounted on cannot serve the operation at all — which is exactly what the
+            // scaffold's 501 states. The router builds the one engine that does carry
+            // the store, so this is unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ResetServiceSpecificCredential",
+            ));
+        };
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // The expiries the clock already owes, materialised before the stored record is
+        // read, exactly as the create, the listing and the status update materialise
+        // them: a credential past its `ExpirationDate` is `Expired` at that instant
+        // whether or not anybody called, and this call reports the record that instant
+        // carries.
+        store.expire_service_specific_credentials(now);
+
+        // The access key id the request was signed with: the caller's identity when the
+        // request names no user, and the acting principal the audit records below are
+        // attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName`, "the operation assumes the user whose credentials are
+        // used to call the operation", resolved through the same binding `GetUser`,
+        // `ListServiceSpecificCredentials` and `UpdateServiceSpecificCredential`
+        // resolve a nameless caller through. A caller whose credentials belong to no
+        // IAM user is refused rather than having an identity invented for it, and this
+        // operation models no error for a request that named no entity, so the refusal
+        // goes through the crate's generic client-input channel (HTTP 400
+        // `ValidationException`).
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "ResetServiceSpecificCredential",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no service-specific credential was reset"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // The credential belongs to a user the account holds. IAM entity names "are not
+        // distinguished by case", so the lookup is on the case-folded key.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "ResetServiceSpecificCredential",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                "no service-specific credential was reset"
+            );
+            return Err(
+                ResetServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The user with name {} cannot be found.",
+                            input.user_name.as_deref().unwrap_or(&user_key)
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A service-specific credential is reachable only through the user that holds
+        // it, so an id the account never minted and an id that belongs to a DIFFERENT
+        // user are the same answer: that user has no such credential, and no new
+        // password is generated in either case.
+        let held = store
+            .service_specific_credentials
+            .get(&input.service_specific_credential_id)
+            .filter(|credential| crate::state::name_key(&credential.user_name) == user_key);
+        let Some(credential) = held.cloned() else {
+            ::tracing::info!(
+                audit = true,
+                operation = "ResetServiceSpecificCredential",
+                outcome = "refused_no_such_credential",
+                caller_akid = %caller_akid,
+                user_key = %user_key,
+                service_specific_credential_id = %input.service_specific_credential_id,
+                "no service-specific credential was reset"
+            );
+            return Err(
+                ResetServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The service-specific credential with id {} cannot be found.",
+                            input.service_specific_credential_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The new password "is Amazon Web Services generated and cryptographically
+        // strong. It cannot be configured by the user", so it comes from the one
+        // component that generates credential material, exactly as the create takes
+        // it; the id minted alongside it is dropped, because a reset keeps the
+        // credential the account already holds and replaces only its secret.
+        let Some((_, password)) =
+            crate::state::mint_service_specific_credential(ctx.credential_store())
+        else {
+            // No secret was minted, and this operation will not invent one; it models
+            // no server fault, so the honest answer is "this emulator did not serve
+            // it".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ResetServiceSpecificCredential",
+            ));
+        };
+
+        // Which member carries the fresh secret is the FORM the credential was minted
+        // in, which the stored record itself records: a user-name-and-password
+        // credential carries a `ServiceUserName`, while a long-term API key carries the
+        // public `ServiceCredentialAlias` whose secret half is
+        // `ServiceCredentialSecret`. Each form's public half belongs to the create that
+        // minted it, so the reset replaces only the generated secret.
+        let (service_password, service_credential_secret) =
+            if credential.service_credential_alias.is_some() {
+                (None, Some(password))
+            } else {
+                (Some(password), None)
+            };
+
+        ::tracing::info!(
+            audit = true,
+            operation = "ResetServiceSpecificCredential",
+            outcome = "reset",
+            caller_akid = %caller_akid,
+            user_key = %user_key,
+            service_specific_credential_id = %credential.service_specific_credential_id,
+            service_name = %credential.service_name,
+            "the service-specific credential's password was reset"
+        );
+
+        // Every other member is the record the account holds: resetting the password
+        // "immediately invalidates the previous password" and reports the new one, and
+        // moves nothing else — not the id, the holder, the service, the creation
+        // instant, the expiry or the status.
+        Ok(ResetServiceSpecificCredentialOutput {
+            service_specific_credential: Some(ServiceSpecificCredential {
+                create_date: credential.create_date,
+                expiration_date: credential.expiration_date,
+                service_name: credential.service_name,
+                service_user_name: credential.service_user_name,
+                // "This is the only time that you can access the password. You cannot
+                // recover the password later" — so it is reported here and, like the
+                // password the create generated, stored nowhere.
+                service_password,
+                service_credential_alias: credential.service_credential_alias,
+                service_credential_secret,
+                service_specific_credential_id: credential.service_specific_credential_id,
+                user_name: credential.user_name,
+                status: credential.status,
+            }),
+        })
     }
 }

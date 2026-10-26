@@ -135,6 +135,8 @@ mod saml_providers;
 mod service_linked_roles;
 #[path = "all/service_provisioned_roles.rs"]
 mod service_provisioned_roles;
+#[path = "all/service_specific_credential_reset.rs"]
+mod service_specific_credential_reset;
 #[path = "all/service_specific_credential_status.rs"]
 mod service_specific_credential_status;
 #[path = "all/service_specific_credentials.rs"]
