@@ -308,6 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let name = record.name.clone();
         detector.filters.insert(name.clone(), record);
+        // The detector itself changed: it holds one more sub-resource than before,
+        // which is the same change its other saved sub-resource creates record on it
+        // (`CreateIPSet`, `CreateThreatIntelSet`, the entity sets, a publishing
+        // destination). A replay above mints nothing and so returns before here.
+        detector.updated_at_millis = now;
 
         Ok(CreateFilterOutput { name })
     }

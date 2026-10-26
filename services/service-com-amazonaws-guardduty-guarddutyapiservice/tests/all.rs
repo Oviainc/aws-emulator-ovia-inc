@@ -45,6 +45,8 @@ mod detector_lifecycle;
 mod detector_sub_resource_creates;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
+#[path = "all/filter_detector_timestamp.rs"]
+mod filter_detector_timestamp;
 #[path = "all/filter_lifecycle.rs"]
 mod filter_lifecycle;
 #[path = "all/filter_listing.rs"]

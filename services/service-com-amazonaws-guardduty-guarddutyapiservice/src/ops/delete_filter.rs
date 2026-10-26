@@ -138,6 +138,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut state = state.lock();
+        // Taken before the detector is borrowed, so the instant a successful delete
+        // records on the detector comes from the same clock every mutation here uses.
+        let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Classified from the REQUEST the way every detector-scoped operation
             // classifies it: a value that cannot be a detector id is a parameter
@@ -159,10 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The detector holds one fewer sub-resource than before, which is the same
+        // change `CreateFilter` records on it in the other direction and the same one
+        // the other saved sub-resource deletes record. A refused delete returns above
+        // and so moves nothing.
+        detector.updated_at_millis = now;
+
         // `DeleteFilterResponse` declares no members
-        // (`smithy_query(operation="DeleteFilter")`). The detector's own timestamps do
-        // not move: a filter is its own resource, and deleting one is not a change to
-        // the detector's configuration.
+        // (`smithy_query(operation="DeleteFilter")`).
         Ok(DeleteFilterOutput {})
     }
 }
