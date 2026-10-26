@@ -39,3 +39,5 @@ mod scaling_plan_lifecycle;
 mod stack_arn_predicate_consistency;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_filter_entry_bounds.rs"]
+mod tag_filter_entry_bounds;

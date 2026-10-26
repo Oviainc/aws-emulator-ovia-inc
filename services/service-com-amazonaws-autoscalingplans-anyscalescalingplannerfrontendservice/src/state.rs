@@ -339,13 +339,62 @@ fn is_cloud_formation_stack_arn(arn: &str) -> bool {
             .is_some_and(|name| !name.is_empty())
 }
 
+/// Documented maximum entry count of `ApplicationSource$TagFilters`: "A set of tags
+/// (up to 50)."
+pub const MAX_TAG_FILTERS: usize = 50;
+
+/// Documented maximum entry count of `TagFilter$Values`: "The tag values (0 to 20)."
+pub const MAX_TAG_VALUES: usize = 20;
+
+/// The refusal for a request list member that holds more entries than its own
+/// documentation allows.
+///
+/// A list member whose documentation states a maximum entry count is bounded by it even
+/// when the list shape carries no modelled `@length`, so nothing before the handler
+/// applies it: this is the single place the whole crate words that refusal. `member` is
+/// the member's wire path, as AWS's validation failures name it, and `max` the count its
+/// own documentation states. Separate from [`check_entry_count`] so a caller whose
+/// member path has to be BUILT renders it only once the bound is actually broken.
+pub fn entry_count_message(member: &str, max: usize) -> String {
+    format!(
+        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+         Member must have length less than or equal to {max}"
+    )
+}
+
+/// Refuse a request list member that holds more entries than its own documentation
+/// allows; a list within its bound is accepted.
+pub fn check_entry_count(member: &str, entries: usize, max: usize) -> Result<(), String> {
+    if entries > max {
+        return Err(entry_count_message(member, max));
+    }
+    Ok(())
+}
+
 /// Validate an `ApplicationSource` a caller wrote, returning its identity key.
 ///
 /// `ApplicationSource` is documented as "A CloudFormation stack or a set of tags" —
 /// the two are ALTERNATIVES, so naming neither identifies no application and naming
 /// both is contradictory, and a stack is named by its ARN. `Err` carries the refusal
 /// message naming the member at fault.
+///
+/// The tag-filter side carries two documented entry counts of its own — on the filter
+/// list and on each filter's value list — and a list past its bound is refused for its
+/// LENGTH before any member of it is read, so those come first.
 pub fn validate_application_source(source: &ApplicationSource) -> Result<String, String> {
+    if let Some(filters) = source.tag_filters.as_ref() {
+        check_entry_count("applicationSource.tagFilters", filters.len(), MAX_TAG_FILTERS)?;
+        for (index, filter) in filters.iter().enumerate() {
+            // The member path is built only for the filter that breaks the bound, so a
+            // source within it renders nothing.
+            if filter.values.as_ref().map_or(0, Vec::len) > MAX_TAG_VALUES {
+                return Err(entry_count_message(
+                    &format!("applicationSource.tagFilters[{index}].values"),
+                    MAX_TAG_VALUES,
+                ));
+            }
+        }
+    }
     let stack_arn = named_stack_arn(source);
     if let Some(arn) = stack_arn {
         if !is_cloud_formation_stack_arn(arn) {

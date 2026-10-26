@@ -248,22 +248,18 @@ pub const MAX_PLAN_NAMES: usize = 10;
 /// the same bound as its sibling selector carries, stated for its own member.
 pub const MAX_APPLICATION_SOURCES: usize = 10;
 
-/// Refuse a request list member that holds more entries than its documented maximum.
+/// Refuse a request list member that holds more entries than its documented maximum,
+/// in this operation's error channel.
 ///
-/// `member` is the member's wire name, as AWS's validation refusal names it, and `max`
-/// the count its own documentation states; a list within its bound is accepted.
+/// The wording lives in [`crate::state::check_entry_count`], so every documented entry
+/// count this service applies — this operation's two selector lists and the tag-filter
+/// counts inside an `ApplicationSource` — is refused with one sentence.
 fn check_entry_count(
     member: &str,
     entries: usize,
     max: usize,
 ) -> Result<(), DescribeScalingPlansError> {
-    if entries > max {
-        return Err(validation(format!(
-            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
-             Member must have length less than or equal to {max}"
-        )));
-    }
-    Ok(())
+    crate::state::check_entry_count(member, entries, max).map_err(validation)
 }
 
 /// AWS's fixed refusal for a request that selects by application source AND by the
