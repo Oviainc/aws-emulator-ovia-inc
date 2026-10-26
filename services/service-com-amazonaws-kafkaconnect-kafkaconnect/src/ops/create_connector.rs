@@ -234,25 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Capacity is "whether it is auto scaled or provisioned": exactly one of
-        // the two forms, which the model expresses as two optional members.
-        let auto_scaled = input.capacity.auto_scaling.is_some();
-        let provisioned = input.capacity.provisioned_capacity.is_some();
-        if auto_scaled == provisioned {
-            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "capacity",
-                    crate::state::ONE_CAPACITY_FORM,
-                )),
-            })
-            .into());
-        }
-
-        // The counts inside the named form. Each member's own documentation
-        // states relations the model cannot: `mcuCount`'s valid value set, and —
-        // for the auto-scaled form — the worker window and the task ceiling
-        // above it. The check is `crate::state::capacity_refusal`, the one an
-        // update's capacity answers to as well.
+        // The capacity: that it is "whether it is auto scaled or provisioned",
+        // naming exactly one of the two forms the model expresses as optional
+        // members, and the counts inside the named form, whose own
+        // documentation states relations the model cannot — `mcuCount`'s valid
+        // value set, and, for the auto-scaled form, the worker window and the
+        // task ceiling above it. The check is `crate::state::capacity_refusal`,
+        // the one an update's capacity answers to as well.
         if let Some(message) = crate::state::capacity_refusal(&input.capacity) {
             return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
                 message: Some(message),

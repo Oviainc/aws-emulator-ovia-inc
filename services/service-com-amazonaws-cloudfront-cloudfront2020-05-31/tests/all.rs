@@ -91,6 +91,8 @@ mod managed_cache_policy_delete_gate;
 mod managed_certificate_details;
 #[path = "all/managed_certificate_domain_ownership.rs"]
 mod managed_certificate_domain_ownership;
+#[path = "all/managed_origin_request_policy_reference.rs"]
+mod managed_origin_request_policy_reference;
 #[path = "all/managed_policy_catalogs.rs"]
 mod managed_policy_catalogs;
 #[path = "all/monitoring_subscription.rs"]

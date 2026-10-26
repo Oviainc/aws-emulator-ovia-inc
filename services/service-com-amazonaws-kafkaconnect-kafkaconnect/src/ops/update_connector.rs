@@ -185,28 +185,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // body that names both or neither.
         let target = match (input.capacity, input.connector_configuration) {
             (Some(capacity), None) => {
-                // Capacity is "whether it is auto scaled or provisioned":
-                // exactly one of the two forms, the same rule a create's
-                // capacity answers to.
-                let auto_scaled = capacity.auto_scaling.is_some();
-                let provisioned = capacity.provisioned_capacity.is_some();
-                if auto_scaled == provisioned {
-                    return Err(UpdateConnectorErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(crate::state::invalid_parameter_because(
-                                "capacity",
-                                crate::state::ONE_CAPACITY_FORM,
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                // The counts inside that form. Their own documentation states
-                // relations the model cannot — `mcuCount`'s valid value set and
-                // the auto-scaled worker window and task ceiling — and an
-                // update's `AutoScalingUpdate` / `ProvisionedCapacityUpdate`
-                // carry the same members under the same documentation as a
-                // create's, so both answer to the one check.
+                // The whole capacity rule, run by the one check a create's
+                // capacity answers to: exactly one of the two forms
+                // ("whether it is auto scaled or provisioned"), and the counts
+                // inside that form, whose own documentation states relations
+                // the model cannot — `mcuCount`'s valid value set and the
+                // auto-scaled worker window and task ceiling. An update's
+                // `AutoScalingUpdate` / `ProvisionedCapacityUpdate` mirror a
+                // create's shapes member for member, and the conversion maps
+                // each form with `Option::map`, so which forms the request
+                // named is the same before and after it.
                 let capacity = crate::state::capacity_from_update(capacity);
                 if let Some(message) = crate::state::capacity_refusal(&capacity) {
                     return Err(UpdateConnectorErrorModeled::BadRequestException(
