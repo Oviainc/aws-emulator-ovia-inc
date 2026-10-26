@@ -93,11 +93,13 @@
 //! `ListOperationEvents` cannot report a milestone of an operation nobody filed, and the
 //! milestones a caller reads move exactly when `GetOperation`'s status does.
 //!
-//! Resource permissions work the same way: `PutResourcePermission` grants and
-//! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
-//! and the `Policy` document both report is PROJECTED from them by
+//! Resource permissions work the same way: `PutResourcePermission` grants,
+//! `DeleteResourcePermission` revokes and `GetResourcePermission` reads the SAME triples in
+//! [`RegionState::resource_permissions`],
+//! and the `Policy` document all three report is PROJECTED from them by
 //! [`RegionState::resource_policy`] — so a grant is observable by every later read in
-//! that Region and neither handler writes a policy document of its own. The target of a
+//! that Region, a revocation disappears from every later read at once, and no handler
+//! writes a policy document of its own. The target of a
 //! grant is a resource this Region holds ([`RegionState::holds_resource`], the same
 //! resolution the tagging calls run), so the policy a read reports always belongs to a
 //! resource some registration brought into being, and the grants go when it does.
@@ -2597,6 +2599,45 @@ impl RegionState {
             .or_default()
             .insert(source_resource_arn.to_string());
         Ok(true)
+    }
+
+    /// Stop permitting the grants `resource_arn` holds, narrowed by the members the
+    /// caller named: `action_type` to that `PermissionActionType` alone, and
+    /// `source_resource_arn` to that one source. A call that narrows by neither
+    /// removes every permission held on the resource.
+    ///
+    /// Revoking what is not held removes nothing and is not a failure: the grant is the
+    /// (resource, action type, source) triple a set holds at most once, so removing it
+    /// twice leaves the same state as removing it once. A (resource, action type) pair
+    /// left with no source, and a resource left with no pair, are DROPPED rather than
+    /// kept as an empty container: an empty entry would render no statement anyway
+    /// ([`Self::resource_policy`]) while still counting against
+    /// [`MAX_PERMISSIONED_RESOURCES`] and keeping the Region's partition alive.
+    pub fn revoke_resource_permission(
+        &mut self,
+        resource_arn: &str,
+        action_type: Option<&str>,
+        source_resource_arn: Option<&str>,
+    ) {
+        let Some(grants) = self.resource_permissions.get_mut(resource_arn) else {
+            return;
+        };
+        grants.retain(|action, sources| {
+            if action_type.is_some_and(|wanted| wanted != action.as_str()) {
+                // An action type the caller did not name keeps every source it holds.
+                return true;
+            }
+            match source_resource_arn {
+                Some(source) => {
+                    sources.remove(source);
+                }
+                None => sources.clear(),
+            }
+            !sources.is_empty()
+        });
+        if grants.is_empty() {
+            self.resource_permissions.remove(resource_arn);
+        }
     }
 
     /// The resource policy document held for `resource_arn`, narrowed to

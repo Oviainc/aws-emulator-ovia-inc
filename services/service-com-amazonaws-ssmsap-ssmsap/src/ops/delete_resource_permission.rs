@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops permitting a source resource to take a `PermissionActionType` on a target
+//! resource, and answers the target's resulting policy document.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The target is a resource this account and Region holds — a registered application
+//! or a SAP HANA database of one of its registrations
+//! ([`crate::state::RegionState::holds_resource`]) — so an ARN that names no such
+//! resource is refused with the modelled `ResourceNotFoundException`, exactly as the
+//! grant and the read refuse it, rather than reporting a revocation on a resource that
+//! does not exist.
+//!
+//! `ActionType` and `SourceResourceArn` are both OPTIONAL here (unlike
+//! `PutResourcePermission`, which models both `@required`), so each one NARROWS what
+//! this call removes: the named action type alone, the named source alone, and with
+//! neither, every permission the target holds. Nothing is removed beyond what the
+//! request names, and removing a triple the target does not hold leaves the policy as
+//! it was — the grant is the (target, action type, source) triple a set holds at most
+//! once ([`crate::state::RegionState::revoke_resource_permission`]), so a repeated
+//! delete answers the same document as the first one.
+//!
+//! The `Policy` this returns is not assembled here: like the grant's and the read's, it
+//! is projected from the grants still held for the target by
+//! [`crate::state::RegionState::resource_policy`], narrowed to the `ActionType` this
+//! call named, so what a caller is told is exactly what `GetResourcePermission` reports
+//! next. A target left holding no matching grant carries no policy at all, which is an
+//! ABSENT `Policy` rather than an invented empty document.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: the grant was made in THIS Region's
+        // partition, so a permission is revoked at the endpoint it was granted at and
+        // nowhere else.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePermissionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        // Every handler materialises what the clock already owes first, so this call
+        // acts on the same resources as any other call at this instant — a
+        // deregistration whose removal has fallen due has already taken its application
+        // and the grants held on it by the time this write resolves the ARN.
+        state.settle(::std::time::SystemTime::now());
+
+        // `ResourceArn` is modelled `@required` with a `@pattern` and the two optional
+        // members carry their own constraints, so reaching here means the request is
+        // well formed. What the model cannot state is whether the TARGET names
+        // anything: the policy being changed is attached TO that resource, so it has to
+        // be one this account and Region holds, resolved the one way this crate resolves
+        // a resource named by ARN ([`crate::state::RegionState::holds_resource`]) — the
+        // same resolution the grant and the read run, so a target that resolves for one
+        // of them resolves for all. Reading the Region first mints no partition for one
+        // that holds nothing (`region`, not `region_entry`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePermission"))
+        // `SourceResourceArn` is NOT resolved against this store, for the reason
+        // `PutResourcePermission` gives: it names the counterparty the grant permitted,
+        // ordinarily a resource of another account or Region, so nothing this partition
+        // holds decides whether it exists.
+        if !state
+            .region(&region)
+            .holds_resource(&region, &input.resource_arn)
+        {
+            return Err(
+                DeleteResourcePermissionErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // The target resolved in THIS Region, so the partition it lives in already
+        // exists and reaching for it to write mints nothing — one binding serves the
+        // removal and the projection that follows it. Each member the request carries
+        // narrows the removal; one it omits narrows nothing, so a call carrying only
+        // `ResourceArn` revokes every permission the target holds.
+        let region_state = state.region_entry(&region);
+        region_state.revoke_resource_permission(
+            &input.resource_arn,
+            input.action_type.as_deref(),
+            input.source_resource_arn.as_deref(),
+        );
+
+        // What is left is the target's policy now, narrowed the way the read narrows it:
+        // the statements of the `ActionType` this call named, or the whole document when
+        // it named none. A target whose last matching grant this call removed carries no
+        // policy, which is an ABSENT `Policy`.
+        let policy =
+            region_state.resource_policy(&input.resource_arn, input.action_type.as_deref());
+
+        Ok(DeleteResourcePermissionOutput { policy })
     }
 }

@@ -31,6 +31,8 @@ mod configuration_check_reads;
 mod configuration_check_rules;
 #[path = "all/configuration_checks.rs"]
 mod configuration_checks;
+#[path = "all/delete_resource_permission.rs"]
+mod delete_resource_permission;
 #[path = "all/deregistration_window.rs"]
 mod deregistration_window;
 #[path = "all/ec2_instance_shutdown.rs"]

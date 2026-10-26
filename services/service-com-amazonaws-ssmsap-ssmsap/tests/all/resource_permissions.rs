@@ -142,11 +142,14 @@ fn cases() -> Vec<Case> {
 
 /// A `DatabaseArn` in the colon-segment branch of the modelled `Arn` pattern
 /// (`^arn:(.+:){2,4}.+$`), the form `tests/all/registered_database_arn.rs` registers too.
-const COLON_SEGMENT_DATABASE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:db:sap-prd";
+///
+/// `pub(crate)` because the suites of this target share one harness:
+/// `tests/all/delete_resource_permission.rs` names a target in this branch too.
+pub(crate) const COLON_SEGMENT_DATABASE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:db:sap-prd";
 
 /// A registration for `application_id` that names its SAP HANA database by
 /// `DatabaseArn`, so the database carries exactly that ARN.
-fn registered_by_arn(application_id: &str, database_arn: &str) -> Value {
+pub(crate) fn registered_by_arn(application_id: &str, database_arn: &str) -> Value {
     let mut body = registration(application_id, &[], None);
     body.as_object_mut()
         .expect("a registration body is a JSON object")
@@ -155,7 +158,11 @@ fn registered_by_arn(application_id: &str, database_arn: &str) -> Value {
 }
 
 /// `PutResourcePermission` at `region`'s endpoint.
-async fn put_in_region(
+///
+/// `pub(crate)` because the suites of this target share one harness:
+/// `tests/all/delete_resource_permission.rs` grants through the same route before
+/// revoking.
+pub(crate) async fn put_in_region(
     emulator: &Emulator,
     region: &str,
     resource: &str,
@@ -178,7 +185,8 @@ async fn put_in_region(
 /// `PutResourcePermission` at [`REGION`]'s endpoint.
 ///
 /// `pub(crate)` because the suites of this target drive ONE permissions harness:
-/// `tests/all/resource_permission_reads.rs` grants through this same call.
+/// `tests/all/resource_permission_reads.rs` and
+/// `tests/all/delete_resource_permission.rs` grant through this same call.
 pub(crate) async fn put(emulator: &Emulator, resource: &str, action: &str, source: &str) -> Reply {
     put_in_region(emulator, REGION, resource, action, source).await
 }
@@ -236,16 +244,16 @@ pub(crate) fn policy(reply: &Reply, case: &str) -> String {
 
 /// One statement of a policy document, reduced to what the assertions read.
 #[derive(Debug, PartialEq, Eq)]
-struct Statement {
+pub(crate) struct Statement {
     effect: String,
-    principal: String,
+    pub(crate) principal: String,
     action: String,
     resource: String,
 }
 
 /// The statements of `document`, in the order the document lists them, after checking
 /// the envelope the policy language requires.
-fn statements(document: &str, case: &str) -> Vec<Statement> {
+pub(crate) fn statements(document: &str, case: &str) -> Vec<Statement> {
     let parsed: Value = serde_json::from_str(document).unwrap_or_else(|error| {
         panic!("case {case:?}: Policy must be a JSON document, got {document:?} ({error})")
     });
@@ -286,7 +294,7 @@ fn statements(document: &str, case: &str) -> Vec<Statement> {
 
 /// Assert that `document` is exactly the policy of `resource` granting `action` to
 /// `expected_sources` — no more statements, no fewer, each one well formed.
-fn assert_policy_grants(
+pub(crate) fn assert_policy_grants(
     document: &str,
     resource: &str,
     action: &str,
