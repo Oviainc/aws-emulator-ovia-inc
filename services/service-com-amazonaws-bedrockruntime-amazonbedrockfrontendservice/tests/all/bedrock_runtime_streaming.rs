@@ -146,7 +146,7 @@ async fn post_json(router: &MultiServiceRouter, path: &str, body: &Value) -> Cal
 
 /// Decode an event-stream response body, asserting the frame headers an SDK
 /// decoder requires. Each entry is `(event type, payload)`.
-fn decode_frames(case: &str, body: &[u8]) -> Vec<(String, Value)> {
+pub(crate) fn decode_frames(case: &str, body: &[u8]) -> Vec<(String, Value)> {
     let mut buffer = bytes::Bytes::copy_from_slice(body);
     let mut frames = Vec::new();
     while !buffer.is_empty() {
@@ -426,7 +426,7 @@ fn event_name(payload: &Value) -> Option<String> {
 
 /// The `chunk` payloads of a response-stream body: every frame is a `chunk`, and
 /// `PayloadPart$bytes` is a blob, so restJson1 renders it base64.
-fn chunk_payloads(case: &str, body: &[u8]) -> Vec<Value> {
+pub(crate) fn chunk_payloads(case: &str, body: &[u8]) -> Vec<Value> {
     let frames = decode_frames(case, body);
     let order: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
     assert!(

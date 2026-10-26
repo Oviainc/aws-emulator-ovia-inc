@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/async_invoke_model_contract.rs"]
 mod async_invoke_model_contract;
+#[path = "all/bedrock_cloudwatch_token_metrics.rs"]
+mod bedrock_cloudwatch_token_metrics;
 #[path = "all/bedrock_runtime_inference.rs"]
 mod bedrock_runtime_inference;
 #[path = "all/bedrock_runtime_request_claim.rs"]
