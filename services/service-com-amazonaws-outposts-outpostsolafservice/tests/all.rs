@@ -39,6 +39,8 @@ mod dependent_resource_conflict;
 mod error_classification;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/get_catalog_item.rs"]
+mod get_catalog_item;
 #[path = "all/get_order_reporting.rs"]
 mod get_order_reporting;
 #[path = "all/get_site_address_reporting.rs"]

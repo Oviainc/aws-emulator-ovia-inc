@@ -4208,6 +4208,10 @@ pub const CONNECTION_ID_MEMBER: &str = "connectionId";
 /// an idempotency token in. See [`SITE_ID_MEMBER`].
 pub const CLIENT_TOKEN_MEMBER: &str = "clientToken";
 
+/// The validation-path name of the `CatalogItemId` input member an operation names
+/// one published hardware configuration by. See [`SITE_ID_MEMBER`].
+pub const CATALOG_ITEM_ID_MEMBER: &str = "catalogItemId";
+
 /// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
 ///
 /// It is the bound on a RESOURCE's tag map and not only on one request's: the

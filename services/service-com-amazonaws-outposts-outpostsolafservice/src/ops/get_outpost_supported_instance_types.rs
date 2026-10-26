@@ -245,9 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // placed against another Outpost, names no hardware here and is the same
         // not-found error, echoed on the member it arrived in. An order it does hold
         // narrows nothing — what an order would narrow by is the catalog items its
-        // line items name, and this emulator has no catalog behind those SKUs
-        // (`GetCatalogItem` is still a scaffold stub with an issue of its own) — so
-        // the report is the Outpost's own. Checked before the asset, so a request
+        // line items name, and the published catalog reports which instance FAMILIES
+        // a configuration carries capacity of rather than the instance types the
+        // hardware of one order supports — so the report is the Outpost's own.
+        // Checked before the asset, so a request
         // naming both is answered about the coarser scope it could not resolve.
         if let Some(order_id) = input.order_id.as_deref().filter(|id| !id.is_empty()) {
             let places_this_outpost = store
