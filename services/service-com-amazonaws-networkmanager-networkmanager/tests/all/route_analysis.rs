@@ -12,6 +12,11 @@
 //! the endpoint the path could not get past, and no return path, because the forward path
 //! did not reach the destination.
 //!
+//! A second table pins the reporting side of that rule on its own: `GetRouteAnalysis`
+//! reports the status the clock owes the analysis — `RUNNING` until that analysis's own due
+//! instant, `COMPLETED` after it — so reading it, however many times, moves nothing a later
+//! caller sees.
+//!
 //! The table below spans that class: rows differing in which endpoint carries an attachment
 //! ARN at all, in whether that ARN names a resource of this global network, of another one,
 //! or of nothing at all, in what kind of resource it names, in whether an IP address is
@@ -502,6 +507,140 @@ async fn an_analysis_reports_the_path_the_global_network_holds_for_its_endpoints
         assert_eq!(
             again, body,
             "case {:?}: repeated reads must report the identical analysis",
+            case.case
+        );
+    }
+}
+
+/// One row of the transition table: the analysis to start, and how many times it is read
+/// back BEFORE the span the clock owes falls due. The rows differ in that count because the
+/// rule under test is that the reported status follows the clock and the analysis's own due
+/// instant — never how often, or whether, anyone read it.
+#[derive(Debug, Clone)]
+struct TransitionRow {
+    analysis: AnalysisCase,
+    reads_before_due: usize,
+}
+
+/// The transition table: one row per completion the table above spans — so the rows differ
+/// in the reason code the stored analysis carries as well as in the number of early reads —
+/// each read a different number of times while still `RUNNING`.
+fn transition_rows(fixture: &Fixture) -> Vec<TransitionRow> {
+    let mut reasons: Vec<&'static str> = Vec::new();
+    let mut rows: Vec<TransitionRow> = Vec::new();
+    for analysis in analysis_cases(fixture) {
+        if reasons.contains(&analysis.reason) {
+            continue;
+        }
+        reasons.push(analysis.reason);
+        rows.push(TransitionRow {
+            analysis,
+            reads_before_due: rows.len() + 1,
+        });
+    }
+    rows
+}
+
+/// `GetRouteAnalysis` reports the status the clock owes, and reading never moves it: an
+/// analysis read any number of times before its due instant is still `RUNNING`, with no
+/// completion to report, and is `COMPLETED` after that instant whether it was read before
+/// or not.
+#[tokio::test]
+async fn a_read_reports_the_status_the_clock_owes_and_never_moves_it() {
+    let emulator = Emulator::new();
+    let fixture = fixture(&emulator).await;
+    let rows = transition_rows(&fixture);
+    assert!(
+        rows.len() > 1,
+        "the transition table must span more than one completion, got {} rows",
+        rows.len()
+    );
+
+    // Start each row and take its early reads straight away, so every read below lands
+    // inside the span the clock owes rather than racing it.
+    let mut started: Vec<(TransitionRow, String, Value)> = Vec::new();
+    for row in rows {
+        let case = &row.analysis;
+        let (status, body) = emulator
+            .post(&analyses_uri(&fixture.network), case.body())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: StartRouteAnalysis expected 200, got {status} with {body}",
+            case.case
+        );
+        let id = body["RouteAnalysis"]["RouteAnalysisId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {:?}: no RouteAnalysisId in {body}", case.case))
+            .to_string();
+
+        let mut running: Option<Value> = None;
+        for read in 1..=row.reads_before_due {
+            let (status, early) = emulator.get(&analysis_uri(&fixture.network, &id)).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: read {read} before the due instant expected 200, got {status} with {early}",
+                case.case
+            );
+            let analysis = &early["RouteAnalysis"];
+            assert_identity(case, &fixture.network, analysis);
+            assert_eq!(
+                analysis["Status"],
+                json!("RUNNING"),
+                "case {:?}: read {read} before the due instant must still be RUNNING, got {early}",
+                case.case
+            );
+            assert_eq!(
+                analysis["ForwardPath"],
+                Value::Null,
+                "case {:?}: read {read} of a running analysis has no completion to report, got {early}",
+                case.case
+            );
+            assert_eq!(
+                analysis["ReturnPath"],
+                Value::Null,
+                "case {:?}: read {read} of a running analysis has no return path to report, got {early}",
+                case.case
+            );
+            match &running {
+                None => running = Some(early.clone()),
+                Some(first) => assert_eq!(
+                    &early, first,
+                    "case {:?}: read {read} before the due instant must report the identical running analysis",
+                    case.case
+                ),
+            }
+        }
+        started.push((row, id, body));
+    }
+
+    // The transition is owed by the clock, not by the reads above: nothing polls for it.
+    std::thread::sleep(PAST_SETTLE);
+
+    for (row, id, start_body) in &started {
+        let case = &row.analysis;
+        let (status, body) = emulator.get(&analysis_uri(&fixture.network, id)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: GetRouteAnalysis after the due instant expected 200, got {status} with {body}",
+            case.case
+        );
+        let analysis = &body["RouteAnalysis"];
+        assert_eq!(
+            analysis["Status"],
+            json!("COMPLETED"),
+            "case {:?}: expected COMPLETED after the span the clock owes, read {} times before it, got {body}",
+            case.case,
+            row.reads_before_due
+        );
+        assert_identity(case, &fixture.network, analysis);
+        assert_completion(case, analysis);
+        // The early reads changed nothing about the analysis itself: the identity members
+        // the start reported are the ones read back.
+        assert_eq!(
+            analysis["StartTimestamp"],
+            start_body["RouteAnalysis"]["StartTimestamp"],
+            "case {:?}: expected the start timestamp the analysis was recorded with, got {body}",
             case.case
         );
     }
