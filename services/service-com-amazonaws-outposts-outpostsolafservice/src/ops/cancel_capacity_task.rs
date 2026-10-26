@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelCapacityTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelCapacityTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelCapacityTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: cancels the stored capacity task the `CapacityTaskId` names on the
+//! Outpost the `OutpostIdentifier` names, resolved from either the bare id or the full
+//! ARN the modelled label pattern accepts. The task moves to the modelled
+//! `CANCELLATION_IN_PROGRESS` status — cancelled, and cleaning up resources — and
+//! settles in `CANCELLED` when that step falls due, so every later read of it
+//! ([`crate::ops::get_capacity_task`]) reports a cancelled task that never goes on to
+//! complete, and the Outpost and order it belongs to can take another one. An
+//! identifier this store holds nothing for is the not-found error this operation
+//! models, and a task Amazon Web Services Outposts is already running or has finished
+//! with is the conflict it models: there is nothing left to cancel.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelCapacityTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelCapacityTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelCapacityTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelCapacityTaskErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the parent is
+        // resolved — and with it the tasks nested under it, exactly as
+        // `GetCapacityTask` reads one.
+        let region = crate::state::request_region(ctx.parts());
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                CancelCapacityTaskErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+
+        let mut store = state.lock();
+        // Whether there is anything left to cancel depends on the status the task
+        // holds NOW, and a task moves on on the clock, so every transition that was
+        // already due at this instant is materialised before the status is read.
+        store.settle_capacity_tasks();
+        // A capacity task is nested under an Outpost
+        // (`/outposts/{OutpostIdentifier}/capacity/{CapacityTaskId}`), so the parent
+        // is resolved first: an Outpost the store does not hold cannot be asked about
+        // its tasks at all. Worded as the identifier echo of the value AS SUPPLIED —
+        // not of `outpost_id`, which is the bare id an ARN resolved to.
+        if store.outpost(&region, &outpost_id).is_none() {
+            return Err(CancelCapacityTaskErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+        // A task belongs to exactly one Outpost, so one named under another Outpost's
+        // route names nothing: the task identifier is what is not found.
+        let task = store
+            .capacity_tasks
+            .get_mut(&input.capacity_task_id)
+            .filter(|task| task.outpost_id == outpost_id)
+            .ok_or_else(|| {
+                CancelCapacityTaskErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::CAPACITY_TASK_ID_MEMBER,
+                        &input.capacity_task_id,
+                    )),
+                })
+            })?;
+        // A task Amazon Web Services Outposts is already carrying out, or has finished
+        // with, cannot be cancelled ([`crate::state::CapacityTaskRecord::is_cancellable`]):
+        // that is the conflict this operation models. The modelled `ResourceType`
+        // names only `ORDER` and `OUTPOST`, so what `ResourceId` / `ResourceType` can
+        // name is the Outpost the task runs on — the resource the route addressed —
+        // while the message names the task and the status it is in.
+        if !task.is_cancellable() {
+            let status = task.status.clone();
+            return Err(CancelCapacityTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::capacity_task_status_conflict(
+                        &input.capacity_task_id,
+                        &status,
+                    )),
+                    resource_id: Some(outpost_id),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
+                },
+            )
+            .into());
+        }
+        // What cancelling leaves behind is stated once, on the record, so the status
+        // the task reports and the transition the clock still owes it can never
+        // disagree about its having been cancelled.
+        task.cancel(std::time::SystemTime::now());
+
+        // The modelled output carries no members: what the call did is observable
+        // through the task itself.
+        Ok(CancelCapacityTaskOutput {})
     }
 }

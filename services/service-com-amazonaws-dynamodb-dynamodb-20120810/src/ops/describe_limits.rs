@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the provisioned-capacity quotas this account holds in the REGION the
+//! request addresses — the documented defaults, each raised to what that region has
+//! already provisioned, so the report can never contradict the descriptions of the very
+//! tables this operation's doc has a client add up
+//! ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::capacity_quotas_in`]).
+//! Nothing is written here: the answer is a function of the tables the store already
+//! holds.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +174,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLimits"))
+        // "The DescribeLimits Request element has no content": there is nothing on the
+        // input to read, and the whole selector is the endpoint this request was signed
+        // for, because a throughput quota is held per account and REGION.
+        let _ = &input;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        let mut store = state.lock();
+        // The one write a reporting operation makes: finishing what the clock has already
+        // made due, so a table whose deletion has fallen due no longer counts towards
+        // what this region has provisioned. The lock is held across that pass AND the
+        // walk below, so the quotas reported are read from ONE snapshot of the store
+        // rather than from a store another request could move in between.
+        store.apply_due_transitions(now);
+        // One walk over the region's tables, which the store's own caps bound: this
+        // request carries no size of its own, so what the answer costs cannot be chosen
+        // by a caller.
+        let quotas = store.capacity_quotas_in(&region);
+
+        Ok(DescribeLimitsOutput {
+            account_max_read_capacity_units: Some(quotas.account_max_read_capacity_units),
+            account_max_write_capacity_units: Some(quotas.account_max_write_capacity_units),
+            table_max_read_capacity_units: Some(quotas.table_max_read_capacity_units),
+            table_max_write_capacity_units: Some(quotas.table_max_write_capacity_units),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DescribeLimitsError {
+    DescribeLimitsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
 }

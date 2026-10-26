@@ -115,6 +115,8 @@ mod permissions_boundary_delete;
 mod permissions_boundary_get;
 #[path = "all/policy_attach_conflict.rs"]
 mod policy_attach_conflict;
+#[path = "all/region_describe.rs"]
+mod region_describe;
 #[path = "all/region_list.rs"]
 mod region_list;
 #[path = "all/resource_tags.rs"]

@@ -68,31 +68,87 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service, ViolationKind};
 use std::sync::Arc;
 
-/// The error code this endpoint answers a value outside a modelled enumeration's value
-/// set with: `BadRequestException`, HTTP 400.
+/// The error code this endpoint answers a request the boundary in front of the service
+/// refuses with: `BadRequestException`, HTTP 400.
 ///
 /// It is NOT a modelled error — no operation in this model (nor in the legacy Amazon
 /// Connect Wisdom view of the same endpoint) declares it
 /// (`smithy_query(query="operation", operation="CreateAssistant")`:
 /// `AccessDeniedException`, `ConflictException`, `ServiceQuotaExceededException`,
-/// `ValidationException`) — because the refusal happens where the request body is read
-/// into the input shape, before the operation's own validation: a `type` outside
-/// `AssistantType`'s value set, a `knowledgeBaseType` outside `KnowledgeBaseType`'s, and
-/// so on are all answered with this one code, while a constraint this service validates
-/// itself (an absent required member, a `@length` or `@pattern` violation) keeps the
-/// modelled `ValidationException`.
+/// `ValidationException`) — because the refusal is made where the request body is read
+/// against the operation's input schema, in front of the operation's own validation. TWO
+/// classes reach it, both recorded for this endpoint:
 ///
-/// The legacy Amazon Connect Wisdom view of this SAME endpoint
-/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/service.rs`, reachable under
-/// its own registration key) words this class identically, from its own copy of this
-/// constant and of `override_refusal`: the two are one endpoint, so a client must not get
-/// a different code for the same input depending on which key it addressed. Change one and
-/// change the other.
+/// * a value outside a modelled enumeration's value set, which the input shape cannot hold
+///   at all — this endpoint's long-standing answer, whose message states the constraint;
+/// * a body value outside a modelled `@length` bound, which this endpoint answers with the
+///   one sentence [`INVALID_REQUEST_BODY_MESSAGE`] states — the recorded wire answer for
+///   exactly that case.
+///
+/// Every other refusal class keeps the error its model declares: a value outside a
+/// `@pattern`, an absent `@required` member, a value outside a `@range` and a `@length`
+/// refusal of a value that travelled in the query string are all the modelled
+/// `ValidationException`, with the constraint-stating sentence AWS words it with.
+///
+/// The legacy Amazon Connect Wisdom view of this endpoint
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/service.rs`) answers under its
+/// own registration key rather than the `wisdom` endpoint identity this view serves, and
+/// words its own refusals from its own constants.
 ///
 /// The code itself is owned by `crate::scaffolded::BAD_REQUEST_CODE`, so the class a
 /// handler refuses through `crate::scaffolded::Scaffolded::bad_request` and the class the
 /// boundary catches here carry ONE code rather than drifting apart.
-const ENUM_VALUE_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
+const BODY_REFUSAL_CODE: &str = crate::scaffolded::BAD_REQUEST_CODE;
+
+/// The sentence this endpoint refuses a body value outside a modelled `@length` bound
+/// with. It carries NOTHING from the request — no value, member name or bound — which is
+/// what the recorded wire answer of this endpoint for that class carries.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+
+/// The member names this model binds to the request QUERY STRING whose values a modelled
+/// `@length` bound can refuse: the continuation tokens
+/// (`smithy_query(query="operation",operation="ListKnowledgeBases,GetRecommendations,GetNextMessage")`
+/// gives `nextToken`, `nextChunkToken` and `nextMessageToken` as `@httpQuery` members of
+/// `NextToken`/`NonEmptyString`, both `len 1..`).
+///
+/// A length refusal of one of these is NOT a refusal of the request BODY — the value
+/// travelled in the URI, which the body check never reads — so it keeps the modelled
+/// `ValidationException` this service declares for input it validates itself. Every other
+/// member a `@length` bound can refuse in this model is a body member: a path label is
+/// refused by its `@pattern` and a query integer by its `@range`, and neither of those
+/// classes is answered here.
+///
+/// Matched by NAME because this seam is handed the violation alone, never the operation
+/// whose schema bound the member; the one place that costs anything is `QueryAssistant`,
+/// which carries `nextToken` in its body, where a length refusal of it therefore also
+/// keeps the modelled error. See [`refuses_the_request_body`].
+const QUERY_TOKEN_MEMBERS: [&str; 3] = ["nextToken", "nextChunkToken", "nextMessageToken"];
+
+/// Whether these violations include a refusal of a BODY value against a modelled size
+/// bound: a `@length` violation on a member the request did not carry in its query string
+/// ([`QUERY_TOKEN_MEMBERS`]).
+///
+/// `any`, not `all`: the body is checked against the operation's input schema BEFORE the
+/// service validates anything, so a request whose body that check rejects is answered
+/// there whatever else the same request also gets wrong — which keeps the answer
+/// independent of the order the members happen to be walked in.
+///
+/// Only the first path segment is looked at: a violation inside a structure, a list
+/// element or a map entry (`searchExpression.filters.1.member.field`) is a violation of
+/// the body member that carries it, and no query parameter has members of its own.
+fn refuses_the_request_body(violations: &[smithy_server_runtime::Violation]) -> bool {
+    violations.iter().any(|violation| {
+        let member = violation
+            .path
+            .split('.')
+            .next()
+            .unwrap_or(violation.path.as_str());
+        matches!(
+            violation.kind,
+            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+        ) && !QUERY_TOKEN_MEMBERS.contains(&member)
+    })
+}
 
 /// This model's OWN sdkId-derived key (`sdkId: QConnect`,
 /// `smithy_query(query="service_info")`), beside the shared endpoint identity
@@ -351,31 +407,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it; `None` keeps the framework's default (400 `ValidationException`,
         // which is also what this service's model declares for a constraint it
-        // validates itself, so every other class is left alone).
+        // validates itself).
         //
-        // The ONE class this endpoint states differently is a value outside a modelled
-        // enumeration's value set: that is refused where the request body is read into
-        // the operation's input shape, and this endpoint answers it 400
-        // `BadRequestException` — a code neither this model nor the legacy Wisdom view
-        // declares as an operation error, because it is the deserialization boundary's,
-        // not a modelled failure. Only the CODE is chosen here; the message stays the
-        // framework's own `Value '…' at '…' failed to satisfy constraint: Member must
-        // satisfy enum value set: […]` sentence, built from the request. The legacy view
-        // of this same endpoint words the same class the same way.
+        // Two classes are refused by the boundary in front of the service instead, with
+        // the code [`BODY_REFUSAL_CODE`] names: a body value outside a modelled `@length`
+        // bound, answered with the one sentence [`INVALID_REQUEST_BODY_MESSAGE`] states,
+        // and a value outside a modelled enumeration's value set, which the input shape
+        // cannot hold at all and whose message states the constraint. The size class is
+        // matched FIRST: a body the boundary measures as too long or too short is refused
+        // there, before anything reads a value out of it.
         //
-        // `any`, not `all` or "the first": a request that ALSO breaks a constraint this
-        // service validates itself could not be read into the input shape either, so the
-        // boundary's refusal is the one the caller gets, and the message still states
-        // every clause the walk found. That keeps the answer independent of the order the
-        // members happen to be walked in.
+        // Every other class — a `@pattern`, an absent `@required` member, a `@range`, and
+        // a length refusal of a value that travelled in the query string — returns `None`
+        // and keeps the modelled wording.
         match refusal {
+            Refusal::Invalid(violations) if refuses_the_request_body(violations) => {
+                Some(Refused {
+                    code: BODY_REFUSAL_CODE.to_string(),
+                    message: INVALID_REQUEST_BODY_MESSAGE.to_string(),
+                })
+            }
             Refusal::Invalid(violations)
                 if violations
                     .iter()
                     .any(|violation| matches!(violation.kind, ViolationKind::EnumValue(_))) =>
             {
                 Some(Refused {
-                    code: ENUM_VALUE_REFUSAL_CODE.to_string(),
+                    code: BODY_REFUSAL_CODE.to_string(),
                     message: aws_smithy_schema_server::envelope(violations)
                         .unwrap_or_else(|| "invalid request".to_string()),
                 })

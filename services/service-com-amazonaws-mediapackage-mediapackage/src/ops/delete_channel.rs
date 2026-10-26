@@ -136,7 +136,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: a delete reaches only the channels of the Region its
+        // own request is served in, so an id another Region holds is missing here rather
+        // than destroyed.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
                 message: Some("the mediapackage state store is unavailable".into()),
@@ -144,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        if !state.channels.contains_key(&input.id) {
+        if !state.has_channel(&region, &input.id) {
             return Err(crate::state::channel_not_found(&input.id).into());
         }
 
@@ -156,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusal names the blocker programmatically — how many children hold the
         // channel, and what they are — in the body's `errors` map, so a client learns the
         // dependency from the error rather than only from its prose.
-        let endpoints = state.origin_endpoints_of(&input.id);
+        let endpoints = state.origin_endpoints_of(&region, &input.id);
         if endpoints > 0 {
             return Err(crate::state::has_attached_children(
                 crate::state::CHANNEL_KIND,
@@ -166,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        state.channels.remove(&input.id);
+        state.remove_channel(&region, &input.id);
         Ok(DeleteChannelOutput {})
     }
 }

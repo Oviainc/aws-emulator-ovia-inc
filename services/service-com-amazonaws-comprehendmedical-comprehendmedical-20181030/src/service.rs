@@ -40,10 +40,13 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// How this service words a request the framework refused before any handler ran. The
+/// wording lives there rather than in [`EmulatedService::override_refusal`] so every
+/// constrained member of every operation is stated by ONE formatter.
+pub(crate) mod validation;
 
 /// The `com-amazonaws-comprehendmedical-comprehendmedical-20181030` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -102,45 +105,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // longer than the limit has its own error, `TextSizeLimitExceededException`
         // ("The size of the text you submitted exceeds the size limit"). Both are
         // modelled 400s, which is the status the framework renders a refusal with, so
-        // only the code and the message change here.
-        let Refusal::Invalid(violations) = refusal else {
-            // An authentication refusal keeps the framework's 403 wording.
-            return None;
-        };
-        let members = violations
-            .iter()
-            .map(|violation| violation.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let text_too_long = violations.iter().any(|violation| {
-            // The violation path names the member as the validator walks it, whose
-            // casing follows the schema's member name rather than the wire name.
-            violation
-                .path
-                .split('.')
-                .next_back()
-                .is_some_and(|member| member.eq_ignore_ascii_case("text"))
-                && matches!(violation.kind, ViolationKind::MaxLength(_))
-        });
-        Some(if text_too_long {
-            Refused {
-                code: "TextSizeLimitExceededException".to_string(),
-                message: format!(
-                    "The size of the text you submitted exceeds the size limit. Reduce the size \
-                     of the text or use a smaller document and then retry your request. \
-                     Offending member(s): {members}."
-                ),
-            }
-        } else {
-            Refused {
-                code: "InvalidRequestException".to_string(),
-                message: format!(
-                    "The request that you made is invalid: member(s) {members} did not satisfy \
-                     the constraints this service declares. Check your request to determine why \
-                     it's invalid and then retry the request."
-                ),
-            }
-        })
+        // only the code and the message change. The wording is NOT written here: it is
+        // `validation::refused`, the one formatter this service states every refused
+        // request with.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

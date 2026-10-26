@@ -6029,11 +6029,18 @@ pub const MILLIS_PER_SECOND: i64 = 1_000;
 /// it names the two ends of the range and interpolates neither of their values.
 pub const REVERSED_TIME_RANGE_MESSAGE: &str = "End time should not be before start time.";
 
-/// The refusal `CreateExportTask` answers for the same condition, which names the two
-/// members that bound an export's window (`from` and `to`) rather than the start and the end
-/// of a query's.
-pub const EXPORT_REVERSED_TIME_RANGE_MESSAGE: &str =
-    "The parameter to must be greater than the parameter from.";
+/// The refusal `CreateExportTask` answers when the window it is given is not a time range:
+/// its fixed text states what the service requires of a window — that the two values bound a
+/// period the log groups still hold data for, and that `from` precede `to` — and its two
+/// quoted slots carry the window the REQUEST sent, in the order it sent it, so the caller can
+/// see which window was rejected.
+pub fn export_time_range_message(from: i64, to: i64) -> String {
+    format!(
+        "Specified time range of '{from}' and '{to}' is not valid. Please make sure the values \
+         are within the retention period of the log groups and from value is lesser than the to \
+         value"
+    )
+}
 
 /// The revision id a resource-scoped policy carries, minted from the monotonic policy
 /// revision counter so it is unique and derived from stored state. AWS documents no

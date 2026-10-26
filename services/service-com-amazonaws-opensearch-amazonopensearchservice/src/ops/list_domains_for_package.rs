@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status they are then in.
         store.settle_packages(now);
         for domain in store.domains.values_mut() {
-            for association in domain.package_associations.values_mut() {
-                association.settle(now);
-            }
+            domain.settle_package_associations(now);
         }
 
         // The associations reported are the ones of ONE package, so an id that names no

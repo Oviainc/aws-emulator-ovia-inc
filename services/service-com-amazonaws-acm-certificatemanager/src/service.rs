@@ -95,8 +95,9 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// value it WITHHOLDS: the position in the input that failed, and NOT the value.
 ///
 /// Reserved for the positions [`withholds_value`] names — a resource identifier, a
-/// request token, and a value the validating walk holds no submitted text for.
-/// Every other position states the value as submitted ([`echoed_subject`]).
+/// request token, a position on the TAG surface, and a value the validating walk
+/// holds no submitted text for. Every other position states the value as submitted
+/// ([`echoed_subject`]).
 const SUBJECT: &str = "Value of the input at";
 
 /// How the subject reads when the member was ABSENT, which is the cross-service
@@ -206,6 +207,16 @@ pub(crate) fn cross_account_arn_refusal(resource_type: &str) -> String {
 /// later without a list of names to extend.
 const WITHHELD_CLASSES: [&str; 2] = ["Arn", "Token"];
 
+/// The word a model spells the input member a request's TAGS arrive in with, which is
+/// what [`names_tag_surface`] recognises a step of a path by.
+///
+/// Every tag member of this service's inputs is named for the tags it carries —
+/// `Tags`, `TagKeys`, and `CertificateTags`, the tag collection
+/// `CreateAcmeEndpoint` passes on to the certificates an endpoint issues
+/// (`smithy_query(query="operation", operation="CreateAcmeEndpoint")`) — so the word
+/// holds for a tag member added later without a list of names to extend.
+const TAG_WORD: &str = "tag";
+
 /// The units the validating walk renders a value it has no TEXT for in: the element
 /// count of a list, the entry count of a map, the byte count of a blob
 /// (`aws_smithy_schema_server::constraints`, whose collection-length check renders a
@@ -218,9 +229,12 @@ const DOCUMENT_SUMMARY: &str = "<document>";
 /// Whether ACM withholds the value submitted at `path`, where `stored` is the echo the
 /// validating walk recorded for it.
 ///
-/// Three classes are withheld, and nothing else:
+/// Four classes are withheld, and nothing else:
 ///
 /// * a resource identifier or a request token ([`WITHHELD_CLASSES`]);
+/// * a position on the TAG surface ([`names_tag_surface`]), whose text is metadata the
+///   caller attaches to a resource and which ACM reports the position of rather than
+///   reflecting back — both halves of a pair and a key list's entries alike;
 /// * a value the walk has only a SUMMARY of — a collection's element or entry count, a
 ///   blob's byte count, a document — since there is no submitted scalar to quote and
 ///   the count is the walk's own text rather than the caller's;
@@ -233,7 +247,38 @@ const DOCUMENT_SUMMARY: &str = "<document>";
 /// string member whose own value IS one of those renderings), that
 /// `services/common/src/validation_message.rs` reads a map's entry count from.
 fn withholds_value(path: &str, stored: &str) -> bool {
-    names_withheld_class(leaf_member(path)) || is_summary(stored) || is_elided(stored)
+    names_withheld_class(leaf_member(path))
+        || names_tag_surface(path)
+        || is_summary(stored)
+        || is_elided(stored)
+}
+
+/// Whether `path` addresses a position on the TAG surface: the tag collection itself, or
+/// anything reached THROUGH it — a pair's key, a pair's value, an entry of a key list.
+///
+/// Resolved from the path rather than from the leaf member, because the leaf of a pair's
+/// half is named for the half (`key`, `value`) and only the step above it says the pair
+/// is a tag: `tags.<position>.member.value` is tag metadata, while a member named `value`
+/// elsewhere in an input is not.
+fn names_tag_surface(path: &str) -> bool {
+    path.split('.').any(names_tags)
+}
+
+/// How a QUALIFIED tag member's name ends, lowercased: a collection of the tags
+/// themselves or of their keys. A member named for the tags alone opens with
+/// [`TAG_WORD`] instead, which is what the walk's lowerCamel spelling makes of `Tags`
+/// and `TagKeys`.
+const TAG_MEMBER_SUFFIXES: [&str; 2] = ["tags", "tagkeys"];
+
+/// Whether `member` names a collection of tags, in the lowerCamel spelling the walk
+/// names a member with: `tags` and `tagKeys` open with [`TAG_WORD`], and a qualified
+/// name such as `certificateTags` closes with one of [`TAG_MEMBER_SUFFIXES`].
+fn names_tags(member: &str) -> bool {
+    let lowered = member.to_ascii_lowercase();
+    lowered.starts_with(TAG_WORD)
+        || TAG_MEMBER_SUFFIXES
+            .iter()
+            .any(|suffix| lowered.ends_with(suffix))
 }
 
 /// The member a path's value belongs to: its last segment, in the spelling the walk
@@ -656,8 +701,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // ACM states a member-constraint failure against the INPUT POSITION that
         // failed, the constraint it failed, and the value submitted there — except
         // at the positions it withholds the value of ([`withholds_value`]: a
-        // resource identifier, a request token, and a value the walk holds no
-        // submitted text for), which name the position alone. A `@pattern`
+        // resource identifier, a request token, a position on the tag surface, and
+        // a value the walk holds no submitted text for), which name the position
+        // alone. A `@pattern`
         // requirement names the expression without the model's `^` / `$`
         // anchoring. The code stays the modeled `ValidationException` (HTTP 400),
         // which is what the framework would have answered; only the wording

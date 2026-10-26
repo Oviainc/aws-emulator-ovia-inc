@@ -27,6 +27,8 @@ mod catalog_pagination;
 mod default_quota_catalog;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/quota_utilization_usage.rs"]
+mod quota_utilization_usage;
 #[path = "all/quota_workflow.rs"]
 mod quota_workflow;
 #[path = "all/quotas_catalog.rs"]
