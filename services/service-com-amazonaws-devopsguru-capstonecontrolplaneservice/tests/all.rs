@@ -27,6 +27,8 @@ mod cost_estimation;
 mod cost_estimation_scope;
 #[path = "all/event_sources_config.rs"]
 mod event_sources_config;
+#[path = "all/events.rs"]
+mod events;
 #[path = "all/insight_deletion.rs"]
 mod insight_deletion;
 #[path = "all/insight_feedback.rs"]

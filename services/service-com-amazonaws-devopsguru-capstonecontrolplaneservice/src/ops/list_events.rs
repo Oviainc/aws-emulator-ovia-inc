@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the events the resources DevOps Guru evaluates emitted: the page of
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::events`]
+//! that every filter the request carries admits, in the store's stable `EventId`
+//! order. Each `ListEventsFilters` member names one property of an event, so the
+//! filters are joined with AND and an omitted one restricts nothing. An `InsightId`
+//! the store holds no insight under names no insight and is refused with
+//! `ResourceNotFoundException`, the same rule `DescribeInsight`, `ListRecommendations`
+//! and `ListAnomalousLogGroups` apply to the same map; an `AccountId` other than the
+//! one this emulator serves is refused with `AccessDeniedException`, as those reads
+//! refuse it. It is a REPORTING operation: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +164,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEvents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // `AccountId` names the member account whose events to read. This emulator
+        // serves one account and is in no organization, so no other account is
+        // accessible to the caller: that is an authorization refusal, decided BEFORE
+        // any lookup so a refusal cannot report what another account holds.
+        let account_id = crate::state::requested_account_id(input.account_id.as_deref());
+        if !crate::state::account_is_accessible(&account_id) {
+            return Err(ListEventsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Access denied when accessing the events of account {account_id}"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // What the request's filters select, with a filter value outside its modelled
+        // enum, or a time bound this service cannot represent, refused as a 400 rather
+        // than answered with a silently empty page.
+        let selector = crate::state::EventSelector::of(&input.filters).map_err(
+            |rejection| -> ListEventsError {
+                ListEventsErrorModeled::ValidationException(rejection.validation_exception())
+                    .into()
+            },
+        )?;
+
+        // `MaxResults` is "the maximum number of results to return with a single
+        // call", so a page carries at most what the caller asked for, and the
+        // service's own page size when it asked for nothing. The modelled range
+        // already bounds a request, so the clamp only keeps a value that reached here
+        // anyway inside it.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::LIST_EVENTS_MAX_RESULTS) as usize
+            });
+
+        let store = state.lock();
+        // The events a request filters by insight are the events OF that insight, so
+        // an id the store holds no insight under names no insight at all — the same
+        // refusal `DescribeInsight` gives for that id, rather than an empty page that
+        // would claim the insight exists and simply emitted nothing.
+        if let Some(insight_id) = selector.insight_id() {
+            if !store.insights.contains_key(insight_id) {
+                return Err(ListEventsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no insight with id {insight_id} exists"),
+                        resource_id: insight_id.to_string(),
+                        resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Select, then page: a token names an offset into the events THESE filters
+        // select, so it is scoped to them and does not resolve against another set's.
+        let selected: Vec<Event> = store
+            .events
+            .values()
+            .filter(|event| selector.matches(event))
+            .map(crate::state::EventRecord::to_event)
+            .collect();
+
+        let (page, next_token) = crate::state::page_sized(
+            &selected,
+            &format!("ListEvents/{}", selector.page_scope()),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListEventsError {
+            ListEventsErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListEvents",
+                    "the events these filters select",
+                    "Filters",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        // An account whose analysis found no matching event is not an error: the list
+        // is simply empty.
+        Ok(ListEventsOutput {
+            events: page,
+            next_token,
+        })
     }
 }

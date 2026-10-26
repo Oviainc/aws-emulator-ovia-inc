@@ -33,6 +33,11 @@
 //! the same provenance too, and live in
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::recommendations`], which
 //! `ListRecommendations` reports for the insight they remediate.
+//!
+//! The EVENTS the covered resources emitted, as that analysis found them in the
+//! operational data sources it reads, have the same provenance again, and live in
+//! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::events`], which
+//! `ListEvents` reports the filtered page of.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -40,16 +45,16 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AccountInsightHealth, AnomalousLogGroup, AnomalyReportedTimeRange, AnomalyResource,
     AnomalySourceDetails, AnomalySourceMetadata, AnomalyTimeRange, CloudFormationCollection,
-    CloudFormationHealth, CloudWatchMetricsDetail, InsightHealth, InsightTimeRange,
-    ListInsightsStatusFilter, LogAnomalyShowcase,
+    CloudFormationHealth, CloudWatchMetricsDetail, Event, EventResource, InsightHealth,
+    InsightTimeRange, ListEventsFilters, ListInsightsStatusFilter, LogAnomalyShowcase,
     MonitoredResourceIdentifier, PerformanceInsightsMetricsDetail, PredictionTimeRange,
     ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
     ReactiveOrganizationInsightSummary, Recommendation, RecommendationRelatedAnomaly,
     RecommendationRelatedEvent, ResourceCollection, ServiceCollection, ServiceHealth,
     ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth, ValidationException,
-    ValidationExceptionField, INSIGHT_SEVERITY_VALUES, INSIGHT_STATUS_VALUES, INSIGHT_TYPE_VALUES,
-    SERVICE_NAME_VALUES,
+    ValidationExceptionField, EVENT_CLASS_VALUES, EVENT_DATA_SOURCE_VALUES,
+    INSIGHT_SEVERITY_VALUES, INSIGHT_STATUS_VALUES, INSIGHT_TYPE_VALUES, SERVICE_NAME_VALUES,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -133,6 +138,24 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// levels because the read pages over the inner one: the key order is stable, which
     /// is what a page cursor needs.
     pub recommendations: BTreeMap<String, BTreeMap<String, RecommendationRecord>>,
+    /// The events the resources DevOps Guru evaluates emitted, keyed by `EventId`.
+    ///
+    /// The same provenance as [`Self::insights`], [`Self::anomalies`],
+    /// [`Self::anomalous_log_groups`] and [`Self::recommendations`]: an event is one
+    /// DevOps Guru's analysis found in an operational data source it reads
+    /// (`EventDataSource`), so no modelled operation mints one and this map is what
+    /// that analysis writes and `ListEvents` reports. It stays empty on an emulator
+    /// over which no analysis ran, so the read over it reports nothing rather than
+    /// inventing an event, and one event is reported at most once because the map is
+    /// keyed by its id. A `BTreeMap` for the same reason as the maps above: the read
+    /// pages over it, and a stable key order is what a page cursor needs.
+    ///
+    /// An event records the insight the analysis related it to in
+    /// [`EventRecord::associated_insight_id`], which is both what `ListEvents`'s
+    /// `Filters.InsightId` selects on and the link `DeleteInsight` follows when it
+    /// deletes "the insight along with the associated anomalies, events and
+    /// recommendations".
+    pub events: BTreeMap<String, EventRecord>,
     /// The account that administers DevOps Guru for the organization this store
     /// records, if any.
     ///
@@ -314,6 +337,12 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
         // The recommendations are named by that same cascade, and are keyed by the
         // insight they remediate, so they go with it too.
         self.recommendations.remove(insight_id);
+        // The events the cascade names are those the analysis related to the deleted
+        // insight, so they go with it exactly as its anomalies do; an event related to
+        // no insight, or to another one, is untouched.
+        self.events.retain(|_, event| {
+            event.associated_insight_id.as_deref() != Some(insight_id)
+        });
         Some(removed)
     }
 }
@@ -1034,6 +1063,69 @@ impl RecommendationRecord {
     }
 }
 
+/// One event a resource DevOps Guru evaluates emitted, as `ListEvents` reports it.
+///
+/// Holds every member the modelled `Event` carries, plus the insight the analysis
+/// related the event to, which `ListEvents`'s `Filters.InsightId` selects on and
+/// `DeleteInsight`'s cascade follows. The emitting resources are kept as the modelled
+/// shape, the way [`AnomalyRecord`] keeps its source details and
+/// [`RecommendationRecord`] its related evidence: finding which resources emitted an
+/// event is the analysis's own output, so the store keeps what it produced rather than
+/// a second encoding of it.
+///
+/// Every modelled member of `Event` is optional, so each is held as an `Option` (or,
+/// for the resource list, as a possibly empty `Vec`): an event the analysis placed no
+/// instant, class, source or data source on reports none, rather than a value this
+/// store invented for it.
+#[derive(Debug, Clone, Default)]
+pub struct EventRecord {
+    /// `Id` — the map key, repeated here so a record is self-contained.
+    pub id: String,
+    /// `Time`: "the time the event occurred"
+    /// (`smithy_query(query="doc",shape="Event",member="Time")`). An event the
+    /// analysis placed no instant on lies in no event-time range.
+    pub time_millis: Option<i64>,
+    /// `EventSource`: the Amazon Web Services service the event came from.
+    pub event_source: Option<String>,
+    /// `Name`: the name of the event.
+    pub name: Option<String>,
+    /// `DataSource`: the operational data source the analysis found the event in, one
+    /// of `EVENT_CLASS_VALUES`' sibling `EVENT_DATA_SOURCE_VALUES`.
+    pub data_source: Option<String>,
+    /// `EventClass`: the class of the event, one of `EVENT_CLASS_VALUES`.
+    pub event_class: Option<String>,
+    /// `Resources`: the resources that emitted the event. Empty when the analysis
+    /// attributed it to none.
+    pub resources: Vec<EventResource>,
+    /// `ResourceCollection`: the collection of resources the event is about, in the
+    /// set form this store keeps every collection in.
+    pub resource_collection: Option<ResourceCoverage>,
+    /// The insight the analysis related this event to, or `None` when it related it to
+    /// none. Not a modelled member of `Event`: it is the relation `ListEvents`'s
+    /// `Filters.InsightId` — "an ID of an insight that is related to the events you
+    /// want to filter for" — selects on.
+    pub associated_insight_id: Option<String>,
+}
+
+impl EventRecord {
+    /// This record as the modelled `Event` the read reports.
+    pub fn to_event(&self) -> Event {
+        Event {
+            resource_collection: self
+                .resource_collection
+                .as_ref()
+                .map(ResourceCoverage::wire_collection),
+            id: Some(self.id.clone()),
+            time: self.time_millis.map(timestamp),
+            event_source: self.event_source.clone(),
+            name: self.name.clone(),
+            data_source: self.data_source.clone(),
+            event_class: self.event_class.clone(),
+            resources: (!self.resources.is_empty()).then(|| self.resources.clone()),
+        }
+    }
+}
+
 /// The language a recommendation read reports its prose in when the request names
 /// none: `Locale`'s English (United States) value — see `LOCALE_VALUES` in
 /// `ops/types/shared_types.rs`.
@@ -1385,6 +1477,161 @@ impl<'a> InsightSearchSelector<'a> {
                 .map_or_else(|| "-".to_string(), ResourceCoverage::page_fragment),
         )
     }
+}
+
+/// What a `ListEvents` request selects out of the stored events.
+///
+/// `ListEvents` "returns a list of the events emitted by the resources that are
+/// evaluated by DevOps Guru. You can use filters to specify which events are
+/// returned", and `ListEventsFilters` is the set of "filters you can use to specify
+/// which events are returned". Every member of it is optional and names ONE property
+/// of an event, so an event is reported exactly while EVERY filter the request carries
+/// admits it, and a filter the request omits restricts nothing.
+#[derive(Debug, Clone)]
+pub struct EventSelector<'a> {
+    /// `Filters.InsightId`: "an ID of an insight that is related to the events you
+    /// want to filter for", so it is matched against the insight the analysis related
+    /// the event to.
+    insight_id: Option<&'a str>,
+    /// `Filters.EventTimeRange`: "a time range during which you want the filtered
+    /// events to have occurred", so it is matched against the event's `Time`. Both of
+    /// its bounds are required, so a range the request carries is bounded on both
+    /// sides.
+    occurred: Option<MillisRange>,
+    /// `Filters.EventClass`, one of `EVENT_CLASS_VALUES`.
+    event_class: Option<&'a str>,
+    /// `Filters.EventSource`, matched against the event's own source exactly: the
+    /// member is a constrained string, not a pattern, and this store expands no value
+    /// into others.
+    event_source: Option<&'a str>,
+    /// `Filters.DataSource`, one of `EVENT_DATA_SOURCE_VALUES`.
+    data_source: Option<&'a str>,
+    /// The resources `Filters.ResourceCollection` names, normalised to the same set
+    /// form an event's own collection is stored in, or `None` when it names no
+    /// resource.
+    about: Option<ResourceCoverage>,
+}
+
+impl<'a> EventSelector<'a> {
+    /// The selection `filters` names, or the [`FilterRejection`] that refuses it.
+    pub fn of(filters: &'a ListEventsFilters) -> Result<Self, FilterRejection> {
+        let event_class = filters.event_class.as_deref();
+        let data_source = filters.data_source.as_deref();
+        enum_value(event_class, EVENT_CLASS_VALUES, "Filters.EventClass")?;
+        enum_value(data_source, EVENT_DATA_SOURCE_VALUES, "Filters.DataSource")?;
+        let occurred = match filters.event_time_range.as_ref() {
+            None => None,
+            Some(range) => Some(millis_range(
+                Some(&range.from_time),
+                Some(&range.to_time),
+                "Filters.EventTimeRange",
+            )?),
+        };
+        Ok(Self {
+            insight_id: filters.insight_id.as_deref(),
+            occurred,
+            event_class,
+            event_source: filters.event_source.as_deref(),
+            data_source,
+            about: filters
+                .resource_collection
+                .as_ref()
+                .map(ResourceCoverage::of_wire)
+                .filter(|about| !about.names_no_resource()),
+        })
+    }
+
+    /// The insight this selection is about, when the request filters on one: the
+    /// caller resolves it against the stored insights before reading, because an id
+    /// the store holds no insight under names no insight at all.
+    pub fn insight_id(&self) -> Option<&'a str> {
+        self.insight_id
+    }
+
+    /// Whether this selection holds `event`: every filter the request carries admits
+    /// it.
+    ///
+    /// A filter names a property of the event, so an event the analysis recorded no
+    /// such property for is not admitted by a filter on it: it is not known to have
+    /// the property asked for.
+    pub fn matches(&self, event: &EventRecord) -> bool {
+        self.insight_id.is_none_or(|wanted| {
+            event.associated_insight_id.as_deref() == Some(wanted)
+        })
+            && self
+                .occurred
+                .is_none_or(|wanted| event.time_millis.is_some_and(|at| wanted.holds(at)))
+            && self
+                .event_class
+                .is_none_or(|wanted| event.event_class.as_deref() == Some(wanted))
+            && self
+                .event_source
+                .is_none_or(|wanted| event.event_source.as_deref() == Some(wanted))
+            && self
+                .data_source
+                .is_none_or(|wanted| event.data_source.as_deref() == Some(wanted))
+            // A `ResourceCollection` filter names a SET OF RESOURCES, so it admits an
+            // event about any one of them; an event about no resource at all is in no
+            // such set.
+            && self.about.as_ref().is_none_or(|wanted| {
+                event
+                    .resource_collection
+                    .as_ref()
+                    .is_some_and(|about| wanted.intersects(about))
+            })
+    }
+
+    /// The scope a page token over this selection is bound to, so a cursor issued for
+    /// one filter set does not seek into another's selection, as
+    /// [`InsightSearchSelector::page_scope`] binds a search's.
+    pub fn page_scope(&self) -> String {
+        let value = |named: Option<&str>| scope_values(named);
+        format!(
+            "insight/{}/occurred/{}/class/{}/source/{}/data/{}/resources/{}",
+            value(self.insight_id),
+            self.occurred
+                .as_ref()
+                .map_or_else(|| "-".to_string(), MillisRange::page_scope),
+            value(self.event_class),
+            value(self.event_source),
+            value(self.data_source),
+            self.about
+                .as_ref()
+                .map_or_else(|| "-".to_string(), ResourceCoverage::page_fragment),
+        )
+    }
+}
+
+/// The most events one `ListEvents` response carries when the request asks for more,
+/// from the modelled range of `ListEventsMaxResults` (1..200): a request cannot ask
+/// for a larger page, so neither does the walk serve one.
+pub const LIST_EVENTS_MAX_RESULTS: i32 = 200;
+
+/// Accepts a single enum filter member whose value is one `allowed` holds, or the
+/// rejection naming `member`.
+///
+/// The per-MEMBER form of [`enum_values`], which decides a list of them, with the same
+/// standing: the model declares the member as an enum, so the boundary validator
+/// refuses anything else before a handler runs, and this keeps such a value a 400
+/// rather than a silently empty answer if it ever reaches here.
+fn enum_value(
+    value: Option<&str>,
+    allowed: &[&str],
+    member: &str,
+) -> Result<(), FilterRejection> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    let allowed = allowed.join(" | ");
+    Err(FilterRejection {
+        message: format!("{member} must be one of {allowed}, got '{value}'"),
+        reason: "FIELD_VALIDATION_FAILED",
+        field: member.to_string(),
+        field_message: format!("must be one of {allowed}"),
+    })
 }
 
 /// Accepts a list filter member whose every value is one `allowed` holds, or the
@@ -2336,8 +2583,9 @@ pub const PAGE_SIZE: usize = 100;
 // Guru's analysis, which this emulator does not run, so nothing a caller sends adds an
 // entry. `anomalies` is the same: an anomaly is detected by that analysis too, and no
 // modelled operation mints one. `anomalous_log_groups` and `recommendations` are the
-// same again, and are reclaimed with the insight they are keyed by. An operation that
-// ever mints any of them brings its own bound.
+// same again, and are reclaimed with the insight they are keyed by. `events` is the
+// same once more: an event enters the store only as something that analysis found in a
+// data source it reads. An operation that ever mints any of them brings its own bound.
 // ---------------------------------------------------------------------------
 
 /// DevOps Guru's own documented ceiling, from `UpdateResourceCollection`'s and
