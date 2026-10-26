@@ -648,9 +648,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // versioning state: this write carries no id of its own.
             version_id: None,
             encryption: encryption.clone(),
-            // A write places no Object Lock retention: the object-lock headers are refused
-            // above, and a retention is placed on a stored version afterwards, by
-            // `PutObjectRetention`.
+            // This write names no Object Lock retention of its own: the object-lock headers
+            // are refused above. The store applies the bucket's own default retention to the
+            // version it records, when its Object Lock configuration names one, and
+            // `PutObjectRetention` is what places a retention on a stored version afterwards.
             retention: None,
             // Nor a legal hold, for the same reason: `PutObjectLegalHold` is what applies
             // one to a stored version.

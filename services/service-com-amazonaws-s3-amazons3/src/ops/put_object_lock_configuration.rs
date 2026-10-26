@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectLockConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectLockConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectLockConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Places the `ObjectLockConfiguration` the request carries on the addressed bucket and
+//! answers 200: Object Lock enabled on it, with the `Rule`'s `DefaultRetention` kept as the
+//! retention its new objects are locked under. `GetObjectLockConfiguration` reads the same
+//! state back, and the store applies that rule to every object version written into the
+//! bucket afterwards — "the rule specified in the Object Lock configuration will be applied
+//! by default to every new object placed in the specified bucket" — which is what
+//! `GetObjectRetention` then reports for such a version.
+//!
+//! A REPLACEMENT of the whole subresource: the container is the request's whole payload, so
+//! what the bucket carries afterwards is exactly what that container named and nothing of
+//! the configuration before it — one naming no rule leaves the bucket locking its new
+//! objects under no default retention at all.
+//!
+//! "Object Lock works only in versioned buckets" (Amazon S3 User Guide, *Using S3 Object
+//! Lock*), so a call addressed to a bucket whose versioning status is not `Enabled` is
+//! refused 409 [`crate::state::INVALID_BUCKET_STATE_CODE`] and nothing is written; a
+//! configuration that does not describe one mode with one period — "the DefaultRetention
+//! settings require both a mode and a period … can be either Days or Years but you must
+//! select one" — is a document that does not validate against the published schema, which
+//! is [`crate::state::MALFORMED_XML_CODE`] (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -106,14 +118,22 @@ use super::types::*;
 // `PutObjectLockConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectLockConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObjectLockConfiguration")]
+// The operation's MODELED errors, widened with `extra_errors` by the 404 shape this SERVICE
+// models for a bucket that is not there.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutObjectLockConfiguration")` reports
+// `errors: []`), yet `Bucket` is an @httpLabel, so a request can name a bucket that does not
+// exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not
+// exist", modelled `@httpError(404)`) — the same 404 every other bucket-scoped operation of
+// this crate answers for that cause.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObjectLockConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutObjectLockConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -167,18 +187,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectLockConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectLockConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the token and the
+        // expected owner travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — this request's `ExpectedBucketOwner`, judged the way every other
+        // bucket-scoped operation judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // `Token` is "a token to allow Object Lock to be enabled for an existing bucket"
+        // (`PutObjectLockConfigurationRequest$Token`): a value AWS Support issues for one
+        // bucket, opaque to the API and checkable against nothing this emulator holds, so a
+        // request carrying one is served exactly as one that does not.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the configuration cannot be recorded at all, and no modelled
+            // error says that, so the scaffold's 501 carries what is true: this emulator
+            // cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectLockConfiguration",
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // The ADDRESS is resolved FIRST, so a request naming a bucket this emulator does not
+        // hold answers that — the way `PutObjectRetention` orders the refusals — rather than
+        // reporting whatever is wrong with a configuration no bucket could have carried.
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutObjectLockConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        }
+
+        // The configuration is judged BEFORE anything is written, so a refused request leaves
+        // whatever the bucket carries exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectLockConfiguration"))
+        // `ObjectLockConfiguration` is not a required member
+        // (`smithy_query(query="operation",operation="PutObjectLockConfiguration")`), so a
+        // request can carry no container at all — and that container is the whole
+        // configuration to apply, so a request without one names nothing to put. "Enable
+        // ObjectLockEnabled when you apply ObjectLockConfiguration to a bucket"
+        // (`ObjectLockConfiguration$ObjectLockEnabled`), whose enum publishes the single
+        // value [`crate::state::OBJECT_LOCK_ENABLED_STATUS`], so a container that does not
+        // name it does not satisfy the published schema either.
+        let Some(configuration) = input.object_lock_configuration.as_ref().filter(|held| {
+            held.object_lock_enabled
+                .as_deref()
+                .is_some_and(|enabled| OBJECT_LOCK_ENABLED_VALUES.contains(&enabled))
+        }) else {
+            return Err(malformed_xml());
+        };
+
+        let default_retention = match configuration.rule.as_ref() {
+            // "Specifies the Object Lock rule for the specified object"
+            // (`ObjectLockConfiguration$Rule`) — a configuration naming no rule enables
+            // Object Lock on the bucket and leaves its new objects under no default
+            // retention, which is the state a `CreateBucket` carrying
+            // `x-amz-bucket-object-lock-enabled` leaves a bucket in too.
+            None => None,
+            Some(rule) => {
+                // A rule is the container FOR a default retention
+                // (`ObjectLockRule$DefaultRetention` is the only member it has), so one
+                // naming none describes no rule at all.
+                let Some(retention) = rule.default_retention.as_ref() else {
+                    return Err(malformed_xml());
+                };
+                // The EVENT HOLD member is a hold that runs from an event rather than to a
+                // date (`DefaultRetention$DefaultEventHold`), so it would decide something
+                // no stored retention here could then report. Nothing emulates it, and
+                // answering 200 would claim behaviour nothing performed, so the request is
+                // refused as unwritten rather than quietly stripped of its meaning — the way
+                // `PutObjectRetention` refuses the event hold of one version's retention.
+                if retention.default_event_hold.is_some() {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(
+                        "PutObjectLockConfiguration with Rule.DefaultRetention.DefaultEventHold",
+                    ));
+                }
+                Some(default_retention_of(retention)?)
+            }
+        };
+
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the name was resolved above, under the same lock. Answered rather
+            // than asserted so nothing here can turn a vanished address into a panic.
+            return Err(
+                PutObjectLockConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // "Object Lock works only in versioned buckets" (Amazon S3 User Guide, *Using S3
+        // Object Lock*): a lock is addressed to an object VERSION, so a bucket that mints no
+        // version ids has nothing for a retention to be placed on. Such a bucket cannot take
+        // the configuration at all, whichever rule it names, which is what
+        // `InvalidBucketState` reports (HTTP 409); the code is not a shape in this model, so
+        // it goes out through the unmodelled channel. A bucket Object Lock is already enabled
+        // on is versioning-enabled by construction
+        // (`crate::state::Bucket::enable_object_lock`), so this refuses only a bucket nothing
+        // ever put in that state.
+        if !bucket.versioning_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_BUCKET_STATE_CODE,
+                crate::state::INVALID_BUCKET_STATE_STATUS,
+                crate::state::OBJECT_LOCK_VERSIONING_REQUIRED_MESSAGE,
+            ));
+        }
+
+        bucket.set_object_lock_configuration(default_retention);
+
+        Ok(PutObjectLockConfigurationOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`PutObjectLockConfigurationOutput$RequestCharged`) — Requester Pays
+            // is not emulated, so nobody was charged and nothing is reported.
+            request_charged: None,
+        })
     }
 }
+
+/// The default retention `retention` describes, or the refusal for a container that does not
+/// describe one.
+///
+/// "The DefaultRetention settings require both a mode and a period. The DefaultRetention
+/// period can be either Days or Years but you must select one. You cannot specify Days and
+/// Years at the same time" (this operation's own documentation), and a period has to be one
+/// an object can really be locked for — at least a day and at most the published ceiling
+/// ([`crate::state::MAX_DEFAULT_RETENTION_YEARS`]) — so a mode without a period, a period
+/// without a mode, both periods at once and one outside those bounds are each a document the
+/// published schema does not accept.
+fn default_retention_of(
+    retention: &DefaultRetention,
+) -> Result<crate::state::BucketDefaultRetention, PutObjectLockConfigurationError> {
+    // `Mode` targets the `ObjectLockRetentionMode` enum, whose values the boundary validator
+    // already refuses anything outside; checked again here because what is stored decides the
+    // mode every new version of this bucket is locked in, so an unknown mode must never reach
+    // the store.
+    let Some(mode) = retention
+        .mode
+        .as_deref()
+        .filter(|mode| OBJECT_LOCK_RETENTION_MODE_VALUES.contains(mode))
+    else {
+        return Err(malformed_xml());
+    };
+    let period = match (retention.days, retention.years) {
+        (Some(days), None) => crate::state::DefaultRetentionPeriod::Days(days),
+        (None, Some(years)) => crate::state::DefaultRetentionPeriod::Years(years),
+        (Some(_), Some(_)) | (None, None) => return Err(malformed_xml()),
+    };
+    // The put is the only place a period can be refused, so it is refused HERE: a bucket
+    // never carries a rule whose date an object written into it could not be locked to.
+    if !period.is_within_published_bounds() {
+        return Err(malformed_xml());
+    }
+    Ok(crate::state::BucketDefaultRetention {
+        mode: mode.to_string(),
+        period,
+    })
+}
+
+/// The refusal for a configuration document the API's published schema does not accept: HTTP
+/// 400 [`crate::state::MALFORMED_XML_CODE`], carrying that code's own FIXED published
+/// sentence and nothing of this request — the answer the boundary validator also gives a
+/// value it refuses inside this operation's payload.
+fn malformed_xml() -> PutObjectLockConfigurationError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::MALFORMED_XML_CODE,
+        MALFORMED_XML_STATUS,
+        crate::state::MALFORMED_XML_MESSAGE,
+    )
+}
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses list
+/// carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The wire error code a request this emulator will not serve for the caller is refused with,
+/// and its status and message: "403 Forbidden (access denied)", the way every other handler
+/// in this crate answers an expected-bucket-owner mismatch.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";

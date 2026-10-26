@@ -51,6 +51,8 @@ mod bucket_metrics_configuration_listing;
 mod bucket_name_namespace;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
+#[path = "all/bucket_object_lock_configuration.rs"]
+mod bucket_object_lock_configuration;
 #[path = "all/bucket_ownership_controls.rs"]
 mod bucket_ownership_controls;
 #[path = "all/bucket_policy_and_tagging.rs"]

@@ -3989,6 +3989,17 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the accessor pair below is the only way in or out.
     object_lock_enabled: bool,
+    /// The default retention the bucket's Object Lock configuration names
+    /// ([`BucketDefaultRetention`]), or `None` while that configuration carries no rule —
+    /// the state a bucket Object Lock was enabled on by `CreateBucket` is in, and what makes
+    /// a write place no retention of its own.
+    ///
+    /// Only ever set beside [`Self::object_lock_enabled`]: the rule is one member of the
+    /// `ObjectLockConfiguration` that member is the other half of, and
+    /// [`Self::set_object_lock_configuration`] is the one place either of them moves.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    object_lock_rule: Option<BucketDefaultRetention>,
     /// The Transfer Acceleration state the last `PutBucketAccelerateConfiguration` set on
     /// the bucket, or `None` while the bucket has none.
     ///
@@ -4396,7 +4407,38 @@ impl Bucket {
     /// One place, so no caller can record half of that pair.
     pub fn enable_object_lock(&mut self) {
         self.object_lock_enabled = true;
-        self.set_versioning(VERSIONING_ENABLED_STATUS, None);
+        // A bucket already in that state keeps the versioning configuration it carries, MFA
+        // delete included: there is nothing to set.
+        if !self.versioning_enabled() {
+            self.set_versioning(VERSIONING_ENABLED_STATUS, None);
+        }
+    }
+
+    /// The default retention new objects written to this bucket are locked under, or `None`
+    /// when its Object Lock configuration names no rule — see [`Self::object_lock_rule`].
+    ///
+    /// A pure read: a bucket whose configuration carries no rule is reported as carrying
+    /// none rather than having one stored for it.
+    pub fn object_lock_default_retention(&self) -> Option<&BucketDefaultRetention> {
+        self.object_lock_rule.as_ref()
+    }
+
+    /// Record the `ObjectLockConfiguration` a `PutObjectLockConfiguration` carried: Object
+    /// Lock enabled on the bucket (with the versioning state Object Lock needs, through
+    /// [`Self::enable_object_lock`]), and `default_retention` as the rule its new objects are
+    /// locked under.
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Self::set_versioning`] replaces the
+    /// versioning state: the request carries "the Object Lock configuration that you want to
+    /// apply to the specified bucket"
+    /// (`PutObjectLockConfigurationRequest$ObjectLockConfiguration`) as its complete
+    /// payload, so a configuration naming no rule leaves the bucket carrying none.
+    pub fn set_object_lock_configuration(
+        &mut self,
+        default_retention: Option<BucketDefaultRetention>,
+    ) {
+        self.enable_object_lock();
+        self.object_lock_rule = default_retention;
     }
 
     /// The bucket's Transfer Acceleration state — a `BucketAccelerateStatus` value — or
@@ -5402,6 +5444,22 @@ impl Bucket {
         // The id is on the object before anything is measured, so the bytes it retains are
         // inside the budgets like every other string kept beside the payload.
         object.version_id = minted;
+        // "The rule specified in the Object Lock configuration will be applied by default to
+        // every new object placed in the specified bucket"
+        // (`PutObjectLockConfiguration`'s own documentation), so a bucket carrying a default
+        // retention locks the version this write stores — counted from that version's own
+        // creation time, and only where the write placed no retention itself, because a
+        // retention the request names is the one the object is stored with.
+        //
+        // Here, because this is the only place that sees both the bucket's configuration and
+        // the object being written: every writer gets the default rather than each one
+        // re-deriving it. Before the budgets below, so the bytes it retains are inside them.
+        if object.retention.is_none() {
+            object.retention = self
+                .object_lock_rule
+                .as_ref()
+                .and_then(|rule| rule.retention_at(object.last_modified));
+        }
         let retaining = self.keeps_superseded(key);
         let held = self.object(key).is_some();
         // The write adds an entry unless it replaces the key's current version in place,
@@ -5976,6 +6034,126 @@ impl ObjectRetention {
     /// an object ([`ObjectEncryption::retained_bytes`] counts its own the same way).
     pub fn retained_bytes(&self) -> usize {
         self.mode.len()
+    }
+}
+
+/// The one value the `ObjectLockEnabled` enum publishes
+/// (`smithy_query(query="shape",shape="ObjectLockEnabled")`, whose values
+/// [`crate::ops::types::OBJECT_LOCK_ENABLED_VALUES`] carries): "indicates whether this
+/// bucket has an Object Lock configuration enabled"
+/// (`ObjectLockConfiguration$ObjectLockEnabled`).
+///
+/// What a reader of a bucket's Object Lock configuration reports for it, and the only value
+/// a put of one may name — there is no second state for that member to be in, which is why
+/// [`Bucket::object_lock_enabled`] keeps it as a `bool`.
+pub const OBJECT_LOCK_ENABLED_STATUS: &str = "Enabled";
+
+/// How many days a default retention period of one YEAR runs for.
+///
+/// A default retention period is "the number of days" or "the number of years that you want
+/// to specify for the default retention period" (`DefaultRetention$Days` and
+/// `DefaultRetention$Years`) counted from the object's own creation time. The API publishes
+/// no calendar for the second of those, so a year is this many days here wherever it falls.
+const DAYS_PER_RETENTION_YEAR: i64 = 365;
+
+/// The longest default retention period a rule may name, in YEARS: "you can set a retention
+/// period of up to 100 years" (Amazon S3 User Guide, *S3 Object Lock*).
+///
+/// A put naming a longer period is refused rather than recorded, so every period a bucket
+/// carries is one an object written into it can really be locked for.
+pub const MAX_DEFAULT_RETENTION_YEARS: i32 = 100;
+
+/// The same ceiling in DAYS, the other unit a period may be given in: derived from
+/// [`MAX_DEFAULT_RETENTION_YEARS`] through [`DAYS_PER_RETENTION_YEAR`], so the two bounds
+/// cannot drift apart.
+pub const MAX_DEFAULT_RETENTION_DAYS: i32 =
+    MAX_DEFAULT_RETENTION_YEARS * DAYS_PER_RETENTION_YEAR as i32;
+
+/// The PERIOD a bucket's default Object Lock retention runs for.
+///
+/// "The DefaultRetention period can be either Days or Years but you must select one. You
+/// cannot specify Days and Years at the same time" (`PutObjectLockConfiguration`'s own
+/// documentation), so this is one of the two and never both nor neither — which a pair of
+/// `Option`s could not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultRetentionPeriod {
+    /// `DefaultRetention$Days` — "the number of days that you want to specify for the
+    /// default retention period".
+    Days(i32),
+    /// `DefaultRetention$Years` — "the number of years that you want to specify for the
+    /// default retention period".
+    Years(i32),
+}
+
+impl DefaultRetentionPeriod {
+    /// Whether the period is one a rule may name: it has to run FORWARD from the write it
+    /// locks, so a count of zero or fewer is no period at all, and no further than the
+    /// published ceiling ([`MAX_DEFAULT_RETENTION_YEARS`]).
+    ///
+    /// The one place that judgement lives, so what a bucket carries is always a period an
+    /// object written into it can be locked for — the write path never has to drop a lock it
+    /// cannot compute.
+    pub fn is_within_published_bounds(self) -> bool {
+        match self {
+            Self::Days(days) => (1..=MAX_DEFAULT_RETENTION_DAYS).contains(&days),
+            Self::Years(years) => (1..=MAX_DEFAULT_RETENTION_YEARS).contains(&years),
+        }
+    }
+
+    /// How many days the period runs for — a year counted as [`DAYS_PER_RETENTION_YEAR`] of
+    /// them — or `None` when that product leaves the range this type can hold.
+    fn days(self) -> Option<i64> {
+        match self {
+            Self::Days(days) => Some(i64::from(days)),
+            Self::Years(years) => i64::from(years).checked_mul(DAYS_PER_RETENTION_YEAR),
+        }
+    }
+
+    /// How many seconds the period runs for, or `None` when the arithmetic leaves the range
+    /// this type can hold.
+    fn seconds(self) -> Option<i64> {
+        self.days()?.checked_mul(SECONDS_PER_DAY)
+    }
+}
+
+/// The DEFAULT RETENTION a bucket's Object Lock configuration carries: the retention every
+/// new object placed in the bucket is locked under.
+///
+/// The members are `DefaultRetention`'s own
+/// (`smithy_query(query="shape",shape="DefaultRetention")`) less its event hold, which
+/// nothing in this emulator carries out: the `Mode` new objects are locked in and the period
+/// that lock runs for. "The DefaultRetention settings require both a mode and a period"
+/// (`PutObjectLockConfiguration`'s own documentation), so the pair is ONE value here rather
+/// than two members that could disagree, and a bucket either carries a default retention or
+/// carries none — which is why this lives behind an `Option` on [`Bucket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDefaultRetention {
+    /// An `ObjectLockRetentionMode` value — [`GOVERNANCE_RETENTION_MODE`] or
+    /// [`COMPLIANCE_RETENTION_MODE`].
+    pub mode: String,
+    /// How long after it is written an object stays locked.
+    pub period: DefaultRetentionPeriod,
+}
+
+impl BucketDefaultRetention {
+    /// The retention an object written at `written_at` is locked under by this rule.
+    ///
+    /// `None` only for a date outside the range this platform can hold, which a stored rule
+    /// cannot reach: [`DefaultRetentionPeriod::is_within_published_bounds`] is what every put
+    /// of a configuration passes through, so the period here is at most the published
+    /// ceiling.
+    ///
+    /// "The rule specified in the Object Lock configuration will be applied by default to
+    /// every new object placed in the specified bucket"
+    /// (`PutObjectLockConfiguration`'s own documentation), and the period is counted from
+    /// the object's own creation time, so the date each version is locked to is its own
+    /// rather than a property of the bucket.
+    pub fn retention_at(&self, written_at: SystemTime) -> Option<ObjectRetention> {
+        let seconds = u64::try_from(self.period.seconds()?).ok()?;
+        Some(ObjectRetention {
+            mode: self.mode.clone(),
+            retain_until: written_at.checked_add(std::time::Duration::from_secs(seconds))?,
+        })
     }
 }
 
@@ -7801,6 +7979,41 @@ pub const OBJECT_LOCK_ACCESS_DENIED_MESSAGE: &str =
 /// code/message pairs rather than being built in each of the handlers that answer it.
 pub const OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE: &str =
     "Bucket is missing Object Lock Configuration";
+
+/// The code a read of a BUCKET's Object Lock configuration answers with when the bucket
+/// carries none, with HTTP 404.
+///
+/// The subresource-not-there case for this subresource, named the way the rest of that
+/// family is ([`NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE`],
+/// `ReplicationConfigurationNotFoundError`): `GetObjectLockConfiguration` reports the
+/// `ObjectLockConfiguration` container as its WHOLE @httpPayload
+/// (`smithy_query(query="operation",operation="GetObjectLockConfiguration")`), so a 200 has
+/// no way to report "there is none".
+pub const OBJECT_LOCK_CONFIGURATION_NOT_FOUND_CODE: &str = "ObjectLockConfigurationNotFoundError";
+/// See [`OBJECT_LOCK_CONFIGURATION_NOT_FOUND_CODE`] — the fixed sentence S3 sends beside it,
+/// which names neither the bucket nor anything else of the request.
+pub const OBJECT_LOCK_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "Object Lock configuration does not exist for this bucket";
+
+/// The code S3 answers a bucket-level call the bucket's own state cannot serve:
+/// `InvalidBucketState`, HTTP 409 — the status S3's "Error responses" list carries for it
+/// ("the request is not valid with the current state of the bucket").
+///
+/// The model declares no shape for it, so it travels through the unmodelled channel with
+/// the message of the condition that was refused.
+pub const INVALID_BUCKET_STATE_CODE: &str = "InvalidBucketState";
+/// The HTTP status [`INVALID_BUCKET_STATE_CODE`] is rendered with: 409.
+pub const INVALID_BUCKET_STATE_STATUS: u16 = 409;
+
+/// The `<Message>` S3 sends beside the 409 [`INVALID_BUCKET_STATE_CODE`] of a
+/// `PutObjectLockConfiguration` addressed to a bucket whose versioning status is not
+/// `Enabled`: "Object Lock works only in versioned buckets" (Amazon S3 User Guide, *Using S3
+/// Object Lock*), so the configuration cannot be applied to such a bucket at all.
+///
+/// A fixed sentence for that one condition, naming nothing of the request — which is why it
+/// lives here beside the other code/message pairs rather than being built in the handler.
+pub const OBJECT_LOCK_VERSIONING_REQUIRED_MESSAGE: &str =
+    "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration";
 
 /// The code S3 answers a call that cannot be served because of the state the object is in:
 /// `InvalidObjectState`, HTTP 403 — the status the shape itself carries
