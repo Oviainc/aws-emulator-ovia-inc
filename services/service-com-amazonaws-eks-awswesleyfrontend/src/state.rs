@@ -2068,9 +2068,8 @@ impl NodegroupRecord {
             warm_pool_config: self.warm_pool_config.clone(),
             // `resources` names the Auto Scaling groups and the remote-access
             // security group EKS creates for the node group. This emulator
-            // creates no EC2 resources, so it reports none rather than
-            // inventing ids for resources no EC2 store holds — the same choice
-            // the cluster slice makes for `clusterSecurityGroupId` and `vpcId`.
+            // creates neither, so it reports none rather than inventing ids
+            // for resources no EC2 store holds.
             resources: None,
         }
     }
@@ -3639,13 +3638,32 @@ fn hyphenate_uuid(bytes: &[u8; 16]) -> String {
 /// used to track the update" — a version-4 UUID, `8-4-4-4-12` lowercase hex with
 /// the version and variant bits RFC 4122 §4.4 fixes.
 ///
+/// `sequence` is a counter the store hands out
+/// ([`ComAmazonawsEksAwswesleyfrontendState::next_update_sequence`]), so two ids
+/// minted in the same nanosecond cannot collide. An update id names a resource for
+/// correlation, never a credential.
+pub fn new_update_id(sequence: u64) -> String {
+    new_uuid_v4(sequence)
+}
+
+/// The id of the call this service made to ANOTHER service on the caller's
+/// behalf, as it is reported back to that caller.
+///
+/// A request identifier is generated per call — it is what correlates one answer
+/// with the call behind it — so it is drawn afresh here and derived from nothing
+/// in the request.
+pub fn new_peer_request_id() -> String {
+    new_uuid_v4(0)
+}
+
+/// A fresh version-4 UUID, `8-4-4-4-12` lowercase hex with the version and
+/// variant bits RFC 4122 §4.4 fixes — the one minter behind every identifier this
+/// service gives that shape to.
+///
 /// The 128 bits come from three sources hashed together with SHA-256 (the `sha2`
 /// crate) and hex-encoded (the `hex` crate): the OS-seeded randomness a
-/// `RandomState` draws, the system clock in nanoseconds, and `sequence` — a
-/// counter the store hands out ([`ComAmazonawsEksAwswesleyfrontendState::next_update_sequence`]),
-/// so two ids minted in the same nanosecond cannot collide. An update id names a
-/// resource for correlation, never a credential.
-pub fn new_update_id(sequence: u64) -> String {
+/// `RandomState` draws, the system clock in nanoseconds, and `sequence`.
+fn new_uuid_v4(sequence: u64) -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
 
@@ -4799,17 +4817,44 @@ fn iam_role_is_absent(
 /// anything. The subnets of the account are EC2's, so EC2 is asked: it answers
 /// `InvalidSubnetID.NotFound` for an id no subnet of the account carries, and
 /// the message it gives — which names that id — is carried through to the
-/// caller with the service, status and error code it came from, the way Amazon
-/// EKS reports a failure of a call it made on the caller's behalf.
+/// caller with the service, status, error code, request id and proxy of the call
+/// it came from, the way Amazon EKS reports a failure of a call it made on the
+/// caller's behalf.
 pub async fn unresolved_subnet_refusal(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
 ) -> Option<String> {
+    resolve_subnets(ctx, region, subnet_ids).await.refusal
+}
+
+/// What EC2 answered about the subnets a request names.
+///
+/// One `DescribeSubnets` answers both of the questions a create asks about them:
+/// whether every id resolves, and — because Amazon EKS provisions the cluster's
+/// own EC2 resources in the network those subnets sit in — which VPC that is.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSubnets {
+    /// Why the list does not resolve, in the wrapped form Amazon EKS reports a
+    /// failure of a call it made on the caller's behalf in. `None` when EC2
+    /// resolved every id, and also when this emulator has no EC2 to ask.
+    pub refusal: Option<String>,
+    /// The VPC every subnet EC2 reported belongs to. `None` when nothing
+    /// answered, and when the reported subnets do not agree on one VPC.
+    pub vpc_id: Option<String>,
+}
+
+/// Resolve `subnet_ids` against EC2: the one reading of a request's subnets, which
+/// [`unresolved_subnet_refusal`] is the refusal half of.
+pub async fn resolve_subnets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> ResolvedSubnets {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
     if subnet_ids.is_empty() {
-        return None;
+        return ResolvedSubnets::default();
     }
     let answer = callback_client!(
         aws_sdk_ec2,
@@ -4822,7 +4867,24 @@ pub async fn unresolved_subnet_refusal(
     .send()
     .await;
     // Every requested id resolved: EC2 reports the subnets rather than refusing.
-    let error = answer.err()?;
+    // A subnet belongs to exactly one VPC, so the VPC a cluster is created in is
+    // the one every subnet it names agrees on; a list that spans two names no
+    // single network to provision in, and none is reported.
+    let error = match answer {
+        Ok(output) => {
+            let mut reported = output
+                .subnets()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::Subnet::vpc_id);
+            let first = reported.next().map(str::to_string);
+            let vpc_id = first.filter(|vpc_id| reported.all(|other| other == vpc_id.as_str()));
+            return ResolvedSubnets {
+                refusal: None,
+                vpc_id,
+            };
+        }
+        Err(error) => error,
+    };
     let code = error
         .as_service_error()
         .and_then(ProvideErrorMetadata::code)
@@ -4833,7 +4895,7 @@ pub async fn unresolved_subnet_refusal(
             error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
             "the requested subnets could not be resolved against EC2"
         );
-        return None;
+        return ResolvedSubnets::default();
     }
     let status = error
         .raw_response()
@@ -4849,9 +4911,188 @@ pub async fn unresolved_subnet_refusal(
             || format!("One of the subnet IDs {subnet_ids:?} does not exist"),
             str::to_string,
         );
-    Some(format!(
-        "{detail} (Service: AmazonEC2; {status}Error Code: {code})"
-    ))
+    // The wrapped form AWS reports an inner service's failure in names the service,
+    // the status and the error code it answered, the id of the call that was made
+    // and the proxy it went through — there is none, so that field is `null`. The
+    // tail is what a caller (or its tooling) correlates this refusal with the call
+    // behind it by, so it is part of the message rather than an addition to it.
+    let request_id = new_peer_request_id();
+    ResolvedSubnets {
+        refusal: Some(format!(
+            "{detail} (Service: AmazonEC2; {status}Error Code: {code}; \
+             Request ID: {request_id}; Proxy: null)"
+        )),
+        vpc_id: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The cluster security group slice.
+//
+// Creating a cluster provisions one security group of its own in the VPC the
+// cluster's subnets sit in: the group every node group, add-on and
+// cluster-to-node rule is authorised against. It is EC2's resource, so EC2 is
+// where it is created and deleted — over the same in-process callback every
+// cross-service reading above goes through — and deleting the cluster releases
+// it, because the group exists only for that cluster.
+// ---------------------------------------------------------------------------
+
+/// The name prefix Amazon EKS gives the security group it creates with a cluster:
+/// `eks-cluster-sg-<cluster name>-<suffix>`.
+pub const CLUSTER_SECURITY_GROUP_NAME_PREFIX: &str = "eks-cluster-sg-";
+
+/// The description that group carries, which says what it is attached to.
+pub const CLUSTER_SECURITY_GROUP_DESCRIPTION: &str =
+    "EKS created security group applied to ENI that is attached to EKS Control \
+     Plane master nodes, as well as any managed workloads.";
+
+/// The tag Amazon EKS stamps on the EC2 resources it owns for a cluster, naming
+/// that cluster. It sits in AWS's own `aws:` tag namespace, so no caller can set
+/// it — which is what makes it the handle a client finds the group by.
+pub const CLUSTER_NAME_TAG: &str = "aws:eks:cluster-name";
+
+/// The prefix of the Kubernetes cluster-ownership tag,
+/// `kubernetes.io/cluster/<cluster name>`: the tag the in-cluster AWS cloud
+/// provider reads to decide which resources belong to the cluster.
+pub const KUBERNETES_CLUSTER_TAG_PREFIX: &str = "kubernetes.io/cluster/";
+
+/// That tag's value on a resource the cluster itself OWNS, as opposed to one it
+/// only shares.
+pub const KUBERNETES_CLUSTER_OWNED: &str = "owned";
+
+/// The tag an EC2 resource's display name is read from.
+const NAME_TAG: &str = "Name";
+
+/// The number of decimal digits the numeric suffix of a cluster security group's
+/// name carries.
+const CLUSTER_SECURITY_GROUP_SUFFIX_DIGITS: u32 = 10;
+
+/// The name of the security group a cluster owns.
+///
+/// The numeric suffix is derived from the cluster's own stable resource id
+/// ([`derive_cluster_resource_id`]), so it is distinct per cluster, the same on
+/// every read, and never borrowed from the request. `resource_id` is therefore
+/// expected to be that 32-hex-character id; a value that is not — which nothing
+/// in this crate produces — draws its suffix from a zero seed rather than
+/// refusing a name, because a group name is not what a create is refused over.
+pub fn cluster_security_group_name(cluster_name: &str, resource_id: &str) -> String {
+    // The low bound is the first number of this width, so the suffix never
+    // renders narrower than the width Amazon EKS publishes it at.
+    let floor = 10_u64.pow(CLUSTER_SECURITY_GROUP_SUFFIX_DIGITS - 1);
+    let span = 10_u64.pow(CLUSTER_SECURITY_GROUP_SUFFIX_DIGITS) - floor;
+    // 15 hex digits is the widest slice of the id that cannot overflow a `u64`.
+    let seed = resource_id
+        .get(..15)
+        .and_then(|head| u64::from_str_radix(head, 16).ok())
+        .unwrap_or_default();
+    let suffix = floor + seed % span;
+    format!("{CLUSTER_SECURITY_GROUP_NAME_PREFIX}{cluster_name}-{suffix}")
+}
+
+/// Mint the security group a new cluster owns, in `vpc_id`, and report its id.
+///
+/// `None` when EC2 did not create it — including when this emulator has no EC2 to
+/// create it in, which is the same silence [`resolve_subnets`] refuses nothing on:
+/// the cluster is still created, it just owns no group.
+pub async fn mint_cluster_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    cluster_name: &str,
+    resource_id: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    let ec2 = callback_client!(
+        aws_sdk_ec2,
+        ctx,
+        format!("https://ec2.{region}.amazonaws.com"),
+        region
+    );
+    let group_name = cluster_security_group_name(cluster_name, resource_id);
+    let created = ec2
+        .create_security_group()
+        .group_name(&group_name)
+        .description(CLUSTER_SECURITY_GROUP_DESCRIPTION)
+        .vpc_id(vpc_id)
+        .send()
+        .await;
+    let group_id = match created {
+        Ok(output) => output.group_id,
+        Err(error) => {
+            ::tracing::warn!(
+                %cluster_name,
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the cluster security group could not be created in EC2"
+            );
+            None
+        }
+    }?;
+    // The group is tagged as the cluster's: the `aws:` key naming the cluster that
+    // owns it, the Kubernetes ownership tag the in-cluster cloud provider reads,
+    // and the display name the group was created under.
+    let tags: Vec<::aws_sdk_ec2::types::Tag> = [
+        (CLUSTER_NAME_TAG.to_string(), cluster_name.to_string()),
+        (
+            format!("{KUBERNETES_CLUSTER_TAG_PREFIX}{cluster_name}"),
+            KUBERNETES_CLUSTER_OWNED.to_string(),
+        ),
+        (NAME_TAG.to_string(), group_name),
+    ]
+    .into_iter()
+    .map(|(key, value)| {
+        ::aws_sdk_ec2::types::Tag::builder()
+            .key(key)
+            .value(value)
+            .build()
+    })
+    .collect();
+    let tagged = ec2
+        .create_tags()
+        .resources(group_id.clone())
+        .set_tags(Some(tags))
+        .send()
+        .await;
+    if let Err(error) = tagged {
+        // The group exists and is the cluster's, so it is reported and released
+        // with the cluster either way; what a failure here costs is the tags a
+        // client finds it by, which is worth a warning.
+        ::tracing::warn!(
+            %cluster_name,
+            %group_id,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the cluster security group could not be tagged in EC2"
+        );
+    }
+    Some(group_id)
+}
+
+/// Release the security group a deleted cluster owned.
+///
+/// A group this emulator cannot delete is reported rather than refused: the
+/// cluster is already gone from this service's store, and `DeleteCluster` has no
+/// failure to answer the caller with for a resource of another service.
+pub async fn release_cluster_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    group_id: &str,
+) {
+    let released = callback_client!(
+        aws_sdk_ec2,
+        ctx,
+        format!("https://ec2.{region}.amazonaws.com"),
+        region
+    )
+    .delete_security_group()
+    .group_id(group_id)
+    .send()
+    .await;
+    if let Err(error) = released {
+        ::tracing::warn!(
+            %group_id,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the cluster security group could not be deleted from EC2"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -19,10 +19,16 @@
 //! [`crate::state::CLUSTER_ACTIVATION_DELAY`] later; the due instant is stored on the
 //! record and materialised by whichever read first runs after it.
 //!
+//! It also provisions the cluster's OWN security group in EC2
+//! ([`crate::state::mint_cluster_security_group`]) — one group in the VPC the request's
+//! subnets belong to, tagged as that cluster's, which appears while the cluster is still
+//! `CREATING` and which `DeleteCluster` releases. Its id and that VPC are what the
+//! cluster's `resourcesVpcConfig` reports for `clusterSecurityGroupId` and `vpcId`.
+//!
 //! Nothing is written until the request is AUTHORIZED and its inputs RESOLVE: the role
 //! ARNs it asks Amazon EKS to pass must be roles of this account
 //! ([`crate::state::pass_role_refusal`], 403 `AccessDeniedException`), and the subnets it
-//! names must exist in EC2 ([`crate::state::unresolved_subnet_refusal`], 400
+//! names must exist in EC2 ([`crate::state::resolve_subnets`], 400
 //! `InvalidParameterException`) — a cluster is never minted against a role the caller
 //! cannot pass or a subnet nothing holds.
 //!
@@ -369,101 +375,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Amazon EKS "provisions elastic network interfaces in your VPC subnets", so the
         // subnets the request names have to exist before a control plane is provisioned
         // in them. They are EC2's resources, so EC2 is what resolves them
-        // ([`state::unresolved_subnet_refusal`]); an id that names no subnet of the
+        // ([`state::resolve_subnets`]); an id that names no subnet of the
         // account is reported as the invalid parameter it is, with the cluster name set,
-        // and nothing is written. It runs with no lock held: it is a call out to another
+        // and nothing is written. The same answer carries the VPC those subnets sit in,
+        // which is the network the cluster's own EC2 resources are provisioned in. It
+        // runs with no lock held: it is a call out to another service.
+        let resolved_subnets = match input.resources_vpc_config.subnet_ids.as_deref() {
+            Some(subnet_ids) => state::resolve_subnets(ctx, &region, subnet_ids).await,
+            None => state::ResolvedSubnets::default(),
+        };
+        if let Some(why) = resolved_subnets.refusal {
+            return Err(invalid_parameter(&input.name, why));
+        }
+
+        // Everything the record carries is computed from the request, the account and
+        // the clock — nothing in it is read out of the store — so it is built BEFORE the
+        // store is locked. The refusals the store decides, and the insert, then happen
+        // under ONE lock below: two concurrent creates of one name cannot both get past
+        // the uniqueness check, and the lock is never held across a call to another
         // service.
-        if let Some(subnet_ids) = input.resources_vpc_config.subnet_ids.as_deref() {
-            if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, subnet_ids).await {
-                return Err(invalid_parameter(&input.name, why));
-            }
-        }
-
-        let mut guard = store.lock();
-        guard.materialize_due_transitions(now);
-
-        // "The name must be unique within the Amazon Web Services Region and Amazon Web
-        // Services account that you're creating the cluster in." The store is keyed
-        // `(region, name)` and this emulator serves a single account, so the same name
-        // in another region is a different cluster.
-        if let Some(existing) = guard.clusters.get(&(region.clone(), input.name.clone())) {
-            // `clientRequestToken` is `@idempotencyToken`: "A unique, case-sensitive
-            // identifier that you provide to ensure the idempotency of the request."
-            // An SDK generates it once per call and RESENDS the same value when it
-            // retries, so a retry of the call that created this cluster must be
-            // absorbed and answered with that cluster — not with a conflict.
-            //
-            // A blank token identifies nothing, so it never matches: absorbing on it
-            // would make two unrelated calls that both sent `""` look like a retry of
-            // each other. The comparison is on the token alone — this does not check
-            // that the rest of the retry's body matches the stored record, which is a
-            // simplification of what the real service does with a reused token.
-            let replayed_token = input
-                .client_request_token
-                .as_deref()
-                .filter(|token| !token.trim().is_empty());
-            if let Some(token) = replayed_token {
-                // And only a retry of a CREATE: a token that happens to match the
-                // one a `RegisterCluster` used for this name is not a retry of this
-                // call, so it conflicts rather than answering with a connected
-                // cluster the caller never asked for.
-                if !existing.is_connected() && existing.client_request_token.as_deref() == Some(token)
-                {
-                    return Ok(CreateClusterOutput {
-                        cluster: Some(existing.to_cluster()),
-                    });
-                }
-            }
-            return Err(CreateClusterErrorModeled::ResourceInUseException(
-                ResourceInUseException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "Cluster already exists with name: {}",
-                        input.name
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
-        // The EKS "Clusters" service quota (100 per Region per account). Exceeding a
-        // service limit is what `ResourceLimitExceededException` reports. It is counted
-        // per REGION, which is how the quota is published.
-        if guard.cluster_names_in(&region).count() >= MAX_CLUSTERS {
-            return Err(CreateClusterErrorModeled::ResourceLimitExceededException(
-                ResourceLimitExceededException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "You have reached the limit of {MAX_CLUSTERS} clusters for this \
-                         account in this Region"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
-        // What BOUNDS THE STORE is the ceiling below, not the per-region quota above:
-        // the region a record is filed under is read from the caller's own credential
-        // scope, so the caller decides how many regions exist and the per-region quota
-        // alone would let repeated creates retain an unbounded number of records. This
-        // check dominates every insert, whatever region each request claims. It is
-        // reported with the same modelled service-limit error.
-        if guard.clusters.len() >= MAX_STORED_CLUSTERS {
-            return Err(CreateClusterErrorModeled::ResourceLimitExceededException(
-                ResourceLimitExceededException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "You have reached the limit of {MAX_STORED_CLUSTERS} clusters for \
-                         this account"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
         let arn = ::engine::emulator_arn("eks", &region, &format!("cluster/{}", input.name));
         let resource_id = state::derive_cluster_resource_id(&arn);
 
@@ -504,11 +434,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resources_vpc_config = VpcConfigResponse {
             subnet_ids: vpc_request.subnet_ids.clone(),
             security_group_ids: vpc_request.security_group_ids.clone(),
-            // This emulator creates no EC2 resources, so it reports neither a
-            // cluster security group nor a resolved VPC rather than inventing ids
-            // for resources no EC2 store holds. Both are optional in the model.
+            // The group Amazon EKS creates for the cluster is minted below, once
+            // the cluster is in the store and the lock this runs under is
+            // released; until EC2 answers with its id there is none to report,
+            // and a cluster whose subnets no EC2 resolved never gets one.
             cluster_security_group_id: None,
-            vpc_id: None,
+            vpc_id: resolved_subnets.vpc_id.clone(),
             endpoint_public_access: vpc_request.endpoint_public_access.unwrap_or(true),
             endpoint_private_access: vpc_request.endpoint_private_access.unwrap_or(false),
             public_access_cidrs: Some(public_access_cidrs),
@@ -671,11 +602,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             insights_refresh: None,
         };
 
-        let cluster = record.to_cluster();
-        guard
-            .arn_index
-            .insert(arn, (region.clone(), input.name.clone()));
-        guard.clusters.insert((region, input.name), record);
+        let key = (region.clone(), input.name.clone());
+        // The store's own refusals and the write, under ONE lock — which is released
+        // before anything is asked of another service.
+        let mut cluster = {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(now);
+
+            // "The name must be unique within the Amazon Web Services Region and Amazon Web
+            // Services account that you're creating the cluster in." The store is keyed
+            // `(region, name)` and this emulator serves a single account, so the same name
+            // in another region is a different cluster.
+            if let Some(existing) = guard.clusters.get(&key) {
+                // `clientRequestToken` is `@idempotencyToken`: "A unique, case-sensitive
+                // identifier that you provide to ensure the idempotency of the request."
+                // An SDK generates it once per call and RESENDS the same value when it
+                // retries, so a retry of the call that created this cluster must be
+                // absorbed and answered with that cluster — not with a conflict.
+                //
+                // A blank token identifies nothing, so it never matches: absorbing on it
+                // would make two unrelated calls that both sent `""` look like a retry of
+                // each other. The comparison is on the token alone — this does not check
+                // that the rest of the retry's body matches the stored record, which is a
+                // simplification of what the real service does with a reused token.
+                let replayed_token = record
+                    .client_request_token
+                    .as_deref()
+                    .filter(|token| !token.trim().is_empty());
+                if let Some(token) = replayed_token {
+                    // And only a retry of a CREATE: a token that happens to match the
+                    // one a `RegisterCluster` used for this name is not a retry of this
+                    // call, so it conflicts rather than answering with a connected
+                    // cluster the caller never asked for.
+                    if !existing.is_connected()
+                        && existing.client_request_token.as_deref() == Some(token)
+                    {
+                        return Ok(CreateClusterOutput {
+                            cluster: Some(existing.to_cluster()),
+                        });
+                    }
+                }
+                return Err(CreateClusterErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        cluster_name: Some(record.name.clone()),
+                        message: Some(format!(
+                            "Cluster already exists with name: {}",
+                            record.name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+
+            // The EKS "Clusters" service quota (100 per Region per account). Exceeding a
+            // service limit is what `ResourceLimitExceededException` reports. It is counted
+            // per REGION, which is how the quota is published.
+            if guard.cluster_names_in(&region).count() >= MAX_CLUSTERS {
+                return Err(CreateClusterErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        cluster_name: Some(record.name.clone()),
+                        message: Some(format!(
+                            "You have reached the limit of {MAX_CLUSTERS} clusters for this \
+                             account in this Region"
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+
+            // What BOUNDS THE STORE is the ceiling below, not the per-region quota above:
+            // the region a record is filed under is read from the caller's own credential
+            // scope, so the caller decides how many regions exist and the per-region quota
+            // alone would let repeated creates retain an unbounded number of records. This
+            // check dominates every insert, whatever region each request claims. It is
+            // reported with the same modelled service-limit error.
+            if guard.clusters.len() >= MAX_STORED_CLUSTERS {
+                return Err(CreateClusterErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        cluster_name: Some(record.name.clone()),
+                        message: Some(format!(
+                            "You have reached the limit of {MAX_STORED_CLUSTERS} clusters for \
+                             this account"
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+
+            let cluster = record.to_cluster();
+            guard.arn_index.insert(arn, key.clone());
+            guard.clusters.insert(key.clone(), record);
+            cluster
+        };
+
+        // Creating a cluster provisions ONE security group of its own, in the VPC the
+        // cluster's subnets belong to: the group every node group, add-on and
+        // cluster-to-node rule is authorised against. It appears while the cluster is
+        // still `CREATING`, which is why it is minted here rather than when the clock
+        // owes the cluster `ACTIVE`, and `DeleteCluster` releases it. A VPC nothing
+        // resolved leaves the cluster with no group, the same way an unresolved subnet
+        // refuses nothing ([`state::resolve_subnets`]).
+        if let Some(vpc_id) = resolved_subnets.vpc_id.as_deref() {
+            let minted =
+                state::mint_cluster_security_group(ctx, &region, &key.1, &resource_id, vpc_id)
+                    .await;
+            if let Some(group_id) = minted {
+                // The cluster is read back rather than assumed: a `DeleteCluster` could
+                // have removed it while the group was being created. A record with
+                // nowhere to report the group — one carrying no `resourcesVpcConfig`,
+                // which this create never writes — is treated the same way, so the group
+                // is never left untracked in EC2.
+                let reported = {
+                    let mut guard = store.lock();
+                    guard.clusters.get_mut(&key).and_then(|record| {
+                        let vpc_config = record.resources_vpc_config.as_mut()?;
+                        vpc_config.cluster_security_group_id = Some(group_id.clone());
+                        Some(record.to_cluster())
+                    })
+                };
+                match reported {
+                    Some(updated) => cluster = updated,
+                    None => {
+                        state::release_cluster_security_group(ctx, &region, &group_id).await;
+                    }
+                }
+            }
+        }
 
         Ok(CreateClusterOutput {
             cluster: Some(cluster),

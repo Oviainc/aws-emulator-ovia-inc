@@ -315,6 +315,13 @@ mod cloudformation_ec2_network_identifiers;
 // every concurrently landing suite puts its line.
 #[path = "all/cloudformation_provisions_wafv2_entities.rs"]
 mod cloudformation_provisions_wafv2_entities;
+// Declared HERE, in this quiet `n`/`o` gap rather than in the appended tail or beside the
+// other `eks_*` suite: both of those are where concurrently landing suites put their line.
+// `eks_wire` is this test crate's shared EKS request harness, not a suite of its own.
+#[path = "all/eks_wire.rs"]
+mod eks_wire;
+#[path = "all/eks_cluster_security_group.rs"]
+mod eks_cluster_security_group;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

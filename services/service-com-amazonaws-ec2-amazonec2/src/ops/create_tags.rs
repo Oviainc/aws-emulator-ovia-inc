@@ -12,6 +12,10 @@
 //! An id naming no resource this account holds is refused rather than silently accepted,
 //! and every id in the request is resolved BEFORE any tag is written.
 //!
+//! AWS's reserved `aws:` tag namespace is refused to a CALLER and accepted from another
+//! emulated AWS service tagging what it provisioned on a caller's behalf
+//! ([`crate::state::is_cross_service_request`]), which is who sets those tags in AWS.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,12 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, instance_id_is_well_formed, require_service_state, tag_bytes,
-            validate_tag_size, MAX_RESOURCE_IDS, MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE,
-            RESERVED_TAG_PREFIX,
+            deduplicate_ids, instance_id_is_well_formed, is_cross_service_request,
+            require_service_state, tag_bytes, validate_tag_size, MAX_RESOURCE_IDS,
+            MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE, RESERVED_TAG_PREFIX,
         };
 
-        let _ = ctx;
+        // "Do not use the `aws:` prefix … it is reserved for AWS use": the rule binds a
+        // CALLER, and the AWS services that provision resources on a caller's behalf are
+        // what set those tags on what they provision. A request that reached here through
+        // the emulator's in-process callback is one of those services, not the caller.
+        let sets_aws_managed_tags = is_cross_service_request(ctx.parts());
 
         if input.resources.is_empty() {
             return Err(Scaffolded::missing_parameter(
@@ -208,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "A tag key cannot be empty",
                 ));
             }
-            if key.starts_with(RESERVED_TAG_PREFIX) {
+            if !sets_aws_managed_tags && key.starts_with(RESERVED_TAG_PREFIX) {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "Tag key '{key}' is invalid: the '{RESERVED_TAG_PREFIX}' prefix is reserved"
                 )));

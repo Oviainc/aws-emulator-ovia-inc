@@ -12871,6 +12871,32 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEc2Amazonec2State>)
 }
 
+/// Whether this request was made by ANOTHER emulated service acting on a caller's
+/// behalf, rather than by the caller itself.
+///
+/// The two are told apart by where the request came from, not by anything in it: the
+/// framework stamps a request a handler sent through its in-process callback with that
+/// chain's depth, and a request that arrived from a client carries none. A client
+/// cannot spell the marker, because it is a typed request extension of this process
+/// and not anything on the wire.
+///
+/// What it decides here is the reserved tag namespace. "Do not use the `aws:` prefix …
+/// it is reserved for AWS use" is a rule about a CALLER's request ([`RESERVED_TAG_PREFIX`]):
+/// the AWS services that provision resources on a caller's behalf are what SET those
+/// tags on what they provision, and a resource created for another service's resource
+/// carries them.
+///
+/// The allowance is on where the request CAME FROM, not on which key it names: EC2 cannot
+/// tell which service is calling, so it is the calling service's own job not to forward a
+/// key its caller supplied — a service that takes tags from a caller and re-sends them
+/// must drop the reserved ones first, as the one in this tree does.
+pub fn is_cross_service_request(parts: &::http::request::Parts) -> bool {
+    parts
+        .extensions
+        .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+        .is_some_and(|depth| depth.0 > 0)
+}
+
 // =============================================================================
 // Verified Access trust providers
 // =============================================================================

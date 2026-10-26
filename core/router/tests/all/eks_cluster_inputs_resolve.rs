@@ -31,190 +31,21 @@
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and
 //! the requests driven — on a sized thread.
+//!
+//! The request harness is the test crate's own: `eks_wire` for the drivers and the answer,
+//! `query_wire` for the XML readers.
 
 use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
-use smithy_server_runtime::MultiServiceRouter;
+
+use crate::eks_wire::{
+    cluster_body, ec2, eks, iam, role_arn, Answer, EC2_NOT_FOUND_CODE,
+};
+use crate::query_wire::opt_element;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
-
-/// The region every request below is signed for.
-const REGION: &str = "us-west-2";
-
-/// The EC2 API version a client sends in an ec2Query body.
-const EC2_API_VERSION: &str = "2016-11-15";
-
-/// The error code EC2 answers for a subnet id no subnet of the account carries, which is
-/// what the EKS refusal carries through.
-const EC2_NOT_FOUND_CODE: &str = "InvalidSubnetID.NotFound";
-
-/// A SigV4 `Authorization` header whose credential scope names `signing_name`.
-/// The signature is never checked: this router runs with authentication off.
-fn authorization(signing_name: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
-         SignedHeaders=host;x-amz-date, Signature=deadbeef"
-    )
-}
-
-/// One answer, reduced to what a client branches on.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    /// The error code, from the `x-amzn-errortype` header or the JSON envelope.
-    error_type: Option<String>,
-    text: String,
-    body: serde_json::Value,
-}
-
-impl Answer {
-    /// The error message, whichever casing the envelope carries it under.
-    fn message(&self) -> String {
-        self.body
-            .get("message")
-            .or_else(|| self.body.get("Message"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-}
-
-fn send(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    signing_name: &str,
-    method: &str,
-    uri: &str,
-    content_type: &str,
-    body: String,
-) -> Answer {
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{signing_name}.{REGION}.amazonaws.com{uri}"))
-        .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
-        .header("authorization", authorization(signing_name))
-        .header("content-type", content_type)
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = runtime.block_on(router.dispatch(request));
-    let status = response.status().as_u16();
-    let header_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-    let error_type = header_type.or_else(|| {
-        body.get("__type")
-            .and_then(serde_json::Value::as_str)
-            .map(|value| value.rsplit(['#', ':']).next().unwrap_or("").to_string())
-    });
-    Answer {
-        status,
-        error_type,
-        text,
-        body,
-    }
-}
-
-/// Drive one EKS request (restJson1).
-fn eks(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    method: &str,
-    uri: &str,
-    body: Option<serde_json::Value>,
-) -> Answer {
-    let payload = body.map(|json| json.to_string()).unwrap_or_default();
-    send(
-        router,
-        runtime,
-        "eks",
-        method,
-        uri,
-        "application/json",
-        payload,
-    )
-}
-
-/// Percent-encode the characters that are significant in an
-/// `application/x-www-form-urlencoded` body, leaving everything else as a client's own
-/// encoder would (`:` and `/` in a CIDR block or a policy document).
-fn form_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '+' => "%2B".to_string(),
-            '%' => "%25".to_string(),
-            ' ' => "%20".to_string(),
-            ';' => "%3B".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
-}
-
-/// Drive one ec2Query action: `POST /` with the parameters in the form body.
-fn ec2(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    action: &str,
-    params: &[(&str, &str)],
-) -> Answer {
-    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
-    for (name, value) in params {
-        body.push_str(&format!("&{name}={}", form_value(value)));
-    }
-    send(
-        router,
-        runtime,
-        "ec2",
-        "POST",
-        "/",
-        "application/x-www-form-urlencoded",
-        body,
-    )
-}
-
-/// Drive one awsQuery IAM action.
-fn iam(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    action: &str,
-    params: &[(&str, &str)],
-) -> Answer {
-    let mut body = format!("Action={action}&Version=2010-05-08");
-    for (name, value) in params {
-        body.push_str(&format!("&{name}={}", form_value(value)));
-    }
-    send(
-        router,
-        runtime,
-        "iam",
-        "POST",
-        "/",
-        "application/x-www-form-urlencoded",
-        body,
-    )
-}
-
-/// The text of the first `<name>…</name>` element in an XML body.
-fn element(xml: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-/// A role ARN of this account, under the default path.
-fn role_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
-}
 
 /// A trust policy with one statement, built from the pieces that vary between rows.
 ///
@@ -225,15 +56,6 @@ fn trust_policy(effect: &str, action: &str, service: &str) -> String {
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
          \"Principal\":{{\"Service\":{service}}},\"Action\":{action}}}]}}"
     )
-}
-
-/// A `CreateCluster` body naming `subnets`.
-fn cluster_body(name: &str, subnets: &[String]) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "roleArn": role_arn("eksClusterRole"),
-        "resourcesVpcConfig": { "subnetIds": subnets },
-    })
 }
 
 /// One subnet row: the ids a create names, and the id (if any) that resolves to nothing.
@@ -298,7 +120,7 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                 created.status, 200,
                 "setup: CreateVpc must succeed, got {created:?}"
             );
-            let vpc_id = element(&created.text, "vpcId")
+            let vpc_id = opt_element(&created.text, "vpcId")
                 .unwrap_or_else(|| panic!("setup: no <vpcId> in {}", created.text));
             let mut client_subnets: Vec<String> = Vec::new();
             for cidr_block in ["10.9.1.0/24", "10.9.2.0/24"] {
@@ -313,7 +135,7 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                     "setup: CreateSubnet {cidr_block} must succeed, got {answer:?}"
                 );
                 client_subnets.push(
-                    element(&answer.text, "subnetId")
+                    opt_element(&answer.text, "subnetId")
                         .unwrap_or_else(|| panic!("setup: no <subnetId> in {}", answer.text)),
                 );
             }
@@ -333,7 +155,7 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                 defaults.status, 200,
                 "setup: DescribeSubnets must succeed, got {defaults:?}"
             );
-            let default_subnet = element(&defaults.text, "subnetId").unwrap_or_else(|| {
+            let default_subnet = opt_element(&defaults.text, "subnetId").unwrap_or_else(|| {
                 panic!(
                     "setup: the account must have a default subnet, got {}",
                     defaults.text

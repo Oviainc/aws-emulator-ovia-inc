@@ -7,6 +7,10 @@
 //! and `ListClusters` no longer lists it. Its EKS Pod Identity associations, which
 //! are children of the cluster, are removed with it.
 //!
+//! The security group `CreateCluster` provisioned for the cluster in EC2 is released
+//! with it ([`crate::state::release_cluster_security_group`]): that group exists only
+//! for this cluster, so nothing holds it once the cluster is gone.
+//!
 //! A cluster created with `deletionProtection` is refused with
 //! `InvalidRequestException` and left in the store: "the cluster cannot be deleted
 //! unless deletion protection is first disabled".
@@ -157,55 +161,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        let mut guard = store.lock();
-        guard.materialize_due_transitions(SystemTime::now());
-
         // A cluster name identifies a cluster only within one region, so this deletes
         // the one in the region the request is signed for.
         let key = (region, input.name.clone());
-        let Some(existing) = guard.clusters.get(&key) else {
-            return Err(not_found());
+
+        // The cluster leaves this service's state under ONE lock; the group it owned in
+        // EC2 is released after that lock is given up, because releasing it is a call
+        // out to another service.
+        let (cluster, owned_group) = {
+            let mut guard = store.lock();
+            guard.materialize_due_transitions(SystemTime::now());
+
+            let Some(existing) = guard.clusters.get(&key) else {
+                return Err(not_found());
+            };
+            if existing.deletion_protection {
+                return Err(DeleteClusterErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        cluster_name: Some(input.name.clone()),
+                        message: Some(format!(
+                            "Cluster {} has deletion protection enabled. Disable deletion \
+                             protection before deleting the cluster.",
+                            input.name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+
+            let Some(mut record) = guard.clusters.remove(&key) else {
+                return Err(not_found());
+            };
+            guard.arn_index.remove(&record.arn);
+            // An add-on exists only inside its cluster, so the add-ons installed on this
+            // one go with it; otherwise a cluster created again under the same name would
+            // inherit the add-ons of the cluster that is gone.
+            guard.remove_cluster_addons(&key.0, &key.1);
+            guard.remove_capabilities_of(&key.0, &key.1);
+            // An EKS Pod Identity association is a child of its cluster, so the
+            // cluster's associations go with it: a cluster later created with the same
+            // name in the same Region must not inherit the deleted cluster's
+            // associations.
+            guard.remove_pod_identity_associations_for_cluster(&key.0, &key.1);
+            // And so is a managed node group, for the same reason.
+            guard.remove_nodegroups_for_cluster(&key.0, &key.1);
+            // And so is a Fargate profile, for the same reason.
+            guard.remove_fargate_profiles_for_cluster(&key.0, &key.1);
+            record.status = STATUS_DELETING.to_string();
+            // The cluster is gone, so the `CREATING` -> `ACTIVE` move the clock owed it is
+            // no longer owed to anybody.
+            record.active_at = None;
+
+            // The security group the create provisioned for this cluster in EC2 goes
+            // with it: that group exists only for this cluster, so nothing holds it once
+            // the cluster is gone.
+            let owned_group = record
+                .resources_vpc_config
+                .as_ref()
+                .and_then(|vpc_config| vpc_config.cluster_security_group_id.clone());
+            (record.to_cluster(), owned_group)
         };
-        if existing.deletion_protection {
-            return Err(DeleteClusterErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!(
-                        "Cluster {} has deletion protection enabled. Disable deletion \
-                         protection before deleting the cluster.",
-                        input.name
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+
+        // The cluster has already left this service's state, so the answer does not
+        // depend on what EC2 says about the group.
+        if let Some(group_id) = owned_group {
+            crate::state::release_cluster_security_group(ctx, &key.0, &group_id).await;
         }
 
-        let Some(mut record) = guard.clusters.remove(&key) else {
-            return Err(not_found());
-        };
-        guard.arn_index.remove(&record.arn);
-        // An add-on exists only inside its cluster, so the add-ons installed on this
-        // one go with it; otherwise a cluster created again under the same name would
-        // inherit the add-ons of the cluster that is gone.
-        guard.remove_cluster_addons(&key.0, &key.1);
-        guard.remove_capabilities_of(&key.0, &key.1);
-        // An EKS Pod Identity association is a child of its cluster, so the
-        // cluster's associations go with it: a cluster later created with the same
-        // name in the same Region must not inherit the deleted cluster's
-        // associations.
-        guard.remove_pod_identity_associations_for_cluster(&key.0, &key.1);
-        // And so is a managed node group, for the same reason.
-        guard.remove_nodegroups_for_cluster(&key.0, &key.1);
-        // And so is a Fargate profile, for the same reason.
-        guard.remove_fargate_profiles_for_cluster(&key.0, &key.1);
-        record.status = STATUS_DELETING.to_string();
-        // The cluster is gone, so the `CREATING` -> `ACTIVE` move the clock owed it is
-        // no longer owed to anybody.
-        record.active_at = None;
-
         Ok(DeleteClusterOutput {
-            cluster: Some(record.to_cluster()),
+            cluster: Some(cluster),
         })
     }
 }
