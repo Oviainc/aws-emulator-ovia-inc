@@ -658,8 +658,11 @@ fn email_otp_sign_in(
 ///
 /// "Valid" is read off the token record this emulator wrote when it issued the token:
 /// it must be a refresh token, issued for the app client the request names, not revoked,
-/// and not past its expiry. `auth_flow` is the member the request actually named, so a
-/// refusal echoes `REFRESH_TOKEN_AUTH` or its `REFRESH_TOKEN` alias as submitted.
+/// and not past its expiry. A token that was issued for this app client and has since
+/// been REVOKED is refused as revoked, while one that resolves to no record of this app
+/// client at all is refused as invalid. `auth_flow` is the member the request actually
+/// named, so a refusal echoes `REFRESH_TOKEN_AUTH` or its `REFRESH_TOKEN` alias as
+/// submitted.
 fn refresh_sign_in(
     state: &mut State,
     client_id: &str,
@@ -686,15 +689,25 @@ fn refresh_sign_in(
         }
         let user_pool_id = pool.id.clone();
 
-        let (username, sub) = state
-            .token(refresh_token)
-            .filter(|record| {
-                record.kind == crate::state::TokenKind::Refresh
-                    && !record.revoked
-                    && record.expires_at > now
-                    && record.client_id == client_id
-                    && record.user_pool_id == user_pool_id
-            })
+        // A record this emulator issued for THIS app client of THIS pool is what
+        // the presented value has to resolve to; anything else — a value never
+        // issued, a token of another kind, or one issued elsewhere — resolves to
+        // nothing at all.
+        let presented = state.token(refresh_token).filter(|record| {
+            record.kind == crate::state::TokenKind::Refresh
+                && record.client_id == client_id
+                && record.user_pool_id == user_pool_id
+        });
+        // A resolved record that was REVOKED is refused as revoked, which is a
+        // different answer from the one a token the service cannot resolve gets:
+        // the caller holds a token this service did issue and has since
+        // invalidated, so the refusal reports that rather than denying the token
+        // was ever issued.
+        if presented.is_some_and(|record| record.revoked) {
+            return Err(refresh_token_revoked());
+        }
+        let (username, sub) = presented
+            .filter(|record| record.expires_at > now)
             .map(|record| (record.username.clone(), record.sub.clone()))
             .ok_or_else(invalid_refresh_token)?;
 
@@ -790,6 +803,14 @@ fn incorrect_credentials() -> InitiateAuthError {
 /// token of the app client the request names.
 fn invalid_refresh_token() -> InitiateAuthError {
     not_authorized("Invalid Refresh Token.")
+}
+
+/// The refusal for a `REFRESH_TOKEN` this emulator issued for the app client the
+/// request names and has since revoked — a sign-out of its user, or a revocation
+/// of the token itself. Told apart from [`invalid_refresh_token`] because the
+/// token did authorize this app client until it was invalidated.
+fn refresh_token_revoked() -> InitiateAuthError {
+    not_authorized("Refresh Token has been revoked")
 }
 
 /// This operation's `NotAuthorizedException`, carrying `message`.
