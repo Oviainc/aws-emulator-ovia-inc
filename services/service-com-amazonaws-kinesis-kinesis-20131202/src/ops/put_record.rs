@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: places one data record in the shard the request's partition key or
+//! explicit hash key maps to, appends it to that shard in the shared store, and answers
+//! the shard id and the sequence number it was stored under. This is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutRecord::handle`] with real behaviour and
@@ -214,6 +215,58 @@ pub struct PutRecord<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> PutRecordError {
+    PutRecordErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a resource this account and region do not hold: "The requested
+/// resource could not be found. The stream might not be specified correctly."
+fn not_found(message: String) -> PutRecordError {
+    PutRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region: the rule the operation's own doc publishes for a request that
+/// names neither ("you must use either the StreamARN or the StreamName parameter, or both"),
+/// and `ResourceNotFoundException` for one that names a stream nothing created.
+fn lookup_refusal(failure: crate::state::StreamLookupFailure, identifier: &str) -> PutRecordError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            not_found(crate::state::stream_not_found_message(identifier))
+        }
+    }
+}
+
+/// How a record this stream cannot place is refused: a parameter that "can't be used",
+/// which is what the modelled `InvalidArgumentException` states.
+fn placement_refusal(failure: crate::state::RecordPlacementFailure) -> PutRecordError {
+    match failure {
+        crate::state::RecordPlacementFailure::PartitionKeyRequired => {
+            invalid_argument(crate::state::PARTITION_KEY_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::RecordPlacementFailure::OutsideTheShardMap(hash_key) => invalid_argument(
+            crate::state::hash_key_outside_the_shard_map_message(&hash_key),
+        ),
+        crate::state::RecordPlacementFailure::NoOpenShard => {
+            invalid_argument(crate::state::NO_OPEN_SHARD_MESSAGE.to_string())
+        }
+    }
+}
+
 impl<Eng> PutRecord<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -240,18 +293,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecord"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutRecordError::from(PutRecordErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let identifier = input
+            .stream_name
+            .as_deref()
+            .or(input.stream_arn.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no stream.
+        let stream = store
+            .resolve_stream_mut(
+                &region,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &identifier))?;
+
+        // A stream whose creation has not fallen due yet has no shard a record can be
+        // placed in, and this operation models no "the resource is not available yet"
+        // error: the shard the write would land in is in no stream this account holds yet,
+        // which is the modelled not-found refusal, stating the status the stream is in.
+        let status = stream.status(now);
+        if status != crate::state::STREAM_ACTIVE {
+            return Err(not_found(crate::state::stream_not_active_message(
+                &identifier, status,
+            )));
+        }
+
+        // "When the data blob (the payload before base64-encoding) is added to the
+        // partition key size, the total size must not exceed the maximum record size"
+        // (`PutRecordInput$Data`).
+        let maximum = stream.max_record_size_bytes();
+        let size = input.data.len()
+            + input
+                .partition_key
+                .as_deref()
+                .map(str::len)
+                .unwrap_or_default();
+        if size > maximum {
+            return Err(invalid_argument(crate::state::record_too_large_message(
+                size, maximum,
+            )));
+        }
+
+        // The record's placement is resolved before the dry run is answered, so a dry run
+        // is refused only for a request that would otherwise have been served — and the
+        // store below works from the index this resolved rather than hashing again. A
+        // request that reaches here named one of the two stream identifiers, since one that
+        // named neither was refused by the lookup above.
+        let shard_index = stream
+            .placement(
+                input.explicit_hash_key.as_deref(),
+                input.partition_key.as_deref(),
+                // One record, so it is the first of this call.
+                0,
+            )
+            .map_err(placement_refusal)?;
+
+        // "Checks if your request will succeed. DryRun is an optional parameter"
+        // (`PutRecordInput$DryRun`): the request is judged in full above and then refused
+        // with the error the model declares for it, so a dry run stores no record.
+        if input.dry_run.unwrap_or(false) {
+            return Err(PutRecordErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "PutRecord returns the shard ID of where the data record was placed and the
+        // sequence number that was assigned to the data record. Sequence numbers increase
+        // over time and are specific to a shard within a stream" — which is what the
+        // shard's own write counter mints, so `SequenceNumberForOrdering` ("to guarantee
+        // strictly increasing ordering... use the SequenceNumberForOrdering parameter")
+        // asks for an ordering every write to one shard of this emulator already has.
+        let encryption_type = stream.encryption_type.clone();
+        // The shard map answered this index a moment ago, under the same `&mut` borrow, so
+        // nothing reaches the `else`; it answers the modelled server error rather than a
+        // sequence number for a record that was not stored.
+        let Some((shard_id, sequence_number)) =
+            stream.append_at(shard_index, input.partition_key, input.data, now)
+        else {
+            return Err(PutRecordErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "the shard the record was placed in is no longer in the shard map"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(PutRecordOutput {
+            shard_id,
+            sequence_number,
+            encryption_type: Some(encryption_type),
+        })
     }
 }
