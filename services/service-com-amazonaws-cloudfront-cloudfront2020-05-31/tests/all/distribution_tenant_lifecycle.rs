@@ -35,11 +35,12 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CONNECTION_GROUP_ID_PREFIX, DISTRIBUTION_TENANT_ID_PREFIX, DOMAIN_STATUS_ACTIVE,
     MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN, MAX_DOMAIN_NAME_LEN,
     MAX_GEO_RESTRICTION_LOCATIONS, MAX_PARAMETERS_PER_TENANT, PROPAGATION_DELAY, STATUS_DEPLOYED,
-    STATUS_IN_PROGRESS,
+    STATUS_IN_PROGRESS, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -97,6 +98,25 @@ pub(crate) fn encode_label(value: &str) -> String {
             other => other.to_string(),
         })
         .collect()
+}
+
+/// The `ManagedCertificateRequest` element a create carries for a domain the account has
+/// not pointed at CloudFront: a tenant is bound to a domain only when the call asks
+/// CloudFront to validate it or the domain already resolves to a CloudFront resource, and
+/// every create below claims a name in a customer's zone, which this service resolves
+/// nothing for. The token host is the one that is NOT `cloudfront` — "you serve the
+/// validation token from your existing infrastructure", which demands nothing of DNS —
+/// read off the model's own catalog rather than written out here.
+///
+/// `pub(crate)` so every sibling suite that needs a tenant asks for its domains to be
+/// validated the same way rather than growing a copy of this.
+pub(crate) fn managed_certificate_request() -> String {
+    let host = VALIDATION_TOKEN_HOST_VALUES
+        .iter()
+        .copied()
+        .find(|host| *host != VALIDATION_TOKEN_HOST_CLOUDFRONT)
+        .expect("the model's ValidationTokenHost admits a host other than cloudfront");
+    format!("<ManagedCertificateRequest><ValidationTokenHost>{host}</ValidationTokenHost></ManagedCertificateRequest>")
 }
 
 /// Escape the five entities XML predefines, so any text may travel in an element.
@@ -282,6 +302,9 @@ impl Create {
         if let Some(enabled) = self.enabled {
             out.push_str(&format!("<Enabled>{enabled}</Enabled>"));
         }
+        // Every row claims a name in a customer's zone, so the create asks CloudFront to
+        // validate it.
+        out.push_str(&managed_certificate_request());
         out.push_str("</CreateDistributionTenantRequest>");
         out
     }
@@ -1211,8 +1234,9 @@ async fn a_connection_group_must_exist_to_be_named() {
              <Name>cg-absent-{index}</Name>\
              <Domains><member><Domain>cg-absent-{index}.example.com</Domain></member></Domains>\
              <Parameters><member><Name>tenantName</Name><Value>acme</Value></member></Parameters>\
-             <ConnectionGroupId>{connection_group_id}</ConnectionGroupId>\
-             </CreateDistributionTenantRequest>"
+             <ConnectionGroupId>{connection_group_id}</ConnectionGroupId>{}\
+             </CreateDistributionTenantRequest>",
+            managed_certificate_request()
         );
         let answer = create_distribution_tenant(&router, &body).await;
         assert_eq!(
@@ -1236,8 +1260,9 @@ async fn a_connection_group_must_exist_to_be_named() {
          <Name>cg-named</Name>\
          <Domains><member><Domain>cg-named.example.com</Domain></member></Domains>\
          <Parameters><member><Name>tenantName</Name><Value>acme</Value></member></Parameters>\
-         <ConnectionGroupId>{default_group}</ConnectionGroupId>\
-         </CreateDistributionTenantRequest>"
+         <ConnectionGroupId>{default_group}</ConnectionGroupId>{}\
+         </CreateDistributionTenantRequest>",
+        managed_certificate_request()
     );
     let answer = create_distribution_tenant(&router, &body).await;
     assert_eq!(
@@ -1441,8 +1466,9 @@ async fn a_tag_set_no_resource_can_carry_is_refused() {
          <Tags><Items>\
          <Tag><Key>stage</Key><Value>prod</Value></Tag>\
          <Tag><Key>stage</Key><Value>dev</Value></Tag>\
-         </Items></Tags>\
-         </CreateDistributionTenantRequest>"
+         </Items></Tags>{}\
+         </CreateDistributionTenantRequest>",
+        managed_certificate_request()
     );
     let answer = create_distribution_tenant(&router, &body).await;
     assert_eq!(
@@ -1505,7 +1531,8 @@ async fn every_caller_chosen_list_is_bounded() {
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
              <DistributionId>{distribution_id}</DistributionId><Name>{name}</Name>\
              <Domains><member><Domain>{name}.example.com</Domain></member></Domains>\
-             {extra}</CreateDistributionTenantRequest>"
+             {extra}{}</CreateDistributionTenantRequest>",
+            managed_certificate_request()
         )
     }
 

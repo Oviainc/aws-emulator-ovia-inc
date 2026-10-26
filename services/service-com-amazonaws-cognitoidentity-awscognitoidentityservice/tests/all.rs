@@ -43,3 +43,5 @@ mod unlink_identity;
 mod untag_resource;
 #[path = "all/update_identity_pool.rs"]
 mod update_identity_pool;
+#[path = "all/vended_role_session.rs"]
+mod vended_role_session;

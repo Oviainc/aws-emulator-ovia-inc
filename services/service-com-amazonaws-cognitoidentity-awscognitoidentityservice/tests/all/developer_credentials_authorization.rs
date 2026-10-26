@@ -886,6 +886,44 @@ async fn the_unauthenticated_identity_flow_is_not_judged_on_iam_policies() {
     let pool_id = emulator.pool("authorization-identity-flow").await;
     let bare = emulator.user("cognito-authz-identity-flow", None).await;
 
+    // A vend is a session of the pool's role, so the pool is given one whose trust policy
+    // admits its own users. What that session STANDS FOR is `super::vended_role_session`'s
+    // rule; what this case asserts is that the vend is not judged on the identity policies
+    // of the credential that happened to sign it.
+    let role_trust = format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"Federated\":\"cognito-identity.amazonaws.com\"}},\
+         \"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{{\"StringEquals\":\
+         {{\"cognito-identity.amazonaws.com:aud\":\"{pool_id}\"}}}}}}]}}"
+    );
+    let created_role = emulator
+        .query(
+            "iam",
+            "2010-05-08",
+            "CreateRole",
+            &[
+                (
+                    "RoleName",
+                    "cognito-authz-identity-flow-unauth".to_string(),
+                ),
+                ("AssumeRolePolicyDocument", role_trust),
+            ],
+        )
+        .await;
+    let role_arn = xml_element(&created_role, "Arn")
+        .unwrap_or_else(|| panic!("CreateRole answers the role's Arn, got {created_role}"));
+    let (status, configured) = emulator
+        .call(
+            ACCOUNT_KEY,
+            "SetIdentityPoolRoles",
+            &json!({ "IdentityPoolId": &pool_id, "Roles": { "unauthenticated": role_arn } }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the setup role assignment must succeed, got {status} with {configured}"
+    );
+
     // `GetId` and `GetCredentialsForIdentity` are modelled `@optionalAuth`
     // (`smithy_query(query="digest")`): they are the calls a client makes BEFORE it holds
     // any credential, so they are not judged on the identity policies of whatever

@@ -18,7 +18,7 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call, emulator, error_code, ok};
+use crate::emulator::{call, emulator, error_code, message, ok};
 use crate::table_items::create_active_table;
 
 /// Run one statement that must succeed, with the parameters it names (if any).
@@ -918,10 +918,19 @@ async fn a_select_over_an_index_reports_the_items_the_index_holds_as_it_projects
         status, 400,
         "case unknown index: expected HTTP 400, got {status} with {refused}"
     );
+    // An index the table does not declare is a bad STATEMENT — the table was resolved,
+    // and nothing it carries answers to that name — so AWS states it as such rather than
+    // as a resource that could not be found.
     assert_eq!(
-        error_code(&refused),
-        "ResourceNotFoundException",
-        "case unknown index: expected ResourceNotFoundException, got {refused}"
+        (
+            error_code(&refused),
+            message(&refused),
+        ),
+        (
+            "ValidationException".to_string(),
+            "The table does not have the specified index".to_string(),
+        ),
+        "case unknown index: expected the index-unknown ValidationException, got {refused}"
     );
 }
 

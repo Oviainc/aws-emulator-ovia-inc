@@ -99,5 +99,7 @@ mod task_definition_rendering;
 mod task_lifecycle;
 #[path = "all/task_provisioning.rs"]
 mod task_provisioning;
+#[path = "all/task_set_creation.rs"]
+mod task_set_creation;
 #[path = "all/task_sets.rs"]
 mod task_sets;

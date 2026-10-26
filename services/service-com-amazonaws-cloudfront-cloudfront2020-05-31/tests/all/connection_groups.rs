@@ -51,7 +51,8 @@ use crate::distribution_lifecycle::{
     call, emulator, is_version_token, Answer, Node, ACCOUNT_ID, API_VERSION,
 };
 use crate::distribution_tenant_lifecycle::{
-    create_distribution_tenant, encode_label, multi_tenant_distribution,
+    create_distribution_tenant, encode_label, managed_certificate_request,
+    multi_tenant_distribution,
 };
 use crate::response_headers_policy_lifecycle::{assert_absent, text};
 
@@ -966,8 +967,9 @@ async fn the_automatic_default_group_is_listed_and_the_clock_deploys_it() {
              <DistributionId>{distribution_id}</DistributionId>\
              <Name>cg-tenant-{index}</Name>\
              <Domains><member><Domain>cg-tenant-{index}.example.com</Domain></member></Domains>\
-             <Parameters><member><Name>tenantName</Name><Value>acme</Value></member></Parameters>\
-             </CreateDistributionTenantRequest>"
+             <Parameters><member><Name>tenantName</Name><Value>acme</Value></member></Parameters>{}\
+             </CreateDistributionTenantRequest>",
+            managed_certificate_request()
         );
         let answer = create_distribution_tenant(&router, &body).await;
         assert_eq!(

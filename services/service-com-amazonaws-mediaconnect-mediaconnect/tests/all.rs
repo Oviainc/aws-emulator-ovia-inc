@@ -43,6 +43,8 @@ mod flow_lifecycle;
 mod flow_listing_default_page;
 #[path = "all/flow_media_streams.rs"]
 mod flow_media_streams;
+#[path = "all/flow_name_references.rs"]
+mod flow_name_references;
 #[path = "all/flow_ndi_sizing.rs"]
 mod flow_ndi_sizing;
 #[path = "all/flow_outputs.rs"]

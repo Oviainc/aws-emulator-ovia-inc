@@ -144,6 +144,17 @@ impl From<ModifyVolumeErrorModeled> for ModifyVolumeError {
 /// shared with `DescribeVolumesModifications`, but the refusal is this call's alone.
 pub const INCORRECT_MODIFICATION_STATE: &str = "IncorrectModificationState";
 
+/// EC2's message for a `ModifyVolume` whose target size is below the size the volume
+/// already has. The rule is "The target volume size must be greater than or equal to the
+/// existing size of the volume" (`ModifyVolumeRequest$Size`); the refusal that enforces it
+/// is `InvalidParameterValue` (HTTP 400) carrying this ONE fixed sentence, which names
+/// neither the size asked for, the size the volume has, nor the volume — so every shrink,
+/// of any volume at any size, is refused with text a caller can recognise.
+///
+/// It lives here, beside the check that answers it, and is read by this crate's suite
+/// rather than restated there.
+pub const SIZE_DECREASE_MESSAGE: &str = "New size cannot be smaller than existing size";
+
 /// Refuse this request because the volume's most recent modification is still running:
 /// HTTP 400 [`INCORRECT_MODIFICATION_STATE`], naming the volume and the state its
 /// modification is in — the two facts the caller needs to know when to try again.
@@ -273,10 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let current_size = current.size.unwrap_or_default();
         let target_size = input.size.unwrap_or(current_size);
         if target_size < current_size {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{target_size}' for size. The target size must be greater \
-                 than or equal to the volume's existing size of {current_size} GiB"
-            )));
+            return Err(Scaffolded::invalid_parameter_value(SIZE_DECREASE_MESSAGE));
         }
         if target_size < size_min || target_size > size_max {
             return Err(Scaffolded::invalid_parameter_value(format!(

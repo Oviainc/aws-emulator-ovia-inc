@@ -51,6 +51,8 @@ mod fhir_rest_and_validate_source;
 mod fhir_update_interaction;
 #[path = "all/list_data_transformation_profile_versions.rs"]
 mod list_data_transformation_profile_versions;
+#[path = "all/list_data_transformation_profiles.rs"]
+mod list_data_transformation_profiles;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/publish_data_transformation_profile.rs"]

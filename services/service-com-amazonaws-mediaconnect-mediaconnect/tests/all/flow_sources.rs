@@ -85,6 +85,11 @@ pub(crate) async fn create_flow_from(emulator: &Emulator, case: &str, body: Valu
 
 /// Create the flow a case works on, with `initial` sources already on it and `failover` as
 /// its `SourceFailoverConfig`, and return its ARN.
+///
+/// The flow holds the media streams and VPC interfaces its sources reference by name
+/// (`crate::flow_outputs::held_media_streams` /
+/// `crate::flow_outputs::attached_vpc_interfaces`), because a source can only associate a
+/// media stream, or use a VPC interface, its own flow holds.
 pub(crate) async fn create_flow_with_sources_and_failover(
     emulator: &Emulator,
     case: &str,
@@ -92,7 +97,12 @@ pub(crate) async fn create_flow_with_sources_and_failover(
     initial: Value,
     failover: Option<Value>,
 ) -> String {
-    let mut body = json!({ "name": name, "sources": initial });
+    let mut body = json!({
+        "name": name,
+        "sources": initial,
+        "mediaStreams": crate::flow_outputs::held_media_streams(),
+        "vpcInterfaces": crate::flow_outputs::attached_vpc_interfaces(),
+    });
     if let Some(failover) = failover {
         body["sourceFailoverConfig"] = failover;
     }

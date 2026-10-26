@@ -25,7 +25,9 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::Emulator;
 use crate::flow_media_streams::{add_media_streams, create_flow, described_media_streams};
-use crate::flow_outputs::{media_stream_output_configuration, unknown_flow_arn};
+use crate::flow_outputs::{
+    attached_vpc_interfaces, media_stream_output_configuration, unknown_flow_arn,
+};
 
 /// `DELETE /v1/flows/{FlowArn}/mediaStreams/{MediaStreamName}` — the
 /// RemoveFlowMediaStream binding
@@ -387,7 +389,8 @@ async fn remove_flow_media_stream_refuses_what_it_cannot_remove() {
 }
 
 /// One `MediaStreamSourceConfigurations` entry for the media stream `media_stream_name`,
-/// listening on `input_port`.
+/// listening on `input_port`, arriving on a VPC interface the flow holds
+/// ([`attached_vpc_interfaces`]).
 fn media_stream_source_configuration(media_stream_name: &str, input_port: i32) -> Value {
     json!({
         "encodingName": "jxsv",
@@ -429,6 +432,7 @@ fn association_cases() -> Vec<AssociationCase> {
             body: json!({
                 "name": "flow-ms-assoc-source",
                 "mediaStreams": streams,
+                "vpcInterfaces": attached_vpc_interfaces(),
                 "source": {
                     "name": "src",
                     "protocol": "st2110-jpegxs",
@@ -447,6 +451,7 @@ fn association_cases() -> Vec<AssociationCase> {
             body: json!({
                 "name": "flow-ms-assoc-output",
                 "mediaStreams": streams,
+                "vpcInterfaces": attached_vpc_interfaces(),
                 "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" },
                 "outputs": [
                     { "name": "plain", "protocol": "udp", "destination": "203.0.113.9", "port": 7000 },
@@ -469,6 +474,7 @@ fn association_cases() -> Vec<AssociationCase> {
             body: json!({
                 "name": "flow-ms-assoc-both",
                 "mediaStreams": streams,
+                "vpcInterfaces": attached_vpc_interfaces(),
                 "source": {
                     "name": "src",
                     "protocol": "st2110-jpegxs",
@@ -584,6 +590,7 @@ async fn an_association_is_stored_and_lifting_it_frees_the_media_stream() {
             "mediaStreams": [
                 { "mediaStreamId": 1, "mediaStreamName": "carried", "mediaStreamType": "video" }
             ],
+            "vpcInterfaces": attached_vpc_interfaces(),
             "source": {
                 "name": "src",
                 "protocol": "st2110-jpegxs",

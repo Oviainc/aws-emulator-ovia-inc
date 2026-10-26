@@ -299,6 +299,26 @@ impl Domain {
             .find(|listing| listing.entity_type == entity_type && listing.entity_id == entity_id)
     }
 
+    /// The DIRECT child of the domain unit `parent_id` that already carries `name`,
+    /// when this domain holds one.
+    ///
+    /// A domain unit's name is unique among the children of ONE parent, so the same
+    /// name under a different parent — or in another domain — is not a collision. This
+    /// is the lookup a create refuses on, and a rename compares the clash's id with its
+    /// own so renaming a unit to the name it already has is not a self-collision. The
+    /// comparison is exact: `DomainUnitName` admits both cases and nothing folds them.
+    ///
+    /// A linear scan, deliberately: `domain_units` is bounded by
+    /// [`MAX_DOMAIN_UNITS_PER_DOMAIN`], so one lookup rule shared by every handler is
+    /// worth more than a second index to keep in step (the same trade
+    /// [`Self::listing_for_entity`] makes). The walk is over a `BTreeMap`, so the clash
+    /// reported for a parent holding several is the same one on every call.
+    pub fn child_domain_unit_named(&self, parent_id: &str, name: &str) -> Option<&DomainUnit> {
+        self.domain_units.values().find(|unit| {
+            unit.name == name && unit.parent_domain_unit_id.as_deref() == Some(parent_id)
+        })
+    }
+
     /// The object stored in this domain that binds a metadata form to the form type
     /// `form_type_name` and so prevents its deletion, when one does.
     ///
