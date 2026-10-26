@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSuppressedDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSuppressedDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSuppressedDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds an address to one of this account's suppression lists — a tenant's when the
+//! request names a tenant, the account-level list otherwise — stamping the entry with
+//! the reason the request carries, and refusing the write while the account has not
+//! been granted production access. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSuppressedDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSuppressedDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSuppressedDestination"))
+        // The list this write targets is chosen by the request, inside the one
+        // emulated account, so no request metadata selects a record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutSuppressedDestination without the shared emulator state",
+            ));
+        };
+
+        let address = input.email_address;
+        let tenant = input.tenant_name;
+
+        // A `TenantName` names a resource, so a value outside its documented form is
+        // a bad request and a well-formed name the account does not hold is a
+        // not-found — the same two refusals every operation that takes one makes.
+        // (`Reason` is a modelled enum, so a value outside `SuppressionListReason`'s
+        // catalog is already refused before this handler runs.)
+        if let Some(tenant) = &tenant {
+            if !crate::state::tenant_name_is_well_formed(tenant) {
+                return Err(bad_request(crate::state::invalid_tenant_name(tenant)));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(tenant) = &tenant {
+            if !store.tenants.contains_key(tenant) {
+                return Err(PutSuppressedDestinationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::tenant_not_found(tenant)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The account-wide restriction, read before anything about this particular
+        // address: an account that has not been granted production access manages no
+        // suppression list of its own, whichever list the request names, so the write
+        // is refused with the input error the model binds and nothing is stored.
+        if !store.account.production_access_enabled {
+            return Err(bad_request(NO_PRODUCTION_ACCESS));
+        }
+
+        // "To target a tenant's suppression list, specify the TenantName parameter. If
+        // you omit TenantName, the address is added to the account-level suppression
+        // list" — so the list written to is the one the request selects, and the same
+        // address on another list is another entry.
+        let key = crate::state::suppression_key(tenant.as_deref(), &address);
+        let record = crate::state::SuppressedDestinationRecord {
+            email_address: address,
+            reason: input.reason,
+            // The entry is written now, which is what its `LastUpdateTime` reports.
+            last_update_time: now,
+            // `Attributes` carries "additional information about the reasons that the
+            // address was added": the message that caused the suppression and the
+            // feedback id generated for it, both of which belong to a bounce or a
+            // complaint. This write is the caller's own, caused by no message, so it
+            // carries neither — and it replaces whatever an earlier write left under
+            // the same key, which is what makes repeating the call idempotent.
+            message_id: None,
+            feedback_id: None,
+            tenant_name: tenant,
+        };
+        if !store.suppress_destination(key, record) {
+            // The table was full, so nothing was stored. This operation models no
+            // limit error, so the ceiling is reported with its input error.
+            return Err(bad_request(format!(
+                "The suppression lists of this account already hold the maximum of {} email \
+                 addresses.",
+                crate::state::MAX_SUPPRESSED_DESTINATIONS
+            )));
+        }
+
+        // `PutSuppressedDestinationResponse` carries no members: what was persisted is
+        // read back with `GetSuppressedDestination` or `ListSuppressedDestinations`.
+        Ok(PutSuppressedDestinationOutput {})
     }
+}
+
+/// How this operation words the refusal of a suppression-list write by an account
+/// that has not been granted production access.
+///
+/// `GetAccountResponse$ProductionAccessEnabled` documents that a false value means the
+/// account is in the sandbox, and that is what the refusal says: an account-wide
+/// restriction rather than anything about the address being suppressed, so the sentence
+/// carries no part of the request.
+const NO_PRODUCTION_ACCESS: &str = "Your account is still in the sandbox.";
+
+/// Refuse the request with this operation's input error — the `BadRequestException` the
+/// model binds for "the input you provided is invalid".
+fn bad_request(message: impl Into<String>) -> PutSuppressedDestinationError {
+    PutSuppressedDestinationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
