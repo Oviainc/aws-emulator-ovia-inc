@@ -503,7 +503,7 @@ async fn a_refused_update_leaves_the_stored_rule_group_untouched() {
                 None,
                 "metric",
             ),
-            "WAFLimitsExceededException",
+            "WAFInvalidParameterException",
         ),
         (
             "a reference to an IP set that does not exist",
@@ -678,10 +678,14 @@ async fn an_update_must_stay_within_the_groups_immutable_capacity() {
                      got {got}"
                 );
             } else {
+                // The capacity is a parameter of the saved group, so a rule list
+                // that does not fit it is the invalid parameter, carrying the cost
+                // the rules were priced at; see
+                // `crate::rule_group_capacity_refusal`.
                 waf.refused(
                     "UpdateRuleGroup",
                     request,
-                    "WAFLimitsExceededException",
+                    "WAFInvalidParameterException",
                     &case,
                 )
                 .await;

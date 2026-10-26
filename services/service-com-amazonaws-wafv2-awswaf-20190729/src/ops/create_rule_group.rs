@@ -366,13 +366,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.name,
                 "",
                 &format!(
-                    "WAFLimitsExceededException: the rules require {required_capacity} WCUs, \
+                    "WAFInvalidParameterException: the rules require {required_capacity} WCUs, \
                      above the declared capacity {}",
                     input.capacity
                 ),
             );
-            return Err(CreateRuleGroupErrorModeled::WAFLimitsExceededException(
-                crate::state::limits_exceeded_exception(),
+            // `Capacity` is a MEMBER of this request, so a rule list that does not
+            // fit it is the invalid parameter, reported with the capacity the rules
+            // actually cost so the caller can re-declare it — not the quota failure,
+            // which is about how many resources the account holds and which no
+            // member of this request can correct.
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::capacity_limit_exceeded_exception(required_capacity),
             )
             .into());
         }

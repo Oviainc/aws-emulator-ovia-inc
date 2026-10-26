@@ -835,10 +835,14 @@ async fn create_rule_group_enforces_the_declared_capacity_against_the_rules_pric
                     "case {case:?}: the stored capacity must be the declared {declared}, got {got}"
                 );
             } else {
+                // `Capacity` is a parameter of this request, so a rule list that
+                // does not fit it is the invalid parameter and not the account
+                // quota; see `crate::rule_group_capacity_refusal`, which pins the
+                // members that refusal carries.
                 waf.refused(
                     "CreateRuleGroup",
                     body,
-                    "WAFLimitsExceededException",
+                    "WAFInvalidParameterException",
                     &case,
                 )
                 .await;

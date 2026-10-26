@@ -943,6 +943,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         self.api_keys.get(&(scope.to_string(), api_key.to_string()))
     }
 
+    /// Remove the API key `api_key` from `scope` and answer the entry as it was
+    /// stored, or `None` when the scope holds no key with that value.
+    ///
+    /// A key value is the key's identity within its scope, and a scope is a
+    /// namespace, so a delete in one scope never removes a key of the other. The
+    /// creation sequence ([`Self::api_keys_minted`]) is NOT rewound: the cursors
+    /// the remaining keys were minted with keep their order, and a key minted
+    /// after a delete still sorts after them.
+    pub fn remove_api_key(&mut self, scope: &str, api_key: &str) -> Option<ApiKeyEntry> {
+        self.api_keys
+            .remove(&(scope.to_string(), api_key.to_string()))
+    }
+
     /// How many API keys this scope already holds. See
     /// [`MAX_API_KEYS_PER_SCOPE`].
     pub fn api_keys_count_in_scope(&self, scope: &str) -> usize {
@@ -3965,6 +3978,38 @@ pub fn invalid_parameter_exception(
 /// [`ARN_NOT_VALID_REASON`].
 pub fn invalid_arn_exception(arn: &str) -> WAFInvalidParameterException {
     invalid_parameter_exception(FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID_REASON)
+}
+
+/// The `ErrorReason` WAF carries when a rule list costs more web ACL capacity
+/// units than the capacity it has to fit inside, as the recorded WAF responses
+/// show it.
+///
+/// One sentence for the whole class — a rule group created under the price of its
+/// rules and one updated past its immutable capacity alike — because the
+/// `Parameter` member carries the capacity the rules actually cost, so the reason
+/// does not have to distinguish them.
+pub const CAPACITY_LIMIT_EXCEEDED_REASON: &str =
+    "You exceeded the capacity limit for a rule group or web ACL.";
+
+/// [`invalid_parameter_exception`] for a rule list that costs more WCUs than the
+/// capacity it must fit inside: `Field` [`FIELD_RULE_GROUP`] (the settings the
+/// capacity was declared in), `Parameter` the capacity the rules actually cost —
+/// the figure [`web_acl_capacity`] derives and `CheckCapacity` publishes, which is
+/// the value a caller re-declares to make the save fit, NOT the under-declared one
+/// the request sent — and `Reason` [`CAPACITY_LIMIT_EXCEEDED_REASON`].
+///
+/// This is a PARAMETER failure and not [`limits_exceeded_exception`]: the capacity
+/// a rule group declares is a member of the request, so a rule list that does not
+/// fit it is corrected by re-declaring that member, while the quota exception is
+/// the account/resource-count failure ("the maximum number of WebACL objects that
+/// you can create for an Amazon Web Services account") that no request member can
+/// correct.
+pub fn capacity_limit_exceeded_exception(required_capacity: i64) -> WAFInvalidParameterException {
+    invalid_parameter_exception(
+        FIELD_RULE_GROUP,
+        &required_capacity.to_string(),
+        CAPACITY_LIMIT_EXCEEDED_REASON,
+    )
 }
 
 /// The `ErrorReason` WAF carries for a value it cannot decode as an API key, as the

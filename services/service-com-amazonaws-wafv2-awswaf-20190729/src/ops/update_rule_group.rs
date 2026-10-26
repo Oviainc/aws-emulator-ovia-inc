@@ -5,7 +5,7 @@
 //! describes, once its `LockToken` still matches the stored one. An unknown triple
 //! is `WAFNonexistentItemException`, a stale token `WAFOptimisticLockException`, a
 //! rule list that does not fit the group's immutable `Capacity`
-//! `WAFLimitsExceededException` (all HTTP 400). This is the ONLY file to touch for
+//! `WAFInvalidParameterException` (all HTTP 400). This is the ONLY file to touch for
 //! this operation.
 //!
 //! ## Shape of an operation
@@ -380,12 +380,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.name,
                 &input.id,
                 &format!(
-                    "WAFLimitsExceededException: the rules require {required_capacity} WCUs, \
+                    "WAFInvalidParameterException: the rules require {required_capacity} WCUs, \
                      above the immutable capacity {declared_capacity}"
                 ),
             );
-            return Err(UpdateRuleGroupErrorModeled::WAFLimitsExceededException(
-                crate::state::limits_exceeded_exception(),
+            // The same classification `CreateRuleGroup` gives the same comparison:
+            // the rule list is the parameter at fault, reported with the capacity
+            // those rules cost, rather than the account-quota failure.
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::capacity_limit_exceeded_exception(required_capacity),
             )
             .into());
         }

@@ -1026,7 +1026,7 @@ async fn update_rule_group_replaces_the_stored_rule_group_under_its_lock_token()
             &create_lock,
             json!([rule("block-sqli-a", sqli_statement()), second_sqli]),
         ),
-        "WAFLimitsExceededException",
+        "WAFInvalidParameterException",
         "UpdateRuleGroup with rules above the declared capacity",
     )
     .await;
