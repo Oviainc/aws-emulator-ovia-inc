@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the queries in flight on one graph: one summary per query — its id, its text,
+//! the state it is in and the milliseconds it waited and has been running — oldest
+//! admission first, capped at the `maxResults` the request asked for and restricted to
+//! one state when `state` names one rather than `ALL`. REPORTING only — the single write
+//! it makes is reclaiming the queries the clock has already ended, which had stopped at
+//! that instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQueries"))
+        // A read (`@readonly`): it reports the queries in flight on the GRAPH the request
+        // names, which lives in exactly one Region.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListQueriesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` carries no range in the model, so the published minimum is
+        // enforced here rather than at the boundary: a request asking for fewer than one
+        // result names no number of queries to fetch. The refusal is worded by the same
+        // builder the boundary refusal renderer uses (`crate::service`), so a caller
+        // cannot tell which side of the boundary caught the violation.
+        if input.max_results < MIN_MAX_RESULTS {
+            return Err(ListQueriesErrorModeled::ValidationException(ValidationException {
+                message: crate::state::validation_envelope(&[crate::state::constraint_clause(
+                    "maxResults",
+                    Some(&input.max_results.to_string()),
+                    &crate::state::min_value_requirement(MIN_MAX_RESULTS),
+                )]),
+                reason: Some("CONSTRAINT_VIOLATION".to_string()),
+            })
+            .into());
+        }
+        // `maxResults` is the count of summaries the answer may carry. The operation is
+        // not `@paginated` and models no token (`smithy_query(query="operation",
+        // operation="ListQueries")`), so what the cap leaves out is simply not reported.
+        let reported_at_most = usize::try_from(input.max_results).unwrap_or(usize::MAX);
+
+        // `state` filters the listing. An absent member filters nothing, which is what
+        // `ALL` asks for too: the other values are the states a stored query can be in
+        // (`crate::ops::types::QUERY_STATE_VALUES`), and the boundary validator has
+        // already restricted the member to the modelled `QueryStateInput` set.
+        let wanted_state = input.state.as_deref().unwrap_or(ALL_STATES);
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // A query is addressed as a query OF a graph, so the identifier has to name a
+        // graph of THIS Region: a listing of the queries of a graph that does not exist
+        // is a failed lookup rather than an empty list. This operation declares no
+        // `ResourceNotFoundException` (`smithy_query(query="operation",
+        // operation="ListQueries")` -> errors), so the failed lookup is reported with the
+        // one client error it does model, carrying the same sentence the 404 of the
+        // operations that do model it carries.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
+            return Err(ListQueriesErrorModeled::ValidationException(ValidationException {
+                message: crate::state::graph_not_found(&input.graph_identifier).message,
+                reason: Some("ILLEGAL_ARGUMENT".to_string()),
+            })
+            .into());
+        };
+        let graph_id = graph.id.clone();
+
+        // Reporting only: the sole write the listing makes is reclaiming the queries the
+        // clock had already ended at this instant — each accepted cancellation that has
+        // fallen due, and each query whose own run span is out — so the answer reports the
+        // queries as they stood at `now` and never one that has stopped.
+        let queries: Vec<QuerySummary> = store
+            .live_queries_on(&graph_id, now)
+            .into_iter()
+            .filter(|query| wanted_state == ALL_STATES || query.state.as_wire() == wanted_state)
+            .take(reported_at_most)
+            .map(|query| summarise(query, now))
+            .collect();
+
+        Ok(ListQueriesOutput { queries })
+    }
+}
+
+/// The smallest `maxResults` this operation accepts.
+///
+/// The model puts no range on the member (`smithy_query(query="operation",
+/// operation="ListQueries")` -> `maxResults` targets the prelude `Integer`), so the
+/// minimum the AWS API reference publishes for it stands as the bound enforced here.
+const MIN_MAX_RESULTS: i32 = 1;
+
+/// The `state` value that filters nothing: the one modelled `QueryStateInput` value
+/// (`crate::ops::types::QUERY_STATE_INPUT_VALUES`) that is not a state a stored query
+/// can be in, and the behaviour of an absent member.
+const ALL_STATES: &str = "ALL";
+
+/// One stored query as the listing reports it: the same five facts `GetQuery` reports
+/// about one query, with both durations read off the clock at `now` against the instants
+/// the record holds.
+fn summarise(query: &crate::state::Query, now: ::std::time::Instant) -> QuerySummary {
+    QuerySummary {
+        id: Some(query.id.clone()),
+        query_string: Some(query.query_string.clone()),
+        state: Some(query.state.as_wire().to_string()),
+        waited: Some(query.waited_millis(now)),
+        elapsed: Some(query.elapsed_millis(now)),
     }
 }

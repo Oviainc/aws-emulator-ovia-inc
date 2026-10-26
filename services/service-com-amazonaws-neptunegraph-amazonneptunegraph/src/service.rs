@@ -75,9 +75,7 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         ViolationKind::MaxLength(max) => {
             format!("Member must have length less than or equal to {max}")
         }
-        ViolationKind::MinValue(min) => {
-            format!("Member must have value greater than or equal to {min}")
-        }
+        ViolationKind::MinValue(min) => crate::state::min_value_requirement(min),
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }

@@ -1653,6 +1653,32 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.queries.get_mut(graph_id)?.get_mut(query_id)
     }
 
+    /// The queries in flight on ONE graph, oldest admission first, after applying every
+    /// termination the clock has made due: the listing `ListQueries` reports.
+    ///
+    /// Admission order is the order the listing reports, because it is the order the work
+    /// arrived in: the query that has been in flight longest comes first, so a caller
+    /// that asks for fewer results than there are queries is told about the oldest rather
+    /// than an arbitrary slice of them. `queries` is keyed by query id, which is what
+    /// breaks a tie between two queries admitted at the same instant and keeps the order
+    /// total. A graph holding no query at all yields nothing rather than being
+    /// distinguished from one whose queries have all terminated.
+    pub fn live_queries_on(&mut self, graph_id: &str, now: Instant) -> Vec<&Query> {
+        self.reap_terminated_queries(now);
+        let mut in_flight: Vec<&Query> = self
+            .queries
+            .get(graph_id)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .collect();
+        in_flight.sort_by(|left, right| {
+            left.submitted_at
+                .cmp(&right.submitted_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        in_flight
+    }
+
     /// The id of the snapshot named `name` in `region`, or `None` when that Region
     /// holds no snapshot by that name. Snapshot names are unique per account per
     /// Region, exactly as graph names are ([`Self::graph_id_named`]).
@@ -2581,6 +2607,17 @@ pub fn pattern_requirement(pattern: &str) -> String {
         "Member must satisfy regular expression pattern: {}",
         unanchored(pattern)
     )
+}
+
+/// The requirement clause for a MINIMUM-VALUE violation: the smallest value the member
+/// accepts.
+///
+/// Worded here rather than at each call site so a bound the boundary validator refuses
+/// from the model and one an operation enforces itself read identically. `min` is taken
+/// as anything printable because the bound a model declares and the bound an operation
+/// states are not always the same numeric type.
+pub fn min_value_requirement(min: impl ::std::fmt::Display) -> String {
+    format!("Member must have value greater than or equal to {min}")
 }
 
 /// The `ValidationException` message over one or more clauses: how many constraints were
