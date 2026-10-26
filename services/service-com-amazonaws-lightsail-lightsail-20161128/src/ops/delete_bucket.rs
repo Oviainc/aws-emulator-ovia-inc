@@ -6,10 +6,12 @@
 //! the delete wrote. This is the ONLY file to touch for this operation.
 //!
 //! Without `forceDelete` the delete is refused while the bucket still has any of the
-//! conditions that member documents as needing a force delete — objects, access keys, or
-//! instances that were granted access to it — so a bucket that is still in use is not
-//! removed by accident. Whether it holds objects is read from the one object store the
-//! bucket's data plane is served from, never from a count of this service's own.
+//! conditions that member documents as needing a force delete — objects, access keys,
+//! instances that were granted access to it, or being the origin a distribution of this
+//! account pulls its content from — so a bucket that is still in use is not removed by
+//! accident. Whether it holds objects is read from the one object store the bucket's data
+//! plane is served from, never from a count of this service's own, and whether it is an
+//! origin is counted from the distribution records that name it.
 //!
 //! ## Shape of an operation
 //!
@@ -187,9 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let bucket = store
                 .bucket(&region, &input.bucket_name)
                 .ok_or_else(|| not_found(&input.bucket_name))?;
+            let access_keys = bucket.access_keys.len();
+            let resources_receiving_access = bucket.resources_receiving_access.len();
             Ok::<_, DeleteBucketError>(HeldBucket {
-                access_keys: bucket.access_keys.len(),
-                resources_receiving_access: bucket.resources_receiving_access.len(),
+                access_keys,
+                resources_receiving_access,
+                origin_of_distributions: store.distributions_with_origin(
+                    &region,
+                    &input.bucket_name,
+                    crate::state::RESOURCE_TYPE_BUCKET,
+                ),
             })
         })
         .ok_or_else(unavailable)??;
@@ -202,10 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You must force delete the bucket if it has one of the following conditions: The
         // bucket is the origin of a distribution. The bucket has instances that were
         // granted access to it using the SetResourceAccessForBucket action. The bucket has
-        // objects. The bucket has access keys." Three of those four are conditions this
-        // store knows about; a distribution is a resource this emulator does not hold, so
-        // no bucket here is the origin of one. Every condition the bucket does have is
-        // named, so the caller learns what to clear or force.
+        // objects. The bucket has access keys." Each of those four is a condition this
+        // store holds the records for, so each is evaluated here. Every condition the
+        // bucket does have is named, so the caller learns what to clear or force.
         if !force_delete {
             let mut blocked_by = Vec::new();
             if objects > 0 {
@@ -223,6 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "{} resource{} were granted access to it",
                     held.resources_receiving_access,
                     plural(held.resources_receiving_access)
+                ));
+            }
+            if held.origin_of_distributions > 0 {
+                blocked_by.push(format!(
+                    "it is the origin of {} distribution{}",
+                    held.origin_of_distributions,
+                    plural(held.origin_of_distributions)
                 ));
             }
             if !blocked_by.is_empty() {
@@ -335,6 +350,10 @@ struct HeldBucket {
     /// How many Lightsail resources were granted access to the bucket through
     /// `SetResourceAccessForBucket` — another of the documented conditions.
     resources_receiving_access: usize,
+    /// How many of this account's distributions pull their content from the bucket —
+    /// the "the bucket is the origin of a distribution" condition, counted from the
+    /// distribution records that name it.
+    origin_of_distributions: usize,
 }
 
 /// The plural suffix for `count`, so a refusal reads as a sentence rather than as

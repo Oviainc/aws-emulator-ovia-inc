@@ -12060,6 +12060,29 @@ impl ComAmazonawsLightsailLightsail20161128State {
         None
     }
 
+    /// How many of this account's distributions pull their content from the
+    /// resource `name` names in `region`, which this store resolved to
+    /// `resource_type`.
+    ///
+    /// Counted from the distribution records that HOLD the origin rather than
+    /// from a counter kept on the origin resource, so the number cannot drift
+    /// from the distributions that actually name it — the same way
+    /// [`Self::certificate_in_use_resource_count`] counts the attachments of a
+    /// certificate. A distribution's origin is held as the name, the Region and
+    /// the resource type the create resolved ([`StoredDistribution::origin`]),
+    /// so a resource is the origin of a distribution exactly when all three
+    /// match. The walk is bounded by [`MAX_DISTRIBUTIONS`].
+    pub fn distributions_with_origin(&self, region: &str, name: &str, resource_type: &str) -> usize {
+        self.distributions
+            .values()
+            .filter(|distribution| {
+                distribution.origin.name.as_deref() == Some(name)
+                    && distribution.origin.region_name.as_deref() == Some(region)
+                    && distribution.origin.resource_type.as_deref() == Some(resource_type)
+            })
+            .count()
+    }
+
     /// The managed relational database `name` names, for a reporting operation.
     pub fn relational_database(&self, name: &str) -> Option<&StoredRelationalDatabase> {
         self.relational_databases.get(name)
