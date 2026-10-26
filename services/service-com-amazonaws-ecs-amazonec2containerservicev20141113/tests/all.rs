@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/agent_plane.rs"]
 mod agent_plane;
+#[path = "all/awsvpc_configuration_store.rs"]
+mod awsvpc_configuration_store;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
 #[path = "all/cluster_capacity_and_statistics.rs"]
