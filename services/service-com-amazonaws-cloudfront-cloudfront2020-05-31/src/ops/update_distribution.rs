@@ -456,7 +456,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(stored) = store.apply_config(&input.id, input.distribution_config, now) else {
+        if store
+            .apply_config(&input.id, input.distribution_config, now)
+            .is_none()
+        {
+            return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(),
+            )
+            .into());
+        }
+        // The answer reports the record the write left behind, through the one projection
+        // every `Distribution` payload of this service is built by — which reads the
+        // account's key groups too, since the active key group set reports the public keys
+        // the trusted groups hold. The write above stored the record, so the read back
+        // cannot miss; the modelled not-found is answered rather than panicking if it ever
+        // does.
+        let Some((distribution, etag)) = store.distribution_payload(&input.id) else {
             return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
                 crate::state::no_such_distribution(),
             )
@@ -464,10 +479,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(UpdateDistributionOutput {
-            distribution: Some(stored.to_distribution()),
+            distribution: Some(distribution),
             // "The current version of the configuration" — a fresh token, so the version
             // this caller just replaced no longer satisfies an `If-Match`.
-            e_tag: Some(stored.etag.clone()),
+            e_tag: Some(etag),
         })
     }
 }

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeyGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeyGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeyGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one key group: the call MINTS the group's identity (an id and a version token),
+//! records the instant it was written and PERSISTS the configuration as submitted, so
+//! `GetKeyGroup` and every other read of that group answer from the record rather than
+//! from the request being served.
+//!
+//! A mutating operation — "Creates a key group that you can use with CloudFront signed
+//! URLs and signed cookies" — and the only path by which a key group enters this service's
+//! store.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +155,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeyGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeyGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.key_group_config;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A key group itself has no transition owed: the
+        // model gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
+
+        // "To create a key group, you must specify at least one public key for the key
+        // group." The model's list carries no length constraint, so a configuration that
+        // names none is refused here — with the refusal this operation models for an
+        // unusable argument — BEFORE anything is minted.
+        if config.items.is_empty() {
+            return Err(CreateKeyGroupErrorModeled::InvalidArgument(
+                crate::state::key_group_without_a_public_key(),
+            )
+            .into());
+        }
+
+        // "A comment to describe the key group. The comment cannot be longer than 128
+        // characters." The member carries no `@length` in the model, so the documented
+        // bound is refused here, in the same words every other configuration of this
+        // service refuses an over-long comment with.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_KEY_GROUP_COMMENT {
+            return Err(CreateKeyGroupErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        // The published quota on ONE group's key list: the list is stored whole and every
+        // read of the group reports it, so a configuration past the bound is refused with
+        // the error the operation models for it rather than stored cut short.
+        if config.items.len() > crate::state::MAX_PUBLIC_KEYS_IN_KEY_GROUP {
+            return Err(CreateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(
+                crate::state::too_many_public_keys_in_key_group(),
+            )
+            .into());
+        }
+
+        // "A name to identify the key group": a name identifies ONE group, so a name
+        // another group already holds cannot name a second one — the group that holds it
+        // is left exactly as it was, and the caller is told to use `UpdateKeyGroup`
+        // instead.
+        if store.key_group_named(&config.name).is_some() {
+            return Err(CreateKeyGroupErrorModeled::KeyGroupAlreadyExists(
+                crate::state::key_group_already_exists(),
+            )
+            .into());
+        }
+
+        // The store grows only here and a key group cannot be evicted (a later read has to
+        // answer with what this create returned), so the bound is an entry count refused
+        // before the insert.
+        if store.key_groups.len() >= crate::state::MAX_KEY_GROUPS {
+            return Err(CreateKeyGroupErrorModeled::TooManyKeyGroups(
+                crate::state::too_many_key_groups(),
+            )
+            .into());
+        }
+
+        let id = store.allocate_key_group_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredKeyGroup {
+            id: id.clone(),
+            // Stored whole: a later read answers from this record, never from the request
+            // that was served — down to the members this create left out.
+            config,
+            // "The date and time when the key group was last modified": the instant this
+            // call stored it, written once so every later read reports the same one until
+            // another mutation writes the record.
+            last_modified_time: now,
+            etag: etag.clone(),
+        };
+        // Read from the record just built, never from the request.
+        let key_group = stored.to_key_group();
+        let location = crate::state::location_uri(&crate::state::key_group_path(&id));
+        store.key_groups.insert(id, stored);
+
+        Ok(CreateKeyGroupOutput {
+            // "The key group that was just created."
+            key_group: Some(key_group),
+            // "The URL of the key group."
+            location: Some(location),
+            // "The identifier for this version of the key group" — the token an `If-Match`
+            // against this group is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

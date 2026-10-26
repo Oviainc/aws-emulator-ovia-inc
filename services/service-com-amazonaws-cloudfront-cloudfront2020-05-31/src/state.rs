@@ -13,11 +13,13 @@
 //! The same holds for every other resource kind this store carries — a key value store, an
 //! Anycast static IP list, a
 //! response headers policy, an origin request policy, a cache policy, an origin access
-//! control, a CloudFront function, a connection function, a public key, a real-time log
+//! control, a CloudFront function, a connection function, a public key, a key group, a
+//! real-time log
 //! configuration: each record is put
 //! there by the call that creates it and is what every later read of that resource answers
 //! from. None of a response headers policy, an origin request policy, a cache policy, an
-//! origin access control, a public key or a real-time log configuration has a status
+//! origin access control, a public key, a key group or a real-time log configuration has a
+//! status
 //! member or a propagation deadline, so
 //! nothing about one is owed by the clock; neither is anything about a function or a
 //! connection function, each of which reaches its `LIVE` stage through a publish CALL
@@ -71,7 +73,8 @@ use crate::ops::types::{
     EntityNotFound, FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
     ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
-    InvalidTagging, IpamCidrConfig, IpamConfig, KGKeyPairIds, KeyPairIds, KeyValueStore,
+    InvalidTagging, IpamCidrConfig, IpamConfig, KGKeyPairIds, KeyGroup, KeyGroupConfig,
+    KeyPairIds, KeyValueStore,
     LambdaFunctionAssociations,
     LoggingConfig, ManagedCertificateDetails, ManagedCertificateRequest, MonitoringSubscription,
     NoSuchCachePolicy,
@@ -664,6 +667,25 @@ pub const PUBLIC_KEY_ID_PREFIX: char = 'K';
 /// own ceiling is an account quota that can be raised and the model states no number, so
 /// this bound is the emulator's rather than a claim about the service.
 pub const MAX_PUBLIC_KEYS: usize = 1_000;
+
+/// The most key groups this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_PUBLIC_KEYS`]: a key group record
+/// is what a later read answers from, so it cannot be evicted, and the create path is
+/// refused at this entry count with the modelled `TooManyKeyGroups` ("You have reached the
+/// maximum number of key groups for this Amazon Web Services account.") instead of growing
+/// further. CloudFront's own ceiling is an account quota that can be raised and the model
+/// states no number, so this bound is the emulator's rather than a claim about the service.
+pub const MAX_KEY_GROUPS: usize = 1_000;
+
+/// The most public keys ONE key group may name.
+///
+/// CloudFront's published quota is 5 public keys in a single key group (the Amazon
+/// CloudFront Developer Guide's "Quotas", quotas on signed URLs and signed cookies), and
+/// the modelled refusal names the same scope: "The number of public keys in this key group
+/// is more than the maximum allowed." The list is stored whole, so this also bounds one
+/// group's contribution to the store.
+pub const MAX_PUBLIC_KEYS_IN_KEY_GROUP: usize = 5;
 
 /// The prefix a field-level encryption profile id carries.
 ///
@@ -1469,7 +1491,14 @@ impl StoredDistribution {
 
     /// The `Distribution` projection `CreateDistribution`, `GetDistribution` and
     /// `UpdateDistribution` return.
-    pub fn to_distribution(&self) -> Distribution {
+    ///
+    /// `key_groups` are the account's stored key groups, which the active key group set
+    /// below reports the public keys of: a distribution's payload names the key groups its
+    /// configuration trusts, and the keys in each one are the ones those RECORDS hold.
+    pub fn to_distribution(
+        &self,
+        key_groups: &BTreeMap<String, StoredKeyGroup>,
+    ) -> Distribution {
         Distribution {
             id: self.id.clone(),
             arn: self.arn.clone(),
@@ -1478,7 +1507,7 @@ impl StoredDistribution {
             in_progress_invalidation_batches: self.in_progress_invalidation_batches(),
             domain_name: self.reported_domain_name(),
             active_trusted_signers: Some(self.active_trusted_signers()),
-            active_trusted_key_groups: Some(self.active_trusted_key_groups()),
+            active_trusted_key_groups: Some(self.active_trusted_key_groups(key_groups)),
             distribution_config: self.config.clone(),
             // An ICP recordal applies only to a distribution with alternate domain
             // names in the China partition, which this emulator does not serve.
@@ -1512,9 +1541,11 @@ impl StoredDistribution {
     /// accounts in the list", and the list itself is every account the distribution's cache
     /// behaviours trust, each named once in the order they first appear.
     ///
-    /// A signer's `KeyPairIds` are the ACTIVE CloudFront key pairs of that account. No call
-    /// in this emulator creates a CloudFront key pair (`CreatePublicKey` and the key-group
-    /// operations still answer 501), so no account has one and the reported set is empty.
+    /// A signer's `KeyPairIds` are the ACTIVE CloudFront key pairs of that account — the
+    /// account-wide key pairs a root user creates, which this service's API cannot create
+    /// (no operation in the model mints one), so no account has one and the reported set is
+    /// empty. The public keys a key group holds are a different thing, reported by
+    /// [`StoredDistribution::active_trusted_key_groups`] from the stored key groups.
     pub fn active_trusted_signers(&self) -> ActiveTrustedSigners {
         let behaviors = self.behaviors();
         let accounts = first_seen(
@@ -1548,11 +1579,18 @@ impl StoredDistribution {
     ///
     /// Read from the stored configuration the same way [`StoredDistribution::active_trusted_signers`]
     /// is: `Quantity` is "the number of key groups in the list" and the list is every key
-    /// group the distribution's cache behaviours trust, each named once. A key group's
-    /// public keys are empty for the same reason a signer's key pairs are — this emulator
-    /// mints no public key — so `Enabled` reports whether the configuration trusts any key
-    /// group at all.
-    pub fn active_trusted_key_groups(&self) -> ActiveTrustedKeyGroups {
+    /// group the distribution's cache behaviours trust, each named once, and `Enabled`
+    /// reports whether the configuration trusts any key group at all.
+    ///
+    /// A group's `KeyPairIds` are "the identifiers of the public keys in each key group
+    /// that CloudFront can use to verify the signatures", which is what the key group
+    /// RECORD `key_groups` holds for that id states — so the set is read from the store
+    /// rather than from this distribution's configuration, and a trusted id the account
+    /// holds no key group for contributes no key.
+    pub fn active_trusted_key_groups(
+        &self,
+        key_groups: &BTreeMap<String, StoredKeyGroup>,
+    ) -> ActiveTrustedKeyGroups {
         let behaviors = self.behaviors();
         let groups = first_seen(
             behaviors
@@ -1568,12 +1606,18 @@ impl StoredDistribution {
             items: (!groups.is_empty()).then(|| {
                 groups
                     .into_iter()
-                    .map(|group| KGKeyPairIds {
-                        key_group_id: Some(group),
-                        key_pair_ids: Some(KeyPairIds {
-                            quantity: 0,
-                            items: None,
-                        }),
+                    .map(|group| {
+                        let keys = key_groups
+                            .get(&group)
+                            .map(|stored| stored.config.items.as_slice())
+                            .unwrap_or_default();
+                        KGKeyPairIds {
+                            key_group_id: Some(group),
+                            key_pair_ids: Some(KeyPairIds {
+                                quantity: i32::try_from(keys.len()).unwrap_or(i32::MAX),
+                                items: (!keys.is_empty()).then(|| keys.to_vec()),
+                            }),
+                        }
                     })
                     .collect()
             }),
@@ -3545,6 +3589,48 @@ impl StoredPublicKey {
     }
 }
 
+/// One CloudFront key group, as this emulator persists it.
+///
+/// "A key group contains a list of public keys that you can use with CloudFront signed URLs
+/// and signed cookies." The record is the single source of truth for the group's id, the
+/// configuration it was created with, the instant it was last written and its version
+/// token, so the create and every later read — `GetKeyGroup` above all — answer from it
+/// rather than from the request being served.
+///
+/// Nothing in here is owed by the CLOCK: the model's `KeyGroup` is `Id`,
+/// `LastModifiedTime` and `KeyGroupConfig` only — a key group carries no status and no
+/// propagation deadline, so one this service accepts is usable at once.
+#[derive(Debug, Clone)]
+pub struct StoredKeyGroup {
+    /// `KeyGroup$Id` — "The identifier for the key group": the token minted at creation,
+    /// which is also the key this record is held under and the path segment its `Location`
+    /// names.
+    pub id: String,
+    /// The configuration as submitted — "A key group configuration." Stored whole, so a
+    /// read reports what was stored rather than re-deriving anything from a request, down
+    /// to the members the create left out.
+    pub config: KeyGroupConfig,
+    /// `KeyGroup$LastModifiedTime` — "The date and time when the key group was last
+    /// modified." Written by the call that last wrote the record, so every later read
+    /// reports the same instant.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this key group.
+    pub etag: String,
+}
+
+impl StoredKeyGroup {
+    /// The `KeyGroup` projection every key group operation returns, read from the one
+    /// stored record.
+    pub fn to_key_group(&self) -> KeyGroup {
+        KeyGroup {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            key_group_config: self.config.clone(),
+        }
+    }
+}
+
 /// One CloudFront field-level encryption profile, as this emulator persists it.
 ///
 /// The record is the single source of truth for the profile's id, the configuration it was
@@ -3677,6 +3763,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// `distributions`: one stable total order for `ListPublicKeys`'s `Marker` to index
     /// into.
     pub public_keys: BTreeMap<String, StoredPublicKey>,
+    /// Every key group this emulator holds, keyed by its minted id — the identifier every
+    /// key group operation addresses one by. A `BTreeMap` for the same reason as
+    /// `distributions`: one stable total order for `ListKeyGroups`'s `Marker` to index
+    /// into.
+    pub key_groups: BTreeMap<String, StoredKeyGroup>,
     /// Every field-level encryption profile this emulator holds, keyed by its minted id —
     /// the identifier every field-level encryption profile operation addresses one by. A
     /// `BTreeMap` for the same reason as `distributions`: one stable total order for
@@ -4298,6 +4389,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|key| key.config.caller_reference == caller_reference)
     }
 
+    /// The key group `id` names, or `None` when the store holds none.
+    pub fn key_group(&self, id: &str) -> Option<&StoredKeyGroup> {
+        self.key_groups.get(id)
+    }
+
+    /// The key group whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `KeyGroupConfig$Name` is "A name to identify the key group", and the create models
+    /// `KeyGroupAlreadyExists` for a name another group already holds — so at most one
+    /// group answers, and this is what makes a repeated name a conflict rather than a
+    /// second group. The comparison is against the stored configuration, never against a
+    /// request, and the collection is bounded by [`MAX_KEY_GROUPS`].
+    pub fn key_group_named(&self, name: &str) -> Option<&StoredKeyGroup> {
+        self.key_groups
+            .values()
+            .find(|group| group.config.name == name)
+    }
+
     /// The field-level encryption profile `id` names, or `None` when the store holds none.
     pub fn field_level_encryption_profile(
         &self,
@@ -4547,7 +4656,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                     return Ok(CreatedDistribution {
                         id: existing.id.clone(),
                         etag: existing.etag.clone(),
-                        distribution: existing.to_distribution(),
+                        distribution: existing.to_distribution(&self.key_groups),
                     });
                 }
                 return Err(CreateRefusal::DistributionAlreadyExists(
@@ -4597,7 +4706,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let created = CreatedDistribution {
             id: id.clone(),
             etag,
-            distribution: stored.to_distribution(),
+            distribution: stored.to_distribution(&self.key_groups),
         };
         self.caller_references.insert(caller_reference, id.clone());
         self.distributions.insert(id, stored);
@@ -4821,6 +4930,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = format!("{PUBLIC_KEY_ID_PREFIX}{}", self.mint(ID_BODY_LEN));
             if !self.public_keys.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a key group id no stored key group holds.
+    ///
+    /// `KeyGroup$Id` is "The identifier for the key group", and CloudFront mints a UUID for
+    /// one (the shape its own `create-key-group` answers show, the same one its cache,
+    /// origin request and response headers policy ids take), so this renders one draw of
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::mint_uuid`] — distinct draws render
+    /// distinctly, so the mint never repeats an id.
+    pub fn allocate_key_group_id(&mut self) -> String {
+        loop {
+            let candidate = self.mint_uuid();
+            if !self.key_groups.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -5087,6 +5212,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.status = STATUS_IN_PROGRESS.to_string();
         stored.deployed_due = now + PROPAGATION_DELAY;
         Some(stored)
+    }
+
+    /// The `Distribution` payload of the record `id` names, beside the version token that
+    /// record carries, or `None` when the store holds no such distribution.
+    ///
+    /// ONE place a `Distribution` payload is built from this store, because the projection
+    /// reads TWO parts of it: the distribution record itself and the account's key groups,
+    /// whose public keys the active key group set reports
+    /// ([`StoredDistribution::active_trusted_key_groups`]). Every operation that answers
+    /// with a `Distribution` goes through it, so they cannot report different things for
+    /// the same state.
+    pub fn distribution_payload(&self, id: &str) -> Option<(Distribution, String)> {
+        let stored = self.distributions.get(id)?;
+        Some((stored.to_distribution(&self.key_groups), stored.etag.clone()))
     }
 
     /// Set or clear the WAF web ACL customization of the distribution tenant `id` names,
@@ -6031,6 +6170,13 @@ pub fn cache_policy_path(id: &str) -> String {
 /// addressed by ID, as `GetPublicKey`'s `{Id}` label is.
 pub fn public_key_path(id: &str) -> String {
     format!("/2020-05-31/public-key/{id}")
+}
+
+/// The path of a key group resource under this service's API version — the route
+/// `GetKeyGroup` serves (`/key-group/{Id}`), which is therefore the resource the create's
+/// `Location` names.
+pub fn key_group_path(id: &str) -> String {
+    format!("/2020-05-31/key-group/{id}")
 }
 
 /// The path of a field-level encryption profile resource under this service's API version.
@@ -8565,6 +8711,88 @@ pub fn too_many_public_keys() -> crate::ops::types::TooManyPublicKeys {
 pub fn public_key_already_exists_message(existing_id: &str) -> String {
     format!("The specified public key already exists: {existing_id}")
 }
+
+/// The longest comment a key group carries.
+///
+/// `KeyGroupConfig$Comment`: "A comment to describe the key group. The comment cannot be
+/// longer than 128 characters." The SAME bound, stated in the same words, as
+/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`] — so it is that constant rather than a second
+/// literal, and a comment past it is refused with the one [`comment_too_long`] sentence.
+pub const MAX_KEY_GROUP_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
+
+/// The modelled `KeyGroupAlreadyExists` (HTTP 409) for a key group name that is already
+/// taken.
+///
+/// The sentence is the one the model states on the shape itself, and it names no part of
+/// the request: what it reports is that the name is taken and what to do instead, which is
+/// a property of the store rather than of the value submitted.
+pub fn key_group_already_exists() -> crate::ops::types::KeyGroupAlreadyExists {
+    crate::ops::types::KeyGroupAlreadyExists {
+        message: Some(KEY_GROUP_ALREADY_EXISTS_MESSAGE.to_string()),
+    }
+}
+
+/// `KeyGroupAlreadyExists`'s message, as the model documents the shape.
+pub const KEY_GROUP_ALREADY_EXISTS_MESSAGE: &str =
+    "A key group with this name already exists. You must provide a unique name. To modify \
+     an existing key group, use UpdateKeyGroup.";
+
+/// The modelled `TooManyKeyGroups` (HTTP 400) for a create that would take the store past
+/// [`MAX_KEY_GROUPS`].
+///
+/// The sentence is the one the model states on the shape itself — a property of the
+/// account's stored key groups rather than of the request, so nothing from the request
+/// belongs in the text; it lives here beside every other modelled error text of this
+/// service rather than in the handler.
+pub fn too_many_key_groups() -> crate::ops::types::TooManyKeyGroups {
+    crate::ops::types::TooManyKeyGroups {
+        message: Some(TOO_MANY_KEY_GROUPS_MESSAGE.to_string()),
+    }
+}
+
+/// `TooManyKeyGroups`'s message, as the model documents the shape.
+pub const TOO_MANY_KEY_GROUPS_MESSAGE: &str =
+    "You have reached the maximum number of key groups for this Amazon Web Services \
+     account. For more information, see Quotas (formerly known as limits) in the Amazon \
+     CloudFront Developer Guide.";
+
+/// The modelled `TooManyPublicKeysInKeyGroup` (HTTP 400) for a configuration that names
+/// more public keys than [`MAX_PUBLIC_KEYS_IN_KEY_GROUP`].
+///
+/// The sentence is the one the model states on the shape itself: what it reports is the
+/// published quota on one group's key list, which is a property of the parameter rather
+/// than of the value submitted.
+pub fn too_many_public_keys_in_key_group() -> crate::ops::types::TooManyPublicKeysInKeyGroup {
+    crate::ops::types::TooManyPublicKeysInKeyGroup {
+        message: Some(TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE.to_string()),
+    }
+}
+
+/// `TooManyPublicKeysInKeyGroup`'s message, as the model documents the shape.
+pub const TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE: &str =
+    "The number of public keys in this key group is more than the maximum allowed. For \
+     more information, see Quotas (formerly known as limits) in the Amazon CloudFront \
+     Developer Guide.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a key group configuration that names no
+/// public key at all.
+///
+/// `CreateKeyGroup` documents the requirement — "To create a key group, you must specify
+/// at least one public key for the key group" — and the model's `PublicKeyIdList` carries
+/// no length constraint, so the bound is not refused before a handler runs and the create
+/// path checks it itself. The sentence states the CONSTRAINT rather than echoing the
+/// request, as [`comment_too_long`] does for the other documented bound on a
+/// configuration.
+pub fn key_group_without_a_public_key() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE.to_string()),
+    }
+}
+
+/// The message a key group create naming no public key is refused with.
+pub const KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE: &str =
+    "An argument is invalid: to create a key group, you must specify at least one public \
+     key for the key group";
 
 /// Mint the request id ONE response names the request it answers with — the `RequestId`
 /// element of this service's `<ErrorResponse>` envelope (`crate::service::envelope`).

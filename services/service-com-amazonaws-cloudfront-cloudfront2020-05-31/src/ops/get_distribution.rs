@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports is the one the distribution has at this instant.
         store.settle(SystemTime::now());
 
-        let Some(stored) = store.distribution(&input.id) else {
+        // The payload is built by the one projection every `Distribution` answer of this
+        // service goes through: it reads the stored record AND the account's key groups,
+        // whose public keys the active key group set reports. An id the store holds no
+        // distribution for is the modelled not-found.
+        let Some((distribution, etag)) = store.distribution_payload(&input.id) else {
             return Err(GetDistributionErrorModeled::NoSuchDistribution(
                 crate::state::no_such_distribution(),
             )
@@ -152,11 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetDistributionOutput {
-            distribution: Some(stored.to_distribution()),
+            distribution: Some(distribution),
             // "The current version of the distribution's information" — the same token
             // the last mutation handed back, which is what an `If-Match` is checked
             // against.
-            e_tag: Some(stored.etag.clone()),
+            e_tag: Some(etag),
         })
     }
 }

@@ -301,7 +301,7 @@ fn is_public_key_id(value: &str) -> bool {
 
 /// Whether `value` is an instant written the way this service's wire format writes one:
 /// an ISO-8601 date and time at UTC, which is what a restXml `timestamp` carries.
-fn is_wire_timestamp(value: &str) -> bool {
+pub(crate) fn is_wire_timestamp(value: &str) -> bool {
     value.contains('T') && value.ends_with('Z') && value.len() >= "2026-01-01T00:00:00Z".len()
 }
 
