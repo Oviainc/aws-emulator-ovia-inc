@@ -476,9 +476,9 @@ async fn a_start_replaces_an_update_that_owes_nothing() {
 }
 
 /// The address of an in-flight accepted update is in use: it survives a start on
-/// its own account, so another account cannot take it — the acceptance there is
-/// the modelled HTTP 409 `ConflictException`, before and after the first
-/// account's completion comes due.
+/// its own account, so another account can neither ask for it nor have it
+/// confirmed — both are the modelled HTTP 409 `ConflictException`, before and
+/// after the first account's completion comes due.
 #[tokio::test]
 async fn an_address_accepted_in_flight_stays_in_use_for_other_accounts() {
     // (case, the account that accepted the address, the account that tries to
@@ -509,6 +509,10 @@ async fn an_address_accepted_in_flight_stays_in_use_for_other_accounts() {
         let router = emulator();
 
         assert_started(case, &start(&router, holder, &address).await, PENDING);
+        // The rival asks for the same address while nothing has been confirmed
+        // for it: two PENDING requests take the address from nobody, so both
+        // starts are admitted.
+        assert_started(case, &start(&router, rival, &address).await, PENDING);
         assert_started(
             case,
             &accept(&router, holder, &address, WELL_FORMED_PASSCODES[3]).await,
@@ -524,9 +528,15 @@ async fn an_address_accepted_in_flight_stays_in_use_for_other_accounts() {
             "ConflictException",
         );
 
-        // The rival may ASK for the address (a pending request changes nothing)
-        // but cannot have it confirmed, in flight or completed.
-        assert_started(case, &start(&router, rival, &address).await, PENDING);
+        // From that acceptance on the address IS in use, so the rival cannot
+        // even ASK for it any more — and the request it had already recorded
+        // cannot be confirmed, in flight or completed.
+        assert_refused(
+            &format!("{case} / a fresh start on the rival"),
+            &start(&router, rival, &address).await,
+            409,
+            "ConflictException",
+        );
         assert_refused(
             &format!("{case} / while the holder's change is in flight"),
             &accept(&router, rival, &address, WELL_FORMED_PASSCODES[0]).await,
