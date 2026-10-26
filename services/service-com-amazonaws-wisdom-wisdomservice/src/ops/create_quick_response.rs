@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQuickResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQuickResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQuickResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a quick response INSIDE the knowledge base the route names — a
+//! fresh v4 uuid `quickResponseId`, the matching `quick-response/<knowledgeBaseId>/<id>`
+//! ARN, and the record every later `GetQuickResponse` reads. A replayed `clientToken`
+//! answers with the quick response that token already created; a `name` or a
+//! `shortcutKey` a live quick response of the same knowledge base already holds is the
+//! conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +101,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::QuickResponse;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,18 +175,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQuickResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQuickResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQuickResponse"))
+        // Modeled constraints (`name`'s length, `contentType`'s pattern, the content
+        // union's length) are already refused BEFORE this handler runs, so reaching here
+        // means the input satisfies every one of them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateQuickResponse",
+            ));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // A quick response exists only inside a knowledge base, so the parent is
+        // resolved first: a create naming a knowledge base this account does not hold is
+        // not found, whatever else the request carries. Its id and ARN are read off the
+        // stored record rather than rebuilt, so the quick response reports the knowledge
+        // base's own ARN.
+        let Some(knowledge_base) = state.knowledge_base(&input.knowledge_base_id) else {
+            return Err(CreateQuickResponseErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
+
+        // A retried create carrying the same `clientToken` answers with the quick
+        // response the first call created under THIS knowledge base, rather than minting
+        // a second one. The token's scope is the parent, so the same token used under
+        // another knowledge base is a different create.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_resource_id(Self::NAME, &knowledge_base_id, token)
+                .cloned()
+                .and_then(|id| state.quick_response(&knowledge_base_id, &id))
+                .map(crate::state::QuickResponse::to_data);
+            if let Some(quick_response) = replayed {
+                return Ok(CreateQuickResponseOutput {
+                    quick_response: Some(quick_response),
+                });
+            }
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's tagging
+        // restrictions allow at most 50 tags on a resource, and a request past that is
+        // outside what the service accepts. The count is taken from what the caller sent,
+        // before the map is stored.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateQuickResponseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::message_too_many_tags()),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+
+        // A quick response's name identifies it inside its knowledge base, so a create
+        // under a name a live one already holds is the modelled conflict (HTTP 409)
+        // rather than a second record, and the refusal leaves the first untouched.
+        if state
+            .quick_response_with_name(&knowledge_base_id, &input.name)
+            .is_some()
+        {
+            return Err(CreateQuickResponseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::message_value_in_use(
+                        crate::state::MEMBER_QUICK_RESPONSE_NAME,
+                    )),
+                },
+            )
+            .into());
+        }
+        // The same for the shortcut key, which the model requires to be unique across the
+        // knowledge base: the key is what an agent types to insert this reply, so two
+        // quick responses cannot answer to one.
+        if let Some(shortcut_key) = input.shortcut_key.as_deref() {
+            if state
+                .quick_response_with_shortcut_key(&knowledge_base_id, shortcut_key)
+                .is_some()
+            {
+                return Err(CreateQuickResponseErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::message_value_in_use(
+                            crate::state::MEMBER_SHORTCUT_KEY,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The content, as the caller gave it: the union declares exactly one member.
+        let content = match &input.content {
+            QuickResponseDataProvider::Content(content) => content.clone(),
+        };
+        // `contentType` is optional on the request while `QuickResponseData.contentType`
+        // is required, so a create that names none stores the plain-text media type the
+        // member documents for content written as nothing else.
+        let content_type = input
+            .content_type
+            .unwrap_or_else(|| crate::state::QUICK_RESPONSE_TYPE_PLAIN.to_string());
+
+        let quick_response_id = crate::state::new_resource_id();
+        let quick_response_arn =
+            crate::state::quick_response_arn(&region, &knowledge_base_id, &quick_response_id);
+        let stored = state.insert_quick_response(QuickResponse {
+            quick_response_id: quick_response_id.clone(),
+            quick_response_arn,
+            knowledge_base_id: knowledge_base_id.clone(),
+            knowledge_base_arn,
+            name: input.name,
+            content_type,
+            // A quick response is usable the moment it is created, so it is created in
+            // the terminal `CREATED` status, not a transient one.
+            status: crate::state::QUICK_RESPONSE_STATUS_CREATED.to_string(),
+            content,
+            description: input.description,
+            grouping_configuration: input.grouping_configuration,
+            shortcut_key: input.shortcut_key,
+            is_active: input.is_active,
+            channels: input.channels,
+            language: input.language,
+            tags,
+            created_at: now,
+            // Nothing has modified the record yet, so it was last written when it was
+            // created.
+            last_modified_at: now,
+        });
+        if !stored {
+            // One knowledge base holds as many quick responses as this emulator keeps
+            // (`state::MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`); the service models this
+            // refusal.
+            return Err(
+                CreateQuickResponseErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::message_quick_response_quota()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(
+                Self::NAME,
+                &knowledge_base_id,
+                token,
+                &quick_response_id,
+            );
+        }
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetQuickResponse` cannot disagree.
+        let quick_response = state
+            .quick_response(&knowledge_base_id, &quick_response_id)
+            .map(crate::state::QuickResponse::to_data);
+        Ok(CreateQuickResponseOutput { quick_response })
     }
 }

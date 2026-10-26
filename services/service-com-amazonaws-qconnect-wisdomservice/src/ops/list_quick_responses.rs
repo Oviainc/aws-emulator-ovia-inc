@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQuickResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQuickResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQuickResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS the quick responses held inside the knowledge base the route names, as
+//! `QuickResponseSummary` pages in `quickResponseId` order, out of the stored records. A
+//! knowledge base this account does not hold is `ResourceNotFoundException` (HTTP 404);
+//! a `nextToken` this service did not mint is refused rather than read as "from the
+//! beginning".
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQuickResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQuickResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQuickResponses"))
+        // `ListQuickResponses` is `@readonly`: it reports the stored records and writes
+        // nothing, so a read cannot change what a later caller sees.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("ListQuickResponses")
+        })?;
+        let store = state.lock();
+
+        // The listing is of ONE knowledge base, so the parent is resolved first: a
+        // knowledge base this account does not hold is not found rather than an empty
+        // page.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(ListQuickResponsesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // A token this service did not mint names no position, so it is refused rather
+        // than silently read as "from the beginning".
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+                ListQuickResponsesErrorModeled::ValidationException(ValidationException {
+                    message: Some("nextToken: the specified token is not valid.".to_string()),
+                })
+            })?),
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator refuses
+        // anything outside it before this handler runs. Refuse explicitly rather than
+        // defaulting, so a value this service cannot page with is never read as "the
+        // whole page".
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_MAX_RESULTS,
+            Some(max) => usize::try_from(max)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| {
+                    ListQuickResponsesErrorModeled::ValidationException(ValidationException {
+                        message: Some("maxResults: must be between 1 and 100.".to_string()),
+                    })
+                })?,
+        };
+
+        // The entries are ordered by id, and a continuation resumes at the first one at
+        // or after the cursor: a quick response deleted between two pages cannot
+        // invalidate a token already handed out.
+        let entries = store.quick_responses_of(&knowledge_base_id);
+        let mut remaining = entries.into_iter().filter(|quick_response| {
+            start_at
+                .as_ref()
+                .is_none_or(|from| &quick_response.quick_response_id >= from)
+        });
+        let quick_response_summaries: Vec<QuickResponseSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::QuickResponse::to_summary)
+            .collect();
+        let next_token = remaining
+            .next()
+            .map(|quick_response| crate::state::encode_cursor(&quick_response.quick_response_id));
+
+        Ok(ListQuickResponsesOutput {
+            quick_response_summaries,
+            next_token,
+        })
     }
 }

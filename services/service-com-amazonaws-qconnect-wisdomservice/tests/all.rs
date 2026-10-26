@@ -29,6 +29,8 @@ mod knowledge_base_lifecycle;
 mod knowledge_base_listing_and_queries;
 #[path = "all/modelled_refusals.rs"]
 mod modelled_refusals;
+#[path = "all/quick_response.rs"]
+mod quick_response;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/session_configuration.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQuickResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQuickResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQuickResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: REPORTS the quick responses held inside the knowledge base the route
+//! names, as `QuickResponseSummary` pages in `quickResponseId` order, out of the stored
+//! records. A knowledge base this account does not hold is `ResourceNotFoundException`
+//! (HTTP 404); a `nextToken` this listing could not have issued is refused rather than
+//! read as "from the beginning".
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQuickResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQuickResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ListQuickResponses` is `@readonly`: it reports the stored records and writes
+        // nothing, so a read cannot change what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to read,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListQuickResponses",
+            ));
+        };
+        let state = state.lock();
+
+        // The listing is of ONE knowledge base, so the parent is resolved first: a
+        // knowledge base this account does not hold is not found rather than an empty
+        // page.
+        let Some(knowledge_base_id) = state.resolve_knowledge_base_id(&input.knowledge_base_id)
+        else {
+            return Err(ListQuickResponsesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A page's `nextToken` is the `quickResponseId` the next page starts at, so a
+        // token that is no id of this service's form names no position and is refused
+        // rather than silently read as "from the beginning".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQuickResponses"))
+        // This listing resumes at an ID rather than at a numeric cursor of its own (the
+        // form `ListAssistants` uses through `state::listing_from`) because the two
+        // listings are different collections: the assistant listing is account-level and
+        // served in CREATION order, so it needs a cursor vector beside the map to keep
+        // that order stable across deletes, while a quick-response listing is of one
+        // knowledge base's records in `quickResponseId` order — the order the records
+        // themselves give — so the id of the next entry is the whole position, and a
+        // record deleted between two pages still resumes at the first id at or after it.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_resource_id(token) {
+                return Err(ListQuickResponsesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("The nextToken is not a token of this listing.".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+        // `maxResults` is modelled `range 1..100`, which the boundary validator has
+        // already enforced; the only choice left here is the page size for a caller who
+        // named none, which is the modelled maximum. The lower clamp keeps a page from
+        // being empty-with-a-token — a loop that never ends — independently of the
+        // validator, as the sibling listings of this crate do.
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_PAGE_SIZE))
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .max(1);
+
+        // The entries are ordered by id, and a continuation resumes at the first one at
+        // or after the token: a quick response deleted between two pages cannot
+        // invalidate a token already handed out.
+        let entries = state.quick_responses_of(&knowledge_base_id);
+        let mut remaining = entries.into_iter().filter(|quick_response| {
+            input
+                .next_token
+                .as_deref()
+                .is_none_or(|from| quick_response.quick_response_id.as_str() >= from)
+        });
+        let quick_response_summaries: Vec<QuickResponseSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::QuickResponse::to_summary)
+            .collect();
+        let next_token = remaining
+            .next()
+            .map(|quick_response| quick_response.quick_response_id.clone());
+
+        Ok(ListQuickResponsesOutput {
+            quick_response_summaries,
+            next_token,
+        })
     }
 }

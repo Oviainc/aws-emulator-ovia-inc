@@ -14,8 +14,9 @@ use crate::ops::types::{
     AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
     AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
     AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
-    KnowledgeBaseAssociationData, KnowledgeBaseData, KnowledgeBaseSummary,
+    GroupingConfiguration, KnowledgeBaseAssociationData, KnowledgeBaseData, KnowledgeBaseSummary,
     OrchestratorConfigurationEntry,
+    QuickResponseContentProvider, QuickResponseContents, QuickResponseData, QuickResponseSummary,
     RenderingConfiguration, RecommendationData, RecommendationTrigger,
     ServerSideEncryptionConfiguration, SessionData, SessionIntegrationConfiguration,
     SourceConfiguration, TagFilter, VectorIngestionConfiguration,
@@ -227,6 +228,85 @@ pub const MAX_ASSOCIATIONS_PER_ASSISTANT: usize = 100;
 /// (`smithy_query(query="shape",shape="AssociationType")`).
 pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
 
+/// The most quick responses one knowledge base may hold at a time, with the same
+/// contract as [`MAX_KNOWLEDGE_BASES`] one level down: a create beyond it is refused
+/// with the modelled `ServiceQuotaExceededException` (HTTP 402), which
+/// `CreateQuickResponse` declares for exactly this, and which is also what keeps this
+/// store finite — a quick response is released only by `DeleteQuickResponse` or by the
+/// delete of its knowledge base.
+///
+/// CHOSEN: AWS quotas quick responses per knowledge base but does not publish the
+/// figure.
+pub const MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE: usize = 100;
+
+/// The terminal `QuickResponseStatus` of a usable quick response, and the one a create
+/// answers with: the service reports the quick response ready in the response to the
+/// call that made it, so no later status change is owed
+/// (`smithy_query(query="shape",shape="QuickResponseStatus")` also declares the
+/// transient `CREATE_IN_PROGRESS`, `UPDATE_IN_PROGRESS`, `DELETE_IN_PROGRESS` and the
+/// failure and deleted values, none of which a record this store holds reaches: a delete
+/// removes the record outright).
+pub const QUICK_RESPONSE_STATUS_CREATED: &str = "CREATED";
+
+/// The `QuickResponseType` of a quick response written in plain text, and the media type
+/// a create that names none is stored with: the member is optional on the request while
+/// `QuickResponseData.contentType` is required, and plain text is the form the content is
+/// read as when the caller marks it up as nothing else
+/// (`smithy_query(query="doc",shape="CreateQuickResponseRequest",member="contentType")`:
+/// "Use application/x.quickresponse;format=plain for a quick response written in plain
+/// text").
+pub const QUICK_RESPONSE_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
+
+/// The `QuickResponseType` of a quick response written in richtext — the same member's
+/// other documented value ("Use application/x.quickresponse;format=markdown for a quick
+/// response written in richtext"), which decides which `QuickResponseContents` member
+/// carries the stored content.
+pub const QUICK_RESPONSE_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
+
+/// The message a read or a write of a quick response this knowledge base does not hold
+/// is refused with, worded as this endpoint words the other not-found resources of this
+/// family ([`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`]).
+pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "Quick Response does not exist.";
+
+/// The sentence a create past [`MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`] is refused
+/// with, stating the RULE — the ceiling and what to do about it — and carrying nothing
+/// from the request or from what the knowledge base already holds.
+///
+/// The Amazon Connect Wisdom view of this same endpoint words it from its own copy of
+/// this text (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a
+/// client cannot get a different sentence depending on which model it addressed.
+pub fn message_quick_response_quota() -> String {
+    format!(
+        "The maximum number of quick responses ({MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE}) in \
+         this knowledge base has been reached. Delete a quick response before creating another."
+    )
+}
+
+/// The sentence a create whose `name` or `shortcutKey` a live quick response of the same
+/// knowledge base already holds is refused with — one message class, worded with the
+/// member whose value clashes.
+///
+/// A quick response's name and shortcut key each identify it inside its knowledge base
+/// (the model states the shortcut key's rule on the member itself:
+/// `smithy_query(query="doc",shape="CreateQuickResponseRequest",member="shortcutKey")`,
+/// "The value should be unique across the knowledge base"), so a second create claiming
+/// either conflicts with the first rather than replacing it.
+///
+/// The fixed text is the sentence the recorded wire answer of this endpoint carries for a
+/// shortcut key already in use — which is why it is not [`MESSAGE_NAME_IN_USE`], the
+/// shorter sentence the other resource families of this crate refuse a duplicate name
+/// with — and the member is named in it as that answer names it: as PROSE ("shortcut
+/// key"), not as the modelled member name (`shortcutKey`). The member name is the
+/// sentence's only variable part, so no stored value travels in it.
+pub fn message_value_in_use(member: &str) -> String {
+    format!("The value for {member} is already in use. Please update and try again.")
+}
+
+/// The member names [`message_value_in_use`] is worded with, as a caller names them: the
+/// request member whose value must be unique inside the knowledge base.
+pub const MEMBER_QUICK_RESPONSE_NAME: &str = "name";
+pub const MEMBER_SHORTCUT_KEY: &str = "shortcut key";
+
 /// The only `KnowledgeBaseType` a content upload may be started against.
 ///
 /// `StartContentUpload`'s own documentation states the rule — "You can only upload
@@ -386,6 +466,20 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         ARN_NAMESPACE,
         region,
         &format!("session/{assistant_id}/{session_id}"),
+    )
+}
+
+/// This service's ARN for a quick response, which names its parent knowledge base too:
+/// `arn:aws:wisdom:<region>:<account>:quick-response/<knowledgeBaseId>/<quickResponseId>`.
+///
+/// Two id segments, the same nested form [`session_arn`] uses and the one the modelled
+/// `Arn` pattern admits for a resource inside another (`<label>/<uuid>(/<uuid>)?`), with
+/// the quick response's own id LAST so [`resolve_id`] reads it back out.
+pub fn quick_response_arn(region: &str, knowledge_base_id: &str, quick_response_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("quick-response/{knowledge_base_id}/{quick_response_id}"),
     )
 }
 
@@ -920,6 +1014,116 @@ impl KnowledgeBase {
     }
 }
 
+/// One persisted quick response: a reply an agent inserts by name or by shortcut key,
+/// held INSIDE the knowledge base it was created under.
+///
+/// The record is the single copy of the resource: `CreateQuickResponse` writes it and
+/// every read of it answers out of these fields, so a create's answer and a later
+/// `GetQuickResponse` cannot disagree. The content is kept as the caller gave it,
+/// together with the media type it is read as, and rendered into the modelled
+/// `QuickResponseContents` union on the way out ([`Self::contents`]).
+#[derive(Debug, Clone)]
+pub struct QuickResponse {
+    pub quick_response_id: String,
+    pub quick_response_arn: String,
+    /// The RESOLVED `knowledgeBaseId` of the parent, never the label form the request
+    /// used, so a quick response resolves the same way under either label form.
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+    pub name: String,
+    /// `QuickResponseType` on the wire: the media type the content is read as.
+    pub content_type: String,
+    /// `QuickResponseStatus` on the wire.
+    pub status: String,
+    /// The content the create carried, as given.
+    pub content: String,
+    pub description: Option<String>,
+    pub grouping_configuration: Option<GroupingConfiguration>,
+    pub shortcut_key: Option<String>,
+    pub is_active: Option<bool>,
+    pub channels: Option<Vec<String>>,
+    pub language: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    /// When this record last changed. Equal to [`Self::created_at`] until an update
+    /// writes it, so `lastModifiedTime` is never earlier than `createdTime`.
+    pub last_modified_at: SystemTime,
+}
+
+impl QuickResponse {
+    /// The stored content as the modelled `QuickResponseContents` union: the member that
+    /// carries it is the one this record's `contentType` names, so a plain-text quick
+    /// response reports its content under `plainText` and a richtext one under
+    /// `markdown`.
+    fn contents(&self) -> QuickResponseContents {
+        let provider = QuickResponseContentProvider::Content(self.content.clone());
+        if self.content_type == QUICK_RESPONSE_TYPE_MARKDOWN {
+            QuickResponseContents {
+                plain_text: None,
+                markdown: Some(provider),
+            }
+        } else {
+            QuickResponseContents {
+                plain_text: Some(provider),
+                markdown: None,
+            }
+        }
+    }
+
+    /// This quick response as the `QuickResponseData` shape `CreateQuickResponse` and
+    /// `GetQuickResponse` return.
+    pub fn to_quick_response_data(&self) -> QuickResponseData {
+        QuickResponseData {
+            quick_response_arn: self.quick_response_arn.clone(),
+            quick_response_id: self.quick_response_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
+            contents: Some(self.contents()),
+            description: self.description.clone(),
+            grouping_configuration: self.grouping_configuration.clone(),
+            shortcut_key: self.shortcut_key.clone(),
+            // `lastModifiedBy` is the ARN of the identity that last wrote the resource.
+            // Nothing in this emulator attributes a write to an identity — a request's
+            // credential scope carries no principal ARN — so the member stays absent
+            // rather than carrying an ARN nothing minted.
+            last_modified_by: None,
+            is_active: self.is_active,
+            channels: self.channels.clone(),
+            language: self.language.clone(),
+            tags: tags_out(&self.tags),
+        }
+    }
+
+    /// The `QuickResponseSummary` a listing of this quick response reports: the same
+    /// stored fields [`Self::to_quick_response_data`] answers with, reduced to the members
+    /// the summary shape declares
+    /// (`smithy_query(query="shape",shape="QuickResponseSummary")`), so a list page and a
+    /// read of the same record cannot disagree.
+    pub fn to_summary(&self) -> QuickResponseSummary {
+        QuickResponseSummary {
+            quick_response_arn: self.quick_response_arn.clone(),
+            quick_response_id: self.quick_response_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
+            description: self.description.clone(),
+            last_modified_by: None,
+            is_active: self.is_active,
+            channels: self.channels.clone(),
+            tags: tags_out(&self.tags),
+        }
+    }
+}
+
 /// What one assistant association associates the assistant WITH: the modelled
 /// `AssistantAssociationInputData` union, as this emulator persists it.
 ///
@@ -1195,6 +1399,11 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     pub assistants: HashMap<String, Assistant>,
     /// Every live knowledge base, keyed by its `knowledgeBaseId`.
     pub knowledge_bases: HashMap<String, KnowledgeBase>,
+    /// Every live quick response, keyed by its `quickResponseId`. Each record names the
+    /// knowledge base it belongs to, so a lookup is always scoped to the parent the route
+    /// named, and at most [`MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`] of them belong to
+    /// any one knowledge base.
+    pub quick_responses: HashMap<String, QuickResponse>,
     /// Every live assistant association, keyed by its `assistantAssociationId`. Each
     /// record names the assistant it belongs to, so a lookup is always scoped to the
     /// parent the route named.
@@ -1363,8 +1572,8 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// `UntagResource` take an `Arn` rather than one family's path label
     /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the lookup
     /// covers EVERY family this store holds a tag map for — assistants, knowledge bases,
-    /// sessions and assistant associations — and reads the tags off that one stored
-    /// record. Nothing is copied into a second place: a tag a create persisted on its
+    /// sessions, assistant associations and quick responses — and reads the tags off that
+    /// one stored record. Nothing is copied into a second place: a tag a create persisted on its
     /// resource is the tag reported here, and a resource a delete removed holds none.
     ///
     /// The ARN is matched against the one the record itself carries, not merely against
@@ -1394,6 +1603,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|association| association.assistant_association_arn == resource_arn)
         {
             return Some(&association.tags);
+        }
+        if let Some(quick_response) = self
+            .quick_responses
+            .get(id)
+            .filter(|quick_response| quick_response.quick_response_arn == resource_arn)
+        {
+            return Some(&quick_response.tags);
         }
         // A session is reachable only through its parent assistant, whose id a session
         // ARN carries in the segment before the session's own ([`session_arn`]). A
@@ -1450,6 +1666,16 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 .get_mut(&id)
                 .map(|association| &mut association.tags);
         }
+        if self
+            .quick_responses
+            .get(&id)
+            .is_some_and(|quick_response| quick_response.quick_response_arn == resource_arn)
+        {
+            return self
+                .quick_responses
+                .get_mut(&id)
+                .map(|quick_response| &mut quick_response.tags);
+        }
         // A session is reachable only through its parent assistant, whose id a session
         // ARN carries in the segment before the session's own.
         let parent = resource_arn.rsplit('/').nth(1)?.to_string();
@@ -1489,10 +1715,24 @@ impl ComAmazonawsQconnectWisdomserviceState {
     pub fn remove_knowledge_base(&mut self, label: &str) -> Option<KnowledgeBase> {
         let knowledge_base = self.knowledge_bases.remove(resolve_id(label))?;
         self.knowledge_base_name_index.remove(&knowledge_base.name);
+        // A quick response lives INSIDE the knowledge base it was created under, so a
+        // knowledge base that is gone takes its quick responses with it: a later read of
+        // one names nothing, and the name and shortcut key it held are released.
+        let orphaned: Vec<String> = self
+            .quick_responses_of(&knowledge_base.knowledge_base_id)
+            .into_iter()
+            .map(|quick_response| quick_response.quick_response_id.clone())
+            .collect();
+        for quick_response_id in &orphaned {
+            self.quick_responses.remove(quick_response_id);
+        }
         let gone: Vec<String> = self
             .idempotency
             .iter()
-            .filter(|(_, created)| *created == &knowledge_base.knowledge_base_id)
+            .filter(|(_, created)| {
+                *created == &knowledge_base.knowledge_base_id
+                    || orphaned.contains(*created)
+            })
             .map(|(token, _)| token.clone())
             .collect();
         for token in gone {
@@ -1512,6 +1752,78 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .get(name)
             .map(String::as_str)
             .filter(|id| self.knowledge_bases.contains_key(*id))
+    }
+
+    /// A `quickResponseId` no stored quick response holds, or `None` when
+    /// [`MINT_ATTEMPTS`] candidates of this sequence number's block were all taken.
+    pub fn mint_quick_response_id(&mut self) -> Option<String> {
+        let seq = self.next_seq();
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.quick_responses.contains_key(candidate))
+    }
+
+    /// Store a quick response under the (already resolved) knowledge base it names.
+    pub fn insert_quick_response(&mut self, quick_response: QuickResponse) {
+        self.quick_responses
+            .insert(quick_response.quick_response_id.clone(), quick_response);
+    }
+
+    /// The quick response a (knowledge base label, quick response label) pair names, in
+    /// either label form.
+    ///
+    /// The parent is resolved first, and a quick response that belongs to a DIFFERENT
+    /// knowledge base does not resolve: the route names a resource inside one knowledge
+    /// base, so crossing the two names nothing. `None` is the caller's not-found.
+    pub fn quick_response(
+        &self,
+        knowledge_base_label: &str,
+        quick_response_label: &str,
+    ) -> Option<&QuickResponse> {
+        let knowledge_base_id = self.knowledge_base(knowledge_base_label)?.knowledge_base_id.clone();
+        self.quick_responses
+            .get(resolve_id(quick_response_label))
+            .filter(|quick_response| quick_response.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// Every quick response of one (resolved) knowledge base, in `quickResponseId`
+    /// order, so what a read reports does not depend on map iteration order.
+    pub fn quick_responses_of(&self, knowledge_base_id: &str) -> Vec<&QuickResponse> {
+        let mut quick_responses: Vec<&QuickResponse> = self
+            .quick_responses
+            .values()
+            .filter(|quick_response| quick_response.knowledge_base_id == knowledge_base_id)
+            .collect();
+        quick_responses.sort_by(|left, right| {
+            left.quick_response_id.cmp(&right.quick_response_id)
+        });
+        quick_responses
+    }
+
+    /// The live quick response of this knowledge base already using `name`, if any: a
+    /// quick response's name identifies it inside its knowledge base.
+    pub fn quick_response_with_name(
+        &self,
+        knowledge_base_id: &str,
+        name: &str,
+    ) -> Option<&QuickResponse> {
+        self.quick_responses_of(knowledge_base_id)
+            .into_iter()
+            .find(|quick_response| quick_response.name == name)
+    }
+
+    /// The live quick response of this knowledge base already using `shortcut_key`, if
+    /// any — the uniqueness the model states on the member itself.
+    pub fn quick_response_with_shortcut_key(
+        &self,
+        knowledge_base_id: &str,
+        shortcut_key: &str,
+    ) -> Option<&QuickResponse> {
+        self.quick_responses_of(knowledge_base_id)
+            .into_iter()
+            .find(|quick_response| {
+                quick_response.shortcut_key.as_deref() == Some(shortcut_key)
+            })
     }
 
     /// Store an assistant and index it by name.

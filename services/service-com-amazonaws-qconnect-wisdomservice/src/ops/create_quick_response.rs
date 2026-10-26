@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQuickResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQuickResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQuickResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a quick response INSIDE the knowledge base the route names, stores it, and
+//! answers out of the STORED record, so what this call reports is what every later
+//! `GetQuickResponse` reports. The service answers the create with the quick response
+//! already `CREATED`, so no status change is owed afterwards; a replayed `clientToken`
+//! answers with the quick response that token already created; a `name` or a
+//! `shortcutKey` a live quick response of the same knowledge base already holds is the
+//! conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +103,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::QuickResponse;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateQuickResponseError {
+    CreateQuickResponseErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> CreateQuickResponseError {
+    CreateQuickResponseErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> CreateQuickResponseError {
+    CreateQuickResponseErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,18 +204,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQuickResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQuickResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQuickResponse"))
+        // Modeled constraints (`name`'s length, `contentType`'s pattern, the content
+        // union's length) are already refused BEFORE this handler runs, so reaching here
+        // means the input satisfies every one of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateQuickResponse")
+        })?;
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A quick response exists only inside a knowledge base, so the parent is resolved
+        // first: a create naming a knowledge base this account does not hold is not
+        // found, whatever else the request carries. Its id and ARN are read off the
+        // stored record rather than rebuilt, so the quick response reports the knowledge
+        // base's own ARN.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
+
+        // A replayed `@idempotencyToken` answers with the quick response it already
+        // created under THIS knowledge base rather than creating a second one. The token
+        // is scoped to this operation and this parent, so the same token on another
+        // create is another resource.
+        let replay_key = input.client_token.as_deref().map(|token| {
+            crate::state::idempotency_key(
+                &format!("CreateQuickResponse/{knowledge_base_id}"),
+                token,
+            )
+        });
+        if let Some(created) = replay_key
+            .as_ref()
+            .and_then(|key| store.idempotency.get(key).cloned())
+        {
+            if let Some(quick_response) = store.quick_response(&knowledge_base_id, &created) {
+                return Ok(CreateQuickResponseOutput {
+                    quick_response: Some(quick_response.to_quick_response_data()),
+                });
+            }
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's tagging
+        // restrictions allow at most 50 tags on a resource, and a request past that is
+        // outside what the service accepts. The count is taken from what the caller sent,
+        // before the map is stored.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(validation(crate::state::message_too_many_tags()));
+        }
+
+        // A quick response's name identifies it inside its knowledge base, so a create
+        // under a name a live one already holds is the modelled conflict (HTTP 409)
+        // rather than a second record, and the refusal leaves the first untouched.
+        if store
+            .quick_response_with_name(&knowledge_base_id, &input.name)
+            .is_some()
+        {
+            return Err(conflict(&crate::state::message_value_in_use(
+                crate::state::MEMBER_QUICK_RESPONSE_NAME,
+            )));
+        }
+        // The same for the shortcut key, which the model requires to be unique across the
+        // knowledge base: the key is what an agent types to insert this reply, so two
+        // quick responses cannot answer to one.
+        if let Some(shortcut_key) = input.shortcut_key.as_deref() {
+            if store
+                .quick_response_with_shortcut_key(&knowledge_base_id, shortcut_key)
+                .is_some()
+            {
+                return Err(conflict(&crate::state::message_value_in_use(
+                    crate::state::MEMBER_SHORTCUT_KEY,
+                )));
+            }
+        }
+
+        // The knowledge base's quick-response bound, which is what keeps this store
+        // finite.
+        if store.quick_responses_of(&knowledge_base_id).len()
+            >= crate::state::MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE
+        {
+            return Err(
+                CreateQuickResponseErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::message_quick_response_quota()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The content, as the caller gave it: the union declares exactly one member.
+        let content = match &input.content {
+            QuickResponseDataProvider::Content(content) => content.clone(),
+        };
+        // `contentType` is optional on the request while `QuickResponseData.contentType`
+        // is required, so a create that names none stores the plain-text media type the
+        // member documents for content written as nothing else.
+        let content_type = input
+            .content_type
+            .clone()
+            .unwrap_or_else(|| crate::state::QUICK_RESPONSE_TYPE_PLAIN.to_string());
+
+        let Some(quick_response_id) = store.mint_quick_response_id() else {
+            return Err(validation(
+                "could not mint a unique quickResponseId; retry the request".to_string(),
+            ));
+        };
+        store.insert_quick_response(QuickResponse {
+            quick_response_arn: crate::state::quick_response_arn(
+                &region,
+                &knowledge_base_id,
+                &quick_response_id,
+            ),
+            quick_response_id: quick_response_id.clone(),
+            knowledge_base_id: knowledge_base_id.clone(),
+            knowledge_base_arn,
+            name: input.name.clone(),
+            content_type,
+            // The service answers a create with the quick response already CREATED, so
+            // there is no transition the clock owes it afterwards.
+            status: crate::state::QUICK_RESPONSE_STATUS_CREATED.to_string(),
+            content,
+            description: input.description.clone(),
+            grouping_configuration: input.grouping_configuration.clone(),
+            shortcut_key: input.shortcut_key.clone(),
+            is_active: input.is_active,
+            channels: input.channels.clone(),
+            language: input.language.clone(),
+            tags,
+            created_at: now,
+            // Nothing has modified the record yet, so it was last written when it was
+            // created.
+            last_modified_at: now,
+        });
+        if let Some(key) = replay_key {
+            store.idempotency.insert(key, quick_response_id.clone());
+        }
+
+        // Render out of the INSERTED record rather than out of the request: what this
+        // call answers is what a later `GetQuickResponse` answers.
+        let Some(stored) = store.quick_response(&knowledge_base_id, &quick_response_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateQuickResponse",
+            ));
+        };
+        Ok(CreateQuickResponseOutput {
+            quick_response: Some(stored.to_quick_response_data()),
+        })
     }
 }
