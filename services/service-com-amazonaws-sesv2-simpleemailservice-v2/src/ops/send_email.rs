@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendEmail
-//! Accepts an outbound message from a verified identity, appends it to this
-//! service's outbound-message log with a fresh unique `MessageId`, and bumps the
-//! account's send counters. This is the ONLY file to touch for this operation.
+//! Accepts an outbound message from a verified identity while the account's
+//! sending switch is on, appends it to this service's outbound-message log with a
+//! fresh unique `MessageId`, and bumps the account's send counters. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -290,6 +291,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
+        // `PutAccountSendingAttributes` sets) gates every message this account
+        // sends, so it is read before anything about this particular message: while
+        // it is off the account has no ability to send, whatever the request says.
+        if !store.account.sending_enabled {
+            return Err(SendEmailErrorModeled::SendingPausedException(
+                SendingPausedException {
+                    message: Some(
+                        "The message can't be sent because the account's ability to send email is \
+                         currently paused."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         // "The address that you specify has to be verified." An address identity
         // authorises itself; a domain identity authorises every address in that
