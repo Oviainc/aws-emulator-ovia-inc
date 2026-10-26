@@ -294,6 +294,10 @@ mod principal_id_format;
 // The public IPv4 pool slice: create a pool, then report it back out of the store.
 #[path = "all/public_ipv4_pools.rs"]
 mod public_ipv4_pools;
+// What `PurchaseCapacityBlock` buys out of a Capacity Block offering, and the pair it stores:
+// the block, and the Capacity Reservation that holds that block's capacity.
+#[path = "all/purchase_capacity_block.rs"]
+mod purchase_capacity_block;
 // What `DeleteQueuedReservedInstances` deletes and what it reports per id.
 #[path = "all/queued_reserved_instances.rs"]
 mod queued_reserved_instances;

@@ -268,6 +268,9 @@ fn seed(engine: &engine::InMemoryEngine) -> Seeded {
                 end_date: hours_from(seeded_at, spec.end_hours),
                 create_date: hours_from(seeded_at, spec.create_hours),
                 pinned_state: spec.pinned_state,
+                // These blocks are seeded rather than bought, so no upfront payment is
+                // pending on any of them.
+                payment_settles_at: None,
                 tags: spec.tags.clone(),
             })
             .expect("a fresh store has room for a seeded Capacity Block");
@@ -398,6 +401,7 @@ async fn every_stored_block_is_reported_with_its_members_and_a_later_write_is_vi
             end_date: hours_from(seeded.seeded_at, 2),
             create_date: seeded.seeded_at,
             pinned_state: None,
+            payment_settles_at: None,
             tags: vec![tag("Name", "late")],
         })
         .expect("the store has room for a later Capacity Block");
@@ -491,6 +495,7 @@ async fn the_window_decides_scheduled_active_and_expired() {
                 end_date: hours_from(seeded_at, end_hours),
                 create_date: hours_from(seeded_at, -336),
                 pinned_state: None,
+                payment_settles_at: None,
                 tags: vec![tag("Case", case)],
             })
             .expect("the store has room for this Capacity Block");

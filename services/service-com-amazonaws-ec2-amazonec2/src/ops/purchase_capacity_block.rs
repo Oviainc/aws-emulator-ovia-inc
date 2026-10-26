@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurchaseCapacityBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurchaseCapacityBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurchaseCapacityBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: buys the Capacity Block offering the request names — resolved out of the
+//! offering id, whose terms it carries ([`crate::state`]) — and stores the pair that purchase
+//! creates: the Capacity Block itself and the Capacity Reservation that holds its capacity,
+//! both answered from the records it wrote. A value that is not an offering id this service
+//! reported is refused as malformed. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,260 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurchaseCapacityBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurchaseCapacityBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // "You must specify the ID of the Capacity Block offering you are purchasing": the
+        // offering is what says WHAT this purchase reserves, and an offering is a search
+        // result rather than a stored resource, so its terms travel inside its id
+        // (`crate::state`, "A Capacity Block OFFERING is a search result, not a stored
+        // resource"). Resolving the id is therefore how the window, the zone and the counts
+        // the offering was reported with are recovered — and a value this service never
+        // reported an offering under names no offering at all, so there is nothing to buy.
+        let offering_id = input.capacity_block_offering_id.as_str();
+        let terms = state::decode_capacity_block_offering_id(offering_id)
+            .ok_or_else(|| state::invalid_capacity_block_offering_id_malformed(offering_id))?;
+
+        // The reserved window, as the instants the block and its reservation report. An id
+        // carries its window as seconds since the epoch; one this service's clock cannot
+        // represent is not a window any offering it reported had, so such a value is no more
+        // an offering id than a value that does not decode at all. A window that has since
+        // CLOSED is accepted: an offering id is derivable from its terms, so an id reported
+        // an hour ago is still the offering it names, and what it buys is a block whose own
+        // reserved window has passed — reported `expired` by the window rule every reader
+        // shares rather than refused with an error AWS publishes none of.
+        let (start_date, end_date) = window_of(&terms)
+            .ok_or_else(|| state::invalid_capacity_block_offering_id_malformed(offering_id))?;
+
+        // "The tags to apply to the Capacity Block during launch" (`TagSpecifications`): the
+        // block is the resource this purchase tags, so a specification naming any other
+        // resource type is refused rather than accepted and discarded.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CAPACITY_BLOCK,
+            Self::NAME,
+        )?;
+
+        // What the purchase reserves, read off the offering's own terms rather than from
+        // anything the purchase names: "The number of instances in the Capacity Block
+        // offering" (`CapacityBlockOffering$InstanceCount`), or — for an offering of EC2
+        // UltraServers, whose capacity is the UltraServers it holds and which carries no
+        // instance count — "The number of EC2 UltraServers in the offering"
+        // ($UltraserverCount), the same units that offering's upfront fee was priced on.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurchaseCapacityBlock"))
+        // And "The instance type of the Capacity Block offering" ($InstanceType) is what the
+        // reservation reserves that capacity for; an offering of UltraServers names no
+        // instance type, and what it sells is the UltraServer type its block reports, so that
+        // is the type its reservation holds capacity for.
+        //
+        // Every offering this service reports carries one of each pair, and the checksum an
+        // offering id carries is non-secret ([`crate::state`]), so terms carrying NEITHER are
+        // terms no offering of this service had: that is as much "not an offering id" as a
+        // value that does not decode, and is refused rather than bought as a reservation of
+        // one unit of nothing.
+        let reserved = terms
+            .instance_count
+            .or(terms.ultraserver_count)
+            .zip(
+                terms
+                    .instance_type
+                    .clone()
+                    .or_else(|| terms.ultraserver_type.clone()),
+            )
+            .filter(|(instance_count, instance_type)| {
+                *instance_count > 0 && !instance_type.is_empty()
+            });
+        let (instance_count, instance_type) = reserved
+            .ok_or_else(|| state::invalid_capacity_block_offering_id_malformed(offering_id))?;
+
+        // DryRun sits AFTER every parameter has been resolved and BEFORE the first write:
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`), so a request that would have been refused is refused with that reason
+        // instead, and one that would have succeeded buys nothing.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The wall clock the purchase is written against, read ONCE so the two records it
+        // creates and the view it answers with all see one instant.
+        let now = ::std::time::SystemTime::now();
+
+        // The capacity is paid for before it is delivered: "`payment-pending` - (Capacity
+        // Blocks) The upfront payment has not been processed yet"
+        // (`CapacityReservation$State`, and the member of the same name in
+        // `CapacityBlockResourceState`). So both halves of the purchase are stored in that
+        // state and settle one TRANSITION_DELAY later — recorded rather than slept for, on
+        // the same clock as every other move this crate owes — after which each is in the
+        // state its reserved window puts it in.
+        let payment_settles_at = now.checked_add(state::TRANSITION_DELAY).ok_or_else(|| {
+            Scaffolded::internal_error(
+                "the clock cannot represent the instant this purchase's payment settles",
+            )
+        })?;
+
+        let region = state::request_region(ctx.parts());
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        store.materialize_due_transitions();
+
+        // Both count ceilings and the byte budget, asked for the PAIR this purchase stores
+        // and BEFORE anything is written, the way every other create of this crate asks its
+        // own: a purchase stores a Capacity Block AND the Capacity Reservation holding its
+        // capacity, so it needs room for both. The caller-chosen bytes are the block's tags
+        // and the instance type the reservation names, which is exactly what the two stores
+        // charge.
+        if !store.has_capacity_block_capacity(1) || !store.has_capacity_reservation_capacity(1) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Blocks and {} Capacity Reservations, which \
+                 is as many as it stores",
+                state::MAX_STORED_CAPACITY_BLOCKS,
+                state::MAX_STORED_CAPACITY_RESERVATIONS,
+            )));
+        }
+        let payload_bytes = state::tag_list_bytes(&tags).saturating_add(instance_type.len());
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let purchased = store.insert_purchased_capacity_block(state::CapacityBlockPurchaseSpec {
+            block: state::CapacityBlockSpec {
+                // "The EC2 UltraServer type of the Capacity Block"
+                // (`CapacityBlock$UltraserverType`): the offering's, and absent on a block of
+                // plain instances, which is sold by instance type instead.
+                ultraserver_type: terms.ultraserver_type.clone(),
+                availability_zone: terms.availability_zone.clone(),
+                availability_zone_id: terms.availability_zone_id.clone(),
+                // Filled in by the insert with the Capacity Reservation it writes beside the
+                // block: the id does not exist until that half is stored.
+                capacity_reservation_ids: Vec::new(),
+                start_date,
+                end_date,
+                create_date: now,
+                // Nothing about this block is pinned: once its payment has settled its state
+                // is the one its reserved window puts it in.
+                pinned_state: None,
+                payment_settles_at: Some(payment_settles_at),
+                tags,
+            },
+            reservation: state::CapacityReservationSpec {
+                instance_type,
+                // "The type of operating system for which to reserve capacity"
+                // (`InstancePlatform`), the one member of the purchase that is not read off
+                // the offering. The modelled enum has already refused any other spelling.
+                instance_platform: input.instance_platform.clone(),
+                availability_zone: terms.availability_zone.clone(),
+                availability_zone_id: terms.availability_zone_id.clone(),
+                region,
+                // "The tenancy of the Capacity Block" (`CapacityBlockOffering$Tenancy`): what
+                // the offering was sold with, from the one place this crate words it, since
+                // nothing in a purchase asks for another tenancy.
+                tenancy: state::CAPACITY_BLOCK_OFFERING_TENANCY.to_string(),
+                instance_count,
+                // Neither is a member of a Capacity Block offering and neither is asked for
+                // by a purchase, so the reservation claims neither.
+                ebs_optimized: false,
+                ephemeral_storage: false,
+                // The block's window IS the reservation's: the capacity arrives on the start
+                // date and "When a Capacity Block expires, all instances in the Capacity
+                // Block are terminated" (`CapacityBlock$EndDate`), so the reservation ends
+                // with the block.
+                end_date: Some(end_date),
+                // "`targeted` - The Capacity Reservation only accepts instances that have
+                // matching attributes … and explicitly target the Capacity Reservation"
+                // (`CapacityReservation$InstanceMatchCriteria`): capacity bought as a
+                // Capacity Block is held for the instances that target it, never joined
+                // automatically by any matching launch.
+                instance_match_criteria: state::INSTANCE_MATCH_CRITERIA_TARGETED.to_string(),
+                created_at: now,
+                // The reservation starts when the block's window opens, which is a date the
+                // offering already fixed rather than one the purchase chose.
+                start_date: Some(start_date),
+                // A commitment and a delivery method are members of a future-dated
+                // reservation a caller asked EC2 to deliver; a Capacity Block is bought
+                // outright, for a window the offering already names.
+                commitment: None,
+                delivery_preference: None,
+                state: state::CAPACITY_RESERVATION_STATE_PAYMENT_PENDING,
+                // The purchase's tags go on the Capacity Block — "The tags to apply to the
+                // Capacity Block during launch" — so the reservation carries none of its own.
+                tags: Vec::new(),
+                // Not allocated out of another reservation: this is the capacity of a block
+                // that was bought.
+                interruption_info: None,
+                zero_size_preference: None,
+                // The end of the payment wait, owed to the clock: from it the reservation is
+                // "scheduled for delivery on the requested start date"
+                // (`CapacityReservation$State`), and from that date active.
+                pending: Some(state::CapacityReservationTransition::starting_now(
+                    state::CapacityReservationMove::Scheduled,
+                )),
+            },
+        });
+        let Some((capacity_block_id, capacity_reservation_id)) = purchased else {
+            // One of the stores refused the write at a ceiling of its own: a quota, not
+            // something the request got wrong. Nothing was stored.
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Blocks, {} Capacity Reservations and {} \
+                 bytes of caller-supplied data, which is as much as it stores",
+                state::MAX_STORED_CAPACITY_BLOCKS,
+                state::MAX_STORED_CAPACITY_RESERVATIONS,
+                state::MAX_STORED_BYTES,
+            )));
+        };
+
+        // Both halves are read back OUT of the store, so this call and every later reader of
+        // the block or the reservation cannot report them differently.
+        let capacity_block = store
+            .capacity_blocks
+            .get(&capacity_block_id)
+            .map(|record| record.view_at(now))
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly purchased Capacity Block '{capacity_block_id}' could not be \
+                     read back"
+                ))
+            })?;
+        let capacity_reservation = store
+            .capacity_reservations
+            .get(&capacity_reservation_id)
+            .map(|record| record.view_at(now))
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the Capacity Reservation '{capacity_reservation_id}' of the newly \
+                     purchased Capacity Block could not be read back"
+                ))
+            })?;
+
+        Ok(PurchaseCapacityBlockOutput {
+            // "The Capacity Block" (`CapacityBlocks`): one purchase buys the one offering it
+            // names, so the set carries that block.
+            capacity_blocks: Some(vec![capacity_block]),
+            capacity_reservation: Some(capacity_reservation),
+        })
     }
+}
+
+/// The reserved window an offering's terms carry, as the instants the records this purchase
+/// writes report; `None` for a window this service's clock cannot represent.
+///
+/// An offering id carries its window as seconds since the Unix epoch
+/// ([`crate::state::CapacityBlockOfferingTerms`]), and the stores take `SystemTime`s, so
+/// the conversion happens here — checked, because an id is text a caller hands back: a value
+/// outside the epoch-seconds range names no window any offering this service reported had.
+fn window_of(
+    terms: &crate::state::CapacityBlockOfferingTerms,
+) -> Option<(::std::time::SystemTime, ::std::time::SystemTime)> {
+    let instant = |epoch_seconds: i64| {
+        let since_epoch = ::std::time::Duration::from_secs(u64::try_from(epoch_seconds).ok()?);
+        ::std::time::UNIX_EPOCH.checked_add(since_epoch)
+    };
+    let start_date = instant(terms.start_date_secs)?;
+    let end_date = instant(terms.end_date_secs)?;
+    Some((start_date, end_date))
 }

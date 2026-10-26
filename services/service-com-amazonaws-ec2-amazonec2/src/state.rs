@@ -926,6 +926,19 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! A block and the Capacity Reservation that holds its capacity are ONE purchase rather than
+//! two resources a caller creates separately, so
+//! [`ComAmazonawsEc2Amazonec2State::insert_purchased_capacity_block`] writes the pair
+//! together and is the one place the two sides of their link are made: the block's
+//! `CapacityReservationIds` and the reservation's `CapacityBlockId` therefore always name
+//! records this store really holds. The upfront payment of a purchase is not instant — the
+//! `payment-pending` member of `CapacityBlockResourceState` is where a block sits while "the
+//! upfront payment has not been processed yet" (`CapacityReservation$State`) — so both halves
+//! are stored in that state and reach the state their reserved window puts them in one
+//! [`TRANSITION_DELAY`] later: the block through [`CapacityBlockRecord::payment_settles_at`],
+//! the reservation through the [`CapacityReservationTransition`] on its own record. Neither
+//! move is written by whoever next calls; both are derived from the instant they fell due.
+//!
 //! ## IPAM
 //!
 //! [`ComAmazonawsEc2Amazonec2State::ipams`] holds the account's IP Address Manager
@@ -18394,15 +18407,27 @@ pub const CAPACITY_BLOCK_STATE_ACTIVE: &str = "active";
 /// (`CapacityBlock$EndDate`).
 pub const CAPACITY_BLOCK_STATE_EXPIRED: &str = "expired";
 
+/// A Capacity Block whose upfront payment is still being processed: that enum's
+/// `payment-pending` member — "the upfront payment has not been processed yet"
+/// (`CapacityReservation$State`, which words the same wait for the reservation the block
+/// holds its capacity as). Where a block a purchase has just bought sits until
+/// [`CapacityBlockRecord::payment_settles_at`] has passed.
+pub const CAPACITY_BLOCK_STATE_PAYMENT_PENDING: &str = "payment-pending";
+
 /// The members of `CapacityBlockResourceState` that are NOT a fact of where the clock
 /// stands in a block's reserved window, and so are stored on the record rather than derived
 /// ([`CapacityBlockRecord::pinned_state`]): a block AWS could not deliver, one that was
 /// cancelled, one that failed, and the two payment states a purchase can sit in.
+///
+/// A block bought through `PurchaseCapacityBlock` reaches
+/// [`CAPACITY_BLOCK_STATE_PAYMENT_PENDING`] the other way — from the instant its payment
+/// settles ([`CapacityBlockRecord::payment_settles_at`]), because that wait ENDS — so the
+/// pinned member of that name is for a block whose payment nothing is going to settle.
 pub const CAPACITY_BLOCK_PINNED_STATES: [&str; 5] = [
     "unavailable",
     "cancelled",
     "failed",
-    "payment-pending",
+    CAPACITY_BLOCK_STATE_PAYMENT_PENDING,
     "payment-failed",
 ];
 
@@ -18460,6 +18485,16 @@ pub struct CapacityBlockRecord {
     /// reserved window. A `&'static str` so it can only ever be a member of the modelled
     /// enum, never text taken from a request.
     pub pinned_state: Option<&'static str>,
+    /// When the upfront payment of the purchase that bought this block finishes processing,
+    /// or `None` for a block whose capacity was not bought and so has no payment to wait
+    /// for.
+    ///
+    /// Until that instant the block is [`CAPACITY_BLOCK_STATE_PAYMENT_PENDING`] whatever its
+    /// window says, and from it the window decides its state again ([`Self::state_at`]), so
+    /// the end of the wait is DERIVED from the instant it fell due rather than written by
+    /// whoever happens to call next. A wall-clock instant, like the window instants beside
+    /// it, because it is compared against the same `now` a reader reports the block as of.
+    pub payment_settles_at: Option<SystemTime>,
 }
 
 impl CapacityBlockRecord {
@@ -18474,13 +18509,21 @@ impl CapacityBlockRecord {
     /// The block's `CapacityBlockResourceState` at `now`.
     ///
     /// A pinned state wins: no passage of time moves a cancelled or unpaid block into its
-    /// reserved window. Otherwise the window delimits the three clock-driven states, a
+    /// reserved window. A block whose purchase is still being paid for is
+    /// [`CAPACITY_BLOCK_STATE_PAYMENT_PENDING`] until [`Self::payment_settles_at`], which is
+    /// a wait the clock ends. Otherwise the window delimits the three clock-driven states, a
     /// block being `scheduled` before its `StartDate`, `active` from it, and `expired` from
     /// its `EndDate`. A date the record does not carry does not bound the window on that
     /// side, so a block with neither is `active`.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
         if let Some(pinned) = self.pinned_state {
             return pinned;
+        }
+        if self
+            .payment_settles_at
+            .is_some_and(|settles_at| now < settles_at)
+        {
+            return CAPACITY_BLOCK_STATE_PAYMENT_PENDING;
         }
         let now = date_time_key(system_time_to_date_time(now));
         if self.block.start_date.map(date_time_key).is_some_and(|start| now < start) {
@@ -18517,6 +18560,10 @@ pub struct CapacityBlockSpec {
     /// A state no clock drives, or `None` for a block whose state is its window's — see
     /// [`CapacityBlockRecord::pinned_state`].
     pub pinned_state: Option<&'static str>,
+    /// When the upfront payment of the purchase that bought the block settles, or `None` for
+    /// a block with no payment to wait for — see
+    /// [`CapacityBlockRecord::payment_settles_at`].
+    pub payment_settles_at: Option<SystemTime>,
     /// "The tags assigned to the Capacity Block" (`CapacityBlock$Tags`).
     pub tags: Vec<Tag>,
 }
@@ -18573,6 +18620,7 @@ impl ComAmazonawsEc2Amazonec2State {
             CapacityBlockRecord {
                 block,
                 pinned_state: spec.pinned_state,
+                payment_settles_at: spec.payment_settles_at,
             },
         );
         Some(capacity_block_id)
@@ -18967,6 +19015,13 @@ pub const CAPACITY_RESERVATION_STATE_PENDING: &str = "pending";
 /// ([`CapacityReservationRecord::state_at`]).
 pub const CAPACITY_RESERVATION_STATE_EXPIRED: &str = "expired";
 
+/// "`payment-pending` - (Capacity Blocks) The upfront payment has not been processed yet"
+/// (`CapacityReservation$State`), which is where the reservation a Capacity Block holds its
+/// capacity as sits until the purchase's payment settles — one [`TRANSITION_DELAY`] after
+/// the purchase, from where it is `scheduled` for the block's reserved window
+/// ([`CapacityReservationRecord::state_at`]).
+pub const CAPACITY_RESERVATION_STATE_PAYMENT_PENDING: &str = "payment-pending";
+
 /// "Valid range: 1 - 1000" (`CreateCapacityReservationRequest$InstanceCount`). The model
 /// puts no `@range` on the member, so this is the only place the published one is kept.
 pub const CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=1000;
@@ -18992,6 +19047,11 @@ pub const END_DATE_TYPE_LIMITED: &str = "limited";
 /// is not a Capacity Block: the `default` member of the modelled `CapacityReservationType`
 /// enum (`smithy_query(query="shape",shape="CapacityReservationType")`).
 pub const CAPACITY_RESERVATION_TYPE_DEFAULT: &str = "default";
+
+/// That enum's other member, the type of the reservation a Capacity Block holds its capacity
+/// as — the one
+/// [`ComAmazonawsEc2Amazonec2State::insert_purchased_capacity_block`] writes.
+pub const CAPACITY_RESERVATION_TYPE_CAPACITY_BLOCK: &str = "capacity-block";
 
 /// The only member of the modelled `InterruptionType` enum
 /// (`smithy_query(query="shape",shape="InterruptionType")`), so it is the one value
@@ -19024,6 +19084,12 @@ pub const ZERO_SIZE_PREFERENCE_RETAIN: &str = "retain";
 
 /// The `ResourceType` a Capacity Reservation tag specification may name.
 pub const RESOURCE_TYPE_CAPACITY_RESERVATION: &str = "capacity-reservation";
+
+/// The `ResourceType` a Capacity Block tag specification may name — the `capacity-block`
+/// member of the modelled `ResourceType` enum
+/// (`smithy_query(query="shape",shape="ResourceType")`), which is the resource
+/// `PurchaseCapacityBlock`'s "tags to apply to the Capacity Block during launch" go on.
+pub const RESOURCE_TYPE_CAPACITY_BLOCK: &str = "capacity-block";
 
 /// How many Capacity Reservations this emulator stores before a writer must refuse.
 ///
@@ -19095,16 +19161,19 @@ impl CapacityReservationRecord {
     /// Three facts of the clock are derived here rather than stored, so a read reports what
     /// was already due without writing anything:
     ///
-    /// * The approval of a future-dated request. It is created `assessing` — "Amazon EC2 is
-    ///   assessing your request for a future-dated Capacity Reservation" — and the move to
-    ///   `scheduled` fell due at the WALL-clock instant its
-    ///   [`CapacityReservationTransition`] names ([`ClockTransition::at`], which is what
-    ///   `now` is compared against here), whether or not anybody called again.
-    /// * The delivery of a future-dated reservation: one that is `scheduled` is "scheduled
-    ///   for delivery on the requested start date" (`CapacityReservation$State`), so it is
-    ///   `active` from that date on. A future-dated reservation is the one that carries a
-    ///   `DeliveryPreference`, which is how a reservation delivered on a date is told from
-    ///   one whose capacity was there from the start.
+    /// * The end of a wait for a decision or for a payment. A future-dated request is
+    ///   created `assessing` — "Amazon EC2 is assessing your request for a future-dated
+    ///   Capacity Reservation" — and a Capacity Block purchase `payment-pending` — "The
+    ///   upfront payment has not been processed yet" — and either one's move to `scheduled`
+    ///   fell due at the WALL-clock instant its [`CapacityReservationTransition`] names
+    ///   ([`ClockTransition::at`], which is what `now` is compared against here), whether or
+    ///   not anybody called again.
+    /// * The delivery of a reservation held for a date: one that is `scheduled` is
+    ///   "scheduled for delivery on the requested start date" (`CapacityReservation$State`),
+    ///   so it is `active` from that date on. Those are the future-dated reservations, which
+    ///   carry a `DeliveryPreference`, and the capacity of a Capacity Block, which carries
+    ///   that block's `CapacityBlockId` — either way a reservation delivered ON a date,
+    ///   rather than one whose capacity was there from the start.
     /// * The expiry of any reservation: "The Capacity Reservation's state changes to
     ///   `expired` when it reaches its end date and time" (`CapacityReservation$EndDate`) —
     ///   the same arrangement [`CapacityBlockRecord::state_at`] gives a Capacity Block's
@@ -19115,7 +19184,9 @@ impl CapacityReservationRecord {
     pub fn state_at(&self, now: SystemTime) -> &str {
         let stored = self.state();
         let now_key = date_time_key(system_time_to_date_time(now));
-        let assessed = stored == CAPACITY_RESERVATION_STATE_ASSESSING
+        let awaiting = stored == CAPACITY_RESERVATION_STATE_ASSESSING
+            || stored == CAPACITY_RESERVATION_STATE_PAYMENT_PENDING;
+        let assessed = awaiting
             && self.pending.as_ref().is_some_and(|pending| {
                 matches!(pending.to, CapacityReservationMove::Scheduled) && now >= pending.at
             });
@@ -19125,7 +19196,7 @@ impl CapacityReservationRecord {
             stored
         };
         let delivered = stored == CAPACITY_RESERVATION_STATE_SCHEDULED
-            && self.view.delivery_preference.is_some()
+            && (self.view.delivery_preference.is_some() || self.view.capacity_block_id.is_some())
             && self
                 .view
                 .start_date
@@ -19377,6 +19448,68 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         Some(capacity_reservation_id)
     }
+
+    /// Store the pair one Capacity Block purchase buys — the block, and the Capacity
+    /// Reservation that holds its capacity — and answer
+    /// `(capacity_block_id, capacity_reservation_id)`, or `None` with NOTHING written when
+    /// either store's own ceiling refuses it.
+    ///
+    /// The two are ONE purchase, not two resources created separately: the block's
+    /// `CapacityReservationIds` names the reservation and the reservation's
+    /// `CapacityBlockId` names the block, so this is the one place that link is made and
+    /// neither side can name an id the other half never got. Each half still enters through
+    /// its own insert ([`Self::insert_capacity_block`],
+    /// [`Self::insert_capacity_reservation`]), so a purchased record carries the same id
+    /// form, stored shape and byte charge as one any other writer of that store makes. Both
+    /// count ceilings are asked for the PAIR before either half is written and a half-written
+    /// pair is taken back out, so a refused purchase stores neither record and charges
+    /// nothing.
+    pub fn insert_purchased_capacity_block(
+        &mut self,
+        spec: CapacityBlockPurchaseSpec,
+    ) -> Option<(String, String)> {
+        if !self.has_capacity_block_capacity(1) || !self.has_capacity_reservation_capacity(1) {
+            return None;
+        }
+        let capacity_reservation_id = self.insert_capacity_reservation(spec.reservation)?;
+        let mut block = spec.block;
+        block.capacity_reservation_ids = vec![capacity_reservation_id.clone()];
+        let Some(capacity_block_id) = self.insert_capacity_block(block) else {
+            // The block half was refused, so there is no purchase at all: the reservation
+            // half comes back out and gives back exactly the bytes
+            // [`Self::insert_capacity_reservation`] charged for it.
+            if let Some(record) = self.capacity_reservations.remove(&capacity_reservation_id) {
+                self.release_stored_bytes(capacity_reservation_payload_bytes(&record.view));
+            }
+            return None;
+        };
+        // The reservation's side of the link, which can only be written once the block it
+        // belongs to has an id. "The type of Capacity Reservation"
+        // (`CapacityReservation$ReservationType`) follows from it: a reservation a Capacity
+        // Block holds its capacity as is of that type rather than the default one.
+        if let Some(record) = self.capacity_reservations.get_mut(&capacity_reservation_id) {
+            record.view.capacity_block_id = Some(capacity_block_id.clone());
+            record.view.reservation_type =
+                Some(CAPACITY_RESERVATION_TYPE_CAPACITY_BLOCK.to_string());
+        }
+        Some((capacity_block_id, capacity_reservation_id))
+    }
+}
+
+/// What one Capacity Block purchase stores: the block it buys, and the Capacity Reservation
+/// that holds the block's capacity — the pair
+/// [`ComAmazonawsEc2Amazonec2State::insert_purchased_capacity_block`] writes.
+///
+/// Neither half names the other: the block's `CapacityReservationIds` and the reservation's
+/// `CapacityBlockId` are ids this store mints, so the insert fills them in rather than a
+/// writer naming an id that does not exist yet.
+#[derive(Debug, Clone)]
+pub struct CapacityBlockPurchaseSpec {
+    /// The Capacity Block the purchase buys, with its `capacity_reservation_ids` left to the
+    /// insert.
+    pub block: CapacityBlockSpec,
+    /// The Capacity Reservation that holds its capacity.
+    pub reservation: CapacityReservationSpec,
 }
 
 /// Refuse a request that named a Capacity Reservation id no reservation of the account
@@ -19547,6 +19680,30 @@ pub fn decode_capacity_block_offering_id(offering_id: &str) -> Option<CapacityBl
         ultraserver_type: optional_hex_field(fields[7])?,
     };
     Some(terms)
+}
+
+/// The code EC2 answers for a value that is not a Capacity Block offering id at all.
+pub const INVALID_CAPACITY_BLOCK_OFFERING_ID_MALFORMED: &str =
+    "InvalidCapacityBlockOfferingIdMalformed";
+
+/// Refuse a request that named something that is not a Capacity Block offering id: HTTP 400
+/// [`INVALID_CAPACITY_BLOCK_OFFERING_ID_MALFORMED`].
+///
+/// Every offering id this service reports carries its own terms, this service's marker and a
+/// checksum over both ([`encode_capacity_block_offering_id`]), so a value
+/// [`decode_capacity_block_offering_id`] cannot read is not an id this service ever reported
+/// an offering under — there is no offering for it to name, which is what "malformed" says.
+/// There is no second, not-found half to tell it from: an offering is a search result rather
+/// than a stored resource (see the module docs), so an id that decodes names the offering it
+/// carries and one that does not names nothing.
+pub fn invalid_capacity_block_offering_id_malformed<E>(
+    capacity_block_offering_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_BLOCK_OFFERING_ID_MALFORMED,
+        400,
+        format!("Capacity Block Offering Id '{capacity_block_offering_id}' is malformed."),
+    )
 }
 
 /// How many fields an offering id's payload carries.
