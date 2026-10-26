@@ -2,12 +2,14 @@
 
 //! @op CreateSession
 //!
-//! Resolves the parent assistant first — a parent this account does not hold is the
-//! modelled `UnauthorizedException` (401), which is what this path answers for an
-//! assistant it cannot resolve — then mints a session, stores it UNDER that assistant,
-//! and answers out of the stored record. A session created through this API carries
-//! `origin` = `CUSTOMER`, which is what the model documents for it. A replayed
-//! `clientToken` answers with the session that token already created.
+//! Decides whether the caller may act on the assistant the path names first — a label
+//! that names no resource identity this account could hold is the modelled
+//! `UnauthorizedException` (401) — then resolves that assistant, answering the modelled
+//! `ResourceNotFoundException` (404) when the account holds none under a label it could
+//! have, and otherwise mints a session, stores it UNDER that assistant, and answers out
+//! of the stored record. A session created through this API carries `origin` =
+//! `CUSTOMER`, which is what the model documents for it. A replayed `clientToken` answers
+//! with the session that token already created.
 //!
 //! ## The authorization decision runs BEFORE input validation
 //!
@@ -25,9 +27,9 @@
 //! the modelled `UuidOrArn` pattern would never get there. The decision therefore also
 //! sits in front of the walk, in [`CreateSessionAuthorization`], which the service's
 //! `override_operation` seam (`crate::service`) consults for every request this route
-//! names. The two agree by construction: both ask the same state for the same parent and
-//! answer with the same modelled error, so an authorized caller's request walks on and
-//! an unauthorized one gets 401 from whichever of them sees it first.
+//! names. The two agree by construction: both ask the same function about the same label
+//! and answer with the same modelled error, so an authorized caller's request walks on
+//! and an unauthorized one gets 401 from whichever of them sees it first.
 //!
 //! ## Shape of an operation
 //!
@@ -167,26 +169,25 @@ fn unauthorized() -> CreateSessionError {
     .into()
 }
 
-/// THE authorization decision for this operation: the `assistantId` of the parent the
-/// caller may act on, or `None` when it may not.
+/// THE authorization decision for this operation: whether the `assistantId` label a
+/// request carries names a resource identity this account could hold at all.
 ///
 /// A session exists only inside an assistant, so acting on a session is acting on that
-/// assistant; an assistant this account does not hold is one the caller has no
-/// permission on, which is the modelled `UnauthorizedException`. (The read paths —
-/// `GetAssistant`, `GetSession` — resolve the resource instead and answer
-/// `ResourceNotFoundException`; this path authorizes first, which is what the recorded
-/// wire answer for a session create under an assistant the caller does not hold shows.)
+/// assistant — and a label that names no identity of this account (a string that is no
+/// id of this service, or an ARN of another partition, account or service) names nothing
+/// any permission of this account covers, which is the modelled `UnauthorizedException`
+/// (HTTP 401). That is what the recorded wire answer for a session create addressed at a
+/// label outside this service's id form shows, and it is decided WITHOUT resolving
+/// anything: a label the account could hold is authorized, and whether an assistant
+/// actually exists under it is a RESOURCE question, answered behind validation with the
+/// modelled `ResourceNotFoundException` (HTTP 404) — which is what the recorded answer
+/// for a well-formed id naming no assistant shows.
 ///
 /// One function, called from both places the decision is made — the pre-walk
 /// [`CreateSessionAuthorization`] and [`CreateSession::handle`] — so the two can never
 /// disagree about who is authorized.
-fn authorized_parent(
-    store: &crate::state::ComAmazonawsQconnectWisdomserviceState,
-    assistant_label: &str,
-) -> Option<String> {
-    store
-        .assistant(assistant_label)
-        .map(|assistant| assistant.assistant_id.clone())
+fn authorized(assistant_label: &str) -> bool {
+    crate::state::names_an_account_resource(assistant_label)
 }
 
 /// The `{assistantId}` label of this operation's modelled URI, as the segment of the
@@ -266,15 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateSessionAuth
         let Some(label) = assistant_label(request.uri()) else {
             return false;
         };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // No store to decide against: leave the request to the walk rather than
-            // refusing a caller this service cannot judge.
+        if crate::state::service_state(&*self.engine).is_none() {
+            // Mounted on an engine this service holds no state in: it cannot serve the
+            // operation at all, so the request is left to the walk rather than refused
+            // for permissions.
             return false;
-        };
-        let store = state.lock();
-        let unauthorized = authorized_parent(&store, &label).is_none();
-        drop(store);
-        unauthorized
+        }
+        !authorized(&label)
     }
 }
 
@@ -385,14 +384,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The parent is resolved first: a session exists only inside an assistant, and
-        // the decision whether this caller may act on it is `authorized_parent`'s — the
-        // same function the pre-walk `CreateSessionAuthorization` asks, so a request
-        // that reaches here and one refused in front of the walk get the same answer.
-        // The read paths (`GetAssistant`, `GetSession`) resolve the resource first and
-        // answer `ResourceNotFoundException` (404) instead.
-        let Some(assistant_id) = authorized_parent(&store, &input.assistant_id) else {
+        // The parent is resolved first: a session exists only inside an assistant. A
+        // label this account could not hold at all is the authorization refusal
+        // `authorized` describes — the pre-walk `CreateSessionAuthorization` has already
+        // answered it for a request that got here through the router, and the same
+        // function answers it here so the two cannot disagree. A label the account COULD
+        // hold that names no assistant is a resource decision: the modelled
+        // `ResourceNotFoundException` (404), worded as every other read of a missing
+        // assistant words it.
+        if !authorized(&input.assistant_id) {
             return Err(unauthorized());
+        }
+        let Some(assistant_id) = store
+            .assistant(&input.assistant_id)
+            .map(|assistant| assistant.assistant_id.clone())
+        else {
+            return Err(CreateSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                    resource_name: Some(input.assistant_id.clone()),
+                },
+            )
+            .into());
         };
         // A replayed `@idempotencyToken` answers with the session it already created
         // under THIS assistant rather than creating a second one. The token is scoped to
