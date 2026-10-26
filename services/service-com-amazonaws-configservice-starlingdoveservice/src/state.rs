@@ -649,6 +649,34 @@ pub fn no_such_conformance_pack_message(missing: &[String]) -> String {
     )
 }
 
+/// How Config words `NoSuchConfigRuleInConformancePackException` ("Config rule that you
+/// passed in the filter does not exist") for the `missing` rule names a filter carried
+/// that the pack holds no rule for.
+///
+/// The message is BUILT FROM THE REQUEST, and worded as the pack-shaped refusal beside
+/// it ([`no_such_conformance_pack_message`]) is: the fixed sentence names the class of
+/// failure, and the names it lists are the ones the caller sent that resolved to no rule
+/// of the pack, in the order they were sent.
+pub fn no_such_config_rule_in_conformance_pack_message(missing: &[String]) -> String {
+    format!(
+        "One or more config rules in the conformance pack are not valid. Name(s): {}",
+        missing.join(", ")
+    )
+}
+
+/// The most rule names one `ConformancePackComplianceFilters` may name
+/// (`ConformancePackConfigRuleNames`, `@length(min: 0, max: 10)`).
+pub const CONFORMANCE_PACK_COMPLIANCE_FILTER_NAMES_MAX: usize = 10;
+
+/// How many rule compliance records one `DescribeConformancePackCompliance` page
+/// carries when the request does not ask for a page size, for the same reason as
+/// [`DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE`]: `Limit` defaults to 0, which is
+/// "unspecified" rather than "no results", and 1000 is that member's own maximum (range
+/// 0..1000) — which is also the length maximum of the
+/// `ConformancePackRuleComplianceList` one response carries, so it is the largest page
+/// the model lets one response carry.
+pub const DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE: usize = 1000;
+
 /// The third-party cloud service provider a connector connects to
 /// (`com.amazonaws.configservice#Provider`, whose only published value is `AZURE`;
 /// `ConnectorSummary$provider`: "Currently, AZURE is supported").
@@ -3642,6 +3670,30 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             self.remediation_exceptions.remove(key);
         }
         expired.len()
+    }
+
+    /// The `ComplianceType` each Config rule of the conformance pack `pack` rolls up
+    /// to, keyed by the name Config gave that rule when the pack deployed it.
+    ///
+    /// A conformance pack's compliance is the compliance of the rules it deployed, so
+    /// each entry is the roll-up of the evaluation results recorded for that rule
+    /// ([`ConfigRuleEntry::compliance`]) — the ONE precedence this service holds, so a
+    /// pack's report cannot disagree with the rule's own. A rule the pack deployed and
+    /// that is no longer in [`Self::config_rules`] has no compliance to report and is
+    /// left out rather than reported unevaluated.
+    ///
+    /// Keyed in NAME ordering, which is what a paged report of it pages over.
+    pub fn conformance_pack_rule_compliance(
+        &self,
+        pack: &ConformancePackEntry,
+    ) -> BTreeMap<String, &'static str> {
+        pack.deployed_rule_names
+            .iter()
+            .filter_map(|name| {
+                let rule = self.config_rules.get(name)?;
+                Some((name.clone(), rule.compliance()))
+            })
+            .collect()
     }
 
     /// The tags of the resource `arn` identifies, or `None` when this store holds no

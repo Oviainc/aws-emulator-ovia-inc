@@ -142,3 +142,5 @@ mod put_remediation_exceptions;
 mod describe_conformance_packs;
 #[path = "all/delete_evaluation_results.rs"]
 mod delete_evaluation_results;
+#[path = "all/conformance_pack_compliance.rs"]
+mod conformance_pack_compliance;

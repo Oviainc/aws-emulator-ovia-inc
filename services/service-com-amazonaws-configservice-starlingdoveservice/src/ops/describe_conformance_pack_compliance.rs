@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConformancePackCompliance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConformancePackCompliance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConformancePackCompliance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the compliance of each Config rule a conformance pack deployed: "Returns
+//! compliance details for each rule in that conformance pack."
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * a pack's compliance is the compliance of the rules IT deployed, so every reported
+//!   entry is one of those rules, named as the deployment named it, carrying the
+//!   `ComplianceType` that rule's recorded evaluation results roll up to
+//!   ([`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState::conformance_pack_rule_compliance`]),
+//!   which is the same roll-up the rule's own compliance read reports;
+//! * `Controls` is "controls for the conformance pack", which a template declares beside
+//!   its rules: a pack deployed from a template that declares none has no control to
+//!   report, so the member is absent rather than invented;
+//! * `NoSuchConformancePackException` ("You specified one or more conformance packs that
+//!   do not exist") for a name this account and Region holds no pack for, and
+//!   `NoSuchConfigRuleInConformancePackException` ("Config rule that you passed in the
+//!   filter does not exist") for a filtered rule name the pack deployed no rule for —
+//!   both refusals name what the request carried;
+//! * the filter narrows rather than changes what is reported: a rule outside
+//!   `Filters.ConfigRuleNames`, or whose roll-up is not the `Filters.ComplianceType`
+//!   asked for, is left out, and a `ComplianceType` outside the modelled enum
+//!   (`CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES`, generated from
+//!   `ConformancePackComplianceType`) is `InvalidParameterValueException`;
+//! * `Limit` is the page size, with the modelled default of 0 meaning the maximum
+//!   ([`crate::state::DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE`]), and a limit
+//!   outside the modelled range is `InvalidLimitException`; `NextToken` resumes at the
+//!   rule name the previous page stopped at, and a token outside the opaque form this
+//!   operation issues is `InvalidNextTokenException`.
+//!
+//! This is a REPORT: every member is computed from the pack and the rules already in
+//! state, and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +184,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConformancePackCompliance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConformancePackComplianceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConformancePackCompliance"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "The maximum number of Config rules within a conformance pack are returned on
+        // each page." The modelled range (0..1000) is refused at the request boundary
+        // where the boundary enforces it; the check stands so a limit outside it answers
+        // this operation's own modelled `InvalidLimitException` either way, with a
+        // message BUILT FROM THE REQUEST. A limit of 0 is the modelled default —
+        // "unspecified" — which is the largest page the model lets one response carry.
+        let requested = input.limit;
+        let page_size = match usize::try_from(requested) {
+            Ok(0) => crate::state::DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE,
+            Ok(limit) if limit <= crate::state::DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE => {
+                limit
+            }
+            _ => {
+                return Err(
+                    DescribeConformancePackComplianceErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "Value '{requested}' at 'limit' failed to satisfy constraint: \
+                                 Member must be between 0 and {}",
+                                crate::state::DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConformancePackComplianceErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        let filtered_names = filters.config_rule_names.unwrap_or_default();
+        // The modelled list carries at most ten names, which the request boundary
+        // enforces; the check stands so a longer list answers this operation's own
+        // modelled `InvalidParameterValueException` either way, with a message BUILT FROM
+        // THE REQUEST.
+        if filtered_names.len() > crate::state::CONFORMANCE_PACK_COMPLIANCE_FILTER_NAMES_MAX {
+            return Err(invalid_parameter(format!(
+                "Value at 'filters.configRuleNames' failed to satisfy constraint: Member must \
+                 have length less than or equal to {}, and {} names were sent",
+                crate::state::CONFORMANCE_PACK_COMPLIANCE_FILTER_NAMES_MAX,
+                filtered_names.len(),
+            )));
+        }
+
+        // A filter may name only a compliance type this report holds, so one that names
+        // another is a bad request rather than a filter that matches nothing. The
+        // modelled enum is refused at the request boundary where the boundary enforces
+        // it; the check stands so a value outside it answers this operation's own
+        // modelled `InvalidParameterValueException` either way, with a message BUILT FROM
+        // THE REQUEST.
+        let filtered_compliance = filters
+            .compliance_type
+            .as_deref()
+            .filter(|compliance_type| !compliance_type.is_empty());
+        if let Some(rejected) = filtered_compliance.filter(|compliance_type| {
+            !CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES.contains(compliance_type)
+        }) {
+            return Err(invalid_parameter(crate::state::unaccepted_value_message(
+                "ComplianceType",
+                rejected,
+                CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES,
+            )));
+        }
+
+        let store = state.lock();
+
+        // "You specified one or more conformance packs that do not exist": a name this
+        // account and Region holds no pack for is refused rather than reported as a pack
+        // with no rules.
+        let Some(pack) = store.conformance_packs.get(&input.conformance_pack_name) else {
+            return Err(
+                DescribeConformancePackComplianceErrorModeled::NoSuchConformancePackException(
+                    NoSuchConformancePackException {
+                        message: Some(crate::state::no_such_conformance_pack_message(
+                            ::std::slice::from_ref(&input.conformance_pack_name),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The pack's compliance is the compliance of the rules it deployed, each read
+        // back out of the rule's own recorded evaluation results.
+        let rule_compliance = store.conformance_pack_rule_compliance(pack);
+
+        // "Config rule that you passed in the filter does not exist": a filtered name
+        // this pack deployed no rule for is REFUSED rather than skipped, and the refusal
+        // names every such name the request carried.
+        let missing: Vec<String> = filtered_names
+            .iter()
+            .filter(|name| !rule_compliance.contains_key(*name))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(
+                DescribeConformancePackComplianceErrorModeled::NoSuchConfigRuleInConformancePackException(
+                    NoSuchConfigRuleInConformancePackException {
+                        message: Some(
+                            crate::state::no_such_config_rule_in_conformance_pack_message(&missing),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Page over the pack's rules in NAME ordering, so a token holds the name the
+        // next page resumes at and survives rules the pack gained or lost between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, compliance) in &rule_compliance {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !filtered_names.is_empty()
+                && !filtered_names.iter().any(|requested| requested == name)
+            {
+                continue;
+            }
+            // The compliance filter selects on what the rule ROLLS UP TO, so a rule the
+            // filter does not place is left out rather than reported with another type.
+            if filtered_compliance.is_some_and(|requested| requested != *compliance) {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(ConformancePackRuleCompliance {
+                config_rule_name: Some(name.clone()),
+                compliance_type: Some((*compliance).to_string()),
+                // "Controls for the conformance pack": the template this pack was
+                // deployed from declares none, so there is no control to report.
+                controls: None,
+            });
+        }
+
+        Ok(DescribeConformancePackComplianceOutput {
+            conformance_pack_name: pack.name.clone(),
+            conformance_pack_rule_compliance_list: page,
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `InvalidParameterValueException`
+/// (HTTP 400) — "one or more of the specified parameters are not valid" — with a message
+/// BUILT FROM THE REQUEST.
+fn invalid_parameter(message: String) -> DescribeConformancePackComplianceError {
+    DescribeConformancePackComplianceErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

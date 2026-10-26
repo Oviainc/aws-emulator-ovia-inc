@@ -1340,7 +1340,10 @@ async fn an_unimplemented_operation_still_answers_not_implemented() {
     // (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
     let emulator = Emulator::new();
     let (status, code) = emulator
-        .refused("DescribeConformancePackCompliance", &json!({ "ConformancePackName": "pack-000" }))
+        .refused(
+            "GetConformancePackComplianceDetails",
+            &json!({ "ConformancePackName": "pack-000" }),
+        )
         .await;
     assert_eq!(
         (status, code.as_str()),
