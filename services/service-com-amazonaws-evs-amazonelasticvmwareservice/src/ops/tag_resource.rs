@@ -2,7 +2,9 @@
 
 //! @op TagResource
 //! Merges the request's tags into the stored environment the ARN names: tags already
-//! on the resource that the request does not mention are left alone. A tag key in
+//! on the resource that the request does not mention are left alone. The operation is
+//! `@idempotent`, so a merge that leaves the stored tag map exactly as it was modified
+//! the resource not at all and its `modifiedAt` stays where it was. A tag key in
 //! AWS's reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched
 //! however it is cased) is refused with this operation's own tag-policy refusal and
 //! writes nothing — a rule about the REQUEST, so it is judged before the ARN is
@@ -241,8 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        environment.tags = merged;
-        environment.modified_at_ms = crate::state::now_ms();
+        // `@idempotent`: the end state is what the call asks for, so a merge that leaves
+        // the stored tag map exactly as it was modified the resource not at all. Only a
+        // call that really changed a tag re-stamps the record — the guard `UntagResource`
+        // applies to the keys it removes, on the keys this operation writes.
+        if merged != environment.tags {
+            environment.tags = merged;
+            environment.modified_at_ms = crate::state::now_ms();
+        }
 
         Ok(TagResourceOutput {})
     }

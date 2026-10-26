@@ -74,6 +74,8 @@ mod list_while_initializing;
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource_idempotent_stamp.rs"]
+mod tag_resource_idempotent_stamp;
 #[path = "all/tagging_not_found.rs"]
 mod tagging_not_found;
 #[path = "all/tagging_resource_arn_resolution.rs"]
