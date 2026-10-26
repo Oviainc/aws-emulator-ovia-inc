@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `CreateVpcEndpoint` stores for each endpoint type, and what it refuses. Declared here
+// rather than in sorted position, for the reason the note above gives: the sorted
+// neighbourhood is where every new ec2 suite inserts its lines.
+#[path = "all/create_vpc_endpoint.rs"]
+mod create_vpc_endpoint;
 // Associating a virtual interface group with a local gateway route table, and reading the
 // association back. Declared beside `prefix_lists` for the reason the note above gives: the
 // sorted region AND the tail of this file are where every new ec2 suite inserts its lines,

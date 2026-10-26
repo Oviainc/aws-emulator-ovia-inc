@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitAttachmentStateChanges
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitAttachmentStateChanges`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitAttachmentStateChanges::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the state the ECS agent reports for the attachments of a task
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::record_attachment_status`]),
+//! resolving the cluster and every attachment the report names against this service's
+//! store first.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitAttachmentStateChanges` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitAttachmentStateChangesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitAttachmentStateChanges"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SubmitAttachmentStateChangesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // "The short name or full ARN of the cluster that hosts the container instance the
+        // attachment belongs to": the attachments a report can name are the ones that
+        // cluster holds, so the cluster is resolved first. The agent plane states a
+        // missing cluster with the same fixed sentence every cluster-resolving operation
+        // does, under the error code this operation answers it with.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(
+                SubmitAttachmentStateChangesErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Every attachment the report names is resolved BEFORE any of them is recorded, so
+        // a batch carrying one unknown attachment stores nothing: the report is refused
+        // whole, as it is when the cluster resolves to nothing.
+        let mut resolved = Vec::new();
+        for change in &input.attachments {
+            let attachment_id =
+                crate::state::attachment_id_from_reference(&change.attachment_arn).to_string();
+            let Some(task_arn) = guard.task_arn_holding_attachment(&cluster_name, &attachment_id)
+            else {
+                return Err(
+                    SubmitAttachmentStateChangesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::attachment_not_found_message(
+                                &change.attachment_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            resolved.push((task_arn, attachment_id, change.status.clone()));
+        }
+
+        for (task_arn, attachment_id, status) in resolved {
+            guard.record_attachment_status(&task_arn, &attachment_id, &status);
+        }
+
+        // "Acknowledgement of the state change" — the report was taken, which is what the
+        // agent plane answers a report it has recorded with.
+        Ok(SubmitAttachmentStateChangesOutput {
+            acknowledgment: Some(crate::state::STATE_CHANGE_ACKNOWLEDGMENT.to_string()),
+        })
     }
 }

@@ -79,6 +79,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/site_address.rs"]
 mod site_address;
+#[path = "all/site_address_order_hold.rs"]
+mod site_address_order_hold;
 #[path = "all/site_and_outpost_lifecycle.rs"]
 mod site_and_outpost_lifecycle;
 #[path = "all/site_and_outpost_projection.rs"]

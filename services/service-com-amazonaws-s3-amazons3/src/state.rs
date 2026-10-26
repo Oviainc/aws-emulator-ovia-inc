@@ -4607,6 +4607,18 @@ impl Bucket {
         self.cors = Some(rules);
     }
 
+    /// Remove the bucket's cors configuration, leaving none associated with it.
+    ///
+    /// What `DeleteBucketCors` does — "Deletes the cors configuration information set for
+    /// the bucket" (that operation's own documentation) — which puts the bucket back in the
+    /// state it was created in, so a later `GetBucketCors` answers
+    /// [`NO_SUCH_CORS_CONFIGURATION_CODE`] again. Scoped to this one bucket's cors
+    /// configuration: nothing else on the record is touched, the way
+    /// [`Bucket::clear_ownership_controls`] is scoped to the ownership controls.
+    pub fn clear_cors(&mut self) {
+        self.cors = None;
+    }
+
     /// Where the bucket's server access logs are delivered, or `None` while logging is not
     /// enabled on it. See [`Self::logging`].
     pub fn logging(&self) -> Option<&crate::ops::types::LoggingEnabled> {

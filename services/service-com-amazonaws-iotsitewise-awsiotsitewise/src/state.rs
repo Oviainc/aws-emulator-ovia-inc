@@ -76,7 +76,13 @@
 //! minted `dashboardId` — which identifies one across every project — each
 //! record naming the project it was created in, holding the definition
 //! literal the last write to it stated and the idempotency token its create
-//! carried, which is what a retry of that create is recognised by. Every
+//! carried, which is what a retry of that create is recognised by. The
+//! account's bulk import jobs live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::bulk_import_jobs`], keyed by
+//! the minted `jobId` — which identifies one across the account — each record
+//! carrying the request that started it and the instant it was created, from
+//! which a read DERIVES the status and the last-update date the clock has made
+//! due. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -95,9 +101,10 @@ use crate::ops::types::{
     ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, CustomerManagedS3Storage, DatasetConfig,
     DatasetSource, DatasetStatus, EnrichmentJobConfiguration, EnrichmentJobSummary,
+    ErrorReportLocation,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
-    ImageLocation, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
+    ExpressionVariable, File, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
+    ImageLocation, JobConfiguration, LoggingOptions, Mount, MountOverrides, MultiLayerStorage,
     PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
     ResolveTo, Resource, ResourceStatus, RetentionPeriod, SearchFilters, TargetResource,
@@ -3610,6 +3617,14 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Written by `CreateDashboard` and `UpdateDashboard`, read by
     /// `DescribeDashboard`.
     pub dashboards: HashMap<String, DashboardRecord>,
+    /// Bulk import jobs by `jobId`, which identifies one across the account:
+    /// `DescribeBulkImportJob` addresses a job by that id alone and only
+    /// NARROWS the read with an optional `workspaceName`, so the workspace a
+    /// job was created for (a job ingesting into a session dataset has one,
+    /// a job ingesting into time series outside a workspace has none) lives on
+    /// the record. Written by `CreateBulkImportJob` and read by
+    /// `DescribeBulkImportJob`; bounded by [`MAX_BULK_IMPORT_JOBS`].
+    pub bulk_import_jobs: HashMap<String, BulkImportJobRecord>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -7208,6 +7223,176 @@ pub fn dashboard_arn(region: &str, dashboard_id: &str) -> String {
 // `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
 // through.
 tagged_record!(DashboardRecord);
+
+// ---------------------------------------------------------------------------
+// The bulk import job slice: the record `CreateBulkImportJob` writes and
+// `DescribeBulkImportJob` reports, the lifecycle a created job is owed, the
+// bounds the request is read against and the resource kind a refusal names.
+//
+// One section, like the slices above: what a job IS and every value derived
+// from it sit beside each other, so the create and the read cannot disagree
+// about either.
+// ---------------------------------------------------------------------------
+
+/// The `JobStatus` a job reports while the import it asked for has not started:
+/// "PENDING – IoT SiteWise is waiting for the current bulk import job to
+/// finish".
+///
+/// Source: `smithy_query(query="shape", shape="JobStatus")`, whose values are
+/// also in `crate::ops::types::JOB_STATUS_VALUES`.
+pub const BULK_IMPORT_JOB_PENDING: &str = "PENDING";
+
+/// The `JobStatus` a job reports while it is being worked on: "RUNNING – IoT
+/// SiteWise is processing your request to import your data from Amazon S3".
+pub const BULK_IMPORT_JOB_RUNNING: &str = "RUNNING";
+
+/// The terminal `JobStatus` a job reaches: "COMPLETED – IoT SiteWise
+/// successfully completed your request to import data from Amazon S3".
+///
+/// WHY the terminal record is this value and not one of the failure ones: the
+/// three remaining values report outcomes something would have had to DIAGNOSE.
+/// `CANCELLED` needs a call that cancels a job, which this service models none
+/// of. `FAILED` and `COMPLETED_WITH_FAILURES` state that the import was
+/// attempted and that the reasons are "saved in the specified error report
+/// location in Amazon S3" — a report nothing here writes — so reporting either
+/// would invent a diagnosis, and would make every job a caller starts look
+/// broken when nothing about the request was. The status this emulator records
+/// is the lifecycle the create OWED (see [`BulkImportJobRecord`]), and the
+/// lifecycle every other owed transition in this service settles into is its
+/// success state, so this is the consistent terminal record for one.
+pub const BULK_IMPORT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// How long each step of a bulk import job's lifecycle takes: a created job
+/// stays [`BULK_IMPORT_JOB_PENDING`] for this long, then reports
+/// [`BULK_IMPORT_JOB_RUNNING`] for this long, then is
+/// [`BULK_IMPORT_JOB_COMPLETED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for either step — an import
+/// takes as long as the data it moves. The span is deliberately NON-ZERO, so a
+/// caller that describes a job straight after creating it still observes the
+/// transient status the real service reports, and short enough that a caller can
+/// poll the job through to its terminal status.
+pub const BULK_IMPORT_JOB_STEP: Duration = Duration::from_millis(500);
+
+/// How many files one bulk import job may name.
+///
+/// DOCUMENTED, not chosen: the `files` member states it — "You can specify up to
+/// 100 files for each bulk import job" — and the list shape carries no length
+/// constraint of its own, so the create is what enforces it.
+pub const MAX_FILES_PER_BULK_IMPORT_JOB: usize = 100;
+
+/// How many bulk import jobs the store holds.
+///
+/// The same kind of bound, and for the same reason, as [`MAX_DASHBOARDS`]: a
+/// create is the only thing that adds a job and nothing evicts one, so without a
+/// cap a stream of creates would grow one emulator process without limit. The
+/// emulator's own bound, not a published AWS quota; `CreateBulkImportJob`
+/// refuses past it with the modelled `LimitExceededException` (HTTP 410).
+pub const MAX_BULK_IMPORT_JOBS: usize = 1_000;
+
+/// The resource kind a not-found refusal names for a bulk import job; see
+/// [`not_found_message`].
+pub const RESOURCE_BULK_IMPORT_JOB: &str = "Bulk Import Job";
+
+/// One bulk import job, as `CreateBulkImportJob` starts it and
+/// `DescribeBulkImportJob` reports it.
+///
+/// Its STATUS is not stored: it is DERIVED from the instant the job was created
+/// ([`Self::status`]), because the lifecycle is owed by the clock rather than by
+/// any call. So a reader reports the status the clock has made due without
+/// writing to the store, and two readers of one job can never disagree about
+/// where it has got to.
+///
+/// That status is a RECORD of the lifecycle the create owed, not a report on
+/// work something performed: the files a job names live in Amazon S3, which this
+/// emulator does not reach, so nothing reads them and no property value appears
+/// because a job ran. An operation that comes to ingest a job's files must take
+/// them from somewhere this emulator really holds, never synthesise values to
+/// match the status reached here.
+#[derive(Debug, Clone)]
+pub struct BulkImportJobRecord {
+    /// The `jobId` this job was minted with ([`new_id`]).
+    pub job_id: String,
+    /// "The unique name that helps identify the job request", as the create
+    /// stated it.
+    pub job_name: String,
+    /// "The ARN of the IAM role that allows IoT SiteWise to read Amazon S3
+    /// data". This service neither assumes nor resolves it.
+    pub job_role_arn: String,
+    /// "The files in the specified Amazon S3 bucket that contain your data",
+    /// kept verbatim and in the order the request listed them, so the reader
+    /// answers the request's own files. Bounded by
+    /// [`MAX_FILES_PER_BULK_IMPORT_JOB`].
+    pub files: Vec<File>,
+    /// "The Amazon S3 destination where errors associated with the job creation
+    /// request are saved". This service writes nothing to it.
+    pub error_report_location: ErrorReportLocation,
+    /// "Contains the configuration information of a job, such as the file format
+    /// used to save data in Amazon S3" — reported only when the create named it.
+    pub job_configuration: Option<JobConfiguration>,
+    /// The modelled `adaptiveIngestion`, as the create stated it.
+    pub adaptive_ingestion: Option<bool>,
+    /// The modelled `deleteFilesAfterImport`, as the create stated it. This
+    /// service deletes nothing: the files are in S3, which it does not reach.
+    pub delete_files_after_import: Option<bool>,
+    /// "The ID of the session dataset to ingest data into", for a job that
+    /// ingests into one; `None` for a job ingesting into time series outside a
+    /// workspace.
+    pub dataset_id: Option<String>,
+    /// The workspace the session dataset lives in — named together with
+    /// [`Self::dataset_id`], and `None` for the same job that has no dataset.
+    pub workspace_name: Option<String>,
+    /// When the job was created, which is the `jobCreationDate` a read reports
+    /// and the instant its whole lifecycle is owed from.
+    pub created_at: SystemTime,
+}
+
+impl BulkImportJobRecord {
+    /// The job's status at `now`, and the instant that status fell due.
+    ///
+    /// ONE place, so [`Self::status`] and [`Self::last_update_date`] cannot
+    /// disagree about where the job has got to: the second is simply the instant
+    /// the first became true.
+    fn settled(&self, now: SystemTime) -> (&'static str, SystemTime) {
+        let running_at = self.created_at + BULK_IMPORT_JOB_STEP;
+        let completed_at = running_at + BULK_IMPORT_JOB_STEP;
+        if now >= completed_at {
+            (BULK_IMPORT_JOB_COMPLETED, completed_at)
+        } else if now >= running_at {
+            (BULK_IMPORT_JOB_RUNNING, running_at)
+        } else {
+            (BULK_IMPORT_JOB_PENDING, self.created_at)
+        }
+    }
+
+    /// The job's `jobStatus` at `now`: [`BULK_IMPORT_JOB_PENDING`] until the
+    /// first [`BULK_IMPORT_JOB_STEP`] has elapsed, [`BULK_IMPORT_JOB_RUNNING`]
+    /// until the second has, [`BULK_IMPORT_JOB_COMPLETED`] after that.
+    /// `COMPLETED` is terminal, so the status never moves again.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        self.settled(now).0
+    }
+
+    /// "The date the job was last updated": the instant of the most recent
+    /// status transition the clock has made due, which for a job nothing has
+    /// moved yet is the instant it was created.
+    pub fn last_update_date(&self, now: SystemTime) -> SystemTime {
+        self.settled(now).1
+    }
+
+    /// Whether this job answers a read scoped to `workspace`.
+    ///
+    /// A read may name a `workspaceName`, which NARROWS it to the jobs of that
+    /// workspace: a job created for a session dataset in another workspace, and
+    /// one created for no workspace at all, are not reachable through it. A read
+    /// that names none is account-wide, so every job answers it.
+    pub fn in_workspace(&self, workspace: Option<&str>) -> bool {
+        match workspace {
+            None => true,
+            Some(workspace) => self.workspace_name.as_deref() == Some(workspace),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The enrichment jobs of a workspace: what `CreateEnrichmentJob` starts and

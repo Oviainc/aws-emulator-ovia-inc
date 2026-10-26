@@ -37,7 +37,8 @@ use crate::ops::types::{
 pub mod authorization;
 
 /// The CloudWatch Logs side of `DataStorage.CwLog`: the permission turning log delivery
-/// on requires, and the vended log group RUM provisions when it is on.
+/// on requires, the vended log group RUM provisions when it is on, and the copies of
+/// delivered telemetry it stores there.
 pub mod cw_log_delivery;
 
 /// This service's ARN namespace / sigv4 signing name (`OPERATIONS.md`,

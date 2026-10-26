@@ -55,6 +55,9 @@ const TOO_MANY: &str = "TOO_MANY_AUTO_ASSOCIATE_BILLING_GROUPS";
 /// the payer account alone, so this is the world in which these calls are reachable.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so the suite can record the billing
+    /// transfers the organization has — see [`Emulator::designate_transfer`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -65,8 +68,14 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
+    /// seam [`crate::billing_transfer_identity::designate_transfer`].
+    fn designate_transfer(&self, arn: &str) -> String {
+        crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
     /// POST a JSON body to one of this service's routes and return the status plus the
@@ -309,7 +318,7 @@ async fn a_second_create_asking_for_auto_associate_is_refused() {
                 "AccountGrouping": {
                     "LinkedAccountIds": ["666677778888"],
                     "AutoAssociate": true,
-                    "ResponsibilityTransferArn": transfer_arn("1234abcd"),
+                    "ResponsibilityTransferArn": em.designate_transfer(&transfer_arn("1234abcd")),
                 },
                 "ComputationPreference": { "PricingPlanArn": plan },
                 "Tags": { "team": "billing" },
@@ -611,7 +620,7 @@ async fn an_update_cannot_elect_a_second_group_whatever_else_it_carries() {
     let plan = em.create_plan("AutoAssociateUpdateTablePlan").await;
     let second_plan = em.create_plan("AutoAssociateUpdateTablePlanTwo").await;
     let holder = elected_holder(&em, &plan).await;
-    let held_transfer = transfer_arn("beef1234");
+    let held_transfer = em.designate_transfer(&transfer_arn("beef1234"));
 
     let rows = [
         UpdateCase {

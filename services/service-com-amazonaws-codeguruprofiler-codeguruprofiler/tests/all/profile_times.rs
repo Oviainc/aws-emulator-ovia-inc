@@ -6,9 +6,11 @@
 //! The rule every case here asserts: `ListProfileTimes` reports the start instants of
 //! the aggregated profiles a stored group holds for the requested aggregation period —
 //! each posted agent profile belongs to the one period-length window, aligned to UTC,
-//! that contains its receipt time, and every such window holding at least one profile
-//! is reported once, filtered to the requested time range, ordered by `orderBy`
-//! (descending by default) and paged by `maxResults`/`nextToken`.
+//! that contains its receipt time, and every such window whose aggregation has fallen
+//! due and which holds at least one profile is reported once, filtered to the requested
+//! time range, ordered by `orderBy` (descending by default) and paged by
+//! `maxResults`/`nextToken`. A window the service is still collecting into has no
+//! aggregated profile yet and is reported by nothing.
 //!
 //! Rows vary what the rule generalises over: the aggregation period (all three the
 //! model declares), how many profiles share a window, where a receipt sits inside its
@@ -741,5 +743,269 @@ async fn requests_outside_the_operation_s_rules_are_refused() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
+    }
+}
+
+/// The length in whole seconds of a modelled `AggregationPeriod` value, read from the
+/// service's own table, so a case cannot name a period the service does not aggregate at.
+fn period_seconds(period: &str) -> i64 {
+    service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::aggregation_period_seconds(
+        period,
+    )
+    .unwrap_or_else(|| panic!("{period} is not a modelled AggregationPeriod"))
+}
+
+/// The start of the `period`-long aggregation window, aligned to the UTC epoch, that
+/// contains `at` — the instant a reported profile time names.
+fn window_start(at: i64, period: i64) -> i64 {
+    at.div_euclid(period) * period
+}
+
+/// The start of the finest aggregation window that has NOT OPENED yet.
+///
+/// A profile whose receipt sits at or after this instant belongs to a window the service
+/// is not collecting into yet, so the aggregated profile that window owes cannot be due
+/// for at least one whole period however long a case takes: the pending cases below
+/// cannot race a window boundary.
+fn pending_window_start() -> i64 {
+    let finest = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::finest_aggregation_period_seconds();
+    let now = DateTime::from(std::time::SystemTime::now()).secs();
+    window_start(now, finest) + finest
+}
+
+/// One pending-aggregation row: where the group's posted profiles are received, relative
+/// to the window whose aggregation is not due yet, and how the request is parameterised.
+#[derive(Debug)]
+struct PendingCase {
+    label: &'static str,
+    /// One offset in seconds per posted profile, from [`pending_window_start`] for the
+    /// pending phase and from a day earlier for the aggregated phase. Non-negative, so
+    /// every pending receipt sits in a window that has not closed.
+    offsets: Vec<i64>,
+    /// A modelled `AggregationPeriod` value (`AGGREGATION_PERIOD_VALUES`).
+    period: &'static str,
+    /// A modelled `OrderBy` value (`ORDER_BY_VALUES`), or none for the default.
+    order_by: Option<&'static str>,
+    max_results: Option<i32>,
+}
+
+impl PendingCase {
+    /// The receipts this case places, and the request that must cover the windows they
+    /// fall in: the range starts three periods before the earliest receipt and ends one
+    /// period after the latest, so every window start the receipts floor to lies strictly
+    /// inside it. An empty page is therefore about the aggregation, not about the range.
+    fn request(&self, base: i64) -> (Vec<i64>, (i64, i64), String) {
+        let receipts: Vec<i64> = self.offsets.iter().map(|at| base + at).collect();
+        let period = period_seconds(self.period);
+        let earliest = receipts.iter().min().copied().unwrap_or(base);
+        let latest = receipts.iter().max().copied().unwrap_or(base);
+        let range = (earliest - 3 * period, latest + period);
+        let mut query = format!(
+            "?startTime={}&endTime={}&period={}",
+            iso(range.0),
+            iso(range.1),
+            self.period
+        );
+        if let Some(order_by) = self.order_by {
+            query.push_str(&format!("&orderBy={order_by}"));
+        }
+        if let Some(max_results) = self.max_results {
+            query.push_str(&format!("&maxResults={max_results}"));
+        }
+        (receipts, range, query)
+    }
+
+    /// The profile times this case must report once the aggregations are due: one entry
+    /// per distinct window the receipts fall in, inside the range, in the requested order
+    /// and bounded by the page size.
+    fn expected(&self, receipts: &[i64], range: (i64, i64)) -> (Vec<i64>, bool) {
+        let period = period_seconds(self.period);
+        let mut starts: Vec<i64> = receipts
+            .iter()
+            .map(|at| window_start(*at, period))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts.retain(|start| *start >= range.0 && *start < range.1);
+        // The model's doc for `orderBy`: "Defaults to TIMESTAMP_DESCENDING."
+        if self.order_by != Some("TimestampAscending") {
+            starts.reverse();
+        }
+        let limit = self.max_results.map_or(
+            service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::DEFAULT_LIST_PAGE_SIZE,
+            |max| usize::try_from(max).unwrap_or(1).max(1),
+        );
+        let page: Vec<i64> = starts.iter().take(limit).copied().collect();
+        (page, starts.len() > limit)
+    }
+}
+
+/// Rows vary what the rule generalises over: the aggregation period (all three the model
+/// declares), how many profiles the group holds, how many windows they fall in, where a
+/// receipt sits inside its window, the order and the page size.
+fn pending_cases() -> Vec<PendingCase> {
+    vec![
+        PendingCase {
+            label: "one profile, five-minute period",
+            offsets: vec![0],
+            period: "PT5M",
+            order_by: None,
+            max_results: None,
+        },
+        PendingCase {
+            label: "one profile, hourly period",
+            offsets: vec![0],
+            period: "PT1H",
+            order_by: None,
+            max_results: None,
+        },
+        PendingCase {
+            label: "one profile, daily period",
+            offsets: vec![0],
+            period: "P1D",
+            order_by: None,
+            max_results: None,
+        },
+        PendingCase {
+            label: "three profiles inside one five-minute window",
+            offsets: vec![0, 1, 299],
+            period: "PT5M",
+            order_by: Some("TimestampAscending"),
+            max_results: None,
+        },
+        PendingCase {
+            label: "profiles spread over three five-minute windows",
+            offsets: vec![0, 300, 600],
+            period: "PT5M",
+            order_by: Some("TimestampAscending"),
+            max_results: None,
+        },
+        PendingCase {
+            label: "profiles spread over two hourly windows",
+            offsets: vec![0, HOUR],
+            period: "PT1H",
+            order_by: Some("TimestampDescending"),
+            max_results: None,
+        },
+        PendingCase {
+            label: "a page size of one still reports an empty page with no token",
+            offsets: vec![0, 300],
+            period: "PT5M",
+            order_by: None,
+            // `maxResults`'s published lower bound (the model: range 1..1000).
+            max_results: Some(1),
+        },
+        PendingCase {
+            label: "a page size at its upper bound reports an empty page",
+            offsets: vec![0],
+            period: "PT1H",
+            order_by: Some("TimestampDescending"),
+            max_results: Some(1000),
+        },
+    ]
+}
+
+/// `ListProfileTimes` lists AGGREGATED profiles, and a posted agent profile is not one
+/// at the instant it is received: the service collects posted profiles into aggregated
+/// profiles over windows aligned to UTC, so a window still open is covered by no
+/// aggregated profile and contributes no profile time — however many profiles it holds,
+/// whatever period, order or page size the request names. Once the aggregation that
+/// window owes has fallen due, the same request reports its start.
+#[tokio::test]
+async fn a_window_is_reported_only_once_the_aggregation_it_owes_is_due() {
+    /// A day in seconds back from the pending window: far enough that every window those
+    /// receipts fall in has closed, so their aggregations are due.
+    const AGED: i64 = DAY;
+
+    let harness = Harness::new();
+
+    for (index, case) in pending_cases().iter().enumerate() {
+        let name = format!("times-pending-{index}");
+        let label = case.label;
+        // One base instant per case, so the two phases place the same profiles a day
+        // apart even if the clock crosses a window boundary mid-case.
+        let base = pending_window_start();
+        let (pending_receipts, pending_range, pending_query) = case.request(base);
+
+        group_with_receipts(&harness, &name, &pending_receipts).await;
+
+        // The posts were RECEIVED — the group records that — and are not aggregated yet.
+        let described = harness.describe(&name).await;
+        assert!(
+            described
+                .json()
+                .pointer("/profilingStatus/latestAgentProfileReportedAt")
+                .is_some(),
+            "case {label:?}: the posts must be recorded as received, got {}",
+            String::from_utf8_lossy(&described.body)
+        );
+
+        // Polling until an aggregate appears is what a client written against the real
+        // service does: every attempt reports an empty page, and no page token, because
+        // there is no aggregated profile to page through.
+        for attempt in 0..3 {
+            let answer = list_profile_times(&harness, &name, &pending_query).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {label:?} attempt {attempt} ({pending_query}): expected HTTP 200, got {} {}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            let reported = profile_times(&answer);
+            assert!(
+                reported.is_empty(),
+                "case {label:?} attempt {attempt} ({pending_query}): a window whose \
+                 aggregation is not due must report no profile time, got {reported:?}"
+            );
+            assert_eq!(
+                next_token(&answer),
+                None,
+                "case {label:?} attempt {attempt}: an empty page must carry no nextToken, \
+                 got {:?}",
+                next_token(&answer)
+            );
+        }
+
+        // The same profiles, received a day earlier: every window they fall in has closed
+        // and been aggregated, so the same request now reports one start per window.
+        let (due_receipts, due_range, due_query) = case.request(base - AGED);
+        place_receipts(&harness, &name, &due_receipts);
+        let (expected, expect_next) = case.expected(&due_receipts, due_range);
+        assert!(
+            !expected.is_empty(),
+            "case {label:?}: the aged receipts must fall inside the requested range"
+        );
+        let answer = list_profile_times(&harness, &name, &due_query).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {label:?} ({due_query}): expected HTTP 200, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            profile_times(&answer),
+            expected,
+            "case {label:?} ({due_query}): expected profile times {expected:?}, got {:?}",
+            profile_times(&answer)
+        );
+        assert_eq!(
+            next_token(&answer).is_some(),
+            expect_next,
+            "case {label:?}: expected nextToken present = {expect_next}, got {:?}",
+            next_token(&answer)
+        );
+        // The pending phase's own range covered the windows it asked about, so the empty
+        // pages above were about the aggregation and not about the range: the windows the
+        // pending receipts floor to are the ones this case's range contains.
+        for receipt in &pending_receipts {
+            let start = window_start(*receipt, period_seconds(case.period));
+            assert!(
+                start >= pending_range.0 && start < pending_range.1,
+                "case {label:?}: the pending range {pending_range:?} must contain window \
+                 start {start}"
+            );
+        }
     }
 }

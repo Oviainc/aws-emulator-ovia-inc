@@ -173,8 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a connector exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN, and a
+        // `ClientToken` stands for a call made against this Region's endpoint.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -216,11 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be answered exactly as the same request with a token nobody has used yet. (The
         // sibling create decides the same situation the same way — see
         // `create_connector.rs`.)
-        if let Some(existing) = store.challenge_for_token(input.client_token.as_deref()) {
-            let answerable = store.challenge(&existing.arn).filter(|challenge| {
+        if let Some(existing) = store.challenge_for_token(&region, input.client_token.as_deref()) {
+            let answerable = store.challenge(&region, &existing.arn).filter(|challenge| {
                 store
-                    .connectors
-                    .get(&challenge.connector_arn)
+                    .connector(&region, &challenge.connector_arn)
                     .is_some_and(crate::state::StoredConnector::is_active)
             });
             if let Some(challenge) = answerable {
@@ -246,8 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let connector_arn = input.connector_arn.clone();
         let connector = store
-            .connectors
-            .get(&connector_arn)
+            .connector(&region, &connector_arn)
             .ok_or_else(|| not_found(&connector_arn))?;
 
         // "For general-purpose connectors" (this operation's own doc): with an Intune
@@ -314,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The response is built from the record BEFORE it is handed to the store, so this
         // answer is exactly what a later GetChallengePassword reads.
         let challenge = record.to_challenge();
-        let Some(connector) = store.connectors.get_mut(&connector_arn) else {
+        let Some(connector) = store.connector_mut(&region, &connector_arn) else {
             // Unreachable: the connector was read under this same lock a few lines above,
             // and nothing can take the lock in between.
             return Err(store_unavailable());
@@ -323,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token {
             store.challenge_tokens.insert(
-                token,
+                crate::state::token_key(&region, &token),
                 crate::state::IdempotencyRecord {
                     arn,
                     created_at: now,
@@ -338,8 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`, which is
-/// also what a well-formed ARN that was never created answers.
+/// No connector is stored under this ARN in the Region the request was signed for — HTTP 404
+/// `ResourceNotFoundException`, which is also what a well-formed ARN that was never created
+/// answers.
 fn not_found(connector_arn: &str) -> CreateChallengeError {
     CreateChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Connector {connector_arn} could not be found"),

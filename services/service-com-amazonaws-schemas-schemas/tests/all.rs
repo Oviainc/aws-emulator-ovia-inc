@@ -39,6 +39,8 @@ mod error_body_codes;
 mod iso8601_timestamps;
 #[path = "all/json_refusal_diagnostics.rs"]
 mod json_refusal_diagnostics;
+#[path = "all/list_discoverers.rs"]
+mod list_discoverers;
 #[path = "all/malformed_content_and_policy_deletion.rs"]
 mod malformed_content_and_policy_deletion;
 #[path = "all/published_document_bytes.rs"]

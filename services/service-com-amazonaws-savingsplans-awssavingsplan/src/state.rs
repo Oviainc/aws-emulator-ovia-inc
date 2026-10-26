@@ -608,6 +608,21 @@ pub fn savings_plan_id_from_arn(arn: &str) -> Option<&str> {
     resource.strip_prefix("savingsplan/")
 }
 
+/// The Savings Plan id the `resourceArn` of a tagging operation names, or the
+/// message with which this service refuses an ARN that is not one of ours.
+///
+/// The model's `@pattern` already refused anything that is not ARN-shaped
+/// before the handler ran; what is left to refuse is a well-formed ARN of some
+/// other service or resource type. That refusal is one rule with one message,
+/// so — like [`resource_not_found_message`] beside it — it lives in ONE place,
+/// shared by every operation that takes a `resourceArn`; each handler only
+/// wraps the message in its own `ValidationException` variant.
+pub fn savings_plan_id_or_refusal(resource_arn: &str) -> Result<&str, String> {
+    savings_plan_id_from_arn(resource_arn).ok_or_else(|| {
+        format!("resourceArn '{resource_arn}' is not the ARN of a {SERVICE_NAMESPACE} savingsplan resource")
+    })
+}
+
 /// How this service states that the resource an operation was pointed at does
 /// not exist.
 ///

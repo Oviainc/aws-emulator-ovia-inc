@@ -33,9 +33,12 @@ Call GetGroup and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
 
 ## Status update
-`GetGroup` has since been implemented and its scaffold marker removed, as the reader the
-`DeleteGroup` fix (`20261025T102129Z-iam-deletegroup-stub.md`) proves a release through:
-the handler reports the stored `Group` and its member list, or `NoSuchEntity` for a name
-the account does not hold. The two units named above were NOT replayed by that fix, so
-this report stays open until its own fixer confirms them; the member list stays empty
-while `AddUserToGroup` persists no membership, which is that operation's own issue.
+`GetGroup` is implemented and its scaffold marker removed. The handler reports the stored
+`Group` beside the users the account records as its members, paged by `MaxItems` with an
+opaque `Marker` that resumes strictly after the last member reported, or `NoSuchEntity`
+for a name the account holds no group under. The membership it reads is persisted state
+(`state::group_members`); it is empty until `AddUserToGroup` records a membership, which
+is that operation's own issue. Replaying the two units named above, the
+`iam|GetGroup|NotImplemented` key is fixed: both now get past their `GetGroup` call and
+fail later, on the `UpdateGroup` and `ListOpenIDConnectProviders` scaffolds, each of which
+has its own issue.

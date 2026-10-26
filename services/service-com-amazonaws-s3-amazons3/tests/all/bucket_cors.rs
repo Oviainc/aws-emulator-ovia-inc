@@ -43,12 +43,17 @@ use super::bucket_website::{content, reported};
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The whole `CORSConfiguration` document for the rules `inner` spells.
-fn payload(inner: &str) -> String {
+///
+/// `pub(crate)`, like [`put_cors`], [`get_cors`], [`simple_rule`] and [`round_trip_rows`]
+/// below it: the cors-delete suite
+/// ([`super::bucket_cors_delete`]) drives the same subresource through these helpers rather
+/// than spelling a second copy of the document and the two requests.
+pub(crate) fn payload(inner: &str) -> String {
     format!("<CORSConfiguration xmlns=\"{XMLNS}\">{inner}</CORSConfiguration>")
 }
 
 /// `PUT /<bucket>?cors` — `PutBucketCors`.
-async fn put_cors(router: &MultiServiceRouter, bucket: &str, inner: &str) -> Answer {
+pub(crate) async fn put_cors(router: &MultiServiceRouter, bucket: &str, inner: &str) -> Answer {
     send(
         router,
         "PUT",
@@ -60,7 +65,7 @@ async fn put_cors(router: &MultiServiceRouter, bucket: &str, inner: &str) -> Ans
 }
 
 /// `GET /<bucket>?cors` — `GetBucketCors`.
-async fn get_cors(router: &MultiServiceRouter, bucket: &str) -> Answer {
+pub(crate) async fn get_cors(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?cors"), &[], "").await
 }
 
@@ -82,7 +87,7 @@ fn entries(name: &str, values: &[&str]) -> String {
 }
 
 /// The simplest rule that satisfies the two required members: one method and one origin.
-fn simple_rule(method: &str, origin: &str) -> String {
+pub(crate) fn simple_rule(method: &str, origin: &str) -> String {
     rule(&format!(
         "{}{}",
         entries("AllowedMethod", &[method]),
@@ -105,7 +110,7 @@ fn replacement() -> String {
 /// published bound of the rule-identifier length), how MANY rules the configuration carries
 /// (one, several and the documented ceiling), how many entries a list carries, the ORDER the
 /// rules arrive in, and the order the members themselves are spelled in.
-fn round_trip_rows() -> Vec<(String, String)> {
+pub(crate) fn round_trip_rows() -> Vec<(String, String)> {
     let any_origin = entries("AllowedOrigin", &["*"]);
     let get = entries("AllowedMethod", &["GET"]);
 

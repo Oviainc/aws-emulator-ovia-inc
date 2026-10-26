@@ -31,6 +31,8 @@ mod billing_group_billing_periods;
 mod billing_group_core_loop;
 #[path = "all/billing_group_cost_report.rs"]
 mod billing_group_cost_report;
+#[path = "all/billing_transfer_identity.rs"]
+mod billing_transfer_identity;
 #[path = "all/billing_transfer_preference.rs"]
 mod billing_transfer_preference;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]

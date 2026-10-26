@@ -73,3 +73,5 @@ mod sns_action_topic_policy;
 mod start_metric_streams;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_metric_streams.rs"]
+mod stop_metric_streams;

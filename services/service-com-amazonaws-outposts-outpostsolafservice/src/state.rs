@@ -870,6 +870,24 @@ pub struct UnfinishedWork {
     pub work: String,
 }
 
+/// What holds a change to one of a site's two addresses up, if anything.
+///
+/// Produced by
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::site_address_block`] so the
+/// refusal's `ResourceId` / `ResourceType` members and its message are read off one
+/// value, the way [`UnfinishedWork`] does for a delete.
+#[derive(Debug, Clone)]
+pub struct SiteAddressBlock {
+    /// The resource the change waits on, as the refusal names it: its modelled
+    /// `ResourceType` ([`RESOURCE_TYPE_ORDER`] or [`RESOURCE_TYPE_OUTPOST`]) and its
+    /// own id, together because one without the other names nothing. Absent when
+    /// the blocking resource carries no id this store can name it by.
+    pub resource: Option<(&'static str, String)>,
+    /// The sentence the refusal states, naming what the caller has to let finish,
+    /// cancel or deactivate first.
+    pub message: String,
+}
+
 /// A stored resource that belongs to ONE region: the region of the endpoint it was
 /// created through, which is the only region it is reachable through.
 ///
@@ -969,6 +987,17 @@ pub struct OrderRecord {
     pub region: String,
     /// The order as `CreateOrder` / `GetOrder` return it.
     pub order: Order,
+    /// The site the Outpost this order was placed on belongs to, as the Outpost
+    /// named it when the order was submitted.
+    ///
+    /// An order is placed AT a site through an Outpost of it, and what AWS holds a
+    /// site address change for is an order in progress at that site
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::outstanding_order_at_site`]),
+    /// so the site travels on the order rather than being re-derived from an Outpost
+    /// record that may no longer be there. `Order` carries no site member of its own,
+    /// so this is the only place it is kept; it is absent only for an order whose
+    /// Outpost named no site.
+    pub site_id: Option<String>,
     /// When this order's [`ORDER_STATUS_PREPARING`] -> [`ORDER_STATUS_IN_PROGRESS`]
     /// transition falls due, or `None` once it has been materialised. Stored as an
     /// instant for the reason [`OutpostRecord::active_at`] is: nothing ever sleeps
@@ -2993,6 +3022,23 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         })
     }
 
+    /// The order of `region` still OUTSTANDING at `site_id`, if this store holds
+    /// one.
+    ///
+    /// An order is placed at a site through an Outpost of that site
+    /// ([`OrderRecord::site_id`]) and is outstanding until it is finished
+    /// ([`OrderRecord::is_outstanding`]), so this is what the service still owes the
+    /// SITE: the fact a change to either of that site's addresses is held for (see
+    /// [`Self::site_address_block`]). Stated beside
+    /// [`Self::outstanding_order_on_outpost`], which is the same question asked of
+    /// the other resource an order belongs to. Scoped to `region` for the reason
+    /// [`RegionalRecord`] gives; callers settle first (see [`Self::settle_orders`]),
+    /// so the statuses read here are the ones the orders hold at that instant.
+    pub fn outstanding_order_at_site(&self, region: &str, site_id: &str) -> Option<&OrderRecord> {
+        all_in_region(&self.orders, region)
+            .find(|record| record.site_id.as_deref() == Some(site_id) && record.is_outstanding())
+    }
+
     /// The quote of `outpost_id` an order WAS submitted from, if this region's
     /// inventory holds one: its SECOND record of an order outstanding on that
     /// Outpost.
@@ -3131,6 +3177,63 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     pub fn outpost_at_site(&self, region: &str, site_id: &str) -> Option<&OutpostRecord> {
         self.outposts_in(region)
             .find(|record| record.outpost.site_id.as_deref() == Some(site_id))
+    }
+
+    /// What holds a change to the `kind` address of `site_id` in `region` up, if
+    /// anything — the fact `UpdateSiteAddress` answers its modelled
+    /// `ConflictException` on.
+    ///
+    /// AWS documents TWO limits on when a site address may change, and this states
+    /// both, in the order a caller meets them:
+    ///
+    /// * "You can't update a site address if there is an order in progress. You must
+    ///   wait for the order to complete or cancel the order." — on an address of
+    ///   EITHER kind, while an order placed at the site is still outstanding
+    ///   ([`Self::outstanding_order_at_site`]). It is the narrower limit of the two
+    ///   and the one with something for the caller to do, so it is reported first
+    ///   where both hold.
+    /// * "You can update the operating address before you place an order at the
+    ///   site, or after all Outposts that belong to the site have been deactivated."
+    ///   — on the OPERATING address only, while an Outpost still belongs to the site
+    ///   ([`Self::outpost_at_site`]). The operating address is where the site itself
+    ///   is, so hardware at it depends on it; the shipping address is where that
+    ///   hardware ships to and no Outpost at the site holds it up.
+    ///
+    /// Callers settle first (see [`Self::settle_orders`]), so the order statuses read
+    /// here are the ones the orders hold at that instant.
+    pub fn site_address_block(
+        &self,
+        region: &str,
+        site_id: &str,
+        kind: SiteAddressKind,
+    ) -> Option<SiteAddressBlock> {
+        if let Some(order) = self.outstanding_order_at_site(region, site_id) {
+            // The order itself is a resource the modelled `ResourceType` names, so
+            // the conflict an order causes names the order. An order record the
+            // store holds is keyed by the id it reports, so the fallback is for a
+            // record that names no order at all: the refusal still states the limit,
+            // naming no resource rather than one it cannot identify.
+            return Some(match order.order.order_id.as_deref() {
+                Some(order_id) => SiteAddressBlock {
+                    resource: Some((RESOURCE_TYPE_ORDER, order_id.to_string())),
+                    message: site_address_order_conflict(site_id, &format!("order {order_id}")),
+                },
+                None => SiteAddressBlock {
+                    resource: None,
+                    message: site_address_order_conflict(site_id, "an order placed at it"),
+                },
+            });
+        }
+        if kind != SiteAddressKind::Operating {
+            return None;
+        }
+        let outpost_id = self
+            .outpost_at_site(region, site_id)
+            .and_then(|record| record.outpost.outpost_id.clone())?;
+        Some(SiteAddressBlock {
+            message: site_address_conflict(site_id, &outpost_id),
+            resource: Some((RESOURCE_TYPE_OUTPOST, outpost_id)),
+        })
     }
 
     /// Every `BlockingResourceType` this store observes still associated with
@@ -4180,6 +4283,21 @@ pub fn site_address_conflict(site_id: &str, outpost_id: &str) -> String {
         "the operating address of site {site_id} cannot be updated while Outpost \
          {outpost_id} belongs to it"
     )
+}
+
+/// How this service states that a site's address — of EITHER type — cannot be
+/// changed while an order placed at that site is still in progress.
+///
+/// AWS documents the rule — "You can't update a site address if there is an order
+/// in progress. You must wait for the order to complete or cancel the order."
+/// (`UpdateSiteAddress`) — but publishes no wording for the refusal, so the
+/// sentence is the emulator's own, worded by the same rule as
+/// [`site_address_conflict`]: what a caller branches on is the `ConflictException`
+/// code (HTTP 409) and the `ResourceId` / `ResourceType` members naming the order,
+/// while the message names the order ([`SiteAddressBlock::message`]) it has to wait
+/// for or cancel.
+pub fn site_address_order_conflict(site_id: &str, order: &str) -> String {
+    format!("the address of site {site_id} cannot be updated while {order} is in progress")
 }
 
 /// How this service states that a site cannot be deleted while an Outpost still
