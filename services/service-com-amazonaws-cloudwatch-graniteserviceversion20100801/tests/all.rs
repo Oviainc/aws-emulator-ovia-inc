@@ -49,6 +49,8 @@ mod ec2_alarm_actions;
 mod forced_state_actions;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/insight_rule_state.rs"]
+mod insight_rule_state;
 #[path = "all/insight_rules.rs"]
 mod insight_rules;
 #[path = "all/list_metric_streams.rs"]

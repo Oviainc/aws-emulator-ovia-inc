@@ -52,8 +52,8 @@ use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, AnomalyDetector, CompositeAlarm, Dimension,
     EvaluationCriteria, EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm,
     MetricAlarm, MetricDataQuery, MetricMathAnomalyDetector, OTelEnrichmentMetricSelector,
-    ResourceNotFoundException, ScheduledQueryConfiguration, SingleMetricAnomalyDetector, Tag,
-    WarmUpConfiguration,
+    PartialFailure, ResourceNotFoundException, ScheduledQueryConfiguration,
+    SingleMetricAnomalyDetector, Tag, WarmUpConfiguration,
 };
 
 /// The action notifications an alarm state transition owes, and how they are delivered to
@@ -1796,6 +1796,29 @@ pub const INSIGHT_RULE_ENABLED: &str = "ENABLED";
 /// (`PutInsightRuleInput$RuleState`).
 pub const INSIGHT_RULE_DISABLED: &str = "DISABLED";
 
+/// The `ExceptionType` a batch Contributor Insights rule operation reports a name it could
+/// not act on under: "The type of error." (`PartialFailure$ExceptionType`) — the parameter
+/// fault every one of those operations models for a value it cannot use, reported per entry
+/// rather than as a refusal of the whole request.
+const INSIGHT_RULE_FAILURE_EXCEPTION: &str = "InvalidParameterValueException";
+
+/// The `FailureCode` beside it: "The code of the error." (`PartialFailure$FailureCode`) — the
+/// query error code that same parameter fault carries on the wire.
+const INSIGHT_RULE_FAILURE_CODE: &str = "InvalidParameterValue";
+
+/// How a batch Contributor Insights rule operation states that one of the names it was given
+/// is not a rule this store holds.
+fn unknown_insight_rule(rule_name: &str) -> String {
+    format!("Rule {rule_name} does not exist")
+}
+
+/// How CloudWatch states that a request named no Contributor Insights rule at all.
+///
+/// "An array of the rule names to disable." (`DisableInsightRulesInput$RuleNames`, required) —
+/// a request carrying no entry for the list names nothing to act on, which is the required
+/// parameter missing. Shared so the operations taking a `RuleNames` cannot word it two ways.
+pub const MISSING_RULE_NAMES: &str = "The parameter RuleNames is required.";
+
 /// The `Schema` a managed Contributor Insights rule carries: "For managed rules, this is
 /// `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a rule
 /// `PutManagedInsightRules` enabled, which is why `PutInsightRule` refuses a definition
@@ -2561,6 +2584,39 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .then_with(|| left_name.cmp(right_name))
         });
         rules
+    }
+
+    /// Move every Contributor Insights rule `rule_names` names to `rule_state`, reporting back
+    /// one entry per name this store holds no rule for.
+    ///
+    /// "An array listing the rules that could not be disabled."
+    /// (`DisableInsightRulesOutput$Failures`) — a name no rule answers to is reported as an
+    /// entry of that array and the rest of the request still takes effect, rather than the
+    /// whole call failing. "This array is empty if the API operation was successful for all
+    /// the rules specified in the request." (`PartialFailure`)
+    ///
+    /// The state a rule moves to is the only thing that differs between the operations that
+    /// enable and disable rules, so the walk lives here and neither can drift from the other.
+    /// Naming a rule that already holds the state asks for no change and is not a failure: the
+    /// operations say what a rule's state BECOMES.
+    pub fn set_insight_rule_state(
+        &mut self,
+        rule_names: &[String],
+        rule_state: &str,
+    ) -> Vec<PartialFailure> {
+        let mut failures: Vec<PartialFailure> = Vec::new();
+        for rule_name in rule_names {
+            match self.insight_rules.get_mut(rule_name) {
+                Some(stored) => stored.rule.state = rule_state.to_string(),
+                None => failures.push(PartialFailure {
+                    failure_resource: Some(rule_name.clone()),
+                    exception_type: Some(INSIGHT_RULE_FAILURE_EXCEPTION.to_string()),
+                    failure_code: Some(INSIGHT_RULE_FAILURE_CODE.to_string()),
+                    failure_description: Some(unknown_insight_rule(rule_name)),
+                }),
+            }
+        }
+        failures
     }
 
     /// Materialise the anomaly-detector training the clock has already made due.
