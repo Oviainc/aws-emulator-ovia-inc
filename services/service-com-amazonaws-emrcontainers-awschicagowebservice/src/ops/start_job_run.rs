@@ -1,14 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobRun
-//! Mints a job run on a virtual cluster and persists everything the request submitted,
-//! so `DescribeJobRun` and `ListJobRuns` read it back rather than recomputing it. The
+//! Mints a job run on a virtual cluster and persists everything the submission resolved
+//! to, so `DescribeJobRun` and `ListJobRuns` read it back rather than recomputing it. The
 //! run starts `PENDING` and the clock owes it `RUNNING`
 //! ([`crate::state::TRANSITION_SPAN`]) — but only once the cluster has a free running
 //! slot, when it configures a `schedulerConfiguration.maxConcurrentJobRuns`. A
 //! submission into a queue that is already `maxInQueueJobRuns` deep is refused, and so is
 //! one that names no job template and does not itself carry the `executionRoleArn`,
 //! `releaseLabel` and `jobDriver` a run cannot exist without.
+//!
+//! A submission that names a `jobTemplateId` is built from the stored template instead:
+//! `JobTemplateData` is "the values of StartJobRun API requests used in job runs started
+//! using the job template", so the template's `executionRoleArn`, `releaseLabel`,
+//! `jobDriver` and `configurationOverrides` are what the run gets and its `jobTags` are
+//! applied to it — a template exists to supply those values and to ENFORCE them, so where
+//! the request carries one of them too, the template's is the one the run runs with.
+//! Every `${name}` the template's values reference is substituted with the value
+//! `jobTemplateParameters` supplies for that parameter, falling back to the
+//! `defaultValue` the template's `parameterConfiguration` declares for it; a reference
+//! nothing resolves, a parameter the template does not declare, a value that is not of
+//! the declared type, and a substituted value the run's own member cannot hold are each
+//! refused with the modelled `ValidationException`.
+//!
+//! The grammar the model declares for a reference offers no escape, so a template value
+//! that wants a literal `${name}` in the run cannot be written: every occurrence is a
+//! reference, and one nothing resolves is a refusal.
+//!
+//! The template winning a value the request carries too is the reading of "enforcing
+//! certain values in StartJobRun API request" taken here; no recorded call settles it,
+//! and the alternative reading is that AWS refuses such a submission outright rather
+//! than overriding it.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +117,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -197,67 +221,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A job template is resolved out of state, never assumed. Resolved BEFORE the
-        // idempotency replay, so which requests this operation refuses does not depend
-        // on whether one of them was retried.
-        if let Some(template_id) = input.job_template_id.as_deref() {
-            if state.job_template(&region, template_id).is_none() {
-                return Err(StartJobRunErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Job Template {template_id} doesn't exist.")),
-                    },
+        // A job template is resolved out of state, never assumed, and APPLIED: the
+        // template holds the `StartJobRun` values the run is built from. Resolved and
+        // applied BEFORE the idempotency replay, so which requests this operation refuses
+        // does not depend on whether one of them was retried.
+        let templated = match input.job_template_id.as_deref() {
+            Some(template_id) => {
+                let Some(template) = state.job_template(&region, template_id) else {
+                    return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("Job Template {template_id} doesn't exist.")),
+                        },
+                    )
+                    .into());
+                };
+                // Cloned out of the store: the template is a stored resource this
+                // submission only READS, and the run is built from the clone so applying
+                // it can never alter what a later caller reads back from the template.
+                let data = template.job_template_data.clone();
+                Some(
+                    apply_job_template(
+                        template_id,
+                        &data,
+                        input.job_template_parameters.as_ref(),
+                    )
+                    .map_err(|message| {
+                        StartJobRunErrorModeled::ValidationException(ValidationException {
+                            message: Some(message),
+                        })
+                    })?,
                 )
+            }
+            None => {
+                // `jobTemplateParameters` only has meaning as the parameters OF a job
+                // template, so parameters without one are refused rather than quietly
+                // dropped: there is nothing for them to be substituted into.
+                if input.job_template_parameters.is_some() {
+                    return Err(StartJobRunErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "jobTemplateParameters requires jobTemplateId to be specified"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                None
+            }
+        };
+
+        // A run has to carry the values `JobTemplateData` — the shape the model documents
+        // as "the values of StartJobRun API requests used in job runs started using the
+        // job template" — marks @required: `executionRoleArn`, `releaseLabel` and
+        // `jobDriver`. They are optional on the request shape only because a template can
+        // supply them, so the submission that names NO template must carry all three
+        // itself; one missing any of them is refused and nothing is stored, rather than
+        // becoming a run with no driver to run.
+        if templated.is_none() {
+            let missing: Vec<&str> = [
+                ("executionRoleArn", input.execution_role_arn.is_none()),
+                ("releaseLabel", input.release_label.is_none()),
+                ("jobDriver", input.job_driver.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(member, absent)| absent.then_some(member))
+            .collect();
+            if !missing.is_empty() {
+                return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "StartJobRun requires executionRoleArn, releaseLabel and jobDriver when no jobTemplateId is specified; missing: {}",
+                        missing.join(", ")
+                    )),
+                })
                 .into());
             }
-            // The template exists, but APPLYING it — building the run from the template's
-            // `jobTemplateData`, substituting the `parameterConfiguration` placeholders
-            // it declares and enforcing the values it fixes — is not implemented in this
-            // slice. A run built from the request alone would silently ignore the values
-            // the template exists to enforce, so the submission is refused with the
-            // modelled error rather than answered with a run the template did not shape.
-            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "job template {template_id} cannot be applied to a job run by this emulator yet"
-                )),
-            })
-            .into());
-        }
-        // `jobTemplateParameters` only has meaning as the parameters OF a job template,
-        // so parameters without one are refused rather than quietly dropped.
-        if input.job_template_parameters.is_some() {
-            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "jobTemplateParameters requires jobTemplateId to be specified".to_string(),
-                ),
-            })
-            .into());
         }
 
-        // Reached only when the request names NO job template (the branch above returns
-        // for every request that does): a run then has nothing but this request to be
-        // built from, so the request must carry every value running one needs.
-        // `JobTemplateData` — the shape the model documents as "the values of StartJobRun
-        // API requests used in job runs started using the job template" — marks
-        // `executionRoleArn`, `releaseLabel` and `jobDriver` @required, so no job run can
-        // exist without all three; they are optional on the request shape only because a
-        // template can supply them. A submission missing any of them is refused and
-        // nothing is stored, rather than becoming a run with no driver to run.
-        let missing: Vec<&str> = [
-            ("executionRoleArn", input.execution_role_arn.is_none()),
-            ("releaseLabel", input.release_label.is_none()),
-            ("jobDriver", input.job_driver.is_none()),
-        ]
-        .into_iter()
-        .filter_map(|(member, absent)| absent.then_some(member))
-        .collect();
-        if !missing.is_empty() {
-            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "StartJobRun requires executionRoleArn, releaseLabel and jobDriver when no jobTemplateId is specified; missing: {}",
-                    missing.join(", ")
-                )),
-            })
-            .into());
+        // What the run runs with: the template's values where a template was named, the
+        // request's where it was not. `configurationOverrides` is optional on the
+        // template too, so a template that overrides nothing leaves the request's
+        // overrides in place; `jobTags` are applied ON TOP of the request's tags, the
+        // template's winning a key both set, because a template exists to enforce the
+        // values it stores. Resolved HERE, before anything in the store is touched, so a
+        // submission this cannot build a run from leaves the store exactly as it was.
+        let templated_run = templated.is_some();
+        let mut tags = input.tags.clone().unwrap_or_default();
+        let (execution_role_arn, release_label, job_driver, configuration_overrides) =
+            match templated {
+                Some(templated) => {
+                    tags.extend(templated.job_tags);
+                    (
+                        Some(templated.execution_role_arn),
+                        Some(templated.release_label),
+                        Some(templated.job_driver),
+                        templated
+                            .configuration_overrides
+                            .or(input.configuration_overrides),
+                    )
+                }
+                None => (
+                    input.execution_role_arn,
+                    input.release_label,
+                    input.job_driver,
+                    input.configuration_overrides,
+                ),
+            };
+        // The values the run would carry, in the shape of the request that could have
+        // carried them directly. A submission that named a template was validated at the
+        // boundary as the request SENT it, which says nothing about what the template
+        // resolved to: a parameter value is up to 1024 characters and may stand anywhere
+        // in a stored value, and the template's `jobTags` are merged into tags already at
+        // their own maximum. So the resolved values are put through the SAME constraint
+        // walk the boundary runs — the model's `@length`, `@pattern`, enum and map bounds,
+        // read from this operation's generated schema rather than restated here — and a
+        // run AWS would have refused is refused with the message its own validation gives.
+        let candidate = StartJobRunInput {
+            name: input.name.clone(),
+            virtual_cluster_id: input.virtual_cluster_id.clone(),
+            client_token: input.client_token.clone(),
+            execution_role_arn,
+            release_label,
+            job_driver,
+            configuration_overrides,
+            tags: Some(tags),
+            job_template_id: input.job_template_id.clone(),
+            // The parameters themselves are the request's and were validated with it;
+            // what is judged here is what they resolved to.
+            job_template_parameters: None,
+            retry_policy_configuration: input.retry_policy_configuration,
+        };
+        if templated_run {
+            if let Some(message) = ::aws_smithy_schema_server::constraints::validate_to_message(
+                &candidate,
+                super::types::START_JOB_RUN_INPUT_SCHEMA,
+            ) {
+                return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into());
+            }
         }
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the job
@@ -322,15 +425,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no free slot waits in PENDING past its due instant (`state::settle`).
             state: crate::state::JOB_PENDING.to_string(),
             client_token: input.client_token.clone(),
-            execution_role_arn: input.execution_role_arn,
-            release_label: input.release_label,
-            job_driver: input.job_driver,
-            configuration_overrides: input.configuration_overrides,
-            retry_policy_configuration: input.retry_policy_configuration,
+            execution_role_arn: candidate.execution_role_arn,
+            release_label: candidate.release_label,
+            job_driver: candidate.job_driver,
+            configuration_overrides: candidate.configuration_overrides,
+            retry_policy_configuration: candidate.retry_policy_configuration,
             created_at_millis: crate::state::now_millis(),
             finished_at_millis: None,
             state_details: None,
-            tags: input.tags.unwrap_or_default(),
+            tags: candidate.tags.unwrap_or_default(),
             sequence,
             // The principal this request authenticated as, recorded now so every later
             // read of the run attributes it to the identity that submitted it.
@@ -348,4 +451,424 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             virtual_cluster_id: Some(input.virtual_cluster_id),
         })
     }
+}
+
+/// The `TemplateParameterDataType` a numeric parameter declares, one of the values of the
+/// generated `TEMPLATE_PARAMETER_DATA_TYPE_VALUES` catalog in `ops::types::shared_types`.
+const PARAMETER_TYPE_NUMBER: &str = "NUMBER";
+
+/// How much substituted parameter value one application of a job template may render.
+///
+/// The emulator's own bound, not an AWS quota: the request chooses both factors of the
+/// product it renders — the references the template carries, and the up-to-1024-character
+/// value `TemplateParameterInputMap` admits for each of them (smithy_query: shape
+/// `TemplateParameterInputMap`) — so without a budget one submission could expand a
+/// stored template many times over. The largest single value the model admits anywhere in
+/// a template is 102,400 characters (`SparkSubmitParameters`, `SparkSqlParameters`), so
+/// this leaves a whole template's worth of substitution and still caps what one call
+/// allocates.
+pub const MAX_SUBSTITUTED_CHARACTERS: usize = 1_048_576;
+
+/// How deep a `ConfigurationList` the substitution walk descends. The emulator's own
+/// bound, above anything a stored template can reach: a body nesting deeper than the
+/// request codec's own guard is never read in, so this only keeps the walk's depth a
+/// property of this module.
+pub const MAX_CONFIGURATION_NESTING: usize = 128;
+
+/// What a job template, with its parameters resolved, contributes to a job run: the
+/// `StartJobRun` values it stores.
+struct TemplatedJobRun {
+    execution_role_arn: String,
+    release_label: String,
+    job_driver: JobDriver,
+    configuration_overrides: Option<ConfigurationOverrides>,
+    job_tags: HashMap<String, String>,
+}
+
+/// The parameter values a submission resolved, the references it found no value for, and
+/// the limit the walk hit, if any.
+///
+/// Substituting is a walk of the whole stored `jobTemplateData`, so the unresolved names
+/// are COLLECTED rather than reported one at a time: a caller is told about every
+/// parameter it still has to supply, not just the first one the walk happened to reach.
+/// What the walk renders is NOT checked here — the values it produces are put through the
+/// operation's own constraint walk once they are assembled (see the handler), so the
+/// model's lengths and patterns are read from the schema rather than restated.
+///
+/// The walk is BOUNDED, because what it renders is a product whose factors a caller
+/// chooses both of: how many references the template carries, times how long a value the
+/// request gives each of them. [`Self::remaining`] is the characters of parameter value
+/// one application may still write, spent before each replacement is produced, so this
+/// allocates the stored template plus at most that budget — and a template that wants
+/// more is refused instead of rendered.
+struct Substitution {
+    values: HashMap<String, String>,
+    unresolved: BTreeSet<String>,
+    remaining: usize,
+    exceeded: Option<Exceeded>,
+}
+
+/// A limit the substitution walk hit, which makes the whole application a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exceeded {
+    /// More substituted parameter value than one run may be built from
+    /// ([`MAX_SUBSTITUTED_CHARACTERS`]).
+    SubstitutedCharacters,
+    /// A `ConfigurationList` nested deeper than the walk descends
+    /// ([`MAX_CONFIGURATION_NESTING`]).
+    ConfigurationNesting,
+}
+
+/// The parameter name a reference opens with, and the text past its closing brace.
+///
+/// `opened` is what follows a `${`. The grammar is the model's: a `${name}` whose `name`
+/// matches `[a-zA-Z]\w*` (the alternative `ParametricReleaseLabel` admits beside a plain
+/// release label, and what a `TemplateParameter` admits inside a longer value). Anything
+/// else is not a reference, and `${` then stands for itself.
+fn reference_name(opened: &str) -> Option<(&str, &str)> {
+    let close = opened.find('}')?;
+    let (name, rest) = opened.split_at(close);
+    let mut characters = name.chars();
+    if !characters.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    if !characters.all(|character| character.is_ascii_alphanumeric() || character == '_') {
+        return None;
+    }
+    // Past the `}`, which is one byte.
+    Some((name, rest.get(1..).unwrap_or_default()))
+}
+
+impl Substitution {
+    /// `value` with every parameter reference in it replaced by that parameter's resolved
+    /// value. A reference nothing resolves is recorded in [`Self::unresolved`]; a
+    /// replacement the remaining budget cannot pay for is not written at all, and the
+    /// walk is marked [`Exceeded::SubstitutedCharacters`].
+    fn text(&mut self, value: &str) -> String {
+        let mut rendered = String::new();
+        let mut rest = value;
+        while let Some(opening) = rest.find("${") {
+            let (literal, opened) = rest.split_at(opening);
+            rendered.push_str(literal);
+            let opened = opened.get(2..).unwrap_or_default();
+            let Some((name, past_reference)) = reference_name(opened) else {
+                // Not a reference, so the `${` is text; scanning carries on after it.
+                rendered.push_str("${");
+                rest = opened;
+                continue;
+            };
+            rest = past_reference;
+            let Some(resolved) = self.values.get(name) else {
+                self.unresolved.insert(name.to_string());
+                continue;
+            };
+            // Spent in CHARACTERS, the unit the budget and every modelled `@length` are
+            // in.
+            let cost = resolved.chars().count();
+            if cost > self.remaining {
+                self.exceeded = Some(Exceeded::SubstitutedCharacters);
+                continue;
+            }
+            self.remaining -= cost;
+            rendered.push_str(resolved);
+        }
+        rendered.push_str(rest);
+        rendered
+    }
+
+    /// The same for a member the template may have left out.
+    fn optional(&mut self, value: Option<&String>) -> Option<String> {
+        value.map(|value| self.text(value))
+    }
+
+    /// A string map with every VALUE substituted: a parameter reference stands where a
+    /// value does, so a configuration property's key and a tag's key are left as stored.
+    fn string_map(&mut self, map: &HashMap<String, String>) -> HashMap<String, String> {
+        map.iter()
+            .map(|(key, value)| (key.clone(), self.text(value)))
+            .collect()
+    }
+
+    /// A `ConfigurationList`, each `Configuration` and each of its nested ones
+    /// substituted, to at most [`MAX_CONFIGURATION_NESTING`] levels: the bound is enforced
+    /// here rather than inherited from the codec that admitted the template, so how deep
+    /// this descends does not depend on another component's guard.
+    fn configurations(&mut self, list: &[Configuration], depth: usize) -> Vec<Configuration> {
+        if depth >= MAX_CONFIGURATION_NESTING {
+            self.exceeded = Some(Exceeded::ConfigurationNesting);
+            return Vec::new();
+        }
+        list.iter()
+            .map(|configuration| Configuration {
+                classification: self.text(&configuration.classification),
+                properties: configuration
+                    .properties
+                    .as_ref()
+                    .map(|properties| self.string_map(properties)),
+                configurations: configuration
+                    .configurations
+                    .as_deref()
+                    .map(|nested| self.configurations(nested, depth + 1)),
+            })
+            .collect()
+    }
+
+    /// A `JobDriver`, both of the drivers the model declares, substituted member by
+    /// member.
+    fn job_driver(&mut self, driver: &JobDriver) -> JobDriver {
+        JobDriver {
+            spark_submit_job_driver: driver.spark_submit_job_driver.as_ref().map(
+                |spark_submit| SparkSubmitJobDriver {
+                    entry_point: self.text(&spark_submit.entry_point),
+                    entry_point_arguments: spark_submit.entry_point_arguments.as_deref().map(
+                        |arguments| {
+                            arguments
+                                .iter()
+                                .map(|argument| self.text(argument))
+                                .collect()
+                        },
+                    ),
+                    spark_submit_parameters: self
+                        .optional(spark_submit.spark_submit_parameters.as_ref()),
+                },
+            ),
+            spark_sql_job_driver: driver
+                .spark_sql_job_driver
+                .as_ref()
+                .map(|spark_sql| SparkSqlJobDriver {
+                    entry_point: self.optional(spark_sql.entry_point.as_ref()),
+                    spark_sql_parameters: self.optional(spark_sql.spark_sql_parameters.as_ref()),
+                }),
+        }
+    }
+
+    /// A `ParametricConfigurationOverrides` with every value substituted. It stays in the
+    /// parametric shape here: turning it into the run's `ConfigurationOverrides` is
+    /// [`run_configuration_overrides`]'s job, because that is where the members the
+    /// parametric shapes leave optional and the run marks @required are resolved.
+    fn parametric_overrides(
+        &mut self,
+        overrides: &ParametricConfigurationOverrides,
+    ) -> ParametricConfigurationOverrides {
+        ParametricConfigurationOverrides {
+            application_configuration: overrides
+                .application_configuration
+                .as_deref()
+                .map(|list| self.configurations(list, 0)),
+            monitoring_configuration: overrides.monitoring_configuration.as_ref().map(
+                |monitoring| ParametricMonitoringConfiguration {
+                    persistent_app_ui: self.optional(monitoring.persistent_app_ui.as_ref()),
+                    cloud_watch_monitoring_configuration: monitoring
+                        .cloud_watch_monitoring_configuration
+                        .as_ref()
+                        .map(|cloud_watch| ParametricCloudWatchMonitoringConfiguration {
+                            log_group_name: self.optional(cloud_watch.log_group_name.as_ref()),
+                            log_stream_name_prefix: self
+                                .optional(cloud_watch.log_stream_name_prefix.as_ref()),
+                        }),
+                    s3_monitoring_configuration: monitoring
+                        .s3_monitoring_configuration
+                        .as_ref()
+                        .map(|s3| ParametricS3MonitoringConfiguration {
+                            log_uri: self.optional(s3.log_uri.as_ref()),
+                        }),
+                },
+            ),
+        }
+    }
+}
+
+/// The job run's `ConfigurationOverrides` from the template's substituted parametric one.
+///
+/// The parametric shapes exist to let a parameter reference stand where a run's own shape
+/// takes a fixed value, so they relax what the run's shapes REQUIRE:
+/// `cloudWatchMonitoringConfiguration.logGroupName` and `s3MonitoringConfiguration.logUri`
+/// are @required on the run's shapes but optional on the parametric ones, so a template
+/// that configures a monitoring destination without naming it cannot produce a run and the
+/// submission is refused. What the substituted values must LOOK like is not decided here:
+/// the assembled values go through the operation's own constraint walk.
+fn run_configuration_overrides(
+    template_id: &str,
+    rendered: ParametricConfigurationOverrides,
+) -> Result<ConfigurationOverrides, String> {
+    let monitoring_configuration = match rendered.monitoring_configuration {
+        None => None,
+        Some(monitoring) => {
+            let cloud_watch_monitoring_configuration =
+                match monitoring.cloud_watch_monitoring_configuration {
+                    None => None,
+                    Some(cloud_watch) => Some(CloudWatchMonitoringConfiguration {
+                        log_group_name: cloud_watch.log_group_name.ok_or_else(|| {
+                            missing_template_member(
+                                template_id,
+                                "monitoringConfiguration.cloudWatchMonitoringConfiguration.logGroupName",
+                            )
+                        })?,
+                        log_stream_name_prefix: cloud_watch.log_stream_name_prefix,
+                    }),
+                };
+            let s3_monitoring_configuration = match monitoring.s3_monitoring_configuration {
+                None => None,
+                Some(s3) => Some(S3MonitoringConfiguration {
+                    log_uri: s3.log_uri.ok_or_else(|| {
+                        missing_template_member(
+                            template_id,
+                            "monitoringConfiguration.s3MonitoringConfiguration.logUri",
+                        )
+                    })?,
+                    // The parametric shape carries no `encryptionKeyArn`, so a template
+                    // cannot store one and the run has none to report.
+                    encryption_key_arn: None,
+                }),
+            };
+            Some(MonitoringConfiguration {
+                // Neither member exists on the parametric shape a template stores, so a
+                // templated run reports neither.
+                managed_logs: None,
+                container_log_rotation_configuration: None,
+                persistent_app_ui: monitoring.persistent_app_ui,
+                cloud_watch_monitoring_configuration,
+                s3_monitoring_configuration,
+            })
+        }
+    };
+    Ok(ConfigurationOverrides {
+        application_configuration: rendered.application_configuration,
+        monitoring_configuration,
+    })
+}
+
+/// The refusal for a template that configures something a job run needs a value for and
+/// does not name it.
+fn missing_template_member(template_id: &str, member: &str) -> String {
+    format!(
+        "Job template {template_id} must specify configurationOverrides.{member} for a job run to be started from it."
+    )
+}
+
+/// Build the `StartJobRun` values a job run gets from the template it names.
+///
+/// `supplied` is the request's `jobTemplateParameters`. A parameter's value is the one
+/// this request supplied for it, falling back to the `defaultValue` the template declared
+/// it with; the resolved values are then substituted into every value the template stores.
+/// The refusals, each the modelled `ValidationException` at the caller:
+///
+/// * a supplied parameter the template declares nothing about — it would be silently
+///   dropped, and the run would not be the one the caller asked for;
+/// * a value that is not of the `TemplateParameterDataType` the parameter was declared
+///   with;
+/// * a reference this request supplies no value for and the template gives no default;
+/// * a template that renders more than [`MAX_SUBSTITUTED_CHARACTERS`] of parameter value,
+///   or nests a `ConfigurationList` deeper than [`MAX_CONFIGURATION_NESTING`];
+/// * a template that configures a monitoring destination the run's shape requires a name
+///   for and does not name it.
+///
+/// What the substituted values must look like is NOT decided here: the handler puts the
+/// values it assembles through this operation's own constraint walk.
+fn apply_job_template(
+    template_id: &str,
+    data: &JobTemplateData,
+    supplied: Option<&HashMap<String, String>>,
+) -> Result<TemplatedJobRun, String> {
+    let declared = data.parameter_configuration.clone().unwrap_or_default();
+
+    let undeclared: BTreeSet<&str> = supplied
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !declared.contains_key(*name))
+        .collect();
+    if !undeclared.is_empty() {
+        return Err(format!(
+            "Job template {template_id} declares no parameter named [{}].",
+            undeclared.into_iter().collect::<Vec<&str>>().join(", ")
+        ));
+    }
+
+    let mut values: HashMap<String, String> = HashMap::new();
+    // The declared parameters in name order, so a request that is wrong about more than
+    // one of them is refused about the same one however the maps happen to hash.
+    let in_name_order: BTreeMap<&String, &TemplateParameterConfiguration> =
+        declared.iter().collect();
+    for (name, configuration) in in_name_order {
+        let Some(value) = supplied
+            .and_then(|supplied| supplied.get(name))
+            .or(configuration.default_value.as_ref())
+        else {
+            // Nothing resolves this parameter. That is a refusal only if the template
+            // actually references it, which the walk below is what establishes.
+            continue;
+        };
+        // A NUMBER parameter takes a number: a value Rust's float parser accepts only as
+        // an infinity or a NaN (`inf`, `NaN`, an exponent that overflows) is not one.
+        if configuration.r#type.as_deref() == Some(PARAMETER_TYPE_NUMBER)
+            && !value.parse::<f64>().is_ok_and(f64::is_finite)
+        {
+            return Err(format!(
+                "Job template parameter {name} is declared as {PARAMETER_TYPE_NUMBER}, so {value} is not a valid value for it."
+            ));
+        }
+        values.insert(name.clone(), value.clone());
+    }
+
+    let mut substitution = Substitution {
+        values,
+        unresolved: BTreeSet::new(),
+        remaining: MAX_SUBSTITUTED_CHARACTERS,
+        exceeded: None,
+    };
+    let execution_role_arn = substitution.text(&data.execution_role_arn);
+    let release_label = substitution.text(&data.release_label);
+    let job_driver = substitution.job_driver(&data.job_driver);
+    let rendered_overrides = data
+        .configuration_overrides
+        .as_ref()
+        .map(|overrides| substitution.parametric_overrides(overrides));
+    let job_tags = data
+        .job_tags
+        .as_ref()
+        .map(|job_tags| substitution.string_map(job_tags))
+        .unwrap_or_default();
+
+    // A limit the walk hit comes first: past it the rendering is incomplete, so there is
+    // nothing about the values it produced worth reporting.
+    match substitution.exceeded {
+        Some(Exceeded::SubstitutedCharacters) => {
+            return Err(format!(
+                "Job template {template_id} substitutes more than {MAX_SUBSTITUTED_CHARACTERS} characters of parameter values into one job run."
+            ));
+        }
+        Some(Exceeded::ConfigurationNesting) => {
+            return Err(format!(
+                "Job template {template_id} nests configurationOverrides.applicationConfiguration more than {MAX_CONFIGURATION_NESTING} levels deep."
+            ));
+        }
+        None => {}
+    }
+
+    // Reported before anything rendered is judged: a value built around a reference
+    // nothing resolved is not a value to judge, it is a parameter the caller still owes.
+    if !substitution.unresolved.is_empty() {
+        return Err(format!(
+            "Job template {template_id} references parameter(s) [{}] that have no value: specify them in jobTemplateParameters or declare a defaultValue for them.",
+            substitution
+                .unresolved
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>()
+                .join(", ")
+        ));
+    }
+
+    let configuration_overrides = match rendered_overrides {
+        Some(rendered) => Some(run_configuration_overrides(template_id, rendered)?),
+        None => None,
+    };
+    Ok(TemplatedJobRun {
+        execution_role_arn,
+        release_label,
+        job_driver,
+        configuration_overrides,
+        job_tags,
+    })
 }

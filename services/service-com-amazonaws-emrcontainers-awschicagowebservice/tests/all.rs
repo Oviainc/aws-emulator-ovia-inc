@@ -39,6 +39,8 @@ mod security_configuration_delete;
 mod security_configuration_in_use;
 #[path = "all/security_configuration_list.rs"]
 mod security_configuration_list;
+#[path = "all/start_job_run_job_template.rs"]
+mod start_job_run_job_template;
 #[path = "all/start_job_run_required_members.rs"]
 mod start_job_run_required_members;
 #[path = "all/state_roundtrip.rs"]
