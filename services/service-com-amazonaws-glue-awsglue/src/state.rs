@@ -71,6 +71,15 @@
 //! which is what `CreateGlossary`'s modelled `AlreadyExistsException` refuses a second
 //! create under.
 //!
+//! RESOURCE POLICIES — the IAM policy documents `PutResourcePolicy` attaches to a Glue
+//! resource — sit beside the catalog tree in one per-account namespace keyed by the
+//! resource's ARN ([`ComAmazonawsGlueAwsglueState::resource_policies`]). The ARN is the
+//! key because every operation that addresses a policy addresses it by `ResourceArn`
+//! alone, with no `CatalogId` member, and a request that names none addresses the Data
+//! Catalog's own policy ("If not supplied, the Data Catalog resource policy is returned"
+//! — `GetResourcePolicyRequest$ResourceArn`), which is therefore keyed by the Data
+//! Catalog's own ARN ([`catalog_arn`]).
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -231,6 +240,28 @@ pub const MAX_ASSET_TYPES: usize = 1_000;
 /// rather than stored; `CreateGlossary` models no limit error, so the refusal is the
 /// closest client error it does model (`InvalidInputException`).
 pub const MAX_GLOSSARIES: usize = 1_000;
+
+/// Ceiling on the resource policies this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `PutResourcePolicy` writes a record any caller can reach, and each
+/// one carries a policy document, so the number of records one process will hold is
+/// bounded here. A write that would add one past the ceiling is refused rather than
+/// stored; `PutResourcePolicy` models no limit error, so the refusal is the closest
+/// client error it does model (`InvalidInputException`).
+pub const MAX_RESOURCE_POLICIES: usize = 1_000;
+
+/// The `ExistCondition` a `PutResourcePolicy` carries to require that a policy is already
+/// attached ("A value of MUST_EXIST is used to update a policy"). One of the modelled
+/// `ExistCondition` values, whose published list the generated
+/// [`crate::ops::types::EXIST_CONDITION_VALUES`] carries (`MUST_EXIST`, `NONE`,
+/// `NOT_EXIST`) and the request layer validates against.
+pub const EXIST_CONDITION_MUST_EXIST: &str = "MUST_EXIST";
+
+/// The `ExistCondition` that requires that NO policy is attached yet ("A value of
+/// NOT_EXIST is used to create a new policy"). See [`EXIST_CONDITION_MUST_EXIST`] for the
+/// published list; the remaining value (`NONE`) states no dependency on an existing
+/// policy at all, which is also what an absent member means ("If a value of NONE or a
+/// null value is used, the call does not depend on the existence of a policy").
+pub const EXIST_CONDITION_NOT_EXIST: &str = "NOT_EXIST";
 
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
 /// the moment `CreateCrawler` returns, and the only one this emulator stores until
@@ -539,6 +570,18 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// `ListColumnStatisticsTaskRuns` has one deterministic order to page over, and
     /// bounded by [`MAX_COLUMN_STATISTICS_TASK_RUNS`].
     pub column_statistics_task_runs: Vec<ColumnStatisticsTaskRunEntry>,
+    /// Every resource policy this emulator holds, keyed by the ARN of the resource it is
+    /// attached to, in ARN order.
+    ///
+    /// A policy lives BESIDE the catalog tree because every operation that addresses one
+    /// (`GetResourcePolicy`, `PutResourcePolicy`, `DeleteResourcePolicy`) addresses it by
+    /// `ResourceArn` alone, with no `CatalogId` member — so the namespace is per account
+    /// and the resource a policy governs is recorded in the key. A request that names no
+    /// `ResourceArn` addresses the Data Catalog's own policy, which is keyed by the Data
+    /// Catalog's ARN ([`catalog_arn`]), so the default and the catalog ARN spelled out
+    /// name ONE record. Ordered, so `GetResourcePolicies` has one deterministic order to
+    /// page over, and bounded by [`MAX_RESOURCE_POLICIES`].
+    pub resource_policies: BTreeMap<String, ResourcePolicyEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -776,6 +819,69 @@ impl ComAmazonawsGlueAwsglueState {
                     .unwrap_or_else(default_connection_password_encryption),
             ),
         }
+    }
+
+    /// The resource policy attached to `resource_arn`, or `None` when no policy is
+    /// attached to that resource.
+    ///
+    /// `resource_arn` is the ARN the request addressed, as
+    /// [`resolve_policy_resource_arn`] resolved it, so a request that named none and one
+    /// that spelled the Data Catalog's ARN out resolve to the same record.
+    pub fn resource_policy(&self, resource_arn: &str) -> Option<&ResourcePolicyEntry> {
+        self.resource_policies.get(resource_arn)
+    }
+
+    /// Whether the store can hold another resource policy, i.e. is below
+    /// [`MAX_RESOURCE_POLICIES`].
+    pub fn can_store_resource_policy(&self) -> bool {
+        self.resource_policies.len() < MAX_RESOURCE_POLICIES
+    }
+
+    /// Attach `policy_in_json` to `resource_arn`, and answer the `PolicyHash` of the
+    /// policy now attached.
+    ///
+    /// A resource that already carries a policy has that policy's DOCUMENT replaced \u2014 the
+    /// put carries the whole document, so nothing is merged \u2014 while the record keeps the
+    /// `CreateTime` of the policy that was first attached and takes `now` as its
+    /// `UpdateTime`. `None` means the store holds no policy for this resource and cannot
+    /// take another ([`MAX_RESOURCE_POLICIES`]), so the write must be refused rather than
+    /// served.
+    pub fn set_resource_policy(
+        &mut self,
+        resource_arn: &str,
+        policy_in_json: String,
+        now: SystemTime,
+    ) -> Option<String> {
+        if let Some(stored) = self.resource_policies.get_mut(resource_arn) {
+            stored.replace_document(policy_in_json, now);
+            return Some(stored.policy_hash.clone());
+        }
+        if !self.can_store_resource_policy() {
+            return None;
+        }
+        let attached = ResourcePolicyEntry::new(policy_in_json, now);
+        let policy_hash = attached.policy_hash.clone();
+        self.resource_policies
+            .insert(resource_arn.to_string(), attached);
+        Some(policy_hash)
+    }
+
+    /// Detach the policy of `resource_arn`, answering whether one was attached.
+    pub fn remove_resource_policy(&mut self, resource_arn: &str) -> bool {
+        self.resource_policies.remove(resource_arn).is_some()
+    }
+
+    /// The policies attached to INDIVIDUAL resources, in the order their ARNs sort in.
+    ///
+    /// Every stored policy except an account-level Data Catalog policy
+    /// ([`names_a_catalog`]), which is the set `GetResourcePolicies` enumerates: the
+    /// catalog's own policy is reported by `GetResourcePolicy`, which addresses it
+    /// directly, and is not one of the individual resources' policies that list reports.
+    pub fn individual_resource_policies(&self) -> Vec<(&String, &ResourcePolicyEntry)> {
+        self.resource_policies
+            .iter()
+            .filter(|(resource_arn, _)| !names_a_catalog(resource_arn))
+            .collect()
     }
 
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
@@ -1117,6 +1223,103 @@ impl Catalog {
     pub fn can_store_connection(&self) -> bool {
         self.connections.len() < MAX_CONNECTIONS_PER_CATALOG
     }
+}
+
+/// One resource policy: the policy document attached to a single Glue resource, and when
+/// it was attached and last written.
+///
+/// The record is what every read of that policy reports, so the `PolicyHash` a write
+/// answered and the one a later read reports are the same string.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicyEntry {
+    /// `PolicyInJson`: "the requested policy document, in JSON format", exactly as the
+    /// write carried it \u2014 a policy is reported as stored, never re-serialised.
+    pub policy_in_json: String,
+    /// `PolicyHash`: the hash of [`Self::policy_in_json`], from [`policy_hash`].
+    pub policy_hash: String,
+    /// `CreateTime`: "the date and time at which the policy was created" \u2014 the instant the
+    /// FIRST write attached a policy to this resource, kept across later writes.
+    pub create_time: SystemTime,
+    /// `UpdateTime`: "the date and time at which the policy was last updated".
+    pub update_time: SystemTime,
+}
+
+impl ResourcePolicyEntry {
+    /// A policy attached at `now`, whose create and update instants are therefore the
+    /// same.
+    pub fn new(policy_in_json: String, now: SystemTime) -> Self {
+        Self {
+            policy_hash: policy_hash(&policy_in_json),
+            policy_in_json,
+            create_time: now,
+            update_time: now,
+        }
+    }
+
+    /// Replace this record's document with the one a later write carried, at `now`.
+    ///
+    /// The document is replaced whole and the hash recomputed from it, while
+    /// [`Self::create_time`] stays where the first write put it: the policy is the same
+    /// attachment, rewritten.
+    pub fn replace_document(&mut self, policy_in_json: String, now: SystemTime) {
+        self.policy_hash = policy_hash(&policy_in_json);
+        self.policy_in_json = policy_in_json;
+        self.update_time = now;
+    }
+}
+
+/// The `PolicyHash` of a policy document: the SHA-256 of the document, lowercase
+/// hexadecimal.
+///
+/// Derived from the document's CONTENT, which is what the member is for: it is "the hash
+/// value returned when the previous policy was set using `PutResourcePolicy`", whose
+/// "purpose is to prevent concurrent modifications of a policy"
+/// (`PutResourcePolicyRequest$PolicyHashCondition`) \u2014 so the same document always hashes
+/// to the same value, and a document changed in any way hashes to a different one. Glue
+/// publishes no digest for it, so the algorithm is this emulator's; the 64 hexadecimal
+/// characters are inside `HashString`'s `length 1..255` and match its pattern.
+///
+/// This is not a per-run value and not a credential: it is computed from the request's
+/// own document, so two runs that attach the same policy report the same hash.
+pub fn policy_hash(policy_in_json: &str) -> String {
+    use ::sha2::Digest;
+
+    ::hex::encode(::sha2::Sha256::digest(policy_in_json.as_bytes()))
+}
+
+/// The resource whose policy a resource-policy request addresses: the `ResourceArn` it
+/// names, else this account's Data Catalog ("If not supplied, the Data Catalog resource
+/// policy is returned" \u2014 `GetResourcePolicyRequest$ResourceArn`).
+///
+/// `Err` carries the sentence for a `ResourceArn` this endpoint can hold no policy for \u2014
+/// one that is not a well-formed Glue ARN, or one naming another account's or another
+/// Region's estate, whose policies this process does not hold.
+///
+/// The ONE resolution all three resource-policy operations go through, so a policy
+/// written under one spelling of its resource is read back under the other.
+pub fn resolve_policy_resource_arn(
+    resource_arn: Option<&String>,
+    region: &str,
+) -> Result<String, String> {
+    let Some(named) = resource_arn.map(String::as_str).filter(|arn| !arn.is_empty()) else {
+        // The catalog of the account this endpoint serves, which is the one a request
+        // that names no catalog addresses ([`resolve_catalog_id`]).
+        return Ok(catalog_arn(region, &resolve_catalog_id(None)));
+    };
+    match parse_glue_arn(named) {
+        Some(parsed) if parsed.is_local(region) => Ok(named.to_string()),
+        _ => Err(messages::invalid_policy_resource_arn(named)),
+    }
+}
+
+/// Whether `resource_arn` names a Data Catalog ITSELF rather than a resource inside one:
+/// its resource portion is [`CATALOG_ARN_RESOURCE`] alone, with no name after it.
+///
+/// This is what separates the ACCOUNT-LEVEL Data Catalog policy — the one a
+/// `PutResourcePolicy` that names no `ResourceArn` sets — from a policy attached to an
+/// individual resource, which is the distinction `GetResourcePolicies` enumerates by.
+pub fn names_a_catalog(resource_arn: &str) -> bool {
+    parse_glue_arn(resource_arn).is_some_and(|parsed| parsed.resource == CATALOG_ARN_RESOURCE)
 }
 
 /// A stored database, plus the tables it contains.
@@ -4180,6 +4383,54 @@ pub mod messages {
     pub fn partition_not_found(values: &[String]) -> String {
         format!("Partition [{}] not found.", values.join(", "))
     }
+
+    /// A resource-policy read or delete (`GetResourcePolicy`, `DeleteResourcePolicy`) for
+    /// a resource that carries no policy. RECORDED constant: the refusal names neither
+    /// the resource nor the ARN that was addressed.
+    pub const POLICY_NOT_FOUND: &str = "Policy not found";
+
+    /// `PutResourcePolicy` carrying `PolicyExistsCondition` `MUST_EXIST` for a resource
+    /// that carries no policy yet ("A value of MUST_EXIST is used to update a policy"), and
+    /// any resource-policy write or delete whose `PolicyHashCondition` is not the hash of
+    /// the policy currently attached — the concurrent-modification check that member exists
+    /// for ("its purpose is to prevent concurrent modifications of a policy"), which a
+    /// resource carrying no policy at all fails too. RECORDED constant, and it names both
+    /// cases: the policy is absent, or the hash is not the attached policy's. No stored
+    /// value is disclosed.
+    pub const POLICY_CONDITION_FAILED: &str = "Policy not exists or policy hash mismatch";
+
+    /// `PutResourcePolicy` carrying `PolicyExistsCondition` `NOT_EXIST` against a resource
+    /// that already carries one ("A value of NOT_EXIST is used to create a new policy").
+    /// NOT recorded — the recorded condition failure above states the opposite case — so
+    /// what is pinned is the behaviour, 400 with the operation's modelled
+    /// `ConditionCheckFailureException`, and the sentence follows that wording and
+    /// discloses nothing of the attached policy.
+    pub const POLICY_ALREADY_EXISTS: &str = "Policy already exists";
+
+    /// A resource-policy request whose `ResourceArn` this endpoint can hold no policy for.
+    /// Derived from the request, like [`super::invalid_resource_arn_message`]: it names the
+    /// member and the value that is not a Glue resource of this account and Region.
+    pub fn invalid_policy_resource_arn(resource_arn: &str) -> String {
+        format!(
+            "ResourceArn must be the ARN of a Glue resource of this account and Region; got \
+             {resource_arn:?}"
+        )
+    }
+
+    /// `PutResourcePolicy` whose policy document is not a JSON object. NOT recorded: what
+    /// is pinned is the behaviour — 400 with the operation's modelled
+    /// `InvalidInputException` — and the sentence names the member the document arrived in,
+    /// which the model describes as "the policy document to set, in JSON format".
+    pub const POLICY_MUST_BE_JSON: &str = "PolicyInJson must be a policy document in JSON format.";
+
+    /// `PutResourcePolicy` for a resource this endpoint cannot take another policy for.
+    /// Its own capacity, not an AWS quota, so the sentence says which ceiling was reached.
+    pub fn too_many_resource_policies(ceiling: usize) -> String {
+        format!(
+            "this endpoint holds resource policies for {ceiling} resources, which is as many \
+             as it can hold"
+        )
+    }
 }
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.
@@ -4330,9 +4581,10 @@ pub fn catalog_arn(region: &str, catalog_id: &str) -> String {
 /// so a caller holding no grant on it is refused as unauthorized rather than told the
 /// entity does not exist — which would also answer a cross-account read out of the
 /// caller's OWN catalog whenever the two hold a same-named entity. This store holds one
-/// catalog ([`is_known_catalog`]) and no Data Catalog resource policy — `PutResourcePolicy`
-/// is not implemented — so no grant on a foreign catalog can exist here and every
-/// cross-account request for one is refused.
+/// catalog ([`is_known_catalog`]) and can hold no resource policy of a FOREIGN catalog —
+/// `PutResourcePolicy` attaches a policy only to a resource of the account this endpoint
+/// serves ([`resolve_policy_resource_arn`]) — so no grant on a foreign catalog can exist
+/// here and every cross-account request for one is refused.
 ///
 /// `action` is the operation's own name, which the refusal names as the IAM action
 /// ([`IAM_ACTION_PREFIX`]) the caller may not perform.

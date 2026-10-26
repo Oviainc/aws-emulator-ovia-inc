@@ -19,6 +19,8 @@ mod cdc_stream_tag_lifetime;
 mod cdc_streams;
 #[path = "all/column_types_and_auto_scaling.rs"]
 mod column_types_and_auto_scaling;
+#[path = "all/create_table_replicas_and_warm_throughput.rs"]
+mod create_table_replicas_and_warm_throughput;
 #[path = "all/delete_keyspace_in_flight_resources.rs"]
 mod delete_keyspace_in_flight_resources;
 #[path = "all/delete_keyspace_lifecycle.rs"]

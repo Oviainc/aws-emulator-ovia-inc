@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQuotaShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQuotaShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQuotaShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the quota share a `quotaShareArn` names, in place, from what
+//! `CreateQuotaShare` stored.
+//!
+//! Every configuration member of the request is OPTIONAL and REPLACES the stored one; a
+//! member the request omits leaves the stored value exactly as it was, so an update of one
+//! member is not an erasure of the rest. The identity of the share — its name, its ARN and
+//! the job queue it hangs off — is not updatable, and the call answers with the name and
+//! ARN it resolved.
+//!
+//! The refusals are `DescribeQuotaShare`'s, because the identifier is the same one: a
+//! `quotaShareArn` carrying no `job-queue/<queue>/quota-share/<share>` path is not a quota
+//! share ARN at all, and an ARN of that shape naming nothing stored is well-formed but
+//! unknown. Both are the modelled `ClientException` (HTTP 400), in the frontend envelope
+//! AWS is recorded to word the quota-share refusals in.
+//!
+//! An accepted update leaves the share in the transient `UPDATING` status — the way
+//! `UpdateJobQueue` leaves a queue — and the move back to `VALID` is owed by the CLOCK
+//! ([`crate::state::JOB_PHASE_MILLIS`] later), materialised by whoever reads it next.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +160,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQuotaShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQuotaShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQuotaShare"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                UpdateQuotaShareErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // The identifier is `DescribeQuotaShare`'s, so the two refusals it distinguishes
+        // are the two this call distinguishes: a value that is no quota-share ARN at all
+        // names nothing to look up, and is refused on the pattern alone.
+        if batch::parse_quota_share_arn(&input.quota_share_arn).is_none() {
+            return Err(UpdateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::QUOTA_SHARE_ARN_NOT_VALID),
+            )
+            .into());
+        }
+        if !state.quota_shares.contains_key(&input.quota_share_arn) {
+            return Err(UpdateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::does_not_exist_sentence(
+                    &input.quota_share_arn,
+                )),
+            )
+            .into());
+        }
+
+        // Everything is validated BEFORE anything is written, so a refused update leaves
+        // the share exactly as it was. A `capacityLimits` the request carries REPLACES the
+        // stored list, so an empty one would leave the share with no capacity allocated at
+        // all — which is not a share this service can hold, the same refusal the create
+        // answers for it.
+        if input.capacity_limits.as_deref().is_some_and(<[_]>::is_empty) {
+            return Err(UpdateQuotaShareErrorModeled::ClientException(
+                batch::client_exception_enveloped(
+                    "capacityLimits must name at least one capacity limit.",
+                ),
+            )
+            .into());
+        }
+
+        let Some(share) = state.quota_shares.get_mut(&input.quota_share_arn) else {
+            return Err(
+                UpdateQuotaShareErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        // Each configuration member the request carries replaces the stored one; one it
+        // omits leaves the stored value untouched.
+        if let Some(limits) = input.capacity_limits {
+            share.capacity_limits = limits;
+        }
+        if let Some(sharing) = input.resource_sharing_configuration {
+            share.resource_sharing_configuration = sharing;
+        }
+        if let Some(preemption) = input.preemption_configuration {
+            share.preemption_configuration = preemption;
+        }
+        if let Some(requested) = input.state {
+            share.state = requested;
+        }
+        // The share is left in the transient status an update puts it in; the clock owes
+        // the move back to `VALID`, so a caller reading straight after this call still
+        // observes `UPDATING`.
+        share.status = batch::STATUS_UPDATING.to_string();
+        share.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+
+        Ok(UpdateQuotaShareOutput {
+            quota_share_name: Some(share.name.clone()),
+            quota_share_arn: Some(share.arn.clone()),
+        })
     }
 }

@@ -1047,29 +1047,30 @@ async fn the_store_and_the_page_are_bounded() {
     );
 }
 
-/// The operations this slice does not cover still answer the scaffold's 501 rather than
-/// an empty success — the signal that they are not written yet, which is a different
-/// claim from "this request was wrong".
+/// No operation of this service answers the scaffold's 501 any more.
+///
+/// `UpdateGatewaySoftwareNow` was the last one still scaffolded, so the row that used to
+/// assert a 501 for it now asserts that it is SERVED: a 501 from any operation here would
+/// mean a handler had been taken back to a scaffold. What that operation does with the
+/// record is the sibling `gateway_software_update` suite's subject.
 #[tokio::test]
-async fn operations_outside_this_slice_still_answer_501() {
+async fn no_operation_of_this_service_answers_501() {
     let engine = build_engine();
     let router = build_router(&engine);
     let arn = create(&router, "gw-untouched").await;
 
-    let rows: [(&str, Value); 1] = [
-        (
-            "UpdateGatewaySoftwareNow",
-            json!({ "GatewayArn": arn }),
-        ),
-    ];
+    let rows: [(&str, Value); 1] = [(
+        "UpdateGatewaySoftwareNow",
+        json!({ "GatewayArn": arn }),
+    )];
 
     for (operation, body) in rows {
         let reply = call(&router, operation, &body).await;
         assert_eq!(
             (reply.status, reply.code.as_deref()),
-            (501, Some("NotImplemented")),
-            "case {operation:?}: an unimplemented operation must answer 501 \
-             NotImplemented, got {} {:?}",
+            (200, None),
+            "case {operation:?}: an implemented operation must serve the request rather \
+             than answer the scaffold's 501, got {} {:?}",
             reply.status,
             reply.body
         );

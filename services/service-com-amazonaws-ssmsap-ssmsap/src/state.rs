@@ -5,7 +5,8 @@
 //! The registered SAP application is this service's primary resource: every
 //! application-scoped operation (`RegisterApplication`, `GetApplication`,
 //! `ListApplications`, `StartApplication`, `StopApplication`,
-//! `DeregisterApplication`) resolves the SAME [`StoredApplication`] out of
+//! `StartApplicationRefresh`, `DeregisterApplication`) resolves the SAME
+//! [`StoredApplication`] out of
 //! [`RegionState::applications`], and every call that changes one files a
 //! [`StoredOperation`] in [`RegionState::operations`] that `GetOperation` reads back.
 //! So a register is observable by every later read, a deregister by every later call,
@@ -179,6 +180,10 @@ pub const OPERATION_TYPE_STOP_APPLICATION: &str = "STOP_APPLICATION";
 
 /// `Operation$Type` for the operation `DeregisterApplication` files.
 pub const OPERATION_TYPE_DEREGISTER_APPLICATION: &str = "DEREGISTER_APPLICATION";
+
+/// `Operation$Type` for the operation `StartApplicationRefresh` files, spelled by the
+/// same rule as the records above: the name of the API call that produced it.
+pub const OPERATION_TYPE_START_APPLICATION_REFRESH: &str = "START_APPLICATION_REFRESH";
 
 /// `Operation$ResourceType`: the kind of resource an operation acted on.
 ///

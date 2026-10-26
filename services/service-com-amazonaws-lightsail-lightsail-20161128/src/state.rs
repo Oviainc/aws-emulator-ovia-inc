@@ -854,6 +854,15 @@ pub const RELATIONAL_DATABASE_SNAPSHOT_PAGE_SIZE: usize = 10;
 /// way.
 pub const RELATIONAL_DATABASE_EVENT_PAGE_SIZE: usize = 10;
 
+/// How many log lines one `GetRelationalDatabaseLogEvents` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that "if
+/// your results are paginated, the response will return a next forward token
+/// and/or next backward token that you can specify as the page token in a
+/// subsequent request" (the modelled `pageToken` documentation). Matches
+/// [`INSTANCE_PAGE_SIZE`], so every paged read in this slice pages the same way.
+pub const RELATIONAL_DATABASE_LOG_EVENT_PAGE_SIZE: usize = 10;
+
 /// How many instance snapshots one `GetInstanceSnapshots` page carries.
 ///
 /// CHOSEN: Lightsail publishes no page size for this operation, only that the
@@ -5882,6 +5891,17 @@ pub const MYSQL_LOG_STREAMS: &[&str] = &[
 /// reads.
 pub const POSTGRES_LOG_STREAMS: &[&str] = &["error/postgresql.log"];
 
+/// What the name of an ERROR log stream begins with, for both engines this
+/// slice serves.
+///
+/// A database's log files fall in the groups the engine writes them in, and the
+/// group is the first path segment of the stream name: the error log the engine
+/// writes its own startup and shutdown to is under `error/` for both engines
+/// ([`MYSQL_LOG_STREAMS`], [`POSTGRES_LOG_STREAMS`]), while a stream under
+/// `general/` or `slowquery/` is a QUERY log — a record of the statements
+/// clients ran, not of the engine itself.
+pub const RELATIONAL_DATABASE_ERROR_LOG_STREAM_PREFIX: &str = "error/";
+
 /// The log streams a database of `engine` publishes.
 ///
 /// The set is the ENGINE's, like the port and the master-credential limits, so a
@@ -6455,6 +6475,104 @@ impl StoredRelationalDatabaseEvent {
     pub fn page_token(&self) -> String {
         self.sequence.to_string()
     }
+
+    /// This entry as one LINE of the database's log file — the modelled
+    /// `LogEvent` `GetRelationalDatabaseLogEvents` reports: the instant the line
+    /// was written and what it says.
+    ///
+    /// The same happening the event log reports, seen through the other API:
+    /// `GetRelationalDatabaseEvents` reports it as the service's event (with the
+    /// database it relates to and the categories it falls in), and a log stream
+    /// reports it as the line the engine wrote, which carries neither.
+    pub fn log_event_view(&self) -> crate::ops::types::LogEvent {
+        crate::ops::types::LogEvent {
+            created_at: Some(timestamp(self.created_at_ms)),
+            message: Some(self.message.clone()),
+        }
+    }
+}
+
+/// Which end of a log stream a `GetRelationalDatabaseLogEvents` page is read
+/// from, and the position in that stream it is read at.
+///
+/// A position is a line's [`StoredRelationalDatabaseEvent::sequence`], so a
+/// token NAMES a place in the log rather than carrying an index into one answer:
+/// a stream that has been written to since the token was issued still answers
+/// the lines after the one the token stopped at, and a line retention has
+/// dropped cannot make the walk skip or repeat another.
+///
+/// Rendered as the direction (`f` forward, `b` backward) and that position —
+/// the two tokens this operation reports are values a caller only ever hands
+/// back, so the rendering is this store's own and is parsed back by
+/// [`Self::parse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEventPageToken {
+    /// Read the line AT this position and the ones after it (forward), or the
+    /// ones BEFORE it (backward).
+    pub forward: bool,
+    /// The position in the stream the next read starts (or ends) at.
+    pub position: u64,
+}
+
+impl LogEventPageToken {
+    /// The forward token at `position`.
+    pub fn forward(position: u64) -> Self {
+        Self {
+            forward: true,
+            position,
+        }
+    }
+
+    /// The backward token at `position`.
+    pub fn backward(position: u64) -> Self {
+        Self {
+            forward: false,
+            position,
+        }
+    }
+
+    /// `token` as this store issues one, or `None` when it is not one at all —
+    /// which the caller turns into a refusal rather than quietly reading from
+    /// the head of the log.
+    ///
+    /// TOTAL on every input: the value is split on the one separator and the
+    /// position is parsed, so an arbitrary caller-supplied string answers
+    /// `None` instead of panicking.
+    pub fn parse(token: &str) -> Option<Self> {
+        let (direction, position) = token.split_once('/')?;
+        let forward = match direction {
+            "f" => true,
+            "b" => false,
+            _ => return None,
+        };
+        Some(Self {
+            forward,
+            position: position.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for LogEventPageToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let direction = if self.forward { 'f' } else { 'b' };
+        write!(formatter, "{direction}/{}", self.position)
+    }
+}
+
+/// One page of a log stream: the lines it reported, and the two tokens that read
+/// the page after it and the page before it.
+///
+/// Both tokens are always present, whether the page carried a line or not: a
+/// stream is appended to while a caller reads it, so a caller that has reached
+/// the end of one still needs the token that picks up the lines written next.
+#[derive(Debug, Clone)]
+pub struct LogEventPage {
+    /// The lines of the page, in the order they were written.
+    pub events: Vec<crate::ops::types::LogEvent>,
+    /// `nextForwardToken`: the lines after this page.
+    pub next_forward_token: LogEventPageToken,
+    /// `nextBackwardToken`: the lines before this page.
+    pub next_backward_token: LogEventPageToken,
 }
 
 /// One stored managed relational database: every member `GetRelationalDatabase`
@@ -6996,6 +7114,149 @@ impl StoredRelationalDatabase {
             .iter()
             .map(|stream| (*stream).to_string())
             .collect()
+    }
+
+    /// Whether `stream` is one of the log streams this database publishes right
+    /// now — the set [`Self::log_streams`] answers, read without building it.
+    pub fn publishes_log_stream(&self, stream: &str) -> bool {
+        self.state != RELATIONAL_DATABASE_STATE_CREATING
+            && relational_database_log_streams(self.blueprint.engine).contains(&stream)
+    }
+
+    /// The lines the log stream `stream` of this database holds, in the order
+    /// they were written.
+    ///
+    /// A log stream is a log FILE the database's engine writes, so its lines are
+    /// what that engine has done — and what this store holds of that is the
+    /// database's own event log: the entries in the
+    /// [`RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION`] and
+    /// [`RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY`] categories are the
+    /// engine coming up and going down, which is exactly what an engine records
+    /// in its ERROR log. So an error-log stream
+    /// ([`RELATIONAL_DATABASE_ERROR_LOG_STREAM_PREFIX`]) reports those entries
+    /// rather than this record keeping a second copy of them, and the two reads
+    /// of one happening — the service's event and the engine's log line — can
+    /// never disagree.
+    ///
+    /// A QUERY log (`general/`, `slowquery/`) holds a line per statement a
+    /// CLIENT ran, and this emulator serves no database protocol, so no
+    /// statement has ever reached an engine here and every one of those streams
+    /// is empty — the same reason a container service's log reports no line
+    /// (`crate::ops::get_container_log`).
+    ///
+    /// Ordered by sequence, which is the order the service logged them in: a
+    /// file is read in the order it was WRITTEN, while the event log's own
+    /// reader orders by instant.
+    fn log_stream_lines(&self, stream: &str) -> Vec<&StoredRelationalDatabaseEvent> {
+        if !stream.starts_with(RELATIONAL_DATABASE_ERROR_LOG_STREAM_PREFIX) {
+            return Vec::new();
+        }
+        let mut lines = self
+            .events
+            .iter()
+            .filter(|event| {
+                event
+                    .categories
+                    .contains(&RELATIONAL_DATABASE_EVENT_CATEGORY_CREATION)
+                    || event
+                        .categories
+                        .contains(&RELATIONAL_DATABASE_EVENT_CATEGORY_AVAILABILITY)
+            })
+            .collect::<Vec<&StoredRelationalDatabaseEvent>>();
+        lines.sort_by_key(|line| line.sequence);
+        lines
+    }
+
+    /// One page of the log stream `stream` of this database: the lines it holds
+    /// inside the half-open interval `[from_ms, to_ms)` — an absent bound leaves
+    /// that side of the interval open — read from the end `start_from_head`
+    /// names, or from the place `page_token` stopped at when the request carried
+    /// one.
+    ///
+    /// At most [`RELATIONAL_DATABASE_LOG_EVENT_PAGE_SIZE`] lines, always in the
+    /// order they were written whichever end the read started from: the end
+    /// chooses WHICH lines the first page carries, not the order they are
+    /// reported in.
+    ///
+    /// A stream this database does not publish answers an empty page here; the
+    /// caller refuses such a name ([`Self::publishes_log_stream`]) rather than
+    /// reporting one.
+    pub fn log_event_page(
+        &self,
+        stream: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        start_from_head: bool,
+        page_token: Option<LogEventPageToken>,
+    ) -> LogEventPage {
+        // A page carries at least one line, so a walk over a non-empty stream
+        // always advances.
+        let page_size = RELATIONAL_DATABASE_LOG_EVENT_PAGE_SIZE.max(1);
+        // "Specified in Coordinated Universal Time (UTC)": the interval is
+        // half-open, so a line written AT `startTime` is inside it and one
+        // written at `endTime` is not — which is what lets a caller walk a log
+        // in abutting intervals without reading a line twice.
+        let reported = self
+            .log_stream_lines(stream)
+            .into_iter()
+            .filter(|line| from_ms.is_none_or(|from_ms| line.created_at_ms >= from_ms))
+            .filter(|line| to_ms.is_none_or(|to_ms| line.created_at_ms < to_ms))
+            .collect::<Vec<&StoredRelationalDatabaseEvent>>();
+        let page: Vec<&StoredRelationalDatabaseEvent> = match page_token {
+            // Forward from the position the last page stopped at: the line at
+            // that position has not been reported yet.
+            Some(token) if token.forward => reported
+                .iter()
+                .copied()
+                .filter(|line| line.sequence >= token.position)
+                .take(page_size)
+                .collect(),
+            // Backward from it: the page that ENDS just before that line.
+            Some(token) => {
+                let before = reported
+                    .iter()
+                    .copied()
+                    .filter(|line| line.sequence < token.position)
+                    .collect::<Vec<&StoredRelationalDatabaseEvent>>();
+                let start = before.len().saturating_sub(page_size);
+                before.into_iter().skip(start).collect()
+            }
+            // "If true is specified, the log event starts from the head of the
+            // log. If false is specified, the log event starts from the tail of
+            // the log."
+            None if start_from_head => reported.iter().copied().take(page_size).collect(),
+            None => {
+                let start = reported.len().saturating_sub(page_size);
+                reported.iter().copied().skip(start).collect()
+            }
+        };
+        let (forward_at, backward_at) = match (page.first(), page.last()) {
+            // The page after this one starts at the line after its last, and
+            // the page before it ends at its first.
+            (Some(first), Some(last)) => (last.sequence.saturating_add(1), first.sequence),
+            // Nothing was reported, so the read stopped where it started: at
+            // the token's own position, at the head of the log (position zero)
+            // for a read from the head, and at its end — the position the next
+            // line written will carry — for a read from the tail. A caller that
+            // has reached the end of the stream can poll the forward token for
+            // the lines written after this answer.
+            _ => {
+                let stopped = match page_token {
+                    Some(token) => token.position,
+                    None if start_from_head => 0,
+                    None => self.next_event_sequence,
+                };
+                (stopped, stopped)
+            }
+        };
+        LogEventPage {
+            events: page
+                .iter()
+                .map(|line| line.log_event_view())
+                .collect::<Vec<crate::ops::types::LogEvent>>(),
+            next_forward_token: LogEventPageToken::forward(forward_at),
+            next_backward_token: LogEventPageToken::backward(backward_at),
+        }
     }
 }
 

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted account-level attributes of this account in this Region:
+//! the sending and dedicated-IP switches, the reputation status, the account
+//! details, and the suppression, VDM and pricing attributes, together with the
+//! sending limits and the recipients charged against them over the trailing
+//! window. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccount"))
+        // `GetAccountRequest` carries no members: the account this answers for is
+        // the one the request was signed for, and the emulator serves one.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetAccount without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting-only, with one exception: the transitions the clock already
+        // owed are materialised before reading — among them the recipients that
+        // have fallen out of the sending quota's trailing window — so this read
+        // answers what every later caller sees too.
+        store.settle(::std::time::SystemTime::now());
+
+        let account = &store.account;
+        Ok(GetAccountOutput {
+            sending_enabled: account.sending_enabled,
+            dedicated_ip_auto_warmup_enabled: account.dedicated_ip_auto_warmup_enabled,
+            production_access_enabled: account.production_access_enabled,
+            enforcement_status: Some(account.enforcement_status.clone()),
+            suppression_attributes: Some(account.suppression_attributes()),
+            vdm_attributes: Some(account.vdm_attributes()),
+            pricing_attributes: Some(account.pricing_attributes()),
+            // `Details` reports what the account supplied about its sending; an
+            // account that has supplied none has no details to report.
+            details: account.details.clone(),
+            send_quota: Some(store.send_counters.send_quota()),
+        })
     }
 }

@@ -274,3 +274,7 @@ mod workload_lens_review_upgrade;
 // Declared last for the same reason as the declaration above.
 #[path = "all/workload_integration_sync.rs"]
 mod workload_integration_sync;
+
+// Declared last for the same reason as the declaration above.
+#[path = "all/profile_notifications.rs"]
+mod profile_notifications;

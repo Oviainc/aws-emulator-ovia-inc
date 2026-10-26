@@ -3176,15 +3176,20 @@ pub enum LookupTableSource {
 pub const LOOKUP_TABLE_SOURCE_EXCLUSIVE: &str =
     "tableBody and queryId are mutually exclusive parameters.";
 
-/// The refusal for a `CreateLookupTable` that names neither content source: a table is
-/// created "by uploading CSV data or from CloudWatch Logs query results", so a create
-/// naming neither names nothing to create the table from. See
+/// The refusal for a lookup-table write that names neither content source: a table is
+/// created "by uploading CSV data or from CloudWatch Logs query results" and updated by
+/// "replacing all of its content with new CSV data or CloudWatch Logs query results", so a
+/// create or an update naming neither names nothing to fill the table from. See
 /// [`LOOKUP_TABLE_SOURCE_EXCLUSIVE`] for the error shape.
 pub const LOOKUP_TABLE_SOURCE_REQUIRED: &str = "Either tableBody or queryId must be provided.";
 
 /// Resolve what a lookup-table request populates the table from. `Ok(None)` is a request
-/// that names neither source — which an UPDATE may do (it can change only the description
-/// or the KMS key) and a CREATE may not; the `Err` carries the message to refuse with.
+/// that names NEITHER source, which neither a create nor an update may be: both state "You
+/// must specify either tableBody or queryId, but not both", and an update is itself a
+/// content replacement ("Updates an existing lookup table by replacing all of its content
+/// with new CSV data or CloudWatch Logs query results"). The `Err` carries the message to
+/// refuse a request naming BOTH with; a caller refuses `Ok(None)` with
+/// [`LOOKUP_TABLE_SOURCE_REQUIRED`].
 pub fn resolve_lookup_table_source(
     table_body: Option<&str>,
     query_id: Option<&str>,
@@ -3339,6 +3344,26 @@ impl LookupTableRecord {
             last_updated_time_ms: created_at_ms,
             tags: BTreeMap::new(),
         }
+    }
+
+    /// Replace everything this table holds with `table_body`, whose shape `shape` describes,
+    /// as of `updated_at_ms`. This is what `UpdateLookupTable` stores: "This is a full
+    /// replacement operation. All existing content is replaced", so the column names and the
+    /// record count are re-derived from the new body rather than merged with the old one's,
+    /// and the instant of the write becomes the table's last-updated instant. The members a
+    /// content replacement does not touch — the name, the ARN, the creation instant, the
+    /// description, the KMS key and the tags — are left as they are, for the caller to set
+    /// from the members its request named.
+    pub fn replace_content(
+        &mut self,
+        table_body: String,
+        shape: TableBodyShape,
+        updated_at_ms: i64,
+    ) {
+        self.table_body = table_body;
+        self.table_fields = shape.fields;
+        self.records_count = shape.records_count;
+        self.last_updated_time_ms = updated_at_ms;
     }
 
     /// `LookupTable$sizeBytes` — "The size of the lookup table in bytes": the length of the
@@ -5747,6 +5772,15 @@ pub const UNTAGGABLE_RESOURCE_ARN: &str =
 pub fn is_query_result_arn(arn: &str) -> bool {
     arn_service_and_resource(arn)
         .is_some_and(|(service, resource)| service == "logs" && resource == "query-result:*")
+}
+
+/// The refusal for a member this service parses as a KMS key's and was handed a value that
+/// names something else: the message names the MEMBER and the value it would not take, so a
+/// caller can fix the request from it. Shared by every operation that holds a member to
+/// naming a KMS key — `kmsKeyId` of the lookup-table writes and `kmsKeyArn` of
+/// `PutIntegration` — so the wording cannot drift between them.
+pub fn not_a_kms_key_message(member: &str, value: &str) -> String {
+    format!("{member} must name a KMS key, got '{value}'")
 }
 
 /// Whether a `kmsKeyId` names a KMS key: the member is documented as "The Amazon

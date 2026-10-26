@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketLogging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketLogging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketLogging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the LOGGING STATUS of a bucket from the `BucketLoggingStatus` it carries as its
+//! payload: a container naming a `LoggingEnabled` enables server access logging with that
+//! configuration, and an empty one disables it again — "To enable logging, you use
+//! LoggingEnabled and its children request elements. To disable logging, you use an empty
+//! BucketLoggingStatus request element" (this operation's own documentation). A replacement
+//! of the whole subresource, read back by `GetBucketLogging`.
+//!
+//! Logs go to a bucket of the caller's own, in the Region of the bucket being logged: a
+//! target this emulator does not hold is `InvalidTargetBucketForLogging` (400) and one in
+//! another Region `CrossLocationLoggingProhibited` (403). A bucket this emulator does not
+//! hold is `NoSuchBucket` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -137,14 +140,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketLoggingOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketLoggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketLogging")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketLogging")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketLogging",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketLoggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -198,18 +209,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketLogging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketLoggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the expected owner and
+        // the status container travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketLoggingRequest$ExpectedBucketOwner`), judged the way every other
+        // bucket-scoped operation in this crate judges it: this emulator serves one
+        // account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
+            // operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketLogging",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put
+        // leaves the bucket's current logging status exactly as it was; and the bucket
+        // being logged is looked up FIRST, so a request naming a bucket this emulator does
+        // not hold answers that rather than whatever is wrong with a status it could never
+        // have carried (the order `PutBucketReplication` keeps).
+        let mut store = state.lock();
+        let Some(source) = store.bucket(&input.bucket) else {
+            return Err(PutBucketLoggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let source_region = source.region.clone();
+
+        if let Some(logging) = input.bucket_logging_status.logging_enabled.as_ref() {
+            // "Specifies the bucket where you want Amazon S3 to store server access logs.
+            // You can have your logs delivered to any bucket that you own, including the
+            // same bucket that is being logged" (`LoggingEnabled$TargetBucket`): a target
+            // that is not a bucket of this account's is exactly the condition
+            // `InvalidTargetBucketForLogging` reports — "the target bucket for logging does
+            // not exist, is not owned by you, or does not have the appropriate grants for
+            // the log-delivery group". The code is not a shape in this model, so it goes
+            // out through the unmodelled channel.
+            let Some(target) = store.bucket(&logging.target_bucket) else {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_TARGET_BUCKET_FOR_LOGGING_CODE,
+                    crate::state::INVALID_TARGET_BUCKET_FOR_LOGGING_STATUS,
+                    crate::state::INVALID_TARGET_BUCKET_FOR_LOGGING_MESSAGE,
+                ));
+            };
+
+            // "All logs are saved to buckets in the same Amazon Web Services Region as the
+            // source bucket" (this operation's own documentation): a target in another
+            // Region is the cross-location delivery `CrossLocationLoggingProhibited`
+            // refuses.
+            if target.region != source_region {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::CROSS_LOCATION_LOGGING_PROHIBITED_CODE,
+                    crate::state::CROSS_LOCATION_LOGGING_PROHIBITED_STATUS,
+                    crate::state::CROSS_LOCATION_LOGGING_PROHIBITED_MESSAGE,
+                ));
+            }
+
+            // "You use the Grantee request element to grant access to other people. The
+            // Permissions request element specifies the kind of access the grantee has to
+            // the logs" (this operation's own documentation): a target grant is a grant on
+            // the logs delivered to the target bucket, so the published ceiling on an
+            // access control list bounds them — "An ACL can have up to 100 grants"
+            // ([`crate::state::MAX_ACL_GRANTS`]). A status past it does not validate
+            // against the schema S3 publishes for an ACL, which is what
+            // `MalformedACLError` reports, worded by the store's own rule so one ceiling
+            // cannot be described two ways. Refusing it is also what keeps the grants one
+            // bucket can park in this process's memory bounded.
+            let grants = logging.target_grants.as_deref().unwrap_or_default();
+            if grants.len() > crate::state::MAX_ACL_GRANTS {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MALFORMED_ACL_CODE,
+                    MALFORMED_ACL_STATUS,
+                    crate::state::AclRejection::TooManyGrants {
+                        count: grants.len(),
+                    }
+                    .to_string(),
+                ));
+            }
+
+            // "Amazon S3 key format for log objects. Only one format, PartitionedPrefix or
+            // SimplePrefix, is allowed" (`TargetObjectKeyFormat`): a container naming both
+            // does not validate against the schema S3 publishes for the payload, which is
+            // what `MalformedXML` reports — carried with that code's own FIXED published
+            // text, the one a schema refusal sends however the document failed.
+            if let Some(format) = logging.target_object_key_format.as_ref() {
+                if format.simple_prefix.is_some() && format.partitioned_prefix.is_some() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::MALFORMED_XML_CODE,
+                        MALFORMED_XML_STATUS,
+                        crate::state::MALFORMED_XML_MESSAGE,
+                    ));
+                }
+            }
+        }
+
+        // "Container for logging status information"
+        // (`PutBucketLoggingRequest$BucketLoggingStatus`): the payload is the complete
+        // status, so what it names becomes the bucket's logging status in full — the
+        // `LoggingEnabled` it carries, or none at all when it carries none, which is how
+        // logging is disabled again.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketLogging"))
+        // `ContentMD5` is NOT verified here, for the reason `PutBucketReplication` gives:
+        // by the time this handler runs the payload is the deserialized container rather
+        // than the bytes the digest was computed over.
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(PutBucketLoggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        bucket.set_logging(input.bucket_logging_status.logging_enabled);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketLoggingOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The HTTP status AWS answers `MalformedACLError` with: 400, from the same list.
+const MALFORMED_ACL_STATUS: u16 = 400;
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if agreement.status != crate::state::STATUS_ACTIVE {
             return Err(
                 SendAgreementCancellationRequestErrorModeled::ValidationException(
-                    crate::state::validation_exception("INACTIVE_AGREEMENT", "agreementId"),
+                    crate::state::inactive_agreement(),
                 )
                 .into(),
             );

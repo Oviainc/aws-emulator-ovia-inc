@@ -17,9 +17,14 @@
 //! + stage name the invoke endpoint the dialect renders in its own place (`host`/
 //! `basePath`/`schemes` for 2.0, `servers` for 3.0). The vendor extensions are rendered
 //! only when the request's `parameters` ask for them, as that member documents: the
-//! integration and authorizer extensions for the value that names each, and the extensions
+//! integration and authorizer extensions for the value that names each, the extensions
 //! describing the API itself — its gateway responses — for the value that asks for API
-//! Gateway's own extension set (`extensions=apigateway`).
+//! Gateway's own extension set (`extensions=apigateway`), and the documentation set the
+//! stage SERVES for the value that asks for the documentation extension
+//! (`extensions=documentation`): the `DocumentationVersion` snapshot the stage's
+//! `documentationVersion` pins, rendered under the same
+//! `x-amazon-apigateway-documentation` key `ImportDocumentationParts` reads one back out
+//! of.
 //!
 //! The document is served as the FILE it is: the response reports the attachment's
 //! unspecified byte stream as its `contentType` whichever spelling `accepts` selected, and
@@ -31,10 +36,7 @@
 //!
 //! What the document does NOT carry, and why: a `Model`'s schema (no operation of this
 //! service creates a `Model` yet, and a `$ref` to a definition the document does not
-//! carry would be a dangling reference rather than an exported model), and the content of
-//! the documentation parts a stage's `documentationVersion` froze (those records are
-//! reported by the documentation operations; merging them into the definition is not part
-//! of what this renders).
+//! carry would be a dangling reference rather than an exported model).
 //!
 //! ## Shape of an operation
 //!
@@ -123,7 +125,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
-use crate::state::{AuthorizerEntry, DeploymentEntry, MethodEntry, ResourceEntry, RestApiEntry, StageEntry};
+use crate::state::{
+    AuthorizerEntry, DeploymentEntry, DocumentationPartEntry, MethodEntry, ResourceEntry,
+    RestApiEntry, StageEntry,
+};
 
 /// The `exportType` for Swagger/OpenAPI 2.0: "'swagger' for Swagger/OpenAPI 2.0"
 /// (`GetExportRequest$exportType`).
@@ -171,7 +176,11 @@ const EXTENSIONS_PARAMETER: &str = "extensions";
 /// The `extensions` values that ask for the integration extension: "extensions=
 /// 'integrations' or extensions='apigateway' will export the API with
 /// x-amazon-apigateway-integration extensions" (`GetExportRequest$parameters`).
-const EXTENSIONS_INTEGRATIONS: &[&str] = &["integrations", EXTENSIONS_APIGATEWAY];
+const EXTENSIONS_INTEGRATIONS: &[&str] = &[EXTENSIONS_INTEGRATION, EXTENSIONS_APIGATEWAY];
+
+/// The `extensions` value that asks for the integration extension and nothing else; see
+/// [`EXTENSIONS_INTEGRATIONS`].
+const EXTENSIONS_INTEGRATION: &str = "integrations";
 
 /// The `extensions` value that asks for API Gateway's OWN extension set rather than one
 /// extension of it: it asks for the integration extension, as `integrations` does, and for
@@ -183,6 +192,29 @@ const EXTENSIONS_APIGATEWAY: &str = "apigateway";
 /// 'authorizers' will export the API with x-amazon-apigateway-authorizer extensions"
 /// (`GetExportRequest$parameters`).
 const EXTENSIONS_AUTHORIZERS: &str = "authorizers";
+
+/// The `extensions` value that asks for the documentation extension: the documentation set
+/// the exported stage serves, which "the original documentation parts are exported in a
+/// OpenAPI extension of `x-amazon-apigateway-documentation`"
+/// (`DocumentationPart$properties`) is the exported form of; see
+/// [`documentation_extension`].
+const EXTENSIONS_DOCUMENTATION: &str = "documentation";
+
+/// Every `extensions` value this operation reads, which is also the set a value outside it
+/// is refused by naming: ONE list, so the values the parser accepts and the values the
+/// refusal names cannot drift apart.
+const EXTENSIONS_VALUES: &[&str] = &[
+    EXTENSIONS_INTEGRATION,
+    EXTENSIONS_APIGATEWAY,
+    EXTENSIONS_AUTHORIZERS,
+    EXTENSIONS_DOCUMENTATION,
+    POSTMAN_PARAMETER,
+];
+
+/// The OpenAPI extension a documentation set is carried in, and the member of it holding
+/// the parts — the constants the IMPORT side reads a set back out of, referenced rather
+/// than re-declared so the two halves of the round trip cannot name different keys.
+use super::import_documentation_parts::{DOCUMENTATION_EXTENSION, DOCUMENTATION_PARTS_MEMBER};
 
 /// The `parameters` key that asks for Postman's own extensions; see
 /// [`postman_not_generated`].
@@ -441,6 +473,8 @@ struct Extensions {
     /// `extensions=apigateway`: API Gateway's own extension set, which carries the
     /// extensions describing the API itself beside the per-method ones.
     apigateway: bool,
+    /// `extensions=documentation`: the documentation set the exported stage serves.
+    documentation: bool,
 }
 
 /// The YAML spelling of `document`, emitted by the YAML crate this service already parses
@@ -485,7 +519,8 @@ fn yaml_node(value: &Value) -> ::yaml_rust2::yaml::Yaml {
 /// A key the member documents no meaning for is ignored, as a query string parameter a
 /// service does not read is. An `extensions` value outside the documented set is refused
 /// with the member and the values it accepts named; a `postman` that ASKS for the Postman
-/// extensions is answered by [`postman_not_generated`].
+/// extensions — whether written as the parameter of that name or as the `extensions` value
+/// the member documents — is answered by [`postman_not_generated`].
 fn read_extensions(
     parameters: Option<&HashMap<String, String>>,
 ) -> Result<Extensions, GetExportError> {
@@ -518,12 +553,18 @@ fn read_extensions(
             }
         } else if name == EXTENSIONS_AUTHORIZERS {
             extensions.authorizers = true;
+        } else if name == EXTENSIONS_DOCUMENTATION {
+            extensions.documentation = true;
+        } else if name == POSTMAN_PARAMETER {
+            // The same extension set the parameter of that name asks for, asked for as an
+            // `extensions` value: one answer for one request, whichever spelling carries
+            // it.
+            return Err(postman_not_generated());
         } else {
             return Err(GetExportErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
-                    "Invalid extensions specified: {name}; extensions must be one of {}, \
-                     {EXTENSIONS_AUTHORIZERS}",
-                    EXTENSIONS_INTEGRATIONS.join(", ")
+                    "Invalid extensions specified: {name}; extensions must be one of {}",
+                    EXTENSIONS_VALUES.join(", ")
                 )),
             })
             .into());
@@ -657,6 +698,11 @@ fn export_document(
     if extensions.apigateway {
         if let Some(responses) = gateway_responses_extension(api) {
             document.insert(GATEWAY_RESPONSES_EXTENSION.to_string(), responses);
+        }
+    }
+    if extensions.documentation {
+        if let Some(documentation) = documentation_extension(api, stage) {
+            document.insert(DOCUMENTATION_EXTENSION.to_string(), documentation);
         }
     }
     if !api.binary_media_types.is_empty() {
@@ -1264,6 +1310,90 @@ fn gateway_responses_extension(api: &RestApiEntry) -> Option<Value> {
         responses.insert(response_type.clone(), Value::Object(rendered));
     }
     (!responses.is_empty()).then_some(Value::Object(responses))
+}
+
+/// The documentation set the exported stage SERVES, as the
+/// `x-amazon-apigateway-documentation` object — the same extension
+/// `ImportDocumentationParts` reads a documentation set back out of, so a set exported here
+/// is a set that side can import.
+///
+/// What a stage serves is the snapshot its `documentationVersion` pins ("The version of the
+/// associated API documentation", `Stage$documentationVersion`), and a
+/// `DocumentationVersion` is "a snapshot of the documentation of an API": so the entries
+/// come from the parts that version FROZE, in the order they were frozen in, and not from
+/// the API's current documentation parts. A part created, edited or deleted after the
+/// snapshot was taken is reported by the documentation-part readers; it does not change
+/// what a stage pinned to that snapshot exports.
+///
+/// `None` for a stage that pins no version, and for one whose pinned version the API no
+/// longer holds: there is no snapshot to render, and the live parts are not one.
+fn documentation_extension(api: &RestApiEntry, stage: &StageEntry) -> Option<Value> {
+    let snapshot = api
+        .documentation_versions
+        .get(stage.documentation_version.as_deref()?)?;
+    let mut rendered = Map::new();
+    rendered.insert(
+        "version".to_string(),
+        Value::from(snapshot.version.as_str()),
+    );
+    if let Some(created_date) = snapshot
+        .created_date
+        .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+    {
+        rendered.insert("createdDate".to_string(), Value::from(created_date));
+    }
+    rendered.insert(
+        DOCUMENTATION_PARTS_MEMBER.to_string(),
+        Value::Array(
+            snapshot
+                .documentation_parts
+                .iter()
+                .map(documentation_part_entry)
+                .collect(),
+        ),
+    );
+    Some(Value::Object(rendered))
+}
+
+/// One frozen documentation part as an entry of the exported documentation set: the API
+/// entity its location names, and the content map describing that entity.
+///
+/// The members are written under the names the import side reads an entry's location and
+/// content map under, and only the location members the part actually sets are written —
+/// the stored location already carries every member its entity type makes valid
+/// ([`super::create_documentation_part::validated_location`]). The content map is carried as
+/// the JSON OBJECT an OpenAPI document writes it as: the stored text is that same map "encoded
+/// as a JSON string" (`DocumentationPart$properties`).
+fn documentation_part_entry(part: &DocumentationPartEntry) -> Value {
+    let mut location = Map::new();
+    location.insert(
+        "type".to_string(),
+        Value::from(part.location.r#type.as_str()),
+    );
+    for (member, value) in [
+        ("path", &part.location.path),
+        ("method", &part.location.method),
+        ("statusCode", &part.location.status_code),
+        ("name", &part.location.name),
+    ] {
+        if let Some(value) = value {
+            location.insert(member.to_string(), Value::from(value.as_str()));
+        }
+    }
+    let mut entry = Map::new();
+    entry.insert("location".to_string(), Value::Object(location));
+    // Nothing but a content map is ever stored (`validated_properties` admits no other
+    // text), so the read below cannot fail; a text that somehow is not one documents
+    // nothing, and is carried as the empty content map rather than as a string the import
+    // side would refuse.
+    entry.insert(
+        "properties".to_string(),
+        ::serde_json::from_str::<Value>(&part.properties)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
+    Value::Object(entry)
 }
 
 /// One `map<string,string>` of a record as a document object, with its entries in key

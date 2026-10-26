@@ -159,21 +159,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Allows an acceptor to cancel an active agreement. Not all agreements
-        // are eligible for cancellation": one that is no longer active has
-        // already reached a terminal status, and cancelling it would move it
-        // backwards.
+        // are eligible for cancellation. Use the error response to determine
+        // why a cancellation request was rejected": one that is no longer active
+        // has already reached a terminal status, and cancelling it would move it
+        // backwards. That is the `INACTIVE_AGREEMENT` the model names among
+        // `ValidationExceptionReason`'s values, raised through
+        // [`crate::state::inactive_agreement`] — the single writer of this
+        // refusal, so this operation answers the condition in the same class, at
+        // the same status and on the same member as every sibling that requires
+        // an active agreement.
         if agreement.status != crate::state::STATUS_ACTIVE {
-            let status = agreement.status.clone();
-            return Err(CancelAgreementErrorModeled::ConflictException(
-                crate::state::conflict(
-                    crate::state::RESOURCE_TYPE_AGREEMENT,
-                    &input.agreement_id,
-                    format!(
-                        "agreement {} is {status}, and only an {} agreement can be cancelled",
-                        input.agreement_id,
-                        crate::state::STATUS_ACTIVE
-                    ),
-                ),
+            return Err(CancelAgreementErrorModeled::ValidationException(
+                crate::state::inactive_agreement(),
             )
             .into());
         }

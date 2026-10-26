@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a policy document to ONE Glue resource, and answers the hash of the policy
+//! now attached. A request that names no `ResourceArn` sets the Data Catalog's own
+//! policy. The document replaces whatever was attached rather than merging into it, so a
+//! later read reports exactly what the last write carried; the attachment keeps the
+//! `CreateTime` of the first write that made it. The two conditions the request may carry
+//! are checked BEFORE anything is stored: a `PolicyExistsCondition` that the attachment
+//! does not satisfy, and a `PolicyHashCondition` that is not the attached policy's hash,
+//! are each refused with the modelled condition failure and leave the store untouched.
+//!
+//! The resource an explicit `ResourceArn` names is NOT resolved against the store: a put
+//! attaches a policy to any Glue resource of this account and Region, whether or not this
+//! endpoint holds that resource. The member is documented "Do not use. For internal use
+//! only", and the policies of individual resources are set on the real service by
+//! Resource Access Manager during a cross-account grant rather than through this API — so
+//! there is no resource lifecycle here to resolve an ARN against, and refusing an ARN
+//! this store holds no resource for would leave the individual-resource half of
+//! `GetResourcePolicies` unreachable. A read of such a resource still reports what is
+//! attached to it, and nothing else about the resource is implied.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +97,10 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//!
+//! `EnableHybrid` selects whether the caller also grants cross-account access with the
+//! console's Grant permissions command. This emulator serves no console grants, so
+//! neither value changes what the put stores, and no read reports the member back.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -127,6 +141,25 @@ impl From<PutResourcePolicyErrorModeled> for PutResourcePolicyError {
     }
 }
 
+/// This operation's refusal for a request member it cannot serve: 400
+/// `InvalidInputException` carrying `message`.
+fn invalid_input(message: String) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's refusal for a condition the request asked to be checked and the
+/// stored attachment does not satisfy: 400 `ConditionCheckFailureException`.
+fn condition_check_failure(message: &str) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::ConditionCheckFailureException(ConditionCheckFailureException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `PutResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +196,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The resource the policy is attached to: the ARN the request named, else this
+        // account's Data Catalog. An ARN of another account's or another Region's estate
+        // must not be conjured into this store by the write.
+        let region = crate::state::request_region(ctx.parts());
+        let resource_arn =
+            match crate::state::resolve_policy_resource_arn(input.resource_arn.as_ref(), &region) {
+                Ok(resource_arn) => resource_arn,
+                Err(message) => return Err(invalid_input(message)),
+            };
+
+        // "Contains the policy document to set, in JSON format": a value that is no JSON
+        // document at all is a bad parameter, not a policy. Only the document's FORM is
+        // checked here — what a statement grants is the caller's to decide.
+        if !serde_json::from_str::<serde_json::Value>(&input.policy_in_json)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(invalid_input(
+                crate::state::messages::POLICY_MUST_BE_JSON.to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let attached_hash = store
+            .resource_policy(&resource_arn)
+            .map(|attached| attached.policy_hash.clone());
+
+        // "A value of MUST_EXIST is used to update a policy. A value of NOT_EXIST is used
+        // to create a new policy. If a value of NONE or a null value is used, the call
+        // does not depend on the existence of a policy."
+        let exists_condition = input.policy_exists_condition.as_deref();
+        if exists_condition == Some(crate::state::EXIST_CONDITION_MUST_EXIST)
+            && attached_hash.is_none()
+        {
+            return Err(condition_check_failure(
+                crate::state::messages::POLICY_CONDITION_FAILED,
+            ));
+        }
+        if exists_condition == Some(crate::state::EXIST_CONDITION_NOT_EXIST)
+            && attached_hash.is_some()
+        {
+            return Err(condition_check_failure(
+                crate::state::messages::POLICY_ALREADY_EXISTS,
+            ));
+        }
+
+        // "The hash value returned when the previous policy was set using
+        // PutResourcePolicy. Its purpose is to prevent concurrent modifications of a
+        // policy": the write proceeds only against the policy the caller last saw, so a
+        // hash that is not the attached policy's — including one sent for a resource with
+        // no policy at all — fails the condition.
+        if let Some(hash_condition) = input.policy_hash_condition.as_deref() {
+            if attached_hash.as_deref() != Some(hash_condition) {
+                return Err(condition_check_failure(
+                    crate::state::messages::POLICY_CONDITION_FAILED,
+                ));
+            }
+        }
+
+        let Some(policy_hash) =
+            store.set_resource_policy(&resource_arn, input.policy_in_json, now)
+        else {
+            return Err(invalid_input(
+                crate::state::messages::too_many_resource_policies(
+                    crate::state::MAX_RESOURCE_POLICIES,
+                ),
+            ));
+        };
+        ::tracing::info!(
+            operation = "PutResourcePolicy",
+            resource_arn = %resource_arn,
+            "attached a resource policy"
+        );
+
+        Ok(PutResourcePolicyOutput {
+            policy_hash: Some(policy_hash),
+        })
     }
 }

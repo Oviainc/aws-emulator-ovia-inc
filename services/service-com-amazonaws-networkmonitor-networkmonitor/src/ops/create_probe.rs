@@ -311,10 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
         monitor.probes.insert(probe_id.clone(), probe);
-        // The monitor changed: it now holds a probe, so it is owed the
-        // `PENDING` -> `ACTIVE` transition and its `modifiedAt` moves.
+        // The monitor changed: it now holds a probe in service, so it is owed
+        // the `PENDING` -> `ACTIVE` transition and its `modifiedAt` moves. The
+        // monitor-level state comes from the one rule that decides it, the
+        // probes the monitor now holds.
         monitor.modified_at = now;
-        monitor.schedule_activation(now);
+        monitor.follow_probe_states(now);
 
         if let Some(token) = input.client_token {
             store.record_client_token(

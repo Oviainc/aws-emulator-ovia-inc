@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseLogEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseLogEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one page of the lines a log stream of the managed relational database
+//! the request names holds inside the time interval it asked for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseLogEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +178,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseLogEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseLogEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: "Returns a list of log events for a database" — the
+        // answer is the window of the named log stream the request asked for,
+        // and nothing about the request changes what that stream holds. A
+        // database is addressed by name alone, so `ctx`'s request metadata takes
+        // no part in it.
+        let _ = ctx;
+
+        // `relationalDatabaseName` and `logStreamName` are modelled `@required`
+        // members and the name carries the `ResourceName` pattern, so the
+        // centralized walk already refused an absent or malformed one. What is
+        // left is what the model cannot express: the interval has to be an
+        // interval, the database has to exist, the stream has to be one that
+        // database publishes, `startFromHead` has to name an end its engine
+        // serves, and a page token has to be one a previous page reported.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseLogEvents"))
+        // "The start of the time interval from which to get log events" / "The
+        // end of the time interval from which to get log events": both members
+        // are optional, so an absent bound leaves that side of the interval
+        // open — but an interval whose end does not follow its start is no
+        // interval at all, and this service refuses that pair the same way
+        // wherever it takes one (see `GetContainerLog`).
+        if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
+            let start_key = crate::state::timestamp_key(start);
+            let end_key = crate::state::timestamp_key(end);
+            if start_key >= end_key {
+                return Err(invalid(format!(
+                    "startTime must be earlier than endTime, got startTime {}.{:09} and \
+                     endTime {}.{:09} (seconds and nanoseconds since the epoch)",
+                    start_key.0, start_key.1, end_key.0, end_key.1
+                )));
+            }
+        }
+
+        // Epoch milliseconds, the unit the stored log holds its instants in:
+        // "Specified in the Unix time format."
+        let from_ms = input
+            .start_time
+            .map(|start| start.to_millis().unwrap_or(i64::MIN));
+        let to_ms = input.end_time.map(|end| end.to_millis().unwrap_or(i64::MAX));
+
+        // An absent — or empty — `pageToken` asks for the first page, the end
+        // `startFromHead` names; a token names where a previous page stopped,
+        // and a value that is no token of this log is refused rather than read
+        // as "start again from the head".
+        let page_token = match input
+            .page_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            None => None,
+            Some(token) => Some(
+                crate::state::LogEventPageToken::parse(token)
+                    .ok_or_else(|| invalid_page_token(token))?,
+            ),
+        };
+        // "Parameter to specify if the log should start from head or tail. If
+        // true is specified, the log event starts from the head of the log. If
+        // false is specified, the log event starts from the tail of the log."
+        // Absent is the documented default, false — the tail.
+        let start_from_head = input.start_from_head.unwrap_or(false);
+
+        let page = crate::state::with_state(&*self.engine, |store| {
+            let database = store
+                .relational_database(&input.relational_database_name)
+                .ok_or_else(|| not_found(&input.relational_database_name))?;
+
+            // "For PostgreSQL, the default value of false is the only option
+            // available": a PostgreSQL database serves the tail of its log and
+            // nothing else, so asking it for the head is a value the service
+            // does not accept for that engine rather than one it quietly
+            // ignores.
+            if start_from_head && crate::state::is_postgres_engine(database.blueprint.engine) {
+                return Err(head_not_available(database.blueprint.engine));
+            }
+
+            // "The name of the log stream. Use the get relational database log
+            // streams operation to get a list of available log streams": a name
+            // that is not one of them addresses no log file, so it earns the
+            // service's `DoesNotExist` envelope rather than an empty report,
+            // which would read as "that file exists and is empty".
+            if !database.publishes_log_stream(&input.log_stream_name) {
+                return Err(stream_does_not_exist(&input.log_stream_name, database));
+            }
+
+            Ok(database.log_event_page(
+                &input.log_stream_name,
+                from_ms,
+                to_ms,
+                start_from_head,
+                page_token,
+            ))
+        })
+        .ok_or_else(unavailable)??;
+
+        Ok(GetRelationalDatabaseLogEventsOutput {
+            // A page always reports a list, empty or not: a stream that holds
+            // no line inside the requested interval has none to report, and an
+            // absent member would hand a typed caller a null where it iterates.
+            resource_log_events: Some(page.events),
+            // "A token used for advancing to the next page of results" / "to
+            // the previous page": a stream is appended to while a caller reads
+            // it, so both are reported even by a page that carried no line —
+            // the forward one picks up whatever is written next.
+            next_forward_token: Some(page.next_forward_token.to_string()),
+            next_backward_token: Some(page.next_backward_token.to_string()),
+        })
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name, as every other read of this resource answers it.
+fn not_found(name: &str) -> GetRelationalDatabaseLogEventsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// The database exists but publishes no log stream of that name: the same
+/// `DoesNotExist` envelope (HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist`), with a message built from the request — the stream and
+/// database it named — and the streams that database DOES publish, so the caller
+/// can fix the request from the text alone. A log stream is not a resource of the
+/// account (the modelled `ResourceType` enum has no entry for one), so the
+/// message is not the resource-type/name one. The list is the engine's own
+/// published set, so the refusal's size does not grow with what the store holds.
+fn stream_does_not_exist(
+    stream: &str,
+    database: &crate::state::StoredRelationalDatabase,
+) -> GetRelationalDatabaseLogEventsError {
+    let published = database.log_streams();
+    let known = if published.is_empty() {
+        "it is still being created, so its engine has started no log".to_string()
+    } else {
+        format!("the streams it publishes are [{}]", published.join(", "))
+    };
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "No log stream named \"{stream}\" is published by the relational database {name}: \
+         {known}.",
+        name = database.name
+    ))
+}
+
+/// `startFromHead` asked for the head of the log of a database whose engine
+/// serves only its tail: the modelled `InvalidInputException`, documented as
+/// "user input does not conform to the validation rules of an input field",
+/// whose message names the member, the engine and the rule.
+fn head_not_available(engine: &str) -> GetRelationalDatabaseLogEventsError {
+    invalid(format!(
+        "startFromHead true is not available for a {engine} database: for PostgreSQL, the \
+         default value of false is the only option available"
+    ))
+}
+
+/// `pageToken` is not a token this operation issued, so it names no page of any
+/// log stream: the same modelled `InvalidInputException`. A page token is the
+/// `nextForwardToken` or `nextBackwardToken` a previous page reported.
+fn invalid_page_token(token: &str) -> GetRelationalDatabaseLogEventsError {
+    invalid(format!(
+        "pageToken {token:?} names no page of a relational database log stream; a page token is \
+         the value a previous GetRelationalDatabaseLogEvents request reported as \
+         nextForwardToken or nextBackwardToken"
+    ))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetRelationalDatabaseLogEventsError {
+    GetRelationalDatabaseLogEventsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabaseLogEventsError {
+    GetRelationalDatabaseLogEventsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

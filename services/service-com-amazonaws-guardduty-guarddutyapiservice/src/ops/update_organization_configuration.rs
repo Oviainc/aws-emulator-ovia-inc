@@ -193,6 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let mut state = state.lock();
+        // A MUTATION of the detector's own record, so the clock is read here — and
+        // before the record is borrowed, because `tick_millis` and the detector both
+        // borrow the store mutably.
+        let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             // Well formed (checked above) but not this account's in this Region:
             // the ownership failure the same classifier answers with.
@@ -228,6 +232,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Features` entry for the same switch wins.
         crate::state::apply_org_data_sources(configuration, input.data_sources.as_ref());
         crate::state::apply_org_feature_configurations(configuration, input.features.as_ref());
+        // `UpdatedAt` is "the last-updated timestamp for the detector"
+        // (`smithy_query(operation="GetDetector")`) and the organization
+        // configuration is part of the detector's own record, like the scan settings
+        // `UpdateMalwareScanSettings` writes — so a write that lands here moves the
+        // timestamp a read reports. Unconditional: exactly one of the two
+        // auto-enablement views is required (refused above otherwise), so an
+        // accepted request always writes the auto-enablement.
+        detector.updated_at_millis = now;
 
         // `UpdateOrganizationConfigurationResponse` declares no members
         // (`smithy_query(operation="UpdateOrganizationConfiguration")`): the

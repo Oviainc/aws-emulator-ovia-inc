@@ -703,9 +703,8 @@ async fn deleting_a_job_template_frees_its_client_token() {
 
 /// RULE 4 for the other reader of a stored template: `StartJobRun` resolves a
 /// `jobTemplateId` out of the SAME store, so an id naming no stored template is not
-/// found, while one that does exist is refused with the modelled `ValidationException` —
-/// this emulator does not apply a template's `jobTemplateData` to a run, and a run built
-/// from the request alone would ignore the values the template exists to enforce.
+/// found, while one that does exist supplies the values the run is built from — which
+/// [`crate::start_job_run_job_template`] asserts member by member.
 #[tokio::test]
 async fn start_job_run_resolves_a_job_template_id_out_of_the_store() {
     let emr = Emr::new();
@@ -724,8 +723,8 @@ async fn start_job_run_resolves_a_job_template_id_out_of_the_store() {
         text(answer.ok("the fixture cluster"), "/id", "the fixture cluster")
     };
 
-    // Rows differ in the stored template's shape, so the refusal is about the template
-    // being unapplicable rather than about one particular body.
+    // Rows differ in the stored template's shape, so the rule is about resolving a
+    // template rather than about one particular body.
     let stored = [
         ("a minimal stored template", "sjr-minimal", minimal_data()),
         ("a parametric stored template", "sjr-deep", deep_data()),
@@ -738,7 +737,7 @@ async fn start_job_run_resolves_a_job_template_id_out_of_the_store() {
         .await;
         let template_id = text(created.ok(label), "/id", label);
 
-        let refused = emr
+        let started = emr
             .send(
                 "POST",
                 &format!("/virtualclusters/{cluster}/jobruns"),
@@ -748,10 +747,23 @@ async fn start_job_run_resolves_a_job_template_id_out_of_the_store() {
                 })),
             )
             .await;
-        refused.refused(label, 400, "ValidationException");
+        let run = text(started.ok(label), "/id", label);
+        assert_resource_id(label, "the templated job run id", &run);
+        let described = emr
+            .send(
+                "GET",
+                &format!("/virtualclusters/{cluster}/jobruns/{run}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            text(field(described.ok(label), "/jobRun", label), "/id", label),
+            run,
+            "case {label:?}: the run StartJobRun minted from the template must be readable"
+        );
     }
 
-    // An id of the right shape naming no stored template is not found, not unapplicable.
+    // An id of the right shape naming no stored template is not found.
     for (label, unknown) in [
         ("a template id that was never minted", "doesnotexist1"),
         ("a template id of the right shape but no record", "0zzzz9"),

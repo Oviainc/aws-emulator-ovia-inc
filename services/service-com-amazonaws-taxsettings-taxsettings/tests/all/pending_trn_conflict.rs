@@ -128,7 +128,11 @@ fn force_status(engine: &Arc<engine::InMemoryEngine>, account_id: &str, status: 
 
 /// The `(accountId, code, message)` of every row of a batch answer's `errors`
 /// list, in the order the response carries them.
-fn error_rows(answer: &Answer) -> Vec<(String, String, String)> {
+///
+/// `pub(crate)` because `tests/all/registration_type_refusals.rs` reads the same
+/// list for the per-account refusals it asserts: one reader, so two suites
+/// cannot read the batch's error channel two different ways.
+pub(crate) fn error_rows(answer: &Answer) -> Vec<(String, String, String)> {
     answer
         .get("errors")
         .as_array()

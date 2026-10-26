@@ -3393,6 +3393,28 @@ pub fn validation_exception(reason: &str, path: impl Into<String>) -> Validation
     }
 }
 
+/// The `ValidationExceptionReason` for a request whose `agreementId` names an
+/// agreement that is no longer active — the one reason the model publishes for
+/// that condition.
+pub const REASON_INACTIVE_AGREEMENT: &str = "INACTIVE_AGREEMENT";
+
+/// The refusal EVERY operation of this service that acts only on an active
+/// agreement answers for one that has already reached a terminal status
+/// ([`STATUS_CANCELLED`], [`STATUS_REPLACED`], or any other value of
+/// `AgreementStatus` outside [`STATUS_ACTIVE`]).
+///
+/// Such a request is an input fault on the member that named the agreement, not
+/// a conflict over the resource: the status is what the caller is told to read
+/// the refusal for, and `ValidationException` is the shape that carries a
+/// machine-readable `reason` — [`REASON_INACTIVE_AGREEMENT`] — and a `fields`
+/// entry naming `agreementId`, which `ConflictException` has no member for. One
+/// writer, so `CancelAgreement`, `SendAgreementCancellationRequest` and
+/// `SendAgreementPaymentRequest` cannot disagree on the class, the status or the
+/// member for the same condition.
+pub fn inactive_agreement() -> ValidationException {
+    validation_exception(REASON_INACTIVE_AGREEMENT, "agreementId")
+}
+
 /// Refuse a selector whose value lies outside the fixed set this service
 /// publishes for that member, BEFORE anything is selected.
 ///

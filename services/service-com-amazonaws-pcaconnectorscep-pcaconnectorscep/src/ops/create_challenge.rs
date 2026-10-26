@@ -208,8 +208,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientToken` is how the caller says "this is a retry": within its documented
         // five-minute window the same token answers with the challenge it already created,
         // password included, rather than minting a second password.
+        //
+        // A retry is not exempt from the preconditions of the call it stands for, so the
+        // token answers only while the connector that challenge lives under could still
+        // serve a fresh one: once that connector is gone, or accepted for teardown and
+        // reporting `DELETING`, there is nothing to hand out and the call falls through to
+        // be answered exactly as the same request with a token nobody has used yet. (The
+        // sibling create decides the same situation the same way — see
+        // `create_connector.rs`.)
         if let Some(existing) = store.challenge_for_token(input.client_token.as_deref()) {
-            if let Some(challenge) = store.challenge(&existing.arn) {
+            let answerable = store.challenge(&existing.arn).filter(|challenge| {
+                store
+                    .connectors
+                    .get(&challenge.connector_arn)
+                    .is_some_and(crate::state::StoredConnector::is_active)
+            });
+            if let Some(challenge) = answerable {
                 // Same token, different request: the caller is not retrying the call this
                 // token stands for.
                 if existing.request != request {
