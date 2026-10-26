@@ -3,8 +3,9 @@
 //! @op GetSoftwareUpdates
 //!
 //! Issues a software-update grant for the requested job and answers the Amazon S3 URL
-//! that grant publishes. The job must be one this service persisted, and it must still
-//! have a device an update file can be fetched for; the URL is available for the two days
+//! that grant publishes. The job must be one this service persisted, and a device must
+//! already have been prepared and shipped for it, since the update file is that device's
+//! software; the URL is available for the two days
 //! `GetSoftwareUpdatesResult$UpdatesURI` documents, after which another call issues
 //! another one.
 //!
@@ -187,15 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A job whose state leaves it without a device has no update file to fetch
-        // either; unlike a main job that is a property of where the job GOT TO, which is
-        // what `InvalidJobStateException` states.
-        if !job.job_state.has_software_update() {
+        // The update file is the software of the device the job ordered, so there is one
+        // only once a device has actually been prepared and shipped for the job
+        // ([`crate::state::JobState::has_prepared_device`]): while the order is still being
+        // placed and made ready no device exists to hold that software, and an order that
+        // was cancelled never gets one. Unlike a main job that is a property of where the
+        // job GOT TO, which is what `InvalidJobStateException` states.
+        if !job.job_state.has_prepared_device() {
             return Err(GetSoftwareUpdatesErrorModeled::InvalidJobStateException(
                 InvalidJobStateException {
                     message: Some(format!(
-                        "The job {} is in state {} and no device will be prepared for it, so \
-                         its software update file can't be requested.",
+                        "The job {} is in state {}, and its software update file can only be \
+                         requested once a device has been prepared and shipped for the job.",
                         job.job_id,
                         job.job_state.as_wire()
                     )),
