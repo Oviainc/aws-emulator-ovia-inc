@@ -352,6 +352,16 @@ pub const LAST_VPC_ASSOCIATION_MESSAGE: &str =
 /// value of Version is always 1."
 pub const FIRST_TRAFFIC_POLICY_VERSION: i32 = 1;
 
+/// The highest version number one traffic policy can reach.
+///
+/// `CreateTrafficPolicyVersion`'s own documentation: "You can create a maximum
+/// of 1000 versions of a traffic policy. If you reach the limit and need to
+/// create another version, you'll need to start a new traffic policy" — the
+/// limit the model's `TooManyTrafficPolicyVersionsForCurrentPolicy` reports, and
+/// the same ceiling `TrafficPolicyVersion` (`range 1..1000`) allows a version
+/// number to carry.
+pub const MAX_TRAFFIC_POLICY_VERSION: i32 = 1000;
+
 /// The `AWSPolicyFormatVersion` a traffic policy document declares.
 ///
 /// The "Traffic Policy Document Format" reference this operation's own
@@ -1036,6 +1046,20 @@ impl StoredTrafficPolicy {
             document: stored.document.clone(),
             comment: stored.comment.clone(),
         })
+    }
+
+    /// The version number the policy's NEXT version carries: one past the
+    /// highest it has ever reached, or [`FIRST_TRAFFIC_POLICY_VERSION`] for a
+    /// policy holding none.
+    ///
+    /// Counted from the highest version rather than from how many versions the
+    /// policy holds, so a version number is never handed out twice — a version
+    /// that has been deleted does not free its number for the next create.
+    pub fn next_version(&self) -> i32 {
+        self.versions
+            .keys()
+            .next_back()
+            .map_or(FIRST_TRAFFIC_POLICY_VERSION, |highest| highest + 1)
     }
 }
 
@@ -1728,19 +1752,28 @@ pub fn apply_tag_changes(
     Ok(())
 }
 
-/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for an `(Id, Version)` pair
-/// that names no traffic policy version in this store.
+/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for a request that names no
+/// traffic policy in this store.
 ///
 /// The ONE place this service words that refusal, so every operation addressed
 /// at a traffic policy answers a missing one identically. The message is
-/// REQUEST-DERIVED — it names the id and version the request asked about, which
-/// is what tells a caller whether the policy or the version was the missing
-/// half.
-pub fn no_such_traffic_policy(requested_id: &str, requested_version: i32) -> NoSuchTrafficPolicy {
+/// REQUEST-DERIVED — it names what the request asked about. An operation
+/// addressed at ONE VERSION of a policy (`GetTrafficPolicy` takes `(Id,
+/// Version)`) passes that version, and the refusal names it too, which is what
+/// tells a caller whether the policy or the version was the missing half; an
+/// operation addressed at the POLICY passes `None`, because such a request
+/// names no version to report as missing.
+pub fn no_such_traffic_policy(
+    requested_id: &str,
+    requested_version: Option<i32>,
+) -> NoSuchTrafficPolicy {
     NoSuchTrafficPolicy {
-        message: Some(format!(
-            "No traffic policy exists with ID {requested_id} and version {requested_version}"
-        )),
+        message: Some(match requested_version {
+            Some(version) => format!(
+                "No traffic policy exists with ID {requested_id} and version {version}"
+            ),
+            None => format!("No traffic policy exists with ID {requested_id}"),
+        }),
     }
 }
 

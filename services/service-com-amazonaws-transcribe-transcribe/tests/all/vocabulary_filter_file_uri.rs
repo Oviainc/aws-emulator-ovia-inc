@@ -24,6 +24,11 @@
 //! branch. The vocabulary family's own file form, which also carries a modelled
 //! processing state, is `crate::vocabulary_file_uri`'s subject.
 //!
+//! A filter recorded either way is ONE record, so every operation that names a filter
+//! by name resolves a file-backed one exactly as it does one built from `Words`: the
+//! last test here drives each `Settings.VocabularyFilterName` member of this service's
+//! job families over both sources.
+//!
 //! Every call goes through the same `MultiServiceRouter` the production router
 //! dispatches on, so these tests exercise the awsJson1_1 envelope, the boundary
 //! constraint validation and the handlers' own refusals — not just the handler
@@ -35,7 +40,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::medical_scribe_settings_references::{FILTER_METHODS, KIND_VOCABULARY_FILTER};
 use crate::medical_vocabularies::is_absent;
+use crate::transcription_job_request_rules::not_found_message;
 use crate::transcription_jobs::{Reply, Transcribe};
 
 /// The region every row of this suite is served in (the rows are unsigned, and this
@@ -538,4 +545,244 @@ async fn a_filter_request_naming_neither_or_both_sources_is_still_refused() {
         "a request refused at the boundary must leave the record untouched, got {:?}",
         got.body
     );
+}
+
+/// Where a filter's words come from, as the `CreateVocabularyFilter` member(s) that
+/// name the source: both alternatives the operation publishes, the file one over each
+/// URI scheme its `@pattern` admits (`^(s3://|http(s*)://).+$`) and at the member's
+/// published 2000-character ceiling.
+fn word_sources() -> Vec<(&'static str, Value)> {
+    vec![
+        ("inline Words", json!({"Words": ["crud", "чепуха"]})),
+        (
+            "an s3 file",
+            json!({"VocabularyFilterFileUri": "s3://DOC-EXAMPLE-BUCKET/my-filter-file.txt"}),
+        ),
+        (
+            "an https file",
+            json!({
+                "VocabularyFilterFileUri": "https://example-bucket.s3.amazonaws.com/words.txt"
+            }),
+        ),
+        (
+            "an http file",
+            json!({
+                "VocabularyFilterFileUri": "http://example-bucket.s3.amazonaws.com/words.txt"
+            }),
+        ),
+        (
+            "a file URI at the modelled 2000-character ceiling",
+            json!({"VocabularyFilterFileUri": file_uri_of_length(2000)}),
+        ),
+    ]
+}
+
+/// A `CreateVocabularyFilter` request for `name` whose words come from `source`.
+fn create_from(name: &str, source: &Value) -> Value {
+    let mut request = json!({"VocabularyFilterName": name, "LanguageCode": "en-US"});
+    let members = request
+        .as_object_mut()
+        .expect("a create request is a JSON object");
+    for (member, value) in source
+        .as_object()
+        .expect("a word source is a JSON object")
+        .iter()
+    {
+        members.insert(member.clone(), value.clone());
+    }
+    request
+}
+
+/// A reader's request: the one member that names the resource to report.
+fn by_name(member: &str, name: &str) -> Value {
+    let mut request = serde_json::Map::new();
+    request.insert(member.to_string(), json!(name));
+    Value::Object(request)
+}
+
+/// One operation that NAMES a custom vocabulary filter: the start that applies it, the
+/// reader that reports the stored job, and where the applied name sits in each.
+struct FilterConsumer {
+    case: &'static str,
+    start: &'static str,
+    get: &'static str,
+    /// The job-name member the start and the reader both carry.
+    name_member: &'static str,
+    /// The member of the reader's answer the stored job sits under.
+    job_member: &'static str,
+    /// A start request for the job `job` applying the filter `filter`, qualified by the
+    /// vocabulary filter `method` where the member it uses documents one.
+    request: fn(job: &str, filter: &str, method: &str) -> Value,
+    /// The filter name the stored job reports.
+    stored_reference: fn(&Value) -> Option<&str>,
+}
+
+/// Every member of this service through which a job applies a custom vocabulary filter
+/// it names: the top-level settings of each job family that has one, and the
+/// per-language `LanguageIdSettings` that names resources of the same families
+/// (`smithy_query(query="shape", shape="Settings,CallAnalyticsJobSettings,\
+/// MedicalScribeSettings,LanguageIdSettings")`).
+fn filter_consumers() -> Vec<FilterConsumer> {
+    vec![
+        FilterConsumer {
+            case: "StartTranscriptionJob Settings.VocabularyFilterName",
+            start: "StartTranscriptionJob",
+            get: "GetTranscriptionJob",
+            name_member: "TranscriptionJobName",
+            job_member: "TranscriptionJob",
+            // "if you include VocabularyFilterName in your request, you must also
+            // include VocabularyFilterMethod".
+            request: |job, filter, method| {
+                json!({
+                    "TranscriptionJobName": job,
+                    "LanguageCode": "en-US",
+                    "Media": {"MediaFileUri": "s3://example-media/audio.flac"},
+                    "Settings": {
+                        "VocabularyFilterName": filter,
+                        "VocabularyFilterMethod": method
+                    }
+                })
+            },
+            stored_reference: |job| job["Settings"]["VocabularyFilterName"].as_str(),
+        },
+        FilterConsumer {
+            case: "StartTranscriptionJob LanguageIdSettings[en-US].VocabularyFilterName",
+            start: "StartTranscriptionJob",
+            get: "GetTranscriptionJob",
+            name_member: "TranscriptionJobName",
+            job_member: "TranscriptionJob",
+            request: |job, filter, _| {
+                json!({
+                    "TranscriptionJobName": job,
+                    "IdentifyLanguage": true,
+                    // "It's recommended that you include LanguageOptions when using
+                    // LanguageIdSettings to ensure that the correct language dialect
+                    // is identified", and "the language codes that you specify must
+                    // match the languages of the associated ... custom vocabulary
+                    // filters" — the filters these rows hold are all en-US
+                    // (`smithy_query(query="doc", shape="StartTranscriptionJobRequest",
+                    // member="LanguageIdSettings")`).
+                    "LanguageOptions": ["en-US"],
+                    "Media": {"MediaFileUri": "https://example.invalid/media/clip.mp4"},
+                    "LanguageIdSettings": {"en-US": {"VocabularyFilterName": filter}}
+                })
+            },
+            stored_reference: |job| {
+                job["LanguageIdSettings"]["en-US"]["VocabularyFilterName"].as_str()
+            },
+        },
+        FilterConsumer {
+            case: "StartCallAnalyticsJob Settings.VocabularyFilterName",
+            start: "StartCallAnalyticsJob",
+            get: "GetCallAnalyticsJob",
+            name_member: "CallAnalyticsJobName",
+            job_member: "CallAnalyticsJob",
+            request: |job, filter, method| {
+                json!({
+                    "CallAnalyticsJobName": job,
+                    "Media": {"MediaFileUri": "s3://example-media/call.flac"},
+                    "Settings": {
+                        "VocabularyFilterName": filter,
+                        "VocabularyFilterMethod": method
+                    }
+                })
+            },
+            stored_reference: |job| job["Settings"]["VocabularyFilterName"].as_str(),
+        },
+        FilterConsumer {
+            case: "StartMedicalScribeJob Settings.VocabularyFilterName",
+            start: "StartMedicalScribeJob",
+            get: "GetMedicalScribeJob",
+            name_member: "MedicalScribeJobName",
+            job_member: "MedicalScribeJob",
+            // `OutputBucketName` and `DataAccessRoleArn` are `@required` here, and the
+            // settings must choose one of the two speaker-partitioning modes.
+            request: |job, filter, method| {
+                json!({
+                    "MedicalScribeJobName": job,
+                    "Media": {"MediaFileUri": "s3://example-media/consult.flac"},
+                    "OutputBucketName": "example-scribe-output",
+                    "DataAccessRoleArn": DATA_ACCESS_ROLE,
+                    "Settings": {
+                        "ShowSpeakerLabels": true,
+                        "MaxSpeakerLabels": 2,
+                        "VocabularyFilterName": filter,
+                        "VocabularyFilterMethod": method
+                    }
+                })
+            },
+            stored_reference: |job| job["Settings"]["VocabularyFilterName"].as_str(),
+        },
+    ]
+}
+
+/// A filter is ONE record whatever its words came from, so every member of this service
+/// that applies a filter BY NAME resolves a file-backed filter exactly as it does one
+/// built from the words a request listed: the start is served, the stored job reports
+/// the name it applied, and a name no create recorded is still the family's own
+/// not-found refusal — so what serves these starts is the record, not a missing check.
+#[tokio::test]
+async fn a_file_backed_filter_is_usable_from_every_member_that_names_a_filter() {
+    let transcribe = Transcribe::new();
+    let sources = word_sources();
+
+    // One held filter per word source, so a start naming it is decided only by where
+    // that filter's words came from.
+    for (index, (case, source)) in sources.iter().enumerate() {
+        transcribe
+            .call(
+                "CreateVocabularyFilter",
+                create_from(&format!("filter-from-{index}"), source),
+            )
+            .await
+            .ok(case);
+    }
+
+    for (consumer_index, consumer) in filter_consumers().iter().enumerate() {
+        for (index, (source_case, _)) in sources.iter().enumerate() {
+            let case = format!("{} applying a filter from {source_case}", consumer.case);
+            let filter = format!("filter-from-{index}");
+            let job = format!("job-{consumer_index}-{index}");
+            let method = FILTER_METHODS[index % FILTER_METHODS.len()];
+
+            transcribe
+                .call(consumer.start, (consumer.request)(&job, &filter, method))
+                .await
+                .ok_status(&case, 200);
+
+            // The served start stored the reference, so the family's reader reports it.
+            let fetched = transcribe
+                .call(consumer.get, by_name(consumer.name_member, &job))
+                .await;
+            let stored = fetched.ok(&case)[consumer.job_member].clone();
+            assert_eq!(
+                (consumer.stored_reference)(&stored),
+                Some(filter.as_str()),
+                "case {case:?}: the stored job must report the filter it applied, got \
+                 {stored:?}"
+            );
+        }
+
+        // The same member naming a filter this account does NOT hold is refused with
+        // the family's not-found text, which names the kind and not the name asked for.
+        let case = format!("{} applying a filter no create recorded", consumer.case);
+        let refused = transcribe
+            .call(
+                consumer.start,
+                (consumer.request)(
+                    &format!("dangling-{consumer_index}"),
+                    "never-created",
+                    FILTER_METHODS[0],
+                ),
+            )
+            .await;
+        refused.refused(&case, 400, "BadRequestException");
+        assert_eq!(
+            refused.error_message(&case),
+            not_found_message(KIND_VOCABULARY_FILTER),
+            "case {case:?}: the refusal must be the vocabulary filter family's own \
+             not-found text, got {:?}",
+            refused.body
+        );
+    }
 }

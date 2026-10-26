@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartWebAuthnRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartWebAuthnRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartWebAuthnRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The passkey registration a signed-in user starts: the `AccessToken` the sign-in
+//! issued is what names the user, resolved through
+//! [`crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::signed_in_user`],
+//! and the credential creation options this call answers are rendered from the STORED
+//! pool and the STORED user — the relying party in force, the pool's user-verification
+//! requirement, the user's own name and handle, and the passkeys it has already
+//! registered. The call MINTS a challenge and stores the registration it belongs to, so
+//! the call that completes the registration can resolve the challenge it is answering.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +134,40 @@ impl From<StartWebAuthnRegistrationErrorModeled> for StartWebAuthnRegistrationEr
     }
 }
 
+/// The first-factor sign-in method a user pool admits when it offers passkeys:
+/// `SignInPolicyType.AllowedFirstAuthFactors` is "the sign-in methods that a user
+/// pool supports as the first factor" (this service's model) and `WEB_AUTHN` is
+/// its passkey value (`AuthFactorType`).
+const WEB_AUTHN: &str = "WEB_AUTHN";
+
+/// The only `PublicKeyCredentialType` the Web Authentication API defines, which
+/// every entry of the creation options carries (W3C Web Authentication Level 2
+/// §5.10.3, `PublicKeyCredentialType`: "public-key").
+const PUBLIC_KEY_CREDENTIAL_TYPE: &str = "public-key";
+
+/// The COSE algorithm identifiers a passkey may be minted with, in the relying
+/// party's order of preference: `-7` is ES256 and `-257` is RS256 (IANA "COSE
+/// Algorithms" registry), the two a passkey provider is expected to implement.
+const PUBLIC_KEY_ALGORITHMS: [i64; 2] = [-7, -257];
+
+/// A passkey is a DISCOVERABLE credential — the authenticator holds it, so a
+/// sign-in can start from the passkey rather than from a username — and
+/// `residentKey: "required"` is what asks for one (W3C Web Authentication Level 2
+/// §5.4.4, `AuthenticatorSelectionCriteria.residentKey`).
+const RESIDENT_KEY_REQUIRED: &str = "required";
+
+/// This registration asks for no attestation statement: `"none"` "indicates that
+/// the Relying Party is not interested in authenticator attestation" (W3C Web
+/// Authentication Level 2 §5.4.7, `AttestationConveyancePreference`), and nothing
+/// here verifies one.
+const ATTESTATION_NONE: &str = "none";
+
+/// The user attribute whose value is a human-palatable name for the user, which
+/// is what WebAuthn's `user.displayName` asks for: `name` is "the user's full
+/// name in displayable form" (OpenID Connect Core 1.0 §5.1, the standard
+/// attribute set this service's schema carries).
+const NAME_ATTRIBUTE: &str = "name";
+
 /// The `StartWebAuthnRegistration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,20 +202,293 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartWebAuthnRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartWebAuthnRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartWebAuthnRegistration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token
+        // is refused whether or not anything has swept it; the challenge this call
+        // hands out is measured from the same instant.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+
+        // Everything the options carry is read from the STORED pool and the STORED
+        // user the access token names: the request carries nothing but the token.
+        let (registration, creation) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+
+            // A pool that does not admit the passkey factor has not enabled the
+            // feature, so it has no credential creation options to request.
+            if !pool.allows_first_auth_factor(WEB_AUTHN) {
+                return Err(web_authn_not_enabled());
+            }
+
+            // A passkey is registered to a relying party, so a pool with neither a
+            // configured relying party id nor an authentication domain to serve as
+            // one cannot hand out options
+            // ([`crate::state::UserPool::relying_party_id`]).
+            let relying_party_id = pool
+                .relying_party_id()
+                .ok_or_else(web_authn_configuration_missing)?;
+
+            // One user holds a bounded number of passkeys, so a registration that
+            // would take it past the bound is refused before a challenge is minted.
+            if user.web_authn_credentials.len()
+                >= crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
+            {
+                return Err(limit_exceeded(format!(
+                    "User {} holds at most {} passkey credentials.",
+                    user.username,
+                    crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
+                )));
+            }
+
+            // The app client the token was issued to is recorded with the
+            // registration: a credential presented with an access token "for a
+            // different client than the one in the original
+            // StartWebAuthnRegistration request" is refused
+            // (`WebAuthnClientMismatchException` in this service's model). The
+            // token resolved a signed-in user just above, so its record is stored.
+            let client_id = guard
+                .token(&input.access_token)
+                .map(|record| record.client_id.clone())
+                .ok_or_else(|| not_authorized(INVALID_ACCESS_TOKEN))?;
+
+            let user_verification = pool.web_authn_user_verification();
+            let creation = CredentialCreation {
+                relying_party_id: relying_party_id.clone(),
+                // WebAuthn's `rp.name` is "a human-palatable identifier for the
+                // Relying Party" (§5.4.1), which is the stored pool's name.
+                relying_party_name: pool.name.clone(),
+                // WebAuthn's `user.id` is the user handle: an opaque byte
+                // sequence of at most 64 bytes that "MUST NOT contain personally
+                // identifying information" (§5.4.3). The stored user's immutable
+                // `sub` is exactly that, base64url-encoded as the JSON form of a
+                // `BufferSource` is.
+                user_handle: crate::state::base64_url(user.sub.as_bytes()),
+                username: user.username.clone(),
+                // WebAuthn's `user.displayName` is "a human-palatable name for
+                // the user account" (§5.4.3): the stored `name` attribute when
+                // the user has one, and the stored username otherwise.
+                display_name: user
+                    .attributes
+                    .get(NAME_ATTRIBUTE)
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| user.username.clone()),
+                user_verification: user_verification.clone(),
+                // `excludeCredentials` lets a relying party "limit the creation
+                // of multiple credentials for the same account on a single
+                // authenticator" (§5.4), so it is the passkeys the user has
+                // ALREADY registered, read from the store in registration order.
+                registered: user
+                    .web_authn_credentials
+                    .iter()
+                    .map(|credential| {
+                        (
+                            credential.credential_id.clone(),
+                            credential.authenticator_transports.clone(),
+                        )
+                    })
+                    .collect(),
+            };
+            let registration = crate::state::WebAuthnRegistration {
+                user_pool_id: pool.id.clone(),
+                client_id,
+                username: user.username.clone(),
+                relying_party_id,
+                user_verification,
+                created_at: now,
+                // Checked, so an instant this clock cannot represent answers a
+                // modelled server error rather than unwinding the handler.
+                expires_at: now
+                    .checked_add(crate::state::WEB_AUTHN_REGISTRATION_TIMEOUT)
+                    .ok_or_else(internal_error)?,
+            };
+            (registration, creation)
+        };
+
+        // Starting the registration is what mints the challenge: it is stored with
+        // the registration it belongs to, so the call that completes the
+        // registration can tell a challenge this emulator handed out from one it
+        // never did, and a second registration gets its own.
+        let challenge = guard.start_web_authn_registration(now, registration);
+
+        Ok(StartWebAuthnRegistrationOutput {
+            credential_creation_options: document(&creation.options(&challenge)),
+        })
     }
+}
+
+/// What the credential creation options are rendered from: the values read from
+/// the stored pool and user, so the document is built with no borrow of the store
+/// still held.
+struct CredentialCreation {
+    relying_party_id: String,
+    relying_party_name: String,
+    user_handle: String,
+    username: String,
+    display_name: String,
+    user_verification: String,
+    /// One entry per passkey the user has already registered: its credential id
+    /// and the transports that credential reported, in registration order.
+    registered: Vec<(String, Vec<String>)>,
+}
+
+impl CredentialCreation {
+    /// The `PublicKeyCredentialCreationOptions` (W3C Web Authentication Level 2
+    /// §5.4) a passkey provider is given, carrying `challenge`: "the information
+    /// that a user can provide in their request to register with their passkey
+    /// provider" (`StartWebAuthnRegistration.CredentialCreationOptions` in this
+    /// service's model).
+    fn options(&self, challenge: &str) -> ::serde_json::Value {
+        ::serde_json::json!({
+            "rp": {
+                "id": self.relying_party_id,
+                "name": self.relying_party_name,
+            },
+            "user": {
+                "id": self.user_handle,
+                "name": self.username,
+                "displayName": self.display_name,
+            },
+            "challenge": challenge,
+            "pubKeyCredParams": PUBLIC_KEY_ALGORITHMS
+                .iter()
+                .map(|algorithm| {
+                    ::serde_json::json!({
+                        "type": PUBLIC_KEY_CREDENTIAL_TYPE,
+                        "alg": algorithm,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            // The window the caller is told about is the window the registration
+            // is held for ([`crate::state::WEB_AUTHN_REGISTRATION_TIMEOUT`]).
+            "timeout": crate::state::WEB_AUTHN_REGISTRATION_TIMEOUT.as_millis(),
+            "excludeCredentials": self
+                .registered
+                .iter()
+                .map(|(credential_id, transports)| {
+                    ::serde_json::json!({
+                        "type": PUBLIC_KEY_CREDENTIAL_TYPE,
+                        "id": credential_id,
+                        "transports": transports,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "authenticatorSelection": {
+                "residentKey": RESIDENT_KEY_REQUIRED,
+                // The deprecated boolean the same requirement is read from by an
+                // authenticator that predates `residentKey` (§5.4.4,
+                // `requireResidentKey`).
+                "requireResidentKey": true,
+                "userVerification": self.user_verification,
+            },
+            "attestation": ATTESTATION_NONE,
+        })
+    }
+}
+
+/// The modelled `Document` for `value`, which is what the `CredentialCreationOptions`
+/// member carries on the wire.
+fn document(value: &::serde_json::Value) -> ::aws_smithy_types::Document {
+    use ::aws_smithy_types::{Document, Number};
+    match value {
+        ::serde_json::Value::Null => Document::Null,
+        ::serde_json::Value::Bool(value) => Document::Bool(*value),
+        ::serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                Document::Number(Number::PosInt(value))
+            } else if let Some(value) = value.as_i64() {
+                Document::Number(Number::NegInt(value))
+            } else {
+                Document::Number(Number::Float(value.as_f64().unwrap_or_default()))
+            }
+        }
+        ::serde_json::Value::String(value) => Document::String(value.clone()),
+        ::serde_json::Value::Array(items) => Document::Array(items.iter().map(document).collect()),
+        ::serde_json::Value::Object(members) => Document::Object(
+            members
+                .iter()
+                .map(|(name, member)| (name.clone(), document(member)))
+                .collect(),
+        ),
+    }
+}
+
+/// The message a token this emulator cannot resolve to a signed-in user is
+/// refused with.
+const INVALID_ACCESS_TOKEN: &str = "Invalid Access Token";
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model); a token whose pool
+/// or user has since been deleted answers the error for the resource that is gone.
+/// `StartWebAuthnRegistration` models neither of those two, so a token naming a
+/// deleted pool or user is refused as the token it is.
+fn token_rejected(rejection: crate::state::TokenRejection) -> StartWebAuthnRegistrationError {
+    match rejection {
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::NotAnAccessToken
+        | crate::state::TokenRejection::PoolGone
+        | crate::state::TokenRejection::UserGone => not_authorized(INVALID_ACCESS_TOKEN),
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> StartWebAuthnRegistrationError {
+    StartWebAuthnRegistrationErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a pool that does not offer passkeys at all: the exception "is
+/// thrown when the passkey feature isn't enabled for the user pool" (this
+/// service's model).
+fn web_authn_not_enabled() -> StartWebAuthnRegistrationError {
+    StartWebAuthnRegistrationErrorModeled::WebAuthnNotEnabledException(
+        WebAuthnNotEnabledException {
+            message: Some("WebAuthn is not enabled for this user pool.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a pool that offers passkeys but names no relying party: the
+/// exception "is thrown when a user pool doesn't have a configured relying party
+/// id or a user pool domain" (this service's model).
+fn web_authn_configuration_missing() -> StartWebAuthnRegistrationError {
+    StartWebAuthnRegistrationErrorModeled::WebAuthnConfigurationMissingException(
+        WebAuthnConfigurationMissingException {
+            message: Some(
+                "This user pool does not have a relying party ID or a user pool domain \
+                 configured."
+                    .to_string(),
+            ),
+        },
+    )
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a user already holding every
+/// passkey one user may hold.
+fn limit_exceeded(message: String) -> StartWebAuthnRegistrationError {
+    StartWebAuthnRegistrationErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> StartWebAuthnRegistrationError {
+    StartWebAuthnRegistrationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

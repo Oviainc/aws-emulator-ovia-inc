@@ -8,8 +8,9 @@
 //! The rule pinned here: `MessageSystemAttributeNames` carries the message system
 //! attribute names, `AttributeNames` is the discontinued alias of that member, and an
 //! alias accepts the value set of the member that replaced it — so each name member
-//! serves every message system attribute name, refuses a name outside that set with
-//! `InvalidAttributeName`, and the two spellings answer the same request identically.
+//! serves every message system attribute name, refuses a name outside that set as an
+//! invalid value for the member it was supplied on, and the two spellings answer the
+//! same request identically.
 //!
 //! The table walks the WHOLE published value set on BOTH members rather than the one
 //! name a defect was reported for, and the refusal rows walk the kinds of name that are
@@ -147,7 +148,8 @@ async fn every_system_attribute_name_is_served_on_both_name_members() {
 }
 
 /// A name outside the message system attribute set names no attribute, on either
-/// member: the request is refused with `InvalidAttributeName` and nothing is handed
+/// member: the request is refused as that member's value — `InvalidParameterValue`
+/// naming the member, the offending name and the set it accepts — and nothing is handed
 /// over. The rows walk the kinds of name that are outside the set.
 #[tokio::test]
 async fn a_name_outside_the_system_attribute_set_is_refused_on_both_members() {
@@ -202,14 +204,15 @@ async fn a_name_outside_the_system_attribute_set_is_refused_on_both_members() {
             let (status, answer) = call(&router, "ReceiveMessage", &request).await;
             assert_eq!(
                 (status, error_code(&answer).as_str()),
-                (400, "InvalidAttributeName"),
-                "case {case}: expected a 400 InvalidAttributeName, got {status} with {answer}"
+                (400, "InvalidParameterValue"),
+                "case {case}: expected a 400 InvalidParameterValue, got {status} with {answer}"
             );
             assert!(
                 answer["message"]
                     .as_str()
-                    .is_some_and(|message| message.contains(reported)),
-                "case {case}: the refusal must name {reported}, got {answer}"
+                    .is_some_and(|message| message.contains(reported)
+                        && message.contains(member)),
+                "case {case}: the refusal must name {reported} and {member}, got {answer}"
             );
             assert!(
                 messages(&answer).is_empty(),

@@ -46,7 +46,7 @@ use crate::distribution_lifecycle::{
 
 /// `POST /2020-05-31/response-headers-policy` with the `ResponseHeadersPolicyConfig`
 /// document `body` — the member the operation binds to the HTTP payload.
-async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -75,7 +75,7 @@ async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// `ResponseHeadersPolicyCorsConfig`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Cors {
+pub(crate) struct Cors {
     origins: Vec<String>,
     headers: Vec<String>,
     /// Values of `ResponseHeadersPolicyAccessControlAllowMethodsValues`.
@@ -90,7 +90,7 @@ struct Cors {
 
 /// `ResponseHeadersPolicyXSSProtection`.
 #[derive(Debug, Clone)]
-struct Xss {
+pub(crate) struct Xss {
     r#override: bool,
     protection: bool,
     mode_block: Option<bool>,
@@ -99,7 +99,7 @@ struct Xss {
 
 /// `ResponseHeadersPolicyStrictTransportSecurity`.
 #[derive(Debug, Clone)]
-struct Hsts {
+pub(crate) struct Hsts {
     r#override: bool,
     include_subdomains: Option<bool>,
     preload: Option<bool>,
@@ -109,7 +109,7 @@ struct Hsts {
 /// `ResponseHeadersPolicySecurityHeadersConfig`: every sub-structure optional, so a row
 /// may carry any subset of them.
 #[derive(Debug, Clone, Default)]
-struct Security {
+pub(crate) struct Security {
     xss: Option<Xss>,
     /// `(Override, FrameOption)`, a value of `FrameOptionsList`.
     frame: Option<(bool, String)>,
@@ -124,7 +124,7 @@ struct Security {
 
 /// `ResponseHeadersPolicyServerTimingHeadersConfig`.
 #[derive(Debug, Clone)]
-struct ServerTiming {
+pub(crate) struct ServerTiming {
     enabled: bool,
     /// `SamplingRate`, which the model bounds to `0..100`, or `None` to leave it out.
     sampling_rate: Option<f64>,
@@ -134,24 +134,24 @@ struct ServerTiming {
 /// out of the document entirely, which is what makes "the record reports what was
 /// submitted" testable for absent members too.
 #[derive(Debug, Clone, Default)]
-struct Policy {
-    case: &'static str,
-    name: String,
-    comment: Option<String>,
-    cors: Option<Cors>,
-    security: Option<Security>,
-    server_timing: Option<ServerTiming>,
+pub(crate) struct Policy {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
+    pub(crate) comment: Option<String>,
+    pub(crate) cors: Option<Cors>,
+    pub(crate) security: Option<Security>,
+    pub(crate) server_timing: Option<ServerTiming>,
     /// `CustomHeadersConfig.Items` as `(Header, Value, Override)`, or `None` to leave the
     /// wrapper out. `Some(vec![])` is the wrapper carrying no items at all.
-    custom_headers: Option<Vec<(String, String, bool)>>,
+    pub(crate) custom_headers: Option<Vec<(String, String, bool)>>,
     /// `RemoveHeadersConfig.Items` headers, or `None` to leave the wrapper out.
-    remove_headers: Option<Vec<String>>,
+    pub(crate) remove_headers: Option<Vec<String>>,
 }
 
 impl Policy {
     /// The `ResponseHeadersPolicyConfig` XML a client sends for this configuration, in
     /// the model's member declaration order.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<ResponseHeadersPolicyConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"

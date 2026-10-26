@@ -23,6 +23,8 @@ mod list_monitors_pagination;
 mod monitor_and_probe;
 #[path = "all/monitor_lifecycle_and_front_door.rs"]
 mod monitor_lifecycle_and_front_door;
+#[path = "all/monitor_state_follows_probe_activation.rs"]
+mod monitor_state_follows_probe_activation;
 #[path = "all/probe_teardown.rs"]
 mod probe_teardown;
 #[path = "all/probes_per_subnet_limit.rs"]

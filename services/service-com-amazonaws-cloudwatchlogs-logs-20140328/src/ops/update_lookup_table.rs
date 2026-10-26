@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLookupTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLookupTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLookupTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: replaces the WHOLE content of the lookup table the request's ARN names with
+//! the CSV body it carries — re-deriving the table's column names and record count from that
+//! body — applies the description and KMS key the request named, and hands back the table's
+//! ARN and the instant of the write. A request naming both content sources or neither, a CSV
+//! body it cannot read, a `queryId` naming no completed or cancelled query, a `kmsKeyId` that
+//! is not a KMS key's, or an ARN no table of this account is stored under writes nothing and
+//! is refused. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,17 +160,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLookupTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLookupTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLookupTable"))
+        // request metadata, which this write needs none of: the table is identified by the
+        // ARN the request names, and that ARN already carries the Region and the account the
+        // table was created in.
+        let _ = ctx;
+
+        let invalid = |message: String| {
+            UpdateLookupTableError::from(UpdateLookupTableErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+        let validation = |message: String| {
+            UpdateLookupTableError::from(UpdateLookupTableErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        };
+        let unavailable = |message: String| {
+            UpdateLookupTableError::from(
+                UpdateLookupTableErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // A member this operation parses as an ARN and was handed something that is not one
+        // is refused before anything is looked up or written, with the service's
+        // validation-error message naming the member and the value it could not parse.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("lookupTableArn", &input.lookup_table_arn)
+        {
+            return Err(invalid(message));
+        }
+
+        // "You must specify either tableBody or queryId, but not both" — a rule ACROSS two
+        // members, which no single member's constraint can express, so it is refused with
+        // the `ValidationException` this operation models rather than with its
+        // `InvalidParameterException`.
+        let source = crate::state::resolve_lookup_table_source(
+            input.table_body.as_deref(),
+            input.query_id.as_deref(),
+        )
+        .map_err(validation)?;
+        // An update "replac[es] all of its content with new CSV data or CloudWatch Logs query
+        // results", so a request naming neither names nothing to replace that content with.
+        let Some(source) = source else {
+            return Err(validation(
+                crate::state::LOOKUP_TABLE_SOURCE_REQUIRED.to_string(),
+            ));
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| unavailable("the log store is unavailable".to_string()))?;
+        let mut store = state.lock();
+        let now_ms = crate::state::now_ms();
+
+        // The replacement content is read HERE, before anything is written: the header row
+        // names the table's columns and the rows after it are its records, so a body those
+        // cannot be read from replaces nothing.
+        let (table_body, shape) = match source {
+            crate::state::LookupTableSource::TableBody(table_body) => {
+                let shape = crate::state::parse_table_body(&table_body).map_err(invalid)?;
+                (table_body, shape)
+            }
+            // `queryId` names "a completed or cancelled CloudWatch Logs query whose results
+            // replace the lookup table content", so an id naming no query of this account, or
+            // naming one that has not finished and was not stopped, replaces nothing — and is
+            // refused with the message naming the id. A query's status is owed by the CLOCK,
+            // so the transitions it has already made due are materialised before it is read.
+            crate::state::LookupTableSource::QueryId(query_id) => {
+                store.materialize_due_query_transitions(now_ms);
+                let finished = store.queries.get(&query_id).is_some_and(|query| {
+                    query.status == crate::state::QUERY_STATUS_COMPLETE
+                        || query.status == crate::state::QUERY_STATUS_CANCELLED
+                });
+                if !finished {
+                    return Err(invalid(crate::state::query_not_found_message(&query_id)));
+                }
+                // The content would be that query's RESULTS, and this service holds none:
+                // nothing here runs a query over the stored events, so there is no result set
+                // to replace the table's content with. The request is refused rather than
+                // answered with rows nothing computed or with a table emptied on its behalf.
+                return Err(unavailable(
+                    "The service cannot complete the request.".to_string(),
+                ));
+            }
+        };
+
+        // "You can use this parameter to add, update, or remove the KMS key. To remove the
+        // KMS key and use an Amazon Web Services-owned key instead, specify an empty string."
+        // So: a request naming no `kmsKeyId` leaves the table's key as it is, the empty
+        // string (which the modelled `KmsKeyId` admits, `length 0..256`) clears it back to
+        // the Amazon-owned default, and any other value must name a KMS key — the same check
+        // `CreateLookupTable` and `AssociateKmsKey` hold one to, which leaves a bare key id
+        // or alias to KMS to resolve and refuses only a value naming another service's
+        // resource. `Some(None)` below is "clear it", `None` is "leave it".
+        let kms_key_update: Option<Option<String>> = match input.kms_key_id.as_deref() {
+            None => None,
+            Some("") => Some(None),
+            Some(kms_key_id) => {
+                if !crate::state::is_kms_key_id(kms_key_id) {
+                    return Err(invalid(crate::state::not_a_kms_key_message(
+                        "kmsKeyId",
+                        kms_key_id,
+                    )));
+                }
+                Some(Some(kms_key_id.to_string()))
+            }
+        };
+
+        // What the account's lookup tables hold in total, read BEFORE the table is borrowed
+        // to write: it is the budget this replacement is held to below.
+        let stored_bytes = store.lookup_table_bytes();
+
+        // "The ARN of the lookup table to update": the ARN names a Region and an account as
+        // well as a name, so an ARN naming another Region's or another account's table names
+        // a resource this account does not hold here, even when a stored table happens to
+        // share its name — which is why the stored ARN is compared and not just the name it
+        // carries.
+        let table = crate::state::lookup_table_name_from_arn(&input.lookup_table_arn)
+            .and_then(|name| store.lookup_tables.get_mut(name))
+            .filter(|table| table.arn == input.lookup_table_arn);
+        let Some(table) = table else {
+            return Err(
+                UpdateLookupTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("lookup table")),
+                })
+                .into(),
+            );
+        };
+
+        // The store's retained-content budget holds across updates as well as creates: only
+        // the DIFFERENCE between the new body and the one it replaces grows the store, since
+        // this is a full replacement, and a write that would take the account past the budget
+        // is refused BEFORE the body is retained. `UpdateLookupTable` models no
+        // `LimitExceededException`, so the emulator reports what it is — a request its store
+        // cannot complete — through the `ServiceUnavailableException` it does model.
+        let prospective_bytes = stored_bytes
+            .saturating_sub(table.table_body.len())
+            .saturating_add(table_body.len());
+        if prospective_bytes > crate::state::MAX_LOOKUP_TABLE_BYTES_TOTAL {
+            return Err(unavailable(format!(
+                "the maximum of {} bytes of lookup table content per account has been \
+                 reached: this update would store {prospective_bytes}",
+                crate::state::MAX_LOOKUP_TABLE_BYTES_TOTAL
+            )));
+        }
+
+        // The write: the content and everything derived from it is replaced wholesale, and
+        // each optional member moves only when the request named it — "An updated description
+        // of the lookup table" leaves the stored one alone when no new one was given.
+        table.replace_content(table_body, shape, now_ms);
+        if let Some(description) = &input.description {
+            table.description = Some(description.clone());
+        }
+        if let Some(kms_key_id) = kms_key_update {
+            table.kms_key_id = kms_key_id;
+        }
+
+        Ok(UpdateLookupTableOutput {
+            lookup_table_arn: Some(table.arn.clone()),
+            last_updated_time: Some(table.last_updated_time_ms),
+        })
     }
 }

@@ -20,7 +20,13 @@
 //! 4. the report PAGES: `MaxResults` bounds a page, `NextToken` resumes it, and walking the
 //!    pages visits every filter exactly once;
 //! 5. one `ClientToken` names one filter, and `DryRun` answers `DryRunOperation` without
-//!    storing or reporting anything.
+//!    storing or reporting anything;
+//! 6. the create holds the request to every bound the crate publishes — a value AT the
+//!    bound is stored, one PAST it is refused — and it decides that BEFORE it writes, so a
+//!    `DryRun` that would not have worked is refused with the reason it would have failed
+//!    for and a refused create stores nothing;
+//! 7. a create carrying no `ClientToken` is never a replay: two identical requests mint two
+//!    distinct filters and neither response echoes a token.
 //!
 //! Each table row is a distinct input along what the rule generalises over — how long a
 //! description is and which characters it holds, how many tags a filter carries, which
@@ -29,7 +35,11 @@
 //! is ONE row of the table in [`an_unknown_filter_id_is_refused_whatever_it_looks_like`].
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
-use ec2::state::{MAX_TRAFFIC_MIRROR_FILTERS_PAGE_SIZE, TRAFFIC_MIRROR_FILTER_TAGGABLE_RESOURCE};
+use ec2::state::{
+    MAX_CLIENT_TOKEN_CHARS, MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    MAX_TRAFFIC_MIRROR_FILTERS_PAGE_SIZE, RESERVED_TAG_PREFIX,
+    TRAFFIC_MIRROR_FILTER_TAGGABLE_RESOURCE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{call, element, elements, error_code, filters, indexed, unescaped};
@@ -120,6 +130,26 @@ fn tag_params(index: usize, key: &str, value: &str) -> Params {
         p(&format!("TagSpecification.{index}.Tag.1.Key"), key),
         p(&format!("TagSpecification.{index}.Tag.1.Value"), value),
     ]
+}
+
+/// The form parameters for `count` tags in ONE specification of the one taggable resource
+/// type, so a row can carry a tag list of any size.
+fn many_tag_params(count: usize) -> Params {
+    let mut params = vec![p(
+        "TagSpecification.1.ResourceType",
+        TRAFFIC_MIRROR_FILTER_TAGGABLE_RESOURCE,
+    )];
+    for index in 1..=count {
+        params.push(p(
+            &format!("TagSpecification.1.Tag.{index}.Key"),
+            format!("Key{index}"),
+        ));
+        params.push(p(
+            &format!("TagSpecification.1.Tag.{index}.Value"),
+            format!("value-{index}"),
+        ));
+    }
+    params
 }
 
 /// RULE 1: every create in the table is stored as the request describes it and reads back
@@ -618,5 +648,203 @@ async fn idempotency_dry_run_and_tagging_are_refused_or_replayed() {
         described_ids(&router, "after the refused tag specifications", &[]).await,
         after_replays,
         "a refused create stores nothing"
+    );
+}
+
+/// RULE 6: the create holds the request to every bound this crate publishes — a value AT
+/// the bound is stored, one PAST it is refused — and it decides that before the first
+/// write, so the same request under `DryRun` is refused with the reason it would have
+/// failed for rather than with `DryRunOperation`, and no refused create leaves a filter
+/// behind.
+#[tokio::test]
+async fn the_create_holds_every_published_bound_before_it_writes() {
+    // The bounds come from the crate's published constants — `MAX_CLIENT_TOKEN_CHARS`
+    // (`CreateLaunchTemplate$ClientToken`: "Constraint: Maximum 128 ASCII characters"),
+    // `MAX_TAG_KEY_CHARS`, `MAX_TAG_VALUE_CHARS` and `MAX_TAGS_PER_RESOURCE` — so each is
+    // asserted at the published bound and one past it, beside the tag rules that hold
+    // whatever the lengths are. `None` is a row that must be STORED.
+    type BoundRow = (String, Params, Option<&'static str>);
+    let rows: Vec<BoundRow> = vec![
+        (
+            format!("a ClientToken of {MAX_CLIENT_TOKEN_CHARS} characters"),
+            vec![p("ClientToken", "t".repeat(MAX_CLIENT_TOKEN_CHARS))],
+            None,
+        ),
+        (
+            format!("a ClientToken of {} characters", MAX_CLIENT_TOKEN_CHARS + 1),
+            vec![p("ClientToken", "t".repeat(MAX_CLIENT_TOKEN_CHARS + 1))],
+            Some("InvalidParameterValue"),
+        ),
+        (
+            format!("a tag key of {MAX_TAG_KEY_CHARS} characters"),
+            tag_params(1, &"k".repeat(MAX_TAG_KEY_CHARS), "at the key bound"),
+            None,
+        ),
+        (
+            format!("a tag key of {} characters", MAX_TAG_KEY_CHARS + 1),
+            tag_params(1, &"k".repeat(MAX_TAG_KEY_CHARS + 1), "past the key bound"),
+            Some("InvalidParameterValue"),
+        ),
+        (
+            format!("a tag value of {MAX_TAG_VALUE_CHARS} characters"),
+            tag_params(1, "AtValueBound", &"v".repeat(MAX_TAG_VALUE_CHARS)),
+            None,
+        ),
+        (
+            format!("a tag value of {} characters", MAX_TAG_VALUE_CHARS + 1),
+            tag_params(1, "PastValueBound", &"v".repeat(MAX_TAG_VALUE_CHARS + 1)),
+            Some("InvalidParameterValue"),
+        ),
+        (
+            format!("{MAX_TAGS_PER_RESOURCE} tags"),
+            many_tag_params(MAX_TAGS_PER_RESOURCE),
+            None,
+        ),
+        (
+            format!("{} tags", MAX_TAGS_PER_RESOURCE + 1),
+            many_tag_params(MAX_TAGS_PER_RESOURCE + 1),
+            Some("TagLimitExceeded"),
+        ),
+        (
+            "an empty tag key".to_string(),
+            tag_params(1, "", "platform"),
+            Some("InvalidParameterValue"),
+        ),
+        (
+            format!("a tag key in the reserved {RESERVED_TAG_PREFIX} namespace"),
+            tag_params(1, &format!("{RESERVED_TAG_PREFIX}cloudformation:stack-name"), "mirrors"),
+            Some("InvalidParameterValue"),
+        ),
+        (
+            "one tag key given twice".to_string(),
+            [tag_params(1, "Team", "platform"), tag_params(2, "Team", "network")].concat(),
+            Some("InvalidParameterValue"),
+        ),
+        (
+            "a tag specification naming no resource type".to_string(),
+            vec![
+                p("TagSpecification.1.Tag.1.Key", "Team"),
+                p("TagSpecification.1.Tag.1.Value", "platform"),
+            ],
+            Some("MissingParameter"),
+        ),
+    ];
+
+    let router = emulator();
+    let mut stored: Vec<String> = Vec::new();
+    for (case, params, refusal) in &rows {
+        let (status, body) = create(&router, params).await;
+        match refusal {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a value at the published bound is stored, got {status} \
+                     with body {body}"
+                );
+                let id = element(&body, "trafficMirrorFilterId").unwrap_or_default();
+                assert!(
+                    is_traffic_mirror_filter_id(&id),
+                    "case {case:?}: expected a minted Traffic Mirror filter id, got {id:?}"
+                );
+                stored.push(id);
+            }
+            Some(code) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400 for a request past the bound, \
+                     got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body).as_str(),
+                    *code,
+                    "case {case:?}: expected {code}, got {body}"
+                );
+            }
+        }
+    }
+
+    // The same table under `DryRun`: the flag asks whether the request WOULD have worked,
+    // so a row that would have been refused keeps its own refusal and a row that would have
+    // succeeded answers `DryRunOperation` (HTTP 412) — and neither stores a thing, the
+    // replayed `ClientToken` row included.
+    for (case, params, refusal) in &rows {
+        let case = format!("{case}, under DryRun");
+        let params = [params.clone(), vec![p("DryRun", "true")]].concat();
+        let (status, body) = create(&router, &params).await;
+        let (expected_status, expected_code) = match refusal {
+            None => (412, "DryRunOperation"),
+            Some(code) => (400, *code),
+        };
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body).as_str(),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+    }
+
+    let mut described = described_ids(&router, "after the whole bound table", &[]).await;
+    described.sort();
+    stored.sort();
+    assert_eq!(
+        described, stored,
+        "only the creates at the published bounds are stored, got {described:?}"
+    );
+}
+
+/// RULE 7: a create that carries no `ClientToken` is never a replay — "Unique,
+/// case-sensitive identifier that YOU provide" is what makes one, so two requests with
+/// identical parameters mint two distinct filters and neither response echoes a token.
+#[tokio::test]
+async fn a_create_without_a_client_token_is_never_a_replay() {
+    let router = emulator();
+    // The rows differ along how much of the record the two requests share: nothing, a
+    // description, and a description plus a tag — identical in every member either way.
+    let rows: Vec<(&str, Params)> = vec![
+        ("no parameters at all", Vec::new()),
+        ("the same description twice", vec![p("Description", "mirror everything")]),
+        (
+            "the same description and tag twice",
+            [vec![p("Description", "tagged")], tag_params(1, "Team", "platform")].concat(),
+        ),
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for (case, params) in rows {
+        let mut ids: Vec<String> = Vec::new();
+        for attempt in 1..=2 {
+            let case = format!("{case}, request {attempt}");
+            let (status, body) = create(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with body {body}"
+            );
+            assert!(
+                element(&body, "clientToken").is_none(),
+                "case {case:?}: a request carrying no token is answered with none, got {body}"
+            );
+            let id = element(&body, "trafficMirrorFilterId").unwrap_or_default();
+            assert!(
+                is_traffic_mirror_filter_id(&id),
+                "case {case:?}: expected a minted Traffic Mirror filter id, got {id:?}"
+            );
+            ids.push(id);
+        }
+        assert_ne!(
+            ids[0], ids[1],
+            "case {case:?}: two tokenless creates mint two filters, got {ids:?}"
+        );
+        minted.extend(ids);
+    }
+
+    let mut described = described_ids(&router, "after the tokenless creates", &[]).await;
+    described.sort();
+    minted.sort();
+    assert_eq!(
+        described, minted,
+        "every tokenless create is stored on its own, got {described:?}"
     );
 }

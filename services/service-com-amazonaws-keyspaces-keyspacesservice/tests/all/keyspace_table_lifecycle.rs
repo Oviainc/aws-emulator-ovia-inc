@@ -1344,8 +1344,10 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
     // with the scaffold's 501: `autoScalingSpecification` and `replicaSpecifications` are
     // reported by `GetTable` / `GetTableAutoScalingSettings` and
     // `warmThroughputSpecification` by `GetTable` (see
-    // `tests/all/column_types_and_auto_scaling.rs` and
-    // `tests/all/update_table_scaling_settings.rs`), and `cdcSpecification` enables the
+    // `tests/all/column_types_and_auto_scaling.rs`,
+    // `tests/all/update_table_scaling_settings.rs` and, for what a CREATE carrying the
+    // per-Region and warm throughput members stores,
+    // `tests/all/create_table_replicas_and_warm_throughput.rs`), and `cdcSpecification` enables the
     // table's CDC stream, reported by `GetTable` and served by KeyspacesStreams (see
     // `tests/all/cdc_streams.rs`).
 

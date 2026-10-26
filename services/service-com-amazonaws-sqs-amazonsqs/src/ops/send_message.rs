@@ -150,6 +150,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
 use crate::state as sqs;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -260,11 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(character) = sqs::invalid_body_character(&input.message_body) {
             return Err(SendMessageErrorModeled::InvalidMessageContents(
                 InvalidMessageContents {
-                    message: Some(format!(
-                        "MessageBody holds U+{:04X}, which is outside the allowed set \
-                         #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to #x10FFFF.",
-                        character as u32
-                    )),
+                    message: Some(sqs::invalid_body_character_message(character)),
                 },
             )
             .into());
@@ -291,16 +288,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A member this emulator does not honour is refused rather than silently
         // dropped on a 200: `MessageSystemAttributes` carries the X-Ray trace header,
-        // which nothing here propagates.
+        // which nothing here propagates. The request is not malformed, so the refusal
+        // is the modelled "unsupported operation" rather than a parameter fault.
         if input
             .message_system_attributes
             .as_ref()
             .is_some_and(|attributes| !attributes.is_empty())
         {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "The request includes MessageSystemAttributes, which this emulator does not \
-                 support yet: it carries the X-Ray trace header, which nothing here propagates.",
-            ));
+            return Err(SendMessageErrorModeled::UnsupportedOperation(
+                UnsupportedOperation {
+                    message: Some(
+                        "The request includes MessageSystemAttributes, which this emulator does \
+                         not support yet: it carries the X-Ray trace header, which nothing here \
+                         propagates."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
         }
 
         // "In FIFO queues, MessageGroupId organizes messages into distinct groups ...
@@ -312,14 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match &group_id {
             Some(given) => {
                 if let Some(reason) = sqs::message_token_refusal("MessageGroupId", given) {
-                    return Err(crate::scaffolded::Scaffolded::validation(reason));
+                    return Err(Scaffolded::invalid_parameter_value(reason));
                 }
             }
             None if fifo => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    "The request must carry a MessageGroupId: the queue it addresses is a FIFO \
-                     queue, which hands a group's messages over in strict order.",
-                ));
+                // Absent, not invalid: the refusal names the parameter the request had
+                // to carry.
+                return Err(Scaffolded::missing_parameter("MessageGroupId"));
             }
             None => {}
         }
@@ -332,13 +336,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deduplication_id = match input.message_deduplication_id.clone() {
             Some(given) => {
                 if !fifo {
-                    return Err(crate::scaffolded::Scaffolded::validation(
-                        "The request includes MessageDeduplicationId, which applies only to a \
-                         FIFO queue; the queue it addresses is a standard queue.",
-                    ));
+                    return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                        &given,
+                        "MessageDeduplicationId",
+                        sqs::QUEUE_TYPE_PARAMETER_REASON,
+                    )));
                 }
                 if let Some(reason) = sqs::message_token_refusal("MessageDeduplicationId", &given) {
-                    return Err(crate::scaffolded::Scaffolded::validation(reason));
+                    return Err(Scaffolded::invalid_parameter_value(reason));
                 }
                 Some(given)
             }
@@ -346,32 +351,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(sqs::content_deduplication_token(&input.message_body))
             }
             None if fifo => {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    "The request must carry a MessageDeduplicationId, or the FIFO queue it \
-                     addresses must have ContentBasedDeduplication enabled.",
-                ));
+                return Err(Scaffolded::invalid_parameter_value(sqs::NO_DEDUPLICATION_ID));
             }
             None => None,
         };
 
         // "When you set FifoQueue, you can't set DelaySeconds per message. You can set
-        // this parameter only on a queue level." The queue's own value applies when the
-        // request names none; either way the value must be inside the range the model
-        // documents for the attribute.
+        // this parameter only on a queue level." What a FIFO queue cannot honour is a
+        // message held back from its group, so it is a POSITIVE per-message delay that
+        // is refused; a delay of zero asks for nothing the queue does not already do.
+        // The queue's own value applies when the request names none; either way the
+        // value must be inside the range the model documents for the attribute.
         let (min_delay, max_delay) = sqs::integer_bounds(sqs::DELAY_SECONDS);
-        if fifo && input.delay_seconds.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "The request includes DelaySeconds, which cannot be set per message on a FIFO \
-                 queue; set the DelaySeconds attribute on the queue instead.",
-            ));
+        if let Some(requested) = input.delay_seconds.filter(|delay| fifo && *delay > 0) {
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                &requested.to_string(),
+                sqs::DELAY_SECONDS,
+                sqs::QUEUE_TYPE_PARAMETER_REASON,
+            )));
         }
         let delay = match input.delay_seconds {
             Some(requested) => i64::from(requested),
             None => queue.integer(sqs::DELAY_SECONDS),
         };
         if delay < min_delay || delay > max_delay {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "DelaySeconds must be an integer from {min_delay} to {max_delay}; got {delay}."
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                &delay.to_string(),
+                sqs::DELAY_SECONDS,
+                &format!(
+                    "{} must be >= {min_delay} and <= {max_delay}.",
+                    sqs::DELAY_SECONDS
+                ),
             )));
         }
 
@@ -382,10 +392,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .collect();
         if message_attributes.len() > sqs::MAX_MESSAGE_ATTRIBUTES {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "A message can have up to {} attributes; got {}.",
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Number of message attributes [{}] exceeds the allowed maximum [{}].",
+                message_attributes.len(),
                 sqs::MAX_MESSAGE_ATTRIBUTES,
-                message_attributes.len()
             )));
         }
         // Name-ordered, so a message with two bad attributes is always refused for the
@@ -394,7 +404,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .find_map(|(name, value)| sqs::message_attribute_refusal(name, value))
         {
-            return Err(crate::scaffolded::Scaffolded::validation(reason));
+            return Err(Scaffolded::invalid_parameter_value(reason));
         }
 
         // Everything the message carries counts toward the queue's MaximumMessageSize:
@@ -404,9 +414,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attribute_bytes = sqs::message_attribute_bytes(&message_attributes);
         let size = input.message_body.len().saturating_add(attribute_bytes);
         if i64::try_from(size).unwrap_or(i64::MAX) > maximum {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "The message body and its attributes must be at most {maximum} bytes together; \
-                 got {size} bytes ({attribute_bytes} of them in attributes)."
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameters_message(
+                &format!("Message must be shorter than {maximum} bytes."),
             )));
         }
 

@@ -68,7 +68,10 @@ pub(crate) fn document_with_start_endpoint(record_type: &str, value: &str) -> St
 }
 
 /// A traffic policy document whose entry point is a rule over two endpoints.
-fn document_with_start_rule(record_type: &str, primary: &str, secondary: &str) -> String {
+///
+/// `pub(crate)` so the suite asserting the VERSION create spans the same
+/// entry-point forms this one does.
+pub(crate) fn document_with_start_rule(record_type: &str, primary: &str, secondary: &str) -> String {
     format!(
         "{{\"AWSPolicyFormatVersion\":\"{TRAFFIC_POLICY_FORMAT_VERSION}\",\
          \"RecordType\":\"{record_type}\",\"StartRule\":\"failover_to_secondary\",\
@@ -107,7 +110,10 @@ pub(crate) async fn create_policy(
 }
 
 /// Read one traffic policy version back.
-async fn get_policy(router: &MultiServiceRouter, id: &str, version: &str) -> Reply {
+///
+/// `pub(crate)` so the version suite rounds a created version back through the
+/// SAME read this one does.
+pub(crate) async fn get_policy(router: &MultiServiceRouter, id: &str, version: &str) -> Reply {
     call(
         router,
         "GET",
@@ -119,7 +125,11 @@ async fn get_policy(router: &MultiServiceRouter, id: &str, version: &str) -> Rep
 
 /// How many traffic policies the account holds, as `GetAccountLimit` reports
 /// it — the count that has to agree with the policies in the store.
-async fn policy_count(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)` so the version suite asserts against the SAME count: a new
+/// VERSION of a policy is not a new policy, so this number must not move for
+/// one.
+pub(crate) async fn policy_count(router: &MultiServiceRouter) -> String {
     let reply = call(
         router,
         "GET",
@@ -140,7 +150,7 @@ async fn policy_count(router: &MultiServiceRouter) -> String {
 
 /// `(Id, Version, Name, Type, Document, Comment)` as a reply carrying a
 /// `TrafficPolicy` reports them.
-fn policy_of(reply: &Reply, case: &str) -> PolicyView {
+pub(crate) fn policy_of(reply: &Reply, case: &str) -> PolicyView {
     let pick = |path: &str| {
         reply.first(path).unwrap_or_else(|| {
             panic!(
@@ -160,14 +170,14 @@ fn policy_of(reply: &Reply, case: &str) -> PolicyView {
 }
 
 /// One `TrafficPolicy` as the wire reports it.
-#[derive(Debug, PartialEq, Eq)]
-struct PolicyView {
-    id: String,
-    version: String,
-    name: String,
-    record_type: String,
-    document: String,
-    comment: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyView {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) name: String,
+    pub(crate) record_type: String,
+    pub(crate) document: String,
+    pub(crate) comment: Option<String>,
 }
 
 /// Whether `id` has the 8-4-4-4-12 lowercase-hex form Route 53 mints a traffic

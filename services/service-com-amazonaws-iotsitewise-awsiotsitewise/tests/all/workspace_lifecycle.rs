@@ -44,13 +44,13 @@ fn workspace_uri(name: &str) -> String {
 }
 
 /// Long enough that a transition the clock owes has certainly fallen due.
-fn settle() -> Duration {
+pub(crate) fn settle() -> Duration {
     ACTIVATION_DELAY + Duration::from_millis(200)
 }
 
 /// The ARN form this emulator mints for a workspace: a workspace is addressed by
 /// its name, so the name is what the resource section carries.
-fn expected_arn(name: &str) -> String {
+pub(crate) fn expected_arn(name: &str) -> String {
     format!(
         "arn:aws:iotsitewise:{REGION}:{}:workspace/{name}",
         engine::EMULATOR_ACCOUNT_ID
@@ -58,7 +58,7 @@ fn expected_arn(name: &str) -> String {
 }
 
 /// The ARN of a KMS resource of this account in the region the suite signs for.
-fn kms_arn(resource: &str) -> String {
+pub(crate) fn kms_arn(resource: &str) -> String {
     format!(
         "arn:aws:kms:{REGION}:{}:{resource}",
         engine::EMULATOR_ACCOUNT_ID
@@ -67,19 +67,19 @@ fn kms_arn(resource: &str) -> String {
 
 /// The `state` of the `workspaceStatus` in a response body — the member every
 /// workspace operation reports its status under.
-fn state(body: &Value) -> &str {
+pub(crate) fn state(body: &Value) -> &str {
     body["workspaceStatus"]["state"].as_str().unwrap_or("")
 }
 
 /// The epoch seconds a `Timestamp` member of `body` carries.
-fn at(body: &Value, member: &str) -> f64 {
+pub(crate) fn at(body: &Value, member: &str) -> f64 {
     body[member]
         .as_f64()
         .unwrap_or_else(|| panic!("{member} is not an epoch-seconds timestamp in {body}"))
 }
 
 /// `CreateWorkspace` with `body`.
-async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", WORKSPACES_URI, Some(body)).await
 }
 
@@ -89,23 +89,23 @@ async fn update(router: &MultiServiceRouter, name: &str, body: Value) -> (u16, V
 }
 
 /// `DescribeWorkspace` on `name`.
-async fn describe(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     call(router, "GET", &workspace_uri(name), None).await
 }
 
 /// The service's default encryption configuration: no key of the caller's own.
-fn default_encryption() -> Value {
+pub(crate) fn default_encryption() -> Value {
     json!({ "encryptionType": "SITEWISE_DEFAULT_ENCRYPTION" })
 }
 
 /// A customer managed key configuration naming `kms_key_id`.
-fn kms_encryption(kms_key_id: &str) -> Value {
+pub(crate) fn kms_encryption(kms_key_id: &str) -> Value {
     json!({ "encryptionType": "KMS_BASED_ENCRYPTION", "kmsKeyId": kms_key_id })
 }
 
 /// Create `name` with `encryption` and wait for the owed CREATING -> ACTIVE
 /// transition, so the workspace is settled and an update may be accepted.
-async fn create_settled(router: &MultiServiceRouter, name: &str, encryption: Value) {
+pub(crate) async fn create_settled(router: &MultiServiceRouter, name: &str, encryption: Value) {
     let (status, body) = create(
         router,
         json!({ "workspaceName": name, "encryptionConfiguration": encryption }),

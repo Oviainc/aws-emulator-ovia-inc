@@ -204,11 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state;
 
         let _ = ctx;
-        // "A map of attributes to set": a map that names none sets nothing, which is a
-        // request this operation models no error for.
+        // "A map of attributes to set": a map that names none sets nothing, so the
+        // parameter the call requires was not really supplied. The absent parameter is
+        // named as the request carries it — one attribute's name and value per entry.
         if input.attributes.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Attributes must name at least one attribute to set",
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(
+                "Attribute.Name",
             ));
         }
 

@@ -39,7 +39,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{
-    encode_next_token, service_state, PageRecord, TOKEN_SCOPE_CONTACTS, TOKEN_SCOPE_PAGE_RECEIPTS,
+    encode_next_token, service_state, PageRecord, ACCOUNT_NOT_FOUND_MESSAGE,
+    TOKEN_SCOPE_CONTACTS, TOKEN_SCOPE_PAGE_RECEIPTS,
 };
 
 use crate::contact_lifecycle::{error_code, Emulator};
@@ -500,13 +501,11 @@ async fn the_account_precondition_is_consulted_before_the_page_is() {
                 error_code(&body).contains("ValidationException"),
                 "case {case:?}: expected a ValidationException, got {body:?}"
             );
-            assert!(
-                body["Message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains(page_id),
-                "case {case:?}: expected the refusal to name the ARN the request carried, got \
-                 {body:?}"
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(ACCOUNT_NOT_FOUND_MESSAGE),
+                "case {case:?}: the account-level precondition is decided from the account \
+                 alone, so it is reported in the account's own words, got {body:?}"
             );
         }
     }

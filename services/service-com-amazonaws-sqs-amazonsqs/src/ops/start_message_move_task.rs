@@ -108,6 +108,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
 use crate::state as sqs;
 use std::collections::VecDeque;
 use std::time::SystemTime;
@@ -196,9 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_number_of_messages_per_second
             .filter(|rate| !(1..=sqs::MAX_MESSAGES_PER_SECOND).contains(rate))
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "MaxNumberOfMessagesPerSecond must be an integer from 1 to {}; got {rate}.",
-                sqs::MAX_MESSAGES_PER_SECOND
+            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
+                &rate.to_string(),
+                "MaxNumberOfMessagesPerSecond",
+                &format!("Must be >= 1 and <= {}.", sqs::MAX_MESSAGES_PER_SECOND),
             )));
         }
 
@@ -269,19 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This action is currently limited to supporting message redrive from queues
         // that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
         // only": the source queue is a DLQ exactly when another queue's RedrivePolicy
-        // names it as its dead-letter target.
+        // names it as its dead-letter target. The queue the caller NAMED is what does
+        // not satisfy the rule, so the fault is in that parameter's value.
         let dead_letter_sources = state.dead_letter_source_queue_names(&source_name);
         if dead_letter_sources.is_empty() {
-            return Err(StartMessageMoveTaskErrorModeled::UnsupportedOperation(
-                UnsupportedOperation {
-                    message: Some(
-                        "The source queue must be configured as a dead-letter queue of another \
-                         Amazon SQS queue before a message movement task can move its messages."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::DEAD_LETTER_SOURCE_REQUIRED,
+            ));
         }
 
         // With no destination named, the messages go back to the queue that drives its

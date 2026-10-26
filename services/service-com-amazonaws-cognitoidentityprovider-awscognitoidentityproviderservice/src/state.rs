@@ -373,15 +373,27 @@ pub const JOB_STOP_SPAN: Duration = Duration::from_millis(500);
 /// bound is 24 hours.
 pub const JOB_EXPIRY_SPAN: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long a passkey registration challenge stays answerable, which is also the
+/// `timeout` its credential creation options advertise, so the window the caller
+/// was told about is the window the emulator holds: W3C Web Authentication Level
+/// 2 §5.4 recommends a `PublicKeyCredentialCreationOptions.timeout` "between
+/// 300000 milliseconds (5 minutes) and 600000 milliseconds (10 minutes)" for a
+/// registration ceremony.
+pub const WEB_AUTHN_REGISTRATION_TIMEOUT: Duration = Duration::from_millis(300_000);
+
+/// `UserVerificationType`'s value for a pool that encourages but does not
+/// require user verification, which is what a pool configuring none asks for.
+pub const USER_VERIFICATION_PREFERRED: &str = "preferred";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
 // This state lives in the emulator's memory, so every store a caller can grow
 // is bounded: a repeated request must not grow the process without limit.
 // These caps are the EMULATOR's, not an AWS quota, and are deliberately far
-// above anything a test fixture builds. The two credential stores are swept of
-// what the clock has already expired before the cap is applied, so the cap is
-// reached only by live state.
+// above anything a test fixture builds. The stores whose entries expire are
+// swept of what the clock has already expired before the cap is applied, so the
+// cap is reached only by live state.
 // ---------------------------------------------------------------------------
 
 /// The most user pools this emulator holds.
@@ -420,6 +432,16 @@ pub const MAX_USER_IMPORT_JOBS_PER_POOL: usize = 50;
 /// against it.
 pub const MAX_CUSTOM_ATTRIBUTES_PER_POOL: usize = 50;
 
+/// The most passkey credentials one user holds: `ListWebAuthnCredentials`'s
+/// `MaxResults` is modelled with a maximum of 20
+/// (`smithy_query(query="operation",operation="ListWebAuthnCredentials")`), so a
+/// user holds no more passkeys than ONE listing can report.
+pub const MAX_WEB_AUTHN_CREDENTIALS_PER_USER: usize = 20;
+
+/// The most unexpired passkey registration challenges this emulator holds; the
+/// oldest are evicted past it.
+const MAX_WEB_AUTHN_REGISTRATIONS: usize = 10_000;
+
 /// The most unexpired challenge sessions this emulator holds; the oldest are
 /// evicted past it.
 const MAX_AUTH_SESSIONS: usize = 10_000;
@@ -438,6 +460,9 @@ pub struct ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceS
     /// Every token this emulator issued, keyed by the token string, so a later
     /// operation can resolve a token back to the stored user.
     pub issued_tokens: HashMap<String, TokenRecord>,
+    /// The passkey registrations in flight, keyed by the challenge value the
+    /// credential creation options carried to the caller.
+    pub web_authn_registrations: HashMap<String, WebAuthnRegistration>,
 }
 
 impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
@@ -523,6 +548,33 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// challenge once.
     pub fn end_session(&mut self, token: &str) {
         self.auth_sessions.remove(token);
+    }
+
+    /// Store a passkey registration and return the CHALLENGE value its creation
+    /// options carry, which is also the key the completing call resolves it by.
+    ///
+    /// Registrations the clock has already expired are swept first — the expiry
+    /// was owed at this instant whether or not anybody called — and the oldest
+    /// are evicted if the store is still at [`MAX_WEB_AUTHN_REGISTRATIONS`], so
+    /// repeating the registration cannot grow this map without limit. A started
+    /// registration leaves every registration started before it answerable: each
+    /// one carries its own challenge.
+    pub fn start_web_authn_registration(
+        &mut self,
+        now: SystemTime,
+        registration: WebAuthnRegistration,
+    ) -> String {
+        self.web_authn_registrations
+            .retain(|_, stored| stored.expires_at > now);
+        evict_oldest_until(
+            &mut self.web_authn_registrations,
+            MAX_WEB_AUTHN_REGISTRATIONS.saturating_sub(1),
+            |stored| stored.expires_at,
+        );
+        let challenge = new_web_authn_challenge();
+        self.web_authn_registrations
+            .insert(challenge.clone(), registration);
+        challenge
     }
 
     /// The token record for `token`, or `None` when this emulator never issued it.
@@ -735,6 +787,12 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             |record| record.expires_at,
         );
 
+        // A token's lifetime comes from the app client's stored validity
+        // settings, which a caller sets, so every instant a token expires at is
+        // computed with the CHECKED addition BEFORE anything is stored: an
+        // unrepresentable one answers no token at all rather than unwinding out
+        // of this state mutation or leaving half a triple behind.
+        let mut records = Vec::with_capacity(minted);
         for (token, kind, ttl) in [
             (Some(&access_token), TokenKind::Access, access_ttl),
             (Some(&id_token), TokenKind::Id, id_ttl),
@@ -743,7 +801,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         .into_iter()
         .filter_map(|(token, kind, ttl)| token.map(|token| (token, kind, ttl)))
         {
-            self.issued_tokens.insert(
+            records.push((
                 token.clone(),
                 TokenRecord {
                     user_pool_id: user_pool_id.to_string(),
@@ -751,10 +809,13 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     username: stored_username.clone(),
                     kind,
                     issued_at: now,
-                    expires_at: now + ttl,
+                    expires_at: now.checked_add(ttl)?,
                     revoked: false,
                 },
-            );
+            ));
+        }
+        for (token, record) in records {
+            self.issued_tokens.insert(token, record);
         }
 
         Some(AuthenticationResultType {
@@ -814,13 +875,16 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         })
     }
 
-    /// Forget every session and token issued for `username` in `user_pool_id`.
-    /// Called when the user it authenticates is deleted.
+    /// Forget every session, token and passkey registration issued for
+    /// `username` in `user_pool_id`. Called when the user it authenticates is
+    /// deleted.
     pub fn forget_user_credentials(&mut self, user_pool_id: &str, username: &str) {
         self.auth_sessions
             .retain(|_, s| !(s.user_pool_id == user_pool_id && s.username == username));
         self.issued_tokens
             .retain(|_, t| !(t.user_pool_id == user_pool_id && t.username == username));
+        self.web_authn_registrations
+            .retain(|_, r| !(r.user_pool_id == user_pool_id && r.username == username));
     }
 
     /// Revoke every token this emulator issued to `username` in `user_pool_id`,
@@ -839,13 +903,15 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         }
     }
 
-    /// Forget every session and token issued in `user_pool_id`. Called when the
-    /// pool they belong to is deleted.
+    /// Forget every session, token and passkey registration issued in
+    /// `user_pool_id`. Called when the pool they belong to is deleted.
     pub fn forget_pool_credentials(&mut self, user_pool_id: &str) {
         self.auth_sessions
             .retain(|_, s| s.user_pool_id != user_pool_id);
         self.issued_tokens
             .retain(|_, t| t.user_pool_id != user_pool_id);
+        self.web_authn_registrations
+            .retain(|_, r| r.user_pool_id != user_pool_id);
     }
 
     /// Forget every outstanding challenge session started for the app client
@@ -1480,6 +1546,64 @@ impl UserPool {
             .find(|stored| stored.client_id == client_id && stored.terms_name == terms_name)
     }
 
+    /// The domain this pool's passkeys name as their relying party, or `None`
+    /// when the pool has neither a configured relying party id nor a domain to
+    /// serve as one.
+    ///
+    /// `WebAuthnConfigurationType.RelyingPartyId` "Sets or displays the
+    /// authentication domain, typically your user pool domain, that passkey
+    /// providers must use as a relying party (RP) in their configuration" (this
+    /// service's model), so the configured value is what is in force when the
+    /// pool sets one. A pool that sets none falls back to its own domain, the
+    /// CUSTOM one first: "when you create a custom domain, the passkey RP ID
+    /// defaults to the custom domain. If you had a prefix domain active, this
+    /// will cause passkey integration for your prefix domain to stop working due
+    /// to a mismatch in RP ID. To keep the prefix domain passkey integration
+    /// working, you can explicitly set RP ID to the prefix domain"
+    /// (`CreateUserPoolDomain.CustomDomainConfig`). A custom domain's stored
+    /// value IS the domain, while a prefix domain's is the prefix alone: "for
+    /// custom domains, this is the fully-qualified domain name, such as
+    /// auth.example.com. For prefix domains, this is the prefix alone, such as
+    /// myprefix. A prefix value of myprefix for a user pool in the us-east-1
+    /// Region results in a domain of myprefix.auth.us-east-1.amazoncognito.com"
+    /// (`CreateUserPoolDomain.Domain`), so only the prefix is expanded. A pool
+    /// with neither is the pool that "doesn't have a configured relying party id
+    /// or a user pool domain" (`WebAuthnConfigurationMissingException`).
+    pub fn relying_party_id(&self) -> Option<String> {
+        let configured = self
+            .web_authn_configuration
+            .as_ref()
+            .and_then(|config| config.relying_party_id.as_deref())
+            .filter(|id| !id.is_empty());
+        if let Some(configured) = configured {
+            return Some(configured.to_string());
+        }
+        if let Some(custom) = &self.custom_domain {
+            return Some(custom.domain.clone());
+        }
+        self.domain
+            .as_ref()
+            .map(|prefix| format!("{}.auth.{}.amazoncognito.com", prefix.domain, self.region))
+    }
+
+    /// The user-verification requirement this pool's passkey registrations ask
+    /// for.
+    ///
+    /// `WebAuthnConfigurationType.UserVerification`: "When `required`, users can
+    /// only register and sign in users with passkeys that are capable of user
+    /// verification. When `preferred`, your user pool doesn't require the use of
+    /// authenticators with user verification but encourages it" (this service's
+    /// model), so a pool that configures none does not require it, which is the
+    /// other of `UserVerificationType`'s two values.
+    pub fn web_authn_user_verification(&self) -> String {
+        self.web_authn_configuration
+            .as_ref()
+            .and_then(|config| config.user_verification.as_deref())
+            .filter(|requirement| !requirement.is_empty())
+            .unwrap_or(USER_VERIFICATION_PREFERRED)
+            .to_string()
+    }
+
     /// Whether this pool's user pool add-ons are enabled, which is what the
     /// threat-protection surface rests on.
     ///
@@ -1966,6 +2090,12 @@ pub struct User {
     /// [`CodePurpose`]'s variants and the attributes a message is sent for at all
     /// ([`delivery_medium`]).
     pub outstanding_codes: BTreeMap<CodePurpose, VerificationCode>,
+    /// The passkey credentials registered to this user, in REGISTRATION order:
+    /// `WebAuthnCredentialDescription.CreatedAt` is "the date and time when the
+    /// item was created" (this service's model), and a completed registration
+    /// appends, so the order the credentials are held in is the order they were
+    /// created in. Bounded by [`MAX_WEB_AUTHN_CREDENTIALS_PER_USER`].
+    pub web_authn_credentials: Vec<WebAuthnCredential>,
 }
 
 impl User {
@@ -2753,6 +2883,54 @@ pub struct TokenRecord {
     pub revoked: bool,
 }
 
+/// A passkey registration in flight: what `StartWebAuthnRegistration` handed out
+/// credential creation options for, and what the call that completes the
+/// registration resolves by the challenge it answers.
+#[derive(Debug, Clone)]
+pub struct WebAuthnRegistration {
+    pub user_pool_id: String,
+    /// The app client the access token that started this registration was issued
+    /// to: a credential presented with an access token "for a different client
+    /// than the one in the original StartWebAuthnRegistration request" is
+    /// refused (`WebAuthnClientMismatchException` in this service's model), so
+    /// the client is recorded with the challenge.
+    pub client_id: String,
+    pub username: String,
+    /// The relying party the credential is registered under, as it was in force
+    /// when the registration started.
+    pub relying_party_id: String,
+    /// The user-verification requirement the creation options asked for.
+    pub user_verification: String,
+    pub created_at: SystemTime,
+    /// When the challenge stops being answerable, one
+    /// [`WEB_AUTHN_REGISTRATION_TIMEOUT`] after it was handed out.
+    pub expires_at: SystemTime,
+}
+
+/// One passkey credential registered to a user, as the completed registration
+/// stored it and every later read of it renders.
+#[derive(Debug, Clone)]
+pub struct WebAuthnCredential {
+    /// "The unique identifier of the passkey credential"
+    /// (`WebAuthnCredentialDescription.CredentialId`), which the authenticator
+    /// minted and the registration presented.
+    pub credential_id: String,
+    /// "An automatically-generated friendly name for the passkey credential"
+    /// (`WebAuthnCredentialDescription.FriendlyCredentialName`).
+    pub friendly_credential_name: String,
+    /// The relying party the credential was registered under.
+    pub relying_party_id: String,
+    /// "The general category of the passkey authenticator"
+    /// (`WebAuthnCredentialDescription.AuthenticatorAttachment`), when the
+    /// registration reported one.
+    pub authenticator_attachment: Option<String>,
+    /// "The transport methods of the passkey credential, for example USB or
+    /// Bluetooth Low Energy"
+    /// (`WebAuthnCredentialDescription.AuthenticatorTransports`).
+    pub authenticator_transports: Vec<String>,
+    pub created_at: SystemTime,
+}
+
 /// The time unit a token-validity number is counted in
 /// (`TokenValidityUnitsType`: `seconds`, `minutes`, `hours`, `days`).
 #[derive(Debug, Clone, Copy)]
@@ -3439,6 +3617,17 @@ pub fn new_uuid() -> String {
 /// A fresh `Session` token: 64 characters, inside the modelled length 20..4096.
 fn new_session_token() -> String {
     random_token(64)
+}
+
+/// A fresh passkey registration challenge: the value the authenticator signs
+/// over, carried base64url as the creation options encode one (W3C Web
+/// Authentication Level 2 §5.4, `PublicKeyCredentialCreationOptions.challenge`,
+/// a `BufferSource` the JSON form base64url-encodes).
+///
+/// 32 characters of the same v4-UUID randomness every other minted value in this
+/// file draws on ([`random_token`]), so nothing here is a hand-rolled generator.
+fn new_web_authn_challenge() -> String {
+    base64_url(random_token(32).as_bytes())
 }
 
 /// A fresh `DeviceKey` for a device of a pool in `region`: `<region>_<v4 UUID>`,

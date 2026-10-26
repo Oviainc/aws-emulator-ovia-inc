@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelInvocationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetModelInvocationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetModelInvocationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one batch inference job out of [`crate::state`], addressed by either spelling a
+//! `ModelInvocationJobIdentifier` carries — the job ARN or the minted job id alone — and
+//! answering 404 `ResourceNotFoundException` for a value no stored job answers to.
+//!
+//! `@readonly`, and the one write it makes is the status transition the CLOCK already made
+//! due for that job ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::model_invocation_job`]):
+//! the job was owed it at the due instant even if nobody had called, which is why the
+//! instants this reports are the due ones rather than the instant of the read.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +206,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetModelInvocationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetModelInvocationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetModelInvocationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetModelInvocationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "batch inference job state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(job) = store.model_invocation_job(&input.job_identifier, &region, now) else {
+            return Err(
+                GetModelInvocationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no batch inference job answers to {} in this account in {region}",
+                            input.job_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member comes off the stored record, through the SAME conversion
+        // `ListModelInvocationJobs` reports a summary with, so a read of one job and a
+        // listing that carries it agree about every member they share.
+        let summary = crate::state::model_invocation_job_summary(job);
+        Ok(GetModelInvocationJobOutput {
+            job_arn: summary.job_arn,
+            job_name: Some(summary.job_name),
+            model_id: summary.model_id,
+            client_request_token: summary.client_request_token,
+            role_arn: summary.role_arn,
+            status: summary.status,
+            message: summary.message,
+            submit_time: summary.submit_time,
+            last_modified_time: summary.last_modified_time,
+            end_time: summary.end_time,
+            input_data_config: summary.input_data_config,
+            output_data_config: summary.output_data_config,
+            vpc_config: summary.vpc_config,
+            timeout_duration_in_hours: summary.timeout_duration_in_hours,
+            job_expiration_time: summary.job_expiration_time,
+            model_invocation_type: summary.model_invocation_type,
+            total_record_count: summary.total_record_count,
+            processed_record_count: summary.processed_record_count,
+            success_record_count: summary.success_record_count,
+            error_record_count: summary.error_record_count,
+        })
     }
 }

@@ -40,7 +40,7 @@ use super::job_lifecycle::{create_address, deliverable_address, ok, router, stri
 /// that `JobMetadata` reports under the same name as `ClusterMetadata`. The remaining
 /// modelled member, `ShippingOption`, is reported by a job under `ShippingDetails` and is
 /// checked beside these.
-const INHERITED_MEMBERS: &[&str] = &[
+pub(crate) const INHERITED_MEMBERS: &[&str] = &[
     "AddressId",
     "ForwardingAddressId",
     "Description",
@@ -52,14 +52,14 @@ const INHERITED_MEMBERS: &[&str] = &[
 
 /// `body`'s member `name`, reading an absent member as JSON null, so a member neither record
 /// reports compares equal.
-fn at(body: &Value, name: &str) -> Value {
+pub(crate) fn at(body: &Value, name: &str) -> Value {
     body.get(name).cloned().unwrap_or(Value::Null)
 }
 
 /// A cluster still short of its quorum, holding `initial` node jobs minted by the create and
 /// `attached` node jobs attached one by one by `CreateJob`: its id and every node job id, in
 /// creation order.
-async fn cluster_with_nodes(
+pub(crate) async fn cluster_with_nodes(
     router: &MultiServiceRouter,
     address_id: &str,
     initial: usize,
@@ -101,7 +101,7 @@ async fn cluster_with_nodes(
 /// Assert the node job `job_id` reports the attributes `cluster` reports, and nothing of its
 /// own changed: it still names its cluster, is still `New`, and was still created when it
 /// was.
-async fn assert_node_agrees_with_cluster(
+pub(crate) async fn assert_node_agrees_with_cluster(
     router: &MultiServiceRouter,
     cluster: &Value,
     cluster_id: &str,

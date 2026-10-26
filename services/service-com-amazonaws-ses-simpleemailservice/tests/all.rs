@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/ses_identity_policies.rs"]
+mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]
 mod ses_identity_send_loop;
 #[path = "all/ses_store_bounds.rs"]

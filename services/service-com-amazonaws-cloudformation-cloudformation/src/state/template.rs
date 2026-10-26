@@ -1344,6 +1344,28 @@ fn creation_order_of<'a>(
     ordered
 }
 
+/// The DIRECT dependency relation of a template, keyed by logical id: for each resource
+/// that depends on any resource of the same template, the logical ids it depends on.
+///
+/// The same relation [`creation_order`] walks — `DependsOn` plus the implicit dependency a
+/// `Ref`, an `Fn::GetAtt` or an `Fn::Sub` variable creates — handed out so a caller can
+/// answer "what did this resource wait for": which is what makes a stack operation's event
+/// log a TIMELINE rather than a set ([`crate::state::timeline`]). A resource that depends
+/// on nothing is absent from the answer.
+///
+/// ONE pass over an already bounded body (a template past the documented per-template
+/// quotas is refused before anything reads it, [`quota_violation`]), so this costs what
+/// [`creation_order`] itself costs.
+pub fn direct_dependencies(template: &Template) -> BTreeMap<String, BTreeSet<String>> {
+    template
+        .resources
+        .iter()
+        .zip(dependency_map(template))
+        .filter(|(_, needs)| !needs.is_empty())
+        .map(|(resource, needs)| (resource.logical_id.clone(), needs))
+        .collect()
+}
+
 /// The dependency relation of a whole template, built ONCE: one entry per resource, in
 /// declaration order, carrying the logical ids that resource depends on.
 fn dependency_map(template: &Template) -> Vec<BTreeSet<String>> {

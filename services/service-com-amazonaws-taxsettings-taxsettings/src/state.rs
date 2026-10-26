@@ -295,6 +295,69 @@ pub const ERROR_CODE_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
 pub const ERROR_CODE_MALFORMED_TOKEN: &str = "MalformedToken";
 /// See [`ERROR_CODE_MISSING_INPUT`].
 pub const ERROR_CODE_INVALID_TOKEN: &str = "InvalidToken";
+/// See [`ERROR_CODE_MISSING_INPUT`]. The code a registration type that belongs
+/// to one country is refused with when the registration is held somewhere else
+/// — see [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`].
+pub const ERROR_CODE_NON_INDIA_CUSTOMER_CAN_NOT_SET_PAN: &str = "NonIndiaCustomerCanNotSetPAN";
+/// See [`ERROR_CODE_MISSING_INPUT`]. The code a registration type is refused
+/// with when the account already holds a registration whose type blocks it —
+/// see [`TYPES_BLOCKED_BY_A_STORED_TYPE`].
+pub const ERROR_CODE_GST_EXISTENCE_BLOCK_SET_PAN: &str = "GSTExistenceBlockSetPAN";
+
+/// The `ValidationException$errorCode` this service answers with when a request
+/// sets a `TaxRegistrationType` that belongs to ONE country
+/// ([`TYPE_JURISDICTIONS`]) for a registration held in a different country, per
+/// type.
+///
+/// `errorCode` is the discriminator a caller branches on instead of parsing the
+/// message, and the model's `ValidationExceptionErrorCode` enum publishes one
+/// value per refusal this service answers; `NonIndiaCustomerCanNotSetPAN` is the
+/// value published for the type India's Permanent Account Number is, so a
+/// request that sets that type for a registration held outside that country is
+/// the refusal it names.
+///
+/// A type whose jurisdiction row exists but that has NO row here is not refused
+/// for its jurisdiction: the published enum is the evidence that the service
+/// enforces the rule for a type, and it publishes a value for this one only. A
+/// later fixer holding a recording of another type refused the same way adds its
+/// row, and nothing else changes.
+pub const TYPE_OUTSIDE_ITS_COUNTRY_CODES: &[(&str, &str)] =
+    &[("PAN", ERROR_CODE_NON_INDIA_CUSTOMER_CAN_NOT_SET_PAN)];
+
+/// The `TaxRegistrationType` a request may not set while the account's stored
+/// registration is of a given type: the stored type, the submitted type it
+/// blocks, and the `ValidationException$errorCode` the refusal carries.
+///
+/// Read the same way as [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`]: the model's
+/// `ValidationExceptionErrorCode` enum publishes `GSTExistenceBlockSetPAN`, so
+/// the existence of a stored registration of the goods-and-services-tax type
+/// blocks a write that sets the Permanent Account Number type for that account,
+/// and the account's stored record decides it. A pair the enum does not publish
+/// is not blocked, so writing any other type over any other stored type stays a
+/// plain replacement.
+pub const TYPES_BLOCKED_BY_A_STORED_TYPE: &[(&str, &str, &str)] =
+    &[("GST", "PAN", ERROR_CODE_GST_EXISTENCE_BLOCK_SET_PAN)];
+
+/// How a refusal of a registration type that cannot be set for this customer
+/// states the rule: the type, and the one country whose customers may set it.
+///
+/// AWS publishes no message for the refusal, only its `errorCode`, so the
+/// sentence is this emulator's own; the code is the requirement and the message
+/// states the same rule in words.
+pub fn type_outside_its_country_message(registration_type: &str, country: &str) -> String {
+    format!("Only a customer in {country} can set a {registration_type} tax registration.")
+}
+
+/// How a refusal of a registration type the account's stored registration blocks
+/// states the rule: the type the request set, and the stored type that blocks
+/// it. The wording is this emulator's own, for the reason
+/// [`type_outside_its_country_message`] gives.
+pub fn type_blocked_by_stored_type_message(registration_type: &str, stored_type: &str) -> String {
+    format!(
+        "You can't set a {registration_type} tax registration while there's a {stored_type} tax \
+         registration for this account. Delete the {stored_type} tax registration first."
+    )
+}
 
 /// The page a listing builds when a request names no `maxResults`, for an
 /// operation whose own documentation states no default.
@@ -522,6 +585,46 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         let status = stored.status.clone();
         self.registrations.insert(account_id.to_string(), stored);
         Ok(status)
+    }
+
+    /// Refuse a write whose registration type the account's STORED registration
+    /// blocks — see [`TYPES_BLOCKED_BY_A_STORED_TYPE`].
+    ///
+    /// The one place both writers judge an entry against what the account
+    /// already holds, so `PutTaxRegistration` and the per-account loop of
+    /// `BatchPutTaxRegistration` cannot judge one account's state two different
+    /// ways. It answers the modelled `ValidationException`, carrying the
+    /// `errorCode` the model publishes for the pair, and is applied BEFORE
+    /// [`Self::store_registration`]: an account whose stored type blocks the
+    /// submitted one keeps its record whatever status that record is in, so the
+    /// caller is told which type blocks the write rather than that the record is
+    /// outstanding.
+    ///
+    /// A reporting call, despite taking `&self` on a store whose records settle:
+    /// the type of a stored registration is fixed when it is written and no
+    /// validation falling due changes it, so nothing has to be materialised to
+    /// read it.
+    pub fn check_registration_type_against_stored(
+        &self,
+        account_id: &str,
+        entry: &TaxRegistrationEntry,
+    ) -> Result<(), ValidationException> {
+        let Some(stored) = self.registrations.get(account_id) else {
+            return Ok(());
+        };
+        let Some(error_code) =
+            type_blocked_by_stored_type(&stored.registration_type, &entry.registration_type)
+        else {
+            return Ok(());
+        };
+        Err(validation(
+            error_code,
+            "taxRegistrationEntry.registrationType",
+            type_blocked_by_stored_type_message(
+                &entry.registration_type,
+                &stored.registration_type,
+            ),
+        ))
     }
 
     /// Whether this service reports tax exemptions for `account_id` at all —
@@ -1226,6 +1329,64 @@ pub fn check_registration_type_members(
         ));
     }
     Ok(())
+}
+
+/// Refuse an entry that sets a registration type the service ties to one country
+/// for a registration held in a different country.
+///
+/// The country the registration is held in is the `countryCode` of the legal
+/// address the entry carries; an entry that carries none identifies no country
+/// but the one its own type belongs to ([`entry_country_code`]), so there is no
+/// other jurisdiction for the rule to refuse it for. The refusal names the
+/// `registrationType` parameter, because the type is what cannot be set here,
+/// and carries the `errorCode`
+/// [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`] publishes for that type.
+pub fn check_registration_type_jurisdiction(
+    entry: &TaxRegistrationEntry,
+) -> Result<(), ValidationException> {
+    let registration_type = &entry.registration_type;
+    let Some(error_code) = type_outside_its_country_code(registration_type) else {
+        return Ok(());
+    };
+    let Some((country_code, country)) = type_jurisdiction(registration_type) else {
+        return Ok(());
+    };
+    let Some(address) = entry.legal_address.as_ref() else {
+        return Ok(());
+    };
+    if address.country_code.eq_ignore_ascii_case(country_code) {
+        return Ok(());
+    }
+    Err(validation(
+        error_code,
+        "taxRegistrationEntry.registrationType",
+        type_outside_its_country_message(registration_type, country),
+    ))
+}
+
+/// The `ValidationException$errorCode` a registration type held outside the one
+/// country it belongs to is refused with, or `None` for a type whose
+/// jurisdiction this service does not refuse a registration for — see
+/// [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`].
+pub fn type_outside_its_country_code(registration_type: &str) -> Option<&'static str> {
+    TYPE_OUTSIDE_ITS_COUNTRY_CODES
+        .iter()
+        .find(|(declared, _)| *declared == registration_type)
+        .map(|(_, error_code)| *error_code)
+}
+
+/// The `ValidationException$errorCode` a write of `registration_type` is refused
+/// with for an account whose stored registration is of `stored_type`, or `None`
+/// for a pair this service does not block — see
+/// [`TYPES_BLOCKED_BY_A_STORED_TYPE`].
+pub fn type_blocked_by_stored_type(
+    stored_type: &str,
+    registration_type: &str,
+) -> Option<&'static str> {
+    TYPES_BLOCKED_BY_A_STORED_TYPE
+        .iter()
+        .find(|(stored, submitted, _)| *stored == stored_type && *submitted == registration_type)
+        .map(|(_, _, error_code)| *error_code)
 }
 
 /// The jurisdiction of a registration type AWS fills the legal address in for —
@@ -2150,16 +2311,28 @@ pub fn check_country_requirements(
 ///
 /// The one place both writers — `PutTaxRegistration` and the per-account loop of
 /// `BatchPutTaxRegistration` — decide whether an entry is storable, so the two
-/// operations cannot disagree about one entry: the structural refusals (a legal
+/// operations cannot disagree about one entry: the structural refusals (a
+/// registration type set for a jurisdiction it does not belong to, a legal
 /// address submitted for a type AWS derives it from, a legal name or address the
 /// entry's own jurisdiction requires and it omits, a blank value the boundary
 /// validator's regex engine could not refuse) and then the per-country business
 /// rules [`COUNTRY_RULES`] carries. Why each is not left to the boundary
 /// validator is spelled out on the helpers this calls and in
 /// `ops/put_tax_registration.rs`.
+///
+/// Everything judged here is a fact about the ENTRY alone. The refusals that
+/// depend on what the account already holds are
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::check_registration_type_against_stored`],
+/// which each writer applies per account.
 pub fn check_tax_registration_entry(
     entry: &TaxRegistrationEntry,
 ) -> Result<(), ValidationException> {
+    // A registration type the service ties to one country may be set only for a
+    // registration held in that country. Decided before the members the type
+    // admits, because what is wrong is the type itself rather than a member of
+    // the entry carrying it.
+    check_registration_type_jurisdiction(entry)?;
+
     // A registration type whose legal address AWS derives from the tax number
     // itself does not take one from the request.
     check_registration_type_members(entry)?;
