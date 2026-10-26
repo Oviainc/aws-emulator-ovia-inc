@@ -185,26 +185,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (page, next) = {
             let store = state.lock();
-            let matched: Vec<SavingsPlanOffering> = store
-                .offerings()
-                .iter()
-                .filter(|offering| admits(&input, offering))
-                .map(project)
-                .collect();
-            let (page, next) = crate::state::paginate(&matched, offset, Some(page_size));
-            // The FIRST answer of a search always carries the cursor to resume
-            // at, even when the page it served already held every offering the
-            // filters admitted: this search reports where its walk of the
-            // catalog got to, not whether another match exists, and the
-            // recorded answers show AWS doing exactly that — a token beside a
-            // page carrying the complete set of matching offerings. A caller
-            // learns the walk is over by resuming it: a RESUMED answer carries
-            // a cursor only while results remain past its page, so the walk
-            // ends on the first resumed page with nothing more to return, which
-            // is what `nextToken` being "null when there are no more results to
-            // return" means here. One extra call at most, and never a loop.
-            let next = next
-                .or_else(|| (input.next_token.is_none()).then_some(matched.len()));
+            // One shared cursor rule and one shared page window
+            // ([`crate::state::search_page`]) for both catalog searches, so an
+            // offering is projected only once it is known to be on the page.
+            let (window, next) = crate::state::search_page(
+                store
+                    .offerings()
+                    .iter()
+                    .filter(|offering| admits(&input, offering)),
+                offset,
+                page_size,
+                input.next_token.is_some(),
+            );
+            let page: Vec<SavingsPlanOffering> = window.into_iter().map(project).collect();
             (page, next)
         };
 

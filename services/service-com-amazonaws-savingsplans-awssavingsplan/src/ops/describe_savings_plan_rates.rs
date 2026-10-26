@@ -191,24 +191,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-            // The card is walked LAZILY and only one page of it is priced: a
-            // line item past the page is never projected, so the work and the
-            // allocation one request can ask for are the page it asked for. One
-            // line item past the page is taken to learn whether the walk has
-            // more to return, and dropped without being reported.
-            let mut window: Vec<SavingsPlanRate> = crate::state::rate_line_items()
-                .iter()
-                .filter(|item| plan.prices(item) && admits(&input, item))
-                .skip(offset)
-                .take(page_size.saturating_add(1))
-                .map(|item| project(plan, item))
-                .collect();
-            let more_remain = window.len() > page_size;
-            window.truncate(page_size);
+            // The card is walked LAZILY through the shared page window, and only
+            // one page of it is priced: a line item past the page is never
+            // projected, so the work and the allocation one request can ask for
+            // are the page it asked for.
+            let (window, more_remain) = crate::state::page_window(
+                crate::state::rate_line_items()
+                    .iter()
+                    .filter(|item| plan.prices(item) && admits(&input, item)),
+                offset,
+                page_size,
+            );
             // `nextToken` "is null when there are no more results to return",
             // so a cursor comes back only while the walk has more to serve.
             let next = more_remain.then(|| offset.saturating_add(window.len()));
-            (window, next)
+            let page: Vec<SavingsPlanRate> =
+                window.into_iter().map(|item| project(plan, item)).collect();
+            (page, next)
         };
 
         Ok(DescribeSavingsPlanRatesOutput {

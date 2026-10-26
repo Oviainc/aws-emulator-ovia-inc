@@ -190,16 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (page, next) = {
             let store = state.lock();
             // The rate catalog is the priced line items crossed with the
-            // offerings that sell them, so it is walked LAZILY: a page is one
-            // window of that walk, and a pairing past the page is never looked
-            // at. One pairing past the page is taken to learn whether the walk
-            // has more to return, and dropped without being priced.
+            // offerings that sell them, so it is walked LAZILY through the
+            // shared page window, and the cursor the answer carries comes from
+            // the one rule both catalog searches follow
+            // ([`crate::state::search_page`]): a pairing past the page is never
+            // priced.
             let offerings: Vec<&crate::state::Offering> = store
                 .offerings()
                 .iter()
                 .filter(|offering| offering_admits(&input, offering))
                 .collect();
-            let mut window: Vec<(&crate::state::Offering, &crate::state::RateLineItem)> =
+            let (window, next) = crate::state::search_page(
                 crate::state::rate_line_items()
                     .iter()
                     .filter(|item| item_admits(&input, item))
@@ -208,27 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .iter()
                             .filter(move |offering| crate::state::offering_prices(offering, item))
                             .map(move |offering| (*offering, item))
-                    })
-                    .skip(offset)
-                    .take(page_size.saturating_add(1))
-                    .collect();
-            let more_remain = window.len() > page_size;
-            window.truncate(page_size);
-            // The FIRST answer of a search always carries the cursor to resume
-            // at, even when its page already held every rate the filters
-            // admitted: this search reports where its walk of the catalog got
-            // to, not whether another match exists. A caller learns the walk is
-            // over by resuming it: a RESUMED answer carries a cursor only while
-            // results remain past its page, so the walk ends on the first
-            // resumed page with nothing more to return, which is what
-            // `nextToken` being "null when there are no more results to return"
-            // means here. One extra call at most, and never a loop.
-            let reached = offset.saturating_add(window.len());
-            let next = if more_remain {
-                Some(reached)
-            } else {
-                input.next_token.is_none().then_some(reached)
-            };
+                    }),
+                offset,
+                page_size,
+                input.next_token.is_some(),
+            );
             let page: Vec<SavingsPlanOfferingRate> = window
                 .into_iter()
                 .map(|(offering, item)| project(offering, item))

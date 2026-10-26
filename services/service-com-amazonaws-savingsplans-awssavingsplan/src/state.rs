@@ -405,6 +405,54 @@ pub fn paginate<T: Clone>(
     (page, next)
 }
 
+/// One window of a LAZILY walked result: the page of `items` at `offset`, plus
+/// whether the walk still has something past that page.
+///
+/// The single home of the page-window idiom every catalog walk in this crate
+/// needs. The walk is advanced exactly one item past the page: that item is what
+/// says more remains, and it is dropped without being reported, so one request
+/// only ever costs the page it asked for. `items` must therefore be the walk
+/// BEFORE any per-row projection, so a row outside the page is never built.
+pub fn page_window<T>(
+    items: impl Iterator<Item = T>,
+    offset: usize,
+    page_size: usize,
+) -> (Vec<T>, bool) {
+    let mut window: Vec<T> = items
+        .skip(offset)
+        .take(page_size.saturating_add(1))
+        .collect();
+    let more_remain = window.len() > page_size;
+    window.truncate(page_size);
+    (window, more_remain)
+}
+
+/// One page of a SEARCH over a catalog this service owns: the window
+/// [`page_window`] serves, plus the cursor that answer carries — `resumed` says
+/// whether the request arrived with a `nextToken`.
+///
+/// The cursor rule, in one place for every such search. The FIRST answer always
+/// carries the cursor its walk reached, even when its page already held every
+/// match the filters admitted: a search reports where its walk of the catalog got
+/// to, not whether another match exists, and the recorded answers show a token
+/// beside a page carrying the complete set of matches. A caller learns the walk
+/// is over by resuming it: a RESUMED answer carries a cursor only while results
+/// remain past its page, so the walk ends on the first resumed page with nothing
+/// more to return, which is what `nextToken` being "null when there are no more
+/// results to return" means for these searches. One extra call at most, and never
+/// a loop.
+pub fn search_page<T>(
+    items: impl Iterator<Item = T>,
+    offset: usize,
+    page_size: usize,
+    resumed: bool,
+) -> (Vec<T>, Option<usize>) {
+    let (page, more_remain) = page_window(items, offset, page_size);
+    let reached = offset.saturating_add(page.len());
+    let next = (more_remain || !resumed).then_some(reached);
+    (page, next)
+}
+
 /// The page the offering and offering-rate searches serve when the caller names
 /// no size.
 ///

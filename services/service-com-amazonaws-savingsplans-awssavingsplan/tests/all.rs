@@ -31,6 +31,8 @@ mod queued_purchase_deletion;
 mod return_monthly_allowance;
 #[path = "all/savings_plans_lifecycle.rs"]
 mod savings_plans_lifecycle;
+#[path = "all/shared_catalog_paging.rs"]
+mod shared_catalog_paging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_round_trip.rs"]
