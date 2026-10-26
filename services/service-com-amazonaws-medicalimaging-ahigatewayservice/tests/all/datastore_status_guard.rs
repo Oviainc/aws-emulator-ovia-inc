@@ -160,7 +160,10 @@ async fn datastore_in_phase(emulator: &Emulator, case: &str, phase: Phase) -> St
 ///
 /// The only write a case makes into the state struct, and it changes no status: it moves
 /// the DUE instant the handler itself recorded.
-fn hold_transition(emulator: &Emulator, case: &str, datastore_id: &str) {
+///
+/// `pub(crate)` because `crate::tagging_write_state_guard` drives the same two held
+/// phases at the tagging routes, which is that suite's rule rather than this one's.
+pub(crate) fn hold_transition(emulator: &Emulator, case: &str, datastore_id: &str) {
     let state = service_state(emulator.engine()).expect("the medical-imaging state store");
     let mut store = state.lock();
     let datastore = store

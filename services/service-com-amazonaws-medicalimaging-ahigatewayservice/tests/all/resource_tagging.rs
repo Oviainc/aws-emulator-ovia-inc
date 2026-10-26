@@ -21,8 +21,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
-    DATASTORE_DELETION_DELAY, MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LENGTH, TAG_KEY_PATTERN,
-    TAG_KEY_RESERVED_PREFIX,
+    DATASTORE_ACTIVATION_DELAY, DATASTORE_DELETION_DELAY, MAX_TAGS_PER_RESOURCE,
+    TAG_KEY_MAX_LENGTH, TAG_KEY_PATTERN, TAG_KEY_RESERVED_PREFIX,
 };
 
 use crate::datastore_lifecycle::{Answer, Emulator, ACCOUNT, SETTLE_MULTIPLE};
@@ -705,7 +705,10 @@ async fn tagging_reads_and_writes_the_resources_own_tag_map() {
             "{case}: expected the tags the create carried, got {listed:?}"
         );
 
-        // An upsert, not an insert: the same key takes the new value.
+        // An upsert, not an insert: the same key takes the new value. The activation the
+        // create left owed is waited out first: a tagging WRITE is served only by a data
+        // store that has settled into `ACTIVE`.
+        tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
         let overwritten = tag(&emulator, &arn, json!({ "team": "cardiology" })).await;
         assert_eq!(
             overwritten.status, 200,

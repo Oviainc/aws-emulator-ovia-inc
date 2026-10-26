@@ -66,6 +66,8 @@
 //! Widened in with `extra_errors` (see the `#[operation_error]` note below):
 //!
 //! * `BadRequestException` (HTTP 400) — The request is invalid or malformed.
+//! * `ConflictException` (HTTP 409) — Updating or deleting a resource can cause an
+//!   inconsistent state.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -87,14 +89,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medicalimaging-ahigatew
 // ("The request is invalid or malformed.", HTTP 400) and only this operation's error
 // list omits. The same classification is applied to the boundary refusal in
 // `crate::service::override_refusal`, so both routes answer one code.
+// `ConflictException` is widened in the same way and for the same reason: this is a
+// WRITE onto a data store, so it answers to the precondition every other write in this
+// service answers to — the store has to have settled into `ACTIVE` — and the shape this
+// SERVICE models for a call that would disagree with a transition already in flight
+// ("Updating or deleting a resource can cause an inconsistent state.", HTTP 409) is the
+// one the rest of the crate refuses that state with.
 #[smithy_macros::operation_error(
     "com.amazonaws.medicalimaging#TagResource",
-    extra_errors = ["BadRequestException"]
+    extra_errors = ["BadRequestException", "ConflictException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -187,15 +196,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reached in the region this request was addressed to, as every id-keyed write
         // is: an ARN naming a data store of another region names a resource this
-        // request cannot see.
-        // Stated by the KIND that is absent, as a constant of this service: no
-        // identifier the caller supplied is reflected back
-        // (`crate::state::MissingResource::message`).
-        let tags = store.resource_tags_mut(&region, &arn).map_err(|missing| {
-            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: missing.message().to_string(),
-            })
-        })?;
+        // request cannot see — and reached through the WRITER'S lookup, which admits only
+        // a resource that can still take part in work: a data store that has settled into
+        // `ACTIVE`, and an image set that has not been retired
+        // (`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::writable_resource_tags_mut`).
+        // An absent resource is stated by the KIND that is absent, as a constant of this
+        // service: no identifier the caller supplied is reflected back
+        // (`crate::state::MissingResource::message`); a store mid-transition is the
+        // modelled conflict every other write in this crate refuses that state with.
+        let tags = store
+            .writable_resource_tags_mut(&region, &arn)
+            .map_err(|refusal| match refusal {
+                crate::state::UnwritableResource::Missing(missing) => {
+                    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: missing.message().to_string(),
+                    })
+                }
+                crate::state::UnwritableResource::DatastoreNotActive => {
+                    TagResourceErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+                    })
+                }
+            })?;
 
         // Only a key the resource does not already carry grows the map, so
         // re-tagging an existing key is never refused by the bound.

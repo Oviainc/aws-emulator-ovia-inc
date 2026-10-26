@@ -55,5 +55,7 @@ mod tag_map_validation;
 mod tag_resource_key_pattern;
 #[path = "all/tagging_not_found_text.rs"]
 mod tagging_not_found_text;
+#[path = "all/tagging_write_state_guard.rs"]
+mod tagging_write_state_guard;
 #[path = "all/untag_key_validation.rs"]
 mod untag_key_validation;

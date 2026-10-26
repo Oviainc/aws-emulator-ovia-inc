@@ -66,6 +66,8 @@
 //! Widened in with `extra_errors` (see the `#[operation_error]` note below):
 //!
 //! * `BadRequestException` (HTTP 400) — The request is invalid or malformed.
+//! * `ConflictException` (HTTP 409) — Updating or deleting a resource can cause an
+//!   inconsistent state.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -84,15 +86,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medicalimaging-ahigatew
 // `BadRequestException` is widened in with `extra_errors`, for the reason given in
 // `tag_resource.rs`: a `resourceArn` label that is not an ARN is a malformed request,
 // which is the shape this SERVICE models for that and only this operation's error list
-// omits.
+// omits. `ConflictException` is widened in for the same reason and the same rule: this
+// too is a WRITE, so it answers to the precondition every other write in this service
+// answers to — the data store has to have settled into `ACTIVE`.
 #[smithy_macros::operation_error(
     "com.amazonaws.medicalimaging#UntagResource",
-    extra_errors = ["BadRequestException"]
+    extra_errors = ["BadRequestException", "ConflictException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -186,15 +191,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reached in the region this request was addressed to, as every id-keyed write
         // is: an ARN naming a data store of another region names a resource this
-        // request cannot see.
+        // request cannot see — and through the WRITER'S lookup, which admits only a
+        // resource that can still take part in work, exactly as `TagResource` does
+        // (`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::writable_resource_tags_mut`).
         // Stated by the KIND that is absent, as a constant of this service: no
         // identifier the caller supplied is reflected back
         // (`crate::state::MissingResource::message`).
-        let tags = store.resource_tags_mut(&region, &arn).map_err(|missing| {
-            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: missing.message().to_string(),
-            })
-        })?;
+        let tags = store
+            .writable_resource_tags_mut(&region, &arn)
+            .map_err(|refusal| match refusal {
+                crate::state::UnwritableResource::Missing(missing) => {
+                    UntagResourceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: missing.message().to_string(),
+                        },
+                    )
+                }
+                crate::state::UnwritableResource::DatastoreNotActive => {
+                    UntagResourceErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+                    })
+                }
+            })?;
 
         // Removing a key the resource does not carry is not an error: untagging is
         // idempotent, so the same request repeated leaves the same tag map.

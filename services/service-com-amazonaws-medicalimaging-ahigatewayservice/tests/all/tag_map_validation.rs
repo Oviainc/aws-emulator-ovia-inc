@@ -22,11 +22,11 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
-    MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH, TAG_KEY_PATTERN,
-    TAG_KEY_RESERVED_PREFIX,
+    DATASTORE_ACTIVATION_DELAY, MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH,
+    TAG_KEY_PATTERN, TAG_KEY_RESERVED_PREFIX,
 };
 
-use crate::datastore_lifecycle::{Answer, Emulator, ACCOUNT};
+use crate::datastore_lifecycle::{Answer, Emulator, ACCOUNT, SETTLE_MULTIPLE};
 use crate::resource_tagging::{
     illegal_tag_keys, list_tags, tag, tag_object, unanchored_tag_key_pattern, untag,
     VALIDATION_ENVELOPE,
@@ -141,6 +141,10 @@ fn admitted_keys() -> Vec<(&'static str, String)> {
 async fn every_tag_key_the_model_admits_is_accepted_on_every_write_path() {
     let emulator = Emulator::new();
 
+    // Every store the rows need, minted up front: a tagging WRITE is served only by a
+    // data store that has settled into `ACTIVE`, so the activation span is waited out
+    // ONCE for all of them instead of once per row.
+    let mut prepared: Vec<(&'static str, String, String, String)> = Vec::new();
     for (index, (case, key)) in admitted_keys().into_iter().enumerate() {
         // Through CreateDatastore, which installs the map as the store is minted.
         let created = emulator
@@ -154,15 +158,6 @@ async fn every_tag_key_the_model_admits_is_accepted_on_every_write_path() {
             created.status, 200,
             "case {case:?} via CreateDatastore: expected HTTP 200, got {created:?}"
         );
-        let created_id = created.string(&["datastoreId"]);
-        let created_arn = datastore_arn(&emulator, &created_id).await;
-        let listed = list_tags(&emulator, &created_arn).await;
-        assert_eq!(
-            listed.field(&["tags"]),
-            &one_tag(&key),
-            "case {case:?} via CreateDatastore: expected the key to read back verbatim, got {listed:?}"
-        );
-
         // And through TagResource, onto a store created with no tags at all.
         let bare = emulator
             .create_datastore(json!({
@@ -174,7 +169,25 @@ async fn every_tag_key_the_model_admits_is_accepted_on_every_write_path() {
             bare.status, 200,
             "case {case:?}: expected the untagged create to answer 200, got {bare:?}"
         );
-        let bare_arn = datastore_arn(&emulator, &bare.string(&["datastoreId"])).await;
+        prepared.push((
+            case,
+            key,
+            created.string(&["datastoreId"]),
+            bare.string(&["datastoreId"]),
+        ));
+    }
+    tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
+
+    for (case, key, created_id, bare_id) in prepared {
+        let created_arn = datastore_arn(&emulator, &created_id).await;
+        let listed = list_tags(&emulator, &created_arn).await;
+        assert_eq!(
+            listed.field(&["tags"]),
+            &one_tag(&key),
+            "case {case:?} via CreateDatastore: expected the key to read back verbatim, got {listed:?}"
+        );
+
+        let bare_arn = datastore_arn(&emulator, &bare_id).await;
         let tagged = tag(&emulator, &bare_arn, one_tag(&key)).await;
         assert_eq!(
             tagged.status, 200,
