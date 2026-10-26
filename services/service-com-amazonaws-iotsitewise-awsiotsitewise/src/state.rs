@@ -23,7 +23,11 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`], keyed by
 //! the workspace and the minted job id, each record carrying the request that
 //! started it and the instant it started, from which a read DERIVES how far the
-//! job has got. A workspace's searches live in
+//! job has got. The data segments a dataset holds live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_data_segments`], keyed
+//! by the dataset, each record naming the dataset the data came from, the time
+//! series it covers and the half-open span it covers of it, which is what a
+//! deletion addresses one by. A workspace's searches live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::searches`], keyed by the
 //! workspace and the search id, each record carrying the request the search was
 //! started from and the instants its lifecycle transitions fall due, so the
@@ -429,6 +433,14 @@ pub const MAX_DATASETS: usize = 1_000;
 /// is a decimal string (`^(0|([1-9]{1}\d*))$`), which is how the counter reaches
 /// the wire.
 pub const DATASET_INITIAL_VERSION: u32 = 1;
+
+/// How many data segments ONE dataset holds.
+///
+/// A segment is added by a producer entry point and nothing evicts one, so the
+/// writer refuses past this cap rather than dropping a segment a caller still
+/// expects to find; together with [`MAX_DATASETS`] it bounds the whole registry.
+/// The emulator's own bound, not a published AWS default.
+pub const MAX_DATA_SEGMENTS_PER_DATASET: usize = 1_000;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the gateway map. `CreateGateway`
 /// is the only thing that adds a gateway and it declares the modelled
@@ -1573,6 +1585,42 @@ impl DatasetRecord {
         self.active_at = now + ACTIVATION_DELAY;
         self.version = self.version.saturating_add(1);
     }
+}
+
+/// One data segment a dataset holds: a span of ONE time series' data.
+///
+/// A session dataset "contains data segments of time series data" and a curated
+/// dataset "curates data segments selected from source session datasets" (the
+/// `CreateDataset` model doc), so a segment names the dataset it came FROM
+/// ([`Self::source_dataset_id`]) beside the time series and the span it covers.
+/// The time series and the span are a segment's IDENTITY inside the dataset that
+/// holds it: that is exactly what `BatchDeleteDatasetDataSegments` addresses one
+/// by, so a dataset holds at most one segment for a given series and span.
+///
+/// The span is HALF-OPEN — `[start_timestamp, end_timestamp)` — the way a capture
+/// source's [`CaptureSegment`] span is read, so two adjacent segments cover a
+/// continuous stream and the instant between them belongs to the later one alone.
+///
+/// The PRODUCER side (`BatchAssociateDataSegmentsToDataset`, and the bulk import
+/// of time series data into a session dataset) is not implemented in this
+/// emulator yet, so today the only writer of a dataset's segments is
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_dataset_data_segment`] — the
+/// one entry point a producer path (or a test seeding a dataset) calls — and the
+/// only remover is
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::delete_dataset_data_segment`].
+#[derive(Debug, Clone)]
+pub struct DataSegmentRecord {
+    /// The dataset the segment's data came from: the holding dataset itself for a
+    /// session dataset's own segment, and the source session dataset for a
+    /// segment a curated dataset selected.
+    pub source_dataset_id: String,
+    /// The `TimeSeriesId` of the time series whose data the segment covers.
+    pub time_series_id: String,
+    /// When the covered data begins.
+    pub start_timestamp: TimeInNanos,
+    /// When it ends. Always later than [`Self::start_timestamp`]: the writer
+    /// refuses a segment covering no time at all.
+    pub end_timestamp: TimeInNanos,
 }
 
 /// A workspace, by the name that identifies it in this account and region.
@@ -3637,6 +3685,14 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// The data segments of each dataset, by `datasetId` — a dataset id
+    /// identifies one across every workspace, so the workspace a segment is
+    /// addressed through is the one on the dataset's own record. Each dataset's
+    /// segments are kept sorted by [`data_segment_key`] and single-valued on it,
+    /// and bounded at [`MAX_DATA_SEGMENTS_PER_DATASET`]. Written by
+    /// [`Self::put_dataset_data_segment`] and removed by
+    /// [`Self::delete_dataset_data_segment`].
+    pub dataset_data_segments: HashMap<String, Vec<DataSegmentRecord>>,
     /// Searches by [`search_key`] — the workspace they run against and their
     /// own id — because a search is addressed by that pair. Bounded at
     /// [`MAX_SEARCHES`] / [`MAX_SEARCHES_PER_WORKSPACE`], which `StartSearch`
@@ -4181,6 +4237,144 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         if let Some(properties) = self.property_values.get_mut(asset_id) {
             properties.remove(property_id);
         }
+    }
+
+    /// Store `segment` on the dataset `dataset_id`, answering `false` — writing
+    /// nothing — when the store cannot hold it: a bound of its span is not an
+    /// instant the modelled `TimeInNanos` can express, the span covers no time
+    /// (its start is not before its end), or the dataset already holds
+    /// [`MAX_DATA_SEGMENTS_PER_DATASET`] segments.
+    ///
+    /// This is the PRODUCER-side entry point — the one writer of a dataset's
+    /// segments, which `BatchDeleteDatasetDataSegments` then removes from. The
+    /// producer operations themselves are not implemented in this emulator yet
+    /// (see [`DataSegmentRecord`]), so a test seeding a dataset is today's only
+    /// caller; everything a deletion can find was written here and nowhere else.
+    ///
+    /// The log stays sorted by [`data_segment_key`] and single-valued on it:
+    /// storing the same series' same span again REPLACES the entry held for it
+    /// rather than holding the segment twice.
+    pub fn put_dataset_data_segment(
+        &mut self,
+        dataset_id: &str,
+        segment: DataSegmentRecord,
+    ) -> bool {
+        if !is_modelled_time(&segment.start_timestamp)
+            || !is_modelled_time(&segment.end_timestamp)
+        {
+            return false;
+        }
+        if timestamp_key(&segment.start_timestamp) >= timestamp_key(&segment.end_timestamp) {
+            return false;
+        }
+        let held = self.dataset_data_segments.entry(dataset_id.to_string()).or_default();
+        let key = data_segment_key(&segment);
+        match held.binary_search_by(|stored| data_segment_key(stored).cmp(&key)) {
+            Ok(at) => held[at] = segment,
+            Err(at) => {
+                // Past the cap the write is REFUSED rather than evicting a
+                // segment: a deletion addresses a segment by its own span, so a
+                // silently dropped one would read as a segment that never
+                // existed. The cap is at least one, so a dataset reaching it
+                // already held segments and no empty entry is left behind here.
+                if held.len() >= MAX_DATA_SEGMENTS_PER_DATASET {
+                    return false;
+                }
+                held.insert(at, segment);
+            }
+        }
+        true
+    }
+
+    /// Forget the segment of `dataset_id` that `time_series_id` and the span
+    /// `[start, end)` name EXACTLY, answering whether one was held.
+    ///
+    /// What `BatchDeleteDatasetDataSegments` does to one entry: a segment is
+    /// addressed by its time series and its own span, so a span no segment of
+    /// the dataset covers exactly removes nothing and the caller reports that
+    /// entry as the absence it is.
+    pub fn delete_dataset_data_segment(
+        &mut self,
+        dataset_id: &str,
+        time_series_id: &str,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> bool {
+        let Some(held) = self.dataset_data_segments.get_mut(dataset_id) else {
+            return false;
+        };
+        let wanted = (time_series_id, timestamp_key(start), timestamp_key(end));
+        let Ok(at) = held.binary_search_by(|stored| data_segment_key(stored).cmp(&wanted)) else {
+            return false;
+        };
+        held.remove(at);
+        // A dataset that holds no segments holds no entry either, so the map does
+        // not grow an empty vector per dataset a deletion has emptied.
+        if held.is_empty() {
+            self.dataset_data_segments.remove(dataset_id);
+        }
+        true
+    }
+
+    /// The stored data stream whose own `TimeSeriesId` is `time_series_id`, or
+    /// `None` when no stream of this store carries it.
+    ///
+    /// The inverse of [`time_series_id`]: a stream an asset property owns is
+    /// named by its `(assetId, propertyId)` pair joined by
+    /// [`TIME_SERIES_ID_SEPARATOR`], and a stream no property owns carries a
+    /// `TimeSeriesId` of its own, minted when the stream appeared. One resolver,
+    /// so an operation that addresses a time series by that id reaches the same
+    /// stream the alias and the id-pair forms reach.
+    pub fn series_by_time_series_id(&self, time_series_id: &str) -> Option<SeriesKey> {
+        if let Some((asset_id, property_id)) = time_series_id.split_once(TIME_SERIES_ID_SEPARATOR)
+        {
+            return self
+                .assets
+                .get(asset_id)
+                .filter(|asset| asset.property(property_id).is_some())
+                .map(|_| SeriesKey::Property(asset_id.to_string(), property_id.to_string()));
+        }
+        self.disassociated_time_series
+            .values()
+            .find(|series| series.time_series_id == time_series_id)
+            .map(|series| SeriesKey::Disassociated(series.alias.clone()))
+    }
+
+    /// Forget every sample of the stream `key` names whose timestamp falls inside
+    /// the HALF-OPEN window `[start, end)`, answering how many went.
+    ///
+    /// What "deleting a data segment deletes the underlying time series data for
+    /// the segment's time range" (the `BatchDeleteDatasetDataSegments` model doc)
+    /// does to the stream a segment covers: the samples inside that segment's own
+    /// span go and every other sample of the stream stays, so the data of a
+    /// neighbouring segment survives the deletion of this one. Answers 0 for a
+    /// stream `key` names no longer, and leaves the series sorted ascending.
+    pub fn forget_series_window(
+        &mut self,
+        key: &SeriesKey,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> usize {
+        let series = match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .property_values
+                .get_mut(asset_id)
+                .and_then(|properties| properties.get_mut(property_id)),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_time_series
+                .get_mut(alias)
+                .map(|series| &mut series.values),
+        };
+        let Some(series) = series else {
+            return 0;
+        };
+        let (start, end) = (timestamp_key(start), timestamp_key(end));
+        let before = series.len();
+        series.retain(|sample| {
+            let at = timestamp_key(&sample.timestamp);
+            at < start || at >= end
+        });
+        before - series.len()
     }
 
     /// The search `workspace` holds under `search_id`, or `None` when that
@@ -5121,6 +5315,9 @@ pub const RESOURCE_TASK: &str = "Task";
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";
 
+/// The resource kind those errors name for a data segment a dataset holds.
+pub const RESOURCE_DATA_SEGMENT: &str = "Data Segment";
+
 /// The resource kind those errors name for a search.
 pub const RESOURCE_SEARCH: &str = "Search";
 
@@ -5468,6 +5665,20 @@ pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
     (
         timestamp.time_in_seconds,
         timestamp.offset_in_nanos.unwrap_or(0),
+    )
+}
+
+/// Total order on a data segment inside the dataset that holds it: the time
+/// series it covers, then its span.
+///
+/// This is the segment's IDENTITY — what `BatchDeleteDatasetDataSegments`
+/// addresses one by — so the one comparison serves the sorted insert, the
+/// single-valued replace and the lookup a deletion makes.
+fn data_segment_key(segment: &DataSegmentRecord) -> (&str, (i64, i32), (i64, i32)) {
+    (
+        segment.time_series_id.as_str(),
+        timestamp_key(&segment.start_timestamp),
+        timestamp_key(&segment.end_timestamp),
     )
 }
 

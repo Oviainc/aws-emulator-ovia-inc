@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteDatasetDataSegments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteDatasetDataSegments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteDatasetDataSegments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below removes, from the session dataset the request
+//! names, each data segment an entry addresses by its time series and its exact
+//! span, deletes the underlying time series data that span covers, and takes the
+//! dataset to its next version when it accepted at least one deletion. An entry
+//! that addresses no stored segment, or that names a span covering no time, is
+//! reported in `errors` with its own `DataSegmentErrorCode` while the rest of the
+//! batch is applied.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteDatasetDataSegments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteDatasetDataSegmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteDatasetDataSegments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchDeleteDatasetDataSegmentsError::Modeled(
+                BatchDeleteDatasetDataSegmentsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token deletes again —
+        // reporting the segments the first call removed as the absences they now are
+        // — rather than replaying the first answer. Left to the idempotency issue,
+        // exactly as `UpdateDataset` and `CreateDataset` leave it.
+
+        // The modelled `@length` of 1..10 on `deleteDataSegmentEntries` is refused
+        // before this handler runs, so the work one request can do under the held
+        // lock is already bounded.
+        let mut store = state.lock();
+
+        // `workspaceName` names "the name of the workspace that contains the
+        // dataset", so it SCOPES the lookup: a dataset held by another workspace, or
+        // by none at all, is not the dataset this request addresses — the same
+        // narrowing every other workspace-scoped lookup in this service applies.
+        let dataset = store
+            .datasets
+            .get(&input.dataset_id)
+            .filter(|dataset| dataset.workspace_name.as_deref() == Some(&input.workspace_name))
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+        let dataset_type = dataset.dataset_type.clone();
+        // The version the dataset reports if this call accepts no deletion at all.
+        let unchanged_version = dataset.version_label();
+
+        // This operation "deletes a batch of data segments from a SESSION dataset",
+        // and deleting one "deletes the underlying time series data for the segment's
+        // time range": the data of a curated dataset's segment belongs to the source
+        // session dataset it was selected from, which is why removing a segment from
+        // a curated dataset is `BatchDisassociateDataSegmentsFromDataset` instead. A
+        // dataset the store holds no type for states which side of that rule it falls
+        // on, so it is not refused here — `CreateDataset` keeps `datasetType` absent
+        // rather than guessing one.
+        if let Some(dataset_type) = dataset_type.filter(|held| held != DATASET_TYPE_SESSION) {
+            return Err(invalid_request(format!(
+                "Data segments can be deleted only from a {DATASET_TYPE_SESSION} dataset, but \
+                 the dataset {} is a {dataset_type} dataset.",
+                input.dataset_id
+            )));
+        }
+
+        let mut errors: Vec<FailedDataSegmentDeletion> = Vec::new();
+        let mut deleted = 0usize;
+        for entry in &input.delete_data_segment_entries {
+            // A segment covers the half-open span its two bounds name, so a span
+            // whose start is not before its end covers no time and can name no
+            // segment. The model constrains each bound on its own and says nothing
+            // about the pair, so this is the entry's own validation failure rather
+            // than a refusal of the whole batch.
+            if crate::state::timestamp_key(&entry.start_timestamp)
+                >= crate::state::timestamp_key(&entry.end_timestamp)
+            {
+                errors.push(failed(
+                    entry,
+                    ERROR_CODE_VALIDATION_ERROR,
+                    "endTimestamp must be later than startTimestamp.".to_string(),
+                ));
+                continue;
+            }
+
+            // The segment is addressed by its time series and its exact span, so an
+            // entry naming a span this dataset holds no segment for — including one
+            // an earlier entry of this same batch already removed — deletes nothing
+            // and is reported as the absence it is.
+            if !store.delete_dataset_data_segment(
+                &input.dataset_id,
+                &entry.time_series_id,
+                &entry.start_timestamp,
+                &entry.end_timestamp,
+            ) {
+                errors.push(failed(
+                    entry,
+                    ERROR_CODE_RESOURCE_NOT_FOUND,
+                    crate::state::not_found_message(
+                        crate::state::RESOURCE_DATA_SEGMENT,
+                        &entry.time_series_id,
+                    ),
+                ));
+                continue;
+            }
+
+            // "Deleting a data segment deletes the underlying time series data for
+            // the segment's time range": the samples the segment's own span covers go
+            // from the stream it covers, and every other sample of that stream — the
+            // data of the segments beside it — stays. A segment whose time series the
+            // store no longer holds has no data left to delete, which is not a reason
+            // to keep the segment.
+            if let Some(stream) = store.series_by_time_series_id(&entry.time_series_id) {
+                store.forget_series_window(
+                    &stream,
+                    &entry.start_timestamp,
+                    &entry.end_timestamp,
+                );
+            }
+            deleted += 1;
+        }
+
+        // "The version of the dataset after deletion": a dataset's version counts the
+        // writes it has accepted, so a call that removed at least one segment takes
+        // it to its next version and reports `UPDATING` until the transition that
+        // write owes falls due, exactly as `UpdateDataset` does; a call every entry
+        // of which failed accepted no write and leaves the version where it was.
+        let dataset_version = match store.datasets.get_mut(&input.dataset_id) {
+            Some(dataset) if deleted > 0 => {
+                dataset.begin_update(now);
+                dataset.version_label()
+            }
+            // The dataset resolved under this same held lock, so it is still there;
+            // the version it was read at is the answer when nothing was written.
+            _ => unchanged_version,
+        };
+
+        Ok(BatchDeleteDatasetDataSegmentsOutput {
+            dataset_id: input.dataset_id.clone(),
+            dataset_version,
+            errors,
+        })
     }
+}
+
+/// The `DatasetTypeEnum` value a data-segment deletion applies to. Source:
+/// `smithy_query(query="shape", shape="DatasetTypeEnum")` — SESSION, CURATED,
+/// EXTERNAL.
+const DATASET_TYPE_SESSION: &str = "SESSION";
+
+/// The `DataSegmentErrorCode` an entry addressing no stored segment reports.
+/// Source: `crate::ops::types::DATA_SEGMENT_ERROR_CODE_VALUES` — the enum's whole
+/// value list is CONFLICTING_OPERATION | INTERNAL_FAILURE | LIMIT_EXCEEDED |
+/// RESOURCE_NOT_FOUND | VALIDATION_ERROR.
+const ERROR_CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
+
+/// The `DataSegmentErrorCode` an entry whose span covers no time reports; see
+/// [`ERROR_CODE_RESOURCE_NOT_FOUND`] for the value list.
+const ERROR_CODE_VALIDATION_ERROR: &str = "VALIDATION_ERROR";
+
+/// The `errors` element for an entry this call could not apply: the segment the
+/// entry addressed, echoed exactly as the request named it, plus the code and the
+/// message saying why.
+fn failed(
+    entry: &DeleteDataSegmentEntry,
+    error_code: &str,
+    error_message: String,
+) -> FailedDataSegmentDeletion {
+    FailedDataSegmentDeletion {
+        time_series_id: entry.time_series_id.clone(),
+        start_timestamp: entry.start_timestamp.clone(),
+        end_timestamp: entry.end_timestamp.clone(),
+        error_code: error_code.to_string(),
+        error_message,
+    }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
+/// nothing in the workspace the request named.
+fn not_found(dataset_id: &str) -> BatchDeleteDatasetDataSegmentsError {
+    BatchDeleteDatasetDataSegmentsError::Modeled(
+        BatchDeleteDatasetDataSegmentsErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_DATASET,
+                    dataset_id,
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> BatchDeleteDatasetDataSegmentsError {
+    BatchDeleteDatasetDataSegmentsError::Modeled(
+        BatchDeleteDatasetDataSegmentsErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
 }
