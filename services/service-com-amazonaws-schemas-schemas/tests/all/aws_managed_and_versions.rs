@@ -395,20 +395,32 @@ async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
     }
 }
 
-/// RULE: `ExportSchema` converts only the schemas AWS publishes, and only into a
-/// schema language the service knows — a caller's own schema is refused 403, and a
-/// `Type` that is not a modelled schema type is refused 400.
+/// RULE: `ExportSchema` refuses what it cannot render, and nothing else — a version
+/// whose STORED schema language is not one the service exports from is refused 403,
+/// a `Type` that is not a modelled schema language is refused 400, and a resource
+/// nothing holds is refused 404. Who owns the registry is never consulted (the
+/// caller-owned documents that DO export are the subject of
+/// `tests/all/export_reads_the_stored_schema.rs`).
 #[tokio::test]
 async fn exporting_what_cannot_be_exported_is_refused() {
     let emulator = Emulator::new();
     create_registry(&emulator, "mine").await;
-    let created = emulator
-        .call("POST", &schema_uri("mine", "own"), Some(schema_body("own")))
+    // A schema stored in the language the conversion PRODUCES: there is no rendering
+    // of it for the export to serve.
+    let stored_as_draft4 = emulator
+        .call(
+            "POST",
+            &schema_uri("mine", "already-draft4"),
+            Some(json!({
+                "Content": r#"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object"}"#,
+                "Type": "JSONSchemaDraft4",
+            })),
+        )
         .await;
     assert_eq!(
-        created.status, 201,
+        stored_as_draft4.status, 201,
         "expected 201 from CreateSchema, got {} {:?}",
-        created.status, created.body
+        stored_as_draft4.status, stored_as_draft4.body
     );
     let managed_registry = AWS_MANAGED_REGISTRY;
     // Any member of the catalogue serves: these refusals are about the request, not
@@ -421,18 +433,19 @@ async fn exporting_what_cannot_be_exported_is_refused() {
         .clone();
     let managed_schema = managed_schema_name.as_str();
 
-    // Rows: a caller's own schema (403 whatever the type asked for), a `Type` outside
-    // the modelled enum (400), and a resource that does not exist (404).
+    // Rows: a schema whose stored language the service does not export from (403
+    // whichever language is asked for), a `Type` outside the modelled enum (400), and
+    // a resource that does not exist (404).
     let cases: Vec<(&str, String, u16, &str)> = vec![
         (
-            "a caller's own schema",
-            export_uri("mine", "own", "JSONSchemaDraft4"),
+            "a schema stored in the language the export produces",
+            export_uri("mine", "already-draft4", "JSONSchemaDraft4"),
             403,
             "ForbiddenException",
         ),
         (
-            "a caller's own schema, exported as its own type",
-            export_uri("mine", "own", "OpenApi3"),
+            "a schema stored as draft 4, asked for as OpenAPI 3",
+            export_uri("mine", "already-draft4", "OpenApi3"),
             403,
             "ForbiddenException",
         ),

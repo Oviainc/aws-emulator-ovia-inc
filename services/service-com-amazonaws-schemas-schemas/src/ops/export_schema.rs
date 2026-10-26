@@ -3,7 +3,7 @@
 //! @op ExportSchema
 //!
 //! Renders a stored schema in another schema language: the JSON Schema draft-4 form
-//! of an AWS-managed OpenAPI 3 event schema.
+//! of an OpenAPI 3 schema document, in whichever registry that schema lives.
 //!
 //! ## Shape of an operation
 //!
@@ -202,22 +202,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // Exporting is offered for the schemas AWS publishes, not for a caller's own:
-        // a schema in a registry the caller created is refused.
-        if !registry.scope.is_managed() {
+        // WHAT IS STORED decides whether a schema can be exported — never who owns the
+        // registry holding it. A schema a caller created, one schema discovery wrote
+        // into a registry of the caller's, and one AWS publishes are all read the same
+        // way: the export renders the document this version stores, and the only source
+        // language it can render is OpenAPI 3. A version stored as JSON Schema draft 4
+        // is already the language the conversion produces and carries nothing an
+        // OpenAPI document needs around it, so there is no rendering of it to serve —
+        // the refusal the modelled `ForbiddenException` covers, named by the stored
+        // type rather than by the registry it sits in.
+        if version.r#type != OPEN_API_3_TYPE {
             return Err(ExportSchemaErrorModeled::ForbiddenException(
-                crate::state::forbidden(
-                    "ExportSchema is supported only for AWS-managed schemas; a schema in a \
-                     registry you created cannot be exported.",
-                ),
+                crate::state::forbidden(format!(
+                    "Exporting of a schema with type {} is not supported.",
+                    version.r#type
+                )),
             )
             .into());
         }
 
-        let content = if input.r#type == version.r#type {
-            // Already in the requested language: the export is the stored document.
-            version.content.clone()
-        } else if input.r#type == JSON_SCHEMA_DRAFT4_TYPE && version.r#type == OPEN_API_3_TYPE {
+        let content = if input.r#type == JSON_SCHEMA_DRAFT4_TYPE {
             to_json_schema_draft4(&version.content).ok_or_else(|| {
                 ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(
                     crate::state::bad_request(format!(
@@ -228,16 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?
         } else {
-            // The other direction is not a conversion this service performs: a draft-4
-            // document carries nothing an OpenAPI document needs around it, so it
-            // cannot be rendered as one.
-            return Err(ExportSchemaErrorModeled::BadRequestException(
-                crate::state::bad_request(format!(
-                    "A schema stored as {} cannot be exported as {}.",
-                    version.r#type, input.r#type
-                )),
-            )
-            .into());
+            // `Type` is one of `TYPE_VALUES` (anything else was refused above), so what
+            // is left is the OpenAPI 3 language this version is already stored in: the
+            // export is the stored document.
+            version.content.clone()
         };
 
         Ok(ExportSchemaOutput {

@@ -37,6 +37,8 @@ mod duplicate_create_refusals;
 mod empty_response_framing;
 #[path = "all/error_body_codes.rs"]
 mod error_body_codes;
+#[path = "all/export_reads_the_stored_schema.rs"]
+mod export_reads_the_stored_schema;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
 #[path = "all/json_refusal_diagnostics.rs"]
