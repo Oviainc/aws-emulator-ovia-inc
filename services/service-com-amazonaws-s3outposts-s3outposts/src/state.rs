@@ -433,6 +433,29 @@ impl ComAmazonawsS3outpostsS3outpostsState {
         None
     }
 
+    /// The endpoint already committing `subnet_id` and `security_group_id` on
+    /// `outpost_id`, whichever account owns that record.
+    ///
+    /// What an endpoint holds is a range of a subnet, reached through a security
+    /// group, committed to an Outpost — EC2 and Outpost resources, not the
+    /// caller's own: a record another account owns holds them exactly as one of
+    /// the caller's does, so it answers here too. Which account owns an endpoint
+    /// decides who may REPORT or REMOVE it (`ListEndpoints`, `DeleteEndpoint`),
+    /// never whether the resources it already holds are free for another
+    /// endpoint.
+    pub fn endpoint_committing(
+        &self,
+        outpost_id: &str,
+        subnet_id: &str,
+        security_group_id: &str,
+    ) -> Option<&EndpointRecord> {
+        self.endpoints.values().find(|endpoint| {
+            endpoint.outpost_id == outpost_id
+                && endpoint.subnet_id == subnet_id
+                && endpoint.security_group_id == security_group_id
+        })
+    }
+
     /// Materialise every status change the clock owes, for a caller that is
     /// about to report on all of them.
     pub fn settle_all(&mut self, now: SystemTime) {

@@ -61,6 +61,8 @@ mod outpost_server_connection;
 mod private_connectivity;
 #[path = "all/private_connectivity_ownership.rs"]
 mod private_connectivity_ownership;
+#[path = "all/private_connectivity_roles.rs"]
+mod private_connectivity_roles;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
 #[path = "all/quote_listing.rs"]

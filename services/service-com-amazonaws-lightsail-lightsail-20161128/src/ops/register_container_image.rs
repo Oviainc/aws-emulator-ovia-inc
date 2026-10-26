@@ -167,36 +167,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A container service is a regional resource whose name is unique within
         // one region of the account, so the region the request is signed for is
-        // what names the service an image would be registered to.
+        // what names the service an image is registered to — and, because the
+        // address `CreateContainerServiceRegistryLogin` hands out carries that
+        // same region, the registry a push put the image in.
         let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
 
         // `serviceName`, `label` and `digest` are modelled `@required`, and the
         // first two carry the modelled length and pattern, so the centralized
         // walk refused anything outside them before this body ran. What is left
         // is what the model cannot express: the service must exist in this
-        // region, and the digest must name an image that has been PUSHED to that
-        // service's private registry.
+        // region, and the digest must name an image that has been PUSHED to the
+        // container image registry of the account.
         crate::state::with_state(&*self.engine, |store| {
             // The name is checked against the store first, so a request naming
             // no container service is answered about the service and not about
             // its registry.
-            store
+            if store
                 .container_service(&region, &input.service_name)
-                .ok_or_else(|| service_does_not_exist(&input.service_name))?;
+                .is_none()
+            {
+                return Err(service_does_not_exist(&input.service_name));
+            }
 
-            // This call REGISTERS an image that is ALREADY in the service's
-            // private registry; it does not upload one. An image gets there by a
-            // `docker push` to the registry endpoint that
+            // This call REGISTERS an image that is ALREADY in the account's
+            // container image registry; it does not upload one. An image gets
+            // there by a push to the registry address that
             // `CreateContainerServiceRegistryLogin` hands out credentials for —
             // which is why this operation's own documentation says it "is not
             // required if you install and use the Lightsail Control
-            // (lightsailctl) plugin to push container images". That registry is a
-            // container image data plane this emulator does not serve, so no
-            // push can reach it, no digest is in it, and every digest a caller
-            // can present names nothing to register. AWS answers an unpushed
-            // digest with `NotFoundException`/`DoesNotExist`, and so does this —
-            // never with a success for an image that was never pushed.
-            Err(digest_does_not_exist(&input.digest))
+            // (lightsailctl) plugin to push container images". That registry is
+            // served by this emulator (`crate::service::container_image_registry`)
+            // and is content-addressed, so the digest a caller presents names an
+            // image whose bytes are held, and a digest nothing pushed names
+            // nothing to register.
+            if !store.image_registry_holds_image(&region, &input.digest) {
+                return Err(digest_does_not_exist(&input.digest));
+            }
+
+            let service = store
+                .container_service_mut(&region, &input.service_name)
+                .ok_or_else(|| service_does_not_exist(&input.service_name))?;
+            // The service assigns the name: the label the request carried, at
+            // the next version that label is at for this service.
+            let registered = service.register_image(&input.label, &input.digest, now);
+            Ok(RegisterContainerImageOutput {
+                container_image: Some(registered.view(&input.service_name)),
+            })
         })
         .ok_or_else(unavailable)?
     }
@@ -213,7 +230,7 @@ fn service_does_not_exist(name: &str) -> RegisterContainerImageError {
     )
 }
 
-/// The service exists but its registry holds no image of that digest: the same
+/// The account's registry holds no image of that digest: the same
 /// `DoesNotExist` envelope (HTTP 400, wire error `NotFoundException`, body `code`
 /// `DoesNotExist`), with a message built from the request — the digest it
 /// carried, quoted, in the sentence Lightsail answers an unpushed digest with.

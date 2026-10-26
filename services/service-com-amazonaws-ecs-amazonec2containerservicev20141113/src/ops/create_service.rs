@@ -822,6 +822,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 None
             },
+            // A created service is not being drained away: nothing has deleted it.
+            drain_due_at: None,
             // A created service has replaced no deployment of its own.
             superseded_deployments: Vec::new(),
         };

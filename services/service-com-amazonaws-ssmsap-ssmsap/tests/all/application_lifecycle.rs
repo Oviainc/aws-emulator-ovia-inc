@@ -262,6 +262,15 @@ impl Emulator {
     }
 }
 
+/// One reply as a value — its status and its whole body — so what a reporting call
+/// answers before and after something else happened compares as a value.
+///
+/// `pub(crate)` so a suite pinning that a read changes nothing a later caller sees
+/// renders its witnesses the one way, rather than each re-deriving the snapshot.
+pub(crate) fn rendered(reply: &Reply) -> String {
+    format!("HTTP {} {}", reply.status, reply.body)
+}
+
 /// Wait out a change the clock owes an application — the next status an asynchronous
 /// call moves it to, or the removal a deregistration ends it with.
 ///
