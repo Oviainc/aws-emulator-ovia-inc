@@ -71,6 +71,8 @@ mod application_update;
 mod create_tag_fingerprint;
 #[path = "all/customer_managed_policy_reference_independence.rs"]
 mod customer_managed_policy_reference_independence;
+#[path = "all/customer_managed_policy_reference_order.rs"]
+mod customer_managed_policy_reference_order;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
 #[path = "all/discovered_instance_surface.rs"]

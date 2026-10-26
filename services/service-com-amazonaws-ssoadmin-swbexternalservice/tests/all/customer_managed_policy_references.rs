@@ -143,7 +143,7 @@ fn reference_cases() -> Vec<ReferenceCase> {
 }
 
 /// Create a permission set named `name` on `instance_arn` and return its minted ARN.
-async fn create_permission_set(
+pub(crate) async fn create_permission_set(
     router: &MultiServiceRouter,
     instance_arn: &str,
     name: &str,
@@ -165,7 +165,7 @@ async fn create_permission_set(
 }
 
 /// `AttachCustomerManagedPolicyReferenceToPermissionSet`, as `(status, body)`.
-async fn attach(
+pub(crate) async fn attach(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
@@ -184,7 +184,7 @@ async fn attach(
 }
 
 /// `DetachCustomerManagedPolicyReferenceFromPermissionSet`, as `(status, body)`.
-async fn detach(
+pub(crate) async fn detach(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
@@ -203,7 +203,7 @@ async fn detach(
 }
 
 /// `ListCustomerManagedPolicyReferencesInPermissionSet`, as `(status, body)`.
-async fn list(
+pub(crate) async fn list(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
@@ -229,7 +229,7 @@ async fn list(
 }
 
 /// The (`Name`, `Path`) pairs one list page reports, in the order the page carries them.
-fn pairs(body: &Value) -> Vec<(String, String)> {
+pub(crate) fn pairs(body: &Value) -> Vec<(String, String)> {
     body["CustomerManagedPolicyReferences"]
         .as_array()
         .cloned()
