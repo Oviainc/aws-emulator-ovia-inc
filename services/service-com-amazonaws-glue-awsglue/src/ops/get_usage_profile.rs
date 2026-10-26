@@ -168,11 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.usage_profiles.get(&input.name) else {
             return Err(GetUsageProfileErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal is derived from the request: it names the member that
-                    // resolved to nothing. What is pinned is the behaviour — 400 with
-                    // `EntityNotFoundException`.
-                    message: Some(format!("Usage profile {} not found", input.name)),
+                    // The refusal names the resource kind and the name that resolved to
+                    // nothing, which is the whole address of a usage profile — the same
+                    // convention this resource's duplicate refusal follows.
+                    message: Some(crate::state::messages::usage_profile_not_found(
+                        &input.name,
+                    )),
                     from_federation_source: None,
                 },
             )

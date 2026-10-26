@@ -159,6 +159,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Action, AssetTypeFormReference,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
+    ConfigurationObject,
     Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
@@ -3088,6 +3089,119 @@ impl UsageProfileEntry {
     }
 }
 
+/// Why the service refuses a submitted `ProfileConfiguration`, as the `Message` of the
+/// refusal, or `None` when every parameter it configures is coherent.
+///
+/// A `ConfigurationObject` states one parameter's `DefaultValue` together with the
+/// `MinValue`/`MaxValue` range it may take ("Specifies the values that an admin sets for
+/// each job or session parameter configured in a Glue usage profile"), so those three have
+/// to agree: a default outside the range, or a minimum above the maximum, describes a
+/// parameter NO value satisfies, and such a write is refused rather than stored.
+///
+/// Only values that are NUMBERS are ordered ([`numeric_configuration_value`]): a parameter
+/// whose values are names — a worker type, a boolean — carries no range to compare, and
+/// what it admits is its `AllowedValues` list rather than a bound.
+///
+/// The walk is in a fixed order — job parameters before session ones, and by parameter
+/// name within each map, whose own iteration order is not the request's — so a
+/// configuration with several incoherent parameters is always refused for the same one.
+/// Within one parameter the default is checked against the maximum first, then against
+/// the minimum, then the two bounds against each other, which is the order the service
+/// reports a parameter breaking more than one of them in.
+pub fn usage_profile_configuration_defect(configuration: &ProfileConfiguration) -> Option<String> {
+    for (section, parameters) in [
+        ("JobConfiguration", configuration.job_configuration.as_ref()),
+        (
+            "SessionConfiguration",
+            configuration.session_configuration.as_ref(),
+        ),
+    ] {
+        let Some(parameters) = parameters else {
+            continue;
+        };
+        let mut names: Vec<&String> = parameters.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(object) = parameters.get(name) else {
+                continue;
+            };
+            if let Some(message) = configuration_object_defect(section, name, object) {
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
+/// The incoherence in ONE parameter's `ConfigurationObject`, as the message it is refused
+/// with. See [`usage_profile_configuration_defect`] for the rule and the order.
+///
+/// The bound each message carries is the TEXT the request sent, not the number it parsed
+/// to, so the refusal quotes the value the client wrote.
+fn configuration_object_defect(
+    section: &str,
+    parameter: &str,
+    object: &ConfigurationObject,
+) -> Option<String> {
+    let default = object
+        .default_value
+        .as_deref()
+        .and_then(numeric_configuration_value);
+    let minimum = object
+        .min_value
+        .as_deref()
+        .and_then(numeric_configuration_value)
+        .zip(object.min_value.as_deref());
+    let maximum = object
+        .max_value
+        .as_deref()
+        .and_then(numeric_configuration_value)
+        .zip(object.max_value.as_deref());
+
+    if let Some((default, (maximum, text))) = default.zip(maximum) {
+        if default > maximum {
+            return Some(messages::configuration_default_above_max(
+                parameter, section, text,
+            ));
+        }
+    }
+    if let Some((default, (minimum, text))) = default.zip(minimum) {
+        if default < minimum {
+            return Some(messages::configuration_default_below_min(
+                parameter, section, text,
+            ));
+        }
+    }
+    if let Some(((minimum, _), (maximum, text))) = minimum.zip(maximum) {
+        if minimum > maximum {
+            return Some(messages::configuration_min_above_max(
+                parameter, section, text,
+            ));
+        }
+    }
+    None
+}
+
+/// The number a `ConfigurationObject` bound states, or `None` when the value is not one.
+///
+/// `ConfigValueString` is free text under `^[a-zA-Z0-9_.-]+$`, so a bound may equally be a
+/// count (`10`), a fraction (`0.0625`) or a name (`G.1X`). Only a decimal integer or
+/// fraction, optionally signed, is read as a number: the float parser would otherwise also
+/// accept `inf`, `NaN` and `1e9`, which are parameter NAMES under that pattern and not
+/// quantities this service orders.
+fn numeric_configuration_value(value: &str) -> Option<f64> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let well_formed = digits.chars().any(|character| character.is_ascii_digit())
+        && digits
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+        && digits.matches('.').count() <= 1;
+    if !well_formed {
+        return None;
+    }
+    value.parse::<f64>().ok()
+}
+
 /// How many machine learning transform ids this process has minted. A nonce source for
 /// [`new_ml_transform_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
 static MINTED_ML_TRANSFORM_IDS: AtomicU64 = AtomicU64::new(0);
@@ -5976,6 +6090,63 @@ pub mod messages {
         format!(
             "this endpoint holds resource policies for {ceiling} resources, which is as many \
              as it can hold"
+        )
+    }
+
+    /// `CreateUsageProfile` for a name this account already holds a profile under.
+    /// RECORDED template: the sentence names the resource kind and carries the `Name` the
+    /// request itself sent, which is the whole address of a usage profile. Unlike the
+    /// catalog duplicates above, this one DOES echo the requested name, because that is
+    /// the wording the corpus pins for this resource.
+    pub fn usage_profile_already_exists(name: &str) -> String {
+        format!("UsageProfile {name} already exists.")
+    }
+
+    /// A usage profile lookup (`GetUsageProfile`, and every other operation that addresses
+    /// a profile by name) for a name no profile of this account has. RECORDED template,
+    /// including its wording, built from the requested `Name`.
+    pub fn usage_profile_not_found(name: &str) -> String {
+        format!("UsageProfile {name} does not exists")
+    }
+
+    /// A usage profile write whose `ConfigurationObject` sets a `DefaultValue` above the
+    /// `MaxValue` it sets for the same parameter. RECORDED template: the sentence carries
+    /// the parameter key, the `ProfileConfiguration` member its map arrived under, and the
+    /// `MaxValue` exactly as submitted.
+    pub fn configuration_default_above_max(
+        parameter: &str,
+        section: &str,
+        max_value: &str,
+    ) -> String {
+        format!(
+            "default value for parameter {parameter} in {section} should be less than or \
+             equal to max value {max_value}."
+        )
+    }
+
+    /// The same refusal for the OTHER bound of the same parameter: a `DefaultValue` below
+    /// its `MinValue`. NOT recorded on its own \u2014 what is pinned is the coherence rule and
+    /// the sentence above \u2014 so this states the mirror requirement in that same wording,
+    /// carrying the parameter, its section and the `MinValue` as submitted.
+    pub fn configuration_default_below_min(
+        parameter: &str,
+        section: &str,
+        min_value: &str,
+    ) -> String {
+        format!(
+            "default value for parameter {parameter} in {section} should be greater than or \
+             equal to min value {min_value}."
+        )
+    }
+
+    /// The same refusal for the two bounds themselves: a `MinValue` above the `MaxValue`
+    /// of the same parameter, which is a range no value lies in. NOT recorded on its own,
+    /// so it follows the wording of [`configuration_default_above_max`] with the member
+    /// that is too large named.
+    pub fn configuration_min_above_max(parameter: &str, section: &str, max_value: &str) -> String {
+        format!(
+            "min value for parameter {parameter} in {section} should be less than or equal \
+             to max value {max_value}."
         )
     }
 }

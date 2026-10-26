@@ -170,10 +170,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.usage_profiles.contains_key(&input.name) {
             return Err(CreateUsageProfileErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal states the resource kind and withholds the requested name,
-                    // as this service's other already-exists refusals do.
-                    message: Some("Usage profile already exists.".to_string()),
+                    // The refusal names the resource kind and the name that collided, which
+                    // is the whole address of a usage profile: a batch of creates is
+                    // otherwise refused with one indistinguishable sentence.
+                    message: Some(crate::state::messages::usage_profile_already_exists(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
+        // A `ProfileConfiguration` whose parameters contradict their own bounds configures
+        // a parameter no value satisfies, so it is refused as invalid input BEFORE anything
+        // is written and the store never holds a profile a read could not report.
+        if let Some(message) = crate::state::usage_profile_configuration_defect(&input.configuration)
+        {
+            return Err(CreateUsageProfileErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
                 },
             )
             .into());
