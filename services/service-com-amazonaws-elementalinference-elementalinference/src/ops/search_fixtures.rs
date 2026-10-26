@@ -172,6 +172,60 @@ const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
 /// (`smithy_query(query="shape",shape="FilterName")`).
 const FILTER_NAME_COMPETITOR: &str = "COMPETITOR";
 
+/// The name this operation's `nextToken` binds, so a token of another paginated
+/// operation of this service is not one this search can be continued with.
+const TOKEN_OPERATION: &str = "SearchFixtures";
+
+/// The canonical criteria a `nextToken` of this operation binds: the SELECTION the
+/// page it ends was computed over, and nothing else.
+///
+/// The members are the ones that decide which fixtures a request selects — the sport,
+/// the window of UTC days (as the days they resolved to, so a window stated with an
+/// explicit `endDate` and the same window stated by omitting it, which "searches only
+/// the day that you specified in startDate", continue each other) and the filters.
+/// Two requests whose `filters` differ only in the ORDER of the filters, or in the
+/// order or repetition of one filter's values, select exactly the same fixtures, so
+/// the canonical form sorts and dedups both.
+///
+/// `maxResults` is deliberately NOT part of it: the model declares it as this
+/// operation's `@paginated` `pageSize`
+/// (`smithy_query(query="operation",operation="SearchFixtures")`), the "maximum number
+/// of fixtures to return for each API request" rather than a search criterion, so
+/// asking the next batch for a different page size is the same search.
+fn token_criteria(
+    sport: crate::state::DataSourceSport,
+    start_day: i64,
+    end_day: i64,
+    filters: &[SearchFilter],
+) -> String {
+    let mut canonical_filters: Vec<String> = filters
+        .iter()
+        .map(|filter| {
+            let mut values: Vec<&str> = filter.values.iter().map(String::as_str).collect();
+            values.sort_unstable();
+            values.dedup();
+            let mut fields: Vec<&str> = Vec::with_capacity(values.len() + 1);
+            fields.push(filter.name.as_str());
+            fields.extend(values);
+            crate::state::page_criteria(&fields)
+        })
+        .collect();
+    canonical_filters.sort();
+    let filters_field = crate::state::page_criteria(
+        &canonical_filters
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<&str>>(),
+    );
+    crate::state::page_criteria(&[
+        TOKEN_OPERATION,
+        sport.as_wire(),
+        &start_day.to_string(),
+        &end_day.to_string(),
+        &filters_field,
+    ])
+}
+
 /// A 400 `ValidationException` refusing this request, as the model declares it for
 /// this operation: "The input fails to satisfy the constraints specified by the
 /// service. Check the error message for details about which parameter or field is
@@ -290,17 +344,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A token that is not a pagination token at all cannot name a page, so it is
-        // refused rather than silently treated as the first page.
+        // The token binds the criteria the page it ends was computed over, so a token
+        // issued for ANOTHER search (or by another operation) names no page of this
+        // one and is refused rather than read as a position in this selection.
+        let criteria = token_criteria(sport, start_day, end_day, &filters);
+        // A token that is not a pagination token at all, or that belongs to a
+        // different request, cannot name a page of this search.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
-                Some(id) => Some(id),
-                None => {
-                    return Err(validation(
-                        "nextToken is not a valid pagination token.".to_string(),
-                    ))
-                }
+            Some(token) => match crate::state::decode_page_token(&criteria, token) {
+                Ok(id) => Some(id),
+                Err(rejection) => return Err(validation(rejection.message().to_string())),
             },
         };
         // `maxResults` is modelled with range 1..100, so the boundary has already
@@ -337,7 +391,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token only when a further fixture is actually there to be fetched: it "is
         // absent when there are no more results to return".
         let next_token = match (matching.next(), fixtures.last()) {
-            (Some(_), Some(last)) => Some(crate::state::encode_page_token(&last.fixture_id)),
+            (Some(_), Some(last)) => Some(crate::state::encode_page_token(
+                &criteria,
+                &last.fixture_id,
+            )),
             _ => None,
         };
 

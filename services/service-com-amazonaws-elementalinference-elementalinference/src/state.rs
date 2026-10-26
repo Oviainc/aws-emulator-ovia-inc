@@ -1935,26 +1935,126 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Encode an opaque `nextToken` that resumes a page after `last_id`.
+/// The layout marker every `nextToken` this service issues carries, so a token
+/// shaped by an older or a different scheme is recognised as none of this
+/// service's.
+const PAGE_TOKEN_LAYOUT: &str = "1";
+
+/// How many bytes of the request digest a `nextToken` carries — 128 bits of SHA-256,
+/// enough that no two requests a caller can build share a digest.
+const PAGE_TOKEN_DIGEST_BYTES: usize = 16;
+
+/// The refusal for a `nextToken` that is not a pagination token of this service at
+/// all: it names no page, so it cannot be read as the first one.
+pub const PAGE_TOKEN_MALFORMED_MESSAGE: &str = "nextToken is not a valid pagination token.";
+
+/// The refusal for a well-formed `nextToken` that this service issued for a
+/// DIFFERENT request: a continuation token continues the request that produced it,
+/// so the only way to use it is to send that request again ("submit the
+/// SearchFixtures request a second time, with the same search criteria, and specify
+/// the nextToken value", `SearchFixturesRequest$nextToken`).
+pub const PAGE_TOKEN_OTHER_REQUEST_MESSAGE: &str =
+    "nextToken was issued for a different request. To see the next batch of results, submit the \
+     same request again, with the same criteria, and specify the nextToken value.";
+
+/// Why a `nextToken` cannot be used for the request that submitted it.
 ///
-/// The token is opaque to the caller: it is the hex encoding of the id the page
-/// ended on, so a client cannot read a resource id out of it and the service can
-/// resume from the next id in order. Hex comes from the `hex` crate rather than
-/// being hand-rolled. Shared by every paginated operation of this service.
-pub fn encode_page_token(last_id: &str) -> String {
-    ::hex::encode(last_id.as_bytes())
+/// Both outcomes are a `ValidationException` (HTTP 400) in every paginated operation
+/// of this service; they differ only in what the message tells the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTokenRejection {
+    /// Not a token this service issues: not hex, or hex that carries none of the
+    /// fields a token has.
+    Malformed,
+    /// A token of this service, issued for another request — another operation,
+    /// another endpoint, or other search criteria.
+    OtherRequest,
 }
 
-/// Decode a `nextToken` back into the id a page resumes after.
+impl PageTokenRejection {
+    /// The `ValidationException` message this rejection is reported with.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Malformed => PAGE_TOKEN_MALFORMED_MESSAGE,
+            Self::OtherRequest => PAGE_TOKEN_OTHER_REQUEST_MESSAGE,
+        }
+    }
+}
+
+/// The canonical form of the criteria one page was computed over, built from
+/// `fields`.
 ///
-/// `None` for a token that is not the hex encoding of a non-empty id, which the
-/// handlers refuse as a `ValidationException` — an empty token names no position at
-/// all. A token that does decode names a POSITION in the id order rather than an
-/// item that must still be there, so paging survives an item that disappeared
-/// between two pages.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    (!decoded.is_empty()).then_some(decoded)
+/// Each field is length-prefixed, so no two different field lists share a canonical
+/// form however the values they carry are punctuated — which is what makes the
+/// digest in a `nextToken` a faithful fingerprint of the request. A caller never
+/// sees this string: only its digest travels, inside the token.
+pub fn page_criteria(fields: &[&str]) -> String {
+    let mut canonical = String::new();
+    for field in fields {
+        canonical.push_str(&field.len().to_string());
+        canonical.push(':');
+        canonical.push_str(field);
+    }
+    canonical
+}
+
+/// The digest of a canonical criteria string ([`page_criteria`]) that a token binds.
+///
+/// SHA-256 from the `sha2` crate, truncated to [`PAGE_TOKEN_DIGEST_BYTES`]: nothing
+/// here hashes by hand, and the digest carries no readable part of the request.
+fn page_criteria_digest(criteria: &str) -> String {
+    use ::sha2::Digest;
+    let digest = ::sha2::Sha256::digest(criteria.as_bytes());
+    ::hex::encode(&digest[..PAGE_TOKEN_DIGEST_BYTES])
+}
+
+/// Encode an opaque `nextToken` that resumes the request whose criteria are
+/// `criteria` after `last_id`.
+///
+/// The token is opaque to the caller: it is the hex encoding of this service's
+/// layout marker, the digest of the criteria the page was computed over, and the id
+/// the page ended on — so a client cannot read a resource id out of it, and the
+/// service can both resume from the next id in order and tell whether the token
+/// belongs to the request that submitted it. Hex and SHA-256 come from the `hex` and
+/// `sha2` crates rather than being hand-rolled. Shared by every paginated operation
+/// of this service, each of which passes the criteria ITS selection depends on.
+pub fn encode_page_token(criteria: &str, last_id: &str) -> String {
+    ::hex::encode(format!(
+        "{PAGE_TOKEN_LAYOUT}:{}:{last_id}",
+        page_criteria_digest(criteria)
+    ))
+}
+
+/// Decode a `nextToken` back into the id a page resumes after, for a request whose
+/// criteria are `criteria`.
+///
+/// [`PageTokenRejection::Malformed`] for a token this service never issues in any
+/// request — one that is not hex, or that carries none of a token's fields — and
+/// [`PageTokenRejection::OtherRequest`] for one whose digest is another request's;
+/// the handlers refuse both as a `ValidationException`. A token that does decode
+/// names a POSITION in the id order rather than an item that must still be there, so
+/// paging survives an item that disappeared between two pages.
+pub fn decode_page_token(criteria: &str, token: &str) -> Result<String, PageTokenRejection> {
+    let bytes = ::hex::decode(token).map_err(|_| PageTokenRejection::Malformed)?;
+    let decoded = String::from_utf8(bytes).map_err(|_| PageTokenRejection::Malformed)?;
+    // The id a page ends on may itself hold the separator, so it is whatever
+    // follows the first two fields.
+    let mut fields = decoded.splitn(3, ':');
+    let (Some(layout), Some(digest), Some(last_id)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return Err(PageTokenRejection::Malformed);
+    };
+    if layout != PAGE_TOKEN_LAYOUT
+        || last_id.is_empty()
+        || ::hex::decode(digest).map(|raw| raw.len()) != Ok(PAGE_TOKEN_DIGEST_BYTES)
+    {
+        return Err(PageTokenRejection::Malformed);
+    }
+    if digest != page_criteria_digest(criteria) {
+        return Err(PageTokenRejection::OtherRequest);
+    }
+    Ok(last_id.to_string())
 }
 
 // ---------------------------------------------------------------------------

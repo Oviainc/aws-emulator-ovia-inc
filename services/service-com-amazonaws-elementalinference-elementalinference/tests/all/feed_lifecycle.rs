@@ -28,10 +28,13 @@
 //!   range is refused, so no request can ask for an unbounded page;
 //! * a feed whose deletion has been accepted cannot be updated (`ConflictException`).
 
-use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
+use crate::harness::{
+    call, create_feed, message_of, output_config, past_the_transition_span, router, REGION,
+    SIGNING_NAME,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
-    MAX_FEEDS, TRANSITION_SPAN,
+    MAX_FEEDS, PAGE_TOKEN_MALFORMED_MESSAGE, TRANSITION_SPAN,
 };
 
 /// Whether `id` satisfies the modelled `FeedId` pattern `^[a-z0-9]{19}$`.
@@ -758,13 +761,17 @@ async fn an_unknown_feed_id_is_a_404_on_every_feed_operation() {
     );
 }
 
-/// A `nextToken` that is not a pagination token at all cannot name a page, so
-/// ListFeeds refuses it as a 400 `ValidationException` rather than silently serving
-/// the first page; a well-formed token keeps paging from its position.
+/// A `nextToken` no `ListFeeds` response ever carried cannot name a page, so the
+/// handler refuses it as a 400 `ValidationException` rather than silently serving a
+/// page from it; a token the service DID issue keeps paging from its position.
 #[tokio::test]
-async fn a_next_token_that_is_not_a_pagination_token_is_refused() {
+async fn a_next_token_this_listing_never_issued_is_refused() {
     let router = router();
-    for token in ["not-a-token", "zz", "0"] {
+    // Not hex at all, hex digits that do not pair up, and hex that decodes to text
+    // carrying none of a token's fields — the hex of a bare id, which is what a caller
+    // forging a cursor would reach for.
+    let hex_of_an_id = hex::encode("0".repeat(19));
+    for token in ["not-a-token", "zz", "0", hex_of_an_id.as_str()] {
         let label = format!("nextToken={token}");
         let (status, error) = call(
             &router,
@@ -775,47 +782,69 @@ async fn a_next_token_that_is_not_a_pagination_token_is_refused() {
         .await;
         assert_eq!(
             status, 400,
-            "case {label:?}: a malformed nextToken is a 400, got {status} with {error}"
+            "case {label:?}: a nextToken this service never issued is a 400, got {status} \
+             with {error}"
         );
         assert_eq!(
             error["__type"],
             json!("ValidationException"),
             "case {label:?}: that 400 is a ValidationException, got {error}"
         );
+        assert_eq!(
+            message_of(&error),
+            PAGE_TOKEN_MALFORMED_MESSAGE,
+            "case {label:?}: expected the invariant sentence for a token that is none of \
+             this service's, got {error}"
+        );
     }
 
-    // A well-formed token names a POSITION in the id order, not a feed that must
-    // still exist, so paging continues even past an id that was never used.
-    let (_, created) = call(
-        &router,
-        "POST",
-        "/v1/feed",
-        Some(json!({
-            "name": "the-only-feed",
-            "outputs": [
-                {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
-            ]
-        })),
-    )
-    .await;
-    let id = created["id"].as_str().unwrap().to_string();
-    // The hex of the smallest id the pattern admits: every other id sorts after it,
-    // so the page resumes at the feed just created.
-    let below_every_id = "0".repeat(19);
-    assert!(
-        id.as_str() > below_every_id.as_str(),
-        "the minted id {id:?} must sort after {below_every_id:?} for this case to mean anything"
-    );
-    let token = hex::encode(&below_every_id);
-    let (status, page) = call(&router, "GET", &format!("/v1/feeds?nextToken={token}"), None).await;
+    // A token the service issued names a POSITION in the id order, not a feed that must
+    // still exist: the feed it would resume at is deleted, and paging continues at the
+    // next one.
+    let mut ids = [
+        create_feed(&router, "first-feed").await,
+        create_feed(&router, "second-feed").await,
+        create_feed(&router, "third-feed").await,
+    ];
+    ids.sort();
+    let (status, first_page) = call(&router, "GET", "/v1/feeds?maxResults=1", None).await;
     assert_eq!(
         status, 200,
-        "case {token:?}: a well-formed token is served, got {status} with {page}"
+        "the first page answers 200, got {status} with {first_page}"
+    );
+    assert_eq!(
+        first_page["feeds"][0]["id"],
+        json!(ids[0]),
+        "the first page of one reports the first id in order, got {first_page}"
+    );
+    let token = first_page["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("two feeds remain, so a nextToken comes back: {first_page}"))
+        .to_string();
+
+    let (status, deleted) = call(&router, "DELETE", &format!("/v1/feed/{}", ids[1]), None).await;
+    assert_eq!(
+        status, 202,
+        "DeleteFeed answers 202, got {status} with {deleted}"
+    );
+    past_the_transition_span();
+
+    let (status, page) = call(
+        &router,
+        "GET",
+        &format!("/v1/feeds?nextToken={token}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {token:?}: a token this listing issued is served, got {status} with {page}"
     );
     assert_eq!(
         page["feeds"][0]["id"],
-        json!(id),
-        "case {token:?}: paging resumes at the next id in order, got {page}"
+        json!(ids[2]),
+        "case {token:?}: paging resumes at the next id in order, past the deleted one, \
+         got {page}"
     );
 }
 

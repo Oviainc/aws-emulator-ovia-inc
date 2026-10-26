@@ -18,16 +18,19 @@
 //! * a `DictionarySummary` is a projection of the STORED dictionary — the same `arn`,
 //!   `id`, `name`, `language` and reported `status` that `GetDictionary` answers with,
 //!   for every lifecycle status a dictionary holds;
-//! * a `nextToken` names a POSITION in that order: one that is not a pagination token at
-//!   all is refused as HTTP 400 `ValidationException`, and a well-formed one resumes
-//!   after its position;
+//! * a `nextToken` names a POSITION in that order, and only in the listing it was
+//!   issued for: one this service never issued is refused as HTTP 400
+//!   `ValidationException`, and one it did resumes after its position even when the
+//!   dictionary that stood there has since been deleted;
 //! * a `maxResults` outside the modelled range never reaches the handler;
 //! * listing is a READ: it changes nothing a later caller sees.
 
 use crate::harness::{
-    call, expected_dictionary_arn, past_the_transition_span, router, subtitling_output,
+    call, expected_dictionary_arn, message_of, past_the_transition_span, router,
+    subtitling_output,
 };
 use serde_json::{json, Value};
+use service_com_amazonaws_elementalinference_elementalinference::state::PAGE_TOKEN_MALFORMED_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// Every value the `DictionaryLanguage` enum admits, from
@@ -85,6 +88,21 @@ async fn list_dictionaries(
         format!("/v1/dictionaries?{}", query.join("&"))
     };
     call(router, "GET", &uri, None).await
+}
+
+/// The ids one page reports, in the order the page reports them.
+fn listed_ids(page: &Value) -> Vec<String> {
+    page["dictionaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the response carries a dictionaries list, got {page}"))
+        .iter()
+        .map(|summary| {
+            summary["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a summary carries an id, got {summary}"))
+                .to_string()
+        })
+        .collect()
 }
 
 /// ListDictionaries pages over every persisted dictionary: at most `maxResults` per
@@ -315,74 +333,100 @@ async fn a_summary_reports_the_status_get_dictionary_reports() {
     }
 }
 
-/// A `nextToken` that is not a pagination token at all cannot name a page, so
-/// ListDictionaries refuses it as a 400 `ValidationException` rather than silently
-/// serving the first page; a well-formed token names a POSITION in the id order.
+/// A `nextToken` no `ListDictionaries` response ever carried cannot name a page, so
+/// the handler refuses it as a 400 `ValidationException` rather than silently serving
+/// a page from it; a token the service DID issue names a POSITION in the id order.
 #[tokio::test]
-async fn a_next_token_that_is_not_a_pagination_token_is_refused() {
+async fn a_next_token_this_listing_never_issued_is_refused() {
     let router = router();
-    // Not hex at all, hex digits that do not pair up, and a byte that is no hex digit.
-    for token in ["not-a-token", "zz", "0", "6g"] {
+    // Not hex at all, hex digits that do not pair up, a byte that is no hex digit, and
+    // hex that decodes to text carrying none of a token's fields — the hex of a bare
+    // id, which is what a caller forging a cursor would reach for.
+    let hex_of_an_id = hex::encode("aaaaaaaaaaaaaaaaaaa");
+    let hex_of_a_digit = hex::encode("0");
+    for token in [
+        "not-a-token",
+        "zz",
+        "0",
+        "6g",
+        hex_of_an_id.as_str(),
+        hex_of_a_digit.as_str(),
+    ] {
         let label = format!("nextToken={token}");
         let (status, error) = list_dictionaries(&router, None, Some(token)).await;
         assert_eq!(
             status, 400,
-            "case {label:?}: a malformed nextToken is a 400, got {status} with {error}"
+            "case {label:?}: a nextToken this service never issued is a 400, got {status} \
+             with {error}"
         );
         assert_eq!(
             error["__type"],
             json!("ValidationException"),
             "case {label:?}: that 400 is a ValidationException, got {error}"
         );
+        assert_eq!(
+            message_of(&error),
+            PAGE_TOKEN_MALFORMED_MESSAGE,
+            "case {label:?}: expected the invariant sentence for a token that is none of \
+             this service's, got {error}"
+        );
     }
 
-    let first = create_dictionary(&router, "firstdict", "eng").await;
-    let second = create_dictionary(&router, "seconddict", "fra").await;
-    let mut ids = [first, second];
+    let mut ids = [
+        create_dictionary(&router, "firstdict", "eng").await,
+        create_dictionary(&router, "seconddict", "fra").await,
+        create_dictionary(&router, "thirddict", "ita").await,
+    ];
     ids.sort();
     past_the_transition_span();
 
-    // A well-formed token names a position, not a dictionary that must still exist:
-    // "0" sorts before every id the `DictionaryId` pattern admits, so a page resuming
-    // after it starts at the first dictionary in order.
-    let before_every_id = hex::encode("0");
-    let after_the_first = hex::encode(&ids[0]);
-    let after_the_last = hex::encode(&ids[1]);
-    for (token, expected_first) in [
-        (before_every_id.as_str(), Some(ids[0].clone())),
-        // Resuming after the first id continues at the second.
-        (after_the_first.as_str(), Some(ids[1].clone())),
-        // Resuming after the last id leaves nothing to report.
-        (after_the_last.as_str(), None),
-    ] {
-        let label = format!("nextToken={token}");
-        let (status, page) = list_dictionaries(&router, None, Some(token)).await;
-        assert_eq!(
-            status, 200,
-            "case {label:?}: a well-formed token is served, got {status} with {page}"
-        );
-        let listed: Vec<String> = page["dictionaries"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {label:?}: the response carries a list, got {page}"))
-            .iter()
-            .map(|summary| summary["id"].as_str().unwrap_or_default().to_string())
-            .collect();
-        match &expected_first {
-            Some(id) => assert_eq!(
-                listed.first(),
-                Some(id),
-                "case {label:?}: paging resumes at the next id in order, got {listed:?}"
-            ),
-            None => assert!(
-                listed.is_empty(),
-                "case {label:?}: a token past the last id reports nothing, got {listed:?}"
-            ),
-        }
-        assert!(
-            page.get("nextToken").is_none_or(Value::is_null),
-            "case {label:?}: a page with nothing left to fetch carries no nextToken, got {page}"
-        );
-    }
+    // The token the service issues for a page of one resumes after the first id.
+    let (status, first_page) = list_dictionaries(&router, Some(1), None).await;
+    assert_eq!(
+        status, 200,
+        "the first page answers 200, got {status} with {first_page}"
+    );
+    assert_eq!(
+        listed_ids(&first_page),
+        vec![ids[0].clone()],
+        "the first page of one reports the first id in order, got {first_page}"
+    );
+    let token = first_page["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("two dictionaries remain, so a nextToken comes back: {first_page}"))
+        .to_string();
+
+    // That token names a POSITION in the id order, not a dictionary that must still be
+    // there: the dictionary it would have resumed at is deleted, and the page continues
+    // at the one after it.
+    let (status, deleted) = call(
+        &router,
+        "DELETE",
+        &format!("/v1/dictionary/{}", ids[1]),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "DeleteDictionary answers 202, got {status} with {deleted}"
+    );
+    past_the_transition_span();
+
+    let (status, page) = list_dictionaries(&router, None, Some(&token)).await;
+    assert_eq!(
+        status, 200,
+        "case {token:?}: a token this listing issued is served, got {status} with {page}"
+    );
+    assert_eq!(
+        listed_ids(&page),
+        vec![ids[2].clone()],
+        "case {token:?}: paging resumes at the next id in order, past the deleted one, \
+         got {page}"
+    );
+    assert!(
+        page.get("nextToken").is_none_or(Value::is_null),
+        "case {token:?}: a page with nothing left to fetch carries no nextToken, got {page}"
+    );
 }
 
 /// A `maxResults` outside the modelled range never reaches the handler: the boundary

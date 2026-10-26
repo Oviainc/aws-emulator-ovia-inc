@@ -57,6 +57,8 @@ mod harness;
 mod output_config_defaults;
 #[path = "all/output_provenance.rs"]
 mod output_provenance;
+#[path = "all/pagination_token_binding.rs"]
+mod pagination_token_binding;
 #[path = "all/put_feed_policy_scope.rs"]
 mod put_feed_policy_scope;
 #[path = "all/refusals_from_state.rs"]

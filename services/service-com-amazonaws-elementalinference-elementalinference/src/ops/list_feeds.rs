@@ -130,22 +130,24 @@ impl From<ListFeedsErrorModeled> for ListFeedsError {
 /// 10 results per page" (`ListFeedsRequest$maxResults`, quoted in this file's header).
 const DEFAULT_MAX_RESULTS: usize = 10;
 
-/// Encode a `nextToken` for the last feed id on a page.
-///
-/// The token is opaque to the caller: it is the hex encoding of the id, so a client
-/// cannot read a feed id out of it and the service can resume from the next id in
-/// order. [`crate::state::encode_page_token`] is the one codec every paginated
-/// operation of this service shares.
-fn encode_next_token(last_id: &str) -> String {
-    crate::state::encode_page_token(last_id)
-}
+/// The name this operation's `nextToken` binds, so a token of another paginated
+/// operation of this service is not one a feed listing can be continued with.
+const TOKEN_OPERATION: &str = "ListFeeds";
 
-/// Decode a `nextToken` back into the feed id a page resumes after.
+/// The canonical criteria a `nextToken` of this operation binds: the selection the
+/// page it ends was computed over.
 ///
-/// `None` for a token that is not the hex encoding of a feed id, which the handler
-/// refuses as a `ValidationException`. See [`crate::state::decode_page_token`].
-fn decode_next_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(token)
+/// A listing selects the feeds of the Region the request was signed for — the service
+/// is regional, so another Region's endpoint reports another set of feeds and a token
+/// issued by one does not continue a listing of the other. `maxResults` is not part of
+/// it: the model declares it as this operation's `@paginated` `pageSize`
+/// (`smithy_query(query="operation",operation="ListFeeds")`), so asking the next batch
+/// for a different page size is the same listing. The token itself is encoded and
+/// decoded by [`crate::state::encode_page_token`] /
+/// [`crate::state::decode_page_token`], the one codec every paginated operation of
+/// this service shares.
+fn token_criteria(region: &str) -> String {
+    crate::state::page_criteria(&[TOKEN_OPERATION, region])
 }
 
 /// The most feeds one page may carry, whatever the request asks for.
@@ -208,16 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A token that is not a pagination token at all cannot name a page, so it is
-        // refused rather than silently treated as the first page.
+        // The token binds the listing it was issued for, so one that is not a
+        // pagination token at all, or that belongs to a different request, cannot name
+        // a page of this listing and is refused rather than read as the first page.
+        let criteria = token_criteria(&region);
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match decode_next_token(token) {
-                Some(id) => Some(id),
-                None => {
+            Some(token) => match crate::state::decode_page_token(&criteria, token) {
+                Ok(id) => Some(id),
+                Err(rejection) => {
                     return Err(ListFeedsErrorModeled::ValidationException(
                         ValidationException {
-                            message: "nextToken is not a valid pagination token.".to_string(),
+                            message: rejection.message().to_string(),
                         },
                     )
                     .into())
@@ -251,7 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when a further feed is actually there to be fetched.
         let next_token = match (remaining.next(), feeds.last()) {
-            (Some(_), Some(last)) => Some(encode_next_token(&last.id)),
+            (Some(_), Some(last)) => {
+                Some(crate::state::encode_page_token(&criteria, &last.id))
+            }
             _ => None,
         };
 

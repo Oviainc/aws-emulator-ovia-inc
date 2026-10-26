@@ -21,14 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque `nextToken` codec for the paginated operations (ListFeeds, SearchFixtures).
+# Opaque `nextToken` codec for the paginated operations (ListFeeds, ListDictionaries,
+# SearchFixtures).
 hex = { workspace = true }
+# SHA-256 for the digest of the request criteria a `nextToken` binds.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true
