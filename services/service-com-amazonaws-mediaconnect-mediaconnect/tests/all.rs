@@ -163,3 +163,5 @@ mod update_gateway_instance;
 mod router_output_listing;
 #[path = "all/router_network_interface_listing.rs"]
 mod router_network_interface_listing;
+#[path = "all/router_input_listing.rs"]
+mod router_input_listing;

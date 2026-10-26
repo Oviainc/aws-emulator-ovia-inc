@@ -28,6 +28,7 @@ use crate::ops::types::{
     Interface, ListedBridge, ListedEntitlement, ListedFlow,
     ListedGateway,
     ListedGatewayInstance,
+    ListedRouterInput,
     ListedRouterNetworkInterface,
     ListedRouterOutput,
     Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
@@ -43,7 +44,8 @@ use crate::ops::types::{
     MergeRouterInputStreamDetails, MonitoringConfig,
     NdiConfig, Offering, Output, Reservation, ResourceSpecification,
     RouterContentQualityAnalysisConfiguration, RouterInput,
-    RouterInputConfiguration, RouterInputStreamDetails, RouterInputTransitEncryption,
+    RouterInputConfiguration, RouterInputMessage, RouterInputStreamDetails,
+    RouterInputTransitEncryption,
     RouterInputTransitEncryptionKeyConfiguration,
     RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
     RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
@@ -3877,6 +3879,17 @@ impl StoredRouterInput {
         self.removal_due_at = Some(now + TRANSITION_SPAN);
     }
 
+    /// `RouterInput$Messages`: "messages with information about the router input".
+    ///
+    /// Nothing in this emulator records a message about an input it serves, so the required
+    /// list is empty. `ListedRouterInput$MessageCount` is "the number of messages associated
+    /// with the router input", so the summary counts THIS list
+    /// ([`Self::to_listed_router_input`]) and the two reads cannot disagree about how many
+    /// messages an input has.
+    pub fn messages(&self) -> Vec<RouterInputMessage> {
+        Vec::new()
+    }
+
     /// The modelled `RouterInput` for this record.
     ///
     /// `routed_outputs` is the number of router outputs routed to this input, which lives
@@ -3907,10 +3920,7 @@ impl StoredRouterInput {
             routing_scope: self.routing_scope.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
             updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
-            // `RouterInput$Messages` carries "messages with information about the router
-            // input"; an input this emulator serves has nothing to report about itself, so
-            // the required list is empty.
-            messages: Vec::new(),
+            messages: self.messages(),
             transit_encryption: self.transit_encryption.clone(),
             tags: self
                 .tags
@@ -3936,6 +3946,47 @@ impl StoredRouterInput {
             content_quality_analysis_configuration: self
                 .content_quality_analysis_configuration
                 .clone(),
+        }
+    }
+
+    /// The modelled `ListedRouterInput` summary for this record — what ListRouterInputs
+    /// reports for it.
+    ///
+    /// The summary is a PROJECTION of the same record [`Self::to_router_input`] reports, so
+    /// every member it shares with the full resource is the same value read from the same
+    /// field, and the members the summary does not declare (the configuration, the stream
+    /// details, the address, the tier, the tags, the messages themselves, the transit
+    /// encryption and the maintenance configuration) stay on the read side. `routed_outputs`
+    /// is resolved by the caller that holds the store, for the same reason as in
+    /// [`Self::to_router_input`].
+    pub fn to_listed_router_input(&self, routed_outputs: i32) -> ListedRouterInput {
+        ListedRouterInput {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            input_type: router_input_type(&self.configuration).to_string(),
+            state: self.state.clone(),
+            routed_outputs,
+            region_name: self.region_name.clone(),
+            availability_zone: self.availability_zone.clone(),
+            maximum_bitrate: self.maximum_bitrate,
+            routing_scope: self.routing_scope.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            // "The number of messages associated with the router input": the count of the
+            // messages the record holds, which is what `RouterInput$Messages` reports in
+            // full (see [`Self::messages`]).
+            message_count: i32::try_from(self.messages().len()).unwrap_or(i32::MAX),
+            // "The ARN of the network interface associated with the router input" — the
+            // interface the input ingests on, which only a configuration that names one has
+            // ([`router_input_network_interface_arn`]).
+            network_interface_arn: router_input_network_interface_arn(&self.configuration)
+                .map(ToString::to_string),
+            maintenance_schedule_type: self
+                .maintenance_schedule
+                .as_ref()
+                .map(|_| MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string()),
+            maintenance_schedule: self.maintenance_schedule.clone(),
         }
     }
 }
