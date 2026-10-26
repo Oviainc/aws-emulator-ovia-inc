@@ -53,6 +53,8 @@ mod validation_errors;
 mod workflow_deletion_teardown;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
+#[path = "all/workflow_listing_cursor_scope.rs"]
+mod workflow_listing_cursor_scope;
 #[path = "all/workflow_run_listing.rs"]
 mod workflow_run_listing;
 #[path = "all/workflow_run_listing_order.rs"]

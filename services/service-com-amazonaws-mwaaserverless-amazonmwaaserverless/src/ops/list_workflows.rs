@@ -4,8 +4,9 @@
 //! IMPLEMENTED: one `WorkflowSummary` per workflow persisted in this service's store
 //! (`crate::state`) FOR THE REGION the request is signed for, in ARN order, at most
 //! `MaxResults` per page. A read NEVER changes what a later caller sees. The
-//! `NextToken` this operation returns is the only one it accepts back; anything else is
-//! refused as a `ValidationException`.
+//! `NextToken` this operation returns AT THAT REGION'S ENDPOINT is the only one it
+//! accepts back there; anything else — a cursor of another list, or one issued at
+//! another regional endpoint — is refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -188,15 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(SystemTime::now());
 
         // The cursor is the ARN of the last item on the previous page, so a workflow
-        // deleted between pages cannot restart or skip the walk.
+        // deleted between pages cannot restart or skip the walk, scoped to the regional
+        // endpoint that issued it. This listing walks the workflows of ONE region
+        // (`crate::state::request_region`), so a cursor minted at another endpoint is
+        // not a position in this walk: its ARN names a place in a different partition,
+        // and honouring it would silently skip or re-serve rows. It is refused the same
+        // way a cursor issued for another list is.
         let after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
-                    ListWorkflowsErrorModeled::ValidationException(
-                        crate::state::invalid_page_token("ListWorkflows"),
-                    )
-                })?,
+                crate::state::parse_workflow_listing_page_token(PAGE_KIND, token, &region)
+                    .ok_or_else(|| {
+                        ListWorkflowsErrorModeled::ValidationException(
+                            crate::state::invalid_page_token("ListWorkflows"),
+                        )
+                    })?,
             ),
         };
 
@@ -227,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = match workflows.last() {
             Some(last) if page.next().is_some() => Some(crate::state::encode_page_token(
                 PAGE_KIND,
-                &last.workflow_arn,
+                &crate::state::format_workflow_listing_key(&region, &last.workflow_arn),
             )),
             _ => None,
         };

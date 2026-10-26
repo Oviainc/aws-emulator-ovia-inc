@@ -27,7 +27,9 @@ use crate::workflow_lifecycle::{is_workflow_arn, role_arn, Harness};
 /// shape="WorkflowArn")`), each paired with how many workflows its endpoint creates.
 /// The counts differ so the rule is asserted for an endpoint holding none, one and
 /// several.
-const REGION_POPULATIONS: &[(&str, usize)] = &[
+///
+/// `pub(crate)` so another suite drives the same spread of endpoint populations.
+pub(crate) const REGION_POPULATIONS: &[(&str, usize)] = &[
     ("us-east-1", 3),
     ("eu-west-1", 1),
     ("ap-southeast-2", 0),
@@ -43,7 +45,10 @@ const REGION_PAIRS: &[(&str, &str)] = &[
 ];
 
 /// Create one workflow at `region`'s endpoint and report its ARN.
-async fn create_at(harness: &Harness, region: &str, name: &str) -> String {
+///
+/// `pub(crate)` so another suite seeds a region's workflows the same way rather than
+/// writing a second create helper.
+pub(crate) async fn create_at(harness: &Harness, region: &str, name: &str) -> String {
     let (status, created) = harness
         .call_in(
             region,
@@ -69,7 +74,9 @@ async fn create_at(harness: &Harness, region: &str, name: &str) -> String {
 
 /// Every `WorkflowArn` `ListWorkflows` reports at `region`'s endpoint, paged
 /// `page_size` at a time through the tokens the operation itself issues.
-async fn listed_arns(harness: &Harness, region: &str, page_size: u64) -> Vec<String> {
+///
+/// `pub(crate)` so another suite walks a region's listing the same way.
+pub(crate) async fn listed_arns(harness: &Harness, region: &str, page_size: u64) -> Vec<String> {
     let mut arns: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     // One more round trip than there are workflows in the whole table, so a listing

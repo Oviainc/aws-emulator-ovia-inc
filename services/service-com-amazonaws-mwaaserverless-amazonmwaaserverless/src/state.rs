@@ -1093,34 +1093,58 @@ pub fn page_size(max_results: i32) -> usize {
         .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE)
 }
 
-/// What separates a child-listing cursor key's POSITION from the workflow the
-/// walk it was issued for is scoped to. Neither a zero-padded decimal position
-/// nor a `WorkflowArn` (`^arn:…:workflow/[a-zA-Z0-9.\-_]+$`) can contain it, so
-/// the split is unambiguous.
+/// What separates a listing cursor key's POSITION from the SCOPE of the walk it
+/// was issued for. Neither a zero-padded decimal position, a `WorkflowArn`
+/// (`^arn:…:workflow/[a-zA-Z0-9.\-_]+$`) nor a region segment
+/// (`[a-z]{2}-[a-z]+-[0-9]{1}`) can contain it, so the split is unambiguous.
 const LISTING_KEY_SCOPE_SEPARATOR: char = '@';
 
-/// The cursor key for a position in ONE workflow's child listing: the position of
-/// the last item on the page, and the workflow whose history the walk is over.
+/// The cursor key for a position in ONE listing walk: the position of the last
+/// item on the page, and the SCOPE that walk is over — the parent workflow for a
+/// child listing, the endpoint's region for a listing partitioned by region.
 ///
-/// A child listing pages the history of exactly one parent, so the parent belongs
-/// in the key: a cursor presented on a walk over ANOTHER workflow's history is
-/// then recognisable as one not issued for that walk, instead of being applied as
-/// a position in a history it says nothing about.
-pub fn format_scoped_listing_key(workflow_arn: &str, position: &str) -> String {
-    format!("{position}{LISTING_KEY_SCOPE_SEPARATOR}{workflow_arn}")
+/// A walk covers exactly one scope, so the scope belongs in the key: a cursor
+/// presented on a walk over ANOTHER scope is then recognisable as one not issued
+/// for that walk, instead of being applied as a position in a sequence it says
+/// nothing about.
+pub fn format_scoped_listing_key(scope: &str, position: &str) -> String {
+    format!("{position}{LISTING_KEY_SCOPE_SEPARATOR}{scope}")
 }
 
-/// The POSITION a cursor of `kind` carries, for a walk scoped to `workflow_arn`.
+/// The POSITION a cursor of `kind` carries, for a walk over `scope`.
 ///
 /// `None` when the token is not one this service issued, when it was issued for
 /// another of this service's lists, when its key is malformed, or when it was
-/// issued on another workflow's history — each of which a listing refuses with
+/// issued on another scope's walk — each of which a listing refuses with
 /// the same `ValidationException` ([`invalid_page_token`]), because none of them
 /// is a position in the walk being asked for.
-pub fn parse_scoped_page_token(kind: &str, token: &str, workflow_arn: &str) -> Option<String> {
+pub fn parse_scoped_page_token(kind: &str, token: &str, scope: &str) -> Option<String> {
     let key = decode_page_token(kind, token)?;
-    let (position, scope) = key.split_once(LISTING_KEY_SCOPE_SEPARATOR)?;
-    (scope == workflow_arn).then(|| position.to_string())
+    let (position, scope_of_token) = key.split_once(LISTING_KEY_SCOPE_SEPARATOR)?;
+    (scope_of_token == scope).then(|| position.to_string())
+}
+
+/// The cursor key for a position in the listing of the workflows ONE regional
+/// endpoint holds: the `WorkflowArn` of the last workflow on the page, scoped to
+/// the region whose partition that walk is over.
+///
+/// The ARN rather than an index, so a workflow removed between pages leaves the
+/// cursor resolving to the same place in what remains; the region beside it
+/// because the workflow listing is partitioned by region ([`request_region`]),
+/// so a position taken from another endpoint's walk is not a position in this one.
+pub fn format_workflow_listing_key(region: &str, last_workflow_arn: &str) -> String {
+    format_scoped_listing_key(region, last_workflow_arn)
+}
+
+/// The ARN a cursor of `kind` resumes `region`'s workflow listing after, as
+/// [`format_workflow_listing_key`] wrote it.
+///
+/// `None` when the token is not one this service issued for this list, when its
+/// key is malformed, or when it was issued at ANOTHER regional endpoint — each of
+/// which the listing refuses with [`invalid_page_token`], because none of them is
+/// a position in the walk being asked for.
+pub fn parse_workflow_listing_page_token(kind: &str, token: &str, region: &str) -> Option<String> {
+    parse_scoped_page_token(kind, token, region).filter(|position| !position.is_empty())
 }
 
 /// The cursor key for a position in ONE workflow's run listing: the two
