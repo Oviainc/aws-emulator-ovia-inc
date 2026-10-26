@@ -107,6 +107,8 @@ mod permission_sets_provisioned_to_account;
 mod permissions_boundary;
 #[path = "all/permissions_boundary_delete.rs"]
 mod permissions_boundary_delete;
+#[path = "all/permissions_boundary_get.rs"]
+mod permissions_boundary_get;
 #[path = "all/policy_attach_conflict.rs"]
 mod policy_attach_conflict;
 #[path = "all/region_list.rs"]

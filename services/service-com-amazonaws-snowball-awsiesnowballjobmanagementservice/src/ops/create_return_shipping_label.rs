@@ -208,19 +208,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A job whose device will never ship, or whose device is already back at Amazon
-        // Web Services, has nothing to return; unlike a main job that is a property of
-        // where the job GOT TO, which is what `InvalidJobStateException` states.
+        // A job whose device has not been handed to the customer yet, or whose device is
+        // already back at Amazon Web Services, has nothing to return
+        // ([`crate::state::JobState::has_returnable_device`]); unlike a main job that is a
+        // property of where the job GOT TO, which is what `InvalidJobStateException`
+        // states.
         if !job_state.has_returnable_device() {
             return Err(
                 CreateReturnShippingLabelErrorModeled::InvalidJobStateException(
                     InvalidJobStateException {
-                        message: Some(format!(
-                            "The job {} is in state {} and has no device to return, so a return \
-                             shipping label can't be created for it.",
-                            input.job_id,
-                            job_state.as_wire()
-                        )),
+                        message: Some(
+                            "The action can't be performed because the job's current state \
+                             doesn't allow that action to be performed."
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

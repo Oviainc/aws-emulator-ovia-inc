@@ -15,12 +15,16 @@
 //! these suites assert the two things that file leaves open: that no input class reaches the
 //! 501 channel, and that several stored labels stay separable. The rows differ along what
 //! the rule generalises over: the input class (a job no record answers to under each
-//! modelled `JobId` prefix, a job with no device to return, a job with no label, a label
-//! whose task is still running, a finished label, a job part of an export order), the job
-//! and device shape, the shipping speed, and how many labelled jobs the store holds.
+//! modelled `JobId` prefix, a job with no device to return — one whose device has not
+//! shipped yet as well as one that never ships — a job with no label, a label whose task is
+//! still running, a finished label, a job part of an export order), the job and device shape,
+//! the shipping speed, and how many labelled jobs the store holds.
 //!
-//! Nothing here reaches into the state struct: every call goes through the same front door
-//! a client uses, so a response that is not computed from persisted state cannot pass.
+//! The shipment states this API moves a job through are not served by this emulator yet, so
+//! a case that needs a job whose device is on the customer's side of its journey sets that
+//! state in the service's own store before calling (`job_unlock_code::set_job_state`), the
+//! store the handler reads. Every call still goes through the same front door a client uses,
+//! so a response that is not computed from persisted state cannot pass.
 
 use std::collections::BTreeSet;
 
@@ -31,9 +35,11 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::RETURN_SHIPPING_LABEL_OBJECT;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::job_lifecycle::{call_in_region, ok, string};
+use super::job_lifecycle::{call_in_region, ok, router_with_engine, string};
+use super::job_unlock_code::set_job_state;
 use super::return_shipping_labels::{
-    create_job, job_parts, label_subject, parameter, parse_label_url, wait_for_the_label,
+    create_job, job_parts, label_subject_in_state, parameter, parse_label_url, wait_for_the_label,
+    A_RETURNABLE_STATE,
 };
 
 /// The Region every call in these suites signs for.
@@ -131,7 +137,7 @@ async fn assert_answered(
 
 #[tokio::test]
 async fn describe_return_shipping_label_answers_a_modelled_response_for_every_input_class() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let mut rows: Vec<(&str, String, Expected)> = Vec::new();
 
     // A job no record answers to, under each prefix the modelled `JobId` pattern admits
@@ -187,11 +193,29 @@ async fn describe_return_shipping_label_answers_a_modelled_response_for_every_in
         Expected::Refused("InvalidJobStateException"),
     ));
 
+    // A job whose device has not been handed to the customer yet: the state `CreateJob`
+    // mints, in which there is no device to return and so no label to report on.
+    let not_shipped_case = "a job whose device has never shipped";
+    let not_shipped = create_job(
+        &router,
+        json!({ "JobType": "IMPORT", "SnowballType": "EDGE_S" }),
+        not_shipped_case,
+    )
+    .await;
+    rows.push((
+        not_shipped_case,
+        not_shipped,
+        Expected::Refused("InvalidJobStateException"),
+    ));
+
     // A job with a returnable device but no label created for it yet.
     let no_label_case = "a job no label was created for";
-    let no_label = create_job(
+    let no_label = label_subject_in_state(
         &router,
+        &engine,
         json!({ "JobType": "IMPORT", "SnowballType": "EDGE_CG" }),
+        false,
+        A_RETURNABLE_STATE,
         no_label_case,
     )
     .await;
@@ -203,9 +227,12 @@ async fn describe_return_shipping_label_answers_a_modelled_response_for_every_in
 
     // A label whose creating task is still running: a status, but no file and no window.
     let in_progress_case = "a label whose task is still running";
-    let in_progress = create_job(
+    let in_progress = label_subject_in_state(
         &router,
+        &engine,
         json!({ "JobType": "IMPORT", "SnowballType": "EDGE", "ShippingOption": "NEXT_DAY" }),
+        false,
+        A_RETURNABLE_STATE,
         in_progress_case,
     )
     .await;
@@ -232,21 +259,26 @@ async fn describe_return_shipping_label_answers_a_modelled_response_for_every_in
     // The two classes that need the task to have finished: a plain job and one job part of
     // an export order, which is the job that carries a device.
     let finished_case = "a finished label on a plain job";
-    let finished = create_job(
+    let finished = label_subject_in_state(
         &router,
+        &engine,
         json!({ "JobType": "IMPORT", "SnowballType": "EDGE_C", "ShippingOption": "STANDARD" }),
+        false,
+        A_RETURNABLE_STATE,
         finished_case,
     )
     .await;
     let part_case = "a finished label on a job part of an export order";
-    let part = label_subject(
+    let part = label_subject_in_state(
         &router,
+        &engine,
         json!({
             "JobType": "EXPORT",
             "SnowballType": "EDGE",
             "Resources": { "S3Resources": [{ "BucketArn": "arn:aws:s3:::parts-bucket" }] },
         }),
         true,
+        A_RETURNABLE_STATE,
         part_case,
     )
     .await;
@@ -338,7 +370,7 @@ fn labelled_jobs() -> Vec<Labelled> {
 
 #[tokio::test]
 async fn every_job_is_reported_the_label_stored_against_its_own_id() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let rows = labelled_jobs();
 
     // Every label exists at once, so a handler reporting anything but the record stored
@@ -346,6 +378,7 @@ async fn every_job_is_reported_the_label_stored_against_its_own_id() {
     let mut jobs: Vec<(&'static str, String, &'static str)> = Vec::new();
     for row in &rows {
         let job_id = create_job(&router, row.submitted.clone(), row.case).await;
+        set_job_state(&engine, &job_id, A_RETURNABLE_STATE);
         ok(
             &router,
             "CreateReturnShippingLabel",
