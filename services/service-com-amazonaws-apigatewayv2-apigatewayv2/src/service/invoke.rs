@@ -113,8 +113,9 @@ use smithy_server_runtime::http;
 use super::data_plane::{
     addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
     identity_source_value, json_response, path_of, path_segments, presents_identity_source,
-    query_of, query_parameters, EXECUTE_API_LABEL, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS,
-    UNPLACEABLE_STATUS,
+    query_of, query_parameters, service_named_by_host, split_first_segment, EXECUTE_API_LABEL,
+    LOCAL_ENDPOINT_PREFIX, NOT_FOUND_MESSAGE, NOT_FOUND_STATUS, UNAUTHORIZED_MESSAGE,
+    UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
 };
 use super::jwt;
 use crate::state::{Api, ComAmazonawsApigatewayv2Apigatewayv2State, Integration, Route, Stage};
@@ -154,21 +155,6 @@ const AUTHORIZATION_JWT: &str = "JWT";
 /// gives is this one; a configuration that names no entry still has to read the token
 /// somewhere, and the `Authorization` header is where RFC 6750 puts a bearer token.
 const DEFAULT_JWT_IDENTITY_SOURCE: &str = "$request.header.Authorization";
-
-/// The status a request matching no route of the api is answered with, and its sentence —
-/// the api serves the host, but nothing of it serves this method and path.
-const NOT_FOUND_STATUS: u16 = 404;
-const NOT_FOUND_MESSAGE: &str = "Not Found";
-
-/// The first path segment that marks an endpoint carried IN THE PATH rather than in the
-/// host: `/_aws/execute-api/{api-id}/{stage}/{route-path}`.
-///
-/// A client on the machine this emulator runs on cannot resolve
-/// `{api-id}.execute-api.{region}.amazonaws.com`, so it reaches the emulator's own address
-/// and keeps the endpoint it was given in the path behind this marker. The segment is
-/// reserved for the emulator — it is not a path any AWS api serves — so reading it cannot
-/// take a request away from a route of an api.
-const LOCAL_ENDPOINT_PREFIX: &str = "_aws";
 
 /// The sentence [`UNPLACEABLE_STATUS`] carries on the HTTP data plane: API Gateway's own
 /// body for an HTTP api whose integration produced no response. Spelled as an HTTP api
@@ -382,31 +368,6 @@ fn local_endpoint_path(path: &str) -> Option<(&str, &str)> {
 /// `HTTP | WEBSOCKET` (`smithy_query(query="shape", shape="ProtocolType")`).
 fn is_http(api: &Api) -> bool {
     api.protocol_type == crate::state::HTTP_PROTOCOL_TYPE
-}
-
-/// The first non-empty segment of `path` and the path that follows it (with its leading
-/// `/`), or `None` for a path with no segment at all.
-fn split_first_segment(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_start_matches('/');
-    let (first, rest) = match trimmed.find('/') {
-        Some(boundary) => (&trimmed[..boundary], &trimmed[boundary..]),
-        None => (trimmed, "/"),
-    };
-    (!first.is_empty()).then_some((first, rest))
-}
-
-/// The service `host` names to the emulator's front door, or `None` when it names none.
-///
-/// The front door's OWN host reader decides it (`emulator_server::service_from_host`, the
-/// last tier of the routing key every front door resolves), rather than a second rule
-/// written here: the request the two path addressings are read for is exactly the one that
-/// reader can place nowhere — a loopback address or `localhost`, which is the only endpoint
-/// a client on this machine can reach.
-fn service_named_by_host(host: &str) -> Option<String> {
-    let mut headers = http::HeaderMap::new();
-    let value = http::HeaderValue::from_str(host).ok()?;
-    headers.insert(http::header::HOST, value);
-    ::emulator_server::service_from_host(&headers)
 }
 
 /// Whether THIS data plane serves the request these parts came from — the HTTP half of

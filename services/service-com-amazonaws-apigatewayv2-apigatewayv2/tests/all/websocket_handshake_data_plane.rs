@@ -201,7 +201,13 @@ async fn deploy_api(
 }
 
 /// The answer to one request: its status, its `x-amzn-errortype`, the `sec-websocket-accept`
-/// and `location` headers it carries (or `None`), and its parsed body.
+/// and `location` headers it carries (or `None`), its `content-type`, its body as text, and
+/// its body parsed as JSON.
+///
+/// Both readings of the body are kept because this service's data planes answer in two
+/// envelopes: a `{"message": …}` JSON body for every refusal, and an HTML document for a
+/// published portal's page (`portal_data_plane`). A body that is not JSON parses to
+/// `Value::Null` and is read through [`Answer::text`].
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) error_type: Option<String>,
@@ -209,6 +215,8 @@ pub(crate) struct Answer {
     /// Where a redirect sends the caller — the header the HTTP data plane answers an
     /// `HTTP_PROXY` upstream with (`http_api_jwt_data_plane`).
     pub(crate) location: Option<String>,
+    pub(crate) content_type: String,
+    pub(crate) text: String,
     pub(crate) body: Value,
 }
 
@@ -216,9 +224,15 @@ impl Answer {
     /// The `message` member of an `execute-api` body, or the `__type` of a front-door
     /// envelope — whichever the answer carries — for an assertion message.
     pub(crate) fn summary(&self) -> String {
+        let body = if self.body.is_null() {
+            // A document rather than an envelope: enough of it to identify the page.
+            self.text.chars().take(200).collect()
+        } else {
+            self.body.to_string()
+        };
         format!(
-            "{} {} (x-amzn-errortype: {:?})",
-            self.status, self.body, self.error_type
+            "{} {body} ({:?}, x-amzn-errortype: {:?})",
+            self.status, self.content_type, self.error_type
         )
     }
 }
@@ -253,7 +267,9 @@ pub(crate) async fn send(
     let error_type = header("x-amzn-errortype");
     let accept = header("sec-websocket-accept");
     let location = header("location");
+    let content_type = header("content-type").unwrap_or_default();
     let bytes = response.into_body();
+    let text = String::from_utf8_lossy(&bytes).to_string();
     let body = if bytes.is_empty() {
         Value::Null
     } else {
@@ -264,6 +280,8 @@ pub(crate) async fn send(
         error_type,
         accept,
         location,
+        content_type,
+        text,
         body,
     }
 }

@@ -242,6 +242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And the growth ONE portal drives: every product it includes is rendered into
+        // the page its domain serves, so the list it stores is bounded here.
+        if let Err(message) =
+            crate::state::validate_included_portal_product_count(&included_portal_product_arns)
+        {
+            return Err(CreatePortalErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("PortalProduct".to_string()),
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let portal_id = store.mint_portal_id();
         let region = crate::state::request_region(ctx.parts());
@@ -264,6 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_configuration: crate::state::resolve_portal_endpoint_configuration(
                 &portal_id,
                 &region,
+                ctx.parts(),
                 &input.endpoint_configuration,
             ),
             included_portal_product_arns,
@@ -280,6 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has been published, disabled or previewed yet, so the service is
             // building nothing for this portal.
             transition: ::std::option::Option::None,
+            // And nothing is live on its domain until a publish has built something.
+            published_site: ::std::option::Option::None,
             preview_ready_at: ::std::option::Option::None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             portal_id: portal_id.clone(),

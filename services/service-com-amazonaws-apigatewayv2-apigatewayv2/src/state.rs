@@ -2206,6 +2206,34 @@ impl Deployment {
 /// operation refuses with. Do not cite this as a published portals quota.
 pub const MAX_PORTALS: usize = 100;
 
+/// The most portal products one portal may INCLUDE, after which a write that would store
+/// more is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: `IncludedPortalProductArns` is
+/// modelled as an unconstrained list, and every entry of it is rendered into the page the
+/// portal's domain serves ([`crate::service`]'s portal plane), so an uncapped list is an
+/// uncapped response built from one small request. It is set to the number of products this
+/// store can hold at all ([`MAX_PORTAL_PRODUCTS`]), which is the most a portal could include
+/// of this account's own products; a portal including products another account shared is
+/// bounded by the same figure rather than by what this store holds.
+/// `TooManyRequestsException` ("A limit has been exceeded") is the modelled error the
+/// writers refuse with. Do not cite this as a published quota.
+pub const MAX_INCLUDED_PORTAL_PRODUCTS: usize = MAX_PORTAL_PRODUCTS;
+
+/// Refuse a list of included portal products that would grow a portal past
+/// [`MAX_INCLUDED_PORTAL_PRODUCTS`]. `Err` carries the message for the writer's
+/// `TooManyRequestsException`, which also names the limit in its `LimitType`.
+pub fn validate_included_portal_product_count(arns: &[String]) -> Result<(), String> {
+    if arns.len() <= MAX_INCLUDED_PORTAL_PRODUCTS {
+        return Ok(());
+    }
+    Err(format!(
+        "The maximum number of portal products ({MAX_INCLUDED_PORTAL_PRODUCTS}) a portal \
+         may include has been reached, got {}.",
+        arns.len()
+    ))
+}
+
 /// The `PublishStatus` a portal carries while it serves nothing: the value
 /// [`Portal`] is created with, since a portal that has never been published is not
 /// serving its content to anyone.
@@ -2289,6 +2317,29 @@ pub struct PortalPublication {
     /// (`PublishPortal$Description`). `None` for a publish that carried none, which
     /// publishes a version with no description.
     pub description: Option<String>,
+    /// The site this publish BUILDS, captured when the publish started: a publish
+    /// "publishes a portal" by building the content the portal held at that moment, so a
+    /// later write to the portal's content changes nothing about what is already live
+    /// until another publish builds it.
+    pub site: PublishedSite,
+}
+
+/// The build a portal's domain is SERVING: what one settled publish put live.
+///
+/// Held apart from the portal's current content because the two are different things —
+/// `PortalContent` is what the next publish would build, this is what the last one built
+/// and what a visitor of the portal's domain is served until a `DisablePortal` takes it
+/// down.
+#[derive(Debug, Clone)]
+pub struct PublishedSite {
+    /// When this build went live, which is the portal's `LastPublished`.
+    pub at: SystemTime,
+    /// The portal content this build was made from.
+    pub content: wire::PortalContent,
+    /// The portal products the portal included when this build was made, by ARN.
+    pub included_portal_product_arns: Vec<String>,
+    /// The logo the portal carried when this build was made, if any.
+    pub logo_uri: Option<String>,
 }
 
 /// What one of the three portal build calls asks the service to do.
@@ -2374,6 +2425,11 @@ pub struct Portal {
     /// The publish or disable the service is building, or the last one it built; `None`
     /// until one is started. See [`Portal::settle`].
     pub transition: Option<PortalTransition>,
+    /// The build this portal's domain is serving: `Some` once a publish has settled,
+    /// `None` before the first one and after a disable has settled. What the domain
+    /// serves is therefore a fact of the record rather than of whoever asks for it; see
+    /// [`Portal::settle`].
+    pub published_site: Option<PublishedSite>,
     /// When the preview this portal's last `PreviewPortal` started is due to be
     /// ready; `None` until one runs, so nothing is reported for a portal with no
     /// preview. The `PreviewStatus` is derived from it on every read, so no stored copy
@@ -2430,9 +2486,18 @@ impl Portal {
             return;
         };
         self.publish_status = transition.settled.to_string();
-        if let Some(published) = transition.published {
-            self.last_published = Some(published.at);
-            self.last_published_description = published.description;
+        match transition.published {
+            Some(published) => {
+                self.last_published = Some(published.at);
+                self.last_published_description = published.description;
+                // The build this publish made is what the portal's domain serves from
+                // here on, in place of whatever an earlier publish put live.
+                self.published_site = Some(published.site);
+            }
+            // A build that publishes nothing is a disable, which takes the publication
+            // down: the portal's domain serves nothing until a later publish builds
+            // another one.
+            None => self.published_site = None,
         }
     }
 
@@ -2472,6 +2537,16 @@ impl Portal {
                     published: Some(PortalPublication {
                         at: due_at,
                         description,
+                        // The content as it stands NOW is what this publish builds: the
+                        // call that starts it is what names the version going live.
+                        site: PublishedSite {
+                            at: due_at,
+                            content: self.portal_content.clone(),
+                            included_portal_product_arns: self
+                                .included_portal_product_arns
+                                .clone(),
+                            logo_uri: self.logo_uri.clone(),
+                        },
                     }),
                     builds_content,
                 });
@@ -2538,6 +2613,38 @@ impl Portal {
                     .collect(),
             ),
         }
+    }
+
+    /// The build this portal's domain is SERVING as of `now`, or `None` when it serves
+    /// nothing: a portal nothing has published yet, and one whose publication a
+    /// `DisablePortal` has taken down.
+    ///
+    /// Derived from the clock the way [`Portal::to_wire`] derives the status it reports, so
+    /// asking what the domain serves writes nothing: a publish the clock has already made
+    /// due is live here while the stored record is left for the next writer to settle. Only
+    /// the publication is cloned — the answer itself — so one visit costs the bytes it
+    /// serves rather than a copy of the whole record.
+    pub fn live_site(&self, now: SystemTime) -> Option<PublishedSite> {
+        match self.transition.as_ref() {
+            // A build still in flight changes nothing yet: what is live is whatever the
+            // last settled build left live.
+            Some(transition) if now < transition.due_at => self.published_site.clone(),
+            // A build the clock has made due: the site that build made, and nothing at all
+            // for a build that publishes nothing (a disable).
+            Some(transition) => transition
+                .published
+                .as_ref()
+                .map(|published| published.site.clone()),
+            None => self.published_site.clone(),
+        }
+    }
+
+    /// Whether the preview this portal's last `PreviewPortal` built is ready as of `now` —
+    /// the `PREVIEW_READY` of [`PREVIEW_STATUS_PREVIEW_READY`], derived from the same due
+    /// instant [`Portal::to_wire`] reports the preview's status from.
+    pub fn preview_is_ready(&self, now: SystemTime) -> bool {
+        self.preview_ready_at
+            .is_some_and(|ready_at| now >= ready_at)
     }
 }
 
@@ -3478,6 +3585,12 @@ pub fn portal_arn(region: &str, portal_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("/portals/{portal_id}"))
 }
 
+/// The second label of the default domain API Gateway generates for a portal:
+/// `{portal-id}.portal.{region}.amazonaws.com`. CHOSEN, like the rest of that host (see
+/// [`portal_default_domain_name`]), and read back by the portal data plane for a request
+/// that carries the endpoint in its path.
+pub const PORTAL_ENDPOINT_LABEL: &str = "portal";
+
 /// The default domain name API Gateway generates for a portal: the host a consumer
 /// reaches the portal on when the account brought no domain of its own
 /// (`EndpointConfigurationResponse$PortalDefaultDomainName`: "This domain name is
@@ -3489,8 +3602,14 @@ pub fn portal_arn(region: &str, portal_id: &str) -> String {
 /// name that is unique to the portal, stable across reads and within the modelled
 /// 3..256 bound; the subdomain label is CHOSEN.
 pub fn portal_default_domain_name(portal_id: &str, region: &str) -> String {
-    format!("{portal_id}.portal.{region}.amazonaws.com")
+    format!("{portal_id}.{PORTAL_ENDPOINT_LABEL}.{region}.amazonaws.com")
 }
+
+/// The single path segment a portal's preview is served under, and the one
+/// [`portal_preview_url`] announces it at. CHOSEN, like the rest of that URL, and read
+/// back by the portal data plane so the path a client is given and the path that is served
+/// cannot drift apart.
+pub const PORTAL_PREVIEW_SEGMENT: &str = "preview";
 
 /// The URL a portal's preview is served on.
 ///
@@ -3504,7 +3623,10 @@ pub fn portal_default_domain_name(portal_id: &str, region: &str) -> String {
 /// which it is because it is derived from the endpoint configuration the create
 /// resolved once.
 pub fn portal_preview_url(endpoint: &wire::EndpointConfigurationResponse) -> String {
-    format!("https://{}/preview", endpoint.portal_default_domain_name)
+    format!(
+        "https://{}/{PORTAL_PREVIEW_SEGMENT}",
+        endpoint.portal_default_domain_name
+    )
 }
 
 /// How many characters follow the leading `Z` of a hosted zone id, matching the
@@ -3534,22 +3656,57 @@ pub fn portal_domain_hosted_zone_id(region: &str) -> String {
 }
 
 /// Resolve a portal's requested domain configuration into the one the readers report,
-/// generating the default domain of a portal with this id in this Region.
+/// generating the default domain of a portal with this id for the endpoint this REQUEST was
+/// addressed at.
 ///
 /// The request names either a domain the account owns together with its ACM certificate
 /// (`AcmManaged`) or API Gateway's default domain (`None`); either way the response
 /// carries the generated default domain name and its hosted zone id, and reports
 /// `DomainName`/`CertificateArn` only for the domain the account brought.
+///
+/// The default domain is generated by [`announced_portal_default_domain_name`], which is
+/// where the choice between the two addresses it can name is explained.
 pub fn resolve_portal_endpoint_configuration(
     portal_id: &str,
     region: &str,
+    parts: &::http::request::Parts,
     requested: &wire::EndpointConfigurationRequest,
 ) -> wire::EndpointConfigurationResponse {
     portal_endpoint_configuration(
-        portal_default_domain_name(portal_id, region),
+        announced_portal_default_domain_name(portal_id, region, parts),
         portal_domain_hosted_zone_id(region),
         requested,
     )
+}
+
+/// The default domain this service ANNOUNCES for a portal: the address a consumer reaches
+/// that portal's website on, resolved ONCE when the portal is created and stored, so every
+/// later read reports the same value.
+///
+/// Which address that is follows the endpoint the CREATE was addressed at, because the
+/// member exists for a client to fetch and a value nothing on the caller's machine resolves
+/// names no portal it can reach:
+///
+/// * a request that addressed this service by one of AWS's own hosts comes from a client
+///   that resolves them, so the portal is announced on the generated host
+///   [`portal_default_domain_name`] builds — the shape
+///   `EndpointConfigurationResponse$PortalDefaultDomainName` documents;
+/// * a request that addressed the EMULATOR'S OWN endpoint ([`local_endpoint_host`]) comes
+///   from a client that resolves nothing else, so the portal is announced on that same
+///   endpoint with its own path behind the [`LOCAL_ENDPOINT_PREFIX`] marker. This is the
+///   address the portal data plane serves, and the same shape this emulator's API Gateway
+///   (REST) stages are reached at (`/_aws/execute-api/{api-id}/{stage}`).
+///
+/// Both forms are within the modelled 3..256 bound of the member.
+pub fn announced_portal_default_domain_name(
+    portal_id: &str,
+    region: &str,
+    parts: &::http::request::Parts,
+) -> String {
+    match local_endpoint_host(parts) {
+        Some(host) => format!("{host}/{LOCAL_ENDPOINT_PREFIX}/{PORTAL_ENDPOINT_LABEL}/{portal_id}"),
+        None => portal_default_domain_name(portal_id, region),
+    }
 }
 
 /// Resolve a requested domain configuration onto a default domain the service has
@@ -3819,6 +3976,38 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The first path segment that marks one of this service's data-plane endpoints carried IN
+/// THE PATH rather than in the host: `/_aws/{endpoint}/{resource-id}/{rest}`.
+///
+/// A client on the machine this emulator runs on resolves none of the hosts AWS serves
+/// these endpoints on, so it reaches the emulator's own address and carries the endpoint in
+/// the path behind this marker. The segment is reserved for the emulator — it is not a path
+/// any AWS endpoint serves — so reading it cannot take a request away from a route of an api
+/// or a page of a portal, and it is the SAME spelling the API Gateway (REST) data plane of
+/// this emulator is reached at (`/_aws/execute-api/{api-id}/{stage}/{resource-path}`).
+pub const LOCAL_ENDPOINT_PREFIX: &str = "_aws";
+
+/// The endpoint this request was addressed at when that endpoint is the EMULATOR'S OWN —
+/// a loopback address, an IP literal or `localhost`, which is what a client configured with
+/// one local endpoint URL sends — and `None` when the host names a service, which is a
+/// client that resolves AWS's own hosts.
+///
+/// The front door's own host reader decides it (`emulator_server::service_from_host`, the
+/// last tier of the routing key every front door resolves), so no second rule for "which
+/// host is a service's" is written here.
+pub fn local_endpoint_host(parts: &::http::request::Parts) -> Option<String> {
+    if ::emulator_server::service_from_host(&parts.headers).is_some() {
+        return None;
+    }
+    let host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())?
+        .trim();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// The URI scheme of an api's default endpoint, chosen by its `ProtocolType`.

@@ -73,6 +73,8 @@ mod integration_validation;
 mod model_lifecycle;
 #[path = "all/model_template.rs"]
 mod model_template;
+#[path = "all/portal_data_plane.rs"]
+mod portal_data_plane;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
 #[path = "all/portal_pagination.rs"]
@@ -87,6 +89,8 @@ mod portal_product_update;
 mod portal_publication;
 #[path = "all/portal_update.rs"]
 mod portal_update;
+#[path = "all/probe.rs"]
+mod probe;
 #[path = "all/product_page_lifecycle.rs"]
 mod product_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_deletion.rs"]

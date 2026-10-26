@@ -60,6 +60,34 @@ pub(crate) async fn call_in_region(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    call_at_host(
+        emulator,
+        &format!("apigateway.{region}.amazonaws.com"),
+        region,
+        method,
+        uri,
+        body,
+    )
+    .await
+}
+
+/// [`call_in_region`] addressed at `host`: the endpoint the request is SENT to, which the
+/// credential scope is independent of.
+///
+/// A client configured with one local endpoint URL sends the emulator's own address as the
+/// `Host` for every service, and a client that resolves AWS's own hosts sends this
+/// service's. Both route here through the credential scope, and a value this service
+/// ANNOUNCES for a client to fetch follows the endpoint the request came in on — see
+/// `state::announced_portal_default_domain_name` — so a suite that asserts on such a value
+/// drives this directly.
+pub(crate) async fn call_at_host(
+    emulator: &MultiServiceRouter,
+    host: &str,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let payload = match &body {
         Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize request body")),
         None => Bytes::new(),
@@ -67,7 +95,7 @@ pub(crate) async fn call_in_region(
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", format!("apigateway.{region}.amazonaws.com"))
+        .header("host", host)
         .header(
             "authorization",
             format!(

@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What BOTH of this service's `execute-api` data planes read and answer with: how an
-//! invoke endpoint's host and path are read, how an authorizer's identity source is
-//! looked up in a request, and the `{"message": …}` envelope an answer is rendered in.
+//! What EVERY one of this service's data planes reads and answers with: how an endpoint's
+//! host and path are read, how an authorizer's identity source is looked up in a request,
+//! and the `{"message": …}` envelope an answer is rendered in.
 //!
-//! API Gateway v2 serves two protocols from one control plane, and each has a data plane
-//! of its own — [`super::websocket`] for the RFC 6455 opening handshake of a WEBSOCKET
-//! api, [`super::invoke`] for a request to a route of an HTTP api — but both are addressed
-//! at the SAME endpoint shape, the one `Api$ApiEndpoint` documents
+//! API Gateway v2 serves two protocols and a developer portal from one control plane, and
+//! each has a data plane of its own — [`super::websocket`] for the RFC 6455 opening
+//! handshake of a WEBSOCKET api, [`super::invoke`] for a request to a route of an HTTP api,
+//! [`super::portal`] for the website a published portal serves — and the two api planes are
+//! addressed at the SAME endpoint shape, the one `Api$ApiEndpoint` documents
 //! (`{api-id}.execute-api.{region}.amazonaws.com`, "the stage name … appended to this URI
-//! to form a complete path to a deployed API stage"), and both answer in the same
-//! envelope. This module owns those shared readings so the two planes cannot disagree
-//! about which host is an invoke endpoint, which path space belongs to another service, or
-//! what a refusal looks like on the wire.
+//! to form a complete path to a deployed API stage"), while the portal's is the domain
+//! `EndpointConfigurationResponse$PortalDefaultDomainName` reports. All of them answer in
+//! the same envelope. This module owns those shared readings so the planes cannot disagree
+//! about which host is one of this service's endpoints, which path space belongs to another
+//! service, or what a refusal looks like on the wire.
 //!
 //! Everything here is a PURE reading of a request plus stored values: nothing in this
 //! module touches state, and every function is total — a host, path or expression it
@@ -70,6 +72,18 @@ pub const UNAUTHORIZED_STATUS: u16 = 401;
 
 /// The sentence that status carries.
 pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The status a request a served endpoint has nothing at is answered with, and its
+/// sentence — the endpoint serves the host, but nothing of it serves this method and path.
+pub const NOT_FOUND_STATUS: u16 = 404;
+pub const NOT_FOUND_MESSAGE: &str = "Not Found";
+
+/// The first path segment that marks an endpoint carried IN THE PATH rather than in the
+/// host. Re-exported from [`crate::state::LOCAL_ENDPOINT_PREFIX`], which owns the marker
+/// because the control plane ANNOUNCES it (see
+/// `crate::state::announced_portal_default_domain_name`), so what a caller is given and
+/// what the data planes read are one constant.
+pub use crate::state::LOCAL_ENDPOINT_PREFIX;
 
 /// The identity-source spellings that name a REQUEST HEADER, from
 /// `Authorizer$IdentitySource`: "this value is route.request.header.Auth … for WebSocket
@@ -133,12 +147,7 @@ pub fn header_of<'h>(headers: &'h http::HeaderMap, name: &str) -> Option<&'h str
 /// domain are not matched against a list: an emulator serves whatever region a caller
 /// addresses, and a FIPS or a dualstack spelling of the same endpoint is the same endpoint.
 pub fn api_id_of_host(host: &str) -> Option<&str> {
-    let without_userinfo = host.rsplit('@').next().unwrap_or(host);
-    let without_port = without_userinfo
-        .split(':')
-        .next()
-        .unwrap_or(without_userinfo);
-    let mut labels = without_port.split('.');
+    let mut labels = host_name(host).split('.');
     let api_id = labels.next()?;
     let second = labels.next()?;
     // The label is `execute-api` itself, or one of its endpoint VARIANTS, which AWS spells
@@ -177,6 +186,41 @@ pub fn path_segments(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+/// The first non-empty segment of `path` and the path that follows it (with its leading
+/// `/`), or `None` for a path with no segment at all.
+pub fn split_first_segment(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_start_matches('/');
+    let (first, rest) = match trimmed.find('/') {
+        Some(boundary) => (&trimmed[..boundary], &trimmed[boundary..]),
+        None => (trimmed, "/"),
+    };
+    (!first.is_empty()).then_some((first, rest))
+}
+
+/// The service `host` names to the emulator's front door, or `None` when it names none.
+///
+/// The front door's OWN host reader decides it (`emulator_server::service_from_host`, the
+/// last tier of the routing key every front door resolves), rather than a second rule
+/// written here: the request the path addressings are read for is exactly the one that
+/// reader can place nowhere — a loopback address or `localhost`, which is the only endpoint
+/// a client on this machine can reach.
+pub fn service_named_by_host(host: &str) -> Option<String> {
+    let mut headers = http::HeaderMap::new();
+    let value = http::HeaderValue::from_str(host).ok()?;
+    headers.insert(http::header::HOST, value);
+    ::emulator_server::service_from_host(&headers)
+}
+
+/// `host` with any userinfo and `:port` removed, the way the front door's own host reader
+/// strips them: what is left is the name a stored endpoint host is compared against.
+pub fn host_name(host: &str) -> &str {
+    let without_userinfo = host.rsplit('@').next().unwrap_or(host);
+    without_userinfo
+        .split(':')
+        .next()
+        .unwrap_or(without_userinfo)
 }
 
 /// The authority of an absolute request URI, or `None` when the URI is origin-form.

@@ -59,10 +59,19 @@
 //!   credential), and [`Service::override_operation`] for the invoke that DOES present a
 //!   SigV4 credential, through [`CredentialedDataPlane`], so the emulator's own signature
 //!   verification runs in front of an `AWS_IAM` route.
+//!
+//! Beside those two there is a THIRD data plane, addressed on the domain every portal this
+//! service mints reports (`EndpointConfigurationResponse$PortalDefaultDomainName`):
+//!
+//! - [`portal`] — an ordinary HTTP request to the website a PUBLISHED portal serves: the
+//!   claim ([`portal::claims_parts`]) and the serving ([`portal::serve`], reached from
+//!   [`Service::override_routing_error`], since a consumer of a developer portal presents
+//!   no AWS credential at all).
 
 mod data_plane;
 mod invoke;
 mod jwt;
+mod portal;
 mod websocket;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -253,7 +262,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // one shared store, and to that api's own `ProtocolType`, so exactly one service
         // and exactly one of these modules claims the request; see [`websocket`] and
         // [`invoke`] for the whole rule and for what each request is answered with.
-        websocket::claims_parts(&*self.engine, parts) || invoke::claims_parts(&*self.engine, parts)
+        websocket::claims_parts(&*self.engine, parts)
+            || invoke::claims_parts(&*self.engine, parts)
+            || portal::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
@@ -336,6 +347,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         if invoke::claims_request(&*self.engine, req) {
             return Some(invoke::serve(&*self.engine, req));
+        }
+        // And a visit to the website a published portal serves on its own domain, which
+        // likewise names no modelled operation and carries no AWS credential.
+        if portal::claims_request(&*self.engine, req) {
+            return Some(portal::serve(&*self.engine, req));
         }
         None
     }

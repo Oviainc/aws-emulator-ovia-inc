@@ -229,6 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(bad_request(message));
             }
+            // Every included product is rendered into the page the portal's domain serves,
+            // so the list a write stores is bounded the way `create_portal` bounds it.
+            if let Err(message) = crate::state::validate_included_portal_product_count(arns) {
+                return Err(UpdatePortalErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        limit_type: Some("PortalProduct".to_string()),
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
