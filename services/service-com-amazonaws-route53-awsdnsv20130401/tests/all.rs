@@ -61,6 +61,8 @@ mod reusable_delegation_sets;
 mod state_roundtrip;
 #[path = "all/traffic_policies.rs"]
 mod traffic_policies;
+#[path = "all/traffic_policy_versions.rs"]
+mod traffic_policy_versions;
 #[path = "all/vpc_association_authorizations.rs"]
 mod vpc_association_authorizations;
 #[path = "all/vpc_associations.rs"]

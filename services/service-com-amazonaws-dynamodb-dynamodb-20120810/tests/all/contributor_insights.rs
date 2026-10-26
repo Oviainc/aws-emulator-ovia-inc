@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::emulator::{call, emulator, error_code, message, ok};
 
 /// Wait out one transient span, so whatever the clock owes a resource is due.
-async fn settle() {
+pub(crate) async fn settle() {
     tokio::time::sleep(
         service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION
             + std::time::Duration::from_millis(150),
@@ -41,7 +41,7 @@ async fn settle() {
 }
 
 /// Create one on-demand table carrying `indexes` global secondary indexes.
-async fn create_table(router: &MultiServiceRouter, name: &str, indexes: &[&str]) -> Value {
+pub(crate) async fn create_table(router: &MultiServiceRouter, name: &str, indexes: &[&str]) -> Value {
     let mut request = json!({
         "TableName": name,
         "KeySchema": [{"AttributeName": "Part", "KeyType": "HASH"}],
@@ -87,7 +87,7 @@ fn request_for(operation: &str, table: &str, index: Option<&str>) -> Value {
 }
 
 /// Send one `UpdateContributorInsights` and return the parsed response.
-async fn set_insights(
+pub(crate) async fn set_insights(
     router: &MultiServiceRouter,
     table: &str,
     index: Option<&str>,
@@ -105,7 +105,7 @@ async fn set_insights(
 }
 
 /// Read one resource's setting back.
-async fn describe_insights(router: &MultiServiceRouter, table: &str, index: Option<&str>) -> Value {
+pub(crate) async fn describe_insights(router: &MultiServiceRouter, table: &str, index: Option<&str>) -> Value {
     let mut request = json!({"TableName": table});
     if let Some(index) = index {
         request["IndexName"] = json!(index);

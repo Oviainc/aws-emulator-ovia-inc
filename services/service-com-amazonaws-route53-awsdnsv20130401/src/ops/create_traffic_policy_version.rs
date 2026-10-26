@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +84,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    invalid_traffic_policy_document, no_such_traffic_policy, resource_location,
+    traffic_policy_record_type, StoredTrafficPolicyVersion, MAX_TRAFFIC_POLICY_VERSION,
+};
+
+/// The refusal text a policy that has already reached its last version number
+/// is answered with (`TooManyTrafficPolicyVersionsForCurrentPolicy`, HTTP 400).
+///
+/// The shape's own documentation, which states the rule naming nothing of the
+/// request's — the limit is the same for every policy, so the only value in it
+/// is that limit — and ends with what the caller has to do next.
+fn too_many_versions_message() -> String {
+    format!(
+        "This traffic policy version can't be created because you've reached the limit of \
+         {MAX_TRAFFIC_POLICY_VERSION} on the number of versions that you can create for the \
+         current traffic policy. To create more traffic policy versions, you can use \
+         GetTrafficPolicy to get the traffic policy document for a specified traffic policy \
+         version, and then use CreateTrafficPolicy to create a new traffic policy using the \
+         traffic policy document."
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +178,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficPolicyVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            CreateTrafficPolicyVersionErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A version's document IS that version's definition, and the version's
+        // `Type` is the record type the document names, so a document the
+        // format does not define has no version to create and no type to
+        // report. The SAME validator the first version was created through, so
+        // one policy cannot hold a version its own create would have refused.
+        let record_type = traffic_policy_record_type(&input.document).map_err(|violations| {
+            CreateTrafficPolicyVersionErrorModeled::InvalidTrafficPolicyDocument(
+                invalid_traffic_policy_document(&violations),
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The request addresses ONE existing policy — the new version is a
+        // version OF it — so an `Id` the account holds no policy under names
+        // nothing to add a version to. No version is named by the request, so
+        // the refusal reports none.
+        let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
+            CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy(
+                &input.id, None,
+            ))
+        })?;
+
+        // The per-policy ceiling: a policy's versions only ever count upwards,
+        // so once its highest version is the last number a version can carry
+        // the caller has to start a new policy instead.
+        let version = policy.next_version();
+        if version > MAX_TRAFFIC_POLICY_VERSION {
+            return Err(
+                CreateTrafficPolicyVersionErrorModeled::TooManyTrafficPolicyVersionsForCurrentPolicy(
+                    TooManyTrafficPolicyVersionsForCurrentPolicy {
+                        message: Some(too_many_versions_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The new version carries the document and the comment THIS request
+        // sent; the policy's id and name belong to the policy, so every version
+        // of it reports the same pair.
+        policy.versions.insert(
+            version,
+            StoredTrafficPolicyVersion {
+                record_type,
+                document: input.document,
+                comment: input.comment,
+            },
+        );
+
+        // Read the response back out of the store, so what the caller is told
+        // is what a later GetTrafficPolicy will tell it.
+        let traffic_policy = policy
+            .to_traffic_policy(version)
+            .expect("the traffic policy version just inserted must be present");
+        Ok(CreateTrafficPolicyVersionOutput {
+            location: resource_location(
+                ctx,
+                &format!("trafficpolicy/{}/{version}", traffic_policy.id),
+            ),
+            traffic_policy,
+        })
     }
 }

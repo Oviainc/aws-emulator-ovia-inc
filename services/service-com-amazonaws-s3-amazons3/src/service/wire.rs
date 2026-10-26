@@ -45,8 +45,13 @@
 //! binds, and [`elements_as_attributes`] puts the outgoing element back where the API
 //! publishes it. Both are applied ONLY to a document that carries one, so every other
 //! request and response goes through the framework's own path untouched.
+//!
+//! A `Grantee` is not the ACL's alone: `LoggingEnabled$TargetGrants` reaches one too
+//! (`smithy_query(query="shape",shape="TargetGrant")`), so both normalizations are keyed on
+//! the DOCUMENT — a request whose body is an XML document, a response whose body spells the
+//! attribute — and never on which operation is being served.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
@@ -326,24 +331,41 @@ fn holds(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|slice| slice == needle)
 }
 
-/// Whether the input shape can carry a member that travels as an XML attribute, i.e.
-/// whether its body is an `AccessControlPolicy`.
+/// Whether the input shape binds a member as the request's XML DOCUMENT: an `@httpPayload`
+/// member whose target is a structured shape (a structure, union, list or map).
 ///
-/// The gate on the request side: `AccessControlPolicy` is the only shape in this model
-/// that reaches a `Grantee`, and it is the `@httpPayload` of the two ACL writes
-/// (`smithy_query(query="operation",operation="PutBucketAcl")` reports
-/// `AccessControlPolicy: {httpPayload: true}`; `PutObjectAcl` the same). Every other
-/// operation's body is therefore left to the framework's own path without even being
+/// What tells a request whose BODY IS A DOCUMENT from one whose body is arbitrary bytes (an
+/// object's payload) or has no body at all. Only such a document can carry a member that
+/// travels as an XML attribute, and only such a document may be scanned for one: an
+/// object's bytes are not XML and must never be rewritten.
+fn is_xml_document_payload(member: &Schema) -> bool {
+    member.http_payload().is_some()
+        && matches!(
+            member.shape_type(),
+            ShapeType::Structure
+                | ShapeType::Union
+                | ShapeType::List
+                | ShapeType::Map
+                | ShapeType::Document
+        )
+}
+
+/// Whether the input shape's body is an XML document, i.e. whether this request can carry a
+/// member that travels as an XML attribute.
+///
+/// The gate on the request side. A `Grantee` is reached by MORE than the two ACL writes —
+/// `BucketLoggingStatus` reaches one through `LoggingEnabled$TargetGrants`
+/// (`smithy_query(query="shape",shape="TargetGrant")`) — so the gate is the SHAPE OF THE
+/// BODY rather than the name of one payload member: every operation whose body is a
+/// document is normalized when that document actually spells an attribute, and every
+/// operation whose body is not is left to the framework's own path without even being
 /// scanned.
-fn carries_access_control_policy(input_schema: &Schema) -> bool {
+fn carries_xml_document_payload(input_schema: &Schema) -> bool {
     input_schema
         .members()
         .iter()
-        .any(|member| member.member_name() == Some(ACCESS_CONTROL_POLICY_MEMBER))
+        .any(|member| is_xml_document_payload(member))
 }
-
-/// The member name [`carries_access_control_policy`] looks for.
-const ACCESS_CONTROL_POLICY_MEMBER: &str = "AccessControlPolicy";
 
 /// The violation to refuse `request` with when its body is an XML DOCUMENT carrying a
 /// character the XML character set does not allow, or `None` when it is not or does not.
@@ -359,17 +381,10 @@ const ACCESS_CONTROL_POLICY_MEMBER: &str = "AccessControlPolicy";
 /// Scoped to a STRUCTURED `@httpPayload` member, so the bytes of an object's body — which
 /// are not a document and may legitimately hold any byte at all — are never scanned.
 fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Violation> {
-    let payload = input_schema.members().iter().find(|member| {
-        member.http_payload().is_some()
-            && matches!(
-                member.shape_type(),
-                ShapeType::Structure
-                    | ShapeType::Union
-                    | ShapeType::List
-                    | ShapeType::Map
-                    | ShapeType::Document
-            )
-    })?;
+    let payload = input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))?;
     let body = std::str::from_utf8(request.body().bytes()?).ok()?;
     let forbidden = crate::state::first_forbidden_xml_char(body)?;
     Some(Violation {
@@ -479,10 +494,16 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
     reader.config_mut().trim_text(false);
 
     // The document's events, with the attribute members' own elements left out, and for
-    // each one the index of the event that opened the element it belongs on.
+    // each event that opened an element the members that belong on its start tag.
+    //
+    // Keyed BY THAT EVENT's index rather than held as one flat list, so the write pass
+    // below is one lookup per start tag: a document carrying many promoted members (an
+    // ACL's grants, a logging status's target grants) costs time linear in its events
+    // rather than in events times members.
     let mut events: Vec<Event<'static>> = Vec::new();
     let mut open: Vec<usize> = Vec::new();
-    let mut promoted: Vec<(usize, &'static XmlAttributeMember, String)> = Vec::new();
+    let mut promoted: BTreeMap<usize, Vec<(&'static XmlAttributeMember, String)>> =
+        BTreeMap::new();
     let mut reading: Option<(usize, &'static XmlAttributeMember, String)> = None;
     loop {
         match reader.read_event() {
@@ -507,9 +528,10 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
                     member_by_element(empty.name().as_ref()),
                 ) {
                     // An empty element is the empty value of its member.
-                    (Some(parent), Some(member)) => {
-                        promoted.push((parent, member, String::new()))
-                    }
+                    (Some(parent), Some(member)) => promoted
+                        .entry(parent)
+                        .or_default()
+                        .push((member, String::new())),
                     _ => events.push(Event::Empty(empty.into_owned())),
                 }
             }
@@ -520,7 +542,9 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
                 None => events.push(Event::Text(text.into_owned())),
             },
             Ok(Event::End(end)) => match reading.take() {
-                Some(member) => promoted.push(member),
+                Some((parent, member, value)) => {
+                    promoted.entry(parent).or_default().push((member, value));
+                }
                 None => {
                     open.pop();
                     events.push(Event::End(end.into_owned()));
@@ -540,7 +564,7 @@ fn elements_as_attributes(document: &[u8]) -> Option<Vec<u8>> {
     for (index, event) in events.into_iter().enumerate() {
         match event {
             Event::Start(mut start) => {
-                for (_, member, value) in promoted.iter().filter(|(at, _, _)| *at == index) {
+                for (member, value) in promoted.get(&index).into_iter().flatten() {
                     if let Some((prefix, _)) = member.attribute.split_once(':') {
                         let declaration = format!("xmlns:{prefix}");
                         start.push_attribute((declaration.as_str(), member.namespace));
@@ -718,11 +742,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         if let Some(violation) = xml_charset_violation(request, input_schema) {
             return Err(ProtocolError::Invalid(vec![violation]));
         }
-        // Only the two ACL writes can carry a member that travels as an XML attribute,
-        // and only a body that actually spells one needs normalizing; everything else —
-        // every other operation, and an ACL write whose grantee is already spelled as an
-        // element — is the framework's own path, byte for byte.
-        if carries_access_control_policy(input_schema) {
+        // Only a request whose BODY IS AN XML DOCUMENT can carry a member that travels as
+        // an XML attribute, and only a body that actually spells one needs normalizing;
+        // everything else — every request whose body is not a document, and every document
+        // whose grantee is already spelled as an element — is the framework's own path,
+        // byte for byte.
+        if carries_xml_document_payload(input_schema) {
             let body = request
                 .body()
                 .bytes()
