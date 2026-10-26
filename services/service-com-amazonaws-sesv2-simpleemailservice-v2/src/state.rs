@@ -1239,6 +1239,20 @@ impl EventDestinationRecord {
         }
     }
 
+    /// Make `definition` this destination's configuration.
+    ///
+    /// `UpdateConfigurationSetEventDestination` "update[s] the configuration of an
+    /// event destination", and the `EventDestinationDefinition` it requires is a
+    /// whole definition of that destination — which services receive events from the
+    /// set and which event types they receive — so afterwards the destination
+    /// publishes what the definition describes and nothing else. The name is not part
+    /// of the definition: it identifies the destination within the set and an update
+    /// addresses the destination by it, so it is kept.
+    pub fn replace_definition(&mut self, definition: crate::ops::types::EventDestinationDefinition) {
+        let name = self.name.clone();
+        *self = Self::new(&name, definition);
+    }
+
     /// The modelled `EventDestination` view of this record.
     ///
     /// One projection shared by every operation that reports a set's event
@@ -1268,6 +1282,91 @@ pub fn event_destination_already_exists(
         "Event destination {event_destination_name} already exists in configuration set \
          {configuration_set_name}."
     )
+}
+
+/// How this service words `NotFoundException` for an event-destination name a
+/// configuration set does not hold.
+///
+/// One wording for every operation that addresses a destination within a set, so a
+/// client sees the same sentence whichever call first tells it the destination is
+/// not there.
+pub fn event_destination_not_found(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> String {
+    format!(
+        "Event destination {event_destination_name} does not exist in configuration set \
+         {configuration_set_name}."
+    )
+}
+
+/// `definition` once every enum-valued member in it carries one of the model's own
+/// values for that member, and the message naming the offending member otherwise.
+///
+/// One check for every operation that takes an `EventDestinationDefinition`, so the
+/// create of a destination and an update of the same destination cannot accept
+/// different values. The value sets are the generated consts, so they follow the
+/// model.
+pub fn checked_event_destination_definition(
+    definition: crate::ops::types::EventDestinationDefinition,
+) -> Result<crate::ops::types::EventDestinationDefinition, String> {
+    let matching_event_types = match definition.matching_event_types {
+        Some(event_types) => Some(
+            event_types
+                .into_iter()
+                .map(|event_type| {
+                    modelled_enum_value(
+                        "MatchingEventTypes",
+                        event_type,
+                        crate::ops::types::EVENT_TYPE_VALUES,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+    let cloud_watch_destination = match definition.cloud_watch_destination {
+        Some(destination) => Some(crate::ops::types::CloudWatchDestination {
+            dimension_configurations: destination
+                .dimension_configurations
+                .into_iter()
+                .map(|dimension| {
+                    Ok(crate::ops::types::CloudWatchDimensionConfiguration {
+                        dimension_value_source: modelled_enum_value(
+                            "CloudWatchDestination.DimensionConfigurations.DimensionValueSource",
+                            dimension.dimension_value_source,
+                            crate::ops::types::DIMENSION_VALUE_SOURCE_VALUES,
+                        )?,
+                        ..dimension
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        }),
+        None => None,
+    };
+    Ok(crate::ops::types::EventDestinationDefinition {
+        matching_event_types,
+        cloud_watch_destination,
+        ..definition
+    })
+}
+
+/// `value` when it is one of `allowed`, and the refusal naming `member` otherwise.
+///
+/// The wording an operation lifts into its own input error, so every member of this
+/// service refuses an unmodelled value the same way.
+pub fn modelled_enum_value(
+    member: &str,
+    value: String,
+    allowed: &[&str],
+) -> Result<String, String> {
+    if allowed.contains(&value.as_str()) {
+        return Ok(value);
+    }
+    Err(format!(
+        "{member} {value} is not one of {}.",
+        allowed.join(", ")
+    ))
 }
 
 /// The `TlsPolicy` value a configuration set holds when the caller configured none.

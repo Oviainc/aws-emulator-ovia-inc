@@ -165,9 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Every enum-valued member carries one of its own modelled values; the value
-        // sets are the generated consts, so they follow the model.
-        let definition = checked_definition(input.event_destination)?;
+        // Every enum-valued member carries one of its own modelled values; the check
+        // is the shared one, so this create and a later update of the same
+        // destination accept exactly the same values.
+        let definition = crate::state::checked_event_destination_definition(input.event_destination)
+            .map_err(bad_request)?;
         let destination_name = input.event_destination_name;
 
         let mut store = state.lock();
@@ -227,57 +229,3 @@ fn bad_request(message: impl Into<String>) -> CreateConfigurationSetEventDestina
     .into()
 }
 
-/// `definition` once every enum-valued member in it is one of the model's own
-/// values for that member, and the refusal naming the offending member otherwise.
-fn checked_definition(
-    definition: EventDestinationDefinition,
-) -> Result<EventDestinationDefinition, CreateConfigurationSetEventDestinationError> {
-    let matching_event_types = match definition.matching_event_types {
-        Some(event_types) => Some(
-            event_types
-                .into_iter()
-                .map(|event_type| enum_value("MatchingEventTypes", event_type, EVENT_TYPE_VALUES))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        None => None,
-    };
-    let cloud_watch_destination = match definition.cloud_watch_destination {
-        Some(destination) => Some(CloudWatchDestination {
-            dimension_configurations: destination
-                .dimension_configurations
-                .into_iter()
-                .map(|dimension| {
-                    Ok(CloudWatchDimensionConfiguration {
-                        dimension_value_source: enum_value(
-                            "CloudWatchDestination.DimensionConfigurations.DimensionValueSource",
-                            dimension.dimension_value_source,
-                            DIMENSION_VALUE_SOURCE_VALUES,
-                        )?,
-                        ..dimension
-                    })
-                })
-                .collect::<Result<Vec<_>, CreateConfigurationSetEventDestinationError>>()?,
-        }),
-        None => None,
-    };
-    Ok(EventDestinationDefinition {
-        matching_event_types,
-        cloud_watch_destination,
-        ..definition
-    })
-}
-
-/// `value` when it is one of `allowed`, and the refusal naming `member` otherwise.
-fn enum_value(
-    member: &str,
-    value: String,
-    allowed: &[&str],
-) -> Result<String, CreateConfigurationSetEventDestinationError> {
-    if allowed.contains(&value.as_str()) {
-        return Ok(value);
-    }
-    Err(bad_request(format!(
-        "{member} {value} is not one of {}.",
-        allowed.join(", ")
-    )))
-}
