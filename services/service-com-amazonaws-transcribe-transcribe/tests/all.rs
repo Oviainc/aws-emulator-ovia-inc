@@ -65,6 +65,8 @@ mod medical_scribe_job_listing;
 mod medical_scribe_jobs;
 #[path = "all/medical_scribe_settings_references.rs"]
 mod medical_scribe_settings_references;
+#[path = "all/medical_transcription_job_delete.rs"]
+mod medical_transcription_job_delete;
 #[path = "all/medical_transcription_job_listing.rs"]
 mod medical_transcription_job_listing;
 #[path = "all/medical_transcription_job_name_lifetime.rs"]

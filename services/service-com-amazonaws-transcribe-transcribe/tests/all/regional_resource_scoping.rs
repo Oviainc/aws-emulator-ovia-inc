@@ -74,8 +74,7 @@ struct Family {
     list: &'static str,
     /// The member each entry of the listing carries the resource's name under.
     name_in_list: &'static str,
-    /// `None` for a family whose delete is still a stub (`DeleteMedicalVocabulary`,
-    /// `DeleteMedicalTranscriptionJob`).
+    /// `None` for a family whose delete is still a stub (`DeleteMedicalVocabulary`).
     delete: Option<&'static str>,
 }
 
@@ -120,7 +119,7 @@ fn families() -> Vec<Family> {
             name_member: "MedicalTranscriptionJobName",
             list: "ListMedicalTranscriptionJobs",
             name_in_list: "MedicalTranscriptionJobName",
-            delete: None,
+            delete: Some("DeleteMedicalTranscriptionJob"),
         },
         Family {
             case: "Call Analytics job",

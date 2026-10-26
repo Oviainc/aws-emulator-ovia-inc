@@ -63,9 +63,9 @@ struct Deletable {
     create_body: fn(&str) -> Value,
 }
 
-/// Every family whose delete this emulator serves. `DeleteMedicalVocabulary` and
-/// `DeleteMedicalTranscriptionJob` are absent on purpose: both are still stubs
-/// (HTTP 501), so there is no delete of theirs to assert a rule about yet.
+/// Every family whose delete this emulator serves. `DeleteMedicalVocabulary` is
+/// absent on purpose: it is still a stub (HTTP 501), so there is no delete of its own
+/// to assert a rule about yet.
 fn deletables() -> Vec<Deletable> {
     vec![
         Deletable {
@@ -125,6 +125,25 @@ fn deletables() -> Vec<Deletable> {
                     "TranscriptionJobName": name,
                     "LanguageCode": "en-US",
                     "Media": {"MediaFileUri": "s3://example-media/audio.wav"}
+                })
+            },
+        },
+        Deletable {
+            kind: "job",
+            create: "StartMedicalTranscriptionJob",
+            read: "GetMedicalTranscriptionJob",
+            delete: "DeleteMedicalTranscriptionJob",
+            name_member: "MedicalTranscriptionJobName",
+            create_body: |name| {
+                json!({
+                    "MedicalTranscriptionJobName": name,
+                    // "US English (en-US) is the only valid value for medical
+                    // transcription jobs" (model doc for this request's LanguageCode).
+                    "LanguageCode": "en-US",
+                    "Media": {"MediaFileUri": "s3://example-media/dictation.wav"},
+                    "OutputBucketName": "example-medical-output",
+                    "Specialty": "PRIMARYCARE",
+                    "Type": "DICTATION"
                 })
             },
         },
