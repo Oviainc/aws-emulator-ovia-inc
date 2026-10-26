@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomainNames
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomainNames`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomainNames::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -146,18 +136,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomainNames` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainNamesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainNames"))
+        let _ = ctx;
+        let max_results = crate::state::parse_max_results(input.max_results.as_deref())
+            .map_err(|message| -> Self::Error {
+                GetDomainNamesErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            })?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainNames"));
+        };
+        // A reporting operation: it reads the store and writes nothing, so a later caller
+        // sees exactly what this one saw.
+        let store = state.lock();
+        let (page, next_token) = crate::state::page(
+            &store.domain_names,
+            &crate::state::page_scope(&["domainnames"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetDomainNamesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
+
+        // Projected as of the clock, exactly as the single-domain-name reader projects it:
+        // the `DomainNameStatus` a record reports is derived from the instant the endpoint
+        // migration its last update started came due, so a migration the CLOCK has already
+        // settled is reported settled without this read writing anything.
+        let now = ::std::time::SystemTime::now();
+        Ok(GetDomainNamesOutput {
+            items: Some(
+                page.into_iter()
+                    .map(|domain_name| domain_name.to_wire(now))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
