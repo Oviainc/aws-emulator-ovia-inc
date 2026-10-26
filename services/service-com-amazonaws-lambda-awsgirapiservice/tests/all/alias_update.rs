@@ -90,16 +90,21 @@ impl Answer {
             .map(str::to_string)
     }
 
-    /// The wire error code (`__type`, or the `x-amzn-errortype` header).
+    /// The wire error code (`__type`, or the `x-amzn-errortype` header), as the shape
+    /// name alone: the JSON protocols spell it either bare or as `<namespace>#<Shape>`,
+    /// and the code the model declares is the shape name, so the prefix is dropped here
+    /// once for every suite driving this harness.
     pub(crate) fn error_code(&self) -> String {
-        self.string("__type")
+        let raw = self
+            .string("__type")
             .or_else(|| {
                 self.headers
                     .get("x-amzn-errortype")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| String::from_utf8_lossy(&self.body).to_string())
+            .unwrap_or_else(|| String::from_utf8_lossy(&self.body).to_string());
+        raw.rsplit('#').next().unwrap_or(&raw).to_string()
     }
 
     /// The `message` of a wire error, however the protocol spells the member.

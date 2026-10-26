@@ -27,6 +27,8 @@ mod alias_name_constraint;
 mod alias_not_found_sentence;
 #[path = "all/alias_update.rs"]
 mod alias_update;
+#[path = "all/alias_version_not_found_sentence.rs"]
+mod alias_version_not_found_sentence;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]
