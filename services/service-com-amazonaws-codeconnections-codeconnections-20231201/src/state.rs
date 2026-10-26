@@ -76,6 +76,16 @@ pub const MAX_REPOSITORY_LINKS: usize = 1000;
 /// past it with the modeled `LimitExceededException` (429), which it declares.
 pub const MAX_SYNC_CONFIGURATIONS: usize = 1000;
 
+/// The largest number of tags one resource of this service carries.
+///
+/// The published AWS tag restriction — a resource carries at most 50 tags — which the
+/// tagging surface of this service's resources follows. It is a bound on the resource,
+/// not on one request: the modeled `TagList` admits up to 200 entries per call, and a
+/// call is refused when the tags it would leave on the resource exceed this many.
+/// `TagResource` refuses past it with the modeled `LimitExceededException` (429), which
+/// is the only capacity error that operation declares.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// A connection as this service persists it.
 ///
 /// One record per `ConnectionArn`; every member of the modeled `Connection` shape
@@ -485,6 +495,27 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
                     .find(|link| link.repository_link_arn == resource_arn)
                     .map(|link| link.tags.as_slice())
             })
+    }
+
+    /// The stored tag list of the resource this ARN names, for a WRITER — or `None`
+    /// when the service holds no such resource.
+    ///
+    /// The mutable twin of [`Self::tags_for_resource`], resolving the ARN against the
+    /// same three stores in the same order, so a tag write and a tag read can never
+    /// disagree about which record an ARN names.
+    pub fn tags_for_resource_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        if let Some(connection) = self.connections.get_mut(resource_arn) {
+            return Some(&mut connection.tags);
+        }
+        if let Some(host) = self.hosts.get_mut(resource_arn) {
+            return Some(&mut host.tags);
+        }
+        // Keyed by id rather than by ARN, so this store is scanned — exactly as the
+        // reporting twin scans it.
+        self.repository_links
+            .values_mut()
+            .find(|link| link.repository_link_arn == resource_arn)
+            .map(|link| &mut link.tags)
     }
 
     /// How many connections are associated with the host this ARN names.
@@ -912,6 +943,33 @@ pub fn host_not_deletable_in_status_message(host_arn: &str, status: &str) -> Str
 /// the value it was given rather than borrowing another resource kind's wording.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("Resource not found. Verify the resource ARN and try again: {resource_arn}")
+}
+
+/// The tag list a resource carries after `requested` is applied to `stored`.
+///
+/// A resource's tags are a MAP keyed by tag key, so applying a tag replaces the value
+/// of a key the resource already carries — in place, keeping the key where it was —
+/// and appends a key it does not, in the order the request listed them. Two entries of
+/// one request naming the same key leave that key's last value, for the same reason.
+/// Computed into a new list rather than written through, so a request refused for
+/// exceeding [`MAX_TAGS_PER_RESOURCE`] leaves the resource exactly as it was.
+pub fn tags_after_merge(stored: &[Tag], requested: &[Tag]) -> Vec<Tag> {
+    let mut merged = stored.to_vec();
+    for tag in requested {
+        match merged.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
+}
+
+/// What the tagging surface answers for a request that would leave a resource carrying
+/// more tags than [`MAX_TAGS_PER_RESOURCE`]: the shape's documented sentence for the
+/// limit that was exceeded, naming the limit the caller is held to — the way this
+/// service's other capacity refusals are worded (see `CreateRepositoryLink`).
+pub fn tag_limit_exceeded_message(limit: usize) -> String {
+    format!("Exceeded the maximum limit for tags ({limit}).")
 }
 
 /// The kind of resource an ARN of this service names — the kinds whose absences this

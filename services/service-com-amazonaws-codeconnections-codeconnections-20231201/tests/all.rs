@@ -37,6 +37,8 @@ mod refusal_messages;
 mod repository_link_lifecycle;
 #[path = "all/resource_sync_status.rs"]
 mod resource_sync_status;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/sync_blocker_summary.rs"]
