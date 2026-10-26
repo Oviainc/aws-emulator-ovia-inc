@@ -17,11 +17,10 @@
 //! Two of the modelled errors are not reachable here. `VersionMismatchException` has
 //! nothing to compare against: the request carries no version. `SchedulerTransitioningException`
 //! reports a schedule caught mid-transition, and a schedule written by this call is in
-//! effect the moment it returns — the operations that suspend and resume a schedule
-//! (`StartCrawlerSchedule`, `StopCrawlerSchedule`) are the ones that move its `State`, and
-//! they are not implemented yet. This operation models NO `CrawlerRunningException`,
-//! unlike `UpdateCrawler`: a crawl in progress does not stand in the way of rescheduling
-//! the next one.
+//! effect the moment it returns — a schedule leaves that state only through the operation
+//! that suspends it (`StopCrawlerSchedule`), which sets it with the same immediacy. This
+//! operation models NO `CrawlerRunningException`, unlike `UpdateCrawler`: a crawl in
+//! progress does not stand in the way of rescheduling the next one.
 //!
 //! ## Shape of an operation
 //!

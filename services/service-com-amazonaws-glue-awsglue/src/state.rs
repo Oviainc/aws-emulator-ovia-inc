@@ -408,11 +408,18 @@ pub const CRAWLER_STATE_RUNNING: &str = "RUNNING";
 /// finished: a run is still in progress, so a definition write is refused here too.
 pub const CRAWLER_STATE_STOPPING: &str = "STOPPING";
 
-/// The `Schedule$State` reported for a crawler that carries a cron expression. One of
-/// the modelled `ScheduleState` values (`SCHEDULED`, `NOT_SCHEDULED`,
-/// `TRANSITIONING`); a crawler created WITHOUT a `Schedule` has no schedule object at
-/// all, so `NOT_SCHEDULED` is not reachable from a create alone.
+/// The `Schedule$State` of a crawler whose cron expression is in force: the state every
+/// write that STATES a schedule leaves it in, because a schedule a write puts on a
+/// crawler is in effect the moment that write returns. One of the modelled `ScheduleState`
+/// values (`SCHEDULED`, `NOT_SCHEDULED`, `TRANSITIONING`); a crawler created WITHOUT a
+/// `Schedule` has no schedule object at all.
 pub const SCHEDULE_STATE_SCHEDULED: &str = "SCHEDULED";
+
+/// The `Schedule$State` of a crawler whose schedule is SUSPENDED: what
+/// `StopCrawlerSchedule` leaves it in ("sets the schedule state of the specified crawler
+/// to NOT_SCHEDULED"), and the state a crawler that carries no cron expression at all is
+/// in. Another of the modelled `ScheduleState` values.
+pub const SCHEDULE_STATE_NOT_SCHEDULED: &str = "NOT_SCHEDULED";
 
 /// The `TriggerState` of a trigger that is registered but not started: the state a
 /// trigger is in the moment `CreateTrigger` returns when the create did not ask for it to
@@ -2744,6 +2751,20 @@ pub fn to_storage_descriptor(stored: &StorageDescriptor) -> StorageDescriptor {
     }
 }
 
+/// The schedule state a write that STATES a crawler's schedule leaves it in: a cron
+/// expression the write puts on the crawler is in force the moment the write returns, and
+/// a crawler left with no expression has no schedule running for it at all.
+///
+/// One place, so `CreateCrawler`, `UpdateCrawler` and `UpdateCrawlerSchedule` cannot
+/// disagree about the state the schedule they wrote is in.
+fn stated_schedule_state(expression: Option<&str>) -> String {
+    if expression.is_some() {
+        SCHEDULE_STATE_SCHEDULED.to_string()
+    } else {
+        SCHEDULE_STATE_NOT_SCHEDULED.to_string()
+    }
+}
+
 /// A stored crawler.
 ///
 /// Every member of the modelled `Crawler` shape that a create can fill is held here, so
@@ -2770,6 +2791,13 @@ pub struct CrawlerEntry {
     pub crawler_security_configuration: Option<String>,
     /// The cron expression the create supplied, if any. Reported inside a `Schedule`.
     pub schedule_expression: Option<String>,
+    /// The state that schedule is in, one of the modelled `ScheduleState` values: a cron
+    /// expression a write states is in force ([`SCHEDULE_STATE_SCHEDULED`]) until the
+    /// operation that suspends a schedule moves it to [`SCHEDULE_STATE_NOT_SCHEDULED`],
+    /// which is also where a crawler carrying no expression sits. Reported as the
+    /// `Schedule`'s `State`, so it is observable only while an expression is there to
+    /// report it with.
+    pub schedule_state: String,
     /// The catalog the crawler writes its output to.
     pub catalog_id: String,
     /// One of the modelled `CrawlerState` values; [`CRAWLER_STATE_READY`] at create.
@@ -2809,6 +2837,7 @@ impl CrawlerEntry {
             configuration: input.configuration.clone(),
             crawler_security_configuration: input.crawler_security_configuration.clone(),
             schedule_expression: input.schedule.clone(),
+            schedule_state: stated_schedule_state(input.schedule.as_deref()),
             catalog_id: catalog_id.to_string(),
             state: CRAWLER_STATE_READY.to_string(),
             version: FIRST_CRAWLER_VERSION,
@@ -2883,6 +2912,7 @@ impl CrawlerEntry {
         }
         if let Some(schedule) = input.schedule.as_ref() {
             self.schedule_expression = Some(schedule.clone());
+            self.schedule_state = stated_schedule_state(Some(schedule));
         }
         if let Some(catalog_id) = catalog_id {
             self.catalog_id = catalog_id;
@@ -2907,7 +2937,33 @@ impl CrawlerEntry {
     /// this request's to change.
     pub fn apply_schedule(&mut self, schedule: Option<&str>, now: SystemTime) {
         self.schedule_expression = schedule.map(str::to_string);
+        self.schedule_state = stated_schedule_state(schedule);
         self.version = self.version.saturating_add(1);
+        self.last_updated = now;
+    }
+
+    /// Whether this crawler's schedule is RUNNING, i.e. its cron expression is in force
+    /// ([`SCHEDULE_STATE_SCHEDULED`]). False both for a crawler whose schedule has been
+    /// suspended and for one that carries no expression to run: neither has a scheduler
+    /// running for it, which is what the operations that suspend and resume a schedule
+    /// decide about.
+    pub fn schedule_is_running(&self) -> bool {
+        self.schedule_state == SCHEDULE_STATE_SCHEDULED
+    }
+
+    /// Suspend this crawler's schedule: the schedule state becomes
+    /// [`SCHEDULE_STATE_NOT_SCHEDULED`], which is all `StopCrawlerSchedule` decides —
+    /// "sets the schedule state of the specified crawler to NOT_SCHEDULED, but does not
+    /// stop the crawler if it is already running".
+    ///
+    /// The cron expression STAYS on the crawler: suspending a schedule is not removing it
+    /// (that is what a schedule write stating no expression does), so the expression is
+    /// there to be put back in force. The crawler's run `State` is untouched for the
+    /// reason the documentation gives, and `Version` with it: it counts the crawler's
+    /// DEFINITION, which this call writes no member of. `LastUpdated` moves, because the
+    /// crawler record did change.
+    pub fn suspend_schedule(&mut self, now: SystemTime) {
+        self.schedule_state = SCHEDULE_STATE_NOT_SCHEDULED.to_string();
         self.last_updated = now;
     }
 
@@ -2927,7 +2983,7 @@ impl CrawlerEntry {
             table_prefix: self.table_prefix.clone(),
             schedule: self.schedule_expression.as_ref().map(|expression| Schedule {
                 schedule_expression: Some(expression.clone()),
-                state: Some(SCHEDULE_STATE_SCHEDULED.to_string()),
+                state: Some(self.schedule_state.clone()),
             }),
             // "If the crawler is running, contains the total time elapsed since the
             // last crawl began" — nothing has run, so no time has elapsed.
@@ -5843,6 +5899,15 @@ pub mod messages {
         format!("Crawler with name {name} is running")
     }
 
+    /// A request to suspend the schedule of a crawler that has no schedule running —
+    /// one whose schedule is already suspended, or that carries no cron expression at
+    /// all. NOT recorded: what is pinned is the behaviour — 400 with the operation's
+    /// modelled `SchedulerNotRunningException` — and, like the crawler-running refusal
+    /// above, a sentence carrying only the requested `CrawlerName`.
+    pub fn scheduler_not_running(name: &str) -> String {
+        format!("Scheduler for crawler with name {name} is not running")
+    }
+
     /// A write whose `Schedule` is not the `cron(..)` expression the service
     /// documents ([`super::is_cron_expression`]). NOT recorded: what is pinned is the
     /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
@@ -7022,13 +7087,15 @@ impl ColumnStatisticsTaskSettingsEntry {
             table_name: Some(table.name.clone()),
             catalog_id: Some(table.catalog_id.clone()),
             // A stated schedule is a schedule the service runs, so it is reported in the
-            // scheduled state, exactly as a crawler's is ([`CrawlerEntry::to_crawler`]).
+            // scheduled state, the same state a stated crawler schedule is written in
+            // ([`stated_schedule_state`]). No operation suspends a column-statistics
+            // schedule, so this record never leaves that state.
             schedule: self
                 .schedule_expression
                 .as_ref()
                 .map(|expression| Schedule {
                     schedule_expression: Some(expression.clone()),
-                    state: Some(SCHEDULE_STATE_SCHEDULED.to_string()),
+                    state: Some(stated_schedule_state(Some(expression))),
                 }),
             schedule_type: self
                 .schedule_expression

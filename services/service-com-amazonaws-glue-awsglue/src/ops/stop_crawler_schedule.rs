@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCrawlerSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopCrawlerSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopCrawlerSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Suspends the schedule of a crawler this service's store holds: the request addresses
+//! the crawler by `CrawlerName` and the call sets that crawler's schedule state to
+//! NOT_SCHEDULED without stopping the crawler if it is already running, so a later
+//! `GetCrawler` reports the crawler's cron expression with that state beside it and the
+//! crawler's own run `State` exactly where it was.
+//!
+//! The cron expression STAYS on the crawler: suspending a schedule is not removing it —
+//! that is what `UpdateCrawlerSchedule` carrying no expression does — so the expression is
+//! still there for a resume to put back in force. The crawler's `Version` counts its
+//! DEFINITION, which this call writes no member of, so only `LastUpdated` moves.
+//!
+//! A name no crawler in this account has is this operation's `EntityNotFoundException`,
+//! and a crawler with no schedule RUNNING — one already suspended, or one that carries no
+//! cron expression at all — is its `SchedulerNotRunningException`: there is no scheduler
+//! to stop. `SchedulerTransitioningException` reports a schedule caught mid-transition,
+//! which this store never holds one in: the documented behaviour is that the call SETS the
+//! state, so it is in effect the moment the call returns.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +148,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopCrawlerSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopCrawlerScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopCrawlerSchedule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error rather than invented as a shape the
+            // model does not declare for it — the same way `GetCrawler` and
+            // `UpdateCrawlerSchedule` report it.
+            return Err(StopCrawlerScheduleErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The crawler this request addresses is resolved FIRST: a name no crawler in this
+        // account has is a miss whatever state a schedule under that name would be in.
+        let mut store = state.lock();
+        let Some(entry) = store.crawlers.get_mut(&input.crawler_name) else {
+            return Err(StopCrawlerScheduleErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::crawler_not_found(
+                        &input.crawler_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Only a schedule that is RUNNING can be stopped: a crawler whose schedule is
+        // already suspended, and one that carries no cron expression to run at all, has
+        // no scheduler for this call to set to NOT_SCHEDULED.
+        if !entry.schedule_is_running() {
+            return Err(StopCrawlerScheduleErrorModeled::SchedulerNotRunningException(
+                SchedulerNotRunningException {
+                    message: Some(crate::state::messages::scheduler_not_running(
+                        &input.crawler_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        entry.suspend_schedule(::std::time::SystemTime::now());
+        ::tracing::info!(
+            operation = "StopCrawlerSchedule",
+            crawler = %input.crawler_name,
+            schedule_state = %entry.schedule_state,
+            "suspended a Glue crawler's schedule"
+        );
+
+        Ok(StopCrawlerScheduleOutput {})
     }
 }
+
