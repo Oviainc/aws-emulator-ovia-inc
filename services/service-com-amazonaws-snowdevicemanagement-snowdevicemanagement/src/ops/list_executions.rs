@@ -177,6 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The addressed task is RESOLVED first — ahead of every member that only says
+        // which slice of ITS executions to serve: this enumeration is the executions
+        // of the task the request names, so whether that task exists is settled before
+        // a page cursor or a filter is interpreted. An id that names no task of this
+        // account in the signed Region is the modelled `ResourceNotFoundException`,
+        // whatever page or filter was asked of it, which is also why the cursor
+        // refusal below is only reachable for a task that is there.
+        if store.task_in(&region, &input.task_id).is_none() {
+            return Err(ListExecutionsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),
+            )
+            .into());
+        }
+
         // The token is an opaque cursor this operation minted for THIS enumeration:
         // the executions of ONE task in the signed Region, narrowed by the `state` the
         // previous page was served under. A value this service never issued — and one
@@ -200,13 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
         let page_size = crate::state::page_size(input.max_results);
-
-        if store.task_in(&region, &input.task_id).is_none() {
-            return Err(ListExecutionsErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),
-            )
-            .into());
-        }
 
         let mut executions = Vec::with_capacity(page_size);
         let mut next_token = None;

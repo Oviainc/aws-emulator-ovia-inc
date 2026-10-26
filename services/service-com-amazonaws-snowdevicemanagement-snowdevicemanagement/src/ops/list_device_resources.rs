@@ -170,6 +170,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The addressed device is RESOLVED first — ahead of every member that only
+        // says which slice of ITS resources to serve: this enumeration is the
+        // resources of the device the path names, so whether that device exists is
+        // settled before a page cursor or a filter is interpreted. An id that names no
+        // device of this account in the signed Region is the modelled
+        // `ResourceNotFoundException`, whatever page or filter was asked of it, which
+        // is also why the cursor refusal below is only reachable for a device that is
+        // there.
+        let Some(device) = store.device_in(&region, &input.managed_device_id) else {
+            return Err(ListDeviceResourcesErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::DEVICE_RESOURCE_TYPE,
+                    &input.managed_device_id,
+                ),
+            )
+            .into());
+        };
+
         // The token is an opaque cursor this operation minted for THIS enumeration:
         // the resources of ONE device in the signed Region, narrowed by the `type` the
         // previous page was served under. A value this service never issued — and one
@@ -196,19 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
         let page_size = crate::state::page_size(input.max_results);
-
-        // The addressed device is RESOLVED first: an id that names no device of this
-        // account in the signed Region is the modelled `ResourceNotFoundException`,
-        // whatever page or filter was asked of it.
-        let Some(device) = store.device_in(&region, &input.managed_device_id) else {
-            return Err(ListDeviceResourcesErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(
-                    crate::state::DEVICE_RESOURCE_TYPE,
-                    &input.managed_device_id,
-                ),
-            )
-            .into());
-        };
 
         // "The Amazon Web Services resources available for a device": the Amazon EC2
         // instances the device itself runs, in the stable order its cache holds them,

@@ -51,6 +51,8 @@ mod resource_tagging;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/sub_list_resolves_its_resource_first.rs"]
+mod sub_list_resolves_its_resource_first;
 #[path = "all/tagged_resource_tag_lookup.rs"]
 mod tagged_resource_tag_lookup;
 #[path = "all/tagging_region_scope.rs"]
