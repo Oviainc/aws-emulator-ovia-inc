@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutVectorsErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -190,7 +189,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
+
+        // The vector bucket's own resource policy decides this call before it writes
+        // anything: an explicit Deny of the action refuses it. The target resolves the
+        // index too, so a put into an index that is not there is still the modelled 404.
+        if let Some(message) = store
+            .authorization_target(&bucket_name, Some(&index_name))
+            .map_err(refusal)?
+            .refusal(&caller, &[Self::NAME])
+        {
+            return Err(PutVectorsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
         // Every vector in the batch is checked against the index BEFORE anything is
@@ -225,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let index = store.index_mut(&bucket_name, &index_name).map_err(refusal)?;
         for vector in prepared {
             // An upsert: a put on an existing key replaces that vector's data and
-            // metadata rather than adding a second entry.
+            // metadata rather than adding a second entry. A key whose earlier delete
+            // left a tombstone behind is live again, so it takes its candidate slot as
+            // the vector it now is rather than keeping the deleted one's beside it.
+            index.clear_tombstone(&vector.key);
             index.vectors.insert(vector.key.clone(), vector);
         }
 

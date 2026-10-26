@@ -74,7 +74,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, PendingClusterConfig, UpdateRecord, CA_BY_EKS, CA_DISTRIBUTION_DELETING,
+    self, PendingClusterConfig, UpdateRecord, UpdateScope, CA_BY_EKS, CA_DISTRIBUTION_DELETING,
     CA_SIGNING_NOT_USED, STATUS_ACTIVE, STATUS_UPDATING, UPDATE_COMPLETION_DELAY,
     UPDATE_IN_PROGRESS, UPDATE_PARAM_CERTIFICATE_AUTHORITY_ID, UPDATE_TYPE_CERTIFICATE_AUTHORITY,
 };
@@ -354,6 +354,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // The trust bundle this removes a CA from is the cluster's own, so
+            // this is an update of the cluster, not of a resource inside it.
+            scope: UpdateScope::Cluster,
         };
         let answer = update.to_update();
 

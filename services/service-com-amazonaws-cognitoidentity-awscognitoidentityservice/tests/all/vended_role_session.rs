@@ -42,13 +42,17 @@ const REGION: &str = "us-east-1";
 const COGNITO_PRINCIPAL: &str = "cognito-identity.amazonaws.com";
 
 /// One emulator: a shared engine with this service and STS mounted on it.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this test target that needs BOTH services on one
+/// engine — the token this service mints being redeemed by the service that reports the
+/// session — drives them through this harness rather than a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not verified: these suites carry only the `Credential=` scope the
@@ -60,7 +64,7 @@ impl Emulator {
     }
 
     /// One awsJson1_1 call to this service, as a client makes it.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://cognito-identity.{REGION}.amazonaws.com/"))
@@ -99,7 +103,7 @@ impl Emulator {
     }
 
     /// A call that must succeed.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -121,7 +125,7 @@ impl Emulator {
     }
 
     /// Mint an identity in `pool_id`, with `logins` when it is federated.
-    async fn identity(&self, pool_id: &str, logins: Option<Value>) -> String {
+    pub(crate) async fn identity(&self, pool_id: &str, logins: Option<Value>) -> String {
         let mut request = json!({"IdentityPoolId": pool_id});
         if let Some(logins) = logins {
             request["Logins"] = logins;
@@ -138,7 +142,7 @@ impl Emulator {
     ///
     /// The `RoleId` is seeded as its own value, so an assertion about the session's
     /// `AssumedRoleId` cannot pass against a handler that derives an id of its own.
-    fn seed_role(&self, role_name: &str, trust_policy: Option<Value>) -> String {
+    pub(crate) fn seed_role(&self, role_name: &str, trust_policy: Option<Value>) -> String {
         let arn = iam::state::role_arn(iam::state::DEFAULT_PATH, role_name);
         let role = iam::ops::types::Role {
             path: iam::state::DEFAULT_PATH.to_string(),
@@ -164,7 +168,7 @@ impl Emulator {
 
     /// `sts:GetCallerIdentity` under `access_key_id`: an awsQuery POST, as a client makes
     /// it, carrying the key in the SigV4 credential scope.
-    async fn caller_identity(&self, access_key_id: &str) -> (u16, String) {
+    pub(crate) async fn caller_identity(&self, access_key_id: &str) -> (u16, String) {
         let request = http::Request::builder()
             .method("POST")
             .uri("https://sts.amazonaws.com/")
@@ -181,6 +185,21 @@ impl Emulator {
                 "Action=GetCallerIdentity&Version=2011-06-15",
             ))
             .expect("the request builds");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (
+            status,
+            String::from_utf8_lossy(&response.into_body()).to_string(),
+        )
+    }
+
+    /// Dispatch one request a suite built itself through the same router, and answer its
+    /// status with the body as text.
+    ///
+    /// The seam a suite needs to make a call this harness's own helpers do not shape: an
+    /// UNSIGNED `awsQuery` request to STS, the form a client holding no credential sends a
+    /// modelled anonymous operation as.
+    pub(crate) async fn dispatch(&self, request: http::Request<bytes::Bytes>) -> (u16, String) {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         (
@@ -212,7 +231,7 @@ impl Emulator {
 /// The text of the one `<name>…</name>` element of an awsQuery response. Every element
 /// these responses carry is uniquely named, so this reads a member without a document
 /// model.
-fn element(body: &str, name: &str) -> String {
+pub(crate) fn element(body: &str, name: &str) -> String {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body
@@ -251,7 +270,7 @@ fn trust_policy(audience: &str) -> Value {
 }
 
 /// The assumed-role ARN a session of `role_name` speaks for.
-fn expected_session_arn(role_name: &str) -> String {
+pub(crate) fn expected_session_arn(role_name: &str) -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{role_name}/{VENDED_ROLE_SESSION_NAME}",
         engine::emulator_account_id()
@@ -259,7 +278,7 @@ fn expected_session_arn(role_name: &str) -> String {
 }
 
 /// The `Credentials` of a served vend.
-fn vended(response: &Value) -> (&str, &str) {
+pub(crate) fn vended(response: &Value) -> (&str, &str) {
     let credentials = &response["Credentials"];
     for member in ["AccessKeyId", "SecretKey", "SessionToken"] {
         assert!(

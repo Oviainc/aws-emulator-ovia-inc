@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetFrameMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetFrameMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a time series of frame-metric values over a group's AGGREGATED profiles: the
+//! requested time period is cut into time steps of the resolution it is reported at, and
+//! each requested frame metric gets one value per step, derived from the profile
+//! documents the group holds for that step. Reporting only: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetFrameMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the answer, each stated once below.
+//!
+//! * The time period is the one the request names with 1 or 2 of `startTime`, `endTime`
+//!   and `period` — this service's one reading of that trio
+//!   ([`crate::state::requested_window`]) — completed with the longest period this
+//!   operation reports over ([`MAX_PERIOD`]) where the request left a side open, and no
+//!   longer than that period, which `period`'s own doc fixes at one day.
+//! * The time steps are the aggregation windows of the reported resolution, aligned to
+//!   UTC the way every aggregated profile of this service is, so each step is exactly one
+//!   aggregated profile's window. A step whose window holds a posted profile the service
+//!   has not collected into an aggregated profile yet cannot be reported on, so it is
+//!   reported as an UNPROCESSED instance instead and leaves "a missing time step in the
+//!   list of end times", as `unprocessedEndTimes` documents.
+//! * A frame metric's value for a step is the metric's own definition applied to the
+//!   stored profiles of that step: for `AggregatedRelativeTotalTime`, whose model doc
+//!   reads "Metric value aggregated for all instances of a frame name in a profile
+//!   relative to the root frame", the sample counts recorded for every frame of that name
+//!   divided by the counts of the whole profile, both taken over the thread states the
+//!   metric asks about ([`tally`]).
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +127,367 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::{HashMap, HashSet};
+use ::std::time::Duration;
+
+use ::aws_smithy_types::DateTime;
+use ::ion_rs::{Element, Value as IonValue};
+
+/// The LONGEST time period this operation reports a time series over. Not an emulator
+/// choice: the `period` member's own doc states it — "The duration of the frame metrics
+/// used to return the time series values. Specify using the ISO 8601 format. The maximum
+/// period duration is one day (PT24H or P1D)" — and it bounds the DURATION of the period,
+/// so a request that names the same duration with a pair of bounds instead of with
+/// `period` is bounded by it too.
+const MAX_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// [`MAX_PERIOD`] in the ISO 8601 duration form the member's doc names it by, for the
+/// refusal that states the limit.
+const MAX_PERIOD_TEXT: &str = "PT24H";
+
+/// Why a request whose time period is longer than [`MAX_PERIOD`] is refused: the limit
+/// the member documents, and the period the request ended up naming — after an open side
+/// was completed — so the caller can fix the request from the message alone.
+fn period_too_long_message(start: DateTime, end: DateTime) -> String {
+    format!(
+        "the time period for the returned time series values must be at most \
+         {MAX_PERIOD_TEXT} long, got {} to {}",
+        crate::state::iso8601(start),
+        crate::state::iso8601(end)
+    )
+}
+
+/// This operation's modelled 400, for a request it refuses on its input.
+fn validation(message: String) -> BatchGetFrameMetricDataError {
+    BatchGetFrameMetricDataErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// How much of a stored profile one request's series may be computed from: how many
+/// document values the tally visits across every profile and every requested metric
+/// together. The work of computing a series is the product of the metrics asked about and
+/// the values the stored documents hold, and only the first factor is something a request
+/// states, so the product is what has to be bounded.
+///
+/// Generous enough that every series over this store's retained profiles
+/// (`crate::state::MAX_RETAINED_PROFILE_BYTES_PER_GROUP`) is computed, and small enough
+/// that one request cannot occupy a thread indefinitely.
+const MAX_TALLY_VISITS: u64 = 20_000_000;
+
+/// How long one request's series may take to compute. A `spawn_blocking` task cannot be
+/// aborted, so the computation carries the budget above to stop ITSELF; this is the bound
+/// on the WAIT, so a caller (and the task's own join handle) is never held by work that
+/// is taking longer than this service gives one series.
+const MAX_TALLY_WAIT: Duration = Duration::from_secs(5);
+
+/// This operation's modelled 429, for a series this service declines to compute: the
+/// sentence the model gives `ThrottlingException` ("The request was denied due to request
+/// throttling."), which is what declining work under a budget is.
+fn throttling() -> BatchGetFrameMetricDataError {
+    BatchGetFrameMetricDataErrorModeled::ThrottlingException(ThrottlingException {
+        message: "The request was denied due to request throttling.".to_string(),
+    })
+    .into()
+}
+
+/// The time period the time series is reported over, as (start, end) — both bounds
+/// present, because the response reports both.
+///
+/// A request names its period with 1 or 2 of `startTime`, `endTime` and `period`
+/// ([`crate::state::requested_window`], this service's one reading of that trio), so one
+/// side can be left open: the period is then the length the request named — or
+/// [`MAX_PERIOD`], the longest this operation reports over, when it named no length —
+/// anchored at whichever bound it did name, and ending at the current instant when it
+/// named neither.
+fn reported_period(
+    input: &BatchGetFrameMetricDataInput,
+) -> Result<(DateTime, DateTime), BatchGetFrameMetricDataError> {
+    let window = crate::state::requested_window(
+        input.start_time,
+        input.end_time,
+        input.period.as_deref(),
+    )
+    .map_err(validation)?;
+
+    let span = crate::state::span_nanos(window.span.unwrap_or(MAX_PERIOD));
+    let (start, end) = match (window.start, window.end) {
+        (Some(start), Some(end)) => (start, end),
+        (Some(start), None) => (start, crate::state::shifted(start, span)),
+        (None, Some(end)) => (crate::state::shifted(end, -span), end),
+        (None, None) => {
+            let now = crate::state::now();
+            (crate::state::shifted(now, -span), now)
+        }
+    };
+
+    // The completed period must still be an interval — the service-wide rule stated once
+    // in `crate::state::validate_interval`, which the shared reading already applied to a
+    // period whose two bounds the request itself named.
+    crate::state::validate_interval(start, end).map_err(validation)?;
+    let longest = crate::state::shifted(start, crate::state::span_nanos(MAX_PERIOD));
+    if crate::state::instant_key(end) > crate::state::instant_key(longest) {
+        return Err(validation(period_too_long_message(start, end)));
+    }
+    Ok((start, end))
+}
+
+/// The resolution the time series is reported at, as (the modelled `AggregationPeriod`
+/// value, its length in whole seconds).
+///
+/// `targetResolution` is what the request ASKS for, and its doc states when the answer
+/// may differ: "If the requested target resolution is not available due to data not being
+/// retained we provide a best effort result by falling back to the most granular
+/// available resolution after the target resolution." A profile this store retains is
+/// collected into an aggregated profile at every one of the service's periods (see
+/// `crate::state::aggregated_profile_starts`), so every resolution is available for the
+/// data there is and the requested one is the one reported. A request that names none is
+/// answered at the most granular resolution the service aggregates at, which is the
+/// resolution that fallback walks away from.
+fn reported_resolution(
+    input: &BatchGetFrameMetricDataInput,
+) -> Result<(&str, i64), BatchGetFrameMetricDataError> {
+    match input.target_resolution.as_deref() {
+        None => Ok(crate::state::FINEST_AGGREGATION_PERIOD),
+        // The validating walk refuses a value the modelled `AggregationPeriod` does not
+        // declare before this handler runs; a value whose length this service cannot read
+        // names no window to step the series by, so it is refused rather than silently
+        // treated as the default.
+        Some(target) => crate::state::aggregation_period_seconds(target)
+            .map(|seconds| (target, seconds))
+            .ok_or_else(|| {
+                validation(format!(
+                    "targetResolution must be one of {}, got {target}",
+                    AGGREGATION_PERIOD_VALUES.join(", ")
+                ))
+            }),
+    }
+}
+
+/// The time steps of the series, as (step start, step END), ascending: the aggregation
+/// windows `resolution_seconds` long, aligned to UTC, that overlap the period
+/// `[start, end)`.
+///
+/// Alignment is what makes a step an aggregated profile's window — "Aggregated profiles
+/// are available with aggregation periods of 5 minutes, 1 hour, and 1 day, aligned to
+/// UTC", as the `GetProfile` doc states and
+/// [`crate::state::aggregation_window_start`] applies — so the data of a step is exactly
+/// the data of one aggregated profile and two neighbouring steps never share a profile.
+///
+/// The walk is bounded TWICE over, so no pair of instants can make it run on: by the
+/// number of steps the period's own maximum admits at this resolution ([`MAX_PERIOD`]
+/// over the step length, which every period this operation reports over fits inside), and
+/// by progress — a step that cannot be advanced past, at the end of representable time,
+/// ends the walk instead of repeating itself.
+fn time_steps(start: DateTime, end: DateTime, resolution_seconds: i64) -> Vec<(DateTime, DateTime)> {
+    // Every resolution of the service's own table is a positive number of seconds; a
+    // non-positive one would name no window to step by at all.
+    let resolution_seconds = resolution_seconds.max(1);
+    let step_seconds = u64::try_from(resolution_seconds).unwrap_or(1);
+    // One more than the whole steps the longest period holds, which is what an unaligned
+    // period of exactly that length needs.
+    let most_steps = usize::try_from(MAX_PERIOD.as_secs() / step_seconds)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+
+    let mut steps: Vec<(DateTime, DateTime)> = Vec::new();
+    let mut step_start = crate::state::aggregation_window_start(start, resolution_seconds);
+    while crate::state::instant_key(step_start) < crate::state::instant_key(end)
+        && steps.len() < most_steps
+    {
+        let Some(step_end) = step_start
+            .secs()
+            .checked_add(resolution_seconds)
+            .map(DateTime::from_secs)
+        else {
+            break;
+        };
+        if crate::state::instant_key(step_end) <= crate::state::instant_key(step_start) {
+            break;
+        }
+        steps.push((step_start, step_end));
+        step_start = step_end;
+    }
+    steps
+}
+
+/// The step of `steps` whose window contains `at`, or `None` when no step does.
+fn step_of(steps: &[(DateTime, DateTime)], at: DateTime) -> Option<usize> {
+    let at = crate::state::instant_key(at);
+    steps.iter().position(|(step_start, step_end)| {
+        crate::state::instant_key(*step_start) <= at && at < crate::state::instant_key(*step_end)
+    })
+}
+
+/// The sample counts one profile document records for a frame metric, as (the counts of
+/// the frames the metric NAMES, the counts of the WHOLE profile), each taken only over
+/// the thread states the metric asks about — or `None` when the walk spent the work
+/// budget it was given ([`MAX_TALLY_VISITS`]), which is what bounds the product of the
+/// metrics a request asks about and the values the stored documents hold.
+///
+/// A profile document is a tree of frames — "the call stacks of a profile are its nested
+/// frames", which is the same reading of a stored document that `GetProfile` bounds by
+/// depth — where a frame is a container and its name is the member it sits under; the
+/// numbers a frame carries keyed by a thread state are the samples observed for that
+/// frame in that state, which is what `FrameMetric$threadStates` selects ("List of
+/// application runtime thread states used to get the counts for a frame a derive a metric
+/// value"). The states are looked up as a SET, so the walk costs the same however many
+/// states the metric names.
+///
+/// The counts of the frames the metric names are TOTAL, not self: a count recorded
+/// anywhere inside a frame of that name belongs to it, which is what makes the ratio the
+/// time spent in that frame including the frames it calls. A count inside a frame of that
+/// name nested in ANOTHER frame of the same name is still one count, so a recursive frame
+/// is not counted twice.
+fn tally(
+    document: &Element,
+    frame_name: &str,
+    thread_states: &HashSet<&str>,
+    budget: &mut u64,
+) -> Option<(f64, f64)> {
+    let mut counts = (0.0, 0.0);
+    tally_into(document, frame_name, thread_states, false, &mut counts, budget)?;
+    Some(counts)
+}
+
+/// [`tally`]'s walk: adds the counts of `node` to `counts`, where `inside` says whether
+/// `node` sits in a frame the metric names. `None` once `budget` is spent, so the caller
+/// declines the series rather than reporting one computed from part of the data.
+///
+/// The descent is bounded by the document itself: a profile is read as a document only
+/// down to the nesting `GetProfile` reads one at (`crate::ops::get_profile`), so a
+/// document this walks is already no deeper than that. The breadth is bounded by
+/// `budget`, which every value visited spends one of.
+fn tally_into(
+    node: &Element,
+    frame_name: &str,
+    thread_states: &HashSet<&str>,
+    inside: bool,
+    counts: &mut (f64, f64),
+    budget: &mut u64,
+) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
+    match node.value() {
+        IonValue::Struct(fields) => {
+            for (name, value) in fields.fields() {
+                // A member whose name has unknown text names neither a frame nor a thread
+                // state, so there is nothing it can be counted as.
+                let Some(name) = name.text() else {
+                    continue;
+                };
+                match sample_count(value) {
+                    Some(count) if thread_states.contains(name) => {
+                        counts.1 += count;
+                        if inside {
+                            counts.0 += count;
+                        }
+                    }
+                    // A number keyed by anything else is a value the frame carries, not a
+                    // count in a thread state this metric asks about.
+                    Some(_) => {}
+                    None => tally_into(
+                        value,
+                        frame_name,
+                        thread_states,
+                        inside || name == frame_name,
+                        counts,
+                        budget,
+                    )?,
+                }
+            }
+        }
+        // A sequence is a frame's contents listed rather than keyed, so its elements sit
+        // in the same frame as the sequence itself.
+        IonValue::List(items) | IonValue::SExp(items) => {
+            for item in items.elements() {
+                tally_into(item, frame_name, thread_states, inside, counts, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// `element` as a sample COUNT — the number a frame carries for one thread state — or
+/// `None` when it is no number, or no number a count of samples can be (negative,
+/// infinite or not a number).
+fn sample_count(element: &Element) -> Option<f64> {
+    let count = match element.value() {
+        IonValue::Int(integer) => integer.expect_i64().ok().map(|value| value as f64)?,
+        IonValue::Float(float) => *float,
+        // Ion writes a decimal exponent with `d`, where Rust writes it with `e`.
+        IonValue::Decimal(decimal) => decimal
+            .to_string()
+            .replace(['d', 'D'], "e")
+            .parse::<f64>()
+            .ok()?,
+        _ => return None,
+    };
+    (count.is_finite() && count >= 0.0).then_some(count)
+}
+
+/// The datum each requested frame metric is reported with: one value per PROCESSED step,
+/// in the order `processed` names the steps — or `None` when computing them would cost
+/// more than the work budget this service gives one series ([`MAX_TALLY_VISITS`]), which
+/// the whole computation shares, so the product of the metrics asked about and the values
+/// the stored documents hold is bounded rather than each factor alone.
+///
+/// `profiles` are the group's aggregated profiles of the series, each with the step its
+/// receipt falls in. Every profile is read as a document ONCE, however many metrics the
+/// request asks about, because reading it is the expensive half and does not depend on
+/// the metric.
+fn frame_metric_data(
+    metrics: &[FrameMetric],
+    profiles: &[(usize, crate::state::AgentProfile)],
+    step_count: usize,
+    processed: &[usize],
+) -> Option<Vec<FrameMetricDatum>> {
+    let documents: Vec<(usize, Element)> = profiles
+        .iter()
+        .filter_map(|(step, profile)| {
+            // Bytes that are no document in the representation they were posted under
+            // hold no frames this service can see, so they record no counts — the same
+            // answer `GetProfile` gives such a profile when it is asked to re-read it.
+            crate::ops::get_profile::profile_document(profile).map(|document| (*step, document))
+        })
+        .collect();
+
+    let mut budget = MAX_TALLY_VISITS;
+    // The capacity comes from the already-bounded list of requested metrics, never from a
+    // number the request states.
+    let mut data: Vec<FrameMetricDatum> = Vec::with_capacity(metrics.len());
+    for metric in metrics {
+        let thread_states: HashSet<&str> = metric
+            .thread_states
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut named = vec![0.0f64; step_count];
+        let mut whole = vec![0.0f64; step_count];
+        for (step, document) in &documents {
+            let (frame, root) = tally(document, &metric.frame_name, &thread_states, &mut budget)?;
+            named[*step] += frame;
+            whole[*step] += root;
+        }
+        data.push(FrameMetricDatum {
+            frame_metric: metric.clone(),
+            values: processed
+                .iter()
+                .map(|step| {
+                    // The metric is "relative to the root frame", so a step whose
+                    // profiles record no count at all in the requested thread states
+                    // has no time to be relative to: nothing of it was spent in the
+                    // frame.
+                    if whole[*step] > 0.0 {
+                        named[*step] / whole[*step]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        });
+    }
+    Some(data)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -183,18 +559,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetFrameMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetFrameMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetFrameMetricDataErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // A request that asks for no metric asks for no series of values; the period and
+        // the steps it is reported over are still the period and the steps. Every metric
+        // that IS asked about names the one aggregation the model's `MetricType` declares:
+        // the validating walk refuses any other before this handler runs, so the value of
+        // a frame metric is the one that aggregation defines ([`tally`]).
+        let metrics: &[FrameMetric] = input.frame_metrics.as_deref().unwrap_or_default();
+        // The series carries one value per requested metric per time step, so what a
+        // request asks about bounds what the response holds: a list longer than this
+        // service answers about is refused rather than served, the way every over-long
+        // member of this service is.
+        if metrics.len() > crate::state::MAX_FRAME_METRICS_PER_REQUEST {
+            return Err(validation(format!(
+                "Value at 'frameMetrics' failed to satisfy constraint: Member must have \
+                 length less than or equal to {}",
+                crate::state::MAX_FRAME_METRICS_PER_REQUEST
+            )));
+        }
+        // Deriving one metric's value tests the counts a stored document records against
+        // the thread states that metric asks about, so the work of reading one request's
+        // documents grows with this list too and it is bounded the same way. The position
+        // is stated the way the validating walk states a list element's — `<list>.<1-based
+        // position>`.
+        if let Some(index) = metrics
+            .iter()
+            .position(|metric| {
+                metric.thread_states.len() > crate::state::MAX_THREAD_STATES_PER_METRIC
+            })
+        {
+            return Err(validation(format!(
+                "Value at 'frameMetrics.{}.threadStates' failed to satisfy constraint: Member \
+                 must have length less than or equal to {}",
+                index + 1,
+                crate::state::MAX_THREAD_STATES_PER_METRIC
+            )));
+        }
+
+        let (resolution, resolution_seconds) = reported_resolution(&input)?;
+        let (start, end) = reported_period(&input)?;
+        let steps = time_steps(start, end, resolution_seconds);
+
+        // The profiles of the series are taken out of the store and the guard released
+        // before any document is read: reading a document a caller posted is work whose
+        // size that caller chose, and holding the store's lock across it would make one
+        // profile's size every other caller's latency.
+        let stored: Vec<crate::state::AgentProfile> = {
+            let guard = state.lock();
+            let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
+                BatchGetFrameMetricDataErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::group_not_found_message(
+                            &input.profiling_group_name,
+                        ),
+                    },
+                )
+            })?;
+            match (steps.first(), steps.last()) {
+                (Some((first, _)), Some((_, last))) => group
+                    .profiles_in(*first, *last)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+
+        // Which steps can be reported on, and which profiles their values come from. A
+        // posted profile the service has not collected into an aggregated profile yet is
+        // in no aggregated profile, so the step holding it has no profile data to report
+        // and is an unprocessed instance instead.
+        let now = crate::state::now();
+        let mut pending: Vec<bool> = vec![false; steps.len()];
+        let mut aggregated: Vec<(usize, crate::state::AgentProfile)> = Vec::new();
+        for profile in stored {
+            let Some(step) = step_of(&steps, profile.received_at) else {
+                continue;
+            };
+            if profile.is_aggregated(now) {
+                aggregated.push((step, profile));
+            } else {
+                pending[step] = true;
+            }
+        }
+        let processed: Vec<usize> = (0..steps.len()).filter(|step| !pending[*step]).collect();
+        let unprocessed: Vec<TimestampStructure> = (0..steps.len())
+            .filter(|step| pending[*step])
+            .map(|step| TimestampStructure {
+                value: steps[step].1,
+            })
+            .collect();
+
+        // Reading the stored documents and tallying their counts is CPU work over
+        // payloads whose size the caller chose (bounded by the store's retention caps),
+        // so it runs on the blocking pool instead of on the async worker serving this
+        // request — and `spawn_blocking(..).await` is a real await point, so a health
+        // check, a timeout and a shutdown all still land while one series is computed.
+        // The profiles were copied out of the store above, so the task owns what it reads.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetFrameMetricData"))
+        // A blocking task cannot be aborted, so the computation carries its OWN work
+        // budget ([`MAX_TALLY_VISITS`]) and stops itself; the wait is bounded too
+        // ([`MAX_TALLY_WAIT`]), so neither the caller nor this handler is held by work
+        // that is taking longer than this service gives one series. Either bound being
+        // reached declines the series with the operation's modelled throttle rather than
+        // reporting one computed from part of the data.
+        let owned_metrics: Vec<FrameMetric> = metrics.to_vec();
+        let step_count = steps.len();
+        let computed = {
+            let processed = processed.clone();
+            let tallied = ::tokio::time::timeout(
+                MAX_TALLY_WAIT,
+                ::tokio::task::spawn_blocking(move || {
+                    frame_metric_data(&owned_metrics, &aggregated, step_count, &processed)
+                }),
+            )
+            .await;
+            match tallied {
+                Ok(Ok(Some(computed))) => computed,
+                Ok(Ok(None)) | Err(_) => return Err(throttling()),
+                Ok(Err(_)) => {
+                    return Err(BatchGetFrameMetricDataErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "reading the stored profiles did not complete".to_string(),
+                        },
+                    )
+                    .into());
+                }
+            }
+        };
+
+        let mut unprocessed_end_times: HashMap<String, Vec<TimestampStructure>> = HashMap::new();
+        if !unprocessed.is_empty() {
+            // The instances are keyed by what could not be processed FOR them: the
+            // profiling group whose aggregated profile data for those steps is not
+            // available yet, which is the one subject a request names.
+            unprocessed_end_times.insert(input.profiling_group_name.clone(), unprocessed);
+        }
+
+        Ok(BatchGetFrameMetricDataOutput {
+            start_time: start,
+            end_time: end,
+            resolution: resolution.to_string(),
+            end_times: processed
+                .iter()
+                .map(|step| TimestampStructure {
+                    value: steps[*step].1,
+                })
+                .collect(),
+            unprocessed_end_times,
+            frame_metric_data: computed,
+        })
     }
 }

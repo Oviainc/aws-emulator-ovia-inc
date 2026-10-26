@@ -155,25 +155,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — one region's endpoint cannot change another region's site.
         let region = crate::state::request_region(ctx.parts());
-        // `SiteId` accepts the bare id or the full site ARN; both name the same
-        // stored record.
-        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
-            UpdateSiteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::site_id_pattern_report()),
-            })
-        })?;
-
-        let mut store = state.lock();
-        let record = store.site_mut(&region, &site_id).ok_or_else(|| {
+        // How this operation states that the `SiteId` names no site this endpoint
+        // holds: the identifier echo of the value AS SUPPLIED — not of the bare id an
+        // ARN resolved to.
+        let not_found = || {
             UpdateSiteErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of
-                // `site_id`, which is the bare id an ARN resolved to.
                 message: Some(crate::state::identifier_not_found(
                     crate::state::SITE_ID_MEMBER,
                     &input.site_id,
                 )),
             })
-        })?;
+        };
+        // `SiteId` accepts the bare id or the full site ARN. A bare id names a site of
+        // the inventory this endpoint serves; an ARN carries a partition, a Region and
+        // an account of its own, and one that is not this endpoint's names no site it
+        // holds — so it changes nothing here.
+        let site_id = crate::state::resolve_site_id(&input.site_id, &region)
+            .ok_or_else(|| {
+                UpdateSiteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::site_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
+        let mut store = state.lock();
+        let record = store.site_mut(&region, &site_id).ok_or_else(not_found)?;
         // The three members this operation takes besides the identifier, each
         // written only when the request carried it.
         crate::state::apply(&mut record.site.name, input.name);

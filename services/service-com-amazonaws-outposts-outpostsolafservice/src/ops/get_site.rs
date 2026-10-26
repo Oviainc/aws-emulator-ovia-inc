@@ -146,29 +146,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // `SiteId` accepts the bare id or the full site ARN; both name the same
-        // stored record.
-        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
-            GetSiteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::site_id_pattern_report()),
+        // How this operation states that the `SiteId` names no site this endpoint
+        // holds: the identifier echo of the value AS SUPPLIED — not of the bare id an
+        // ARN resolved to. A site of another region, of another account or of another
+        // partition is as absent here as one that never existed.
+        let not_found = || {
+            GetSiteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::SITE_ID_MEMBER,
+                    &input.site_id,
+                )),
             })
-        })?;
+        };
+        // `SiteId` accepts the bare id or the full site ARN. A bare id names a site of
+        // the inventory this endpoint serves; an ARN carries a partition, a Region and
+        // an account of its own, and one that is not this endpoint's names no site it
+        // holds.
+        let site_id = crate::state::resolve_site_id(&input.site_id, &region)
+            .ok_or_else(|| {
+                GetSiteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::site_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let store = state.lock();
         let site = store
             .site(&region, &site_id)
             .map(|record| record.site.clone())
-            .ok_or_else(|| {
-                GetSiteErrorModeled::NotFoundException(NotFoundException {
-                    // The identifier echo, of the value AS SUPPLIED — not of
-                    // `site_id`, which is the bare id an ARN resolved to. A site of
-                    // another region is as absent here as one that never existed.
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::SITE_ID_MEMBER,
-                        &input.site_id,
-                    )),
-                })
-            })?;
+            .ok_or_else(not_found)?;
 
         Ok(GetSiteOutput { site: Some(site) })
     }
