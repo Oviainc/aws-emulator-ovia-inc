@@ -4,6 +4,11 @@
 //! IMPLEMENTED. Records a harvest job against one origin endpoint and reports it as
 //! stored, so a later `GetHarvestJob` returns the same bytes.
 //!
+//! The operation is `@idempotent` and binds `ClientToken` with `@idempotencyToken`, so a
+//! repeat under the same token is the SAME request: an unchanged one replays the job that
+//! token already created and creates nothing, while one that changed any other member is
+//! the modelled `IDEMPOTENT_PARAMETER_MISMATCH` conflict.
+//!
 //! Refusals, in the order they are judged: a schedule whose end is before its start, or
 //! equal to it, is `ValidationException` (400) with `END_TIME_EARLIER_THAN_START_TIME` /
 //! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
@@ -325,6 +330,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The request's own fingerprint: every member it carried EXCEPT the token that
+        // identifies the attempt. A retry of this create has the same fingerprint; a
+        // create that differs in any member has another one. An optional member is
+        // rendered so that ABSENT and present-but-empty stay apart (`Description` admits
+        // the empty string), which is what lets a retry that omitted `HarvestJobName`
+        // match the first attempt instead of being read as a second, differently-named
+        // create.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.channel_group_name.clone(),
+            input.channel_name.clone(),
+            input.origin_endpoint_name.clone(),
+            format!("{:?}", input.harvest_job_name),
+            format!("{:?}", input.description),
+            format!("{:?}", input.harvested_manifests),
+            format!("{:?}", input.schedule_configuration),
+            format!("{:?}", input.destination),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        // The same idempotency rule every create in this service follows, applied among
+        // the jobs of the endpoint the request addresses — the level this create's
+        // siblings live at. The replay answers from the stored record, so it reports
+        // exactly what the first attempt stored; it advances no clock of its own (a job's
+        // due transitions are materialised by the operations that report it).
+        match crate::state::match_client_token(
+            input.client_token.as_deref(),
+            &fingerprint,
+            endpoint.harvest_jobs.values().map(|job| {
+                (
+                    job.name.as_str(),
+                    job.client_token.as_deref(),
+                    job.fingerprint.as_str(),
+                )
+            }),
+        ) {
+            crate::state::TokenMatch::Replay(name) => {
+                return Ok(job_output(&endpoint.harvest_jobs[&name]));
+            }
+            crate::state::TokenMatch::Mismatch => {
+                return Err(CreateHarvestJobErrorModeled::ConflictException(
+                    crate::state::idempotent_parameter_mismatch(),
+                )
+                .into());
+            }
+            crate::state::TokenMatch::Fresh => {}
+        }
+
         let created_at = crate::state::now();
         // `HarvestJobName` is optional: with none given the service names the job itself,
         // from the endpoint it belongs to and the instant it was created, so the name is
@@ -384,30 +436,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version: 1,
             etag: String::new(),
             tags,
+            client_token: input.client_token,
+            fingerprint,
         };
         job.recompute_etag();
         endpoint.harvest_jobs.insert(name.clone(), job);
         // Answer from what was stored, so the response can only carry what a later
         // `GetHarvestJob` will read.
-        let job = &endpoint.harvest_jobs[&name];
+        Ok(job_output(&endpoint.harvest_jobs[&name]))
+    }
+}
 
-        Ok(CreateHarvestJobOutput {
-            channel_group_name: job.group_name.clone(),
-            channel_name: job.channel_name.clone(),
-            origin_endpoint_name: job.endpoint_name.clone(),
-            destination: job.destination.clone(),
-            harvest_job_name: job.name.clone(),
-            harvested_manifests: job.harvested_manifests.clone(),
-            description: job.description.clone(),
-            schedule_configuration: job.schedule_configuration.clone(),
-            arn: job.arn.clone(),
-            created_at: job.created_at,
-            modified_at: job.modified_at,
-            status: job.status.clone(),
-            error_message: job.error_message.clone(),
-            e_tag: Some(job.etag.clone()),
-            tags: Some(job.tags.clone()),
-        })
+/// This operation's projection of a stored harvest job.
+///
+/// The ONE place the create's response is built, so a first attempt and the replay of a
+/// retry under the same `ClientToken` cannot report a job differently.
+fn job_output(job: &crate::state::HarvestJobRecord) -> CreateHarvestJobOutput {
+    CreateHarvestJobOutput {
+        channel_group_name: job.group_name.clone(),
+        channel_name: job.channel_name.clone(),
+        origin_endpoint_name: job.endpoint_name.clone(),
+        destination: job.destination.clone(),
+        harvest_job_name: job.name.clone(),
+        harvested_manifests: job.harvested_manifests.clone(),
+        description: job.description.clone(),
+        schedule_configuration: job.schedule_configuration.clone(),
+        arn: job.arn.clone(),
+        created_at: job.created_at,
+        modified_at: job.modified_at,
+        status: job.status.clone(),
+        error_message: job.error_message.clone(),
+        e_tag: Some(job.etag.clone()),
+        tags: Some(job.tags.clone()),
     }
 }
 

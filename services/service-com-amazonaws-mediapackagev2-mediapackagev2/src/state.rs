@@ -1053,6 +1053,12 @@ pub struct HarvestJobRecord {
     pub version: u64,
     pub etag: String,
     pub tags: HashMap<String, String>,
+    /// The `ClientToken` the create that minted this job carried, if any — what an SDK's
+    /// automatic retry of that create sends again.
+    pub client_token: Option<String>,
+    /// The fingerprint of the create request that minted this job, so a repeat carrying
+    /// the same token can be told apart from a changed one.
+    pub fingerprint: String,
 }
 
 impl HarvestJobRecord {

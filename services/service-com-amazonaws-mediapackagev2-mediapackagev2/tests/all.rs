@@ -84,3 +84,5 @@ mod harvest_job_tagging;
 mod shared_page_size;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/harvest_job_idempotency.rs"]
+mod harvest_job_idempotency;
