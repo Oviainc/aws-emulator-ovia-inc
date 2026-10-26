@@ -24,8 +24,14 @@
 //! session that stands for nothing.
 //!
 //! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
-//! authenticated one, and the pool's `authenticated` role is the one assumed, which is
-//! also the `amr` the trust-policy decision is made with.
+//! authenticated one, and the pool's `authenticated` role is the one assumed.
+//!
+//! The authentication methods the trust-policy decision is made with — the
+//! `cognito-identity.amazonaws.com:amr` condition values — come from the LOGIN rather than
+//! from the name it is presented under: a token this service minted names the providers
+//! that authenticated the identity, as its own issuance recorded them, so a
+//! developer-authenticated login is admitted by a role conditioned on the pool's developer
+//! provider and a login of another provider is not.
 //!
 //! ## The login the exchange is made with
 //!
@@ -315,6 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 }
             }
             let providers: Vec<String> = logins.keys().cloned().collect();
+            // The methods the exchange is made under, which is what the trust-policy
+            // decision below publishes: a token this service minted carries the providers
+            // that authenticated the identity in the issuance it was recorded with, so a
+            // developer-authenticated login and a user-pool login presented under the same
+            // provider name are told apart by the policy that conditions on them.
+            let methods = store.exchange_authentication_methods(&logins, now);
 
             // Which role this vend assumes: the `CustomRoleArn` the request names, which
             // can only be honoured against the roles the pool has stored, or — for a
@@ -347,7 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
 
             ResolvedVend {
                 identity_pool_id,
-                providers,
+                methods,
                 role_arn,
                 expired,
                 held: store.credentials.get(&input.identity_id).cloned(),
@@ -379,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         let context = crate::state::web_identity_condition_context(
             &resolved.identity_pool_id,
             &input.identity_id,
-            &resolved.providers,
+            &resolved.methods,
         );
         if !crate::state::role_admits_web_identity(&role, &context) {
             return Err(refused());
@@ -462,8 +474,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
 struct ResolvedVend {
     /// The pool the identity belongs to, which is the `aud` the assume is made for.
     identity_pool_id: String,
-    /// The `Logins` provider names the request presented, in the order the map holds them.
-    providers: Vec<String>,
+    /// The authentication methods the exchange was made under, which the assume publishes
+    /// as its `...:amr` condition values.
+    methods: Vec<String>,
     /// The ARN of the role this vend assumes.
     role_arn: String,
     /// The access key ids of the sessions the clock has expired, to be forgotten.

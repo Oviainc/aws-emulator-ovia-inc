@@ -186,13 +186,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `SiteId` accepts the bare id or the full site ARN; both name the same
-        // stored site.
-        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
-            CreateOutpostErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::site_id_pattern_report()),
+        // `SiteId` accepts the bare id or the full site ARN. A bare id names a site of
+        // the inventory this endpoint serves; an ARN carries a partition, a Region and
+        // an account of its own, and one that is not this endpoint's names no site it
+        // holds — so there is no site here to place an Outpost on.
+        let site_not_found = || {
+            CreateOutpostErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo names the member the absent identifier
+                // arrived in — here the site, not the Outpost being created —
+                // and echoes the value AS SUPPLIED.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::SITE_ID_MEMBER,
+                    &input.site_id,
+                )),
             })
-        })?;
+        };
+        let site_id = crate::state::resolve_site_id(&input.site_id, &region)
+            .ok_or_else(|| {
+                CreateOutpostErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::site_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(site_not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // An Outpost belongs to a site, so a site that does not exist cannot take
@@ -203,17 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let site_arn = store
             .site(&region, &site_id)
             .and_then(|record| record.site.site_arn.clone())
-            .ok_or_else(|| {
-                CreateOutpostErrorModeled::NotFoundException(NotFoundException {
-                    // The identifier echo names the member the absent identifier
-                    // arrived in — here the site, not the Outpost being created —
-                    // and echoes the value AS SUPPLIED.
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::SITE_ID_MEMBER,
-                        &input.site_id,
-                    )),
-                })
-            })?;
+            .ok_or_else(site_not_found)?;
         // See `CreateSite`: the store's growth is capped and refused with the quota
         // error this operation models.
         if store.outposts.len() >= crate::state::MAX_RESOURCES {
@@ -228,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let (outpost_id, sequence) = store.mint_id("op");
+        let (outpost_id, sequence) = store.mint_id(crate::state::OUTPOST_ID_PREFIX);
         // AWS resolves the Availability Zone identity the caller did not name from
         // the one they did ("You can specify either an Availability one or an AZ
         // ID"), so the stored Outpost carries BOTH forms and every later read of it
