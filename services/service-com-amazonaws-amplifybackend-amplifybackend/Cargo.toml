@@ -28,6 +28,10 @@ hex = { workspace = true }
 # holds, which S3 owns, so it is read from S3's own state in the shared engine rather
 # than kept a second time here.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The Amplify control plane's app store: `RemoveAllBackends` with `CleanAmplifyApp` set
+# cleans up the Amplify Console app, which Amplify owns, so it is removed from Amplify's
+# own state in the shared engine rather than mirrored here.
+service-com-amazonaws-amplify-amplify = { workspace = true }
 # `sha2` derives the `ETag` validator this service puts on an error response from the
 # response bytes themselves (see `service.rs`).
 sha2 = { workspace = true }

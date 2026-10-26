@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCrawlerSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCrawlerSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCrawlerSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the schedule of a crawler this service's store holds: the request addresses the
+//! crawler by `CrawlerName` and STATES its schedule, so the cron expression it carries
+//! becomes the crawler's schedule and a request carrying none leaves the crawler with no
+//! schedule at all. A later `GetCrawler` reports the schedule this call wrote, and the
+//! write moves the crawler's `Version` and `LastUpdated` like every other write to its
+//! definition.
+//!
+//! A name no crawler in this account has is this operation's `EntityNotFoundException`,
+//! and an expression that is not the documented `cron(..)` form is its
+//! `InvalidInputException`: it is not a schedule this service could run, so it is refused
+//! rather than stored and reported back.
+//!
+//! Two of the modelled errors are not reachable here. `VersionMismatchException` has
+//! nothing to compare against: the request carries no version. `SchedulerTransitioningException`
+//! reports a schedule caught mid-transition, and a schedule written by this call is in
+//! effect the moment it returns — the operations that suspend and resume a schedule
+//! (`StartCrawlerSchedule`, `StopCrawlerSchedule`) are the ones that move its `State`, and
+//! they are not implemented yet. This operation models NO `CrawlerRunningException`,
+//! unlike `UpdateCrawler`: a crawl in progress does not stand in the way of rescheduling
+//! the next one.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCrawlerSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCrawlerScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCrawlerSchedule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is
+            // reported as the operation's own timeout error rather than invented as a
+            // shape the model does not declare for it — the same way `GetCrawler` and
+            // `UpdateCrawler` report it.
+            return Err(UpdateCrawlerScheduleErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The crawler this request addresses is resolved FIRST: a name no crawler in this
+        // account has is a miss whatever schedule the request carries, so identity is
+        // settled before the schedule is judged.
+        let mut store = state.lock();
+        let Some(entry) = store.crawlers.get_mut(&input.crawler_name) else {
+            return Err(UpdateCrawlerScheduleErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::crawler_not_found(
+                        &input.crawler_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "The updated cron expression used to specify the schedule", whose documented
+        // form is `cron(<six fields>)`. Anything else is not a schedule this service can
+        // run, so it is refused and the stored schedule stays where it was.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(UpdateCrawlerScheduleErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::schedule_not_a_cron_expression(
+                            schedule,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The request states the crawler's whole schedule, so every call writes: an
+        // expression replaces whatever the crawler was scheduled by, and no expression
+        // takes the schedule off it.
+        entry.apply_schedule(input.schedule.as_deref(), ::std::time::SystemTime::now());
+        ::tracing::info!(
+            operation = "UpdateCrawlerSchedule",
+            crawler = %input.crawler_name,
+            version = entry.version,
+            scheduled = input.schedule.is_some(),
+            "wrote a Glue crawler's schedule"
+        );
+
+        Ok(UpdateCrawlerScheduleOutput {})
     }
 }

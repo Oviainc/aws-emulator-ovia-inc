@@ -6,11 +6,9 @@
 //! the shard id and the sequence number it was stored under. This is the ONLY file to
 //! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The stream is resolved by `StreamName`, by `StreamARN` or by both, through the one
+//! lookup every operation of this service that addresses a stream shares
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream_mut`]).
 //!
 //! ## Shape of an operation
 //!
@@ -315,6 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries one and a request naming only that member names no stream.
         let stream = store
             .resolve_stream_mut(
+                now,
                 &region,
                 input.stream_name.as_deref(),
                 input.stream_arn.as_deref(),

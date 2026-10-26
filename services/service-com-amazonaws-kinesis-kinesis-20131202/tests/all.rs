@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/data_records.rs"]
 mod data_records;
+#[path = "all/record_flow.rs"]
+mod record_flow;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/shard_iterators.rs"]
@@ -23,5 +25,7 @@ mod shard_listing;
 mod state_roundtrip;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/stream_removal.rs"]
+mod stream_removal;
 #[path = "all/stream_tags.rs"]
 mod stream_tags;

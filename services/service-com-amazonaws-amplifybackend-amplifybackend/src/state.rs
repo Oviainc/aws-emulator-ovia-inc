@@ -134,9 +134,12 @@ pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Sc
 /// What it is NOT, and the one known gap: an `AppId` is minted by Amplify's `CreateApp`,
 /// so the authoritative registry is the Amplify service's app store, and an app that
 /// exists there but has no backend here is refused by this gate where the real service
-/// would answer about the resource. Reading that store would make this crate depend on
-/// the Amplify crate; it is the same cross-service read `ListS3Buckets` performs for S3's
-/// buckets, and it is what the open app-identity issue for `CreateBackend`
+/// would answer about the resource. That store is reachable —
+/// [`amplify_console_app_exists`] reads it, the way `ListS3Buckets` reads S3's buckets, and
+/// `RemoveAllBackends` resolves its app against it — but WHICH refusal each operation owes
+/// for an app of that kind is what the recordings decide one operation at a time, and for
+/// the operations gated here they show this refusal. Widening the gate itself is what the
+/// open app-identity issue for `CreateBackend`
 /// (`20261022T052247Z-amplifybackend-control-plane-7-fidelity-divergences-no-environment`,
 /// Cause 2) has to settle — it decides whether `CreateBackend` may register an app at
 /// all. This function is the single place that answers the question, so widening it to a
@@ -150,6 +153,49 @@ pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Sc
 /// store guard held, so it cannot be part of a lock cycle.
 pub fn app_is_registered<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
     service_state(engine).is_some_and(|state| state.lock().apps.contains_key(app_id))
+}
+
+/// Whether the Amplify control plane holds an app under `app_id`, read from Amplify's own
+/// store through the one shared engine.
+///
+/// The authoritative registry for an `AppId` is Amplify's `CreateApp`, not this service:
+/// an Amplify project can exist with no backend here at all. An operation that addresses
+/// the PROJECT — `RemoveAllBackends`, which removes the project's backend environments and,
+/// when asked, the Console app itself — therefore resolves the app against this registry as
+/// well as [`app_is_registered`], which answers the narrower question of whether this
+/// service holds a backend record (and is what the operations whose recordings show the
+/// 400 `ValidationException` refusal use).
+///
+/// `false` when Amplify's store is unreachable (the engine is not the shared in-memory
+/// one), which is the same answer as "no such app": nothing is assumed about an app this
+/// emulator cannot see.
+///
+/// LOCK ORDER: this takes Amplify's store lock and holds no other while it does, and it
+/// hands back an owned value rather than a guard — so it is called with NO store guard of
+/// this service held. Keeping the cross-service access one-directional and guard-free is
+/// what makes a lock cycle between the two stores unreachable.
+pub fn amplify_console_app_exists<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
+    ::service_com_amazonaws_amplify_amplify::state::service_state(engine)
+        .is_some_and(|state| state.lock().apps.contains_key(app_id))
+}
+
+/// Clean up the Amplify Console app `app_id` identifies, answering whether one was held.
+///
+/// `RemoveAllBackends`'s `CleanAmplifyApp` asks for the CONSOLE app to be cleaned up, and
+/// the console app is the Amplify control plane's resource, not this service's: it is
+/// removed from Amplify's OWN store — the same map and the same removal Amplify's
+/// `DeleteApp` performs, so the app's branches, domains and webhooks go with it — rather
+/// than from a second copy of it kept here. Nothing is created: an app Amplify does not
+/// hold leaves this a no-op.
+///
+/// LOCK ORDER: as [`amplify_console_app_exists`] — Amplify's lock only, no guard of this
+/// service held.
+pub fn remove_amplify_console_app<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
+    let Some(state) = ::service_com_amazonaws_amplify_amplify::state::service_state(engine) else {
+        return false;
+    };
+    let mut store = state.lock();
+    store.apps.remove(app_id).is_some()
 }
 
 /// Refuse the request unless `app_id` identifies a registered Amplify app
@@ -184,6 +230,36 @@ pub fn require_registered_app<Eng: Send + Sync + 'static, E>(
     app_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     if app_is_registered(engine, app_id) {
+        Ok(())
+    } else {
+        Err(crate::scaffolded::Scaffolded::validation(
+            invalid_app_id_message(),
+        ))
+    }
+}
+
+/// Refuse the request unless `app_id` identifies an app EITHER registry knows: the Amplify
+/// control plane's app store, which is what mints an `AppId`, or this service's own backend
+/// records.
+///
+/// The gate for an operation that addresses the Amplify PROJECT rather than one of this
+/// service's resources — `RemoveAllBackends`, which removes the project's backend
+/// environments and, when asked, the Console app itself. A project can exist with no
+/// backend here, and such a call has something to answer about it, so the narrower
+/// [`require_registered_app`] would refuse a request the real service serves.
+///
+/// The REFUSAL is the same one: an app id neither registry holds is answered HTTP 400 with
+/// the error code `ValidationException` and [`invalid_app_id_message`], which is what the
+/// recordings show for an app id no app exists under, whichever operation was called. Only
+/// the question differs, never the wording.
+///
+/// LOCK ORDER: both stores' locks are taken and released inside, one at a time, and this
+/// is called with NO store guard held, so it cannot be part of a lock cycle.
+pub fn require_known_app<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    app_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if amplify_console_app_exists(engine, app_id) || app_is_registered(engine, app_id) {
         Ok(())
     } else {
         Err(crate::scaffolded::Scaffolded::validation(
@@ -330,6 +406,20 @@ pub const OPERATION_CREATE_BACKEND: &str = "CreateBackend";
 pub const OPERATION_CREATE_BACKEND_AUTH: &str = "CreateBackendAuth";
 /// See [`OPERATION_CREATE_BACKEND`].
 pub const OPERATION_DELETE_BACKEND: &str = "DeleteBackend";
+/// See [`OPERATION_CREATE_BACKEND`].
+pub const OPERATION_REMOVE_ALL_BACKENDS: &str = "RemoveAllBackends";
+
+/// The `BackendEnvironmentName` a job records when the call it answers for addresses the
+/// WHOLE app rather than one of its environments (`RemoveAllBackends`): no name at all.
+///
+/// A job is addressed by (app, environment, job id) on every read path this service has —
+/// `GetBackendJob` and `ListBackendJobs` both bind the environment name as a required
+/// `@httpLabel`, and `RemoveAllBackends`'s own output carries no environment member — so
+/// an app-wide job belongs to none of them and is recorded under a name no request can
+/// address. Naming one of the environments it removed instead would claim the job was
+/// that environment's, and would surface it in that environment's job list after the
+/// environment itself is gone.
+pub const JOB_ENVIRONMENT_APP_WIDE: &str = "";
 
 /// Render an instant the way this service reports `CreateTime` / `UpdateTime`:
 /// RFC-3339 in UTC, which is what `restJson1` carries for a timestamp rendered as a
@@ -492,6 +582,9 @@ pub struct ComAmazonawsAmplifybackendAmplifybackendState {
     /// The next sequence number [`Self::mint_session_id`] hands out, so two session ids
     /// are distinct even if the credential store repeats the random text they carry.
     pub next_challenge_session_seq: u64,
+    /// The next job id [`Self::mint_app_wide_job_id`] hands out, for a call whose job this
+    /// service retains no record of because the project it answered for holds no backend.
+    pub next_app_wide_job_seq: u64,
 }
 
 impl ComAmazonawsAmplifybackendAmplifybackendState {
@@ -524,6 +617,34 @@ impl ComAmazonawsAmplifybackendAmplifybackendState {
         // for the same app restates it.
         app.app_name = app_name.to_string();
         app
+    }
+
+    /// Forget the app `app_id` names — its environments, its job records and the live
+    /// challenge tokens minted for it — answering whether an app record was held.
+    ///
+    /// Everything this service keys by an app id goes in one call, so no map keeps a
+    /// record of an app the store no longer holds: [`Self::apps`] owns the environments
+    /// and the jobs, while [`Self::challenge_tokens`] is a second map keyed by the same id
+    /// and would otherwise retain a token addressing an app that is gone.
+    pub fn remove_app(&mut self, app_id: &str) -> bool {
+        self.challenge_tokens.remove(app_id);
+        self.apps.remove(app_id).is_some()
+    }
+
+    /// Mint a job id for a call that had nothing to remove: an app-wide job of an Amplify
+    /// project this service holds NO backend record for.
+    ///
+    /// Such a job has nowhere to live — a job record is retained on the app's backend
+    /// record ([`BackendApp::jobs`]), which is where `GetBackendJob` and `ListBackendJobs`
+    /// read it from, and the project has none — so the id is minted from the store's own
+    /// sequence and no record is kept. Two calls therefore never report the same id, and
+    /// no app record is brought into being for a project that has no backend: a later read
+    /// answers about the project exactly as it did before the call.
+    ///
+    /// A caller that has not looked the app up yet may take an id and not use it: this
+    /// hands out a sequence number, so an unused one costs nothing but the number.
+    pub fn mint_app_wide_job_id(&mut self, now: SystemTime) -> String {
+        mint_job_id(now, &mut self.next_app_wide_job_seq)
     }
 
     /// Mint a `SessionId` for a challenge token: the store-minted random text from
@@ -611,6 +732,25 @@ impl ComAmazonawsAmplifybackendAmplifybackendState {
     }
 }
 
+/// Mint a job id from `next_seq`: a decimal epoch-millisecond value, bumped past the last
+/// one handed out so ids are unique and increasing even when two jobs are minted inside
+/// one millisecond.
+///
+/// One implementation for every job id this service hands out, so the id a caller gets is
+/// the same shape whichever sequence it came from: an app's own
+/// ([`BackendApp::next_job_seq`]) or the store's
+/// ([`ComAmazonawsAmplifybackendAmplifybackendState::next_app_wide_job_seq`]).
+fn mint_job_id(now: SystemTime, next_seq: &mut u64) -> String {
+    let millis = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let candidate = u64::try_from(millis).unwrap_or(u64::MAX);
+    let id = candidate.max(*next_seq);
+    *next_seq = id.saturating_add(1);
+    id.to_string()
+}
+
 /// One Amplify app's backend: its name, the environments created for it, and the jobs
 /// recorded against it.
 #[derive(Debug, Default)]
@@ -668,14 +808,7 @@ impl BackendApp {
     /// Mint a job id: a decimal epoch-millisecond value, bumped past the last one
     /// handed out so ids are unique and increasing even within one millisecond.
     fn mint_job_id(&mut self, now: SystemTime) -> String {
-        let millis = now
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let candidate = u64::try_from(millis).unwrap_or(u64::MAX);
-        let id = candidate.max(self.next_job_seq);
-        self.next_job_seq = id.saturating_add(1);
-        id.to_string()
+        mint_job_id(now, &mut self.next_job_seq)
     }
 
     /// Apply the job map's bound: reclaim this app's OLDEST job records until there is

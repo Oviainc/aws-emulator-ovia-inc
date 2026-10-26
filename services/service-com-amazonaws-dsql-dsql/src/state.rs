@@ -206,6 +206,29 @@ impl Cluster {
         self.status == STATUS_ACTIVE || self.status == STATUS_IDLE
     }
 
+    /// The modelled refusal a request that MUTATES this cluster answers with
+    /// while its status does not accept a mutation, or `None` when it does.
+    ///
+    /// Every operation that writes a cluster record asks this one question, so
+    /// none of them can state the condition differently from
+    /// [`Self::accepts_mutation`] or word the refusal differently. `attempted`
+    /// completes the sentence after the cluster's identifier ("be updated",
+    /// "take a stream"), which is the only part that is about the caller's
+    /// request rather than about the cluster.
+    pub fn mutation_conflict(&self, attempted: &str) -> Option<ConflictException> {
+        if self.accepts_mutation() {
+            return None;
+        }
+        Some(ConflictException {
+            message: format!(
+                "cluster {} cannot {attempted} while its status is {}",
+                self.identifier, self.status
+            ),
+            resource_id: Some(self.identifier.clone()),
+            resource_type: Some(RESOURCE_TYPE_CLUSTER.to_string()),
+        })
+    }
+
     /// Every resource identifier that ceases to exist when this cluster does:
     /// the cluster itself, and each stream stored on its record — a stream lives
     /// ON the cluster, so removing the cluster removes the stream too. The

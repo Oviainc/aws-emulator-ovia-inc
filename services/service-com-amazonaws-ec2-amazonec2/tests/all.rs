@@ -28,6 +28,12 @@ mod create_vpc_endpoint;
 // and these two lines lost several serialized squash merges to the tail.
 #[path = "all/create_local_gateway_route_table_virtual_interface_group_association.rs"]
 mod create_local_gateway_route_table_virtual_interface_group_association;
+// What `CreateClientVpnRoute` adds to one Client VPN endpoint's route table, what it refuses,
+// and what `DescribeClientVpnRoutes` reports back. Declared BELOW the two suites above rather
+// than straight after `prefix_lists`: that first position is where every new ec2 suite
+// inserts its lines, and these two lost three serialized squash merges to exactly that.
+#[path = "all/client_vpn_routes.rs"]
+mod client_vpn_routes;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.

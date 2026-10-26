@@ -283,16 +283,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cluster the clock still owes a transition, or one on its way out, cannot
         // take a configuration change.
-        if !cluster.accepts_mutation() {
-            return Err(UpdateClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} cannot be updated while its status is {}",
-                    cluster.identifier, cluster.status
-                ),
-                resource_id: Some(cluster.identifier.clone()),
-                resource_type: Some("cluster".to_string()),
-            })
-            .into());
+        if let Some(conflict) = cluster.mutation_conflict("be updated") {
+            return Err(UpdateClusterErrorModeled::ConflictException(conflict).into());
         }
 
         // Only the members the request carries are applied; an absent member leaves

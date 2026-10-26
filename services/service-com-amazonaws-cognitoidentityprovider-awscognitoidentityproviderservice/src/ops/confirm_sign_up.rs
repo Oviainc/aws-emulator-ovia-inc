@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(user) = pool.user(&input.username) else {
             return Err(if hides_user_existence {
-                not_authorized("Username/client id combination not found.")
+                not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
             } else {
                 user_not_found()
             });
@@ -395,11 +395,13 @@ fn unverified_secret_hash(client_id: &str) -> ConfirmSignUpError {
     ))
 }
 
-/// This operation's `UserNotFoundException`. Carries the fixed message of
-/// [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+/// This operation's `UserNotFoundException`. The user is resolved from the `Username`
+/// and the `ClientId` of the request TOGETHER — this operation models no
+/// `UserPoolId` — so the refusal is the one of
+/// [`crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE`], which quotes neither.
 fn user_not_found() -> ConfirmSignUpError {
     ConfirmSignUpErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
