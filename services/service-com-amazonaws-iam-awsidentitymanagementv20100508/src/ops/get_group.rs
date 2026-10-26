@@ -162,6 +162,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default for
+        // an absent `MaxItems`: "if you do not include this parameter, the number of
+        // items defaults to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
         // A read: it reports the stored group and its members and writes nothing.
         let store = state.lock();
 
@@ -205,38 +214,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "A list of users in the group": the members are the users the account
-        // persists a membership for. `AddUserToGroup` is the operation that records a
-        // membership, and it is still scaffolded, so the account holds none — the
-        // reading `state::principal_sourced_policies` takes of a user's group
-        // memberships for the same reason — and no group has a member to report. The
-        // whole member list therefore fits in the page any `MaxItems` asks for, which
-        // is why `IsTruncated` is false and no `Marker` is issued, and why `MaxItems`
-        // is not consulted yet: when a membership can be persisted, this is where the
-        // page is drawn and where that bound, the truncation flag and the `Marker`
-        // below have to be honoured.
-        let users = Vec::new();
+        // The page resumes strictly after the POSITION the marker names in THIS group's
+        // membership order, so a token this service did not issue while paging this
+        // group's members is refused rather than read as "start from the beginning".
+        let scope = crate::state::group_members_marker_scope(&key);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    // Neither modelled error fits a token that is not one this service
+                    // issued, so the refusal goes through the crate's generic
+                    // client-input channel (HTTP 400, `ValidationException`).
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued \
+                         for this group's members",
+                    ));
+                }
+            },
+            None => None,
+        };
 
-        // No page of this collection is ever truncated, so this operation has issued no
-        // `Marker`: a request carrying one carries a token this service did not issue,
-        // which is refused through the crate's generic client-input channel (HTTP 400,
-        // `ValidationException`) rather than read as "start from the beginning". A
-        // marker names a position in ONE group's member order, so the group is resolved
-        // first: a request that names no group the account holds is answered with the
-        // modelled not-found error whatever token it carries.
-        if input.marker.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Invalid Marker: the value is not a marker this service issued",
-            ));
+        // The members this group holds, in the store's own total key order, resolved to
+        // the user records the account holds. A membership key naming a user the account
+        // no longer holds names no user to report, so it is passed over rather than
+        // reported as a half-filled member.
+        //
+        // Each member is reported as the account holds it: the subset note IAM's
+        // resource-LISTING operations carry ("this operation does not return the
+        // following attributes", `ListUsers`) is not part of this operation's
+        // documentation, which says only "a list of users in the group"
+        // (`GetGroupResponse$Users`), so nothing is withheld here.
+        let members = store
+            .group_members
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|member| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| member.as_str() > after)
+            })
+            .filter_map(|member| store.users.get(member).map(|user| (member, user)));
+
+        let mut users: Vec<User> = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (member, user) in members {
+            if users.len() == page_size {
+                // At least one more member follows, so the caller needs another page
+                // to see it.
+                is_truncated = true;
+                break;
+            }
+            users.push(user.clone());
+            last_key = Some(member.clone());
         }
 
         Ok(GetGroupOutput {
             // Every member of `Group` is `@required` and this read withholds none of
             // them, so the stored record is what the response reports.
             group: group.clone(),
+            // "A list of users in the group" — the member is required, and a group
+            // holding none of them is reported as the empty list.
             users,
-            is_truncated: false,
-            marker: None,
+            is_truncated,
+            // "When IsTruncated is true, this element is present and contains the value
+            // to use for the Marker parameter in a subsequent pagination request"
+            // (`$Marker`), so a complete page carries none.
+            marker: is_truncated
+                .then(|| {
+                    last_key
+                        .as_deref()
+                        .map(|member| crate::state::encode_marker(&scope, member))
+                })
+                .flatten(),
         })
     }
 }

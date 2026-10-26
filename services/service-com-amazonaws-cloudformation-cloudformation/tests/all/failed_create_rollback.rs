@@ -8,8 +8,8 @@
 //! default) removes the resources the create had already made and the stack reports
 //! `ROLLBACK_COMPLETE`, `DO_NOTHING` (which `DisableRollback=true` also spells) leaves the
 //! stack `CREATE_FAILED` with those resources in place, and `DELETE` takes the stack away
-//! with them. Whichever it is, a resource the stack did NOT create is never touched and
-//! never reported as the stack's.
+//! with them. Whichever it is, a resource the stack did NOT create still exists in the
+//! service that owns it: the unwind removes only what the create itself made.
 //!
 //! The collision used here is an IAM role NAME, because IAM names are unique across the
 //! whole account while a stack name is unique only within a Region: a template whose role
@@ -322,12 +322,14 @@ async fn a_create_whose_resource_is_refused_is_unwound_as_on_failure_says() {
 }
 
 /// The resources a rolled-back create had made are gone from the services that own them,
-/// and the stack reports no resource it does not have — so a client cannot read one back.
+/// while the stack KEEPS a record of each resource the create declared, at the terminal
+/// `DELETE_COMPLETE` the rollback disposed of it at — which is what says which declared
+/// resource was disposed of.
 ///
 /// The row here is the recorded shape end to end: one template, deployed to the Region it
 /// belongs in while the misdeployed copy still holds the Region-free role name.
 #[tokio::test]
-async fn a_rolled_back_create_reports_and_holds_no_resources() {
+async fn a_rolled_back_create_keeps_its_resource_records_and_holds_no_resources() {
     let router = crate::stack_lifecycle::router();
     let role = "redeploy-global-role";
     let (status, body) = iam(
@@ -365,10 +367,15 @@ async fn a_rolled_back_create_reports_and_holds_no_resources() {
         "the rollback must have removed the bucket the create made"
     );
 
-    // Nothing the stack did not create is readable as its resource.
-    for (case, logical_id) in [
-        ("the resource the create had made", "ABucket"),
-        ("the resource that failed", "ZRole"),
+    // Each resource the create declared is still readable, at the status the rollback left
+    // it in: the row is the only thing that says what the rollback disposed of.
+    for (case, logical_id, resource_type) in [
+        (
+            "the resource the create had made",
+            "ABucket",
+            "AWS::S3::Bucket",
+        ),
+        ("the resource that failed", "ZRole", "AWS::IAM::Role"),
     ] {
         let (status, body) = call(
             &router,
@@ -380,9 +387,20 @@ async fn a_rolled_back_create_reports_and_holds_no_resources() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: a rolled-back stack holds no {logical_id} to describe, got \
-             {status} {body}"
+            status, 200,
+            "case {case:?}: a rolled-back stack still reports {logical_id}, got {status} \
+             {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "ResourceStatus").as_deref(),
+            Some("DELETE_COMPLETE"),
+            "case {case:?}: expected the rollback's terminal status for {logical_id}, got \
+             {body}"
+        );
+        assert_eq!(
+            xml_text(&body, "ResourceType").as_deref(),
+            Some(resource_type),
+            "case {case:?}: expected the declared type for {logical_id}, got {body}"
         );
     }
 

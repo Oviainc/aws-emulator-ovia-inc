@@ -215,17 +215,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Outpost for cannot take one: the not-found error this operation models,
         // worded as the identifier echo of the value AS SUPPLIED — not of the bare id
         // an ARN resolved to.
-        if store.outpost(&region, &outpost_id).is_none() {
-            return Err(CreateOrderErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                        &outpost_identifier,
-                    )),
-                },
-            )
-            .into());
-        }
+        // The site that Outpost belongs to is read here, while the Outpost is: an
+        // order is placed AT that site through the Outpost, and the site is what the
+        // limit on changing a site address is stated against (see
+        // [`crate::state::OrderRecord::site_id`]).
+        let site_id = match store.outpost(&region, &outpost_id) {
+            Some(record) => record.outpost.site_id.clone(),
+            None => {
+                return Err(CreateOrderErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                            &outpost_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
         // A quote named for the order has to exist, and has to be one an order can
         // still be submitted from: the modelled `ORDER_SUBMITTED` is "An order has
         // been submitted for the quote" and `EXPIRED` is a quote past its own
@@ -336,6 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // only one it is reachable through.
                 region: region.clone(),
                 order: order.clone(),
+                // The site the order's Outpost belongs to, so the order stays placed
+                // at that site for as long as the store holds it.
+                site_id,
                 in_progress_at: Some(std::time::Instant::now() + crate::state::ORDER_PREPARATION),
             },
         );

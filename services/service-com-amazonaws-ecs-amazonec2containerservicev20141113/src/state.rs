@@ -1243,6 +1243,13 @@ pub const SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found.";
 /// `InvalidParameterException$message` for a `task` that names no stored task.
 pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
 
+/// `InvalidParameterException$message` for a `DeleteAccountSetting` whose principal holds
+/// no setting of the name it was asked to disable. The operation "disables an account
+/// setting for a specified user, role, or the root user", so a principal that holds none
+/// of that name has nothing to disable — one fixed sentence naming neither the setting nor
+/// the principal the request carried.
+pub const ACCOUNT_SETTING_NOT_FOUND_MESSAGE: &str = "Referenced setting doesn't exist";
+
 /// `ClientException$message` for a `taskDefinition` that names no stored revision, as the
 /// operations that READ a revision state it — `DescribeTaskDefinition`,
 /// `DeregisterTaskDefinition` and a tagging call naming a revision by ARN.
@@ -1499,6 +1506,30 @@ pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster tha
 /// so the sentence names no resource either.
 pub const SERVICE_SCALED_ABOVE_ZERO_MESSAGE: &str =
     "The service cannot be stopped while it is scaled above 0.";
+
+/// The attachment id an `attachmentArn` names: the last segment of the value when it is
+/// an ARN (`arn:aws:ecs:<region>:<account>:attachment/<id>`), and the value itself
+/// otherwise — `Attachment$id` is "the unique identifier for the attachment", and both
+/// forms name the same attachment.
+pub fn attachment_id_from_reference(reference: &str) -> &str {
+    if reference.starts_with("arn:") {
+        reference.rsplit('/').next().unwrap_or(reference)
+    } else {
+        reference
+    }
+}
+
+/// `InvalidParameterException$message` for an `attachmentArn` that names no stored
+/// attachment, BUILT FROM THE REQUEST: Amazon ECS names the attachment the report
+/// referred to, so an agent acknowledging a batch can tell which entry was rejected. The
+/// sentence carries the attachment ID alone, which is why the reference is reduced to its
+/// id by [`attachment_id_from_reference`] rather than echoed whole.
+pub fn attachment_not_found_message(reference: &str) -> String {
+    format!(
+        "Attachment with id {} does not exist",
+        attachment_id_from_reference(reference)
+    )
+}
 
 /// `InvalidParameterException$message` for a launch of an `awsvpc` task definition that
 /// carries no `networkConfiguration`. The condition names no resource — it is a property
@@ -2444,6 +2475,11 @@ pub struct TaskRecord {
     /// `protectionEnabled` property", which the clock pass does — the expiry was owed at
     /// that instant whether or not anybody called.
     pub protection_expires_at: Option<SystemTime>,
+    /// The resources Amazon ECS allocated to this task: the elastic network interface an
+    /// `awsvpc` launch gets ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::mint_task_attachments`]),
+    /// each in the state the agent last acknowledged through
+    /// `SubmitAttachmentStateChanges`. Empty for a task whose network mode allocates none.
+    pub attachments: Vec<AttachmentRecord>,
 }
 
 impl TaskRecord {
@@ -2454,6 +2490,11 @@ impl TaskRecord {
     /// in the response. If this field is omitted, tags aren't included."
     pub fn view(&self, include_tags: bool) -> Task {
         Task {
+            // `Task$attachments`: "The Elastic Network Adapter that's associated with the
+            // task if the task uses the `awsvpc` network mode" — the attachments this task
+            // actually holds, so a task that was allocated none reports an empty list
+            // rather than one invented.
+            attachments: Some(self.attachments.iter().map(AttachmentRecord::view).collect()),
             cluster_arn: Some(self.cluster_arn.clone()),
             containers: Some(self.containers.iter().map(ContainerRecord::view).collect()),
             cpu: self.cpu.clone(),
@@ -2940,9 +2981,64 @@ pub struct Placement {
     pub launch_type: Option<String>,
     pub capacity_provider_name: Option<String>,
     pub platform_version: Option<String>,
+    /// The networking every task of this placement is launched with, which is what an
+    /// `awsvpc` task's own interface is allocated out of: the task set's when a task set
+    /// places the task, the service's otherwise ("If a `launchType` is specified" the task
+    /// set carries its own configuration).
+    pub network_configuration: Option<NetworkConfiguration>,
     /// `Task$startedBy` of every task this placement places: the deployment id for a
     /// service's own scheduler, the task-set id for a task set's.
     pub started_by: String,
+}
+
+/// `Attachment$type` of the elastic network interface an `awsvpc` task is allocated —
+/// `RegisterTaskDefinition$networkMode`: "If the network mode is `awsvpc`, the task is
+/// allocated an elastic network interface". The member's own doc names this type first
+/// ("such as `ElasticNetworkInterface`, `Service Connect`, and
+/// `AmazonElasticBlockStorage`").
+pub const ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE: &str = "ElasticNetworkInterface";
+
+/// `Attachment$status` of an attachment Amazon ECS has created for a task and no agent has
+/// acknowledged yet. The member's own doc lists the statuses: "Valid values are
+/// `PRECREATED`, `CREATED`, `ATTACHING`, `ATTACHED`, `DETACHING`, `DETACHED`, `DELETED`,
+/// and `FAILED`" — and the one that moves it is the agent's own report
+/// (`SubmitAttachmentStateChanges`: "Sent to acknowledge that an attachment changed
+/// states"), never a read.
+pub const ATTACHMENT_STATUS_PRECREATED: &str = "PRECREATED";
+
+/// The `KeyValuePair` key an elastic-network-interface attachment reports its subnet
+/// under. `Attachment$details` "for elastic network interfaces ... includes the network
+/// interface ID, the MAC address, the subnet ID, and the private IPv4 address"; the subnet
+/// is the one detail this emulator KNOWS, because the launch supplied it
+/// (`AwsVpcConfiguration$subnets`), and nothing here creates an interface to report an id,
+/// a MAC or an address of.
+pub const ATTACHMENT_DETAIL_SUBNET_ID: &str = "subnetId";
+
+/// One attachment of a task: the resource Amazon ECS allocated for it, in the state the
+/// agent last acknowledged.
+///
+/// `Attachment` is "an object representing a container instance or task attachment" — for
+/// a task, the elastic network interface an `awsvpc` launch gets. The record is what
+/// `SubmitAttachmentStateChanges` resolves a reported `attachmentArn` against, and the
+/// status it carries is the one that report left.
+#[derive(Debug, Clone)]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub attachment_type: String,
+    pub status: String,
+    pub details: Vec<KeyValuePair>,
+}
+
+impl AttachmentRecord {
+    /// The `Attachment` a task-returning operation reports for this record.
+    pub fn view(&self) -> Attachment {
+        Attachment {
+            id: Some(self.id.clone()),
+            r#type: Some(self.attachment_type.clone()),
+            status: Some(self.status.clone()),
+            details: Some(self.details.clone()),
+        }
+    }
 }
 
 /// What one pass over the task map counts for ONE service.
@@ -3035,6 +3131,8 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of daemon-deployment ids, so every deployment of every daemon is
     /// distinct.
     next_daemon_deployment_seq: u64,
+    /// Monotonic source of attachment ids, so every attachment of every task is distinct.
+    next_attachment_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -3273,6 +3371,102 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn next_task_id(&mut self) -> String {
         self.next_task_seq += 1;
         format!("{:032x}", self.next_task_seq)
+    }
+
+    /// Mint the next attachment id. `Attachment$id` is "the unique identifier for the
+    /// attachment", which Amazon ECS spells as a UUID — the form the five hyphen-separated
+    /// hexadecimal groups below take; the counter is what makes every attachment of every
+    /// task distinct.
+    pub fn next_attachment_id(&mut self) -> String {
+        self.next_attachment_seq += 1;
+        let sequence = self.next_attachment_seq;
+        format!("{:08x}-0000-0000-0000-{:012x}", sequence, sequence)
+    }
+
+    /// The attachments Amazon ECS allocates to a task it is placing, from the task
+    /// definition's network mode and the launch's own network configuration.
+    ///
+    /// `RegisterTaskDefinition$networkMode`: "If the network mode is `awsvpc`, the task is
+    /// allocated an elastic network interface" — that interface is the attachment, and a
+    /// task in any other network mode shares its host's networking and is allocated none.
+    /// The attachment starts [`ATTACHMENT_STATUS_PRECREATED`]: Amazon ECS creates it, and
+    /// it is the AGENT that attaches it and says so through `SubmitAttachmentStateChanges`.
+    pub fn mint_task_attachments(
+        &mut self,
+        network_mode: &str,
+        configuration: Option<&NetworkConfiguration>,
+    ) -> Vec<AttachmentRecord> {
+        if network_mode != NETWORK_MODE_AWSVPC {
+            return Vec::new();
+        }
+        let subnet = configuration
+            .and_then(|configuration| configuration.awsvpc_configuration.as_ref())
+            .and_then(|awsvpc| awsvpc.subnets.first().cloned());
+        let details = subnet
+            .map(|subnet| {
+                vec![KeyValuePair {
+                    name: Some(ATTACHMENT_DETAIL_SUBNET_ID.to_string()),
+                    value: Some(subnet),
+                }]
+            })
+            .unwrap_or_default();
+        vec![AttachmentRecord {
+            id: self.next_attachment_id(),
+            attachment_type: ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE.to_string(),
+            status: ATTACHMENT_STATUS_PRECREATED.to_string(),
+            details,
+        }]
+    }
+
+    /// The ARN of the task of `cluster_name` that holds the attachment `attachment_id`, or
+    /// `None` when no task of that cluster holds one — the lookup a report of an attachment
+    /// state change resolves its `attachmentArn` through.
+    pub fn task_arn_holding_attachment(
+        &self,
+        cluster_name: &str,
+        attachment_id: &str,
+    ) -> Option<String> {
+        self.tasks
+            .values()
+            .find(|task| {
+                task.cluster_name == cluster_name
+                    && task
+                        .attachments
+                        .iter()
+                        .any(|attachment| attachment.id == attachment_id)
+            })
+            .map(|task| task.task_arn.clone())
+    }
+
+    /// Record the status the agent reported for ONE attachment of ONE task, as
+    /// `SubmitAttachmentStateChanges` does ("Sent to acknowledge that an attachment changed
+    /// states"): the agent is what attaches the resource, so its word on the status is
+    /// stored as given.
+    ///
+    /// `Task$version`: "Every time a task experiences a change ... the version counter is
+    /// incremented" — an attachment of it changing state is such a change, so a report that
+    /// moves the status bumps the counter and one that restates it does not.
+    pub fn record_attachment_status(
+        &mut self,
+        task_arn: &str,
+        attachment_id: &str,
+        status: &str,
+    ) {
+        let Some(task) = self.tasks.get_mut(task_arn) else {
+            return;
+        };
+        let Some(attachment) = task
+            .attachments
+            .iter_mut()
+            .find(|attachment| attachment.id == attachment_id)
+        else {
+            return;
+        };
+        if attachment.status == status {
+            return;
+        }
+        attachment.status = status.to_string();
+        task.version += 1;
     }
 
     /// Mint the next container id (32 lowercase hex digits, the shape of an ECS
@@ -4516,6 +4710,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         );
         let task_id = self.next_task_id();
         let task_arn = task_arn(region, &service.cluster_name, &task_id);
+        // The interface an `awsvpc` task is allocated is allocated to EVERY task of it,
+        // whoever places it, out of the network configuration the placement runs under —
+        // for a service's task, the service's own.
+        let attachments = self.mint_task_attachments(
+            &definition.network_mode,
+            placement.network_configuration.as_ref(),
+        );
         let containers = self.mint_containers(
             region,
             &service.cluster_name,
@@ -4575,6 +4776,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             stopped_due_at: None,
             // Nobody has protected a task the scheduler has just placed.
             protection_expires_at: None,
+            attachments,
         };
         self.tasks.insert(task_arn, record);
     }
@@ -5398,6 +5600,7 @@ pub fn service_placement(service: &ServiceRecord) -> Placement {
         launch_type,
         capacity_provider_name,
         platform_version: service.platform_version.clone(),
+        network_configuration: service.network_configuration.clone(),
         started_by: service.deployment_id.clone(),
     }
 }
@@ -5414,6 +5617,7 @@ pub fn task_set_placement(task_set: &TaskSetRecord) -> Placement {
             .first()
             .map(|item| item.capacity_provider.clone()),
         platform_version: task_set.platform_version.clone(),
+        network_configuration: task_set.network_configuration.clone(),
         started_by: task_set.id.clone(),
     }
 }

@@ -51,6 +51,8 @@ mod register_application_conditional_requirements;
 mod registered_database_arn;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/registration_derived_state.rs"]
+mod registration_derived_state;
 #[path = "all/resource_permissions.rs"]
 mod resource_permissions;
 #[path = "all/resource_tags.rs"]

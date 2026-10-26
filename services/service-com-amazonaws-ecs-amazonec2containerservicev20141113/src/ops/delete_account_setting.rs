@@ -201,16 +201,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `setting`: "The account setting for the specified principal ARN" — the one
         // this call disabled, so the caller sees which value stopped applying to that
-        // principal. A name the principal held no setting of leaves nothing to report
-        // but the account setting already in effect for it, which is also what still
-        // applies afterwards.
+        // principal. A principal that holds no setting of that name has nothing for this
+        // call to disable, so the call is refused rather than answered with the setting
+        // that was already in effect: what a client learns from the refusal is that the
+        // state is already clean.
         let setting = {
             let mut guard = state.lock();
             match guard.delete_account_setting(&principal_arn, &input.name) {
                 Some(value) => crate::state::setting_view(&input.name, &value, &principal_arn),
                 None => {
-                    let resolved = guard.effective_account_setting(&principal_arn, &input.name);
-                    crate::state::setting_view(&input.name, &resolved.value, &resolved.principal_arn)
+                    return Err(DeleteAccountSettingErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::ACCOUNT_SETTING_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into())
                 }
             }
         };
