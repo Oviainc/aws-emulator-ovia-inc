@@ -25,6 +25,8 @@ mod account_assignment_deletion_status_list;
 mod account_instance_restriction;
 #[path = "all/accounts_for_provisioned_permission_set.rs"]
 mod accounts_for_provisioned_permission_set;
+#[path = "all/application_access_scope_delete.rs"]
+mod application_access_scope_delete;
 #[path = "all/application_access_scope_limits.rs"]
 mod application_access_scope_limits;
 #[path = "all/application_access_scopes.rs"]

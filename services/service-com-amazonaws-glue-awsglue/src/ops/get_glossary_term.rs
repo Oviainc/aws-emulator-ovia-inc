@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the glossary term `CreateGlossaryTerm` stored under this identifier, read out of
+//! this account's glossary term namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::glossary_terms`]). Reporting only: nothing
+//! is written, so two reads of one term agree and a read after an update reports what that
+//! update stored.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGlossaryTerm"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(GetGlossaryTermErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Read-only: the stored term is projected out and nothing is written.
+        let store = state.lock();
+        let Some(entry) = store.glossary_term(&input.identifier) else {
+            return Err(GetGlossaryTermErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // Wording for this slice is pinned by no recording or doc, so the
+                    // refusal is derived from the request: it names the member that
+                    // resolved to nothing, exactly as `GetGlossary`'s does. What is
+                    // pinned is the behaviour — 400 with `EntityNotFoundException`.
+                    message: Some(format!("Glossary term {} not found", input.identifier)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Every member comes from the store, so two reads of one term agree and a read
+        // after an update reports what that update stored. The glossary the term belongs to
+        // is reported as recorded, which is why deleting that glossary does not change what
+        // this read answers.
+        Ok(GetGlossaryTermOutput {
+            id: Some(entry.id.clone()),
+            glossary_id: Some(entry.glossary_id.clone()),
+            name: Some(entry.name.clone()),
+            short_description: entry.short_description.clone(),
+            long_description: entry.long_description.clone(),
+        })
     }
 }

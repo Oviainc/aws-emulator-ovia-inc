@@ -19,6 +19,8 @@ mod harness;
 mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]
 mod ses_identity_send_loop;
+#[path = "all/ses_receipt_rule_set_listing.rs"]
+mod ses_receipt_rule_set_listing;
 #[path = "all/ses_receipt_rule_sets.rs"]
 mod ses_receipt_rule_sets;
 #[path = "all/ses_store_bounds.rs"]

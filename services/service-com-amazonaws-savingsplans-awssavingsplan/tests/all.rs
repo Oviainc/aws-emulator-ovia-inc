@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/commitment_bounds.rs"]
 mod commitment_bounds;
+#[path = "all/foreign_resource_arn_refusal.rs"]
+mod foreign_resource_arn_refusal;
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 #[path = "all/offering_product_type_coverage.rs"]

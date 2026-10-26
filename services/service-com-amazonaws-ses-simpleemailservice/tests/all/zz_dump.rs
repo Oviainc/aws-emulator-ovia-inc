@@ -57,7 +57,6 @@ async fn operations_this_slice_left_unimplemented_still_answer_501() {
     let rows: &[(&str, &[(&str, &str)])] = &[
         ("ListConfigurationSets", &[]),
         ("DescribeActiveReceiptRuleSet", &[]),
-        ("ListReceiptRuleSets", &[]),
         (
             "GetIdentityDkimAttributes",
             &[("Identities.member.1", "example.com")],
