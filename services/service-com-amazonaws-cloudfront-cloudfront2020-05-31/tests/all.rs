@@ -169,6 +169,8 @@ mod tenant_domain_admission;
 mod tenant_invalidations;
 #[path = "all/tenant_web_acl_association.rs"]
 mod tenant_web_acl_association;
+#[path = "all/tenant_web_acl_association_scope.rs"]
+mod tenant_web_acl_association_scope;
 #[path = "all/tenant_web_acl_disassociation_scope.rs"]
 mod tenant_web_acl_disassociation_scope;
 #[path = "all/untag_resource.rs"]
