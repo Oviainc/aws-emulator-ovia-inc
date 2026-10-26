@@ -38,6 +38,12 @@
 //! invokes through
 //! ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
 //!
+//! It also owns the GLOBAL ENDPOINT ([`EndpointRecord`]), the pair of event
+//! buses `CreateEndpoint` writes and `DescribeEndpoint` reports: an endpoint
+//! answered in a non-terminal state reaches its next one on its own,
+//! [`ENDPOINT_TRANSITION`] later
+//! ([`ComAmazonawsEventbridgeAwseventsState::settle_endpoints`]).
+//!
 //! It also owns the PARTNER EVENT SOURCE ([`PartnerEventSourceRecord`]), the one
 //! resource two accounts share: an SaaS partner authors it in a namespace it is
 //! the registered partner of ([`not_entitled_to_namespace`] refuses any other
@@ -63,9 +69,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     Connection, ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
-    DescribeArchiveOutput, DescribeConnectionOutput, DescribeReplayOutput, LogConfig,
-    PartnerEventSourceAccount, Replay as ReplaySummary, ReplayDestination, Rule as RuleSummary,
-    Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
+    DescribeArchiveOutput, DescribeConnectionOutput, DescribeEndpointOutput, DescribeReplayOutput,
+    EndpointEventBus, LogConfig, PartnerEventSourceAccount, Replay as ReplaySummary,
+    ReplayDestination, ReplicationConfig, RoutingConfig, Rule as RuleSummary, Tag, Target,
+    INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -1681,6 +1688,245 @@ pub fn event_source_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("event-source/{name}"))
 }
 
+/// The `EndpointState` a created global endpoint is answered in.
+///
+/// "Creates a global endpoint" (`CreateEndpoint`) starts work that finishes on
+/// its own — the endpoint's own URL has to be published before events can be
+/// routed through it — so the create answers a non-terminal state and a later
+/// read reports the endpoint serving.
+pub const ENDPOINT_STATE_CREATING: &str = "CREATING";
+
+/// The `EndpointState` of a global endpoint that is serving.
+pub const ENDPOINT_STATE_ACTIVE: &str = "ACTIVE";
+
+/// How long after the create a global endpoint's [`ENDPOINT_STATE_ACTIVE`] state
+/// becomes due.
+///
+/// AWS publishes no duration for it, so this is the emulator's OWN span, chosen
+/// inside the window the project fixes for a clock-owed transition, and it is
+/// stored as a DUE INSTANT rather than waited for: a caller reading straight
+/// after the create still observes [`ENDPOINT_STATE_CREATING`].
+pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(400);
+
+/// Largest number of global endpoints this store holds.
+///
+/// This emulator's OWN bound, like [`MAX_ARCHIVES`]: a create past it answers
+/// the modelled `LimitExceededException` instead of growing memory without
+/// limit. It is far above any realistic fixture's needs.
+pub const MAX_ENDPOINTS: usize = 100;
+
+/// `ReplicationState`'s value for an endpoint that replicates every event to
+/// the secondary Region.
+pub const REPLICATION_STATE_ENABLED: &str = "ENABLED";
+
+/// `ReplicationState`'s value for an endpoint that replicates nothing.
+pub const REPLICATION_STATE_DISABLED: &str = "DISABLED";
+
+/// The `ReplicationState` an endpoint takes when the request names none: "The
+/// default state is ENABLED which means you must supply a RoleArn"
+/// (`CreateEndpoint$ReplicationConfig`). It is what a read reports, so the
+/// endpoint reports the replication actually in force rather than nothing.
+pub const DEFAULT_REPLICATION_STATE: &str = REPLICATION_STATE_ENABLED;
+
+/// The domain a global endpoint's URL is published under.
+///
+/// "The URL subdomain of the endpoint. For example, if the URL for Endpoint is
+/// `https://abcde.veo.endpoints.event.amazonaws.com`, then the EndpointId is
+/// `abcde.veo`" (`Endpoint$EndpointId`): the URL is the endpoint's own id
+/// followed by this domain, which is why [`endpoint_url`] builds one from the
+/// other instead of storing both independently.
+pub const ENDPOINT_URL_DOMAIN: &str = "endpoints.event.amazonaws.com";
+
+/// `arn:aws:events:<region>:<account>:endpoint/<name>`.
+///
+/// `EndpointArn`'s modelled pattern is
+/// `^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:endpoint\/[/\.\-_A-Za-z0-9]+$`,
+/// so the resource is the endpoint's own name under this service's `endpoint/`
+/// type.
+pub fn endpoint_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("endpoint/{name}"))
+}
+
+/// The `EndpointId` of a global endpoint, built from one id of this store's own
+/// mint ([`ComAmazonawsEventbridgeAwseventsState::next_unique_id`]).
+///
+/// `EndpointId` is modelled `pattern ^[A-Za-z0-9\-]+[\.][A-Za-z0-9\-]+$` and
+/// documented with the example `abcde.veo` — two dot-separated segments — while
+/// the URL built from it ([`endpoint_url`]) is modelled
+/// `^(https://)?[\.\-a-z0-9]+$`, so both segments are lowercase. The id is the
+/// subdomain EventBridge publishes the endpoint at, so it is minted per
+/// endpoint and never derived from the endpoint's name: two endpoints of one run
+/// cannot share a subdomain.
+pub fn endpoint_id(unique: &str) -> String {
+    let minted: String = unique
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    // An id shorter than the two segments is padded, so the value satisfies the
+    // modelled pattern whatever the mint handed back.
+    let padded = format!("{minted:0<9}");
+    let subdomain: String = padded.chars().take(6).collect();
+    let suffix: String = padded.chars().skip(6).take(3).collect();
+    format!("{subdomain}.{suffix}")
+}
+
+/// The URL a global endpoint is reached at: its own [`endpoint_id`] under
+/// [`ENDPOINT_URL_DOMAIN`].
+pub fn endpoint_url(endpoint_id: &str) -> String {
+    format!("https://{endpoint_id}.{ENDPOINT_URL_DOMAIN}")
+}
+
+/// What any reader reports for a name that names no global endpoint: the missing
+/// ENDPOINT by name, built from the request, in the same words every reader of
+/// this service's resources uses — `no_such_archive`, [`no_such_replay`],
+/// [`no_such_event_bus`], [`no_such_event_source`] and [`no_such_rule`] all name
+/// the resource kind and then the identifier the caller passed, so a caller
+/// reads one form across this API.
+pub fn no_such_endpoint(name: &str) -> String {
+    format!("Endpoint {name} does not exist.")
+}
+
+/// The Region field of an ARN, or `None` when the text carries none.
+///
+/// The ARN fields are `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// ([`is_arn`]), and the Region is the one an endpoint's event bus is reached in
+/// ([`endpoint_event_bus_violation`]).
+pub fn arn_region(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next() != Some("arn") {
+        return None;
+    }
+    let (_partition, _service) = (fields.next()?, fields.next()?);
+    let region = fields.next()?;
+    (!region.is_empty()).then_some(region)
+}
+
+/// Why an endpoint request's `EventBuses` name no pair of buses an endpoint can
+/// route between, or `None` when they do.
+///
+/// "You define a primary and secondary Region with event buses in each Region"
+/// and "the names of the event buses must be identical in each Region"
+/// (`CreateEndpoint`): the pair is ONE bus name present in TWO Regions, so a
+/// pair naming two differently named buses, or the same Region twice, is refused
+/// rather than stored as a routing pair no event could ever follow. The list's
+/// length and each member's ARN form are modelled (`EndpointEventBusList` is
+/// len 2..2 and `EndpointEventBus$EventBusArn` carries a pattern), so a pair
+/// reaching here holds exactly two well-formed bus ARNs.
+///
+/// Whether each bus EXISTS is not decided here, and cannot be: one of the two is
+/// in another Region by the rule above, and this store holds the buses of the
+/// Region its requests are signed for.
+///
+/// The message is built from the request: it names the member that was rejected
+/// and the requirement it failed, the way this service's other parameter
+/// refusals do ([`parameter_violation`]).
+pub fn endpoint_event_bus_violation(buses: &[EndpointEventBus]) -> Option<String> {
+    let [first, second] = buses else {
+        return None;
+    };
+    let bus_name = |bus: &EndpointEventBus| -> Option<String> {
+        event_bus_name_in_arn(&bus.event_bus_arn).map(str::to_string)
+    };
+    let bus_region =
+        |bus: &EndpointEventBus| -> Option<String> { arn_region(&bus.event_bus_arn).map(str::to_string) };
+    if bus_name(first) != bus_name(second) {
+        return Some(parameter_violation(
+            "EventBuses",
+            "The names of the event buses must be identical in each Region.",
+        ));
+    }
+    if bus_region(first) == bus_region(second) {
+        return Some(parameter_violation(
+            "EventBuses",
+            "The event buses must be in two different Regions.",
+        ));
+    }
+    None
+}
+
+/// A global endpoint as this emulator persists it.
+///
+/// "A global endpoint used to improve your application's availability by making
+/// it regional-fault tolerant" ([`crate::ops::types::Endpoint`]): the record
+/// holds the pair of event buses events are routed between, the routing policy
+/// that decides which of the two is used, whether events are replicated to the
+/// secondary Region and the role that replication runs as, plus the identity
+/// EventBridge publishes the endpoint at — its ARN, its subdomain and the URL
+/// built from that subdomain.
+#[derive(Debug, Clone)]
+pub struct EndpointRecord {
+    pub name: String,
+    /// Minted ONCE, when the endpoint is created, and never recomputed.
+    pub arn: String,
+    pub description: Option<String>,
+    /// The Region the endpoint was created in, which is its PRIMARY Region:
+    /// "The primary Region of the endpoint you want to get information about"
+    /// (`DescribeEndpoint$HomeRegion`), so a reader naming another Region's
+    /// endpoint reads nothing
+    /// ([`ComAmazonawsEventbridgeAwseventsState::endpoint_in_home_region`]).
+    pub home_region: String,
+    /// "Configure the routing policy, including the health check and secondary
+    /// Region" (`CreateEndpoint$RoutingConfig`), reported back as given.
+    pub routing_config: RoutingConfig,
+    /// One of `ReplicationState`'s values, defaulted to
+    /// [`DEFAULT_REPLICATION_STATE`] when the request named none.
+    pub replication_state: String,
+    pub event_buses: Vec<EndpointEventBus>,
+    /// "The ARN of the role used for replication" (`CreateEndpoint$RoleArn`);
+    /// `None` only for an endpoint whose replication is disabled.
+    pub role_arn: Option<String>,
+    /// The subdomain EventBridge publishes this endpoint at ([`endpoint_id`]),
+    /// minted once with the endpoint.
+    pub endpoint_id: String,
+    /// One of `EndpointState`'s values.
+    pub state: String,
+    pub state_reason: Option<String>,
+    pub created: SystemTime,
+    pub last_modified: SystemTime,
+    /// When [`ENDPOINT_STATE_ACTIVE`] falls due, or `None` once the endpoint has
+    /// reached the state it stays in until a caller changes it.
+    pub active_due: Option<SystemTime>,
+}
+
+impl EndpointRecord {
+    /// "Whether replication is enabled or disabled for the endpoint"
+    /// (`DescribeEndpoint$ReplicationConfig`), built from the stored state so a
+    /// read reports the replication actually in force — including the default
+    /// the request left out.
+    pub fn replication_config(&self) -> ReplicationConfig {
+        ReplicationConfig {
+            state: Some(self.replication_state.clone()),
+        }
+    }
+
+    /// "The URL of the endpoint" (`DescribeEndpoint$EndpointUrl`), built from
+    /// the stored subdomain so the URL and the `EndpointId` cannot disagree.
+    pub fn url(&self) -> String {
+        endpoint_url(&self.endpoint_id)
+    }
+
+    /// Every member `DescribeEndpoint` reports, read back from the stored
+    /// record, so a read and what the create did cannot disagree.
+    pub fn to_describe_output(&self) -> DescribeEndpointOutput {
+        DescribeEndpointOutput {
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            arn: Some(self.arn.clone()),
+            routing_config: Some(self.routing_config.clone()),
+            replication_config: Some(self.replication_config()),
+            event_buses: Some(self.event_buses.clone()),
+            role_arn: self.role_arn.clone(),
+            endpoint_id: Some(self.endpoint_id.clone()),
+            endpoint_url: Some(self.url()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            creation_time: Some(to_wire_timestamp(self.created)),
+            last_modified_time: Some(to_wire_timestamp(self.last_modified)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-eventbridge-awsevents. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEventbridgeAwseventsState {
@@ -1699,6 +1945,10 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// Every API destination, by name — the resource `CreateApiDestination`
     /// writes and `DescribeApiDestination` reports.
     pub api_destinations: BTreeMap<String, ApiDestinationRecord>,
+    /// Every global endpoint, by name — the resource `CreateEndpoint` writes
+    /// and `DescribeEndpoint` reports. Ordered by name, so enumeration is
+    /// deterministic.
+    pub endpoints: BTreeMap<String, EndpointRecord>,
     /// Every partner event source, by name — the resource
     /// `CreatePartnerEventSource` writes, `DescribePartnerEventSource` and
     /// `DescribeEventSource` report, and `PutPartnerEvents` publishes to. Ordered
@@ -1754,6 +2004,7 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
             archives: BTreeMap::new(),
             replays: BTreeMap::new(),
             api_destinations: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
             partner_sources: BTreeMap::new(),
             partner_namespaces: BTreeSet::new(),
             delivered: VecDeque::new(),
@@ -2055,6 +2306,53 @@ impl ComAmazonawsEventbridgeAwseventsState {
             creation_time: Some(to_wire_timestamp(destination.created)),
             last_modified_time: Some(to_wire_timestamp(destination.last_modified)),
         }
+    }
+
+    /// The global endpoint `name` names, for a REPORTING operation.
+    pub fn endpoint(&self, name: &str) -> Option<&EndpointRecord> {
+        self.endpoints.get(name)
+    }
+
+    /// The global endpoint `name` names as a reader addressing `home_region`
+    /// sees it, for a REPORTING operation.
+    ///
+    /// `HomeRegion` is "the primary Region of the endpoint you want to get
+    /// information about" (`DescribeEndpoint$HomeRegion`) — it SELECTS which
+    /// endpoint the call is about rather than filtering the answer — so a
+    /// reader that names a Region the endpoint was not created in reads nothing,
+    /// exactly as it would for a name no endpoint carries. A reader that names
+    /// no Region is asking about the endpoint of that name wherever it lives.
+    pub fn endpoint_in_home_region(
+        &self,
+        name: &str,
+        home_region: Option<&str>,
+    ) -> Option<&EndpointRecord> {
+        self.endpoint(name)
+            .filter(|record| home_region.is_none_or(|region| record.home_region == region))
+    }
+
+    /// Materialise every global-endpoint transition the clock has ALREADY made
+    /// due at `now`, and answer how many were applied.
+    ///
+    /// The change is owed by the clock alone: an endpoint answered
+    /// [`ENDPOINT_STATE_CREATING`] reaches [`ENDPOINT_STATE_ACTIVE`]
+    /// [`ENDPOINT_TRANSITION`] after the create, and was owed at the same
+    /// instant even if nobody had called — which is why a reporting operation
+    /// may finish it.
+    pub fn settle_endpoints(&mut self, now: SystemTime) -> usize {
+        let mut settled = 0usize;
+        for endpoint in self.endpoints.values_mut() {
+            let Some(due) = endpoint.active_due.filter(|due| *due <= now) else {
+                continue;
+            };
+            // The state moves to the instant the transition fell DUE, not to
+            // the instant it was noticed, so two reads agree.
+            endpoint.active_due = None;
+            endpoint.state = ENDPOINT_STATE_ACTIVE.to_string();
+            endpoint.last_modified = due;
+            settled += 1;
+        }
+        settled
     }
 
     /// Whether this account may author partner event sources in `namespace`,

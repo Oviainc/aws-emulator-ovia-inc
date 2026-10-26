@@ -8,7 +8,11 @@
 //! `Protocols`, `IpAddressType`, `SecurityPolicyName`, and each member of
 //! `ProtocolDetails` and `S3StorageOptions`) is resolved here, once, at create time — a
 //! reader never re-applies a default. The server's host key is minted here too, so
-//! `HostKeyFingerprint` reports a real key's real fingerprint.
+//! `HostKeyFingerprint` reports a real key's real fingerprint — and that key is
+//! materialised as one of the server's HOST KEYS
+//! (`crate::state::ComAmazonawsTransferTransferserviceState::materialise_host_key`), so
+//! `ListHostKeys` and `DescribeHostKey` report the key the server serves with whether a
+//! caller supplied it or the service generated it.
 //!
 //! Three refusals precede the write, in this order:
 //!
@@ -412,6 +416,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (due, next_state) =
             crate::state::ComAmazonawsTransferTransferserviceState::server_start_due(now);
 
+        // The server's HOST KEY, resolved once, here: the key the request supplied when
+        // the emulator can read it, otherwise one minted for this server, as the
+        // service does for a server whose host key it manages. Both halves — the
+        // fingerprint the server reports and the algorithm a host-key reader reports —
+        // come from REAL key material (`state::read_host_key` /
+        // `state::mint_host_key`), never from the request's text.
+        let (host_key_fingerprint, host_key_type) = input
+            .host_key
+            .as_deref()
+            .and_then(st::read_host_key)
+            .unwrap_or_else(st::mint_host_key);
+
         let server = st::Server {
             arn: st::server_arn(&region, &server_id),
             domain,
@@ -431,14 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             security_policy_name,
             pre_authentication_login_banner: input.pre_authentication_login_banner,
             post_authentication_login_banner: input.post_authentication_login_banner,
-            // The real fingerprint of the server's host key: of the key the caller
-            // supplied when the emulator can read it, otherwise of one minted for this
-            // server. See `state::supplied_host_key_fingerprint`.
-            host_key_fingerprint: input
-                .host_key
-                .as_deref()
-                .and_then(st::supplied_host_key_fingerprint)
-                .unwrap_or_else(st::mint_host_key_fingerprint),
+            host_key_fingerprint: host_key_fingerprint.clone(),
             structured_log_destinations: st::configured_log_destinations(
                 input.structured_log_destinations,
             ),
@@ -454,6 +463,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_id: server_id.clone(),
         };
         guard.servers.insert(server_id.clone(), server);
+        // The key the server serves with is one of the server's HOST KEYS, so it is
+        // materialised into the collection `ListHostKeys` and `DescribeHostKey` read:
+        // a client that enumerates a server's keys to audit or rotate them finds the
+        // key the server is actually serving with, under the same fingerprint the
+        // server reports. Written under the SAME lock as the server itself, so no read
+        // can see one without the other.
+        guard.materialise_host_key(&region, &server_id, &host_key_fingerprint, &host_key_type);
         drop(guard);
 
         Ok(CreateServerOutput { server_id })

@@ -23,3 +23,12 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the iotsitewise emulator
 2. Call CreateEnrichmentJob and observe HTTP 501 with no state persisted
+
+## Already implemented
+
+`CreateEnrichmentJob` was implemented alongside `ListEnrichmentJobs` (that
+operation had nothing to enumerate until something wrote a job): the handler
+persists the job and its creation instant, the scaffold marker is gone, and
+`tests/all/enrichment_jobs.rs` covers the create, its refusals, its conflict and
+its `clientToken` replay end to end. Nothing in the description above is left to
+do — confirm against the handler and close this report.

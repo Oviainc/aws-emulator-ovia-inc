@@ -27,10 +27,11 @@
 //! * a refused request associates NOTHING: the domain's associations are exactly
 //!   what they were before it.
 //!
-//! The domain's associations are read back through the store the handler writes —
-//! reached exactly as a handler reaches it — because `ListPackagesForDomain`, the
-//! wire read path for them, is still a scaffold stub; every rule that a call CAN
-//! observe is asserted over the wire.
+//! The domain's associations are read back both through the wire listing that reports
+//! them (`ListPackagesForDomain`, asserted in
+//! [`super::package_association_listings`]) and, where a case needs the record a
+//! status move has not reached yet, through the store the handler writes — reached
+//! exactly as a handler reaches it.
 
 use std::time::SystemTime;
 
@@ -122,10 +123,11 @@ pub(crate) fn member(details: &Value, name: &str, case: &str) -> String {
 /// The `DomainPackageStatus` the store holds for `package_id` on `domain`, or `None`
 /// where the domain has no association with that package at all.
 ///
-/// Read through the store the handler writes, reached the way a handler reaches it:
-/// `ListPackagesForDomain` is still a stub, so this is how a case asserts what was
-/// persisted. It passes the current instant, so a status move the clock already owed
-/// is materialised by the read exactly as a handler's read of it would be.
+/// Read through the store the handler writes, reached the way a handler reaches it: a
+/// case that asserts what a REFUSED call left behind needs the absence of a record,
+/// which a listing reports as an empty set either way. It passes the current instant,
+/// so a status move the clock already owed is materialised by the read exactly as a
+/// handler's read of it would be.
 pub(crate) fn stored_status(emulator: &Emulator, domain: &str, package_id: &str) -> Option<String> {
     let store = emulator.store();
     let mut guard = store.lock();
@@ -663,7 +665,9 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
 
     // One row per way a request cannot be served, each with the status and error
     // code the model declares for it: `ResourceNotFoundException` at HTTP 409 and
-    // `ValidationException` at 400.
+    // `ValidationException` at 400. A `DomainName` that names no domain is the
+    // CLIENT-INPUT refusal, exactly as it is for a call that links one package:
+    // linking resolves the domain as part of reading the request.
     let table: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a domain nothing created",
@@ -671,8 +675,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
                 "DomainName": "assoc-no-such-domain",
                 "PackageList": [{ "PackageID": ids[0] }],
             }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a package nothing created",
@@ -708,8 +712,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
         (
             "a domain nothing created, naming no package at all",
             json!({ "DomainName": "assoc-no-such-domain", "PackageList": [] }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 

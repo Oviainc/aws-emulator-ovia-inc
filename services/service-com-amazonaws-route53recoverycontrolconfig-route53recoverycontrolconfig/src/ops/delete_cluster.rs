@@ -160,7 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                    message: crate::state::not_found_message(
+                        crate::state::CLUSTER_NOUN,
+                        &input.cluster_arn,
+                    ),
                 },
             )
             .into());

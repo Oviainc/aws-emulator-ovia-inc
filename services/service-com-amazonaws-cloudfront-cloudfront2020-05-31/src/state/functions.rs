@@ -400,20 +400,47 @@ pub fn function_already_exists(name: &str) -> crate::ops::types::FunctionAlready
     }
 }
 
+/// The modelled `FunctionInUse` (HTTP 409) for a delete of a function a cache behaviour
+/// still attaches.
+///
+/// The sentence is the one the model states on the shape itself, and it is a property of
+/// the CONDITION rather than of the request — the function is attached to a cache
+/// behaviour, and the caller is told to remove the association first — so nothing from the
+/// request or from the store belongs in it and every refusal of this condition reads the
+/// same, exactly as [`super::cache_policy_in_use`] words the same condition for the other
+/// resource a cache behaviour attaches.
+pub fn function_in_use() -> crate::ops::types::FunctionInUse {
+    crate::ops::types::FunctionInUse {
+        message: Some(FUNCTION_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `FunctionInUse`'s message, as the model documents the shape: "Cannot delete the
+/// function because it's attached to one or more cache behaviors."
+pub const FUNCTION_IN_USE_MESSAGE: &str =
+    "Cannot delete the function because it's attached to one or more cache behaviors.";
+
 /// The modelled `NoSuchFunctionExists` (HTTP 404) for a function stage no stored function
 /// has — either no function of that name, or a function that has never been published to
 /// the stage the request names.
 ///
-/// The sentence is the one the model states on the shape — "The function does not exist."
-/// — followed by which function and stage was asked for, which is built from the request
-/// and is what tells a caller whether it addressed the wrong name or the wrong stage.
-pub fn no_such_function_exists(name: &str, stage: &str) -> NoSuchFunctionExists {
+/// FIXED service text ([`NO_SUCH_FUNCTION_EXISTS_MESSAGE`]), for the same reason
+/// [`super::no_such_cache_policy`] and [`super::no_such_distribution`] carry one: what the
+/// refusal states is a property of the STORE rather than of the request — the function the
+/// caller addressed is not there — and the caller already knows which name and stage it
+/// asked for, so nothing from the request belongs in the text and every read that finds no
+/// such function reads the same.
+pub fn no_such_function_exists() -> NoSuchFunctionExists {
     NoSuchFunctionExists {
-        message: Some(format!(
-            "The function does not exist: no function named {name} in the {stage} stage"
-        )),
+        message: Some(NO_SUCH_FUNCTION_EXISTS_MESSAGE.to_string()),
     }
 }
+
+/// `NoSuchFunctionExists`'s message, in the form CloudFront answers a `NoSuch…` for a named
+/// resource with — "The specified <resource> does not exist.", as
+/// [`super::NO_SUCH_CACHE_POLICY_MESSAGE`] and [`super::NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]
+/// carry it; the shape's own documentation states it in its shorter form.
+pub const NO_SUCH_FUNCTION_EXISTS_MESSAGE: &str = "The specified function does not exist.";
 
 /// The message for a function configuration whose `KeyValueStoreAssociations.Quantity`
 /// disagrees with the length of its `Items`, or `None` when the two agree.

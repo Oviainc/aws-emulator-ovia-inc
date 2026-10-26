@@ -27,6 +27,8 @@ mod alarm_history;
 mod alarm_history_data;
 #[path = "all/alarm_reason_datapoints.rs"]
 mod alarm_reason_datapoints;
+#[path = "all/anomaly_detectors.rs"]
+mod anomaly_detectors;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
 #[path = "all/dashboards.rs"]
@@ -65,5 +67,7 @@ mod resource_tags;
 mod sns_action_queue_policy;
 #[path = "all/sns_action_topic_policy.rs"]
 mod sns_action_topic_policy;
+#[path = "all/start_metric_streams.rs"]
+mod start_metric_streams;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -10,9 +10,10 @@
 //! handlers under `src/ops/` compute each one way instead of once per handler.
 
 use crate::ops::types::{
-    AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails, CreateJobInput,
-    CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2, JobDescriptor,
-    JobManifest, JobManifestGenerator, JobOperation, JobReport, ListStorageLensConfigurationEntry,
+    AccessGrantsLocationConfiguration, AccessPoint, AsyncOperation, AsyncRequestParameters,
+    AsyncResponseDetails, CreateJobInput, CreateMultiRegionAccessPointInput2,
+    DeleteMultiRegionAccessPointInput2, Grantee, JobDescriptor, JobManifest, JobManifestGenerator,
+    JobOperation, JobReport, ListStorageLensConfigurationEntry,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
     MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
     StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
@@ -517,17 +518,19 @@ pub fn create_job_fingerprint(input: &CreateJobInput) -> String {
     hex::encode(sha2::Sha256::digest(rendered.as_bytes()))
 }
 
-/// A fresh job id, in the shape S3 Batch Operations gives one: a version-4
-/// UUID, `8-4-4-4-12` lowercase hex with the version and variant bits RFC 4122
-/// §4.4 fixes — 36 characters, which is the maximum the modelled `JobId` (len
-/// 5..36, pattern `^[a-zA-Z0-9\-\_]+$`) admits.
+/// A fresh service-assigned resource id, in the shape S3 Control gives one: a
+/// version-4 UUID, `8-4-4-4-12` lowercase hex with the version and variant bits
+/// RFC 4122 §4.4 fixes — 36 characters, which is the maximum the modelled
+/// `JobId` (len 5..36, pattern `^[a-zA-Z0-9\-\_]+$`) admits and which the
+/// modelled `AccessGrantsLocationId` / `AccessGrantId` (len 1..64, pattern
+/// `^[a-zA-Z0-9\-]+$`) admit too.
 ///
 /// The 128 bits come from three sources hashed together with SHA-256: the
 /// OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds,
 /// and `sequence` — a counter the store hands out, so two creates in the same
-/// nanosecond cannot collide. A job id names a resource; a credential would
-/// come from the credential store instead, never from here.
-fn new_job_uuid(sequence: u64) -> String {
+/// nanosecond cannot collide. This names a resource; a credential would come
+/// from the credential store instead, never from here.
+fn new_resource_uuid(sequence: u64) -> String {
     use sha2::Digest;
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
@@ -778,6 +781,216 @@ pub const ACCESS_GRANTS_INSTANCE_ID: &str = "default";
 /// of the key.
 pub const ACCESS_GRANTS_INSTANCE_QUOTA: usize = 1_000;
 
+/// One registered S3 Access Grants location: everything
+/// `CreateAccessGrantsLocation` recorded and `GetAccessGrantsLocation` reports.
+#[derive(Debug, Clone)]
+pub struct AccessGrantsLocationRecord {
+    /// The account whose S3 Access Grants instance holds the location.
+    pub account_id: String,
+    /// The Region the location was registered in — "Your S3 data must be in the
+    /// same Region as your S3 Access Grants instance"
+    /// (`CreateAccessGrantsLocation`), and an instance is Region-scoped, so the
+    /// Region is part of this resource's identity too.
+    pub region: String,
+    /// The id S3 Access Grants assigned: [`ACCESS_GRANTS_LOCATION_DEFAULT_ID`]
+    /// for the default location, otherwise a service-assigned one.
+    pub id: String,
+    pub arn: String,
+    /// The S3 URI path the location spans, as registered.
+    pub location_scope: String,
+    /// The IAM role S3 Access Grants assumes to manage the location.
+    pub iam_role_arn: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// The tags the register call was given. Recorded here because they are part
+    /// of the resource; the operations that report them (`ListTagsForResource`,
+    /// `TagResource`, `UntagResource`) are still stubs with their own gap
+    /// issues, and will read this field rather than a second copy.
+    pub tags: Vec<Tag>,
+}
+
+/// How a registered location is keyed: the owning account, the Region, and the
+/// location id the service assigned — the triple a location id is unique
+/// within, because the instance it belongs to is itself (account, Region).
+pub type AccessGrantsLocationKey = (String, String, String);
+
+/// The default S3 Access Grants location scope.
+///
+/// `AccessGrantsLocationId` documents it: "S3 Access Grants assigns the ID
+/// `default` to the default location `s3://`" — so the scope and the id it is
+/// assigned are both fixed rather than minted.
+pub const DEFAULT_LOCATION_SCOPE: &str = "s3://";
+
+/// The id the default location carries. See [`DEFAULT_LOCATION_SCOPE`].
+pub const ACCESS_GRANTS_LOCATION_DEFAULT_ID: &str = "default";
+
+/// How many registered locations the store holds before
+/// `CreateAccessGrantsLocation` refuses to record a FURTHER one.
+///
+/// This is the emulator's OWN bound on its store, not a claim about a limit AWS
+/// publishes: `LocationScope` is an arbitrary S3 URI path, so the number of
+/// locations a caller can register is caller-chosen, and without this bound a
+/// caller could grow this process's state without end.
+pub const ACCESS_GRANTS_LOCATION_QUOTA: usize = 1_000;
+
+/// One access grant: everything `CreateAccessGrant` recorded, what
+/// `GetAccessGrant` reports, and the scope `GetDataAccess` evaluates a target
+/// against.
+#[derive(Debug, Clone)]
+pub struct AccessGrantRecord {
+    /// The account whose S3 Access Grants instance holds the grant.
+    pub account_id: String,
+    /// The Region the grant was created in — the Region of the instance and of
+    /// the registered location it narrows.
+    pub region: String,
+    /// The id S3 Access Grants assigned the grant.
+    pub id: String,
+    pub arn: String,
+    /// The registered location the grant narrows.
+    pub access_grants_location_id: String,
+    /// The location configuration the create call submitted, reported back
+    /// verbatim; `None` when the grant covers the whole location scope.
+    pub location_configuration: Option<AccessGrantsLocationConfiguration>,
+    /// The S3 URI path the grant covers: see [`grant_scope`].
+    pub grant_scope: String,
+    pub grantee: Grantee,
+    /// One of the modelled `Permission` values.
+    pub permission: String,
+    /// The Identity Center application the grantee must come through, if the
+    /// create call named one.
+    pub application_arn: Option<String>,
+    /// The `S3PrefixType` the create call submitted (`Object` when the grant
+    /// scope is a single object). Part of the resource, though no modelled
+    /// output member carries it back.
+    pub s3_prefix_type: Option<String>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// The tags the create call was given, recorded for the same reason as
+    /// [`AccessGrantsLocationRecord::tags`].
+    pub tags: Vec<Tag>,
+}
+
+/// How a grant is keyed: the owning account, the Region, and the grant id — the
+/// triple a grant id is unique within, for the same reason as
+/// [`AccessGrantsLocationKey`].
+pub type AccessGrantKey = (String, String, String);
+
+/// How many grants the store holds before `CreateAccessGrant` refuses to record
+/// a FURTHER one. The emulator's OWN bound on its store, for the same reason as
+/// [`ACCESS_GRANTS_LOCATION_QUOTA`].
+pub const ACCESS_GRANT_QUOTA: usize = 1_000;
+
+/// How many live credentials `GetDataAccess` has vended before it refuses to
+/// vend another.
+///
+/// The emulator's OWN bound: a vend adds a credential to the emulator's
+/// credential store, and nothing but its own expiry removes it, so without this
+/// bound a caller could grow the store without end. A credential whose
+/// expiration has passed is released first (see
+/// [`ComAmazonawsS3controlAwss3controlservicev20180820State::expire_data_access_credentials`]),
+/// so the bound is on credentials that are still live.
+pub const DATA_ACCESS_CREDENTIAL_QUOTA: usize = 1_000;
+
+/// The session duration `GetDataAccess` vends a credential for when the request
+/// names none.
+///
+/// `DurationSeconds` documents it: "The default value is 1 hour, but the grantee
+/// can specify a range from 900 seconds (15 minutes) up to 43200 seconds (12
+/// hours)."
+pub const DATA_ACCESS_DEFAULT_DURATION_SECONDS: i32 = 3_600;
+
+/// The shortest session `GetDataAccess` vends a credential for, which is the
+/// floor of `DurationSeconds`' modelled `range 900..43200` — "the grantee can
+/// specify a range from 900 seconds (15 minutes) up to 43200 seconds (12
+/// hours)".
+pub const DATA_ACCESS_MIN_DURATION_SECONDS: i32 = 900;
+
+/// The longest session `GetDataAccess` vends a credential for, the ceiling of
+/// the same modelled range. See [`DATA_ACCESS_MIN_DURATION_SECONDS`].
+pub const DATA_ACCESS_MAX_DURATION_SECONDS: i32 = 43_200;
+
+/// The `Privilege` whose token carries the scope of the matched grant.
+///
+/// `Privilege` documents the two values: "Default – The scope of the returned
+/// temporary access token is the scope of the grant that is closest to the
+/// target scope. Minimal – The scope of the returned temporary access token is
+/// the same as the requested target scope as long as the requested scope is the
+/// same as or a subset of the grant scope." `Privilege` is also the member's
+/// default when a request omits it.
+pub const PRIVILEGE_DEFAULT: &str = "Default";
+
+/// The `Privilege` whose token carries the requested target scope. See
+/// [`PRIVILEGE_DEFAULT`].
+pub const PRIVILEGE_MINIMAL: &str = "Minimal";
+
+/// The `Permission` that grants read-only access.
+pub const PERMISSION_READ: &str = "READ";
+
+/// The `Permission` that grants write-only access.
+pub const PERMISSION_WRITE: &str = "WRITE";
+
+/// The `Permission` that grants both read and write access, so it satisfies a
+/// request for either one — "READWRITE – Grant both read and write access to
+/// the S3 data" (`Permission`).
+pub const PERMISSION_READWRITE: &str = "READWRITE";
+
+/// The grant scope of a grant on `location_scope` narrowed by `sub_prefix`.
+///
+/// `AccessGrantsLocationConfiguration$S3SubPrefix` states the rule: "The
+/// `S3SubPrefix` is appended to the location scope creating the grant scope",
+/// and its example appends `<bucket-name>/*` to the default location `s3://` to
+/// reach `s3://<bucket-name>/*`. A grant that narrows nothing has the location
+/// scope itself for its grant scope. The separator is normalised to exactly one
+/// `/` between the two halves, whichever of them carries it, so a location
+/// registered as a bucket path with or without its trailing slash yields the
+/// same grant scope.
+pub fn grant_scope(location_scope: &str, sub_prefix: Option<&str>) -> String {
+    let Some(sub_prefix) = sub_prefix.filter(|prefix| !prefix.is_empty()) else {
+        return location_scope.to_string();
+    };
+    let tail = sub_prefix.strip_prefix('/').unwrap_or(sub_prefix);
+    if location_scope.ends_with('/') {
+        format!("{location_scope}{tail}")
+    } else {
+        format!("{location_scope}/{tail}")
+    }
+}
+
+/// How much of `target` the S3 URI path `scope` covers, or `None` when it covers
+/// none of it.
+///
+/// An S3 Access Grants scope is an S3 URI path, and `S3SubPrefix` states how one
+/// is read: "If the `S3SubPrefix` includes a prefix, append the wildcard
+/// character `*` after the prefix to indicate that you want to include all
+/// object key names in the bucket that start with that prefix." So a scope
+/// ending in `*` covers every target whose path starts with the text before the
+/// `*`; a scope ending in `/` is a bucket-or-prefix boundary and covers every
+/// target beneath it; and any other scope names one object, covering the target
+/// equal to it and the targets under it as a prefix boundary.
+///
+/// The answer is the number of characters of `scope` that did the covering, so a
+/// caller can pick the MOST SPECIFIC of several covering scopes — the grant
+/// "closest to the target scope" `Privilege` speaks of — by taking the largest.
+pub fn scope_coverage(scope: &str, target: &str) -> Option<usize> {
+    if let Some(prefix) = scope.strip_suffix('*') {
+        return target.starts_with(prefix).then_some(prefix.len());
+    }
+    if scope.ends_with('/') {
+        return target.starts_with(scope).then_some(scope.len());
+    }
+    let covers = target == scope || target.starts_with(&format!("{scope}/"));
+    covers.then_some(scope.len())
+}
+
+/// Whether a grant carrying `granted` satisfies a request for `requested`.
+///
+/// `Permission` documents the three values, of which only `READWRITE` grants
+/// more than itself: it "grant[s] both read and write access to the S3 data", so
+/// it satisfies a request for `READ` or for `WRITE` as well as for itself.
+pub fn permission_satisfies(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || (granted == PERMISSION_READWRITE
+            && (requested == PERMISSION_READ || requested == PERMISSION_WRITE))
+}
+
 /// Per-service state for com-amazonaws-s3control-awss3controlservicev20180820. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
@@ -846,9 +1059,9 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// record is length-bounded by the model.
     pub jobs: BTreeMap<JobKey, JobRecord>,
 
-    /// How many job ids this store has minted, so two ids are distinct even
-    /// when the clock reports the same nanosecond (see [`new_job_uuid`]).
-    minted_job_ids: u64,
+    /// How many resource ids this store has minted, so two ids are distinct even
+    /// when the clock reports the same nanosecond (see [`new_resource_uuid`]).
+    minted_resource_ids: u64,
 
     /// Multi-Region Access Points by (account id, name).
     ///
@@ -889,14 +1102,169 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// [`ACCESS_GRANTS_INSTANCE_QUOTA`] records, and every member of a record
     /// is length-bounded by the model.
     pub access_grants_instances: BTreeMap<AccessGrantsInstanceKey, AccessGrantsInstanceRecord>,
+
+    /// Registered S3 Access Grants locations by (account id, Region, location
+    /// id) — what `CreateAccessGrantsLocation` records and
+    /// `GetAccessGrantsLocation` reports.
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`:
+    /// `ListAccessGrantsLocations` is `@paginated`, and a page token can only
+    /// resume a scan whose order does not change between calls.
+    ///
+    /// BOUNDED: `CreateAccessGrantsLocation` refuses a NEW location past
+    /// [`ACCESS_GRANTS_LOCATION_QUOTA`] records, and every member of a record is
+    /// length-bounded by the model.
+    pub access_grants_locations: BTreeMap<AccessGrantsLocationKey, AccessGrantsLocationRecord>,
+
+    /// Access grants by (account id, Region, grant id) — what
+    /// `CreateAccessGrant` records, `GetAccessGrant` reports and `GetDataAccess`
+    /// evaluates a target against.
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`: `ListAccessGrants`
+    /// is `@paginated`, and a page token can only resume a scan whose order does
+    /// not change between calls. The sorted order also decides which of two
+    /// equally specific grants a target matches, so that answer does not move
+    /// between calls.
+    ///
+    /// BOUNDED: `CreateAccessGrant` refuses a NEW grant past
+    /// [`ACCESS_GRANT_QUOTA`] records, and every member of a record is
+    /// length-bounded by the model.
+    pub access_grants: BTreeMap<AccessGrantKey, AccessGrantRecord>,
+
+    /// When each credential `GetDataAccess` has vended expires, by the access
+    /// key id it was minted under.
+    ///
+    /// The credential material itself lives in the emulator's credential store,
+    /// which is the only thing that mints or forgets it; this map is the record
+    /// of WHEN each one is owed to be forgotten, which only a handler holding
+    /// that store can act on.
+    ///
+    /// BOUNDED: `GetDataAccess` releases every expired credential before it
+    /// vends, and refuses to vend past [`DATA_ACCESS_CREDENTIAL_QUOTA`] live
+    /// ones.
+    pub data_access_credentials: BTreeMap<String, SystemTime>,
 }
 
 impl ComAmazonawsS3controlAwss3controlservicev20180820State {
-    /// A fresh job id for a job this store is about to hold, over this store's
-    /// own counter (see [`new_job_uuid`]).
+    /// A fresh service-assigned id for a resource this store is about to hold,
+    /// over this store's own counter (see [`new_resource_uuid`]) — the one place
+    /// the counter is bumped, so two ids are distinct whatever kind of resource
+    /// they name.
+    fn new_resource_id(&mut self) -> String {
+        self.minted_resource_ids = self.minted_resource_ids.wrapping_add(1);
+        new_resource_uuid(self.minted_resource_ids)
+    }
+
+    /// A fresh job id for a job this store is about to hold.
     pub fn new_job_id(&mut self) -> String {
-        self.minted_job_ids = self.minted_job_ids.wrapping_add(1);
-        new_job_uuid(self.minted_job_ids)
+        self.new_resource_id()
+    }
+
+    /// A fresh location id — the id S3 Access Grants assigns a location other
+    /// than the default one.
+    pub fn new_access_grants_location_id(&mut self) -> String {
+        self.new_resource_id()
+    }
+
+    /// A fresh grant id — the id `AccessGrantId` documents S3 Access Grants
+    /// auto-generates when the grant is created.
+    pub fn new_access_grant_id(&mut self) -> String {
+        self.new_resource_id()
+    }
+
+    /// The location `location_id` names in `account_id`'s instance in `region`,
+    /// or `None` when that instance has no such location.
+    pub fn access_grants_location(
+        &self,
+        account_id: &str,
+        region: &str,
+        location_id: &str,
+    ) -> Option<&AccessGrantsLocationRecord> {
+        self.access_grants_locations.get(&(
+            account_id.to_string(),
+            region.to_string(),
+            location_id.to_string(),
+        ))
+    }
+
+    /// The location in `account_id`'s instance in `region` registered for
+    /// `location_scope`, if any: the record a repeat registration conflicts
+    /// with, because one scope is registered once.
+    pub fn access_grants_location_by_scope(
+        &self,
+        account_id: &str,
+        region: &str,
+        location_scope: &str,
+    ) -> Option<&AccessGrantsLocationRecord> {
+        self.access_grants_locations.values().find(|location| {
+            location.account_id == account_id
+                && location.region == region
+                && location.location_scope == location_scope
+        })
+    }
+
+    /// The grant `grant_id` names in `account_id`'s instance in `region`, or
+    /// `None` when that instance has no such grant.
+    pub fn access_grant(
+        &self,
+        account_id: &str,
+        region: &str,
+        grant_id: &str,
+    ) -> Option<&AccessGrantRecord> {
+        self.access_grants.get(&(
+            account_id.to_string(),
+            region.to_string(),
+            grant_id.to_string(),
+        ))
+    }
+
+    /// The grant in `account_id`'s instance in `region` whose scope covers
+    /// `target` for `permission` and is CLOSEST to it — the authorization
+    /// decision `GetDataAccess` makes.
+    ///
+    /// Specificity is how much of the target the grant's scope covers (see
+    /// [`scope_coverage`]), so a grant on a narrower prefix wins over one on the
+    /// bucket that contains it. Two equally specific grants are ordered by their
+    /// key, so the answer does not move between calls.
+    pub fn grant_covering(
+        &self,
+        account_id: &str,
+        region: &str,
+        target: &str,
+        permission: &str,
+    ) -> Option<&AccessGrantRecord> {
+        self.access_grants
+            .values()
+            .filter(|grant| grant.account_id == account_id && grant.region == region)
+            .filter(|grant| permission_satisfies(&grant.permission, permission))
+            .filter_map(|grant| {
+                scope_coverage(&grant.grant_scope, target).map(|covered| (covered, grant))
+            })
+            .max_by(|(left, left_grant), (right, right_grant)| {
+                left.cmp(right)
+                    .then_with(|| right_grant.id.cmp(&left_grant.id))
+            })
+            .map(|(_, grant)| grant)
+    }
+
+    /// Release every credential `GetDataAccess` vended whose expiration has
+    /// passed at `now`, and answer their access key ids so the caller can forget
+    /// the credential material too.
+    ///
+    /// Each was over at `now` whether or not anybody called, so the operation
+    /// that vends runs this before vending: the credentials this process holds
+    /// are the ones the clock says are still live.
+    pub fn expire_data_access_credentials(&mut self, now: SystemTime) -> Vec<String> {
+        let expired: Vec<String> = self
+            .data_access_credentials
+            .iter()
+            .filter(|(_, expires_at)| **expires_at <= now)
+            .map(|(access_key_id, _)| access_key_id.clone())
+            .collect();
+        for access_key_id in &expired {
+            self.data_access_credentials.remove(access_key_id);
+        }
+        expired
     }
 
     /// Apply every job transition the clock already owed at `now`.
@@ -1044,6 +1412,32 @@ pub fn storage_lens_group_arn(region: &str, name: &str) -> String {
 /// single source of truth for the canonical emulator account.
 pub fn access_grants_instance_arn(region: &str, instance_id: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("access-grants/{instance_id}"))
+}
+
+/// The ARN of a registered S3 Access Grants location, in the Region the
+/// location was registered in — the form `AccessGrantsLocationArn`'s pattern
+/// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/location/[a-zA-Z0-9\-]+$`)
+/// admits.
+///
+/// The account segment comes from [`::emulator_server::emulator_arn`], the
+/// single source of truth for the canonical emulator account.
+pub fn access_grants_location_arn(region: &str, location_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        "s3",
+        region,
+        &format!("access-grants/location/{location_id}"),
+    )
+}
+
+/// The ARN of an access grant, in the Region the grant was created in — the
+/// form `AccessGrantArn`'s pattern
+/// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/grant/[a-zA-Z0-9\-]+$`)
+/// admits.
+///
+/// The account segment comes from [`::emulator_server::emulator_arn`], the
+/// single source of truth for the canonical emulator account.
+pub fn access_grant_arn(region: &str, grant_id: &str) -> String {
+    ::emulator_server::emulator_arn("s3", region, &format!("access-grants/grant/{grant_id}"))
 }
 
 /// How many characters of the Identity Center application segment an
@@ -1670,6 +2064,125 @@ pub fn access_grants_instance_store_full<E>() -> crate::scaffolded::Scaffolded<E
     )
 }
 
+/// `AccessGrantsLocationNotExistsError` (HTTP 404): the S3 Access Grants
+/// instance of the account the request names, in the Region it was signed for,
+/// has no location registered under that id.
+///
+/// The code and status follow the instance refusal one resource up
+/// ([`no_such_access_grants_instance`]): the Access Grants surface answers a
+/// missing resource with a `<Resource>NotExistsError` code and a 404, carried in
+/// the S3-style XML envelope because the model declares no error here.
+pub fn no_such_access_grants_location<E>(location_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsLocationNotExistsError",
+        404,
+        format!("Access Grants Location does not exist: {location_id}"),
+    )
+}
+
+/// `AccessGrantsLocationAlreadyExistsError` (HTTP 409): the instance already has
+/// a location registered for that scope, so registering it again would be two
+/// locations over one S3 path rather than a replacement — the same conflict, and
+/// so the same code shape and status, as
+/// [`access_grants_instance_already_exists`].
+pub fn access_grants_location_already_exists<E>(
+    location_scope: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsLocationAlreadyExistsError",
+        409,
+        format!("Access Grants Location already exists for this scope: {location_scope}"),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): the store already holds
+/// [`ACCESS_GRANTS_LOCATION_QUOTA`] registered locations, so recording another
+/// would grow this process's state without end. The code and status are the ones
+/// [`access_grants_instance_store_full`] answers for the same kind of bound.
+pub fn access_grants_location_store_full<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!(
+            "This emulator holds the maximum of {ACCESS_GRANTS_LOCATION_QUOTA} S3 Access \
+             Grants locations."
+        ),
+    )
+}
+
+/// `AccessGrantNotExistsError` (HTTP 404): the instance has no grant under that
+/// id. The code and status follow the Access Grants surface's missing-resource
+/// refusal; see [`no_such_access_grants_location`].
+pub fn no_such_access_grant<E>(grant_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantNotExistsError",
+        404,
+        format!("Access Grant does not exist: {grant_id}"),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): the store already holds [`ACCESS_GRANT_QUOTA`]
+/// grants, so recording another would grow this process's state without end.
+/// The code and status are the ones [`access_grants_instance_store_full`]
+/// answers for the same kind of bound.
+pub fn access_grant_store_full<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!("This emulator holds the maximum of {ACCESS_GRANT_QUOTA} S3 access grants."),
+    )
+}
+
+/// `InvalidRequest` (HTTP 400): a grant was asked for over the whole default
+/// location.
+///
+/// `CreateAccessGrant$AccessGrantsLocationId` states the rule: "If you are
+/// passing the default location, you cannot create an access grant for the
+/// entire default location. You must also specify a bucket or a bucket and
+/// prefix in the Subprefix field." The code and status are the ones this
+/// service answers a well-formed request it cannot carry out with (see
+/// [`job_not_found`]).
+pub fn grant_sub_prefix_required<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequest",
+        400,
+        format!(
+            "An access grant on the default location {DEFAULT_LOCATION_SCOPE} must narrow it: \
+             specify a bucket, or a bucket and prefix, in S3SubPrefix."
+        ),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): no grant of this instance covers the requested
+/// target for the requested permission, so `GetDataAccess` vends nothing.
+///
+/// The message is built from the request — the permission asked for and the S3
+/// path asked about — because those are what the caller has to change for the
+/// call to succeed.
+pub fn data_access_denied<E>(permission: &str, target: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!("You do not have {permission} permissions to the requested S3 Prefix: {target}"),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): `GetDataAccess` has already vended
+/// [`DATA_ACCESS_CREDENTIAL_QUOTA`] credentials that are still live, so vending
+/// another would grow this process's credential store without end. The code and
+/// status are the ones [`access_grants_instance_store_full`] answers for the
+/// same kind of bound.
+pub fn data_access_credential_store_full<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!(
+            "This emulator has vended the maximum of {DATA_ACCESS_CREDENTIAL_QUOTA} live S3 \
+             Access Grants credentials."
+        ),
+    )
+}
+
 /// `InternalError` (HTTP 500): [`service_state`] answered `None`, so this
 /// process has no shared store to read. Never answered with a fresh engine — a
 /// private store would accept writes nobody else can see.
@@ -1678,5 +2191,16 @@ pub fn state_unavailable<E>() -> crate::scaffolded::Scaffolded<E> {
         "InternalError",
         500,
         "The emulator's shared state is not reachable from this request.",
+    )
+}
+
+/// `InternalError` (HTTP 500): the credential store minted a session credential
+/// without the secrets a session always carries, so there is no credential to
+/// answer with. Never answered with material chosen here.
+pub fn credential_without_secrets<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InternalError",
+        500,
+        "A temporary credential was created without its secrets.",
     )
 }

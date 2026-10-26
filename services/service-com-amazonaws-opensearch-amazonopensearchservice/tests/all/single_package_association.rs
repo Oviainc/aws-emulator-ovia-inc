@@ -30,10 +30,11 @@
 //! * this operation and the one that links several packages at once make the SAME
 //!   record for the same package, because both go through the store's one decision.
 //!
-//! The domain's associations are read back through the store the handler writes —
-//! reached exactly as a handler reaches it — because `ListPackagesForDomain`, the
-//! wire read path for them, is still a scaffold stub; every rule that a call CAN
-//! observe is asserted over the wire.
+//! The domain's associations are read back both through the wire listing that reports
+//! them (`ListPackagesForDomain`, asserted in
+//! [`super::package_association_listings`]) and, where a case needs the record a
+//! status move has not reached yet, through the store the handler writes — reached
+//! exactly as a handler reaches it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -420,15 +421,18 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
 
     // One row per way a request cannot be served, each with the status and error code
     // the model declares for it: `ResourceNotFoundException` at HTTP 409,
-    // `ConflictException` at 409 and `ValidationException` at 400.
+    // `ConflictException` at 409 and `ValidationException` at 400. A `DomainName` that
+    // names no domain is the CLIENT-INPUT refusal: linking a package resolves the
+    // domain as part of reading the request, so the name is a value the caller has to
+    // fix.
     let table: Vec<(&str, &str, &str, Value, u16, &str)> = vec![
         (
             "a domain nothing created",
             "single-no-such-domain",
             &ids[0],
             json!({}),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a package nothing created",

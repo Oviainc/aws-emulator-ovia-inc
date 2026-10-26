@@ -67,6 +67,12 @@ pub const LIST_POLICIES_GRANTING_SERVICE_ACCESS: &str = "iam:ListPoliciesGrantin
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 
+/// `iam:DeleteGroup`.
+pub const DELETE_GROUP: &str = "iam:DeleteGroup";
+
+/// `iam:GetGroup`.
+pub const GET_GROUP: &str = "iam:GetGroup";
+
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
 

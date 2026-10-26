@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessGrantsLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessGrantsLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessGrantsLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the registered S3 Access Grants location `CreateAccessGrantsLocation`
+//! recorded under this id, in the account's instance in the Region the request
+//! was signed for. Refuses with `AccessGrantsLocationNotExistsError` when that
+//! instance has no such location. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessGrantsLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessGrantsLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessGrantsLocation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // A location belongs to the Access Grants instance of this account in
+        // the Region the request was signed for, which is the key the register
+        // call recorded it under.
+        let region = crate::state::signing_region(ctx.parts());
+        let store = state.lock();
+        let Some(record) = store.access_grants_location(
+            &input.account_id,
+            &region,
+            &input.access_grants_location_id,
+        ) else {
+            return Err(crate::state::no_such_access_grants_location(
+                &input.access_grants_location_id,
+            ));
+        };
+
+        Ok(GetAccessGrantsLocationOutput {
+            created_at: Some(record.created_at),
+            access_grants_location_id: Some(record.id.clone()),
+            access_grants_location_arn: Some(record.arn.clone()),
+            location_scope: Some(record.location_scope.clone()),
+            iam_role_arn: Some(record.iam_role_arn.clone()),
+        })
     }
 }

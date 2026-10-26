@@ -240,6 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = crate::state::now_secs();
 
+        // A job the clock has made `Complete` since the last call has its export objects
+        // written now: the write is a change the clock had already made due at `now`, owed
+        // whether or not anybody read the job, so performing it here reports the job and its
+        // destination in the one state. Nothing else about a job is written by this read.
+        crate::state::export::write_due_exports(&*self.engine, now);
+
         let guard = state.lock();
         if !guard.enrollment.is_opted_in() {
             return Err(

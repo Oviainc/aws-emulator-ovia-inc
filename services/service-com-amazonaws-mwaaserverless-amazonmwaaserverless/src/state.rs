@@ -22,7 +22,8 @@
 //! products are finite and so is the caller-supplied data each record holds); `workflow_names` holds exactly one
 //! key per stored workflow, released when the delete's teardown removes the record
 //! ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`]);
-//! and the
+//! a workflow's `tags` at [`MAX_TAGS_PER_RESOURCE`] (a tagging call past that ceiling is
+//! refused and stores nothing); and the
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
 //! A run's `task_instances` ([`TaskInstance`]) is NOT caller-driven growth: no modelled
@@ -174,6 +175,15 @@ pub const MAX_RUNS_PER_WORKFLOW: usize = 1_000;
 /// [`MAX_WORKFLOWS`]: the number is the emulator's own ceiling, not a claim about the
 /// published quota.
 pub const MAX_VERSIONS_PER_WORKFLOW: usize = 1_000;
+
+/// How many tags ONE resource of this service carries.
+///
+/// `Tags` is modelled `@length(min: 0, max: 50)`
+/// (`smithy_query(query="shape", shape="Tags")`) wherever it appears — on a create, on a
+/// tagging request and on the tag listing's response — so 50 is the size of the tag set a
+/// resource of this service can report, and the ceiling a tagging call may not carry it
+/// past.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The most `@idempotencyToken` entries this service remembers.
 ///
@@ -456,6 +466,9 @@ pub struct Workflow {
     pub current_version: String,
     pub revision_id: String,
     pub versions: Vec<WorkflowVersionRecord>,
+    /// The tag set this workflow carries, keyed by tag key: at most
+    /// [`MAX_TAGS_PER_RESOURCE`] entries, which is the size the modelled `Tags` map can
+    /// report.
     pub tags: BTreeMap<String, String>,
     pub runs: BTreeMap<String, WorkflowRun>,
     /// The instant the clock owes this workflow's removal, once its teardown has
@@ -839,6 +852,30 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
     let rest = decoded.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let (token_kind, key) = rest.split_once('\u{1f}')?;
     (token_kind == kind).then(|| key.to_string())
+}
+
+/// The smallest page size the modelled `MaxResults` range allows. Every paginated
+/// request of this service declares that member `@range(min: 1, max: 100)` with
+/// `@default: 20` (`smithy_query(query="shape", shape="ListWorkflowsRequest,
+/// ListWorkflowRunsRequest,ListWorkflowVersionsRequest,ListTaskInstancesRequest")`).
+pub const MIN_PAGE_SIZE: usize = 1;
+
+/// The largest page size that same range allows.
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size one walk of a paginated listing serves, from the `MaxResults` the
+/// request carries — the single derivation every list handler of this service
+/// reads its page size through, beside the cursor helpers they already share.
+///
+/// `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before a
+/// handler runs, so the value is already a usable page size; it is held to those
+/// published bounds anyway, because a page size of zero would report "there is
+/// nothing here" for a parent that holds items — a wrong answer dressed as success
+/// — and a walk must always make progress.
+pub fn page_size(max_results: i32) -> usize {
+    usize::try_from(max_results)
+        .unwrap_or(MIN_PAGE_SIZE)
+        .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE)
 }
 
 /// What separates a child-listing cursor key's POSITION from the workflow the
@@ -1956,6 +1993,29 @@ fn model_member_name(path: &str) -> String {
     match rest {
         Some(rest) => format!("{head}.{rest}"),
         None => head,
+    }
+}
+
+/// The modelled `ValidationException` for a tagging call that would leave a resource
+/// carrying more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// The ceiling is a service rule rather than a constraint on one member — the request's
+/// own `Tags` map is within its modelled entry count; it is the UNION with the tags the
+/// resource already carries that is too large — so it is refused with the same shape,
+/// reason and `FieldList` as a constraint failure, naming the member that carried the
+/// extra keys.
+pub fn too_many_tags(member: &str, resource_arn: &str, resulting: usize) -> ValidationException {
+    let message = format!(
+        "A resource holds at most {MAX_TAGS_PER_RESOURCE} tags; this request would leave \
+         {resource_arn} holding {resulting}"
+    );
+    ValidationException {
+        message: message.clone(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
     }
 }
 

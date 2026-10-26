@@ -47,6 +47,8 @@ mod extension_registry;
 mod failed_create_rollback;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
+#[path = "all/generated_template_coverage.rs"]
+mod generated_template_coverage;
 #[path = "all/generated_template_reads.rs"]
 mod generated_template_reads;
 #[path = "all/generated_templates.rs"]
@@ -55,6 +57,8 @@ mod generated_templates;
 mod handler_progress_reports;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/hook_result_detail.rs"]
+mod hook_result_detail;
 #[path = "all/hook_result_invocations.rs"]
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]

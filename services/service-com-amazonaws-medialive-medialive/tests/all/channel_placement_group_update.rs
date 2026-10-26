@@ -41,7 +41,12 @@ use crate::wire::{call, error_code, medialive};
 /// One `UpdateChannelPlacementGroup` call
 /// (`smithy_query(query="operation", operation="UpdateChannelPlacementGroup")`:
 /// `PUT /prod/clusters/{ClusterId}/channelplacementgroups/{ChannelPlacementGroupId}`).
-async fn update_group(
+///
+/// `pub(crate)` because the suite that asserts what a REFUSED update does to the
+/// group's lifecycle ([`crate::channel_placement_group_node_resolution`]) drives
+/// the same operation: one wrapper for the call, so the two suites cannot
+/// disagree about the URI or the method it is bound to.
+pub(crate) async fn update_group(
     router: &MultiServiceRouter,
     cluster: &str,
     id: &str,
@@ -608,6 +613,15 @@ async fn an_update_only_assigns_a_node_of_the_groups_own_cluster() {
         assert_eq!(
             after, before,
             "case {case:?}: expected the refused update to change nothing, got {after}"
+        );
+        // A refused update also STARTS nothing: the association an accepted node
+        // set would have begun is only observable once the clock has run, so the
+        // group is read again after it has.
+        wait_for_the_clock();
+        let settled = described(&router, case, &cluster, &id).await;
+        assert_eq!(
+            settled, before,
+            "case {case:?}: expected the refused update to start no transition, got {settled}"
         );
     }
 

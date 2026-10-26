@@ -315,6 +315,10 @@ mod transit_gateway_route_table_propagation;
 // back through the describe.
 #[path = "all/verified_access_endpoints.rs"]
 mod verified_access_endpoints;
+// The Verified Access GROUP slice: create a group on a stored instance, then reach it
+// through the operations that resolve a group.
+#[path = "all/verified_access_groups.rs"]
+mod verified_access_groups;
 // The Verified Access trust provider slice: create, then read it back.
 #[path = "all/verified_access_trust_providers.rs"]
 mod verified_access_trust_providers;
@@ -435,3 +439,7 @@ mod traffic_mirror_sessions;
 // it.
 #[path = "all/client_vpn_endpoints.rs"]
 mod client_vpn_endpoints;
+// Declared LAST for the reason the header gives: the VPC flow log slice — turning flow
+// logging on for a resource, reading the flow logs back, and deleting them in batches.
+#[path = "all/flow_logs.rs"]
+mod flow_logs;

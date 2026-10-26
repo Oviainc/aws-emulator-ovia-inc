@@ -2,16 +2,23 @@
 
 //! @op StartFileTransfer
 //!
-//! Resolves the `ConnectorId` a transfer is started on against stored state: a
-//! connector the store does not hold is not found, which is what distinguishes a
-//! missing connector from a service fault. A request that names no files to transfer
-//! (neither `SendFilePaths` nor `RetrieveFilePaths`) is refused with the modelled
-//! `InvalidRequestException`.
+//! Accepts a file transfer for a STORED connector and answers the `TransferId` it is
+//! recorded under, so `ListFileTransferResults` reports the per-file status of exactly
+//! the files this request named, in the order it named them. A connector the store does
+//! not hold is not found, which is what distinguishes a missing connector from a
+//! service fault.
 //!
-//! Starting the transfer itself is what this emulator cannot do: the transfer runs
-//! against the partner's REMOTE AS2 or SFTP endpoint, an outbound connection the
-//! emulator never makes, so a resolved request answers the scaffold's 501 rather than
-//! handing back a `TransferId` for a transfer nothing will run.
+//! Three things make a request malformed, each refused before anything is recorded: it
+//! names no file at all (neither `SendFilePaths` nor `RetrieveFilePaths`), it asks an
+//! AS2 connector to RETRIEVE files ("for an AS2 connector, you specify the ConnectorId
+//! and one or more SendFilePaths" — outbound only), or the connector already holds the
+//! maximum number of accepted operations this emulator stores for one connector.
+//!
+//! What this emulator does NOT do is move the bytes: the transfer runs against the
+//! partner's REMOTE AS2 or SFTP endpoint, an outbound connection the emulator never
+//! makes. So each accepted file stays `QUEUED` — the `TransferTableStatus` for a
+//! transfer that has not run — and nothing here ever reports a file as transferred,
+//! failed or in progress, because nothing attempted it.
 //!
 //! ## Shape of an operation
 //!
@@ -187,44 +194,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let guard = state.lock();
+        let mut guard = state.lock();
 
         // The connector is resolved FIRST: it is the resource the request is addressed
         // at, and a `ConnectorId` the store does not hold is not found — never a
         // service fault, and never a bad parameter.
-        if !guard.connectors.contains_key(&input.connector_id) {
+        let Some(connector) = guard.connectors.get(&input.connector_id) else {
             return Err(st::not_found(
                 StartFileTransferErrorModeled::ResourceNotFoundException(st::unknown_connector(
                     &input.connector_id,
                 )),
             ));
-        }
+        };
+        let configures_sftp = connector.sftp_config.is_some();
 
         // The direction of the transfer comes from which paths the request names:
         // "you specify one or more RetrieveFilePaths to identify the files you want to
         // transfer" (inbound) or "one or more SendFilePaths" (outbound). A request that
         // names neither identifies no file at all.
-        let names_files =
-            |member: Option<&Vec<String>>| member.is_some_and(|paths| !paths.is_empty());
-        if !names_files(input.send_file_paths.as_ref())
-            && !names_files(input.retrieve_file_paths.as_ref())
-        {
+        let named = |member: Option<Vec<String>>| {
+            member
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_default()
+        };
+        let send_file_paths = named(input.send_file_paths);
+        let retrieve_file_paths = named(input.retrieve_file_paths);
+        if send_file_paths.is_empty() && retrieve_file_paths.is_empty() {
+            return Err(
+                StartFileTransferErrorModeled::InvalidRequestException(st::transfer_names_no_file())
+                    .into(),
+            );
+        }
+        // Only an SFTP connector's transfer "can be either outbound or inbound": an AS2
+        // connector cannot be asked to retrieve files from the partner.
+        if !retrieve_file_paths.is_empty() && !configures_sftp {
             return Err(StartFileTransferErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: "SendFilePaths or RetrieveFilePaths must be specified: the \
-                              request names no file to transfer"
-                        .to_string(),
+                st::retrieval_requires_sftp_connector(),
+            )
+            .into());
+        }
+
+        // The per-connector record set is BOUNDED: past its capacity a transfer is
+        // refused rather than adding another record. The modelled
+        // `ServiceUnavailableException` is the refusal that says the service did not
+        // take this request; `DeleteConnector` releases a connector's records.
+        if !guard.connector_has_transfer_capacity(&input.connector_id) {
+            return Err(StartFileTransferErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} accepted transfers \
+                         for one connector",
+                        st::MAX_TRANSFERS_PER_CONNECTOR
+                    )),
                 },
             )
             .into());
         }
 
-        // The request resolves, so what is left is the transfer: moving bytes between
-        // local storage and the partner's remote AS2 or SFTP endpoint. The emulator
-        // makes no outbound connection, so nothing can run it — and a `TransferId`
-        // handed back here would name a transfer that never happened, whose results
-        // `ListFileTransferResults` would then have to invent. The 501 says that
-        // instead.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartFileTransfer"))
+        // Recorded under the SAME lock the id is minted in, so the answer never names a
+        // transfer the store does not hold. The files are kept in the order the request
+        // named them — outbound first, as the request lists them — which is the order
+        // their results are reported in.
+        let mut file_paths = send_file_paths;
+        file_paths.extend(retrieve_file_paths);
+        let transfer_id = guard.accept_connector_transfer(&input.connector_id, file_paths);
+        drop(guard);
+
+        Ok(StartFileTransferOutput { transfer_id })
     }
 }

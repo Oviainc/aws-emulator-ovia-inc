@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApiKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApiKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApiKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +74,42 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ApiKeyEntry;
+
+/// Whether `entry` satisfies every filter the request set.
+///
+/// Each filter NARROWS the account's key sequence before a page is cut out of it, so
+/// paging a filtered listing walks the filtered sequence rather than cutting pages out
+/// of the whole collection and emptying them afterwards.
+///
+/// * `customerId` names "the identifier of a customer in Amazon Web Services Marketplace
+///   or an external system" (`smithy_query(query="doc",
+///   shape="GetApiKeysRequest", member="customerId")`), which a key carries or does not:
+///   it selects the keys stamped with exactly that customer.
+/// * `nameQuery` is "the name of queried API keys" (`smithy_query(query="doc",
+///   shape="GetApiKeysRequest", member="nameQuery")`), which API Gateway matches as a
+///   PREFIX of the key's name: a query selects every key whose name begins with it, so a
+///   key with no name at all is selected by no query.
+///
+/// A request that carries neither reports the account's keys as they stand.
+fn matches_filters(entry: &ApiKeyEntry, input: &GetApiKeysInput) -> bool {
+    if let Some(customer_id) = &input.customer_id {
+        if entry.customer_id.as_deref() != Some(customer_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(name_query) = &input.name_query {
+        if !entry
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with(name_query.as_str()))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,18 +181,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApiKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApiKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApiKeys"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        // Creation order is the stable sequence a `position` cursor walks, and the
+        // request's filters narrow that sequence BEFORE the page is cut; see
+        // `matches_filters` and `api_key_ids_in_creation_order`.
+        let ordered: Vec<String> = store
+            .api_key_ids_in_creation_order()
+            .into_iter()
+            .filter(|id| {
+                store
+                    .api_keys
+                    .get(id)
+                    .is_some_and(|entry| matches_filters(entry, &input))
+            })
+            .collect();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetApiKeysErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        // Each listed key is rendered by the one `ApiKey` conversion this crate owns, so
+        // a listed key and its own `GetApiKey` read cannot report a record differently.
+        let items: Vec<CreateApiKeyOutput> = page
+            .ids
+            .iter()
+            .filter_map(|id| store.api_keys.get(id))
+            .map(|entry| {
+                let mut body = CreateApiKeyOutput::from(entry);
+                // "A boolean flag to specify whether (true) or not (false) the result
+                // contains key values" (`GetApiKeysRequest$includeValues`): the member
+                // is nullable with no default, so a request that does not ask for the
+                // values is not told them — the same rule `GetApiKey$includeValue`
+                // applies to a single key.
+                if input.include_values != Some(true) {
+                    body.value = None;
+                }
+                body
+            })
+            .collect();
+        Ok(GetApiKeysOutput {
+            // `ApiKeys$warnings` is "a list of warning messages logged during the import
+            // of API keys" — the import call's own diagnostics, which `ImportApiKeys`
+            // reports from the payload it parsed. Listing the stored keys imports
+            // nothing, so there is no warning to report and the member is absent rather
+            // than an empty list some earlier import's diagnostics would have to fill.
+            warnings: None,
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }

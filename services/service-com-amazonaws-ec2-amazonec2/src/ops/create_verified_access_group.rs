@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVerifiedAccessGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVerifiedAccessGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVerifiedAccessGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the Verified Access instance the request names against the
+//! account's stored instances, mints a group on it from the request and stores it, so the
+//! endpoints and the policy readers that resolve a group see what this call created — this
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVerifiedAccessGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVerifiedAccessGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVerifiedAccessGroup"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            invalid_verified_access_instance_id_not_found, iso8601_utc, request_region,
+            require_service_state, tags_from_specifications, verified_access_group_limit_exceeded,
+            verified_access_group_payload_bytes, VerifiedAccessGroupRecord, MAX_CLIENT_TOKEN_CHARS,
+            MAX_STORED_BYTES, MAX_VERIFIED_ACCESS_GROUPS, VERIFIED_ACCESS_GROUP_TAGGABLE_RESOURCE,
+        };
+
+        // The Region the request was signed for: the group's ARN names it, so it is read off
+        // the request the way every other Region-bearing member of this service is.
+        let region = request_region(ctx.parts());
+
+        // "The tags to assign to the Verified Access group"
+        // (`CreateVerifiedAccessGroupRequest$TagSpecifications`): the group is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded. Read through the crate's ONE reading of
+        // a create's tag specifications, so this operation bounds and validates a tag payload
+        // exactly as every other create does.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            VERIFIED_ACCESS_GROUP_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Materialise what the clock already owed before reading the store, so this call
+        // resolves its reference against the state a caller would have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Verified Access instance"
+        // (`CreateVerifiedAccessGroupRequest$VerifiedAccessInstanceId`): an id that names no
+        // instance of the account is refused with that resource's own `NotFound` code and
+        // nothing is stored — a group belongs to an instance, so a group on an instance the
+        // account does not hold would be a dangling reference.
+        if !store
+            .verified_access_instances
+            .contains_key(&input.verified_access_instance_id)
+        {
+            return Err(invalid_verified_access_instance_id_not_found(
+                &input.verified_access_instance_id,
+            ));
+        }
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request" (`CreateVerifiedAccessGroupRequest$ClientToken`) —
+        // one token names the one group it minted, so a replay reports that group and creates
+        // nothing. Read here, answered below the DryRun check, because a replay stores
+        // nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.verified_access_group_client_tokens.get(token).cloned());
+
+        // The record this call would store. Every member is either taken from the request or
+        // derived here; the id, the ARN and the owning account are derived by the store at
+        // the insert, so an id is never chosen twice and the ARN cannot name a different
+        // group than the record it sits on.
+        let created_at = iso8601_utc(::std::time::SystemTime::now());
+        let record = VerifiedAccessGroupRecord {
+            view: VerifiedAccessGroup {
+                // Minted by the store at the insert, with the ARN it builds and the account
+                // that owns it.
+                verified_access_group_id: None,
+                verified_access_group_arn: None,
+                owner: None,
+                verified_access_instance_id: Some(input.verified_access_instance_id.clone()),
+                description: input.description.clone(),
+                // A group is created and updated in the same instant; a later modify is what
+                // carries `LastUpdatedTime` on.
+                creation_time: Some(created_at.clone()),
+                last_updated_time: Some(created_at),
+                // Nothing has deleted this group, so there is no deletion time.
+                deletion_time: None,
+                tags: Some(tags),
+                // "The options for server side encryption"
+                // (`CreateVerifiedAccessGroupRequest$SseSpecification`). The response shape
+                // reports whether a customer managed key is in use and which one, so a
+                // request that named no specification reports the Amazon Web Services owned
+                // key: not customer managed, and no key ARN to name.
+                sse_specification: Some(VerifiedAccessSseSpecificationResponse {
+                    customer_managed_key_enabled: Some(
+                        input
+                            .sse_specification
+                            .as_ref()
+                            .and_then(|sse| sse.customer_managed_key_enabled)
+                            .unwrap_or(false),
+                    ),
+                    kms_key_arn: input
+                        .sse_specification
+                        .as_ref()
+                        .and_then(|sse| sse.kms_key_arn.clone()),
+                }),
+            },
+            // "The Verified Access policy document"
+            // (`CreateVerifiedAccessGroupRequest$PolicyDocument`): the group shape carries no
+            // member for it, so it is kept beside the record for
+            // `GetVerifiedAccessGroupPolicy` to report.
+            policy_document: input.policy_document.clone(),
+        };
+
+        // Both ceilings are asked only of a create that would STORE something: a replay
+        // stores nothing, so it passes the ceilings a fresh create has to clear. A COUNT
+        // ceiling admits gigabytes on its own, because the record holds strings the caller
+        // chose the length of (the description and the policy document), so both are asked.
+        if replayed.is_none() {
+            if !store.has_verified_access_group_capacity() {
+                return Err(verified_access_group_limit_exceeded(format!(
+                    "This emulator holds {MAX_VERIFIED_ACCESS_GROUPS} Verified Access groups, \
+                     which is as many as it stores"
+                )));
+            }
+            // The caller-chosen bytes this create would retain for the process's lifetime,
+            // counted by the ONE definition of that charge, so the figure checked here is
+            // exactly the one the insert charges.
+            let payload_bytes =
+                verified_access_group_payload_bytes(&record, input.client_token.as_deref());
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(verified_access_group_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the instance reference
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let group_id = match replayed {
+            Some(group_id) => group_id,
+            None => {
+                store.insert_verified_access_group(record, &region, input.client_token.as_deref())
+            }
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later read of
+        // the group will see rather than the request object.
+        store
+            .verified_access_groups
+            .get(&group_id)
+            .map(|record| CreateVerifiedAccessGroupOutput {
+                verified_access_group: Some(record.view.clone()),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Verified Access group '{group_id}' could not be read back"
+                ))
+            })
     }
 }

@@ -212,8 +212,8 @@ fn refused(
         }
         Refusal::ProgramNotFound => {
             UpdateMultiplexProgramErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "MultiplexProgram",
+                message: Some(crate::state::multiplex_program_not_found_message(
+                    multiplex_id,
                     program_name,
                 )),
             })

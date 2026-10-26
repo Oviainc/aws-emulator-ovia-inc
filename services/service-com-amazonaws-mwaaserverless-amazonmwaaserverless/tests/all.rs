@@ -19,12 +19,16 @@ mod child_listing_absent_parent_walk;
 mod child_listing_cursor_scope;
 #[path = "all/child_listing_error_set.rs"]
 mod child_listing_error_set;
+#[path = "all/list_page_size.rs"]
+mod list_page_size;
 #[path = "all/missing_resource_lookups.rs"]
 mod missing_resource_lookups;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
 #[path = "all/run_lifecycle_progression.rs"]

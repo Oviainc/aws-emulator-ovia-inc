@@ -19,6 +19,11 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+// Declared here, at the head, for the reason the entry above records: the appended tail
+// and the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrent suites add their line to.
+#[path = "all/cloudformation_provisions_transfer_servers.rs"]
+mod cloudformation_provisions_transfer_servers;
 // Declared beside the entry above, at the head, for the same reason: the appended tail
 // and the sorted `s…` span are both regions concurrent suites land in.
 #[path = "all/ses_family_signing_name_routing.rs"]
@@ -211,6 +216,12 @@ mod iot_job_execution_reaches_the_device;
 mod iot_jobs_data_endpoint_discovery;
 #[path = "all/ivs_signing_name_routing.rs"]
 mod ivs_signing_name_routing;
+// Declared here, between two unrelated spans, rather than at the head of this file, in its
+// appended tail or in the `a…` span of its own name: all three are where concurrently
+// landing suites put their line, so a declaration in any of them loses a squash merge to
+// every one of them, while this boundary's neighbouring lines are stable.
+#[path = "all/apigatewayv2_cognito_jwt_authorizer.rs"]
+mod apigatewayv2_cognito_jwt_authorizer;
 #[path = "all/keyspaces_signing_name_routing.rs"]
 mod keyspaces_signing_name_routing;
 #[path = "all/keyspaces_streams_routing.rs"]

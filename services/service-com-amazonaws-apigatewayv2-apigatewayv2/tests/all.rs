@@ -69,6 +69,8 @@ mod model_lifecycle;
 mod model_template;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
+#[path = "all/portal_pagination.rs"]
+mod portal_pagination;
 #[path = "all/portal_product_lifecycle.rs"]
 mod portal_product_lifecycle;
 #[path = "all/portal_product_sharing_policy.rs"]
@@ -81,6 +83,8 @@ mod portal_publication;
 mod portal_update;
 #[path = "all/product_page_lifecycle.rs"]
 mod product_page_lifecycle;
+#[path = "all/product_rest_endpoint_page_deletion.rs"]
+mod product_rest_endpoint_page_deletion;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]
 mod product_rest_endpoint_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_update.rs"]

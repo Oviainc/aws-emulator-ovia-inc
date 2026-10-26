@@ -159,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The profile version" (`GetProfileInput$ProfileVersion`): a profile is read AT a
         // version, so a request that names one is asking for THAT revision of it, and a
         // version the profile does not have resolves to nothing. A request that names none
-        // reads the version the profile is at. Only the version `CreateProfile` minted can
-        // exist so far — `UpdateProfile`, which mints the next one, is a stub with its own
-        // issue — so the check compares against the stored version rather than searching a
-        // history this emulator does not keep yet.
+        // reads the version the profile is at. A profile holds the revision it is AT — the
+        // earlier revisions `UpdateProfile` moved it off are not kept — so the check
+        // compares against the stored version rather than searching a history this
+        // emulator does not keep.
         if let Some(asked) = input.profile_version.as_deref() {
             if asked != record.profile_version {
                 return Err(GetProfileErrorModeled::ResourceNotFoundException(

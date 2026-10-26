@@ -19,6 +19,8 @@ mod account_assignment_creation_status;
 mod account_assignment_delete;
 #[path = "all/account_assignment_deletion_status.rs"]
 mod account_assignment_deletion_status;
+#[path = "all/account_assignment_deletion_status_list.rs"]
+mod account_assignment_deletion_status_list;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
 #[path = "all/accounts_for_provisioned_permission_set.rs"]
@@ -93,6 +95,8 @@ mod managed_policies;
 mod managed_policies_in_permission_set;
 #[path = "all/permission_set_provisioning.rs"]
 mod permission_set_provisioning;
+#[path = "all/permission_set_provisioning_status_list.rs"]
+mod permission_set_provisioning_status_list;
 #[path = "all/permission_set_provisioning_status_poll.rs"]
 mod permission_set_provisioning_status_poll;
 #[path = "all/permission_set_update.rs"]

@@ -249,7 +249,7 @@ use super::template::{
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
-    WAF_REGIONAL_IP_SET,
+    TRANSFER_SERVER, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -330,6 +330,7 @@ pub(super) enum Provisioner {
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
     ElasticBeanstalkEnvironment,
+    TransferServer,
     CodeDeployApplication,
     CodeDeployDeploymentGroup,
     CodeDeployDeploymentConfig,
@@ -380,6 +381,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
         }
         ELASTIC_BEANSTALK_ENVIRONMENT => Some(Provisioner::ElasticBeanstalkEnvironment),
+        TRANSFER_SERVER => Some(Provisioner::TransferServer),
         CODEDEPLOY_APPLICATION => Some(Provisioner::CodeDeployApplication),
         CODEDEPLOY_DEPLOYMENT_GROUP => Some(Provisioner::CodeDeployDeploymentGroup),
         CODEDEPLOY_DEPLOYMENT_CONFIG => Some(Provisioner::CodeDeployDeploymentConfig),
@@ -533,6 +535,9 @@ impl Provisioner {
             }
             Self::ElasticBeanstalkEnvironment => {
                 create_eb_environment(ctx, region, resource, propagated).await
+            }
+            Self::TransferServer => {
+                create_transfer_server(ctx, region, resource, propagated).await
             }
             Self::CodeDeployApplication => {
                 create_codedeploy_application(ctx, region, resource, propagated).await
@@ -831,6 +836,10 @@ impl Provisioner {
             Self::ElasticBeanstalkEnvironment => {
                 terminate_eb_environment(ctx, region, physical_resource_id).await
             }
+            // The server is addressed by the `ServerId` Transfer Family assigned it,
+            // which this type's `ServerId` attribute carries — its physical id is the
+            // server's ARN.
+            Self::TransferServer => delete_transfer_server(ctx, region, resource).await,
             Self::CodeDeployApplication => {
                 delete_codedeploy_application(ctx, region, physical_resource_id).await
             }
@@ -972,6 +981,8 @@ impl Provisioner {
             Self::ElasticBeanstalkEnvironment => {
                 describe_eb_environment(ctx, region, physical_resource_id).await
             }
+            // Read back by the assigned `ServerId`, like the delete.
+            Self::TransferServer => describe_transfer_server(ctx, region, resource).await,
             Self::CodeDeployApplication => {
                 describe_codedeploy_application(ctx, region, physical_resource_id).await
             }
@@ -9454,6 +9465,181 @@ async fn call_codedeploy(
         region,
         AWS_JSON_1_1,
         &format!("{CODEDEPLOY_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS Transfer Family: AWS::Transfer::Server
+// ---------------------------------------------------------------------------
+
+/// AWS Transfer Family's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: transfer`, service shape `TransferService`), which speaks `awsJson1_1`.
+const TRANSFER_SIGNING_NAME: &str = "transfer";
+const TRANSFER_TARGET_PREFIX: &str = "TransferService";
+
+/// The error code AWS Transfer Family answers for a server it does not hold.
+const TRANSFER_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The properties of `AWS::Transfer::Server` that are reported back as the server's ACTUAL
+/// configuration, as `(property, member)` pairs: the members `DescribeServer` answers
+/// under the property's own name AND in the property's own shape.
+///
+/// `Protocols`, `Domain`, `EndpointType`, `IdentityProviderType`, `IpAddressType`,
+/// `SecurityPolicyName`, `LoggingRole`, `Certificate` and the two login banners are each
+/// one member of `DescribedServer` spelled identically to the property. The structured
+/// members a server also reports (`EndpointDetails`, `IdentityProviderDetails`,
+/// `ProtocolDetails`, `S3StorageOptions`, `WorkflowDetails`, `Tags`) are reported with
+/// every documented default already materialised, so comparing them against a declaration
+/// that names only some of their members would read as drift the declaration never asked
+/// for; a property the actual document does not carry is not evidence of anything
+/// ([`super::drift`]), so they are left out.
+const TRANSFER_SERVER_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("Certificate", "Certificate"),
+    ("Domain", "Domain"),
+    ("EndpointType", "EndpointType"),
+    ("IdentityProviderType", "IdentityProviderType"),
+    ("IpAddressType", "IpAddressType"),
+    ("LoggingRole", "LoggingRole"),
+    ("PostAuthenticationLoginBanner", "PostAuthenticationLoginBanner"),
+    ("PreAuthenticationLoginBanner", "PreAuthenticationLoginBanner"),
+    ("Protocols", "Protocols"),
+    ("SecurityPolicyName", "SecurityPolicyName"),
+];
+
+/// Create the server an `AWS::Transfer::Server` declares, so a client that deployed the
+/// stack and then calls `transfer describe-server` with the `ServerId` the stack publishes
+/// reads the server back rather than a `ResourceNotFoundException`.
+///
+/// The type's properties ARE `CreateServer`'s own members — `Certificate`, `Domain`,
+/// `EndpointDetails`, `EndpointType`, `IdentityProviderDetails`, `IdentityProviderType`,
+/// `IpAddressType`, `LoggingRole`, `PostAuthenticationLoginBanner`,
+/// `PreAuthenticationLoginBanner`, `ProtocolDetails`, `Protocols`, `S3StorageOptions`,
+/// `SecurityPolicyName`, `StructuredLogDestinations`, `Tags` and `WorkflowDetails` are
+/// named and shaped identically on both sides — so the evaluated property document IS the
+/// request, passed through verbatim. `Tags` is the one member rebuilt rather than carried:
+/// the server carries the tags CloudFormation gives it beside the declared ones
+/// ([`tags_of`]), as the `[{Key, Value}]` list that model's own `Tag` shape spells.
+///
+/// The server's identity is Transfer Family's OWN: `CreateServer` takes no identifier and
+/// answers the `ServerId` it assigned, and "Ref returns the Amazon Resource Name (ARN) of
+/// the server" — which carries that id. So the id that service assigned is reported back
+/// as this resource's physical id and as its `ServerId` attribute, and the stack publishes
+/// the handle Transfer Family really created rather than one these naming rules computed.
+async fn create_transfer_server(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            if property == "Tags" {
+                continue;
+            }
+            request.insert(property.clone(), value.clone());
+        }
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let answered = call_transfer(ctx, region, "CreateServer", &Value::Object(request)).await?;
+    let server_id = answered
+        .get("ServerId")
+        .and_then(Value::as_str)
+        .filter(|server_id| !server_id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "AWS Transfer Family answered CreateServer without a ServerId".to_string(),
+        })?;
+    // A Transfer Family server's ARN is a total function of the Region and the assigned
+    // id, built from the one account id this emulator mints — the same ARN that service
+    // keyed the server by and reports for it — so the handle below is the created
+    // server's own, not a guess at one.
+    let arn = ::emulator_server::emulator_arn(
+        TRANSFER_SIGNING_NAME,
+        region,
+        &format!("server/{server_id}"),
+    );
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.clone());
+    attributes.insert("ServerId".to_string(), server_id.to_string());
+    Ok(Created {
+        physical_resource_id: Some(arn),
+        attributes,
+    })
+}
+
+/// Delete the server a stack created, addressed by the `ServerId` Transfer Family assigned
+/// it.
+///
+/// A server that service no longer resolves the id to is already in the state the delete
+/// asks for, judged on its not-found CODE and never on a message.
+async fn delete_transfer_server(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "ServerId": transfer_server_id(resource) });
+    match call_transfer(ctx, region, "DeleteServer", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == TRANSFER_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The server's configuration as Transfer Family reports it, for drift detection. One it
+/// no longer holds was deleted, which is the `DELETED` drift status.
+async fn describe_transfer_server(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ServerId": transfer_server_id(resource) });
+    match call_transfer(ctx, region, "DescribeServer", &request).await {
+        Ok(answered) => Ok(Some(reported_as_properties(
+            answered.get("Server").unwrap_or(&Value::Null),
+            TRANSFER_SERVER_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == TRANSFER_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The `ServerId` a resource record is addressed by: the attribute the create reported,
+/// which is the id Transfer Family assigned.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to
+/// the last segment of its physical id, which is that same id — the physical id is the
+/// server's ARN, whose resource path is `server/<ServerId>`.
+fn transfer_server_id(resource: &StoredResource) -> String {
+    if let Some(server_id) = resource.attributes.get("ServerId") {
+        return server_id.clone();
+    }
+    resource
+        .physical_resource_id
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Call one AWS Transfer Family operation on the awsJson1_1 wire its model declares.
+async fn call_transfer(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        TRANSFER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{TRANSFER_TARGET_PREFIX}.{operation}"),
         request,
     )
     .await

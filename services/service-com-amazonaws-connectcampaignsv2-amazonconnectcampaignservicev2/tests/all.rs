@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/campaign_channel_subtype_config_deletion.rs"]
 mod campaign_channel_subtype_config_deletion;
+#[path = "all/campaign_channel_subtype_config_update.rs"]
+mod campaign_channel_subtype_config_update;
 #[path = "all/campaign_communication_limits.rs"]
 mod campaign_communication_limits;
 #[path = "all/campaign_communication_limits_deletion.rs"]
@@ -31,6 +33,8 @@ mod campaign_lifecycle;
 mod campaign_name_uniqueness;
 #[path = "all/campaign_not_found_message.rs"]
 mod campaign_not_found_message;
+#[path = "all/campaign_rename.rs"]
+mod campaign_rename;
 #[path = "all/campaign_resume.rs"]
 mod campaign_resume;
 #[path = "all/campaign_schedule_completion.rs"]

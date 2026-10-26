@@ -167,39 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The profile questions" (`CreateProfileInput$ProfileQuestions`) are answers to
         // questions, so each one is recorded UNDER the question it answers: the request's
-        // list becomes the map the profile holds, keyed by `QuestionId`.
-        //
-        // Two entries the model allows cannot be recorded that way, and both are refused
-        // with the modelled `ValidationException` rather than silently dropped or merged:
-        // an update that names no question (`ProfileQuestionUpdate$QuestionId` is
-        // optional) answers nothing, and two updates naming the SAME question disagree
-        // about one answer. The selected choices, by contrast, are a SET — "the selected
-        // choices", so a choice is either selected or not — so a choice named twice in
-        // one update selects it once.
-        let mut questions: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        for update in &input.profile_questions {
-            let question_id = update.question_id.as_deref().unwrap_or_default();
-            if question_id.is_empty() {
-                return Err(questions_validation(
-                    "Member must name the question it answers in QuestionId",
-                ));
-            }
-            if questions.contains_key(question_id) {
-                return Err(questions_validation(&format!(
-                    "Member must answer each question at most once, got {question_id} twice"
-                )));
-            }
-            questions.insert(
-                question_id.to_string(),
-                update
-                    .selected_choice_ids
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-            );
-        }
+        // list becomes the map the profile holds, keyed by `QuestionId`. The normalization,
+        // and the modelled `ValidationException` for an entry no profile can record, live
+        // in `crate::state` (`recorded_profile_questions`), shared with `UpdateProfile`,
+        // which records a profile's answers from the very same member.
+        let questions = crate::state::recorded_profile_questions(&input.profile_questions)
+            .map_err(CreateProfileErrorModeled::ValidationException)?;
 
         // How many questions one profile records is a QUOTA this emulator sets, not a
         // modelled constraint: `ProfileQuestionUpdates` publishes no `@length`, so the
@@ -330,16 +303,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_version: Some(profile_version),
         })
     }
-}
-
-/// The modelled `ValidationException` (HTTP 400) for a `ProfileQuestions` entry this
-/// operation cannot record, worded the way the framework's own constraint walk words a
-/// member failure ([`crate::state::member_constraint_exception`]) so a handler-enforced
-/// rule reads like a modelled one.
-fn questions_validation(constraint: &str) -> CreateProfileError {
-    CreateProfileErrorModeled::ValidationException(crate::state::member_constraint_exception(
-        crate::state::PROFILE_QUESTIONS_MEMBER,
-        constraint,
-    ))
-    .into()
 }

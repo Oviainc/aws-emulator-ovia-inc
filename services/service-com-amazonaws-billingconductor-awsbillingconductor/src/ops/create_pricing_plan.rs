@@ -255,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_time_millis: now,
             last_modified_time_millis: now,
+            // A plan starts with ONE generation — the one this call creates, projected
+            // from the record itself — so there is nothing it has superseded yet.
+            superseded_versions: Vec::new(),
         };
         state.pricing_plans.insert(arn.clone(), record);
         state.pricing_plan_names.insert(input.name, arn.clone());

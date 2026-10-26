@@ -25,7 +25,8 @@ async fn host_keys_page_in_host_key_id_order() {
     let server_id = emulator.create_server(json!({})).await;
 
     // Four stored keys, so a page size below, at and above the count are all distinct
-    // cases.
+    // cases — beside the key the server itself serves with, which is a host key of it
+    // too (`crate::server_host_key_resource`).
     let mut imported: Vec<String> = Vec::new();
     for index in 0..4 {
         let (material, _) = generated_host_key();
@@ -43,8 +44,9 @@ async fn host_keys_page_in_host_key_id_order() {
     let unbounded = walk_host_keys(&emulator, &server_id, None).await;
     assert_eq!(
         unbounded.len(),
-        imported.len(),
-        "case \"unbounded\": expected the {} stored host keys, got {unbounded:?}",
+        imported.len() + 1,
+        "case \"unbounded\": expected the {} imported host keys and the server's own, got \
+         {unbounded:?}",
         imported.len()
     );
     let ids: Vec<&str> = unbounded
@@ -64,7 +66,7 @@ async fn host_keys_page_in_host_key_id_order() {
         );
     }
 
-    for limit in [1_u32, 2, 3, 4, 5, 1000] {
+    for limit in [1_u32, 2, 3, 4, 5, 6, 1000] {
         let paged = walk_host_keys(&emulator, &server_id, Some(limit)).await;
         let paged_ids: Vec<&str> = paged
             .iter()

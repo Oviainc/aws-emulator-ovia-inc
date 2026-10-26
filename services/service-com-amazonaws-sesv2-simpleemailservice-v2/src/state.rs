@@ -72,6 +72,102 @@ pub const MAX_CONTACT_LISTS: usize = 1_000;
 /// `CreateContact`.
 pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
 
+/// Tenants the account may hold.
+///
+/// CHOSEN for the same reason as [`MAX_CONTACT_LISTS`]: one record per accepted
+/// `CreateTenant`, so a long-lived emulator needs a ceiling. `CreateTenant`
+/// refuses past it with the `LimitExceededException` its model binds.
+pub const MAX_TENANTS: usize = 1_000;
+
+/// The longest `TenantName` SES accepts: its documentation states the name "can
+/// contain up to 64 alphanumeric characters, including letters, numbers, hyphens
+/// (-) and underscores (_) only". The model itself binds only the lower bound
+/// (length 1..), so the upper bound and the character set are enforced by the
+/// handler.
+pub const MAX_TENANT_NAME_CHARS: usize = 64;
+
+/// The ARN namespace this service stamps on a resource ARN it mints: SES's ARN
+/// namespace is `ses`.
+pub const ARN_NAMESPACE: &str = "ses";
+
+/// The region an ARN carries when the request carries no SigV4 credential scope
+/// naming one.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `SendingStatus` a freshly created tenant carries: sending is allowed for a
+/// new tenant, and `ENABLED` is terminal — the clock owes no transition out of it.
+pub const TENANT_SENDING_STATUS_CREATED: &str = "ENABLED";
+
+/// The `SuppressionListScope` a tenant gets when the request names none:
+/// `TenantSuppressionAttributes$SuppressionScope` documents that "if you don't
+/// specify a suppression scope, the tenant defaults to ACCOUNT scope and uses the
+/// account-level suppression list".
+pub const DEFAULT_SUPPRESSION_SCOPE: &str = "ACCOUNT";
+
+/// The region to stamp into the ARNs a request mints: the SigV4 credential
+/// scope's region, else [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// `arn:aws:ses:<region>:<account>:tenant/<name>/<id>` — the ARN SES reports for a
+/// tenant: the resource part names the tenant AND its id, so the ARN identifies
+/// the tenant record even after a tenant of the same name is recreated. Minted
+/// once at create and read back from the record afterwards.
+pub fn tenant_arn(region: &str, tenant_name: &str, tenant_id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("tenant/{tenant_name}/{tenant_id}"),
+    )
+}
+
+/// Whether `tenant_name` satisfies the documented `TenantName` form: at most
+/// [`MAX_TENANT_NAME_CHARS`] characters, each a letter, a digit, `-` or `_`.
+pub fn tenant_name_is_well_formed(tenant_name: &str) -> bool {
+    let length = tenant_name.chars().count();
+    length > 0
+        && length <= MAX_TENANT_NAME_CHARS
+        && tenant_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// How this service words `BadRequestException` for a `TenantName` that does not
+/// satisfy the documented form, stated once for every operation that takes one.
+pub fn invalid_tenant_name(tenant_name: &str) -> String {
+    format!(
+        "Invalid tenant name: {tenant_name}. The name can contain up to \
+         {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, \
+         numbers, hyphens (-) and underscores (_) only."
+    )
+}
+
+/// How this service words `NotFoundException` for a tenant it does not hold.
+///
+/// One wording for every operation that takes a `TenantName`, so a client sees the
+/// same sentence whichever call first tells it the tenant is gone.
+pub fn tenant_not_found(tenant_name: &str) -> String {
+    format!("Tenant {tenant_name} does not exist.")
+}
+
+/// How this service words `AlreadyExistsException` for a tenant name already taken.
+pub fn tenant_already_exists(tenant_name: &str) -> String {
+    format!("Tenant with name: {tenant_name} already exists.")
+}
+
+/// Configuration sets the account may hold: SES's documented quota is 10,000
+/// configuration sets per account per Region, and `CreateConfigurationSet` refuses
+/// past it with the `LimitExceededException` its model binds.
+pub const MAX_CONFIGURATION_SETS: usize = 10_000;
+
+/// The longest a `ConfigurationSetName` may be, from the member's own
+/// documentation: "The name can contain up to 64 alphanumeric characters, including
+/// letters, numbers, hyphens (-) and underscores (_) only."
+pub const MAX_CONFIGURATION_SET_NAME_LEN: usize = 64;
+
 /// Per-service state for com-amazonaws-sesv2-simpleemailservice-v2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -79,10 +175,22 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// were created with. Ordered, so `ListEmailIdentities` enumerates and pages
     /// deterministically.
     pub identities: BTreeMap<String, EmailIdentityRecord>,
+    /// Tenants, keyed by the `TenantName` they were created with — an opaque name
+    /// the API echoes back as given, so it is keyed exactly as supplied. Ordered,
+    /// so `ListTenants` enumerates and pages deterministically.
+    pub tenants: BTreeMap<String, TenantRecord>,
+    /// Monotonic counter feeding [`Self::next_tenant_id`], so two tenants created
+    /// in the same millisecond still get different ids.
+    pub tenant_sequence: u64,
     /// Contact lists, keyed by the `ContactListName` they were created with — an
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
     /// Ordered, so `ListContactLists` enumerates and pages deterministically.
     pub contact_lists: BTreeMap<String, ContactListRecord>,
+    /// Configuration sets, keyed by the `ConfigurationSetName` they were created
+    /// with. The name is an identifier the API echoes back as given and compares
+    /// exactly, so it is keyed exactly as supplied. Ordered, so
+    /// `ListConfigurationSets` enumerates and pages deterministically.
+    pub configuration_sets: BTreeMap<String, ConfigurationSetRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -187,6 +295,24 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             .as_millis();
         let sequence = self.message_sequence;
         format!("0100{millis:012x}-{sequence:016x}-000000")
+    }
+
+    /// Mint the next `TenantId`.
+    ///
+    /// `TenantId` is documented only as "a unique identifier for the tenant" and
+    /// carries no modelled format, so the one guarantee this makes is that
+    /// documented one: uniqueness is structural, because the monotonic sequence
+    /// number is part of the id, so two tenants created in the same millisecond
+    /// still differ. The id is minted once, at create, and read back from the
+    /// record afterwards.
+    pub fn next_tenant_id(&mut self, now: SystemTime) -> String {
+        self.tenant_sequence += 1;
+        let millis = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let sequence = self.tenant_sequence;
+        format!("{millis:016x}{sequence:016x}")
     }
 }
 
@@ -560,6 +686,83 @@ impl ContactRecord {
     }
 }
 
+/// One tenant: the logical container SES groups resources, reputation and sending
+/// status under.
+#[derive(Debug, Clone)]
+pub struct TenantRecord {
+    /// The `TenantName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `TenantId`, minted once by [`ComAmazonawsSesv2SimpleemailserviceV2State::next_tenant_id`].
+    pub tenant_id: String,
+    /// `TenantArn`, minted once from the request's region by [`tenant_arn`].
+    pub arn: String,
+    /// When the tenant was created.
+    pub created_at: SystemTime,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// `SendingStatus`.
+    pub sending_status: String,
+    /// `TenantSuppressionAttributes$SuppressedReasons`: the reasons an address is
+    /// added to this tenant's suppression list, in the order supplied.
+    pub suppressed_reasons: Vec<String>,
+    /// `TenantSuppressionAttributes$SuppressionScope`.
+    pub suppression_scope: String,
+}
+
+impl TenantRecord {
+    /// A tenant as `CreateTenant` stores it: sending enabled, and the
+    /// account-level suppression list until a caller asks for a tenant-level one.
+    pub fn new(name: &str, tenant_id: String, arn: String, now: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            tenant_id,
+            arn,
+            created_at: now,
+            tags: Vec::new(),
+            sending_status: TENANT_SENDING_STATUS_CREATED.to_string(),
+            suppressed_reasons: Vec::new(),
+            suppression_scope: DEFAULT_SUPPRESSION_SCOPE.to_string(),
+        }
+    }
+
+    /// The modelled `TenantSuppressionAttributes` view of this record, shared by
+    /// every operation that reports a tenant's suppression preferences, so a write
+    /// and the read after it cannot disagree.
+    pub fn suppression_attributes(&self) -> crate::ops::types::TenantSuppressionAttributes {
+        crate::ops::types::TenantSuppressionAttributes {
+            // A tenant that adds nothing automatically has no reason set at all,
+            // rather than an empty one.
+            suppressed_reasons: (!self.suppressed_reasons.is_empty())
+                .then(|| self.suppressed_reasons.clone()),
+            suppression_scope: Some(self.suppression_scope.clone()),
+        }
+    }
+
+    /// The modelled `Tenant` view of this record, as `GetTenant` reports it.
+    pub fn view(&self) -> crate::ops::types::Tenant {
+        crate::ops::types::Tenant {
+            tenant_name: Some(self.name.clone()),
+            tenant_id: Some(self.tenant_id.clone()),
+            tenant_arn: Some(self.arn.clone()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            tags: Some(self.tag_list()),
+            sending_status: Some(self.sending_status.clone()),
+            suppression_attributes: Some(self.suppression_attributes()),
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
 /// How this service words `NotFoundException` for a contact list it does not hold.
 ///
 /// One wording for every operation that takes a `ContactListName` — the reads, the
@@ -576,6 +779,156 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
         "Contact with email address: {email_address} doesn't exist in list: \
          {contact_list_name}."
     )
+}
+
+/// One configuration set: the rules a send that names it is subject to.
+///
+/// Every member is the EFFECTIVE configuration, with the documented default already
+/// resolved at create time, so a read reports what a send would be subject to rather
+/// than re-deriving a default per reader.
+#[derive(Debug, Clone)]
+pub struct ConfigurationSetRecord {
+    /// The `ConfigurationSetName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `TrackingOptions`: the custom open/click redirect domain, when the caller
+    /// configured one. SES tracks through its own domain otherwise, so an
+    /// unconfigured set holds nothing here.
+    pub tracking_options: Option<crate::ops::types::TrackingOptions>,
+    /// `DeliveryOptions$TlsPolicy`.
+    pub tls_policy: String,
+    /// `DeliveryOptions$MaxDeliverySeconds`, when the caller bounded delivery.
+    pub max_delivery_seconds: Option<i64>,
+    /// `ReputationOptions$ReputationMetricsEnabled`.
+    pub reputation_metrics_enabled: bool,
+    /// `SendingOptions$SendingEnabled`.
+    pub sending_enabled: bool,
+    /// `SuppressionOptions`, as supplied: a set that configures none falls back to
+    /// the tenant or account suppression preferences, so nothing is stored.
+    pub suppression_options: Option<crate::ops::types::SuppressionOptions>,
+    /// `VdmOptions`, as supplied.
+    pub vdm_options: Option<crate::ops::types::VdmOptions>,
+    /// `MessageSecurityOptions`, as supplied.
+    pub message_security_options: Option<crate::ops::types::MessageSecurityOptions>,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the set was created.
+    pub created_at: SystemTime,
+    /// When the set's reputation metrics were last given a fresh start.
+    ///
+    /// `ReputationOptions$LastFreshStart` is "the date and time when the reputation
+    /// metrics were last given a fresh start", and SES documents that where sending
+    /// has never been disabled and re-enabled this is the time the configuration set
+    /// was created \u2014 so it starts at the create instant and moves only when a fresh
+    /// start happens.
+    pub last_fresh_start: SystemTime,
+}
+
+impl ConfigurationSetRecord {
+    /// A set as `CreateConfigurationSet` stores it when the request configures
+    /// nothing: SES's own defaults.
+    pub fn new(name: &str, now: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            tracking_options: None,
+            // `TlsPolicy`: "If the value is Require, messages are only delivered if
+            // a TLS connection can be established. If the value is Optional,
+            // messages can be delivered in plain text if a TLS connection can't be
+            // established." SES delivers opportunistically unless a caller asks for
+            // the stricter policy, so a set that configures none is Optional.
+            tls_policy: TLS_POLICY_OPTIONAL.to_string(),
+            max_delivery_seconds: None,
+            // The member's modelled default.
+            reputation_metrics_enabled: false,
+            // Sending through a configuration set is something a caller PAUSES
+            // (`PutConfigurationSetSendingOptions` "enable or disable email sending
+            // for messages that use this configuration set"), so a newly created set
+            // does not itself hold sending back.
+            sending_enabled: true,
+            suppression_options: None,
+            vdm_options: None,
+            message_security_options: None,
+            tags: Vec::new(),
+            created_at: now,
+            last_fresh_start: now,
+        }
+    }
+
+    /// The modelled `DeliveryOptions` view of this record.
+    ///
+    /// One projection shared by every operation that reports a set's delivery
+    /// configuration, so a create and the read after it cannot disagree.
+    pub fn delivery_options(&self) -> crate::ops::types::DeliveryOptions {
+        crate::ops::types::DeliveryOptions {
+            tls_policy: Some(self.tls_policy.clone()),
+            // The dedicated IP pool a set sends from is a resource no implemented
+            // operation of this service keeps, so no set holds one.
+            sending_pool_name: None,
+            max_delivery_seconds: self.max_delivery_seconds,
+        }
+    }
+
+    /// The modelled `ReputationOptions` view of this record.
+    pub fn reputation_options(&self) -> crate::ops::types::ReputationOptions {
+        crate::ops::types::ReputationOptions {
+            reputation_metrics_enabled: self.reputation_metrics_enabled,
+            last_fresh_start: Some(::aws_smithy_types::DateTime::from(self.last_fresh_start)),
+        }
+    }
+
+    /// The modelled `SendingOptions` view of this record.
+    pub fn sending_options(&self) -> crate::ops::types::SendingOptions {
+        crate::ops::types::SendingOptions {
+            sending_enabled: self.sending_enabled,
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The `TlsPolicy` value a configuration set holds when the caller configured none.
+pub const TLS_POLICY_OPTIONAL: &str = "OPTIONAL";
+
+/// Whether `name` is a `ConfigurationSetName` SES accepts.
+///
+/// From the member's documentation: "The name can contain up to 64 alphanumeric
+/// characters, including letters, numbers, hyphens (-) and underscores (_) only" —
+/// so a name is a non-empty run of at most [`MAX_CONFIGURATION_SET_NAME_LEN`] ASCII
+/// letters, digits, hyphens and underscores.
+pub fn configuration_set_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_CONFIGURATION_SET_NAME_LEN
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// How this service words the refusal of a `ConfigurationSetName` outside the
+/// documented character and length rule, stated once for every operation that takes
+/// one.
+pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
+    format!(
+        "Configuration set name {configuration_set_name} is invalid. The name can contain up to \
+         {MAX_CONFIGURATION_SET_NAME_LEN} alphanumeric characters, including letters, numbers, \
+         hyphens (-) and underscores (_) only."
+    )
+}
+
+/// How this service words `NotFoundException` for a configuration set it does not
+/// hold.
+///
+/// One wording for every operation that takes a `ConfigurationSetName`, so a client
+/// sees the same sentence whichever call first tells it the set is not there.
+pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
+    format!("Configuration set {configuration_set_name} does not exist.")
 }
 
 /// One accepted outbound message.

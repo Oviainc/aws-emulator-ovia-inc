@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfigurationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfigurationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfigurationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored configuration set the request names, or refuses with
+//! `NotFoundException` when the account holds none by that name. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfigurationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfigurationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfigurationSet"))
+        // Request metadata is not needed: a configuration set is keyed by name within
+        // the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetConfigurationSet without the shared emulator state",
+            ));
+        };
+
+        let name = input.configuration_set_name;
+        if !crate::state::configuration_set_name_is_valid(&name) {
+            return Err(GetConfigurationSetErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::configuration_set_name_invalid(&name)),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let Some(record) = store.configuration_sets.get(&name) else {
+            return Err(GetConfigurationSetErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::configuration_set_not_found(&name)),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetConfigurationSetOutput {
+            configuration_set_name: Some(record.name.clone()),
+            // Open and click tracking is configured per set; a set that configures no
+            // custom redirect domain carries no `TrackingOptions` member at all.
+            tracking_options: record.tracking_options.clone(),
+            // The delivery, reputation and sending views always exist: they carry the
+            // effective policy a send through this set is subject to, which is SES's
+            // own default until a caller changes it.
+            delivery_options: Some(record.delivery_options()),
+            reputation_options: Some(record.reputation_options()),
+            sending_options: Some(record.sending_options()),
+            // A set with no tags has no `Tags` member, rather than an empty list.
+            tags: (!record.tags.is_empty()).then(|| record.tag_list()),
+            // The options below are reported only where the set configures them: a set
+            // that configures none follows the account's (or tenant's) own preferences
+            // instead of holding one of its own.
+            suppression_options: record.suppression_options.clone(),
+            vdm_options: record.vdm_options.clone(),
+            // The MailManager archive a set sends to is a resource no implemented
+            // operation keeps, so no set holds one.
+            archiving_options: None,
+            message_security_options: record.message_security_options.clone(),
+        })
     }
 }

@@ -10,8 +10,12 @@
 //! the modelled 400 `ValidationException` and records nothing: the address
 //! becomes the root user email address of the account, and the syntax it is held
 //! to is the email-address expression this service's model declares
-//! ([`crate::state::validated_email_address`]). A request on an account whose
-//! previous update has been accepted
+//! ([`crate::state::validated_email_address`]). An address another account
+//! already holds, or is already owed by its accepted update, is refused with the
+//! modelled 409 `ConflictException` and records nothing — the conflict this
+//! service's `ConflictException` documents by example, decided where the change
+//! is asked for rather than only where it is confirmed. A request on an account
+//! whose previous update has been accepted
 //! and whose address change the clock has not applied yet is refused with the
 //! modelled 409 `ConflictException`, rather than replacing a record and dropping
 //! a change that is already owed.
@@ -210,17 +214,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Materialise every completion the clock already owes, across every
+        // account, before deciding: an accepted update whose completion came
+        // due has already made its address that account's primary email, so
+        // both the record this call writes over and the addresses that count as
+        // in use are the settled ones.
+        store.settle_primary_email_updates(now);
+        // The address a root user email change asks for cannot be one that is
+        // already in use as an account's primary email address — the conflict
+        // this service's own `ConflictException` documents by example — and that
+        // is as true where the change is ASKED for as where it is confirmed:
+        // the passcode this operation sends is sent towards an address the
+        // service could never assign. Decided with the store-wide helper the
+        // confirming step uses, and BEFORE the target record is reached, so a
+        // refused start records nothing (not even the account record a stored
+        // update would have created). The target account itself is skipped on
+        // both halves of the test: asking again for the address it already
+        // holds, or is already owed, takes that address from nobody.
+        if store.primary_email_in_use_by_other(&input.primary_email, &input.account_id) {
+            return Err(StartPrimaryEmailUpdateErrorModeled::ConflictException(
+                crate::state::primary_email_already_in_use(),
+            )
+            .into());
+        }
         let Some(account) = store.account_mut(&input.account_id, now) else {
             return Err(StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(
                 crate::state::account_store_full(&input.account_id),
             )
             .into());
         };
-        // Materialise the completion the clock already owes this account before
-        // its update record is replaced: an accepted update whose completion
-        // came due has already made its address the account's primary email,
-        // and starting another update must not lose that.
-        account.settle_primary_email_update(now);
         // What the settle above leaves ACCEPTED is an update whose completion is
         // still OWED: the service has already confirmed that address change and
         // the clock has not applied it yet. A change the clock owes is never

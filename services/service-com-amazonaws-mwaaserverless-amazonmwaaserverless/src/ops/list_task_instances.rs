@@ -93,13 +93,6 @@ use std::time::SystemTime;
 /// another paginated list of this service is refused here.
 const PAGE_KIND: &str = "TaskInstances";
 
-/// The smallest page size the modelled `MaxResults` range allows
-/// (`@range(min: 1, max: 100)`).
-const MIN_PAGE_SIZE: usize = 1;
-
-/// The largest page size that same range allows.
-const MAX_PAGE_SIZE: usize = 100;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -236,14 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
-        // this handler runs, so the value is already a usable page size; it is held to
-        // those published bounds anyway, because a page size of zero would report "this
-        // run has no task instances" for a run that has them — a wrong answer dressed as
-        // success — and the walk must always make progress.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(0)
-            .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+        // The page size this walk serves, through the one derivation every paginated
+        // listing of this service shares (`crate::state::page_size`).
+        let page_size = crate::state::page_size(input.max_results);
 
         // The entity this listing walks is the RUN its `@httpLabel`s name. A workflow
         // this endpoint does not hold (including one of ANOTHER region) and a workflow

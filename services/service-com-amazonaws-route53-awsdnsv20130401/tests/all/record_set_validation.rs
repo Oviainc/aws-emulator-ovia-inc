@@ -91,7 +91,7 @@ impl Rrset {
         self
     }
 
-    fn alias(mut self, hosted_zone_id: &str, dns_name: &str) -> Self {
+    pub(crate) fn alias(mut self, hosted_zone_id: &str, dns_name: &str) -> Self {
         self.alias = Some((hosted_zone_id.to_string(), dns_name.to_string()));
         self
     }
