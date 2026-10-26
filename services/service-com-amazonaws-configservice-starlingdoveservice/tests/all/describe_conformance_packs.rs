@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::DESCRIBE_CONFORMANCE_PACKS_PAGE_SIZE;
 
 use crate::config_setup_and_rule_loop::Emulator;
-use crate::conformance_packs::{pack_from_body, rule_template};
+use crate::conformance_packs::{pack_from_body, past_the_deployment, rule_template};
 
 /// How Config words `NoSuchConformancePackException` for the names a request carried
 /// that resolve to no pack: the fixed sentence, then the names themselves.
@@ -251,6 +251,9 @@ async fn a_redeploy_is_reported_with_what_it_was_last_deployed_with() {
             .unwrap_or_else(|| panic!("case {case:?}: the pack carries an id, got {before}"))
             .to_string();
 
+        // A pack is redeployed once its previous deployment has settled: while that one
+        // is in flight the pack is in use (`conformance_packs` pins that refusal).
+        tokio::time::sleep(past_the_deployment()).await;
         let redeployed_arn = deploy(case, &emulator, name, &second).await;
         let after = emulator
             .ok("DescribeConformancePacks", &describe_of(&[name]))

@@ -21,6 +21,11 @@
 //!   duplicate resource if one was already created": a second call for the same name
 //!   redeploys that pack rather than creating another, and "tags will not be updated,
 //!   even if they are different";
+//! * "For PutConformancePack ..., a conformance pack creation, update, and deletion is
+//!   in progress. Try your request again later." (`ResourceInUseException`): the
+//!   deployment this call starts is still in flight when it answers, so a further call
+//!   for a pack whose deployment has not settled is refused rather than restarting work
+//!   in progress — the idempotency above is what a call for a SETTLED pack gets;
 //! * a NEW pack has to fit under this Region's conformance pack quota
 //!   ([`crate::state::CONFORMANCE_PACKS_QUOTA`]), else
 //!   `MaxNumberOfConformancePacksExceededException`;
@@ -911,6 +916,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let completes_at = now + crate::state::CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER;
         let mut store = state.lock();
+
+        // "For PutConformancePack and PutOrganizationConformancePack, a conformance pack
+        // creation, update, and deletion is in progress. Try your request again later."
+        // (`ResourceInUseException`): the deployment this operation starts is still
+        // running when the call answers, so a further call for a pack whose deployment is
+        // in flight is refused rather than restarting work in progress. A pack whose
+        // deployment has finished — complete, or failed — is redeployed as usual.
+        if store
+            .conformance_packs
+            .get(&name)
+            .is_some_and(|pack| {
+                pack.state_at(now) == crate::state::CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS
+            })
+        {
+            return Err(PutConformancePackErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(
+                        "A conformance pack creation, update, and deletion is in progress. Try \
+                         your request again later."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         // "Subsequent requests won't create a duplicate resource if one was already
         // created": a pack this account already holds is REDEPLOYED from the template

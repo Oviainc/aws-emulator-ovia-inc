@@ -12,9 +12,11 @@
 //! `DescribeConformancePackStatus` reports.
 //!
 //! Three further properties are pinned with it: the operation is idempotent, so a second
-//! call for the same name redeploys that pack rather than creating another; exactly one
-//! of `TemplateS3Uri`, `TemplateBody` and `TemplateSSMDocumentDetails` may be specified;
-//! and a status read pages over the packs' name ordering.
+//! call for the same name redeploys that pack rather than creating another — once that
+//! pack's deployment has settled, a call made while it is still in flight finding the
+//! pack in use (`ResourceInUseException`); exactly one of `TemplateS3Uri`, `TemplateBody`
+//! and `TemplateSSMDocumentDetails` may be specified; and a status read pages over the
+//! packs' name ordering.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
@@ -33,7 +35,7 @@ use crate::config_setup_and_rule_loop::Emulator;
 
 /// Long enough for the clock to have made a pack's deployment due, read from the service
 /// itself so the test cannot drift from the span the service owes.
-fn past_the_deployment() -> Duration {
+pub(crate) fn past_the_deployment() -> Duration {
     CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER + Duration::from_millis(200)
 }
 
@@ -546,6 +548,10 @@ async fn a_second_put_for_the_same_name_redeploys_that_pack_rather_than_creating
         .to_string();
 
     for (case, request) in cases {
+        // A pack is redeployed once its previous deployment has settled; a call made
+        // while that deployment is still in flight finds the pack in use, which
+        // `a_put_for_a_pack_whose_deployment_is_still_in_flight_is_refused` pins.
+        tokio::time::sleep(past_the_deployment()).await;
         let answered = emulator.ok("PutConformancePack", &request).await;
         assert_eq!(
             answered["ConformancePackArn"].as_str(),
@@ -571,6 +577,133 @@ async fn a_second_put_for_the_same_name_redeploys_that_pack_rather_than_creating
             "case {case:?}: the pack keeps the tags it was created with, got {tags}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_put_for_a_pack_whose_deployment_is_still_in_flight_is_refused() {
+    // "For PutConformancePack and PutOrganizationConformancePack, a conformance pack
+    // creation, update, and deletion is in progress. Try your request again later."
+    // (`ResourceInUseException`.) Rows differ along what the call made while the first
+    // deployment is still in flight asks for: the same request again, another template,
+    // a delivery location, and other tags.
+    let name = "in-flight-pack";
+    let cases: [(&str, Value); 4] = [
+        (
+            "the same request again",
+            pack_from_body(name, &rule_template("only-rule")),
+        ),
+        (
+            "another template, declaring another rule",
+            pack_from_body(name, &rule_template("another-rule")),
+        ),
+        ("a delivery location", {
+            let mut body = pack_from_body(name, &rule_template("only-rule"));
+            body["DeliveryS3Bucket"] = json!("config-templates");
+            body
+        }),
+        ("other tags", {
+            let mut body = pack_from_body(name, &rule_template("only-rule"));
+            body["Tags"] = json!([{ "Key": "owner", "Value": "someone-else" }]);
+            body
+        }),
+    ];
+
+    for (case, request) in cases {
+        let emulator = Emulator::new();
+        let created = emulator
+            .ok(
+                "PutConformancePack",
+                &pack_from_body(name, &rule_template("only-rule")),
+            )
+            .await;
+        let arn = created["ConformancePackArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a ConformancePackArn, got {created}"))
+            .to_string();
+
+        let (status, code) = emulator.refused("PutConformancePack", &request).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ResourceInUseException"),
+            "case {case:?}: a put for a pack whose deployment is in flight is refused 400 \
+             ResourceInUseException, got {status} {code}"
+        );
+
+        // The refusal left the deployment it refused in flight, and stored nothing of the
+        // call it refused: the pack still carries what the deployment in flight started
+        // with.
+        let body = emulator
+            .ok("DescribeConformancePackStatus", &status_of(&[name]))
+            .await;
+        let reported = details(case, &body);
+        let [detail] = reported.as_slice() else {
+            panic!("case {case:?}: the account holds exactly one pack of that name, got {body}");
+        };
+        assert_eq!(
+            detail["ConformancePackState"].as_str(),
+            Some(CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS),
+            "case {case:?}: the refused call leaves the deployment in flight, got {detail}"
+        );
+        let described = emulator
+            .ok(
+                "DescribeConformancePacks",
+                &json!({ "ConformancePackNames": [name] }),
+            )
+            .await;
+        assert!(
+            described["ConformancePackDetails"][0]["DeliveryS3Bucket"].is_null(),
+            "case {case:?}: the refused call stored none of its own configuration, got \
+             {described}"
+        );
+
+        // Once the clock has made that deployment due, the very same call is served, as
+        // the redeploy of the pack that already exists.
+        tokio::time::sleep(past_the_deployment()).await;
+        let answered = emulator.ok("PutConformancePack", &request).await;
+        assert_eq!(
+            answered["ConformancePackArn"].as_str(),
+            Some(arn.as_str()),
+            "case {case:?}: a pack whose deployment has settled is redeployed under the ARN it \
+             was created with, got {answered}"
+        );
+    }
+
+    // The rule is about a deployment in FLIGHT, not about the pack existing: a deployment
+    // that FAILED is finished, so the pack it left behind is redeployed with no wait.
+    let emulator = Emulator::new();
+    let mut oversized = String::from("Resources:\n");
+    for index in 0..=CONFIG_RULES_QUOTA {
+        oversized.push_str(&format!(
+            "  Rule{index}:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
+             ConfigRuleName: rule-{index}\n      Source:\n        Owner: AWS\n        \
+             SourceIdentifier: IAM_PASSWORD_POLICY\n"
+        ));
+    }
+    emulator
+        .ok(
+            "PutConformancePack",
+            &pack_from_body("failed-pack", &oversized),
+        )
+        .await;
+    let body = emulator
+        .ok("DescribeConformancePackStatus", &status_of(&["failed-pack"]))
+        .await;
+    assert_eq!(
+        body["ConformancePackStatusDetails"][0]["ConformancePackState"].as_str(),
+        Some("CREATE_FAILED"),
+        "a deployment past the Config rules quota of {CONFIG_RULES_QUOTA} failed, got {body}"
+    );
+    let redeployed = emulator
+        .ok(
+            "PutConformancePack",
+            &pack_from_body("failed-pack", &rule_template("only-rule")),
+        )
+        .await;
+    assert!(
+        redeployed["ConformancePackArn"].as_str().is_some(),
+        "a pack whose deployment failed is redeployed rather than reported in use, got \
+         {redeployed}"
+    );
 }
 
 #[tokio::test]
@@ -707,6 +840,9 @@ async fn a_redeploy_replaces_exactly_the_resources_this_packs_own_deployment_cre
     ];
 
     for (case, template_body, expected) in cases {
+        // The previous deployment of this pack has to have settled before the next one is
+        // accepted; see `a_put_for_a_pack_whose_deployment_is_still_in_flight_is_refused`.
+        tokio::time::sleep(past_the_deployment()).await;
         emulator
             .ok(
                 "PutConformancePack",
@@ -832,7 +968,8 @@ async fn a_new_pack_past_this_regions_conformance_pack_quota_is_refused() {
     }
 
     // A pack this account already holds is redeployed rather than created, so the quota
-    // does not stand in its way.
+    // does not stand in its way — once that pack's own deployment has settled.
+    tokio::time::sleep(past_the_deployment()).await;
     let redeployed = emulator
         .ok("PutConformancePack", &pack_from_body("pack-0000", &template))
         .await;
