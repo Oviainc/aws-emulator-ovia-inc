@@ -19,6 +19,8 @@ mod aliases;
 mod client_error_status;
 #[path = "all/custom_key_stores.rs"]
 mod custom_key_stores;
+#[path = "all/data_key_pair_without_plaintext.rs"]
+mod data_key_pair_without_plaintext;
 #[path = "all/data_key_without_plaintext.rs"]
 mod data_key_without_plaintext;
 #[path = "all/decrypt_key_origin.rs"]

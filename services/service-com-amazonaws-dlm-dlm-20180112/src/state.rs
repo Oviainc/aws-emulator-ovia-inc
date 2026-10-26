@@ -394,8 +394,21 @@ pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails 
 /// of one member would need a precedence between them, and any fixed precedence
 /// makes a write to the losing place unobservable, so the write paths resolve the
 /// two into this ONE value and the read reports it.
+///
+/// The resource type is one of them: `PolicyDetails$ResourceType` and
+/// `CreateLifecyclePolicyRequest$DefaultPolicy` carry the SAME documentation
+/// ("Specify the type of default policy to create", `VOLUME` or `INSTANCE`), so
+/// they are the structure form and the body form of one member and it is resolved
+/// here like the rest. It is the one member an update may not CHANGE
+/// (`UpdateLifecyclePolicyRequest$PolicyDetails`: "You cannot update the policy
+/// type or the resource type"), so it is the one member
+/// [`LifecyclePolicyRecord::replace_default_policy_configuration`] does not reset
+/// to a default.
 #[derive(Debug, Clone, Default)]
 pub struct DefaultPolicyConfiguration {
+    /// `DefaultPolicyTypeValues` (`INSTANCE` | `VOLUME`), as
+    /// `PolicyDetails$ResourceType` or `DefaultPolicy` states it.
+    pub resource_type: Option<String>,
     pub create_interval: Option<i32>,
     pub retain_interval: Option<i32>,
     pub copy_tags: Option<bool>,
@@ -413,6 +426,7 @@ impl DefaultPolicyConfiguration {
     /// are.
     pub fn taken_from_policy_details(details: &mut PolicyDetails) -> Self {
         Self {
+            resource_type: details.resource_type.take(),
             create_interval: details.create_interval.take(),
             retain_interval: details.retain_interval.take(),
             copy_tags: details.copy_tags.take(),
@@ -429,6 +443,7 @@ impl DefaultPolicyConfiguration {
     /// and the precedence never decides anything a caller can observe.
     pub fn or(self, fallback: Self) -> Self {
         Self {
+            resource_type: self.resource_type.or(fallback.resource_type),
             create_interval: self.create_interval.or(fallback.create_interval),
             retain_interval: self.retain_interval.or(fallback.retain_interval),
             copy_tags: self.copy_tags.or(fallback.copy_tags),
@@ -465,7 +480,12 @@ pub struct LifecyclePolicyRecord {
     pub policy_details: Option<PolicyDetails>,
     /// True when this is a default policy rather than a custom one.
     pub default_policy: bool,
-    /// `DefaultPolicyTypeValues` (`INSTANCE` | `VOLUME`) for a default policy.
+    /// `DefaultPolicyTypeValues` (`INSTANCE` | `VOLUME`) for a default policy:
+    /// the ONE stored copy of the resource type, whichever of the two
+    /// alternative places the request stated it in (`DefaultPolicy` at the
+    /// request-body level, or `PolicyDetails$ResourceType` inside the
+    /// configuration structure), so every read and the `resourceTypes` filter
+    /// report the same type.
     pub default_policy_type: Option<String>,
     /// The `[Default policies only]` configuration, in the ONE place this record
     /// keeps it — see [`DefaultPolicyConfiguration`].
@@ -506,10 +526,7 @@ impl LifecyclePolicyRecord {
         let mut details = self.policy_details.clone().unwrap_or_default();
         details.policy_language = Some(SIMPLIFIED_POLICY_LANGUAGE.to_string());
         details.policy_type = Some(self.policy_type());
-        details.resource_type = self
-            .default_policy_type
-            .clone()
-            .or(details.resource_type.clone());
+        details.resource_type = self.default_policy_type.clone();
         details.create_interval = Some(self.create_interval.unwrap_or(DEFAULT_CREATE_INTERVAL));
         details.retain_interval = Some(self.retain_interval.unwrap_or(DEFAULT_RETAIN_INTERVAL));
         details.copy_tags = Some(self.copy_tags.unwrap_or(DEFAULT_COPY_TAGS));
@@ -531,10 +548,22 @@ impl LifecyclePolicyRecord {
     /// member it omits goes back to the default its own documentation publishes,
     /// because the `PolicyDetails` structure a request states IS "the
     /// configuration of the lifecycle policy" rather than a patch of it.
+    ///
+    /// The resource type is the exception the model states:
+    /// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
+    /// lifecycle policy. You cannot update the policy type or the resource type",
+    /// so a configuration that omits it leaves the type the policy was created
+    /// with in place rather than unsetting it. A configuration that STATES it has
+    /// been checked against that stored type already (the update refuses a
+    /// different one), so storing it here is what fills in a type nothing had
+    /// stated yet and is otherwise a write of the value already held.
     pub fn replace_default_policy_configuration(
         &mut self,
         configuration: DefaultPolicyConfiguration,
     ) {
+        if configuration.resource_type.is_some() {
+            self.default_policy_type = configuration.resource_type;
+        }
         self.create_interval = configuration.create_interval;
         self.retain_interval = configuration.retain_interval;
         self.copy_tags = configuration.copy_tags;
@@ -560,7 +589,7 @@ impl LifecyclePolicyRecord {
     /// policy it is however its configuration structure was written.
     pub fn policy_type(&self) -> String {
         if self.default_policy {
-            return match self.default_policy_target().as_deref() {
+            return match self.default_policy_type.as_deref() {
                 Some(INSTANCE_DEFAULT_POLICY_TYPE) => IMAGE_POLICY_TYPE.to_string(),
                 _ => DEFAULT_POLICY_TYPE.to_string(),
             };
@@ -571,29 +600,17 @@ impl LifecyclePolicyRecord {
             .unwrap_or_else(|| DEFAULT_POLICY_TYPE.to_string())
     }
 
-    /// The `DefaultPolicyTypeValues` member a DEFAULT policy names, from
-    /// whichever of the two alternative places the request stated it in:
-    /// `DefaultPolicy` at the request-body level, or the `[Default policies
-    /// only]` `PolicyDetails$ResourceType`.
-    fn default_policy_target(&self) -> Option<String> {
-        if let Some(default_type) = self.default_policy_type.clone() {
-            return Some(default_type);
-        }
-        self.policy_details
-            .as_ref()
-            .and_then(|details| details.resource_type.clone())
-    }
-
     /// Every resource type this policy targets, for the `resourceTypes` filter.
+    ///
+    /// A DEFAULT policy targets the one type [`Self::default_policy_type`] holds
+    /// — the single stored copy of it, which is also the one every read reports —
+    /// and a CUSTOM policy the types its configuration's `ResourceTypes` names.
     pub fn target_resource_types(&self) -> Vec<String> {
         let mut types: Vec<String> = Vec::new();
         if let Some(default_type) = self.default_policy_type.as_ref() {
             types.push(default_type.clone());
         }
         if let Some(details) = self.policy_details.as_ref() {
-            if let Some(resource_type) = details.resource_type.as_ref() {
-                types.push(resource_type.clone());
-            }
             if let Some(resource_types) = details.resource_types.as_ref() {
                 types.extend(resource_types.iter().cloned());
             }
@@ -947,7 +964,7 @@ impl DefaultPolicyOnlyParameters {
     /// stated inside the configuration structure, `""` for a request-body one.
     pub fn stated_names(&self, prefix: &str) -> Vec<String> {
         [
-            ("ResourceType", self.resource_type),
+            (RESOURCE_TYPE_MEMBER, self.resource_type),
             ("CreateInterval", self.create_interval),
             ("RetainInterval", self.retain_interval),
             ("CopyTags", self.copy_tags),
@@ -988,6 +1005,32 @@ pub fn configuration_stated_twice(body_parameters: &[String]) -> InvalidRequestE
 /// The wire name of the configuration structure the body parameters are an
 /// alternative to.
 pub const POLICY_DETAILS_MEMBER: &str = "PolicyDetails";
+
+/// The wire name of the `PolicyDetails` member that states a default policy's
+/// resource type.
+pub const RESOURCE_TYPE_MEMBER: &str = "ResourceType";
+
+/// The wire name of the request-BODY member that states the same thing as
+/// [`RESOURCE_TYPE_MEMBER`]: `CreateLifecyclePolicyRequest$DefaultPolicy` and
+/// `PolicyDetails$ResourceType` carry the same documentation, so a create naming
+/// both states the resource type twice.
+pub const DEFAULT_POLICY_MEMBER: &str = "DefaultPolicy";
+
+/// The `InvalidRequestException` for an update whose configuration states a
+/// resource type other than the one the policy holds.
+///
+/// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
+/// lifecycle policy. You cannot update the policy type or the resource type": the
+/// request states a configuration the service cannot apply to this policy, which
+/// is the "invalid parameters" the operation models `InvalidRequestException`
+/// for. The message names the member refused, the type the policy holds and the
+/// one the request asked for.
+pub fn resource_type_cannot_be_updated(stated: &str, stored: &str) -> InvalidRequestException {
+    invalid_request(format!(
+        "The parameter {POLICY_DETAILS_PREFIX}{RESOURCE_TYPE_MEMBER} cannot be updated. The \
+         policy's resource type is {stored} and {stated} was requested."
+    ))
+}
 
 /// The `InvalidRequestException` for `[Default policies only]` parameters stated
 /// by a request that is not creating or updating a DEFAULT policy.

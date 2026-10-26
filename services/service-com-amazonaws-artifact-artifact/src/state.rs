@@ -64,7 +64,11 @@
 //!
 //! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
 //! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
-//! the presigned URL it answers with carries.
+//! the presigned URL it answers with carries. That document is served the same way a
+//! report's is — from the bytes the export stored, under the endpoint the caller reached
+//! ([`document_url_host`]) and a path this service publishes
+//! ([`EXPORT_DOCUMENT_PATH_PREFIX`]) — so the URL the export announces resolves for
+//! whoever was handed it.
 //!
 //! The CUSTOMER-AGREEMENT set is held the same way as the catalog, and for the same
 //! reason: the API has no operation that creates, accepts or terminates one — an
@@ -139,16 +143,18 @@ pub const TERM_GRANT_CAPACITY: usize = 1_000;
 /// not issue.
 pub const REASON_INVALID_TOKEN: &str = "invalidToken";
 
-/// The first label of the host this service publishes its compliance-inquiry EXPORT URLs
-/// under (`<DOCUMENT_HOST>.<region>.amazonaws.com`, see [`inquiry_export_url`]). It names
-/// no service, which is why [`is_document_host`] exists: `crate::service` claims a request
-/// addressed to it, so a URL this service handed out routes back here.
-const DOCUMENT_HOST: &str = "artifact-documents";
+/// The path prefix the compliance-inquiry EXPORT documents are served under, within this
+/// service's own endpoint (see [`export_document_path`]).
+///
+/// Like [`DOCUMENT_PATH_PREFIX`] it is not a modelled operation URI — every modelled one
+/// is `/v1/compliance-inquiry/<verb>`, and the segment after this prefix is an inquiry id
+/// rather than a verb — so an export download can never be mistaken for a control-plane
+/// call, and `crate::service` can claim the paths this service publishes its exports at.
+pub const EXPORT_DOCUMENT_PATH_PREFIX: &str = "/v1/compliance-inquiry/download";
 
-/// The host a REPORT or TERM document URL names when the request carries neither a `Host`
-/// header nor an authority to read the emulator's own endpoint from. A LOOPBACK literal:
-/// this emulator serves the document the URL names, so a caller that follows it must come
-/// back here.
+/// The host a document URL names when the request carries neither a `Host` header nor an
+/// authority to read the emulator's own endpoint from. A LOOPBACK literal: this emulator
+/// serves the document the URL names, so a caller that follows it must come back here.
 const LOOPBACK_HOST: &str = "127.0.0.1";
 
 /// The path prefix the document data plane serves, under this service's own endpoint.
@@ -1281,8 +1287,8 @@ pub struct InquiryExport {
 /// What a request to a published export-document URL names: the inquiry the document was
 /// exported from, the export that produced it, and the object being fetched.
 ///
-/// The path is the one [`inquiry_export_url`] builds:
-/// `/compliance-inquiry/<inquiryId>/export/<exportId>/<object>`.
+/// The path is the one [`export_document_path`] builds:
+/// `<EXPORT_DOCUMENT_PATH_PREFIX>/<inquiryId>/export/<exportId>/<object>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportDocumentTarget {
     pub inquiry_id: String,
@@ -1293,7 +1299,9 @@ pub struct ExportDocumentTarget {
 /// The export document a request path names, or `None` when the path is not one this
 /// service publishes.
 pub fn parse_export_document_path(path: &str) -> Option<ExportDocumentTarget> {
-    let rest = path.strip_prefix("/compliance-inquiry/")?;
+    let rest = path
+        .strip_prefix(EXPORT_DOCUMENT_PATH_PREFIX)?
+        .strip_prefix('/')?;
     let mut segments = rest.split('/');
     let (Some(inquiry_id), Some("export"), Some(export_id), Some(object), None) = (
         segments.next(),
@@ -1312,25 +1320,6 @@ pub fn parse_export_document_path(path: &str) -> Option<ExportDocumentTarget> {
         export_id: export_id.to_string(),
         object: object.to_string(),
     })
-}
-
-/// True when `host` is the hostname this service publishes its document URLs under —
-/// `<DOCUMENT_HOST>.<region>.amazonaws.com`, as [`inquiry_export_url`] builds it.
-///
-/// Recognising it is what routes a request to a URL this service HANDED OUT back to this
-/// service: the host's first label names no service, so the framework's route key cannot
-/// name one from it.
-pub fn is_document_host(host: &str) -> bool {
-    let host = host.rsplit('@').next().unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
-    let Some(rest) = host
-        .strip_prefix(DOCUMENT_HOST)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return false;
-    };
-    rest.strip_suffix(".amazonaws.com")
-        .is_some_and(is_region_shaped)
 }
 
 /// Per-service state for com-amazonaws-artifact-artifact. A handler reaches it through [`service_state`].
@@ -1734,8 +1723,8 @@ const QUERY_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPH
     .remove(b'_')
     .remove(b'~');
 
-/// The endpoint the request reached this emulator on, as a REPORT or TERM document URL
-/// names it: the request's own `Host`, else the authority its URI carries, else
+/// The endpoint the request reached this emulator on, as every document URL this service
+/// announces names it: the request's own `Host`, else the authority its URI carries, else
 /// [`LOOPBACK_HOST`].
 ///
 /// Read from the request rather than built from the model's endpoint template, because
@@ -1744,9 +1733,7 @@ const QUERY_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPH
 ///
 /// The value is a value the CALLER chose, and it is interpolated into a URL this service
 /// announces, so only a BARE AUTHORITY is honoured: anything else is not an endpoint, and
-/// the loopback literal is announced instead of reflecting it. (`crate::service`'s own
-/// `request_host` reads the same two sources without that filter, because recognising the
-/// published export host is all it has to do.)
+/// the loopback literal is announced instead of reflecting it.
 pub fn document_url_host(parts: &::http::request::Parts) -> String {
     parts
         .headers
@@ -1791,18 +1778,31 @@ pub fn report_document_url(
     )
 }
 
+/// The path the document one compliance-inquiry export produced is published at: the
+/// inquiry it was exported from, the export that produced it, and the document's own file
+/// name. Built from the STORED export, never from the request, so the path names where the
+/// document is rather than what was asked for.
+pub fn export_document_path(inquiry_id: &str, export_id: &str) -> String {
+    format!(
+        "{EXPORT_DOCUMENT_PATH_PREFIX}/{inquiry_id}/export/{export_id}/{INQUIRY_EXPORT_OBJECT}"
+    )
+}
+
 /// The URL of the document one compliance-inquiry export produced.
 ///
-/// Built from the stored export — the inquiry it was exported from and the export's own
-/// id — so each export of an inquiry has its own URL and the URL names the record it can
-/// be traced back to. As with [`report_document_url`], NO SigV4 signature is attached:
-/// this emulator does not sign documents, and a fabricated signature would claim a
-/// computation nothing performed.
-pub fn inquiry_export_url(region: &str, inquiry_id: &str, export_id: &str) -> String {
-    format!(
-        "https://{DOCUMENT_HOST}.{region}.amazonaws.com/compliance-inquiry/{inquiry_id}\
-         /export/{export_id}/{INQUIRY_EXPORT_OBJECT}"
-    )
+/// `host` is the endpoint the CALLER reached this emulator on (see [`document_url_host`]),
+/// exactly as [`report_document_url`] and [`term_document_url`] name it: this emulator
+/// holds the export's document, so the URL it announces has to resolve back here for
+/// whoever was handed it rather than naming a host this emulator does not serve.
+///
+/// The path is built from the stored export — the inquiry it was exported from and the
+/// export's own id — so each export of an inquiry has its own URL and the URL names the
+/// record it can be traced back to. As with [`report_document_url`], NO SigV4 signature is
+/// attached: this emulator does not sign documents, and a fabricated signature would claim
+/// a computation nothing performed.
+pub fn inquiry_export_url(host: &str, inquiry_id: &str, export_id: &str) -> String {
+    let path = export_document_path(inquiry_id, export_id);
+    format!("https://{host}{path}")
 }
 
 /// The URL of the term document governing `report`, under the grant `term_token`.

@@ -59,6 +59,8 @@ mod revision_conflict_message;
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_transition_revision.rs"]
+mod status_transition_revision;
 #[path = "all/tag_cap.rs"]
 mod tag_cap;
 #[path = "all/unknown_catalog_lookup.rs"]

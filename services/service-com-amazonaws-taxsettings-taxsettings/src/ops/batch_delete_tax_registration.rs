@@ -162,19 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut errors: Vec<BatchDeleteTaxRegistrationError2> = Vec::new();
         let mut store = state.lock();
-        let mut addressed: ::std::collections::BTreeSet<&str> =
-            ::std::collections::BTreeSet::new();
-        for account_id in &input.account_ids {
-            // `accountIds` is "List of unique account identifiers", and the
-            // registration of every account the request names is removed once,
-            // so an id named twice names the SAME account and the SAME single
-            // deletion: it is performed and reported once rather than judged a
-            // second time against the record this very call just removed, which
-            // would report the deletion of that account as having failed with
-            // "not found" in the response that performed it.
-            if !addressed.insert(account_id.as_str()) {
-                continue;
-            }
+        // The registration of every account the request addresses is removed
+        // once, in the order the request names them, so the `errors` rows below
+        // are built in request order — see
+        // [`crate::state::distinct_account_ids`], which is where what a repeated
+        // id means is stated for this whole service.
+        for account_id in crate::state::distinct_account_ids(&input.account_ids) {
             // Exactly what this account's own single-account delete would have
             // answered, so the two delete paths cannot disagree about one
             // record: the code is the modelled error that delete raises and the
@@ -190,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             match refused {
                 Some((code, message)) => errors.push(BatchDeleteTaxRegistrationError2 {
-                    account_id: account_id.clone(),
+                    account_id: account_id.to_string(),
                     message,
                     code: Some(code.to_string()),
                 }),

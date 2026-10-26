@@ -11,11 +11,18 @@
 //! so an account with no ACTIVE one is refused with the modelled `ValidationException`
 //! (HTTP 400) before `ContactId` is resolved and before anything is removed.
 //!
-//! A contact that still has contact channels is NOT removed: the model's own
-//! `ConflictException` doc says "Updating or deleting a resource causes an inconsistent
-//! state", and a channel's `ContactArn` is required, so deleting the contact under it
-//! would leave a channel pointing at nothing. The refusal names the dependent channels in
-//! the error's `DependentEntities`.
+//! A contact another resource DEPENDS ON is NOT removed: the model's own `ConflictException`
+//! doc says "Updating or deleting a resource causes an inconsistent state", and a dependent
+//! resource names the contact in a member it is required to carry — a contact channel's
+//! `ContactArn`, a rotation's `ContactIds` (modelled `length` 1..30) or a rotation override's
+//! `NewContactIds` — so removing the contact under it would leave that resource naming an ARN
+//! that names nothing, which this service's own creates refuse to be given. The refusal is
+//! the modelled `ConflictException` (HTTP 409), one `DependentEntity` per relation, and the
+//! contact stays readable.
+//!
+//! A `Plan` reference is the contrary case and does not block: this operation's own doc says
+//! deleting a contact "does not remove it from escalation plans and related response plans",
+//! so a contact another contact's plan targets still deletes and that plan keeps its stage.
 //!
 //! ## Shape of an operation
 //!
@@ -185,28 +192,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     message: format!("Contact {} not found", input.contact_id),
                     resource_id: input.contact_id.clone(),
-                    resource_type: "contact".to_string(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
                 },
             )
             .into());
         };
         let alias = contact.alias.clone();
 
-        let dependent_channels = state.channel_arns_of(&input.contact_id);
-        if !dependent_channels.is_empty() {
+        let dependents = dependent_entities(&state, &input.contact_id);
+        if !dependents.is_empty() {
             return Err(DeleteContactErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Contact {} still has {} contact channel(s); delete them before deleting \
-                     the contact",
-                    input.contact_id,
-                    dependent_channels.len()
-                ),
+                message: dependency_conflict_message(&input.contact_id, &dependents),
                 resource_id: input.contact_id.clone(),
-                resource_type: "contact".to_string(),
-                dependent_entities: Some(vec![DependentEntity {
-                    relation_type: "contact-channel".to_string(),
-                    dependent_resource_ids: dependent_channels,
-                }]),
+                resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                dependent_entities: Some(dependents),
             })
             .into());
         }
@@ -219,6 +218,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeleteContactOutput {})
     }
+}
+
+/// The `resourceType` this operation's errors name, spelled as the other contact handlers
+/// spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The `RelationType` of a channel that belongs to the contact.
+const CONTACT_CHANNEL_RELATION: &str = "contact-channel";
+
+/// The `RelationType` of a rotation whose shift team — its own or an override's — names the
+/// contact. The model's `DependentEntity` doc states exactly this relation: "if a contact is
+/// a member of a rotation, the rotation is a dependent entity of the contact".
+const ROTATION_RELATION: &str = "rotation";
+
+/// How many ARNs one `DependentEntity` may report: `DependentResourceIds` targets
+/// `SsmContactsArnList`, modelled `length` 0..25, so a relation with more dependents than
+/// that reports the first 25 rather than a list the model cannot carry.
+const MAX_DEPENDENT_RESOURCE_IDS: usize = 25;
+
+/// Every resource that still holds a reference to `contact_arn` which the REFERRING resource
+/// cannot be without, one [`DependentEntity`] per relation.
+///
+/// Those references are the ones stored in a required member of another resource: a contact
+/// channel's `ContactArn`, a rotation's `ContactIds` (`length` 1..30, so a rotation always
+/// names at least one contact) and a rotation override's `NewContactIds`. Removing the
+/// contact under them would leave the referring resource naming an ARN that names nothing —
+/// a state this service's own creates refuse to be given.
+///
+/// A `Plan` reference is deliberately NOT one of them: `DeleteContact`'s own documentation
+/// says deleting a contact "does not remove it from escalation plans and related response
+/// plans", so a plan that targets the contact keeps its stage and the delete proceeds.
+fn dependent_entities(
+    state: &crate::state::ComAmazonawsSsmcontactsSsmcontactsState,
+    contact_arn: &str,
+) -> Vec<DependentEntity> {
+    let relations = [
+        (CONTACT_CHANNEL_RELATION, state.channel_arns_of(contact_arn)),
+        (
+            ROTATION_RELATION,
+            state.rotation_arns_depending_on_contact(contact_arn),
+        ),
+    ];
+    relations
+        .into_iter()
+        .filter_map(|(relation_type, mut dependent_resource_ids)| {
+            if dependent_resource_ids.is_empty() {
+                return None;
+            }
+            dependent_resource_ids.truncate(MAX_DEPENDENT_RESOURCE_IDS);
+            Some(DependentEntity {
+                relation_type: relation_type.to_string(),
+                dependent_resource_ids,
+            })
+        })
+        .collect()
+}
+
+/// The refusal's `Message`: the contact the request named, and how many resources of each
+/// relation depend on it — the same relations the error's `DependentEntities` lists by ARN.
+fn dependency_conflict_message(contact_arn: &str, dependents: &[DependentEntity]) -> String {
+    let relations: Vec<String> = dependents
+        .iter()
+        .map(|entity| {
+            format!(
+                "{} {}(s)",
+                entity.dependent_resource_ids.len(),
+                entity.relation_type
+            )
+        })
+        .collect();
+    format!(
+        "Contact {contact_arn} is in use by {}; delete or update them before deleting the \
+         contact",
+        relations.join(" and ")
+    )
 }
 
 /// The account precondition's refusal: this operation's modelled `ValidationException`,

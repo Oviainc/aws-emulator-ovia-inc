@@ -7,7 +7,9 @@
 //! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]) and its 400 `BadRequestException`
 //! for a key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, which
 //! a caller may not delete. Idempotent: a key the resource
-//! does not carry is nothing to remove, not a failure.
+//! does not carry is nothing to remove, not a failure. A successful removal re-stamps
+//! the group's `lastModifiedBy`/`lastModifiedAt`, as every write to that record does
+//! ([`crate::state::InvestigationGroup::touch`]).
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::bad_request(why));
         }
 
+        // A tag removal mutates the stored group, so it re-stamps the record exactly as
+        // every other write to it does (`InvestigationGroup::touch`): the principal and
+        // the instant are read from this request before the store is locked.
+        let principal = crate::state::caller_principal(ctx.parts());
+        let modified_at = crate::state::now_epoch_seconds();
         // This service is regional: the endpoint this request reached holds only the
         // groups of the Region it was signed for, so another Region's group is absent
         // here and cannot be untagged through it.
@@ -188,6 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for key in &input.tag_keys {
             group.tags.remove(key);
         }
+        // The write succeeded, so the record it changed reports this caller and this
+        // instant as its last writer, the same way every other mutation of the group
+        // does — including one whose stored value happened not to differ.
+        group.touch(&principal, modified_at);
 
         Ok(UntagResourceOutput {})
     }

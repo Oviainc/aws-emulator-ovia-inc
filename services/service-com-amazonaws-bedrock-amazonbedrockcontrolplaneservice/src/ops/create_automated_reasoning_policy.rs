@@ -272,6 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             created_at: now,
             updated_at: now,
+            // A fresh policy has only its draft; `CreateAutomatedReasoningPolicyVersion`
+            // cuts the first numbered version, which is why the next number is 1.
+            versions: ::std::collections::BTreeMap::new(),
+            version_tokens: ::std::collections::HashMap::new(),
+            next_version: 1,
         };
 
         store

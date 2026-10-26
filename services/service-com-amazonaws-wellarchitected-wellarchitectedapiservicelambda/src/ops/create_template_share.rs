@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTemplateShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTemplateShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTemplateShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records a share of one review template with one principal, minted a
+//! `ShareId` of its own, and raises the invitation its recipient has to answer. The path
+//! `TemplateArn` is resolved by lookup, so an ARN no stored review template answers to is
+//! `ResourceNotFoundException` (404); sharing with the principal doing the sharing is
+//! `ValidationException` (400), a principal that already holds a share of the template is
+//! `ConflictException` (409), and `ClientRequestToken` replays the original share rather
+//! than minting a second.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +171,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTemplateShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTemplateShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTemplateShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTemplateShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool review template store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "TemplateArn": &input.template_arn,
+            "SharedWith": &input.shared_with,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // share the original request created instead of creating a second one.
+        if let Some(token) = store
+            .create_template_share_tokens
+            .get(&input.client_request_token)
+        {
+            if token.fingerprint != fingerprint {
+                let share_id = token.share_id.clone();
+                return Err(CreateTemplateShareErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::TEMPLATE_SHARE_RESOURCE_TYPE,
+                        share_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(recorded) = store.template_share(&token.template_arn, &token.share_id) {
+                return Ok(CreateTemplateShareOutput {
+                    template_arn: Some(recorded.template_arn.clone()),
+                    share_id: Some(recorded.share_id.clone()),
+                });
+            }
+            // The token names a share that is no longer stored, so there is no original
+            // result to return: forget the token and let this request share afresh, which
+            // is what the caller asked for — the same fall-through `CreateProfileShare`
+            // makes for a share its token no longer resolves to.
+            store
+                .create_template_share_tokens
+                .forget(&input.client_request_token);
+        }
+
+        // The review template being shared is resolved by this lookup, so a `TemplateArn`
+        // no stored template answers to is the lookup's 404 whatever its syntax, and the
+        // account that owns the template (`ReviewTemplate$Owner`) is the principal doing
+        // the sharing.
+        let Some(shared_by) = store
+            .review_templates
+            .get(&input.template_arn)
+            .map(|template| template.owner.clone())
+        else {
+            return Err(CreateTemplateShareErrorModeled::ResourceNotFoundException(
+                crate::state::review_template_not_found(&input.template_arn),
+            )
+            .into());
+        };
+
+        // A share GRANTS access to a principal that does not have it: the sharer already
+        // has it, so sharing with the sharer's own principal is not a share at all. The
+        // comparison is against the identity that shares the template — the owning account
+        // this request is attributed to — never against a literal account id, and the
+        // refusal states the PRINCIPAL RELATIONSHIP that was refused rather than a
+        // constraint on the member's value, so it discloses no account id
+        // (`crate::state::SELF_SHARE_MESSAGE`).
+        if input.shared_with == shared_by {
+            return Err(CreateTemplateShareErrorModeled::ValidationException(
+                crate::state::self_share_exception(),
+            )
+            .into());
+        }
+
+        // One principal holds at most one share of one review template: the access a
+        // second share would grant belongs to the share that already exists, which
+        // `DeleteTemplateShare` is the operation to revoke (still a scaffold with its own
+        // issue, so nothing revokes one yet).
+        if let Some(existing) = store.template_share_with(&input.template_arn, &input.shared_with) {
+            let conflict = crate::state::template_share_conflict(existing);
+            return Err(CreateTemplateShareErrorModeled::ConflictException(conflict).into());
+        }
+
+        // Shares are metered per review template, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a share and its create token are both 1:1 with a live grant.
+        if store.template_shares_of(&input.template_arn).len()
+            >= crate::state::MAX_SHARES_PER_REVIEW_TEMPLATE
+        {
+            return Err(
+                CreateTemplateShareErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The review template with ARN {} already holds the maximum of {} \
+                             shares",
+                            input.template_arn,
+                            crate::state::MAX_SHARES_PER_REVIEW_TEMPLATE
+                        ),
+                        resource_id: Some(input.template_arn.clone()),
+                        resource_type: Some(
+                            crate::state::TEMPLATE_SHARE_RESOURCE_TYPE.to_string(),
+                        ),
+                        // The model publishes no numeric Service Quotas code for this
+                        // quota, so it is named by what it meters; the service code is
+                        // this service's own signing name.
+                        quota_code: "SharesPerReviewTemplate".to_string(),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let share_id = store.mint_share_id();
+        // Creating the share is what raises the invitation the recipient has to answer —
+        // "Shared access to a review template is not removed until the review template
+        // share invitation is deleted" — so the invitation exists from here. It is a
+        // resource of its own, named by its own `ShareInvitationId` rather than by this
+        // share's `ShareId`, and it is what `ListShareInvitations` reports to the
+        // principal offered the share.
+        let share_invitation_id = store.mint_share_invitation_id();
+        let record = crate::state::TemplateShareRecord {
+            share_id: share_id.clone(),
+            share_invitation_id,
+            template_arn: input.template_arn.clone(),
+            shared_by,
+            shared_with: input.shared_with,
+            // A new share waits on the invitation the principal it was offered to has to
+            // answer; nothing this operation does accepts it on their behalf.
+            status: crate::state::DEFAULT_SHARE_STATUS.to_string(),
+            status_message: None,
+        };
+        store
+            .template_shares
+            .entry(input.template_arn.clone())
+            .or_default()
+            .insert(share_id.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_template_share_tokens.remember(
+            input.client_request_token,
+            crate::state::CreateTemplateShareToken {
+                template_arn: input.template_arn.clone(),
+                share_id: share_id.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateTemplateShareOutput {
+            template_arn: Some(input.template_arn),
+            share_id: Some(share_id),
+        })
     }
 }

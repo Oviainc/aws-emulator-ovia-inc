@@ -212,9 +212,9 @@ pub struct CapacityCounts {
 
 impl CapacityCounts {
     /// The counts the named form of `capacity` asks for, or `None` when it names
-    /// neither form — which every operation that takes a capacity refuses on the
-    /// `capacity` member itself ([`ONE_CAPACITY_FORM`]) before reading its
-    /// counts.
+    /// neither form — which [`capacity_refusal`], the one check every operation
+    /// that takes a capacity runs, has already refused on the `capacity` member
+    /// itself ([`ONE_CAPACITY_FORM`]) before any counts are read.
     ///
     /// An update's `CapacityUpdate` mirrors `Capacity` member for member and is
     /// read through [`capacity_from_update`], so both operations' forms reach
@@ -278,7 +278,16 @@ impl CapacityCounts {
 /// on the `Capacity` its request carried, an update on the `Capacity` its
 /// `CapacityUpdate` converts to ([`capacity_from_update`]), so neither can
 /// accept a capacity the other refuses.
+///
+/// It decides the whole rule, the form as well as the counts: a connector is
+/// "whether it is auto scaled or provisioned", so a capacity names exactly one
+/// of the two optional forms the model gives it ([`ONE_CAPACITY_FORM`], blamed
+/// on the `capacity` member that carried them), and only then are the counts
+/// inside the named form read ([`CapacityCounts::refusal`]).
 pub fn capacity_refusal(capacity: &Capacity) -> Option<String> {
+    if capacity.auto_scaling.is_some() == capacity.provisioned_capacity.is_some() {
+        return Some(invalid_parameter_because("capacity", ONE_CAPACITY_FORM));
+    }
     CapacityCounts::of(capacity)?.refusal()
 }
 

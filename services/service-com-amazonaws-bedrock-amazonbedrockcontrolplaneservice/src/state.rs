@@ -67,7 +67,9 @@
 //! And it holds the Automated Reasoning policies `ops/create_automated_reasoning_policy.rs`
 //! mints and `ops/get_automated_reasoning_policy.rs` reads back, each with the draft
 //! definition it was created with and the hash of that definition, so the hash the create
-//! answered is the hash the read reports.
+//! answered is the hash the read reports — and, beside that draft, every numbered version
+//! `ops/create_automated_reasoning_policy_version.rs` cuts from it, which the same read
+//! reports when the ARN it is given carries that version's number.
 //!
 //! And it holds the build workflows of those policies —
 //! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them and
@@ -1742,7 +1744,8 @@ impl AutomatedReasoningPolicyBuildWorkflowRecord {
 }
 
 /// A stored Automated Reasoning policy: the identity `CreateAutomatedReasoningPolicy`
-/// minted, and the draft definition every later read of that policy reports.
+/// minted, the draft definition every later read of that policy reports, and every
+/// numbered version snapshotted from that draft.
 ///
 /// The `definitionHash` is held beside the definition rather than recomputed per read, so
 /// the hash the create answered is the hash the read reports; it is a function of the
@@ -1782,6 +1785,71 @@ pub struct AutomatedReasoningPolicyRecord {
     /// When the policy was last written. The creation instant until an update rewrites
     /// the draft.
     pub updated_at: SystemTime,
+    /// Every numbered version cut from this policy's draft, keyed by its version number —
+    /// the `:<version>` suffix an `AutomatedReasoningPolicyArn` carries.
+    ///
+    /// Held INSIDE the policy record, like a guardrail's [`Guardrail::versions`], so a
+    /// version can neither outlive the policy it was cut from nor be reached under another
+    /// one. A version is a SNAPSHOT: nothing rewrites an entry once it is inserted, which
+    /// is what makes a later write to the draft invisible to it.
+    pub versions: BTreeMap<u32, AutomatedReasoningPolicyVersionRecord>,
+    /// `CreateAutomatedReasoningPolicyVersion` idempotency: `clientRequestToken` -> the
+    /// version number that token cut.
+    ///
+    /// Inside the record for the reason [`Guardrail::version_tokens`] is: it holds at most
+    /// one entry per version of this policy, and dies with the policy by construction.
+    pub version_tokens: HashMap<String, u32>,
+    /// The number `CreateAutomatedReasoningPolicyVersion` will mint next, from `1` upwards
+    /// — the smallest number `AutomatedReasoningPolicyVersion` (`^([1-9][0-9]{0,11})$`)
+    /// admits.
+    pub next_version: u32,
+}
+
+impl AutomatedReasoningPolicyRecord {
+    /// The version `number` names, or `None` when this policy has cut no such version.
+    #[must_use]
+    pub fn version(&self, number: u32) -> Option<&AutomatedReasoningPolicyVersionRecord> {
+        self.versions.get(&number)
+    }
+}
+
+/// The most numbered versions one Automated Reasoning policy may hold at once, past which
+/// cutting another is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota: version numbers are never
+/// reused and no operation of this service removes a single version, so without a
+/// server-side cap a caller could grow one policy's snapshots without end.
+pub const MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY: usize = 100;
+
+/// One numbered version of an Automated Reasoning policy: the snapshot
+/// `CreateAutomatedReasoningPolicyVersion` cut from the policy's draft, which every later
+/// read of that version reports.
+///
+/// The definition and its hash are COPIED out of the draft at the instant the version was
+/// cut rather than borrowed from it, which is what makes the version immutable: a later
+/// write to the draft changes the draft's hash and leaves every version's alone.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyVersionRecord {
+    /// The versioned `AutomatedReasoningPolicyArn` this version is addressed by, minted by
+    /// [`automated_reasoning_policy_version_arn`].
+    pub arn: String,
+    /// `version` — the number this snapshot was cut as, from `1` upwards.
+    pub version: u32,
+    /// `name`, as the policy carried it when the version was cut.
+    pub name: String,
+    /// `description`, as the policy carried it when the version was cut (absent when it
+    /// carried none).
+    pub description: Option<String>,
+    /// The policy definition this version froze, absent when the draft carried none.
+    pub definition: Option<AutomatedReasoningPolicyDefinition>,
+    /// `definitionHash` — [`policy_definition_hash`] of [`Self::definition`], so the hash
+    /// the version answers is the hash of what it froze.
+    pub definition_hash: String,
+    /// `tags` — the tags the create-version request attached to this version.
+    pub tags: Vec<Tag>,
+    /// `createdAt` — when this version was cut. Also the instant a read reports as its
+    /// last update, since nothing rewrites a version.
+    pub created_at: SystemTime,
 }
 
 /// The most tests one Automated Reasoning policy may hold at once, past which a create is
@@ -2006,6 +2074,12 @@ pub struct AccountDataRetention {
 ///   `CreateAutomatedReasoningPolicy` enforces, and
 ///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
 ///   the same reason `create_tokens` does.
+///
+/// * each policy's [`AutomatedReasoningPolicyRecord::versions`] holds one entry per version
+///   cut from it, capped at [`MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY`] by the
+///   quota `CreateAutomatedReasoningPolicyVersion` enforces, and that policy's
+///   [`AutomatedReasoningPolicyRecord::version_tokens`] is bounded the same way against
+///   those versions.
 ///
 /// * `automated_reasoning_policy_build_workflows` holds one entry per started build
 ///   workflow, capped at [`MAX_BUILD_WORKFLOWS_PER_POLICY`] per policy by the quota
@@ -2382,15 +2456,47 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// The Automated Reasoning policy an `AutomatedReasoningPolicyArn` names.
     ///
     /// The lookup is EXACT, so the ARN's region and its optional `:<version>` suffix both
-    /// select: the base ARN names the draft this store holds, and a versioned ARN names a
-    /// version, of which this store holds none until `CreateAutomatedReasoningPolicyVersion`
-    /// mints one.
+    /// select: only the base ARN names the policy whose draft this store holds. Reach a
+    /// version through [`Self::automated_reasoning_policy_revision`], which resolves either
+    /// spelling.
     #[must_use]
     pub fn automated_reasoning_policy(
         &self,
         policy_arn: &str,
     ) -> Option<&AutomatedReasoningPolicyRecord> {
         self.automated_reasoning_policies.get(policy_arn)
+    }
+
+    /// The Automated Reasoning policy an `AutomatedReasoningPolicyArn` names, mutably.
+    pub fn automated_reasoning_policy_mut(
+        &mut self,
+        policy_arn: &str,
+    ) -> Option<&mut AutomatedReasoningPolicyRecord> {
+        self.automated_reasoning_policies.get_mut(policy_arn)
+    }
+
+    /// The REVISION an `AutomatedReasoningPolicyArn` names: the policy, and the version its
+    /// optional `:<version>` suffix selects.
+    ///
+    /// The suffix is what the shape's own pattern admits beside the base ARN
+    /// (`^arn:…:automated-reasoning-policy/[a-z0-9]{12}(:([1-9][0-9]{0,11}))?$`), so a
+    /// versioned ARN names a version this policy has cut and an unversioned one names its
+    /// working draft. A version the policy has not cut names no revision at all, exactly as
+    /// an id nothing minted names no policy.
+    #[must_use]
+    pub fn automated_reasoning_policy_revision(
+        &self,
+        policy_arn: &str,
+    ) -> Option<(
+        &AutomatedReasoningPolicyRecord,
+        Option<&AutomatedReasoningPolicyVersionRecord>,
+    )> {
+        let (base_arn, version) = automated_reasoning_policy_arn_parts(policy_arn);
+        let policy = self.automated_reasoning_policies.get(base_arn)?;
+        match version {
+            None => Some((policy, None)),
+            Some(number) => Some((policy, Some(policy.version(number)?))),
+        }
     }
 
     /// Mint a fresh `AutomatedReasoningPolicyBuildWorkflowId`: the lowercase hyphenated
@@ -3652,6 +3758,31 @@ pub fn automated_reasoning_policy_arn(region: &str, id: &str) -> String {
         region,
         &format!("automated-reasoning-policy/{id}"),
     )
+}
+
+/// The versioned `AutomatedReasoningPolicyArn` of version `version` of the policy
+/// `policy_arn` names: the base ARN with the `:<version>` suffix
+/// `AutomatedReasoningPolicyArn` admits after it.
+#[must_use]
+pub fn automated_reasoning_policy_version_arn(policy_arn: &str, version: u32) -> String {
+    format!("{policy_arn}:{version}")
+}
+
+/// An `AutomatedReasoningPolicyArn` split into the base ARN and the version its optional
+/// `:<version>` suffix names.
+///
+/// The suffix is the LAST colon-separated field, and only when it spells a number the
+/// shape admits there (`([1-9][0-9]{0,11})`); anything else is part of the base ARN, so an
+/// ARN carrying no suffix is returned whole.
+#[must_use]
+pub fn automated_reasoning_policy_arn_parts(policy_arn: &str) -> (&str, Option<u32>) {
+    match policy_arn.rsplit_once(':') {
+        Some((base, suffix)) => match version_number(suffix) {
+            Some(number) => (base, Some(number)),
+            None => (policy_arn, None),
+        },
+        None => (policy_arn, None),
+    }
 }
 
 /// The `AutomatedReasoningPolicyTestCase` a stored test is reported as.

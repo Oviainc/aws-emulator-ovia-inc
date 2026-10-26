@@ -95,7 +95,7 @@ use crate::ops::types::{
     AssetTypeFormReference,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
-    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput,
+    CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
@@ -2199,6 +2199,17 @@ impl CustomEntityTypeEntry {
             regex_string: input.regex_string.clone(),
             context_words: input.context_words.clone(),
             tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `CustomEntityType` shape from what is stored, so a listing
+    /// reports the same pattern a single read does. The stored `Tags` are not part of
+    /// that shape, so they stay out of it.
+    pub fn to_custom_entity_type(&self) -> CustomEntityType {
+        CustomEntityType {
+            name: self.name.clone(),
+            regex_string: self.regex_string.clone(),
+            context_words: self.context_words.clone(),
         }
     }
 }
