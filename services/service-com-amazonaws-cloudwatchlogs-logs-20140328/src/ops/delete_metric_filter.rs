@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMetricFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMetricFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMetricFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the metric filter `filterName` names from the log group it is
+//! associated with in the shared store, so `DescribeMetricFilters` no longer reports it and
+//! the group's `metricFilterCount` no longer counts it. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMetricFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMetricFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMetricFilter"))
+        // `ctx` carries only request metadata: a metric filter is identified by the log
+        // group it is associated with and its own name, both of which are in `input`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMetricFilterError::from(
+                DeleteMetricFilterErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let not_found = |resource_kind: &str| {
+            DeleteMetricFilterError::from(
+                DeleteMetricFilterErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(resource_kind)),
+                    },
+                ),
+            )
+        };
+
+        // A metric filter is associated with one log group and lives on it, so a group this
+        // account does not hold holds no filter to delete.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(not_found("log group"));
+        };
+        // "Deletes the specified metric filter": a name the group does not hold names no
+        // filter, so there is nothing this call can delete. Removing the filter is what
+        // drops it from the group's derived `metricFilterCount` and from the regular
+        // expression budget the patterns of the filters it holds count against.
+        if group.metric_filters.remove(&input.filter_name).is_none() {
+            return Err(not_found("metric filter"));
+        }
+
+        Ok(DeleteMetricFilterOutput)
     }
 }
