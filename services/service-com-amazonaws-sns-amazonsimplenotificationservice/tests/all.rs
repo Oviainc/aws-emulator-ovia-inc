@@ -77,6 +77,9 @@ mod resource_tags;
 #[path = "all/set_subscription_attributes.rs"]
 mod set_subscription_attributes;
 
+#[path = "all/sms_attributes.rs"]
+mod sms_attributes;
+
 #[path = "all/sms_sandbox_account_status.rs"]
 mod sms_sandbox_account_status;
 

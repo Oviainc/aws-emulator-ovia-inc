@@ -2254,6 +2254,228 @@ impl Default for SmsSandboxAccountRecord {
 }
 
 // =============================================================================
+// SMS: the calling account's message settings
+// =============================================================================
+
+/// The default type of SMS message the account sends, one of
+/// [`DEFAULT_SMS_TYPES`].
+pub const DEFAULT_SMS_TYPE_ATTRIBUTE: &str = "DefaultSMSType";
+
+/// The string displayed as the sender on the receiving device.
+pub const DEFAULT_SENDER_ID_ATTRIBUTE: &str = "DefaultSenderID";
+
+/// The ARN of the IAM role that lets SNS write SMS delivery logs.
+pub const DELIVERY_STATUS_IAM_ROLE_ATTRIBUTE: &str = "DeliveryStatusIAMRole";
+
+/// The percentage of successful SMS deliveries SNS writes logs for, between
+/// [`MIN_SAMPLING_RATE`] and [`MAX_SAMPLING_RATE`].
+pub const DELIVERY_STATUS_SUCCESS_SAMPLING_RATE_ATTRIBUTE: &str =
+    "DeliveryStatusSuccessSamplingRate";
+
+/// The maximum amount in USD the account is willing to spend on SMS each month.
+pub const MONTHLY_SPEND_LIMIT_ATTRIBUTE: &str = "MonthlySpendLimit";
+
+/// The name of the S3 bucket that receives the daily SMS usage report.
+pub const USAGE_REPORT_S3_BUCKET_ATTRIBUTE: &str = "UsageReportS3Bucket";
+
+/// The attribute names SNS defines for the calling account's SMS settings: "You can
+/// set values for the following attribute names: `MonthlySpendLimit` …
+/// `DeliveryStatusIAMRole` … `DeliveryStatusSuccessSamplingRate` …
+/// `DefaultSenderID` … `DefaultSMSType` … `UsageReportS3Bucket`"
+/// (`SetSMSAttributesInput$attributes` doc — the full text is
+/// `smithy_query(query="doc", shape="SetSMSAttributesInput", member="attributes")`).
+///
+/// A closed set, like [`TOPIC_ATTRIBUTE_NAMES`] and [`SUBSCRIPTION_ATTRIBUTE_NAMES`]:
+/// SNS refuses any other name, which is also what keeps one account's settings record
+/// from growing as a caller invents fresh names for it.
+pub const SMS_ATTRIBUTE_NAMES: &[&str] = &[
+    DEFAULT_SENDER_ID_ATTRIBUTE,
+    DEFAULT_SMS_TYPE_ATTRIBUTE,
+    DELIVERY_STATUS_IAM_ROLE_ATTRIBUTE,
+    DELIVERY_STATUS_SUCCESS_SAMPLING_RATE_ATTRIBUTE,
+    MONTHLY_SPEND_LIMIT_ATTRIBUTE,
+    USAGE_REPORT_S3_BUCKET_ATTRIBUTE,
+];
+
+/// The values [`DEFAULT_SMS_TYPE_ATTRIBUTE`] accepts: "`Promotional` – (Default)
+/// Noncritical messages … `Transactional` – Critical messages that support customer
+/// transactions" (`SetSMSAttributesInput$attributes` doc), in that documented order.
+pub const DEFAULT_SMS_TYPES: &[&str] = &["Promotional", "Transactional"];
+
+/// The lowest [`DELIVERY_STATUS_SUCCESS_SAMPLING_RATE_ATTRIBUTE`]: "The value can be
+/// an integer from 0 - 100" (`SetSMSAttributesInput$attributes` doc).
+pub const MIN_SAMPLING_RATE: u32 = 0;
+
+/// The highest [`DELIVERY_STATUS_SUCCESS_SAMPLING_RATE_ATTRIBUTE`], from the same
+/// documented range as [`MIN_SAMPLING_RATE`].
+pub const MAX_SAMPLING_RATE: u32 = 100;
+
+/// The fewest characters a [`DEFAULT_SENDER_ID_ATTRIBUTE`] carries: "The sender ID can
+/// be 1 - 11 alphanumeric characters, and it must contain at least one letter"
+/// (`SetSMSAttributesInput$attributes` doc).
+pub const MIN_SENDER_ID_CHARS: usize = 1;
+
+/// The most characters a [`DEFAULT_SENDER_ID_ATTRIBUTE`] carries, from the same
+/// documented range as [`MIN_SENDER_ID_CHARS`].
+pub const MAX_SENDER_ID_CHARS: usize = 11;
+
+/// The name a refusal gives the calling account's SMS settings record, in the place
+/// [`TOPIC_RECORD`] and [`SUBSCRIPTION_RECORD`] take for the records they name.
+pub const SMS_SETTINGS_RECORD: &str = "an account's SMS configuration";
+
+/// The [`MONTHLY_SPEND_LIMIT_ATTRIBUTE`] an account has before anyone sets one: "By
+/// default, the spend limit is set to the maximum allowed by Amazon SNS. If you want
+/// to raise the limit, submit an SNS Limit Increase case"
+/// (`SetSMSAttributesInput$attributes` doc) — the maximum an account is allowed before
+/// such a case is granted is 1.00 USD per month, which the SNS Developer Guide
+/// publishes as an account's SMS spend quota.
+///
+/// So a spend limit is a setting an account ALWAYS has, unlike the settings SNS
+/// applies only once an account has been given them: a report of an account's SMS
+/// settings carries this one whether or not a caller set it
+/// ([`SmsSettingsRecord::reported_attributes`]).
+pub const DEFAULT_MONTHLY_SPEND_LIMIT: &str = "1";
+
+/// The calling account's settings for sending SMS messages: what `SetSMSAttributes`
+/// writes and `GetSMSAttributes` reports.
+///
+/// NOT caller-grown — [`SMS_ATTRIBUTE_NAMES`] is a closed set, so the map holds at
+/// most that many entries — and bounded in BYTES by [`MAX_ATTRIBUTE_BYTES_PER_RECORD`]
+/// like every other attribute map here, so a caller cannot grow one setting without
+/// limit either.
+#[derive(Debug, Clone, Default)]
+pub struct SmsSettingsRecord {
+    /// The settings the account has been GIVEN, keyed by attribute name: a setting it
+    /// has never been given, and one a write of an empty value cleared, is absent. The
+    /// settings a report carries are [`Self::reported_attributes`], which is what a
+    /// caller reads.
+    pub attributes: HashMap<String, String>,
+}
+
+impl SmsSettingsRecord {
+    /// The settings a report of this account carries: every setting the account has
+    /// been given, and the spend limit whether or not it has been given one.
+    ///
+    /// A spend limit is a setting an account ALWAYS has — "By default, the spend limit
+    /// is set to the maximum allowed by Amazon SNS" — so it is reported from
+    /// [`DEFAULT_MONTHLY_SPEND_LIMIT`] until a caller sets one and again once a caller
+    /// clears it, unlike every other SMS setting, which SNS applies only once the
+    /// account has been given it and which a report therefore carries only then.
+    pub fn reported_attributes(&self) -> HashMap<String, String> {
+        let mut attributes = self.attributes.clone();
+        attributes
+            .entry(MONTHLY_SPEND_LIMIT_ATTRIBUTE.to_string())
+            .or_insert_with(|| DEFAULT_MONTHLY_SPEND_LIMIT.to_string());
+        attributes
+    }
+}
+
+/// Whether `name` is an attribute SNS defines for an account's SMS settings.
+pub fn is_sms_attribute(name: &str) -> bool {
+    SMS_ATTRIBUTE_NAMES.contains(&name)
+}
+
+/// Whether writing `value` to an SMS setting CLEARS it rather than giving it a value.
+///
+/// A setting is cleared by writing an EMPTY value to it — the way AWS documents
+/// removing an attribute whose value is a document ([`clears_attribute`]) — so the
+/// account is left as it was before it was ever given that setting: SNS applies to it
+/// what it applies to an account that has not set it, and a report of the account's
+/// settings carries no entry for it.
+///
+/// The rule is here rather than in the handler so the read path and the write path
+/// agree on what the account holds: a cleared setting is one the record does not hold,
+/// never one it holds empty.
+pub fn clears_sms_attribute(value: &str) -> bool {
+    value.is_empty()
+}
+
+/// The sentence SNS refuses a name that is no setting of an account's SMS
+/// configuration with: the name the caller sent, and that it is not one.
+///
+/// Recorded evidence: `SetSMSAttributes` carrying a name outside
+/// [`SMS_ATTRIBUTE_NAMES`] answers `400 InvalidParameter` with exactly this sentence
+/// for that name.
+pub fn invalid_sms_attribute_name_message(name: &str) -> String {
+    format!("{name} is not a valid attribute")
+}
+
+/// The sentence SNS refuses a value an SMS setting does not accept with: the setting
+/// whose value failed, and that the value is not one of its own.
+///
+/// ONE sentence for the whole class — whichever setting, and whichever of the
+/// constraints [`sms_attribute_value_accepted`] holds it to, the refusal names the
+/// setting and nothing else. Recorded evidence: `SetSMSAttributes` carrying a
+/// `DefaultSMSType` outside [`DEFAULT_SMS_TYPES`] answers `400 InvalidParameter` with
+/// exactly this sentence for that setting.
+pub fn invalid_sms_attribute_value_message(name: &str) -> String {
+    format!("{name} is invalid")
+}
+
+/// Whether the SMS setting `name` accepts `value`, under the constraint SNS documents
+/// for that setting — and so for every `name` it documents no constraint on the value
+/// of.
+///
+/// ARGUMENT validation: it judges the value alone, so a whole request is judged before
+/// any of it is written. An EMPTY value is accepted whatever the setting, because such
+/// a write CLEARS the setting ([`clears_sms_attribute`]) rather than giving it a value
+/// to judge.
+pub fn sms_attribute_value_accepted(name: &str, value: &str) -> bool {
+    if clears_sms_attribute(value) {
+        return true;
+    }
+    match name {
+        DEFAULT_SMS_TYPE_ATTRIBUTE => DEFAULT_SMS_TYPES.contains(&value),
+        // "The value can be an integer from 0 - 100": a percentage, so a value that is
+        // not a whole number in that range governs no sampling.
+        DELIVERY_STATUS_SUCCESS_SAMPLING_RATE_ATTRIBUTE => value
+            .parse::<u32>()
+            .is_ok_and(|rate| (MIN_SAMPLING_RATE..=MAX_SAMPLING_RATE).contains(&rate)),
+        // "The sender ID can be 1 - 11 alphanumeric characters, and it must contain at
+        // least one letter."
+        DEFAULT_SENDER_ID_ATTRIBUTE => is_sender_id(value),
+        // "The maximum amount in USD that you are willing to spend each month": an
+        // amount, so a value that is not a non-negative number is not a spend limit.
+        MONTHLY_SPEND_LIMIT_ATTRIBUTE => is_usd_amount(value),
+        // "The ARN of the IAM role that allows Amazon SNS to write logs …" — only the
+        // ARN's shape is judged here; whether that role exists is not this service's
+        // record to check.
+        DELIVERY_STATUS_IAM_ROLE_ATTRIBUTE => arn_shape_reason(value).is_none(),
+        // "The name of the Amazon S3 bucket to receive daily SMS usage reports": SNS
+        // documents no constraint on the name beyond its being one, and whether the
+        // bucket exists is not this service's record to check.
+        _ => true,
+    }
+}
+
+/// The message a write of the SMS setting `name` to `value` is refused with, or `None`
+/// when the setting accepts the value.
+pub fn sms_attribute_refusal(name: &str, value: &str) -> Option<String> {
+    (!sms_attribute_value_accepted(name, value)).then(|| invalid_sms_attribute_value_message(name))
+}
+
+/// Whether `value` is a sender id: [`MIN_SENDER_ID_CHARS`] to [`MAX_SENDER_ID_CHARS`]
+/// alphanumeric characters, at least one of them a letter.
+fn is_sender_id(value: &str) -> bool {
+    let characters = value.chars().count();
+    (MIN_SENDER_ID_CHARS..=MAX_SENDER_ID_CHARS).contains(&characters)
+        && value.chars().all(|character| character.is_alphanumeric())
+        && value.chars().any(char::is_alphabetic)
+}
+
+/// Whether `value` is an amount in USD: digits, optionally followed by a decimal point
+/// and digits — a spend limit is an amount of money, so it carries no sign and no
+/// other text.
+fn is_usd_amount(value: &str) -> bool {
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+// =============================================================================
 // Phone numbers: the E.164 rule and the SMS opt-out list
 // =============================================================================
 
@@ -2569,6 +2791,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// the account starts in the sandbox and no SNS operation takes it out, so this
     /// record is one value rather than a store.
     pub sms_sandbox_account: SmsSandboxAccountRecord,
+    /// The calling account's settings for sending SMS messages: what
+    /// `SetSMSAttributes` writes and `GetSMSAttributes` reports. NOT caller-grown and
+    /// bounded in bytes — see [`SmsSettingsRecord`] — so it is one record rather than
+    /// a store.
+    pub sms_settings: SmsSettingsRecord,
     /// The calling account's mobile-push platform applications, keyed by their ARN.
     /// At most [`MAX_RECORDS_PER_STORE`]: an operation that registers one must refuse
     /// a request that would cross that ceiling, as the topic and subscription stores

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetSMSAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetSMSAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetSMSAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,23 +139,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::SET_SMS_ATTRIBUTES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Write the calling account's default settings for sending SMS messages.
+    ///
+    /// "Use this request to set the default settings for sending SMS messages": the
+    /// request carries the settings it changes, so the account keeps every setting this
+    /// call does not name — a write of one setting is not a replacement of the record.
+    /// A setting written an EMPTY value is CLEARED
+    /// ([`state::clears_sms_attribute`]), leaving the account as it was before it was
+    /// ever given that setting.
+    ///
+    /// Every name and every value is judged BEFORE anything is written, so a request
+    /// carrying one bad entry changes nothing: SNS defines a closed set of SMS setting
+    /// names ([`state::SMS_ATTRIBUTE_NAMES`]) and a documented value set or range for
+    /// several of them, and refuses the request with `InvalidParameter` otherwise.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetSMSAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetSMSAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetSMSAttributes"))
+        let invalid_parameter = |message: String| -> Self::Error {
+            SetSMSAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // Argument validation, BEFORE the store is consulted — by name, so a request
+        // carrying several bad entries is refused for the same one of them whichever
+        // order the map happens to iterate in.
+        let mut requested: Vec<(&String, &String)> = input.attributes.iter().collect();
+        requested.sort();
+        for (name, value) in &requested {
+            // The set of settings is closed: a name outside it is no setting of an
+            // account, so there is nothing for the write to govern.
+            if !state::is_sms_attribute(name) {
+                return Err(invalid_parameter(state::invalid_sms_attribute_name_message(
+                    name,
+                )));
+            }
+            // And each setting accepts only the values SNS documents for it.
+            if let Some(message) = state::sms_attribute_refusal(name, value) {
+                return Err(invalid_parameter(message));
+            }
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(SetSMSAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        // The record the write WOULD leave: every setting the account already holds,
+        // with this request's entries laid over it and the ones it clears taken off.
+        let mut would_hold = store.sms_settings.attributes.clone();
+        for (name, value) in &requested {
+            if state::clears_sms_attribute(value) {
+                would_hold.remove(*name);
+            } else {
+                would_hold.insert((*name).clone(), (*value).clone());
+            }
+        }
+
+        // Measured on that record, so repeating the call with ever larger values cannot
+        // grow one account's settings past the ceiling every attribute map here keeps.
+        if let Some(refusal) =
+            state::attribute_bytes_refusal(state::SMS_SETTINGS_RECORD, &would_hold)
+        {
+            return Err(invalid_parameter(refusal));
+        }
+
+        store.sms_settings.attributes = would_hold;
+
+        Ok(SetSMSAttributesOutput {})
     }
 }

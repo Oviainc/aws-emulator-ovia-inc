@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSMSAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSMSAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSMSAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +66,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,23 +134,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_SMS_ATTRIBUTES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// The calling account's SMS settings, as `SetSMSAttributes` left them.
+    ///
+    /// A pure REPORT of persisted account state: "Returns the settings for sending SMS
+    /// messages from your Amazon Web Services account. These settings are set with the
+    /// SetSMSAttributes action" — so the answer is what the account's record holds and
+    /// nothing here writes. A setting the account has never been given is held by no
+    /// record and so reported by no entry: this operation invents no default for one. A
+    /// setting a write of an empty value took out of force is still held, with nothing
+    /// in it, and so still reported.
+    ///
+    /// The request may name the settings it wants: "A list of the individual attribute
+    /// names … for which you want values … If you don't use this parameter, Amazon SNS
+    /// returns all SMS attributes" (`GetSMSAttributesInput$attributes` doc). A named
+    /// setting the account does not hold contributes no entry either, so the response
+    /// carries exactly the intersection of what was asked for with what is held.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSMSAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSMSAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSMSAttributes"))
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(GetSMSAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+        // Every setting SNS reports for this account, whether the account was given it
+        // or SNS applies it by default.
+        let held = store.sms_settings.reported_attributes();
+
+        // A request that names no setting asks for all of them; one that names some asks
+        // for those alone, so a name it repeats still yields one entry and a name the
+        // account holds nothing for yields none.
+        let requested = input.attributes.unwrap_or_default();
+        let attributes: std::collections::HashMap<String, String> = if requested.is_empty() {
+            held
+        } else {
+            requested
+                .iter()
+                .filter_map(|name| held.get_key_value(name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        };
+
+        Ok(GetSMSAttributesOutput {
+            attributes: Some(attributes),
+        })
     }
 }
