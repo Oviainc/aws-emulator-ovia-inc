@@ -10,8 +10,13 @@
 //! string REMOVES the association.
 //!
 //! Nothing else about the quote moves: its id, account, creation and expiration
-//! instants stay the ones it was created with, and no pricing is reported, for the
-//! reason `CreateQuote` reports none.
+//! instants stay the ones it was created with. What the update replaces, though, is
+//! what the quote's DERIVED members follow from, so an update that replaces the
+//! configuration the quote is priced on re-prices it (a fresh `QuoteOption`, with
+//! its own identifier), and one that replaces the country it is for or the Outpost
+//! it names re-runs the checks an order submitted from it has to satisfy — by the
+//! same two rules `CreateQuote` derives them by. An update that touches neither
+//! leaves both exactly as they stand.
 //!
 //! ## Shape of an operation
 //!
@@ -264,6 +269,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // What a quote's DERIVED members follow from: its options are priced on the
+        // configuration it asks for, and its requirements are checked against the
+        // country it is for and the Outpost it names. An update that replaces one of
+        // those re-derives what follows from it; one that names neither leaves both
+        // as they stand. Read off the request before its members are applied below.
+        let reprice = input.requested_capacities.is_some()
+            || input.requested_payment_options.is_some()
+            || input.requested_payment_terms.is_some();
+        let recheck =
+            input.country_code.is_some() || !matches!(association, Association::Unchanged);
+
         // The same quote, now borrowed to change. It was resolved above under this
         // same lock, which has not been released, so the fallback is unreachable by
         // construction; it is stated rather than asserted because a handler answers a
@@ -297,6 +313,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Association::Unchanged => {}
             Association::Removed => record.quote.outpost_arn = None,
             Association::Set(outpost_arn) => record.quote.outpost_arn = Some(outpost_arn),
+        }
+
+        // The configuration the quote NOW describes, read back off the record this
+        // update just wrote: what its options are priced on and what the quote
+        // reports can then never disagree.
+        let capacities = record
+            .quote
+            .requested_capacities
+            .clone()
+            .unwrap_or_default();
+        let payment_options = record.quote.requested_payment_options.clone();
+        let payment_terms = record.quote.requested_payment_terms.clone();
+        let country_code = record.quote.country_code.clone().unwrap_or_default();
+        let outpost_id = record
+            .quote
+            .outpost_arn
+            .as_deref()
+            .and_then(crate::state::resolve_outpost_id);
+
+        let derived_options = match reprice {
+            true => Some(store.quote_options(
+                &capacities,
+                payment_options.as_deref(),
+                payment_terms.as_deref(),
+            )),
+            false => None,
+        };
+        let derived_requirements = match recheck {
+            true => {
+                // The checks read the Outpost as it stands NOW, so the lifecycle
+                // transition the clock has already made due is materialised before
+                // they are run — exactly as `CreateQuote` does.
+                store.settle_outposts();
+                Some(store.ordering_requirements(&region, &country_code, outpost_id.as_deref()))
+            }
+            false => None,
+        };
+        // The quote once more, to write what was derived from the configuration it
+        // now carries. Resolved under the same lock as above, so the fallback is
+        // unreachable by construction, for the reason stated there.
+        let record = store
+            .quote_mut(&region, &quote_id)
+            .ok_or_else(|| quote_not_found(&input.quote_identifier))?;
+        if let Some(quote_options) = derived_options {
+            record.quote.quote_options = Some(quote_options);
+        }
+        if let Some(ordering_requirements) = derived_requirements {
+            record.quote.ordering_requirements = Some(ordering_requirements);
         }
 
         Ok(UpdateQuoteOutput {

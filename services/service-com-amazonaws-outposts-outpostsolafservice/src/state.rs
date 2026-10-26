@@ -18,10 +18,11 @@
 //! configurations this service publishes, the hardware an Outpost of a given form
 //! factor is installed with, the instance types an Outpost's EC2 capacity is
 //! configured with, weighing a requested capacity configuration against the instance
-//! capacity available to the hardware it is asked of, pricing a renewal of the
-//! subscription an
-//! Outpost's orders hold and recording the contract a renewal of it is bought
-//! under, and
+//! capacity available to the hardware it is asked of, pricing a subscription on EC2
+//! capacity — the renewal of the one an
+//! Outpost's orders hold, and recording the contract a renewal of it is bought
+//! under, as well as the configuration-and-pricing options a quote is answered with
+//! and the checks that must pass before an order can be submitted from it, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
@@ -33,8 +34,9 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     Address, AssetInfo, AssetInstance, AssetLocation, CapacityTaskFailure, CatalogItem,
     ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
-    InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, Outpost, PricingOption,
-    PrivateConnectivityConfig, Quote, Site, SubscriptionPricingDetails, VpcInformation,
+    InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, OrderingRequirement,
+    Outpost, PricingOption, PrivateConnectivityConfig, Quote, QuoteCapacity, QuoteOption, Site,
+    SubscriptionPricingDetails, VpcInformation,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -2307,21 +2309,179 @@ pub const PAYMENT_OPTION_UPFRONT_SHARE: &[(&str, f32)] = &[
 ];
 
 /// The monthly list price, in [`CURRENCY_USD`], of one vCPU of the EC2 capacity an
-/// Outposts configuration carries — the rate every renewal this service prices is
-/// computed from.
+/// Outposts configuration carries — the rate every subscription this service prices
+/// is computed from, whether it is quoted for new hardware or renewed on hardware
+/// already installed.
 ///
 /// AWS prices a configuration per quote rather than publishing a machine-readable
 /// price list, so the rate itself is this emulator's own, exactly as the capacity
-/// assignment of [`CATALOG_ITEMS`] is. What an emulated renewal has to get right is
-/// that the price FOLLOWS from the hardware under subscription: the same Outpost is
-/// priced the same figure in every process and on every read, twice the capacity
-/// costs twice as much, and a longer term costs more over the term than a shorter
-/// one.
-pub const RENEWAL_PRICE_PER_VCPU_MONTH: f32 = 20.0;
+/// assignment of [`CATALOG_ITEMS`] is. What an emulated price has to get right is
+/// that it FOLLOWS from the capacity it is a price for: the same capacity is priced
+/// the same figure in every process and on every read, twice the capacity costs
+/// twice as much, and a longer term costs more over the term than a shorter one.
+pub const SUBSCRIPTION_PRICE_PER_VCPU_MONTH: f32 = 20.0;
 
 /// `amount` rounded to the cent, the precision a price is quoted to.
 fn to_the_cent(amount: f32) -> f32 {
     (amount * 100.0).round() / 100.0
+}
+
+/// What a subscription on `vcpus` vCPUs of EC2 capacity costs under `payment_option`
+/// and `payment_term` — or `None` when there is nothing to price: no capacity at
+/// all, or a payment option or term this service holds no rule for.
+///
+/// The ONE rule this service prices a subscription by, so what a quote for new
+/// hardware quotes ([`ComAmazonawsOutpostsOutpostsolafserviceState::quote_pricing`])
+/// and what a renewal of hardware already installed is bought at
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::renewal_price`]) cannot disagree
+/// about the same capacity: the term's months ([`PAYMENT_TERM_MONTHS`]) of the
+/// monthly rate that capacity carries ([`SUBSCRIPTION_PRICE_PER_VCPU_MONTH`]) make
+/// up the whole-term cost, of which the payment option's share
+/// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal monthly
+/// instalments. Every figure follows from the capacity it was given, so one price is
+/// answered the same in every process and on every call.
+pub fn subscription_price(
+    vcpus: f32,
+    payment_option: &str,
+    payment_term: &str,
+) -> Option<SubscriptionPricingDetails> {
+    let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
+        .iter()
+        .find(|(option, _)| *option == payment_option)?;
+    let (_, months) = PAYMENT_TERM_MONTHS
+        .iter()
+        .find(|(term, _)| *term == payment_term)?;
+    if vcpus <= 0.0 || !vcpus.is_finite() {
+        // There is no capacity here, so there is no subscription on it that could be
+        // priced at all.
+        return None;
+    }
+    let monthly_rate = vcpus * SUBSCRIPTION_PRICE_PER_VCPU_MONTH;
+    let term = monthly_rate * *months as f32;
+    Some(SubscriptionPricingDetails {
+        payment_option: Some(payment_option.to_string()),
+        payment_term: Some(payment_term.to_string()),
+        upfront_price: Some(to_the_cent(term * share)),
+        monthly_recurring_price: Some(to_the_cent(monthly_rate * (1.0 - share))),
+        currency: Some(CURRENCY_USD.to_string()),
+    })
+}
+
+/// The id prefix a minted `QuoteOptionIdentifier` carries, from the modelled pattern
+/// `^oqo-[a-f0-9]{17}$`. See
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::mint_id`].
+pub const QUOTE_OPTION_ID_PREFIX: &str = "oqo";
+
+/// The most options one quote reports, as the modelled `QuoteOptionList`
+/// (`length(max: 10)`) allows.
+const QUOTE_OPTION_MAX: usize = 10;
+
+/// The most pricing options one quote option reports, as the modelled
+/// `PricingOptionList` (`length(max: 9)`) allows — which is exactly the number of
+/// (`PaymentOption`, `PaymentTerm`) combinations the two modelled value sets make.
+const PRICING_OPTION_MAX: usize = 9;
+
+/// The most ordering requirements one quote reports, as the modelled
+/// `OrderingRequirementList` (`length(max: 50)`) allows.
+const ORDERING_REQUIREMENT_MAX: usize = 50;
+
+/// The `QuoteCapacityType` whose capacity this service publishes a figure for: the
+/// EC2 capacity of an Outposts configuration, which `QuoteCapacity$Unit` names the
+/// instance type of. One of the modelled values (see
+/// [`crate::ops::types::QUOTE_CAPACITY_TYPE_VALUES`]).
+pub const QUOTE_CAPACITY_TYPE_EC2: &str = "EC2";
+
+/// The `OrderingRequirementStatus` a check this service ran and found SATISFIED
+/// carries.
+///
+/// The modelled enum declares three values (see
+/// [`crate::ops::types::ORDERING_REQUIREMENT_STATUS_VALUES`]): a check that passed,
+/// one that failed, and one the quote is exempt from. Exemption is granted outside
+/// this API, so a check this service runs reports one of the first two.
+pub const ORDERING_REQUIREMENT_PASS: &str = "PASS";
+
+/// The `OrderingRequirementStatus` a check this service ran and found UNSATISFIED
+/// carries. See [`ORDERING_REQUIREMENT_PASS`].
+pub const ORDERING_REQUIREMENT_FAIL: &str = "FAIL";
+
+/// The `OrderingRequirementType` of the check that the quote names an Outpost: "the
+/// quote must be associated with an Outpost before submitting an order", which is
+/// also what makes an order submitted from the quote an order OF an Outpost.
+pub const ORDERING_REQUIREMENT_OUTPOST_ID_MISSING: &str = "OUTPOST_ID_MISSING_ON_QUOTE_ERROR";
+
+/// The `OrderingRequirementType` of the check that the Outpost the quote names is
+/// usable: "the Outpost must be in an active state", which for this service is the
+/// terminal [`LIFE_CYCLE_STATUS_ACTIVE`] an Outpost settles in.
+pub const ORDERING_REQUIREMENT_OUTPOST_ACTIVE: &str = "OUTPOST_ACTIVE_CHECK_ERROR";
+
+/// The `OrderingRequirementType` of the check that another order can still be
+/// placed: "the maximum number of allowed orders has been reached", which for this
+/// service is the store's own entry ceiling ([`MAX_RESOURCES`]).
+pub const ORDERING_REQUIREMENT_MAXIMUM_ALLOWED_ORDERS: &str =
+    "MAXIMUM_ALLOWED_ORDERS_CHECK_ERROR";
+
+/// The `OrderingRequirementType` of the check that the site has the address it
+/// operates at: "the site must have an operating address".
+pub const ORDERING_REQUIREMENT_OPERATING_ADDRESS: &str = "OPERATING_ADDRESS_EXISTENCE_CHECK_ERROR";
+
+/// The `OrderingRequirementType` of the check that the site has the address its
+/// hardware is shipped to: "the site must have a shipping address".
+pub const ORDERING_REQUIREMENT_SHIPPING_ADDRESS: &str = "SHIPPING_ADDRESS_EXISTENCE_CHECK_ERROR";
+
+/// The `OrderingRequirementType` of the check that the quote is for the country the
+/// hardware would stand in: "the country code on the quote does not match the
+/// Outpost site country".
+pub const ORDERING_REQUIREMENT_COUNTRY_CODE_MISMATCH: &str = "COUNTRY_CODE_MISMATCH_CHECK_ERROR";
+
+/// The modelled `OrderingRequirementStatus` a check that was RUN reports: passed
+/// when what it checks holds, failed when it does not.
+fn pass_or_fail(satisfied: bool) -> &'static str {
+    match satisfied {
+        true => ORDERING_REQUIREMENT_PASS,
+        false => ORDERING_REQUIREMENT_FAIL,
+    }
+}
+
+/// One requirement of a quote: the check, the outcome [`pass_or_fail`] read off the
+/// store, and the message stating what that outcome was read from.
+///
+/// AWS publishes no wording for `OrderingRequirement$StatusMessage`, so each message
+/// is this emulator's own; what a caller branches on is the modelled
+/// `OrderingRequirementType` and `OrderingRequirementStatus`, while the message names
+/// the resource and the value the check was decided on.
+fn ordering_requirement(check: &str, status: &str, status_message: String) -> OrderingRequirement {
+    OrderingRequirement {
+        status_message: Some(status_message),
+        ordering_requirement_type: Some(check.to_string()),
+        status: Some(status.to_string()),
+    }
+}
+
+/// The values a quote requested of one of the two payment value sets, or every value
+/// the model declares when it requested none.
+///
+/// "The payment options to include in the quote pricing. If not specified, all
+/// available payment options are returned", and the same sentence for the payment
+/// terms — and a list the modelled `length(min: 0)` let arrive empty names no more
+/// than an absent member does. A value named twice is one request for it, so the
+/// quote is priced under each distinct value once, in the order the request named
+/// them in.
+fn requested_or_modelled<'a>(
+    requested: Option<&'a [String]>,
+    modelled: &'static [&'static str],
+) -> Vec<&'a str> {
+    match requested {
+        Some(values) if !values.is_empty() => {
+            let mut named: Vec<&str> = Vec::new();
+            for value in values.iter().map(String::as_str) {
+                if !named.contains(&value) {
+                    named.push(value);
+                }
+            }
+            named
+        }
+        _ => modelled.to_vec(),
+    }
 }
 
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
@@ -2884,8 +3044,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             })
             .collect();
         debug_assert!(
-            options.len() <= 9,
-            "a renewal is priced under at most the nine options PricingOptionList allows"
+            options.len() <= PRICING_OPTION_MAX,
+            "a renewal is priced under at most the options PricingOptionList allows"
         );
         options
     }
@@ -2895,16 +3055,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// when there is nothing to price: an Outpost with no subscribed hardware, or a
     /// payment option or term this service holds no rule for.
     ///
-    /// The ONE rule this service prices a renewal by, so the pricing read
-    /// ([`Self::renewal_pricing`]) and the renewal a caller actually buys quote the
-    /// same figures: the term's months ([`PAYMENT_TERM_MONTHS`]) of the monthly rate
-    /// the Outpost's capacity carries ([`RENEWAL_PRICE_PER_VCPU_MONTH`]) make up the
-    /// whole-term cost, of which the payment option's share
-    /// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal
-    /// monthly instalments. Every figure follows from what is persisted for the
-    /// Outpost — the capacity its orders subscribe to
-    /// ([`Self::subscribed_capacity_vcpus`]) — so one price is answered the same in
-    /// every process and on every call.
+    /// The capacity the Outpost's orders subscribe to
+    /// ([`Self::subscribed_capacity_vcpus`]) is what a renewal covers and the only
+    /// thing this store knows about its size, so that capacity is what the one
+    /// pricing rule ([`subscription_price`]) is applied to — which is why the pricing
+    /// read ([`Self::renewal_pricing`]) and the renewal a caller actually buys quote
+    /// the same figures.
     pub fn renewal_price(
         &self,
         region: &str,
@@ -2912,27 +3068,270 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         payment_option: &str,
         payment_term: &str,
     ) -> Option<SubscriptionPricingDetails> {
-        let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
+        subscription_price(
+            self.subscribed_capacity_vcpus(region, outpost_id) as f32,
+            payment_option,
+            payment_term,
+        )
+    }
+
+    /// The configuration-and-pricing options this service answers a quote for
+    /// `capacities` with, priced under the payment options and terms that quote
+    /// requests.
+    ///
+    /// "A quote provides pricing and configuration options based on the requested
+    /// capacity", and `CreateOrder`'s `QuoteOptionIdentifier` can only ever be
+    /// obtained from one of them, so a quote this service answers carries an option a
+    /// caller can order from. The request describes ONE configuration — the capacity
+    /// it asks for — so one option is derived for it, well within what the modelled
+    /// `QuoteOptionList` ([`QUOTE_OPTION_MAX`]) allows, and it reports the members
+    /// that follow from the quote:
+    ///
+    /// * `QuoteOptionIdentifier` (`^oqo-[a-f0-9]{17}$`), minted here and persisted
+    ///   WITH the quote, so every later read of that quote names the same option and
+    ///   an order can be submitted against it.
+    /// * `Capacities`, "the capacities included in this quote option": the
+    ///   configuration is the one the quote asks for, so it provides exactly that
+    ///   capacity.
+    /// * `PricingOptions`, one per payment combination the quote is priced under
+    ///   ([`Self::quote_pricing`]).
+    ///
+    /// `CapacitySummary` and `Specifications` are absent. The first is a summary of
+    /// the capacity that EXISTS against the capacity the option would leave, and this
+    /// store holds no record of an Outpost's capacity per capacity unit — EC2
+    /// instances per instance type, EBS and S3 volume — so a summary of it would be
+    /// the request read back as if it were the Outpost's. The second is the physical
+    /// rack or server a configuration is deployed on, which AWS picks when it builds
+    /// the order and this store records for no quote.
+    pub fn quote_options(
+        &mut self,
+        capacities: &[QuoteCapacity],
+        payment_options: Option<&[String]>,
+        payment_terms: Option<&[String]>,
+    ) -> Vec<QuoteOption> {
+        let pricing_options = self.quote_pricing(capacities, payment_options, payment_terms);
+        let (quote_option_identifier, _) = self.mint_id(QUOTE_OPTION_ID_PREFIX);
+        let options = vec![QuoteOption {
+            quote_option_identifier: Some(quote_option_identifier),
+            capacities: Some(capacities.to_vec()),
+            capacity_summary: None,
+            specifications: None,
+            pricing_options: Some(pricing_options),
+        }];
+        debug_assert!(
+            options.len() <= QUOTE_OPTION_MAX,
+            "a quote reports at most the options QuoteOptionList allows"
+        );
+        options
+    }
+
+    /// Every pricing option a quote option providing `capacities` is reported under:
+    /// one priced SUBSCRIPTION option per combination of the payment options and
+    /// payment terms the quote requests ([`requested_or_modelled`], so a quote that
+    /// requested neither is priced under every modelled value).
+    ///
+    /// The combinations are walked in the order the two value sets name them, so one
+    /// configuration's options are reported in the same order on every read and in
+    /// every process. Each is priced by [`subscription_price`] — the ONE rule this
+    /// service prices a subscription by — on the EC2 capacity the option provides
+    /// ([`Self::quoted_capacity_vcpus`]), so what a quote quotes and what a renewal
+    /// of the same capacity costs cannot disagree. A combination there is nothing to
+    /// price under is left out rather than reported at a figure the emulator invented.
+    fn quote_pricing(
+        &self,
+        capacities: &[QuoteCapacity],
+        payment_options: Option<&[String]>,
+        payment_terms: Option<&[String]>,
+    ) -> Vec<PricingOption> {
+        let vcpus = self.quoted_capacity_vcpus(capacities);
+        let options =
+            requested_or_modelled(payment_options, crate::ops::types::PAYMENT_OPTION_VALUES);
+        let terms = requested_or_modelled(payment_terms, crate::ops::types::PAYMENT_TERM_VALUES);
+        let priced: Vec<PricingOption> = options
             .iter()
-            .find(|(option, _)| *option == payment_option)?;
-        let (_, months) = PAYMENT_TERM_MONTHS
+            .flat_map(|payment_option| {
+                terms
+                    .iter()
+                    .map(move |payment_term| (*payment_option, *payment_term))
+            })
+            .filter_map(|(payment_option, payment_term)| {
+                Some(PricingOption {
+                    pricing_type: Some(QUOTE_PRICING_TYPE_SUBSCRIPTION.to_string()),
+                    subscription_pricing_details: Some(subscription_price(
+                        vcpus,
+                        payment_option,
+                        payment_term,
+                    )?),
+                })
+            })
+            .collect();
+        debug_assert!(
+            priced.len() <= PRICING_OPTION_MAX,
+            "a quote option is priced under at most the options PricingOptionList allows"
+        );
+        priced
+    }
+
+    /// How many vCPUs of EC2 capacity the configuration `capacities` describes
+    /// carries, as this service's published catalog figures it: for every EC2
+    /// capacity, the default vCPUs published for the instance type its `Unit` names
+    /// ([`Self::published_vcpus`]) times the quantity of instances asked for.
+    ///
+    /// "For Amazon EC2, this is the instance type (for example, `c5.24xlarge`)", as
+    /// the model documents `QuoteCapacity$Unit`, and "for Amazon EC2, the quantity is
+    /// the number of additional instances to add to the Outpost" — so this is the
+    /// capacity of a quoted configuration, read off the same catalog
+    /// `ListOrderableInstanceTypes` publishes. A capacity measured in storage rather
+    /// than in instances (the modelled `EBS` and `S3` types), one naming a unit the
+    /// catalog publishes no instance type for, and one asking for no instances at all
+    /// contribute nothing: capacity this service publishes no figure for is not
+    /// capacity the emulator can price, and never one it invents.
+    pub fn quoted_capacity_vcpus(&self, capacities: &[QuoteCapacity]) -> f32 {
+        capacities
             .iter()
-            .find(|(term, _)| *term == payment_term)?;
-        let capacity = self.subscribed_capacity_vcpus(region, outpost_id);
-        if capacity <= 0 {
-            // Nothing is subscribed on this Outpost, so there is no subscription a
-            // renewal of could be priced at all.
-            return None;
+            .filter(|capacity| {
+                capacity.quote_capacity_type.as_deref() == Some(QUOTE_CAPACITY_TYPE_EC2)
+            })
+            .filter_map(|capacity| {
+                let vcpus = self.published_vcpus(capacity.unit.as_deref()?)?;
+                let quantity = capacity
+                    .quantity
+                    .filter(|quantity| quantity.is_finite() && *quantity > 0.0)?;
+                Some(quantity * vcpus as f32)
+            })
+            .sum()
+    }
+
+    /// The requirements that must be met before an order can be submitted for a quote
+    /// of `country_code` associated with the Outpost `outpost_id` names in `region`
+    /// (or with no Outpost at all).
+    ///
+    /// "The requirements that must be met before an order can be submitted for the
+    /// quote", and the modelled `OrderingRequirementType` names the checks AWS runs
+    /// (see [`crate::ops::types::ORDERING_REQUIREMENT_TYPE_VALUES`]). A check is
+    /// reported only where this store holds the records to decide it, and a reported
+    /// one carries the outcome those records give at the instant the quote is priced:
+    ///
+    /// * [`ORDERING_REQUIREMENT_OUTPOST_ID_MISSING`] — whether the quote names an
+    ///   Outpost, which is the association `CreateQuote` and `UpdateQuote` record.
+    /// * [`ORDERING_REQUIREMENT_MAXIMUM_ALLOWED_ORDERS`] — whether this store can
+    ///   still take an order, which is the ceiling `CreateOrder` refuses at.
+    /// * [`ORDERING_REQUIREMENT_OUTPOST_ACTIVE`] — whether that Outpost has settled
+    ///   in its terminal status. Callers materialise the lifecycle transition the
+    ///   clock owes first (see [`Self::settle_outposts`]), so the status read here is
+    ///   the one the Outpost holds at that same instant.
+    /// * [`ORDERING_REQUIREMENT_OPERATING_ADDRESS`] and
+    ///   [`ORDERING_REQUIREMENT_SHIPPING_ADDRESS`] — whether the site that Outpost
+    ///   stands on records each of the two addresses an order is placed against.
+    /// * [`ORDERING_REQUIREMENT_COUNTRY_CODE_MISMATCH`] — whether the country the
+    ///   quote is for is the country of that site, which only a site with a recorded
+    ///   operating address answers.
+    ///
+    /// Every outcome follows from a record this store holds, so a check is never
+    /// reported as passed because nothing was looked at — and the checks that depend
+    /// on an Outpost are reported only for a quote that names one, because a quote
+    /// associated with no Outpost gives them nothing to look at.
+    pub fn ordering_requirements(
+        &self,
+        region: &str,
+        country_code: &str,
+        outpost_id: Option<&str>,
+    ) -> Vec<OrderingRequirement> {
+        let mut requirements = vec![match outpost_id {
+            Some(outpost_id) => ordering_requirement(
+                ORDERING_REQUIREMENT_OUTPOST_ID_MISSING,
+                ORDERING_REQUIREMENT_PASS,
+                format!("the quote is associated with Outpost {outpost_id}"),
+            ),
+            None => ordering_requirement(
+                ORDERING_REQUIREMENT_OUTPOST_ID_MISSING,
+                ORDERING_REQUIREMENT_FAIL,
+                "the quote is associated with no Outpost".to_string(),
+            ),
+        }];
+        let placed = self.orders.len();
+        requirements.push(ordering_requirement(
+            ORDERING_REQUIREMENT_MAXIMUM_ALLOWED_ORDERS,
+            pass_or_fail(placed < MAX_RESOURCES),
+            format!("{placed} of the {MAX_RESOURCES} orders this service holds have been placed"),
+        ));
+        if let Some(record) = outpost_id.and_then(|outpost_id| self.outpost(region, outpost_id)) {
+            if let (Some(outpost_id), Some(status)) = (
+                record.outpost.outpost_id.as_deref(),
+                record.outpost.life_cycle_status.as_deref(),
+            ) {
+                requirements.push(ordering_requirement(
+                    ORDERING_REQUIREMENT_OUTPOST_ACTIVE,
+                    pass_or_fail(status == LIFE_CYCLE_STATUS_ACTIVE),
+                    format!("Outpost {outpost_id} is {status}"),
+                ));
+            }
+            let site = record
+                .outpost
+                .site_id
+                .as_deref()
+                .and_then(|site_id| Some((site_id, self.site(region, site_id)?)));
+            if let Some((site_id, site)) = site {
+                for (check, kind, address) in [
+                    (
+                        ORDERING_REQUIREMENT_OPERATING_ADDRESS,
+                        SiteAddressKind::Operating,
+                        "operating address",
+                    ),
+                    (
+                        ORDERING_REQUIREMENT_SHIPPING_ADDRESS,
+                        SiteAddressKind::Shipping,
+                        "shipping address",
+                    ),
+                ] {
+                    let recorded = site.address(kind).is_some();
+                    requirements.push(ordering_requirement(
+                        check,
+                        pass_or_fail(recorded),
+                        match recorded {
+                            true => format!("site {site_id} has a recorded {address}"),
+                            false => format!("site {site_id} has no recorded {address}"),
+                        },
+                    ));
+                }
+                if let Some(country) = site
+                    .address(SiteAddressKind::Operating)
+                    .map(|address| address.country_code.as_str())
+                {
+                    requirements.push(ordering_requirement(
+                        ORDERING_REQUIREMENT_COUNTRY_CODE_MISMATCH,
+                        pass_or_fail(country == country_code),
+                        match country == country_code {
+                            true => format!(
+                                "the quote's country code {country_code} is the country of site \
+                                 {site_id}"
+                            ),
+                            false => format!(
+                                "the quote's country code {country_code} is not {country}, the \
+                                 country of site {site_id}"
+                            ),
+                        },
+                    ));
+                }
+            }
         }
-        let monthly_rate = capacity as f32 * RENEWAL_PRICE_PER_VCPU_MONTH;
-        let term = monthly_rate * *months as f32;
-        Some(SubscriptionPricingDetails {
-            payment_option: Some(payment_option.to_string()),
-            payment_term: Some(payment_term.to_string()),
-            upfront_price: Some(to_the_cent(term * share)),
-            monthly_recurring_price: Some(to_the_cent(monthly_rate * (1.0 - share))),
-            currency: Some(CURRENCY_USD.to_string()),
-        })
+        debug_assert!(
+            requirements.len() <= ORDERING_REQUIREMENT_MAX
+                && requirements.iter().all(|requirement| {
+                    requirement
+                        .ordering_requirement_type
+                        .as_deref()
+                        .is_some_and(|check| {
+                            crate::ops::types::ORDERING_REQUIREMENT_TYPE_VALUES.contains(&check)
+                        })
+                        && requirement.status.as_deref().is_some_and(|status| {
+                            crate::ops::types::ORDERING_REQUIREMENT_STATUS_VALUES.contains(&status)
+                        })
+                }),
+            "every requirement reported names a modelled check with a modelled status, and a \
+             quote reports at most the requirements OrderingRequirementList allows"
+        );
+        requirements
     }
 
     /// Materialise every Outpost lifecycle transition the clock has already made

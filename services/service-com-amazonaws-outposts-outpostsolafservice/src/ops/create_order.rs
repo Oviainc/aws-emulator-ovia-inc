@@ -11,8 +11,6 @@
 //! ([`crate::state::ORDER_PREPARATION`]); nothing here reports it delivered or
 //! complete, because those are claims about hardware installed on the Outpost that
 //! this emulator has no record of (see [`crate::state::ORDER_STATUS_IN_PROGRESS`]).
-//! No price is reported: an order's prices come from AWS's own price list, which this
-//! emulator does not have, exactly as `CreateQuote` reports no `QuoteOption`.
 //!
 //! ## Shape of an operation
 //!
@@ -317,11 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that non-terminal status until the transition the clock owes falls due;
             // every read materialises it through `settle_orders`.
             status: Some(crate::state::ORDER_STATUS_PREPARING.to_string()),
-            // An order taken from a quote with no line items of its own has line
-            // items AWS priced on the quote option it was built from — which this
-            // store has no record of, for the reason `CreateQuote` reports no
-            // `QuoteOption` — so the order reports none rather than inventing catalog
-            // items nobody ordered.
+            // An order taken from a quote with no line items of its own has the
+            // line items AWS built out of the quote option it was ordered from. A
+            // quote option of this service carries the CAPACITY the quote asked for
+            // rather than the catalog items that would provide it, so the order
+            // reports no line item rather than inventing catalog items nobody
+            // ordered.
             line_items: match line_items.is_empty() {
                 true => None,
                 false => Some(line_items),

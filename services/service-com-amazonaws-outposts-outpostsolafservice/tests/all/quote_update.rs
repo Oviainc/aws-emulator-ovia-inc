@@ -25,10 +25,15 @@
 //! identifier echo, one that is no quote identifier at all 400 `ValidationException`,
 //! and an `OutpostIdentifier` naming no Outpost 404 — and a refused update changes
 //! nothing.
+//!
+//! A quote's `QuoteOptions` and `OrderingRequirements` are DERIVED rather than
+//! written, so an update re-derives the ones whose source it replaced; what each of
+//! them then reports is stated in [`crate::quote_options`].
 
 use serde_json::{json, Value};
 
 use crate::quote_lifecycle::{create_quote, get_quote, request, ABSENT_QUOTE_ID, QUOTE_ARN_PREFIX};
+use crate::quote_options::{option_identifier, requirement_status, OUTPOST_ID_MISSING};
 use crate::site_and_outpost_lifecycle::{
     refusal, segment, text, without, Outposts, Refusal, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
 };
@@ -61,6 +66,14 @@ const CONSTRAINT_TYPES: &[&str] = &[
 ///
 /// Source: `smithy_query(query="shape", shape="QuoteCapacityType,QuoteCapacity")`.
 const CAPACITY_TYPES: &[(&str, &str)] = &[("EC2", "c5.24xlarge"), ("EBS", "TiB"), ("S3", "TiB")];
+
+/// The members of a quote its `QuoteOptions` are priced on, so an update that names
+/// one of them re-prices the quote. See [`crate::quote_options`].
+const PRICED_ON: &[&str] = &[
+    "RequestedCapacities",
+    "RequestedPaymentOptions",
+    "RequestedPaymentTerms",
+];
 
 /// `PATCH /quotes/{QuoteIdentifier}`, returning the `Quote` it answered with.
 async fn update_quote(outposts: &Outposts, identifier: &str, patch: &Value) -> Value {
@@ -215,8 +228,33 @@ async fn update_quote_applies_present_members_and_reads_back() {
 
     let mut expected = created;
     for (case, identifier, patch) in &cases {
+        let previous = expected.get("QuoteOptions").cloned();
         expected = overlay(&expected, patch);
         let answered = update_quote(&outposts, identifier, patch).await;
+        // `QuoteOptions` is not a member an update writes: it is DERIVED from the
+        // configuration the quote is priced on, so a patch naming one of those
+        // members re-prices the quote — a new option, with its own identifier — and
+        // one naming none of them leaves the option the quote already had. The
+        // expectation for that member is therefore the answer's own, but only once
+        // this has asserted it moved exactly when the rule says it moves.
+        let repriced = PRICED_ON.iter().any(|member| patch.get(member).is_some());
+        let options = answered.get("QuoteOptions").cloned();
+        match repriced {
+            true => assert_ne!(
+                options, previous,
+                "case {case:?}: the update replaced what the quote is priced on, so it must be \
+                 re-priced, got {answered:?}"
+            ),
+            false => assert_eq!(
+                options, previous,
+                "case {case:?}: the update replaced nothing the quote is priced on, so its option \
+                 must stand, got {answered:?}"
+            ),
+        }
+        option_identifier(&answered, case);
+        if let (Some(target), Some(options)) = (expected.as_object_mut(), options) {
+            target.insert("QuoteOptions".to_string(), options);
+        }
         assert_eq!(
             answered, expected,
             "case {case:?}: UpdateQuote must answer the updated quote, got {answered:?}"
@@ -310,11 +348,29 @@ async fn update_quote_sets_and_removes_the_outpost_association() {
             *expected_arn,
             "case {case:?}: expected OutpostArn {expected_arn:?}, got {answered:?}"
         );
-        // The association is the only member the request named, so nothing else may
-        // have moved: the rest of the quote is exactly what the create reported.
+        // The association is one of the records a quote's ordering requirements are
+        // checked against, so changing it re-runs those checks: the association check
+        // reports PASS exactly when the quote now names an Outpost. Every member that
+        // does not follow from the association is exactly what the create reported.
+        assert_eq!(
+            requirement_status(&answered, OUTPOST_ID_MISSING).as_deref(),
+            Some(match expected_arn {
+                Some(_) => "PASS",
+                None => "FAIL",
+            }),
+            "case {case:?}: the association check reports whether the quote names an Outpost, got \
+             {answered:?}"
+        );
+        let mut baseline = created.clone();
+        if let (Some(target), Some(requirements)) = (
+            baseline.as_object_mut(),
+            answered.get("OrderingRequirements").cloned(),
+        ) {
+            target.insert("OrderingRequirements".to_string(), requirements);
+        }
         assert_eq!(
             without(&answered, "OutpostArn"),
-            without(&created, "OutpostArn"),
+            without(&baseline, "OutpostArn"),
             "case {case:?}: setting the association changed another member, got {answered:?}"
         );
         assert_eq!(

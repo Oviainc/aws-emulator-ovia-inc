@@ -5,9 +5,16 @@
 //! answers it from what was persisted. The quote records the capacities,
 //! constraints, payment options and payment terms the request specified, the
 //! country code, the ARN of the Outpost it was associated with (when one was
-//! named), and the instants it was created at and expires at. No pricing is
-//! reported: a `QuoteOption`'s prices come from AWS's own price list, which this
-//! emulator does not have, so the member is absent rather than invented.
+//! named), and the instants it was created at and expires at. "A quote provides
+//! pricing and configuration options based on the requested capacity", so it also
+//! carries the option that configuration is offered as — its own minted
+//! `QuoteOptionIdentifier`, the capacity it provides and a price per payment
+//! combination the request asked for
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::quote_options`])
+//! — and the checks that must pass before an order can be submitted from it
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::ordering_requirements`]).
+//! Both are persisted with the quote, so `GetQuote` names the same option and
+//! `CreateOrder` has a `QuoteOptionIdentifier` to be given.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The Outpost an association names is read as it stands NOW — whether it has
+        // settled in its terminal status is one of the checks this quote's ordering
+        // requirements report — so the lifecycle transition the clock has already
+        // made due is materialised before anything is read off it.
+        store.settle_outposts();
         // A quote may be associated only with an Outpost that exists, so an
         // identifier naming none is the not-found error this operation models. The
         // Outpost is resolved in the region this request is addressed to: one of
@@ -227,6 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (quote_id, sequence) = store.mint_id("oq");
+        // The configuration-and-pricing options this service answers the requested
+        // capacity with, and the checks an order submitted from the quote has to
+        // satisfy. Both are derived HERE, from the configuration this request
+        // describes and the records the store holds for the Outpost it names, and
+        // persisted with the quote below — so every later read of it reports the same
+        // option, under the same `QuoteOptionIdentifier` a `CreateOrder` names.
+        let quote_options = store.quote_options(
+            &input.requested_capacities,
+            input.requested_payment_options.as_deref(),
+            input.requested_payment_terms.as_deref(),
+        );
+        let ordering_requirements =
+            store.ordering_requirements(&region, &input.country_code, outpost_id.as_deref());
         let created = ::std::time::SystemTime::now();
         let quote = Quote {
             quote_id: Some(quote_id.clone()),
@@ -249,12 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested_constraints: input.requested_constraints,
             requested_payment_options: input.requested_payment_options,
             requested_payment_terms: input.requested_payment_terms,
-            // A `QuoteOption` carries upfront and monthly prices from AWS's price
-            // list, and an `OrderingRequirement` is the outcome of a check AWS runs
-            // against the order pipeline. The emulator has neither, so it reports
-            // neither rather than synthesising numbers or check results.
-            quote_options: None,
-            ordering_requirements: None,
+            // The options the requested capacity is offered as, and the outcome of
+            // each check this store can decide, as derived above.
+            quote_options: Some(quote_options),
+            ordering_requirements: Some(ordering_requirements),
             // Set by submitting an order from this quote, which nothing in this
             // slice does.
             submitted_order_id: None,

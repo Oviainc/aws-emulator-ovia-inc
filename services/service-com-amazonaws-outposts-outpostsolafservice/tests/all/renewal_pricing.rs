@@ -47,7 +47,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
     CURRENCY_USD, ORDER_STATUS_COMPLETED, PAYMENT_OPTION_UPFRONT_SHARE, PAYMENT_TERM_MONTHS,
     PRICING_RESULT_PRICED, PRICING_RESULT_UNABLE_TO_PRICE, QUOTE_PRICING_TYPE_SUBSCRIPTION,
-    RENEWAL_PRICE_PER_VCPU_MONTH,
+    SUBSCRIPTION_PRICE_PER_VCPU_MONTH,
 };
 
 use crate::quote_lifecycle::{create_quote, request as quote_request};
@@ -314,7 +314,7 @@ fn assert_priced(reply: &Value, capacity: i64, case: &str) {
         "case {case:?}: expected one option per payment option and term ({}), got {reply}",
         expected.len()
     );
-    let monthly_rate = capacity as f64 * f64::from(RENEWAL_PRICE_PER_VCPU_MONTH);
+    let monthly_rate = capacity as f64 * f64::from(SUBSCRIPTION_PRICE_PER_VCPU_MONTH);
     for (index, (actual, (payment_option, payment_term))) in
         reported.iter().zip(&expected).enumerate()
     {

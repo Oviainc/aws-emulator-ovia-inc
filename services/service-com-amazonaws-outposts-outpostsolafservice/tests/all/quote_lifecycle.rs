@@ -27,6 +27,7 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 
+use crate::quote_options::option_identifier;
 use crate::site_and_outpost_lifecycle::{
     is_minted_id, refusal, segment, text, without, Outposts, Refusal,
 };
@@ -48,16 +49,10 @@ pub(crate) const ABSENT_QUOTE_ID: &str = "oq-00000000000000000";
 const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
 
 /// The members a `Quote` carries only once something has happened to it that this
-/// slice of the API cannot make happen: prices come from AWS's own price list, an
-/// `OrderingRequirement` is the outcome of a check against the order pipeline, a
-/// `SubmittedOrderId` appears when an order is submitted from the quote, and a
-/// `StatusMessage` explains a status that needs explaining.
-const UNREPORTED: &[&str] = &[
-    "QuoteOptions",
-    "OrderingRequirements",
-    "SubmittedOrderId",
-    "StatusMessage",
-];
+/// slice of the API cannot make happen: a `SubmittedOrderId` appears when an order
+/// is submitted from the quote, and a `StatusMessage` explains a status that needs
+/// explaining.
+const UNREPORTED: &[&str] = &["SubmittedOrderId", "StatusMessage"];
 
 /// The two identifier forms the modelled `QuoteIdentifier` pattern accepts for one
 /// quote: the bare id, and the full quote ARN.
@@ -276,6 +271,21 @@ async fn create_quote_persists_and_both_identifier_forms_read_it_back() {
                  must be absent, got {created}"
             );
         }
+
+        // A quote is answered with the option its requested capacity is offered as
+        // and with the checks an order submitted from it has to satisfy. What each
+        // of them reports is stated in full in [`crate::quote_options`]; this rule
+        // needs the quote to carry them, the option under an identifier of the
+        // modelled form.
+        option_identifier(&created, case);
+        assert!(
+            created
+                .get("OrderingRequirements")
+                .and_then(Value::as_array)
+                .is_some_and(|requirements| !requirements.is_empty()),
+            "case {case:?}: the quote must report the checks an order from it has to satisfy, \
+             got {created}"
+        );
 
         let created_date = instant(&created, "CreatedDate", case);
         let expiration_date = instant(&created, "ExpirationDate", case);

@@ -41,7 +41,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
     PAYMENT_OPTION_VALUES, PAYMENT_TERM_VALUES,
 };
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    store_full, RenewalRecord, CURRENCY_USD, MAX_RESOURCES, RENEWAL_PRICE_PER_VCPU_MONTH,
+    store_full, RenewalRecord, CURRENCY_USD, MAX_RESOURCES, SUBSCRIPTION_PRICE_PER_VCPU_MONTH,
 };
 
 use crate::renewal_pricing::{
@@ -110,7 +110,7 @@ fn assert_contract(
         Some(CURRENCY_USD),
         "case {case:?}: expected Currency {CURRENCY_USD:?}, got {reply}"
     );
-    let monthly_rate = capacity as f64 * f64::from(RENEWAL_PRICE_PER_VCPU_MONTH);
+    let monthly_rate = capacity as f64 * f64::from(SUBSCRIPTION_PRICE_PER_VCPU_MONTH);
     let months = months(payment_term);
     let share = upfront_share(payment_option);
     let term_cost = monthly_rate * months;

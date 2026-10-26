@@ -75,6 +75,8 @@ mod quote_deletion;
 mod quote_lifecycle;
 #[path = "all/quote_listing.rs"]
 mod quote_listing;
+#[path = "all/quote_options.rs"]
+mod quote_options;
 #[path = "all/quote_store_bound.rs"]
 mod quote_store_bound;
 #[path = "all/quote_update.rs"]
