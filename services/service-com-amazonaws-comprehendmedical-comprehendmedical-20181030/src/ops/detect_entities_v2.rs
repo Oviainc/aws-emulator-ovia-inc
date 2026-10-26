@@ -16,8 +16,10 @@
 //! confidence in the detection and analysis". This emulator runs no such model, and a
 //! hand-written term list with a digest-derived confidence would be output nothing
 //! computed, so the honest answer stays the 501 below until a real, maintained inference
-//! component is wired into the workspace. The same holds for its siblings
-//! `DetectEntities`, `DetectPHI` and the `Infer*` operations.
+//! component is wired into the workspace. The same holds for its sibling
+//! `DetectEntities`. It does NOT hold for the operations whose entities have a published
+//! written form or an ontology to link against: `DetectPHI` and the `Infer*` operations
+//! are implemented from those forms.
 //!
 //! ## Shape of an operation
 //!

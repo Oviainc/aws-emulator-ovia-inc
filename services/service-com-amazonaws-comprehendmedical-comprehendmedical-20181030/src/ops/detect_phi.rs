@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectPHI
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectPHI`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectPHI::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The protected-health-information pass runs in-process over the
+//! submitted clinical text: every entity it reports is a stretch of THAT text, placed
+//! either by the written form an identifier class takes (an e-mail address, a telephone
+//! number, a date, a street address, a social-security number) or by the words standing
+//! around an otherwise ambiguous value (a bare number after an age or record-number cue,
+//! a capitalized word after a personal title). Nothing is matched out of a particular
+//! request, and no value is carried from one call to the next.
 //!
-//! ## Shape of an operation
+//! No maintained crates.io crate ships a clinical-text model that can be loaded
+//! in-process without an external runtime, so the engine here is rule- and
+//! lexicon-based — the same class of engine as the ontology-linking operations of this
+//! crate — and the rule each table applies is stated on that table. It runs on the SAME
+//! clinical-text pass those operations already own (`crate::ops::infer_icd10_cm`'s
+//! tokenizer, spans, lexicon matching, confidence weights and character offsets) rather
+//! than on a second matching mechanism of its own; what this file adds is the written
+//! forms and the context cues of the identifier classes, which are PHI's own.
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `DetectPHI::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The operation holds NO state: the answer is a function of the submitted text alone,
+//! so repeating the call returns the same entities and nothing a later caller reads is
+//! changed by calling it.
 //!
 //! ## Reaching this service's state
 //!
@@ -89,6 +94,1548 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::sync::OnceLock;
+
+use crate::ops::infer_icd10_cm::{
+    character_offset, character_starts, lexicon_matches, term_confidence, tokenize, Span, Token,
+    WEIGHT_CUE, WEIGHT_PATTERN,
+};
+
+/// The version this emulator reports for the model behind the PHI pass.
+///
+/// The modelled `ModelVersion` member documents the SHAPE of the value ("The version
+/// number looks like X.X.X"), not a particular version, so one constant is the single
+/// source for every response this operation serves.
+const MODEL_VERSION: &str = "0.1.0";
+
+/// The category every entity of this operation is in: the modelled `EntityType` member
+/// `PROTECTED_HEALTH_INFORMATION` (`super::types::ENTITY_TYPE_VALUES`), which is what
+/// this operation inspects the text for.
+const CATEGORY_PHI: &str = "PROTECTED_HEALTH_INFORMATION";
+
+// The modelled `EntitySubType` values this pass can produce
+// (`super::types::ENTITY_SUB_TYPE_VALUES`, generated from the model's enum), named once
+// so no pass below can report a value outside the enum. They are the identifier classes
+// the operation's own documentation names for protected health information: who the
+// person is, how old they are, when something happened, how to reach them, which number
+// identifies them, where they live and what they do for a living.
+const TYPE_NAME: &str = "NAME";
+const TYPE_AGE: &str = "AGE";
+const TYPE_DATE: &str = "DATE";
+const TYPE_PHONE_OR_FAX: &str = "PHONE_OR_FAX";
+const TYPE_EMAIL: &str = "EMAIL";
+const TYPE_ID: &str = "ID";
+const TYPE_URL: &str = "URL";
+const TYPE_ADDRESS: &str = "ADDRESS";
+const TYPE_PROFESSION: &str = "PROFESSION";
+
+/// The characters a sentence puts AFTER a written form, which are therefore not part of
+/// it: a web address at the end of a sentence is written with the stop touching its last
+/// character.
+const TRAILING_PUNCTUATION: &[char] = &['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"'];
+
+/// The characters an e-mail address's local part is written from, beside letters and
+/// digits. Source: the dot-atom text of an RFC 5322 addr-spec, in the practical form a
+/// note carries it.
+const LOCAL_PART_CHARACTERS: &str = "._%+-";
+
+/// The characters a host name is written from, beside letters and digits.
+const HOST_CHARACTERS: &str = ".-";
+
+/// The characters that end a web address written in running text: whitespace, and the
+/// quoting characters a note wraps one in.
+const URL_TERMINATORS: &str = "<>\"'";
+
+/// How a pass established that the stretch of text it placed is protected health
+/// information, and therefore how much confidence the detection carries.
+///
+/// These are EVIDENCE classes rather than decoration: which class placed an entity says
+/// what the pass actually verified about the characters it reports, so two spans found
+/// the same way carry the same confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// The span's own characters are the whole of the evidence: a written form that
+    /// only this identifier class takes, so nothing but the form can be wrong.
+    Form,
+    /// The span's own form is ambiguous — a bare number, a capitalized word — and it is
+    /// admitted only because the words around it name what it is.
+    Context,
+    /// A written form one of the lexicons below names, where a longer match is a more
+    /// specific mention of the same thing.
+    Lexicon,
+}
+
+impl Evidence {
+    /// The confidence a span of this evidence class carries, in (0, 1]. A closed written
+    /// form and a context cue are weighted as every other pass of this crate weights
+    /// them; a lexicon match is weighted by how many tokens its written form spans.
+    fn score(self, matched: &str) -> f32 {
+        match self {
+            Self::Form => WEIGHT_PATTERN,
+            Self::Context => WEIGHT_CUE,
+            Self::Lexicon => term_confidence(matched.split_whitespace().count()),
+        }
+    }
+}
+
+/// One entity the pass placed: where it is written in the submitted text, in BYTE
+/// offsets, which identifier class it is and how confident the detection is.
+#[derive(Debug)]
+struct Mention {
+    start: usize,
+    end: usize,
+    phi_type: &'static str,
+    score: f32,
+}
+
+/// The months a date names, lowercased, with the abbreviations a note writes.
+///
+/// Source: the Gregorian calendar months and their three-letter abbreviations.
+const MONTHS: &[&str] = &[
+    "january",
+    "jan",
+    "february",
+    "feb",
+    "march",
+    "mar",
+    "april",
+    "apr",
+    "may",
+    "june",
+    "jun",
+    "july",
+    "jul",
+    "august",
+    "aug",
+    "september",
+    "sept",
+    "sep",
+    "october",
+    "oct",
+    "november",
+    "nov",
+    "december",
+    "dec",
+];
+
+/// The month names whose lowercase spelling is also an ordinary English word — the modal
+/// "may", the verbs "march" and "mar", the adjective "august". One of these names a
+/// month only when it is written with a capital, as a date writes it, so a sentence that
+/// merely uses the word is not read as a date.
+const AMBIGUOUS_MONTHS: &[&str] = &["may", "march", "mar", "august", "aug"];
+
+/// The words a day number is written with after the digits.
+const ORDINAL_SUFFIXES: &[&str] = &["st", "nd", "rd", "th"];
+
+/// Personal titles, lowercased. A title names the person written after it, whatever
+/// lexicon that name belongs to.
+const TITLES: &[&str] = &[
+    "mr",
+    "mrs",
+    "ms",
+    "miss",
+    "dr",
+    "doctor",
+    "prof",
+    "professor",
+    "rev",
+    "reverend",
+];
+
+/// The field and role words a record writes a person's name after.
+const NAME_CUES: &[&str] = &[
+    "patient", "patients", "name", "names", "surname", "insured", "guardian", "kin",
+];
+
+/// The words that say a number identifies the person, lowercased, as a cue phrase of one
+/// to three tokens.
+///
+/// Source: the identifiers a record carries for a person — the medical record number,
+/// the chart, account, member, policy and licence numbers, and the social-security
+/// number.
+const ID_CUES: &[&str] = &[
+    "mrn",
+    "medical record number",
+    "medical record",
+    "record number",
+    "patient id",
+    "patient identifier",
+    "chart number",
+    "chart",
+    "account number",
+    "insurance id",
+    "member id",
+    "policy number",
+    "ssn",
+    "social security number",
+    "license number",
+    "licence number",
+    "certificate number",
+    "id number",
+];
+
+/// The filler words a cue is written with in front of the value it names.
+const ID_FILLERS: &[&str] = &["is", "no", "number", "of"];
+
+/// The street-type words a street address ends its street name with, lowercased.
+///
+/// Source: the street suffixes of the United States Postal Service's addressing
+/// standard, in their written and abbreviated forms.
+const STREET_TYPES: &[&str] = &[
+    "street",
+    "st",
+    "avenue",
+    "ave",
+    "road",
+    "rd",
+    "boulevard",
+    "blvd",
+    "lane",
+    "ln",
+    "drive",
+    "dr",
+    "court",
+    "ct",
+    "place",
+    "pl",
+    "way",
+    "terrace",
+    "ter",
+    "circle",
+    "cir",
+    "highway",
+    "hwy",
+    "parkway",
+    "pkwy",
+    "trail",
+    "trl",
+];
+
+/// The words that count a person's age when they stand after the number.
+const AGE_UNITS: &[&str] = &["year", "years", "yr", "yrs", "y"];
+
+/// The words that count the age of an infant when they stand after the number.
+const INFANT_AGE_UNITS: &[&str] = &["month", "months", "week", "weeks", "day", "days"];
+
+/// The words that name the age a number counts when they stand in front of it.
+const AGE_CUES: &[&str] = &["age", "aged", "ages"];
+
+/// What a number written together with one of these suffixes counts: "45yo", "45yr".
+const AGE_SUFFIXES: &[&str] = &["yo", "yof", "yom", "yr", "yrs", "y"];
+
+/// The words that state what a person does for a living when they stand in front of an
+/// occupation.
+const WORK_WORDS: &[&str] = &["work", "works", "worked", "working", "employed"];
+
+/// The words that introduce an occupation as the person's own.
+const OCCUPATION_CUES: &[&str] = &["retired", "occupation", "profession"];
+
+/// Given names, as a clinical note writes them: with a capital.
+///
+/// Source: the given names most often recorded in the United States, which is the
+/// vocabulary a patient name is written from. A name whose lowercase spelling is also an
+/// ordinary English word or a month ("April", "Grace", "Mark", "Will") is deliberately
+/// NOT an entry: this lexicon is what admits a capitalized word with no cue in front of
+/// it, so an entry that is also a word would read a benign sentence as a name. A name
+/// outside this lexicon is still placed when a title or a field cue names it.
+const GIVEN_NAMES: &[&str] = &[
+    "aaron",
+    "adam",
+    "alan",
+    "albert",
+    "alexander",
+    "alice",
+    "amanda",
+    "amber",
+    "amy",
+    "andrea",
+    "andrew",
+    "angela",
+    "anna",
+    "anthony",
+    "arthur",
+    "ashley",
+    "barbara",
+    "benjamin",
+    "bernice",
+    "beth",
+    "betty",
+    "beverly",
+    "bonnie",
+    "brandon",
+    "brenda",
+    "brian",
+    "carlos",
+    "carmen",
+    "carolyn",
+    "catherine",
+    "charles",
+    "charlotte",
+    "cheryl",
+    "christian",
+    "christina",
+    "christine",
+    "christopher",
+    "cynthia",
+    "daniel",
+    "danielle",
+    "david",
+    "deborah",
+    "denise",
+    "dennis",
+    "diana",
+    "diane",
+    "donald",
+    "donna",
+    "dorothy",
+    "douglas",
+    "dylan",
+    "edward",
+    "elaine",
+    "eleanor",
+    "elizabeth",
+    "emily",
+    "emma",
+    "eric",
+    "erica",
+    "erin",
+    "esther",
+    "ethan",
+    "eugene",
+    "evelyn",
+    "frances",
+    "francisco",
+    "gary",
+    "george",
+    "gerald",
+    "gloria",
+    "gregory",
+    "harold",
+    "heather",
+    "helen",
+    "henry",
+    "holly",
+    "irene",
+    "jacob",
+    "jacqueline",
+    "james",
+    "jane",
+    "janet",
+    "janice",
+    "jason",
+    "jeffrey",
+    "jennifer",
+    "jeremy",
+    "jessica",
+    "joan",
+    "joanne",
+    "john",
+    "jonathan",
+    "jose",
+    "joseph",
+    "josephine",
+    "joshua",
+    "juanita",
+    "judith",
+    "julia",
+    "julie",
+    "justin",
+    "karen",
+    "katherine",
+    "kathleen",
+    "kathryn",
+    "keith",
+    "kenneth",
+    "kevin",
+    "kimberly",
+    "kristen",
+    "kyle",
+    "larry",
+    "laura",
+    "lauren",
+    "lawrence",
+    "leslie",
+    "linda",
+    "lisa",
+    "lorraine",
+    "louise",
+    "lucille",
+    "luis",
+    "margaret",
+    "maria",
+    "marie",
+    "marilyn",
+    "marion",
+    "marjorie",
+    "martha",
+    "mary",
+    "matthew",
+    "megan",
+    "melanie",
+    "melissa",
+    "michael",
+    "michele",
+    "michelle",
+    "mildred",
+    "monica",
+    "nancy",
+    "nathan",
+    "nicholas",
+    "nicole",
+    "norma",
+    "pamela",
+    "patricia",
+    "patrick",
+    "paul",
+    "paula",
+    "pauline",
+    "peter",
+    "phyllis",
+    "rachel",
+    "ralph",
+    "rebecca",
+    "regina",
+    "renee",
+    "richard",
+    "rita",
+    "robert",
+    "roberta",
+    "ronald",
+    "rosa",
+    "ruth",
+    "ryan",
+    "samuel",
+    "sandra",
+    "sarah",
+    "scott",
+    "sean",
+    "sharon",
+    "sheila",
+    "shirley",
+    "stephanie",
+    "stephen",
+    "steven",
+    "susan",
+    "suzanne",
+    "sylvia",
+    "teresa",
+    "theresa",
+    "thomas",
+    "timothy",
+    "tracy",
+    "tyler",
+    "valerie",
+    "vanessa",
+    "veronica",
+    "victoria",
+    "vincent",
+    "virginia",
+    "vivian",
+    "walter",
+    "wanda",
+    "wayne",
+    "wendy",
+    "william",
+    "yolanda",
+    "yvonne",
+    "zachary",
+];
+
+/// Occupations, lowercased, as the vocabulary an occupation is stated with.
+///
+/// Source: the occupation titles of the United States Bureau of Labor Statistics'
+/// published major groups. An occupation word is only read as protected health
+/// information when the clause STATES it as the person's occupation (see
+/// [`states_occupation`]): a clinician named in passing is not the patient's profession.
+const PROFESSIONS: &[&str] = &[
+    "accountant",
+    "architect",
+    "artist",
+    "athlete",
+    "attorney",
+    "baker",
+    "banker",
+    "barber",
+    "bartender",
+    "bus driver",
+    "butcher",
+    "caregiver",
+    "carpenter",
+    "cashier",
+    "chef",
+    "clerk",
+    "coach",
+    "construction worker",
+    "cook",
+    "custodian",
+    "dentist",
+    "dishwasher",
+    "electrician",
+    "engineer",
+    "farmer",
+    "firefighter",
+    "fisherman",
+    "flight attendant",
+    "florist",
+    "gardener",
+    "hairdresser",
+    "homemaker",
+    "housekeeper",
+    "janitor",
+    "jeweler",
+    "journalist",
+    "landscaper",
+    "lawyer",
+    "librarian",
+    "machinist",
+    "mail carrier",
+    "manager",
+    "mechanic",
+    "miner",
+    "minister",
+    "musician",
+    "nanny",
+    "nurse",
+    "optician",
+    "painter",
+    "paramedic",
+    "pastor",
+    "pharmacist",
+    "photographer",
+    "physician",
+    "pilot",
+    "pipefitter",
+    "plumber",
+    "police officer",
+    "priest",
+    "professor",
+    "programmer",
+    "realtor",
+    "receptionist",
+    "researcher",
+    "roofer",
+    "sailor",
+    "salesperson",
+    "scientist",
+    "seamstress",
+    "secretary",
+    "security guard",
+    "social worker",
+    "software engineer",
+    "soldier",
+    "supervisor",
+    "tailor",
+    "taxi driver",
+    "teacher",
+    "technician",
+    "truck driver",
+    "veterinarian",
+    "waiter",
+    "waitress",
+    "welder",
+    "writer",
+];
+
+/// Words a clinical note writes with a capital that name no person.
+///
+/// Source: the headings and section words of a clinical note. They are what keeps the
+/// field-cue pass — a cue followed by capitalized words — from reading a note's own
+/// vocabulary ("Patient Education Materials") as somebody's name.
+const NOT_A_NAME: &[&str] = &[
+    "admission",
+    "advance",
+    "allergies",
+    "assessment",
+    "care",
+    "center",
+    "chart",
+    "clinic",
+    "consent",
+    "department",
+    "discharge",
+    "education",
+    "emergency",
+    "follow",
+    "history",
+    "hospital",
+    "information",
+    "instructions",
+    "labs",
+    "materials",
+    "medical",
+    "medications",
+    "notes",
+    "plan",
+    "portal",
+    "record",
+    "records",
+    "report",
+    "reports",
+    "results",
+    "room",
+    "visit",
+    "vitals",
+];
+
+/// The longest written form the occupation lexicon holds, in tokens, built once.
+fn profession_tokens() -> usize {
+    static LONGEST: OnceLock<usize> = OnceLock::new();
+    *LONGEST.get_or_init(|| {
+        PROFESSIONS
+            .iter()
+            .map(|term| term.split(' ').count())
+            .max()
+            .unwrap_or(1)
+    })
+}
+
+/// Every maximal run of ASCII digits in `text`, as byte offsets.
+///
+/// The digit forms below — a telephone number, a social-security number, a date, a ZIP
+/// code — are runs of digits joined by one separator character each, so they are read
+/// off this table rather than off the tokens: a token keeps a decimal point inside it,
+/// which would hide the groups of "555.123.4567".
+fn digit_runs(text: &str) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (index, character) in text.char_indices() {
+        if character.is_ascii_digit() {
+            if open.is_none() {
+                open = Some(index);
+            }
+        } else if let Some(start) = open.take() {
+            runs.push((start, index));
+        }
+    }
+    if let Some(start) = open {
+        runs.push((start, text.len()));
+    }
+    runs
+}
+
+/// The character written just before byte offset `byte`, or `None` at the start.
+fn character_before(text: &str, byte: usize) -> Option<char> {
+    text.get(..byte).and_then(|before| before.chars().next_back())
+}
+
+/// The character written at byte offset `byte`, or `None` at the end.
+fn character_at(text: &str, byte: usize) -> Option<char> {
+    text.get(byte..).and_then(|from| from.chars().next())
+}
+
+/// The characters written between two spans of the submitted text.
+fn between(text: &str, left_end: usize, right_start: usize) -> &str {
+    text.get(left_end..right_start).unwrap_or("")
+}
+
+/// Whether the characters between two spans are at most `most` of `allowed`.
+fn joined_by(gap: &str, allowed: &str, most: usize) -> bool {
+    gap.chars().count() <= most && gap.chars().all(|character| allowed.contains(character))
+}
+
+/// Whether a written form occupying `start..end` stands on its own rather than inside a
+/// longer word or number.
+fn free_standing(text: &str, start: usize, end: usize) -> bool {
+    character_before(text, start).is_none_or(|character| !character.is_alphanumeric())
+        && character_at(text, end).is_none_or(|character| !character.is_alphanumeric())
+}
+
+/// Whether `token` is written with a capital in the submitted text.
+fn is_capitalized(text: &str, token: &Token) -> bool {
+    text.get(token.start..token.end)
+        .and_then(|written| written.chars().next())
+        .is_some_and(char::is_uppercase)
+}
+
+/// Whether `token` is a word: letters only, so a measurement is never read as one.
+fn is_word(token: &Token) -> bool {
+    !token.lower.is_empty() && token.lower.chars().all(char::is_alphabetic)
+}
+
+/// `token` as a run of ASCII digits, when that is all it is.
+fn plain_digits(token: &Token) -> Option<usize> {
+    (!token.lower.is_empty() && token.lower.chars().all(|digit| digit.is_ascii_digit()))
+        .then_some(token.lower.len())
+}
+
+/// How many leading ASCII digits `token` is written with.
+fn leading_digits(token: &Token) -> usize {
+    token
+        .lower
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count()
+}
+
+/// `token` as a day of the month: one or two digits, with or without the ordinal suffix
+/// a note writes them with ("15", "15th").
+fn day_number(token: &Token) -> Option<usize> {
+    let digits = leading_digits(token);
+    if !(1..=2).contains(&digits) {
+        return None;
+    }
+    let rest = token.lower.get(digits..)?;
+    (rest.is_empty() || ORDINAL_SUFFIXES.contains(&rest)).then_some(digits)
+}
+
+/// The month `token` names, or `None` when it names none.
+fn month_of(text: &str, token: &Token) -> Option<&'static str> {
+    let named = MONTHS
+        .iter()
+        .find(|month| **month == token.lower.as_str())?;
+    (!AMBIGUOUS_MONTHS.contains(named) || is_capitalized(text, token)).then_some(*named)
+}
+
+/// Whether the token at `right` is written immediately after the token at `left`, with
+/// nothing between them but at most `most` characters of `allowed`.
+fn follows(text: &str, tokens: &[Token], left: usize, right: usize, allowed: &str, most: usize) -> bool {
+    right == left + 1
+        && right < tokens.len()
+        && joined_by(
+            between(text, tokens[left].end, tokens[right].start),
+            allowed,
+            most,
+        )
+}
+
+/// `span` with the characters a sentence put after it dropped, or `None` when nothing is
+/// left.
+fn without_trailing_punctuation(text: &str, span: (usize, usize)) -> Option<(usize, usize)> {
+    let (start, mut end) = span;
+    while end > start {
+        let last = text.get(start..end)?.chars().next_back()?;
+        if !TRAILING_PUNCTUATION.contains(&last) {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    (end > start).then_some((start, end))
+}
+
+/// Whether `start..end` touches a stretch of text already placed: one stretch of text
+/// reports ONE entity, so the first pass to claim it is the one that reports it.
+///
+/// `placed` is held in writing order, so the scan stops at the first entity written at
+/// or after the end of this span.
+fn overlaps(placed: &[Mention], start: usize, end: usize) -> bool {
+    placed
+        .iter()
+        .take_while(|mention| mention.start < end)
+        .any(|mention| start < mention.end)
+}
+
+/// Record `spans` as entities of `phi_type`, in writing order, skipping every span a
+/// pass of higher precedence already placed.
+fn place(
+    placed: &mut Vec<Mention>,
+    spans: Vec<(usize, usize)>,
+    phi_type: &'static str,
+    evidence: Evidence,
+    text: &str,
+) {
+    for (start, end) in spans {
+        if start >= end || overlaps(placed, start, end) {
+            continue;
+        }
+        let Some(matched) = text.get(start..end) else {
+            continue;
+        };
+        let position = placed.partition_point(|mention| mention.start < start);
+        placed.insert(
+            position,
+            Mention {
+                start,
+                end,
+                phi_type,
+                score: evidence.score(matched),
+            },
+        );
+    }
+}
+
+/// The span of the digit runs from `index` on, when their lengths fit `lengths` and each
+/// pair is joined by ONE separator character of `separators`. With `uniform`, every pair
+/// must be joined by the SAME separator, which is what tells a date from a number that
+/// merely holds digits.
+fn digit_group(
+    text: &str,
+    runs: &[(usize, usize)],
+    index: usize,
+    lengths: &[(usize, usize)],
+    separators: &str,
+    uniform: bool,
+) -> Option<(usize, usize)> {
+    if index + lengths.len() > runs.len() {
+        return None;
+    }
+    let mut separator: Option<char> = None;
+    for (offset, &(fewest, most)) in lengths.iter().enumerate() {
+        let (start, end) = runs[index + offset];
+        if !(fewest..=most).contains(&(end - start)) {
+            return None;
+        }
+        if offset > 0 {
+            let gap = between(text, runs[index + offset - 1].1, start);
+            let mut characters = gap.chars();
+            let joined = characters.next()?;
+            if characters.next().is_some() || !separators.contains(joined) {
+                return None;
+            }
+            if uniform && separator.is_some_and(|first| first != joined) {
+                return None;
+            }
+            separator = Some(joined);
+        }
+    }
+    let span = (runs[index].0, runs[index + lengths.len() - 1].1);
+    free_standing(text, span.0, span.1).then_some(span)
+}
+
+/// Every e-mail address written in `text`.
+///
+/// Source: the RFC 5322 addr-spec in the practical form a note carries it — a local part,
+/// the `@`, and a host name whose last label is alphabetic.
+fn email_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for (at, character) in text.char_indices() {
+        if character != '@' {
+            continue;
+        }
+        let mut start = at;
+        while let Some(previous) = character_before(text, start) {
+            if !previous.is_ascii_alphanumeric() && !LOCAL_PART_CHARACTERS.contains(previous) {
+                break;
+            }
+            start -= previous.len_utf8();
+        }
+        let mut end = at + 1;
+        while let Some(next) = character_at(text, end) {
+            if !next.is_ascii_alphanumeric() && !HOST_CHARACTERS.contains(next) {
+                break;
+            }
+            end += next.len_utf8();
+        }
+        // A separator the sentence wrote, not the address: a host name ends in a label.
+        while end > at + 1
+            && character_before(text, end).is_some_and(|last| HOST_CHARACTERS.contains(last))
+        {
+            end -= 1;
+        }
+        let local = between(text, start, at);
+        let host = between(text, at + 1, end);
+        let last_label = host.rsplit('.').next().unwrap_or("");
+        if local.starts_with(|first: char| first.is_ascii_alphanumeric())
+            && host.contains('.')
+            && last_label.len() >= 2
+            && last_label.chars().all(char::is_alphabetic)
+        {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+/// Every web address written in `text`: an absolute URI, and the scheme-less host form a
+/// note writes.
+///
+/// Source: the RFC 3986 absolute URI. A web address written in running text ends at
+/// whitespace or a quoting character, and the sentence's own stop is not part of it.
+fn url_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let scheme_marks = text.match_indices("://").map(|(at, _)| (at, true));
+    let host_marks = text.match_indices("www.").map(|(at, _)| (at, false));
+    for (at, scheme) in scheme_marks.chain(host_marks) {
+        let start = if scheme {
+            let mut start = at;
+            while let Some(previous) = character_before(text, start) {
+                if !previous.is_ascii_alphabetic() {
+                    break;
+                }
+                start -= previous.len_utf8();
+            }
+            let named = text.get(start..at).unwrap_or("").to_ascii_lowercase();
+            if !matches!(named.as_str(), "http" | "https" | "ftp") {
+                continue;
+            }
+            start
+        } else {
+            if character_before(text, at).is_some_and(char::is_alphanumeric) {
+                continue;
+            }
+            at
+        };
+        let mut end = if scheme { at + 3 } else { at + 4 };
+        while let Some(next) = character_at(text, end) {
+            if next.is_whitespace() || URL_TERMINATORS.contains(next) {
+                break;
+            }
+            end += next.len_utf8();
+        }
+        let Some((start, end)) = without_trailing_punctuation(text, (start, end)) else {
+            continue;
+        };
+        let rest = between(text, if scheme { at + 3 } else { at + 4 }, end);
+        if rest.is_empty() || (!scheme && !rest.contains('.')) {
+            continue;
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Every social-security number written in `text`.
+///
+/// Source: the Social Security Administration's written form — three digits, two digits
+/// and four digits, joined by hyphens — which identifies the person on its own.
+fn social_security_spans(text: &str, runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    (0..runs.len())
+        .filter_map(|index| {
+            digit_group(text, runs, index, &[(3, 3), (2, 2), (4, 4)], "-", true)
+        })
+        .collect()
+}
+
+/// Every number the text itself says identifies the person: a record, chart, account,
+/// member, policy or licence number written after the words that name it.
+///
+/// The value carries at least one digit, so a clause that says the number is unknown
+/// reports no identifier, and it is read no further than three tokens past the cue.
+fn identifier_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let Some(cue_tokens) = cue_length(tokens, index, ID_CUES) else {
+            index += 1;
+            continue;
+        };
+        let mut value = index + cue_tokens;
+        // The words a cue is written with in front of the value it names.
+        while value < tokens.len() && ID_FILLERS.contains(&tokens[value].lower.as_str()) {
+            value += 1;
+        }
+        let placed = value < tokens.len()
+            && value <= index + cue_tokens + 3
+            && tokens[value].lower.chars().any(|digit| digit.is_ascii_digit())
+            && joined_by(
+                between(text, tokens[value - 1].end, tokens[value].start),
+                " :=#-.\n\r\t",
+                3,
+            );
+        if placed {
+            // A value written in parts ("12-3456") is one identifier.
+            let mut end = tokens[value].end;
+            let mut next = value + 1;
+            while next < tokens.len()
+                && joined_by(between(text, tokens[next - 1].end, tokens[next].start), "-/", 1)
+                && tokens[next].lower.chars().any(|digit| digit.is_ascii_digit())
+            {
+                end = tokens[next].end;
+                next += 1;
+            }
+            spans.push((tokens[value].start, end));
+            index = next;
+            continue;
+        }
+        index += cue_tokens;
+    }
+    spans
+}
+
+/// How many tokens of `cues` are written at `index`, longest cue first, or `None` when
+/// none is.
+fn cue_length(tokens: &[Token], index: usize, cues: &[&str]) -> Option<usize> {
+    let longest = cues
+        .iter()
+        .map(|cue| cue.split(' ').count())
+        .max()
+        .unwrap_or(1)
+        .min(tokens.len() - index);
+    (1..=longest).rev().find(|length| {
+        let phrase = tokens[index..index + length]
+            .iter()
+            .map(|token| token.lower.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        cues.contains(&phrase.as_str())
+    })
+}
+
+/// Every telephone or fax number written in `text`.
+///
+/// Source: the North American Numbering Plan's written forms — an area code, written
+/// bare or in parentheses, a three-digit prefix and a four-digit line number — with or
+/// without a country code.
+fn telephone_spans(text: &str, runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..runs.len() {
+        let (area_start, area_end) = runs[index];
+        let parenthesised = character_before(text, area_start) == Some('(')
+            && character_at(text, area_end) == Some(')');
+        let span = if parenthesised {
+            parenthesised_telephone(text, runs, index)
+        } else {
+            digit_group(text, runs, index, &[(3, 3), (3, 3), (4, 4)], " .-", false)
+        };
+        let Some((start, end)) = span else { continue };
+        spans.push((with_country_code(text, runs, index, start), end));
+    }
+    spans
+}
+
+/// The telephone number whose area code at `index` is written in parentheses.
+fn parenthesised_telephone(
+    text: &str,
+    runs: &[(usize, usize)],
+    index: usize,
+) -> Option<(usize, usize)> {
+    let (area_start, area_end) = runs[index];
+    if area_end - area_start != 3 || index + 2 >= runs.len() {
+        return None;
+    }
+    let (prefix_start, prefix_end) = runs[index + 1];
+    let (line_start, line_end) = runs[index + 2];
+    if prefix_end - prefix_start != 3 || line_end - line_start != 4 {
+        return None;
+    }
+    if !joined_by(between(text, area_end, prefix_start), ") .-", 3) {
+        return None;
+    }
+    if !joined_by(between(text, prefix_end, line_start), " .-", 1) {
+        return None;
+    }
+    let start = area_start - '('.len_utf8();
+    free_standing(text, start, line_end).then_some((start, line_end))
+}
+
+/// `start` moved back over the country code written in front of the number, when one is.
+fn with_country_code(
+    text: &str,
+    runs: &[(usize, usize)],
+    index: usize,
+    start: usize,
+) -> usize {
+    if index == 0 {
+        return start;
+    }
+    let (code_start, code_end) = runs[index - 1];
+    let country = (1..=2).contains(&(code_end - code_start))
+        && character_before(text, code_start) == Some('+')
+        && joined_by(between(text, code_end, start), " .-", 1);
+    if country {
+        code_start - '+'.len_utf8()
+    } else {
+        start
+    }
+}
+
+/// Every calendar date written in `text`.
+///
+/// Source: the written forms a note dates an encounter with — ISO 8601, the all-numeric
+/// form, and the forms that name the month in words.
+fn date_spans(text: &str, tokens: &[Token], runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = (0..runs.len())
+        .filter_map(|index| {
+            digit_group(text, runs, index, &[(4, 4), (1, 2), (1, 2)], "-", true).or_else(|| {
+                digit_group(text, runs, index, &[(1, 2), (1, 2), (2, 4)], "/-", true)
+            })
+        })
+        .collect();
+
+    for index in 0..tokens.len() {
+        // A day, the month in words and the year: "15-Mar-2021", "15 March 2021".
+        let day_first = day_number(&tokens[index])
+            .filter(|_| index + 2 < tokens.len())
+            .filter(|_| follows(text, tokens, index, index + 1, " -./", 2))
+            .and_then(|_| month_of(text, &tokens[index + 1]))
+            .filter(|_| follows(text, tokens, index + 1, index + 2, " -.,", 2))
+            .and_then(|_| plain_digits(&tokens[index + 2]))
+            .filter(|digits| (2..=4).contains(digits))
+            .map(|_| (tokens[index].start, tokens[index + 2].end));
+        if let Some(span) = day_first {
+            spans.push(span);
+            continue;
+        }
+        if month_of(text, &tokens[index]).is_none() {
+            continue;
+        }
+        // The month in words and a day, with the year the note writes after it:
+        // "March 15, 2021", "Mar. 15".
+        let day = (index + 1 < tokens.len() && follows(text, tokens, index, index + 1, " .", 2))
+            .then(|| day_number(&tokens[index + 1]))
+            .flatten();
+        if day.is_some() {
+            let mut end = tokens[index + 1].end;
+            let year = index + 2 < tokens.len()
+                && follows(text, tokens, index + 1, index + 2, " ,", 2)
+                && plain_digits(&tokens[index + 2]) == Some(4);
+            if year {
+                end = tokens[index + 2].end;
+            }
+            spans.push((tokens[index].start, end));
+            continue;
+        }
+        // The month and the year alone: "June 2020".
+        let month_year = index + 1 < tokens.len()
+            && follows(text, tokens, index, index + 1, " .", 2)
+            && plain_digits(&tokens[index + 1]) == Some(4);
+        if month_year {
+            spans.push((tokens[index].start, tokens[index + 1].end));
+        }
+    }
+
+    spans.sort_unstable();
+    spans
+}
+
+/// Every street address written in `text`, and every city, state and ZIP code written
+/// without one.
+///
+/// Source: the United States Postal Service's addressing standard — a house number, a
+/// street name, a street-type word, and the city, state and ZIP code the note writes
+/// after them.
+fn address_spans(text: &str, tokens: &[Token], runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..tokens.len() {
+        if plain_digits(&tokens[index]).is_none_or(|digits| !(1..=6).contains(&digits)) {
+            continue;
+        }
+        let mut next = index + 1;
+        let mut named = 0usize;
+        while next < tokens.len()
+            && named <= 4
+            && follows(text, tokens, next - 1, next, " ", 1)
+            && is_word(&tokens[next])
+            && is_capitalized(text, &tokens[next])
+        {
+            if STREET_TYPES.contains(&tokens[next].lower.as_str()) && named > 0 {
+                let end = locality_end(text, tokens, runs, next).unwrap_or(tokens[next].end);
+                spans.push((tokens[index].start, end));
+                break;
+            }
+            named += 1;
+            next += 1;
+        }
+    }
+    // A city, state and ZIP code standing without a street still says where the person
+    // lives.
+    for index in 0..tokens.len() {
+        if !is_word(&tokens[index]) || !is_capitalized(text, &tokens[index]) {
+            continue;
+        }
+        if let Some(end) = state_and_zip_end(text, tokens, runs, index, tokens[index].end) {
+            spans.push((tokens[index].start, end));
+        }
+    }
+    spans.sort_unstable();
+    spans
+}
+
+/// Where the city, state and ZIP code written after the street part ends, or `None` when
+/// the address is the street part alone.
+fn locality_end(
+    text: &str,
+    tokens: &[Token],
+    runs: &[(usize, usize)],
+    street_type: usize,
+) -> Option<usize> {
+    let city = street_type + 1;
+    if city >= tokens.len()
+        || !is_word(&tokens[city])
+        || !is_capitalized(text, &tokens[city])
+        || !between(text, tokens[street_type].end, tokens[city].start).contains(',')
+        || !joined_by(
+            between(text, tokens[street_type].end, tokens[city].start),
+            ", .",
+            3,
+        )
+    {
+        return None;
+    }
+    let mut end = tokens[city].end;
+    let mut last = city;
+    // A city written in two words ("San Diego"), which the state after it tells from a
+    // two-letter state code.
+    if last + 1 < tokens.len()
+        && follows(text, tokens, last, last + 1, " ", 1)
+        && is_word(&tokens[last + 1])
+        && is_capitalized(text, &tokens[last + 1])
+        && !is_state_code(text, &tokens[last + 1])
+    {
+        last += 1;
+        end = tokens[last].end;
+    }
+    Some(state_and_zip_end(text, tokens, runs, last, end).unwrap_or(end))
+}
+
+/// Whether `token` is a two-letter state code, as an address writes one.
+fn is_state_code(text: &str, token: &Token) -> bool {
+    token.lower.len() == 2
+        && text
+            .get(token.start..token.end)
+            .is_some_and(|written| written.chars().all(char::is_uppercase))
+}
+
+/// Where the state and ZIP code written after the city end, or `None` when neither is.
+fn state_and_zip_end(
+    text: &str,
+    tokens: &[Token],
+    runs: &[(usize, usize)],
+    city: usize,
+    city_end: usize,
+) -> Option<usize> {
+    let state = city + 1;
+    if state >= tokens.len()
+        || !is_state_code(text, &tokens[state])
+        || !between(text, city_end, tokens[state].start).contains(',')
+        || !joined_by(between(text, city_end, tokens[state].start), ", ", 2)
+    {
+        return None;
+    }
+    let mut end = tokens[state].end;
+    // The ZIP code, with the four digits a note writes after it. The digit runs are in
+    // writing order, so the first one at or after the state is found by bisection.
+    if let Some(zip) = digit_run_from(runs, end).filter(|(start, zip_end)| {
+        zip_end - start == 5 && joined_by(between(text, end, *start), " ", 1)
+    }) {
+        end = zip.1;
+        if let Some(extension) = digit_run_from(runs, end).filter(|(start, extension_end)| {
+            extension_end - start == 4 && between(text, end, *start) == "-"
+        }) {
+            end = extension.1;
+        }
+    }
+    Some(end)
+}
+
+/// The first digit run written at or after byte offset `byte`, or `None` when there is
+/// none. `runs` is in writing order, so the run is found by bisection.
+fn digit_run_from(runs: &[(usize, usize)], byte: usize) -> Option<(usize, usize)> {
+    let from = runs.partition_point(|(start, _)| *start < byte);
+    runs.get(from).copied()
+}
+
+/// Every age written in `text`: the NUMBER is the entity, and the unit or the cue beside
+/// it is what says the number counts the person's age.
+fn age_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..tokens.len() {
+        let digits = leading_digits(&tokens[index]);
+        if (1..=3).contains(&digits) {
+            let number = (tokens[index].start, tokens[index].start + digits);
+            let rest = tokens[index].lower.get(digits..).unwrap_or("");
+            // The age and its unit written as one word: "45yo".
+            if AGE_SUFFIXES.contains(&rest) {
+                spans.push(number);
+                continue;
+            }
+            if rest.is_empty() && age_unit_follows(text, tokens, index) {
+                spans.push(number);
+                continue;
+            }
+        }
+        // The word that names the age in front of the number: "Age: 62", "aged 62".
+        if !AGE_CUES.contains(&tokens[index].lower.as_str()) {
+            continue;
+        }
+        let mut value = index + 1;
+        while value < tokens.len() && matches!(tokens[value].lower.as_str(), "of" | "is") {
+            value += 1;
+        }
+        let counted = value < tokens.len()
+            && value <= index + 2
+            && plain_digits(&tokens[value]).is_some_and(|digits| (1..=3).contains(&digits))
+            && joined_by(
+                between(text, tokens[value - 1].end, tokens[value].start),
+                " :=-",
+                3,
+            );
+        if counted {
+            spans.push((tokens[value].start, tokens[value].end));
+        }
+    }
+    spans
+}
+
+/// Whether the words written after the number at `index` count a person's age: "45 years
+/// old", "45-year-old", "7 months old", "38 y/o", "45 years of age".
+fn age_unit_follows(text: &str, tokens: &[Token], index: usize) -> bool {
+    let unit = index + 1;
+    if unit >= tokens.len() || !follows(text, tokens, index, unit, " -", 1) {
+        return false;
+    }
+    let word = tokens[unit].lower.as_str();
+    // "38 yo", and "38 y/o" as the two tokens a slash leaves.
+    if word == "yo" {
+        return true;
+    }
+    if word == "y"
+        && unit + 1 < tokens.len()
+        && follows(text, tokens, unit, unit + 1, "/.", 1)
+        && tokens[unit + 1].lower == "o"
+    {
+        return true;
+    }
+    let counted = AGE_UNITS.contains(&word) || INFANT_AGE_UNITS.contains(&word);
+    if !counted {
+        return false;
+    }
+    let after = unit + 1;
+    if after < tokens.len() && follows(text, tokens, unit, after, " -", 1) {
+        if tokens[after].lower == "old" {
+            return true;
+        }
+        // "45 years of age", which the age cue alone does not reach.
+        if AGE_UNITS.contains(&word)
+            && tokens[after].lower == "of"
+            && after + 1 < tokens.len()
+            && follows(text, tokens, after, after + 1, " ", 1)
+            && tokens[after + 1].lower == "age"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The capitalized words written from `index` on, at most `limit` of them, joined by one
+/// space, hyphen or apostrophe — which is how a person's name is written.
+fn capitalized_run(text: &str, tokens: &[Token], index: usize, limit: usize) -> Option<Span> {
+    if index >= tokens.len() || !is_word(&tokens[index]) || !is_capitalized(text, &tokens[index]) {
+        return None;
+    }
+    let mut end = index + 1;
+    while end < tokens.len() && end - index < limit {
+        let joined = between(text, tokens[end - 1].end, tokens[end].start);
+        if !matches!(joined, " " | "-" | "'")
+            || !is_word(&tokens[end])
+            || !is_capitalized(text, &tokens[end])
+        {
+            break;
+        }
+        end += 1;
+    }
+    Some(Span::of(tokens, index..end))
+}
+
+/// Whether the capitalized run `matched` names a person rather than a note's own
+/// heading: its FIRST word decides, because that is the word a cue introduces.
+fn names_a_person(matched: &str) -> bool {
+    matched
+        .split_whitespace()
+        .next()
+        .is_some_and(|first| !NOT_A_NAME.contains(&first.to_lowercase().as_str()))
+}
+
+/// Every person named by a personal title written in front of them. The title itself is
+/// not part of the name.
+fn titled_name_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..tokens.len() {
+        if !TITLES.contains(&tokens[index].lower.as_str()) || !is_capitalized(text, &tokens[index])
+        {
+            continue;
+        }
+        if !follows(text, tokens, index, index + 1, ". ", 2) {
+            continue;
+        }
+        if let Some(run) = capitalized_run(text, tokens, index + 1, 4) {
+            if text
+                .get(run.start..run.end)
+                .is_some_and(names_a_person)
+            {
+                spans.push((run.start, run.end));
+            }
+        }
+    }
+    spans
+}
+
+/// Every person named by a field or role cue written in front of them.
+///
+/// Two capitalized words are required here, because the cue alone is weaker evidence
+/// than a title: a note writes "Patient" in front of its own headings too.
+fn cued_name_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..tokens.len() {
+        if !NAME_CUES.contains(&tokens[index].lower.as_str()) {
+            continue;
+        }
+        let mut start = index + 1;
+        // The words a cue is written with in front of the name it names.
+        while start < tokens.len() && matches!(tokens[start].lower.as_str(), "is" | "name") {
+            start += 1;
+        }
+        if start >= tokens.len()
+            || !joined_by(
+                between(text, tokens[start - 1].end, tokens[start].start),
+                " :,-",
+                3,
+            )
+        {
+            continue;
+        }
+        let Some(run) = capitalized_run(text, tokens, start, 4) else {
+            continue;
+        };
+        if run.tokens.len() < 2 {
+            continue;
+        }
+        if text.get(run.start..run.end).is_some_and(names_a_person) {
+            spans.push((run.start, run.end));
+        }
+    }
+    spans
+}
+
+/// Every person named by a given name the lexicon holds, with the family name written
+/// after it.
+fn lexicon_name_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    (0..tokens.len())
+        .filter(|index| GIVEN_NAMES.contains(&tokens[*index].lower.as_str()))
+        .filter(|index| is_capitalized(text, &tokens[*index]))
+        .filter_map(|index| capitalized_run(text, tokens, index, 3))
+        .map(|run| (run.start, run.end))
+        .collect()
+}
+
+/// Every occupation the clause states as the person's own.
+fn profession_spans(tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut covered = vec![false; tokens.len()];
+    lexicon_matches(tokens, &mut covered, profession_tokens(), |phrase| {
+        PROFESSIONS.contains(&phrase)
+    })
+    .into_iter()
+    .filter(|(span, _)| states_occupation(tokens, span))
+    .map(|(span, _)| (span.start, span.end))
+    .collect()
+}
+
+/// Whether the words written immediately in front of `span` state the occupation it
+/// names as the person's own: an occupational statement ("works as a …", "occupation:
+/// …", "retired …") or a description of the person by age and occupation ("a
+/// 45-year-old …").
+fn states_occupation(tokens: &[Token], span: &Span) -> bool {
+    let index = span.tokens.start;
+    let before = |back: usize| -> Option<&str> {
+        index
+            .checked_sub(back)
+            .and_then(|at| tokens.get(at))
+            .map(|token| token.lower.as_str())
+    };
+    let article = matches!(before(1), Some("a" | "an"));
+    if article {
+        if matches!(before(2), Some("is" | "was")) {
+            return true;
+        }
+        if matches!(before(2), Some("as")) && before(3).is_some_and(|word| WORK_WORDS.contains(&word))
+        {
+            return true;
+        }
+        return before(2).is_some_and(|word| OCCUPATION_CUES.contains(&word));
+    }
+    if before(1).is_some_and(|word| OCCUPATION_CUES.contains(&word)) {
+        return true;
+    }
+    if matches!(before(1), Some("as")) && before(2).is_some_and(|word| WORK_WORDS.contains(&word)) {
+        return true;
+    }
+    // "a 45-year-old teacher": the clause describes the person by age and occupation.
+    matches!(before(1), Some("old")) && before(2).is_some_and(|word| AGE_UNITS.contains(&word))
+}
+
+/// Every protected-health-information entity of `text`, in the order the entities are
+/// written, as the modelled `Entity` values this operation answers with.
+///
+/// The passes run in order of PRECEDENCE: the closed written forms — the ones only one
+/// identifier class takes — first, the forms admitted by the words around them next, and
+/// the lexicon-admitted capitalized word last, so one stretch of text reports one entity
+/// and the strongest evidence for it is what reports it.
+///
+/// The `Id` member is "a monotonically increasing id unique within this response", so
+/// each entity takes the next one in writing order. A PHI entity reports no attribute
+/// and no trait: the identifier classes carry no modifier of their own, which is what
+/// the operation's own documented output — the entity text, its category, where it
+/// begins and ends, and the confidence — says it reports.
+fn detect_phi(text: &str) -> Vec<Entity> {
+    let tokens = tokenize(text);
+    let runs = digit_runs(text);
+    let mut placed: Vec<Mention> = Vec::new();
+
+    for (spans, phi_type, evidence) in [
+        (email_spans(text), TYPE_EMAIL, Evidence::Form),
+        (url_spans(text), TYPE_URL, Evidence::Form),
+        (
+            social_security_spans(text, &runs),
+            TYPE_ID,
+            Evidence::Form,
+        ),
+        (
+            telephone_spans(text, &runs),
+            TYPE_PHONE_OR_FAX,
+            Evidence::Form,
+        ),
+        (
+            date_spans(text, &tokens, &runs),
+            TYPE_DATE,
+            Evidence::Form,
+        ),
+        (
+            address_spans(text, &tokens, &runs),
+            TYPE_ADDRESS,
+            Evidence::Form,
+        ),
+        (
+            identifier_spans(text, &tokens),
+            TYPE_ID,
+            Evidence::Context,
+        ),
+        (age_spans(text, &tokens), TYPE_AGE, Evidence::Context),
+        (
+            titled_name_spans(text, &tokens),
+            TYPE_NAME,
+            Evidence::Context,
+        ),
+        (
+            cued_name_spans(text, &tokens),
+            TYPE_NAME,
+            Evidence::Context,
+        ),
+        (
+            lexicon_name_spans(text, &tokens),
+            TYPE_NAME,
+            Evidence::Lexicon,
+        ),
+        (
+            profession_spans(&tokens),
+            TYPE_PROFESSION,
+            Evidence::Context,
+        ),
+    ] {
+        place(&mut placed, spans, phi_type, evidence, text);
+    }
+
+    // Character offsets, as both modelled offset members report, from the byte offsets
+    // the passes work in.
+    let character_starts = character_starts(text);
+    let character_offset = |byte: usize| character_offset(&character_starts, byte);
+
+    placed
+        .into_iter()
+        .enumerate()
+        .map(|(index, mention)| Entity {
+            id: Some(i32::try_from(index).unwrap_or(i32::MAX)),
+            begin_offset: Some(character_offset(mention.start)),
+            end_offset: Some(character_offset(mention.end)),
+            score: Some(mention.score),
+            text: text.get(mention.start..mention.end).map(str::to_string),
+            category: Some(CATEGORY_PHI.to_string()),
+            r#type: Some(mention.phi_type.to_string()),
+            traits: Some(Vec::new()),
+            attributes: None,
+        })
+        .collect()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,18 +1710,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectPHI` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectPHIErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectPHI"))
+        // The pass holds NO state: the answer is a function of the submitted text
+        // alone, so repeating the call returns the same entities and nothing a later
+        // caller reads is changed by calling it. The engine and the request metadata are
+        // bound here only because this operation consults neither.
+        let _ = (ctx, &self.engine);
+
+        // `Text` carries the modelled 1..20000 length, which the boundary validator
+        // enforces before this handler runs — reaching here means the text is present,
+        // non-empty and within the size limit, and text past that maximum is already
+        // refused with this service's own `TextSizeLimitExceededException` (see
+        // `crate::service::validation`) — and it arrives as a Rust `String`, so it is
+        // valid UTF-8 and the modelled `InvalidEncodingException` is unreachable.
+        let entities = detect_phi(input.text.as_str());
+
+        Ok(DetectPHIOutput {
+            entities,
+            // Every entity of the submitted text is in this one response: nothing was
+            // truncated, so there is no page for the caller to resume from.
+            pagination_token: None,
+            model_version: MODEL_VERSION.to_string(),
+        })
     }
 }
