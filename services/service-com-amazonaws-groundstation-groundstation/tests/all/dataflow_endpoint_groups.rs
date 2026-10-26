@@ -566,10 +566,18 @@ async fn one_group_holds_endpoints_of_one_type_and_each_item_names_exactly_one()
     // plus the one `EndpointDetails` describes ONE endpoint.
     let accepted: Vec<(&str, Vec<Value>)> = vec![
         (
+            // Each endpoint carries a name of its own: a mission profile's
+            // `dataflowEndpointConfig` selects an endpoint of a group by name, so the two
+            // endpoints of one group differ in it (asserted in
+            // `crate::dataflow_endpoint_addressing`).
             "two dataflow endpoints",
             vec![
                 details(dataflow.member, &dataflow.body, true),
-                details(dataflow.member, &dataflow.body, true),
+                details(
+                    dataflow.member,
+                    &with_member(&dataflow.body, "name", &json!("second-endpoint")),
+                    true,
+                ),
             ],
         ),
         (
