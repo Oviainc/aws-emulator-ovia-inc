@@ -73,6 +73,9 @@ const MAX_DESCRIPTION_LEN: usize = 1024;
 /// A live emulator holding only this service.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so the suite can record the billing
+    /// transfers the organization has — see [`Emulator::designate_transfer`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -91,8 +94,14 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
+    /// seam [`crate::billing_transfer_identity::designate_transfer`].
+    fn designate_transfer(&self, arn: &str) -> String {
+        crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
     /// POST a JSON body to one of this service's routes and return the status plus the
@@ -861,6 +870,9 @@ async fn status_is_settable_only_among_the_statuses_the_group_can_hold() {
 
     for (index, case) in cases.iter().enumerate() {
         let em = Emulator::new();
+        // The transfer relationship the transfer-billing rows bill through: a group may
+        // only name a transfer the organization has.
+        em.designate_transfer(&transfer_arn("1234abcd"));
         let plan = em.create_plan(&format!("StatusPlan{index:03}")).await;
         let mut body = json!({
             "Name": format!("StatusGroup{index:03}"),
@@ -981,6 +993,9 @@ async fn a_status_round_trips_and_a_group_losing_its_owner_reports_the_absence()
 async fn the_responsibility_transfer_arn_of_an_existing_group_cannot_be_modified() {
     let em = Emulator::new();
     let plan = em.create_plan("TransferPlan").await;
+    // The one transfer relationship this organization has, so the group below can be
+    // created against it.
+    em.designate_transfer(&transfer_arn("1234abcd"));
     let standard = em.create_group(&base_group("StandardGroup", &plan)).await;
     let transfer = em
         .create_group(&json!({
