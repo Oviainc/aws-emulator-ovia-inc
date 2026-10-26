@@ -46,6 +46,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+pub mod export;
+
 use ::aws_smithy_types::DateTime;
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
@@ -5096,9 +5098,10 @@ fn ecs_filter_vocabulary(name: &str) -> Option<&'static [&'static str]> {
 // one-job-in-progress-per-Region limit each export operation documents, the seven-day
 // window the reader reports over, and the `JobFilter` vocabulary it selects with.
 //
-// What the job does NOT hold is the exported file: the destination is a bucket in the
-// CALLER's account, which this emulator does not serve, and no operation of this API ever
-// returns the file's content. The record is the whole of what a client can observe.
+// What the job does NOT hold once it has completed is the exported FILE: the two objects the
+// job writes are written into the destination bucket when the clock makes the job complete
+// ([`export::write_due_exports`]) and are read back from the Amazon S3 service, so a reader of
+// this record never serves their bytes.
 // ---------------------------------------------------------------------------
 
 /// The `JobStatus` values (`crate::ops::types::JOB_STATUS_VALUES`), named so the rules
@@ -5108,6 +5111,9 @@ pub const JOB_STATUS_QUEUED: &str = "Queued";
 pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`JOB_STATUS_QUEUED`].
 pub const JOB_STATUS_COMPLETE: &str = "Complete";
+/// See [`JOB_STATUS_QUEUED`]: the terminal status of a job whose export could not be written
+/// to its destination, which is what [`ExportJob::failure_reason`] then says.
+pub const JOB_STATUS_FAILED: &str = "Failed";
 
 /// The `JobFilterName` values (`crate::ops::types::JOB_FILTER_NAME_VALUES`): "Specify
 /// `ResourceType` to return export jobs of a specific resource type ... Specify `JobStatus`
@@ -5181,17 +5187,29 @@ pub struct ExportJob {
     pub metadata_key: String,
     /// When the job was created, in seconds since the epoch ([`now_secs`]).
     pub created_at: f64,
+    /// The export file and its metadata file, computed when the job was created and held
+    /// until the clock makes the job's completion due, at which point they are written into
+    /// the destination bucket and TAKEN from the record ([`export::write_due_exports`]).
+    /// `None` on a job whose objects have been written, or whose write failed.
+    pub pending: Option<export::PendingExport>,
+    /// "The reason for an export job failure": why the destination would not take this job's
+    /// objects, or `None` for a job that has not failed.
+    pub failure_reason: Option<String>,
 }
 
 impl ExportJob {
     /// The job's `JobStatus` at `now`: `Queued` until the first step has elapsed,
-    /// `InProgress` until the second has, `Complete` after that. `Complete` is terminal,
-    /// so the status never moves again.
+    /// `InProgress` until the second has, and then terminal — `Complete`, or `Failed` for a
+    /// job whose export the destination would not take. A terminal status never moves again.
     pub fn status_at(&self, now: f64) -> &'static str {
         let step = EXPORT_JOB_STEP.as_secs_f64();
         let elapsed = now - self.created_at;
         if elapsed >= 2.0 * step {
-            JOB_STATUS_COMPLETE
+            if self.failure_reason.is_some() {
+                JOB_STATUS_FAILED
+            } else {
+                JOB_STATUS_COMPLETE
+            }
         } else if elapsed >= step {
             JOB_STATUS_IN_PROGRESS
         } else {
@@ -5204,9 +5222,9 @@ impl ExportJob {
     pub fn last_updated_at(&self, now: f64) -> f64 {
         let step = EXPORT_JOB_STEP.as_secs_f64();
         match self.status_at(now) {
-            JOB_STATUS_COMPLETE => self.created_at + 2.0 * step,
             JOB_STATUS_IN_PROGRESS => self.created_at + step,
-            _ => self.created_at,
+            JOB_STATUS_QUEUED => self.created_at,
+            _ => self.created_at + 2.0 * step,
         }
     }
 
@@ -5214,7 +5232,10 @@ impl ExportJob {
     /// This is what "only one export job in progress per Amazon Web Services Region"
     /// counts.
     pub fn is_in_progress(&self, now: f64) -> bool {
-        self.status_at(now) != JOB_STATUS_COMPLETE
+        matches!(
+            self.status_at(now),
+            JOB_STATUS_QUEUED | JOB_STATUS_IN_PROGRESS
+        )
     }
 
     /// Whether the job was created within the last seven days, the window
@@ -5237,9 +5258,9 @@ impl ExportJob {
 
     /// The job as `DescribeRecommendationExportJobs` reports it at `now`.
     ///
-    /// `failureReason` is "the reason for an export job failure": this emulator's export
-    /// jobs are refused at the export call when they cannot be created at all, and none
-    /// fails afterwards, so a reported job carries no failure reason.
+    /// `failureReason` is "the reason for an export job failure": a job whose export could
+    /// not be written to the destination it named carries why, and every other job carries
+    /// none.
     pub fn to_wire(&self, now: f64) -> RecommendationExportJob {
         RecommendationExportJob {
             job_id: Some(self.job_id.clone()),
@@ -5250,7 +5271,7 @@ impl ExportJob {
             status: Some(self.status_at(now).to_string()),
             creation_timestamp: Some(DateTime::from_secs_f64(self.created_at)),
             last_updated_timestamp: Some(DateTime::from_secs_f64(self.last_updated_at(now))),
-            failure_reason: None,
+            failure_reason: self.failure_reason.clone(),
         }
     }
 }
@@ -5334,6 +5355,35 @@ impl ExportJobStore {
     /// Called from the export path, which is already a mutation; a reader never writes.
     pub fn prune_expired(&mut self, now: f64) {
         self.jobs.retain(|job| job.is_reported_at(now));
+    }
+
+    /// Take the objects of every job whose completion the clock has made due at `now` and
+    /// that still holds them: what [`export::write_due_exports`] writes to the destinations.
+    ///
+    /// TAKING them is what makes the write happen once: a job whose objects have been taken
+    /// holds none, so a later call hands them to nobody.
+    pub fn take_due_exports(&mut self, now: f64) -> Vec<export::DueExport> {
+        self.jobs
+            .iter_mut()
+            .filter(|job| !job.is_in_progress(now))
+            .filter_map(|job| {
+                job.pending.take().map(|pending| export::DueExport {
+                    job_id: job.job_id.clone(),
+                    bucket: job.bucket.clone(),
+                    key: job.key.clone(),
+                    metadata_key: job.metadata_key.clone(),
+                    pending,
+                })
+            })
+            .collect()
+    }
+
+    /// Record `reason` as why the job named `job_id` failed, which is what its
+    /// `failureReason` reports and what makes its terminal status `Failed`.
+    pub fn fail(&mut self, job_id: &str, reason: String) {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.job_id == job_id) {
+            job.failure_reason = Some(reason);
+        }
     }
 }
 
