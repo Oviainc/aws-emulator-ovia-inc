@@ -2,8 +2,9 @@
 
 //! @op GetOutpost
 //! IMPLEMENTED: reports the stored Outpost the `OutpostId` names, resolved from either
-//! the bare id or the full ARN the modelled label pattern accepts. A read: it never
-//! changes what a later caller sees.
+//! the bare id or the full ARN the modelled label pattern accepts — an ARN only when
+//! the partition, Region and account it names are this endpoint's own. A read: it
+//! never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -146,13 +147,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
-        // same stored record.
-        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
-            GetOutpostErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::outpost_id_pattern_report()),
+        // How this operation states that the `OutpostId` names no Outpost this
+        // endpoint holds: the identifier echo of the value AS SUPPLIED — not of the
+        // bare id an ARN resolved to. An Outpost of another region, of another
+        // account or of another partition is as absent here as one that never
+        // existed.
+        let not_found = || {
+            GetOutpostErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_ID_MEMBER,
+                    &input.outpost_id,
+                )),
             })
-        })?;
+        };
+        // `OutpostId` accepts the bare id or the full Outpost ARN. A bare id names an
+        // Outpost of the inventory this endpoint serves; an ARN carries a partition, a
+        // Region and an account of its own, and one that is not this endpoint's names
+        // no Outpost it holds.
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id, &region)
+            .ok_or_else(|| {
+                GetOutpostErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
 
         let mut store = state.lock();
         // Report the status the Outpost holds NOW: a transition the clock has
@@ -162,18 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let outpost = store
             .outpost(&region, &outpost_id)
             .map(|record| record.outpost.clone())
-            .ok_or_else(|| {
-                GetOutpostErrorModeled::NotFoundException(NotFoundException {
-                    // The identifier echo, of the value AS SUPPLIED — not of
-                    // `outpost_id`, which is the bare id an ARN resolved to. An
-                    // Outpost of another region is as absent here as one that never
-                    // existed.
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_ID_MEMBER,
-                        &input.outpost_id,
-                    )),
-                })
-            })?;
+            .ok_or_else(not_found)?;
 
         Ok(GetOutpostOutput {
             outpost: Some(outpost),

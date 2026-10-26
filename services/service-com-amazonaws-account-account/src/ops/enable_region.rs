@@ -200,20 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rules. Both are checked BEFORE the store is touched, so a refused
         // call writes nothing.
         let region_name = input.region_name;
-        match crate::state::region_kind(&region_name) {
-            None => {
-                return Err(EnableRegionErrorModeled::ValidationException(
-                    crate::state::unknown_region(&region_name),
-                )
-                .into())
-            }
-            Some(RegionKind::EnabledByDefault) => {
-                return Err(EnableRegionErrorModeled::ValidationException(
-                    crate::state::region_not_opt_target(&region_name),
-                )
-                .into())
-            }
-            Some(RegionKind::OptIn) => {}
+        if let Err(invalid) = crate::state::region_opt_target(&region_name) {
+            return Err(EnableRegionErrorModeled::ValidationException(invalid).into());
         }
 
         // The account this call acts on. An absent `AccountId` is the standalone
@@ -247,10 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 );
             }
-            // Already opted in, or already opting in: enabling it again asks
-            // for the state it is already heading to, so there is nothing to
-            // write and nothing to refuse.
-            RegionOptState::Enabling { .. } | RegionOptState::Enabled => {}
             // "this happens if you try to enable a Region that is currently
             // being disabled (in a status of DISABLING)" — ConflictException.
             status @ RegionOptState::Disabling { .. } => {
@@ -259,14 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            // Not reachable: the catalog check above already refused a
-            // default-enabled Region, which is the only source of this status.
-            RegionOptState::EnabledByDefault => {
-                return Err(EnableRegionErrorModeled::ValidationException(
-                    crate::state::region_not_opt_target(&region_name),
-                )
-                .into())
-            }
+            // Already opted in, or already opting in: enabling it again asks
+            // for the state it is already heading to, so there is nothing to
+            // write and nothing to refuse. `ENABLED_BY_DEFAULT` is not among
+            // the statuses that reach here: the opt-target rule above refused
+            // every Region that carries it.
+            _ => {}
         }
 
         Ok(EnableRegionOutput)
