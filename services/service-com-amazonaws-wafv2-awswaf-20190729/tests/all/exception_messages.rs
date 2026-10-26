@@ -11,10 +11,11 @@
 //! forms: the body carries that type's one sentence, and it discloses nothing the
 //! request supplied (no name, id, ARN, scope or lock token).
 //!
-//! The sentences for the duplicate-item, optimistic-lock and nonexistent-item
-//! exceptions are the wire wording recorded from WAF; the associated-item and
-//! limits sentences are the ones the model documents for those shapes
-//! (`smithy_query(query="shape",shape="WAFAssociatedItemException")`). They are
+//! The sentences for the duplicate-item, optimistic-lock, nonexistent-item and
+//! associated-item exceptions are the wire wording recorded from WAF — the shape's
+//! own documented sentence prefixed with the service name; the limits sentence is
+//! the one the model documents for that shape
+//! (`smithy_query(query="shape",shape="WAFLimitsExceededException")`). They are
 //! spelled out here as literals, independently of the service's own constants, so
 //! this suite pins the text and not merely its reuse.
 
@@ -37,8 +38,8 @@ const OPTIMISTIC_LOCK: &str = "AWS WAF couldn’t save your changes because some
 const NONEXISTENT_ITEM: &str =
     "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
 
-/// `WAFAssociatedItemException`'s sentence, as the model documents it.
-const ASSOCIATED_ITEM: &str = "WAF couldn’t perform the operation because your \
+/// `WAFAssociatedItemException`'s sentence, as recorded from WAF.
+const ASSOCIATED_ITEM: &str = "AWS WAF couldn’t perform the operation because your \
      resource is being used by another resource or it’s associated with another \
      resource.";
 

@@ -218,8 +218,10 @@
 //! Instance Connect Endpoints as [`InstanceConnectEndpointRecord`]s, on exactly the terms
 //! the volume store holds a volume: the modelled `Ec2InstanceConnectEndpoint` every
 //! operation that reports one answers with, plus the instant the clock owes the endpoint
-//! its `create-in-progress` -> `create-complete` move, which is a fact of the endpoint's
-//! age rather than of the request and so is derived on read
+//! its `create-in-progress` -> `create-complete` move, and the instant a delete that has
+//! been asked for owes it its `delete-in-progress` -> `delete-complete` move. Both are
+//! facts of the endpoint's age rather than of the request and so the state is derived on
+//! read
 //! ([`InstanceConnectEndpointRecord::view_at`]) instead of stored. Keyed by
 //! `InstanceConnectEndpointId` in a [`BTreeMap`], so a pagination token can name the id
 //! the next page starts at.
@@ -17290,6 +17292,13 @@ pub const INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS: &str = "create-in-
 /// An endpoint AWS has finished creating: that same enum's `create-complete` member.
 pub const INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE: &str = "create-complete";
 
+/// An endpoint AWS is still deleting: that same enum's `delete-in-progress` member, which
+/// `DeleteInstanceConnectEndpoint` answers with until [`TRANSITION_DELAY`] has passed.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// An endpoint AWS has finished deleting: that same enum's `delete-complete` member.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
 /// The `ResourceType` a `CreateInstanceConnectEndpoint` tag specification may name: the
 /// endpoint it creates — "The tags to apply to the EC2 Instance Connect Endpoint during
 /// creation" (`CreateInstanceConnectEndpointRequest$TagSpecifications`), which is the
@@ -17359,6 +17368,12 @@ pub struct InstanceConnectEndpointRecord {
     /// clock and never reported, so a wall-clock adjustment cannot move an endpoint back to
     /// `create-in-progress`.
     pub create_complete_at: Instant,
+    /// The instant from which this endpoint's `delete-in-progress` -> `delete-complete`
+    /// move is due, and `None` for an endpoint nobody has asked to delete. Set once, by the
+    /// delete that asked for it
+    /// ([`ComAmazonawsEc2Amazonec2State::begin_instance_connect_endpoint_deletion`]), and
+    /// monotonic for the same reason as [`Self::create_complete_at`].
+    pub delete_complete_at: Option<Instant>,
 }
 
 impl InstanceConnectEndpointRecord {
@@ -17371,7 +17386,18 @@ impl InstanceConnectEndpointRecord {
     }
 
     /// The endpoint's `Ec2InstanceConnectEndpointState` at `now`.
+    ///
+    /// A deletion that has been asked for is the only move left, so it takes precedence: an
+    /// endpoint asked to delete while it was still being created does not report
+    /// `create-complete` once the creation's own move falls due.
     pub fn state_at(&self, now: Instant) -> &'static str {
+        if let Some(delete_complete_at) = self.delete_complete_at {
+            return if now < delete_complete_at {
+                INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS
+            } else {
+                INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_COMPLETE
+            };
+        }
         if now < self.create_complete_at {
             INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS
         } else {
@@ -17388,6 +17414,35 @@ impl ComAmazonawsEc2Amazonec2State {
     /// refuses with [`instance_connect_endpoint_limit_exceeded`] when it answers `false`.
     pub fn has_instance_connect_endpoint_capacity(&self) -> bool {
         self.instance_connect_endpoints.len() < MAX_INSTANCE_CONNECT_ENDPOINTS
+    }
+
+    /// Start deleting the EC2 Instance Connect Endpoint `endpoint_id`, and answer it as the
+    /// store then holds it — `None` when the account holds no such endpoint.
+    ///
+    /// The deletion is a CLOCK-OWED move, like the creation: the endpoint is
+    /// `delete-in-progress` until `delete_complete_at`, which is stored rather than slept
+    /// for, and [`InstanceConnectEndpointRecord::view_at`] derives the state from it on
+    /// every read.
+    ///
+    /// The record STAYS in the store, because an endpoint in either delete state is still
+    /// reported — `delete-in-progress` and `delete-complete` are both
+    /// `Ec2InstanceConnectEndpointState` members, which the `state` filter of
+    /// `DescribeInstanceConnectEndpoints` selects on — so its caller-chosen bytes stay
+    /// charged to the store's budget, which still holds them, and it still counts against
+    /// [`MAX_INSTANCE_CONNECT_ENDPOINTS`], which bounds the records this process holds.
+    ///
+    /// An endpoint already being deleted keeps the due instant its own delete gave it: a
+    /// repeat of the call reports the deletion already under way instead of restarting its
+    /// clock.
+    pub fn begin_instance_connect_endpoint_deletion(
+        &mut self,
+        endpoint_id: &str,
+        now: Instant,
+        delete_complete_at: Instant,
+    ) -> Option<crate::ops::types::Ec2InstanceConnectEndpoint> {
+        let record = self.instance_connect_endpoints.get_mut(endpoint_id)?;
+        record.delete_complete_at.get_or_insert(delete_complete_at);
+        Some(record.view_at(now))
     }
 }
 
@@ -17440,14 +17495,19 @@ pub fn require_known_instance_connect_endpoint<E>(
 }
 
 /// Refuse a request that named an EC2 Instance Connect Endpoint id no endpoint of the
-/// account has: HTTP 400 `InvalidInstanceConnectEndpointId.NotFound`.
+/// account has: HTTP 400 `InvalidInstanceConnectEndpointId.NotFound`, worded as EC2 words
+/// this error class — the resource, the id the request named, and what the caller has to do
+/// about it — with the id taken from the request.
 pub fn invalid_instance_connect_endpoint_id_not_found<E>(
     endpoint_id: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND,
         400,
-        format!("The EC2 Instance Connect Endpoint '{endpoint_id}' does not exist."),
+        format!(
+            "The Instance Connect Endpoint {endpoint_id} does not exist. Add an existing \
+             Instance Connect Endpoint ID and retry your request."
+        ),
     )
 }
 

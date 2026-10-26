@@ -151,3 +151,5 @@ mod update_router_output;
 mod describe_gateway_instance;
 #[path = "all/gateway_instance_listing.rs"]
 mod gateway_instance_listing;
+#[path = "all/update_gateway_instance.rs"]
+mod update_gateway_instance;

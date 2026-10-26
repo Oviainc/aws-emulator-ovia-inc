@@ -21,7 +21,11 @@
 //!    block for is refused;
 //! 4. an endpoint is `create-in-progress` and the CLOCK, not a caller, moves it to
 //!    `create-complete`;
-//! 5. one `ClientToken` names one endpoint.
+//! 5. one `ClientToken` names one endpoint;
+//! 6. `DeleteInstanceConnectEndpoint` STARTS A CLOCK-OWED DELETION of the endpoint the
+//!    request names: it answers that endpoint `delete-in-progress`, the describe reports the
+//!    same endpoint, the CLOCK moves it to `delete-complete`, and an id the account holds no
+//!    endpoint for is refused rather than treated as already gone.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which address
 //! family the subnet has, which address type the request asks for, which filter, how many
@@ -35,6 +39,8 @@ use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, INSTANCE_CONNECT_ENDPOINT_ID_PREFIX,
     INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE as STATE_CREATE_COMPLETE,
     INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS as STATE_CREATE_IN_PROGRESS,
+    INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_COMPLETE as STATE_DELETE_COMPLETE,
+    INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS as STATE_DELETE_IN_PROGRESS,
     IP_ADDRESS_TYPE_DUALSTACK, IP_ADDRESS_TYPE_IPV4, IP_ADDRESS_TYPE_IPV6, SecurityGroupSpec,
     SubnetSpec, TRANSITION_DELAY, availability_zones_in_region,
     instance_connect_endpoint_dns_name, instance_connect_endpoint_fips_dns_name,
@@ -43,7 +49,7 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, error_code, filters, indexed};
+use super::ec2_query::{call, element, error_code, error_message, filters, indexed};
 // The XML readers every suite in this crate shares, rather than a fourth copy of them.
 use super::wire::{child, child_text, document};
 
@@ -87,6 +93,10 @@ async fn create(router: &MultiServiceRouter, params: &[(String, String)]) -> (u1
 
 async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
     call(router, REGION, "DescribeInstanceConnectEndpoints", params).await
+}
+
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    call(router, REGION, "DeleteInstanceConnectEndpoint", params).await
 }
 
 /// `TagSpecification.1` form fields tagging the endpoint a create mints.
@@ -1409,4 +1419,386 @@ fn the_endpoint_dns_names_carry_the_regions_partition_suffix() {
             "case {region:?}: the FIPS name is a different name from the plain one"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 6: a delete starts a clock-owed deletion of the endpoint it names
+// ---------------------------------------------------------------------------
+
+/// The one endpoint a describe of `endpoint_id` reports.
+async fn described_row(router: &MultiServiceRouter, case: &str, endpoint_id: &str) -> EndpointRow {
+    let (status, body) = describe(router, &indexed("InstanceConnectEndpointId", &[endpoint_id])).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeInstanceConnectEndpoints, \
+         got {status} with body {body}"
+    );
+    let rows = endpoint_rows(case, &body);
+    assert_eq!(
+        rows.len(),
+        1,
+        "case {case:?}: expected exactly one endpoint in the describe response, got {rows:?}"
+    );
+    rows.into_iter().next().unwrap_or_else(|| unreachable!())
+}
+
+/// The one endpoint a successful delete reports.
+async fn delete_endpoint(
+    router: &MultiServiceRouter,
+    case: &str,
+    params: &[(String, String)],
+) -> EndpointRow {
+    let (status, body) = delete(router, params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DeleteInstanceConnectEndpoint, \
+         got {status} with body {body}"
+    );
+    let rows = endpoint_rows(case, &body);
+    assert_eq!(
+        rows.len(),
+        1,
+        "case {case:?}: expected exactly one endpoint in the delete response, got {rows:?}"
+    );
+    rows.into_iter().next().unwrap_or_else(|| unreachable!())
+}
+
+/// RULE 6: the delete reports the endpoint it names as the store then holds it —
+/// `delete-in-progress`, with every other member of the endpoint unchanged — the describe
+/// reports that same endpoint, a repeat of the call reports the deletion already under way
+/// without restarting its clock, and the CLOCK alone moves the endpoint on to
+/// `delete-complete`.
+///
+/// The rows differ along what the rule generalises over: which address family the endpoint's
+/// subnet has, whether the request that created it carried tags or a client token, and
+/// whether the endpoint had finished being created when the delete arrived.
+#[tokio::test]
+async fn deleting_an_endpoint_starts_a_clock_owed_deletion() {
+    let fixture = fixture();
+    // An endpoint the table never deletes, so each row can also show that a delete touches
+    // only the endpoint it names.
+    let bystander = create_endpoint(
+        &fixture.router,
+        "the endpoint no row deletes",
+        &[p("SubnetId", fixture.ipv4_subnet.clone())],
+    )
+    .await;
+
+    /// `(case, the create's parameters, whether to wait out the create span first)`.
+    type DeleteRow = (&'static str, Params, bool);
+    let rows: Vec<DeleteRow> = vec![
+        (
+            "an IPv4 endpoint deleted inside its create span",
+            vec![p("SubnetId", fixture.ipv4_subnet.clone())],
+            false,
+        ),
+        (
+            "a tagged dual-stack endpoint deleted once it is create-complete",
+            {
+                let mut params = vec![p("SubnetId", fixture.dual_subnet.clone())];
+                params.extend(tag_params(&[("Name", "bastion"), ("Owner", "TeamA")]));
+                params
+            },
+            true,
+        ),
+        (
+            "an IPv6-only endpoint created with a client token",
+            vec![
+                p("SubnetId", fixture.ipv6_subnet.clone()),
+                p("ClientToken", "delete-row-ipv6"),
+            ],
+            false,
+        ),
+        (
+            "an endpoint created with an explicit security group",
+            {
+                let mut params = vec![p("SubnetId", fixture.dual_subnet.clone())];
+                params.extend(indexed("SecurityGroupId", &[&fixture.extra_group]));
+                params
+            },
+            true,
+        ),
+    ];
+
+    for (case, create_params, wait_first) in rows {
+        let created = create_endpoint(&fixture.router, case, &create_params).await;
+        if wait_first {
+            past_the_transition().await;
+        }
+        // What the store holds the instant before the delete, so the comparison below is
+        // against the endpoint as it really stood and not against the create's own answer.
+        let before = described_row(&fixture.router, case, &created.id).await;
+        let expected_before_state = if wait_first {
+            STATE_CREATE_COMPLETE
+        } else {
+            STATE_CREATE_IN_PROGRESS
+        };
+        assert_eq!(
+            before.state, expected_before_state,
+            "case {case:?}: expected the endpoint to be {expected_before_state} before the \
+             delete, got {before:?}"
+        );
+
+        let params = vec![p("InstanceConnectEndpointId", created.id.clone())];
+        let deleted = delete_endpoint(&fixture.router, case, &params).await;
+        let expected = EndpointRow {
+            state: STATE_DELETE_IN_PROGRESS.to_string(),
+            ..before.clone()
+        };
+        assert_eq!(
+            deleted, expected,
+            "case {case:?}: expected the delete to answer {expected:?}, got {deleted:?}"
+        );
+
+        // The endpoint the delete reported is the endpoint the describe reports, and the
+        // span is never zero, so a caller reading straight after its own delete still sees
+        // the transient state — which the `state` filter agrees with.
+        assert_eq!(
+            described_row(&fixture.router, case, &created.id).await,
+            expected,
+            "case {case:?}: the describe must report the endpoint the delete stored"
+        );
+        let in_progress = described_ids(
+            &fixture.router,
+            case,
+            &filters(&[("state", &[STATE_DELETE_IN_PROGRESS])]),
+        )
+        .await;
+        assert!(
+            in_progress.contains(&created.id),
+            "case {case:?}: expected {} among the endpoints the \
+             state={STATE_DELETE_IN_PROGRESS} filter reports inside its span, got \
+             {in_progress:?}",
+            created.id
+        );
+
+        // A repeat of the call reports the deletion already under way: the same endpoint,
+        // still inside the span the FIRST delete gave it.
+        let repeated = delete_endpoint(&fixture.router, case, &params).await;
+        assert_eq!(
+            repeated, expected,
+            "case {case:?}: a repeated delete must report the deletion already under way, \
+             got {repeated:?}"
+        );
+
+        // Only the endpoint the request named moved: the bystander is still in a CREATE
+        // state, which is the only kind of state its own clock can give it.
+        let other = described_row(&fixture.router, case, &bystander.id).await;
+        assert!(
+            other.state == STATE_CREATE_IN_PROGRESS || other.state == STATE_CREATE_COMPLETE,
+            "case {case:?}: a delete must not move an endpoint it did not name, got {other:?}"
+        );
+
+        past_the_transition().await;
+        // Twice: the materialised state is stable, not consumed by the read.
+        for read in 1..=2 {
+            let row = described_row(&fixture.router, case, &created.id).await;
+            assert_eq!(
+                row.state, STATE_DELETE_COMPLETE,
+                "case {case:?} read {read}: expected {} to be {STATE_DELETE_COMPLETE} once \
+                 the deletion is due, got {row:?}",
+                created.id
+            );
+        }
+        let complete = described_ids(
+            &fixture.router,
+            case,
+            &filters(&[("state", &[STATE_DELETE_COMPLETE])]),
+        )
+        .await;
+        assert!(
+            complete.contains(&created.id),
+            "case {case:?}: expected {} among the endpoints the \
+             state={STATE_DELETE_COMPLETE} filter reports, got {complete:?}",
+            created.id
+        );
+        // The bystander has reached `create-complete` by the clock alone, never a delete
+        // state.
+        assert_eq!(
+            described_row(&fixture.router, case, &bystander.id)
+                .await
+                .state,
+            STATE_CREATE_COMPLETE,
+            "case {case:?}: an endpoint no delete named is only ever moved by its own clock"
+        );
+    }
+}
+
+/// RULE 6: an id a delete cannot resolve is REFUSED — malformed before unknown, in the
+/// wording EC2 uses for the class — and nothing in the store moves.
+///
+/// The rows differ along why the id does not resolve: the shape of the text, the length of
+/// the suffix, the resource the prefix names, and a well-formed id of each id era the
+/// account holds no endpoint for.
+#[tokio::test]
+async fn a_delete_that_cannot_resolve_its_endpoint_is_refused() {
+    let fixture = fixture();
+    let ids = seeded_endpoints(&fixture).await;
+
+    let rows: Vec<RefusalRow> = vec![
+        (
+            "an id that is not shaped like an endpoint id",
+            vec![p("InstanceConnectEndpointId", "not-an-endpoint")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "an id with a non-hex suffix",
+            vec![p("InstanceConnectEndpointId", "eice-zzzzzzzz")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "an id whose suffix is of neither published length",
+            vec![p("InstanceConnectEndpointId", "eice-0123456789")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "a well-formed id of another resource",
+            vec![p("InstanceConnectEndpointId", "subnet-0123456789abcdef0")],
+            "InvalidInstanceConnectEndpointId.Malformed",
+        ),
+        (
+            "a long id no endpoint of the account has",
+            vec![p("InstanceConnectEndpointId", "eice-00000000000000099")],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+        (
+            "an all-zero long id",
+            vec![p("InstanceConnectEndpointId", "eice-00000000000000000")],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+        (
+            "a short id no endpoint of the account has",
+            vec![p("InstanceConnectEndpointId", "eice-0a1b2c3d")],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+        (
+            "a dry run of a delete naming an id no endpoint has",
+            vec![
+                p("InstanceConnectEndpointId", "eice-00000000000000099"),
+                p("DryRun", "true"),
+            ],
+            "InvalidInstanceConnectEndpointId.NotFound",
+        ),
+    ];
+    for (case, params, code) in rows {
+        let (status, body) = delete(&fixture.router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            code,
+            "case {case:?}: expected {code}, got {body}"
+        );
+        // An id the account holds no endpoint for is reported as the id the REQUEST named,
+        // with what the caller has to do about it.
+        if code.ends_with(".NotFound") {
+            let named = params
+                .iter()
+                .find(|(key, _)| key == "InstanceConnectEndpointId")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            let expected = format!(
+                "The Instance Connect Endpoint {named} does not exist. Add an existing \
+                 Instance Connect Endpoint ID and retry your request."
+            );
+            let actual = error_message(&body);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the message {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    // Nothing a refused delete named moved, and nothing was removed.
+    assert_eq!(
+        fixture.stored_endpoints(),
+        ids.len(),
+        "a refused delete must leave the store as it was"
+    );
+    assert_eq!(
+        described_ids(&fixture.router, "every endpoint after the refusals", &[]).await,
+        ids,
+        "a refused delete leaves the store exactly as it was"
+    );
+    for id in &ids {
+        let row = described_row(&fixture.router, "a seeded endpoint", id).await;
+        assert!(
+            row.state == STATE_CREATE_IN_PROGRESS || row.state == STATE_CREATE_COMPLETE,
+            "expected {id} to be in a create state still, got {row:?}"
+        );
+    }
+}
+
+/// RULE 6 under `DryRun`: the flag asks whether the delete WOULD have succeeded — HTTP 412
+/// `DryRunOperation` — and the endpoint it named keeps the state it had, so no deletion was
+/// started.
+#[tokio::test]
+async fn a_dry_run_delete_starts_no_deletion() {
+    let fixture = fixture();
+    let created = create_endpoint(
+        &fixture.router,
+        "the endpoint the dry run names",
+        &[p("SubnetId", fixture.dual_subnet.clone())],
+    )
+    .await;
+
+    // Once inside the create span and once after it: a dry run reports the same thing in
+    // either state, and starts nothing in either.
+    for (case, wait_first, expected_state) in [
+        (
+            "a dry run inside the endpoint's create span",
+            false,
+            STATE_CREATE_IN_PROGRESS,
+        ),
+        (
+            "a dry run once the endpoint is create-complete",
+            true,
+            STATE_CREATE_COMPLETE,
+        ),
+    ] {
+        if wait_first {
+            past_the_transition().await;
+        }
+        let (status, body) = delete(
+            &fixture.router,
+            &[
+                p("InstanceConnectEndpointId", created.id.clone()),
+                p("DryRun", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 412,
+            "case {case:?}: expected HTTP 412, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "DryRunOperation",
+            "case {case:?}: expected DryRunOperation, got {body}"
+        );
+        let row = described_row(&fixture.router, case, &created.id).await;
+        assert_eq!(
+            row.state, expected_state,
+            "case {case:?}: expected the endpoint to still be {expected_state}, got {row:?}"
+        );
+        assert_eq!(
+            fixture.stored_endpoints(),
+            1,
+            "case {case:?}: a dry run changes nothing the store holds"
+        );
+    }
+
+    // The delete the dry run stood for still works afterwards.
+    let deleted = delete_endpoint(
+        &fixture.router,
+        "the delete the dry runs stood for",
+        &[p("InstanceConnectEndpointId", created.id.clone())],
+    )
+    .await;
+    assert_eq!(
+        deleted.state, STATE_DELETE_IN_PROGRESS,
+        "the delete a dry run reported as workable must work, got {deleted:?}"
+    );
 }

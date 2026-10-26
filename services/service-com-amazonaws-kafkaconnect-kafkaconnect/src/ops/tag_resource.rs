@@ -172,18 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         // Every taggable resource this emulator holds is keyed by its own ARN, so
         // the lookup is the ARN itself rather than anything parsed out of it, and
-        // one checked seam covers all three kinds. The write is per key: a
-        // repeated key is overwritten, a new one is added, and a key the request
-        // does not name is left exactly as it was — unless a key or value breaks
-        // an AWS tag rule, or the merged set would hold more tags than a resource
-        // may, in which case nothing is written.
-        match state.attach_tags(&input.resource_arn, input.tags) {
+        // one checked seam covers all three kinds — scoped, like every other
+        // read and write of this regional service, to the region this call was
+        // signed for, so another region's resource cannot be tagged from here.
+        // The write is per key: a repeated key is overwritten, a new one is
+        // added, and a key the request does not name is left exactly as it was —
+        // unless a key or value breaks an AWS tag rule, or the merged set would
+        // hold more tags than a resource may, in which case nothing is written.
+        match state.attach_tags(&region, &input.resource_arn, input.tags) {
             Ok(()) => Ok(TagResourceOutput {}),
             // A tag rule the model cannot express (`TagKey`/`TagValue` carry
             // lengths and no pattern), so the handler is where it is refused:

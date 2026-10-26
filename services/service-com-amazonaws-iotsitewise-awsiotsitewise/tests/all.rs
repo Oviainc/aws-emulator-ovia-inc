@@ -343,3 +343,10 @@ mod gateway_delete;
 #[path = "all/project_delete.rs"]
 mod project_delete;
 
+// Declared at the very end, after every suite above, for the reason the notes
+// above give: both stretches higher up are where every concurrent iotsitewise
+// change inserts a declaration of its own. Fold it into the sorted list once the
+// churn settles.
+#[path = "all/computation_model_data_binding_usages.rs"]
+mod computation_model_data_binding_usages;
+

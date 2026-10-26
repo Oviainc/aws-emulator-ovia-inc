@@ -164,17 +164,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         let prefix = input.name_prefix.unwrap_or_default();
+        // kafkaconnect is a regional service, so the listing covers the custom
+        // plugins of the region this call was signed for and no other region's.
+        //
         // Keyed by ARN and paged BEFORE the summaries are built, so a page costs
         // one `CustomPluginSummary` per plugin it returns rather than one per
         // plugin stored.
         let keyed: Vec<(String, &crate::state::CustomPluginRecord)> = state
-            .custom_plugins
-            .values()
+            .custom_plugins_in(&region)
             .filter(|plugin| plugin.name.starts_with(&prefix))
             .map(|plugin| (plugin.arn.clone(), plugin))
             .collect();

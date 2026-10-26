@@ -281,7 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`connectorName` here — the member is the one the REQUEST names), in
         // the service's `Invalid parameter <member>: <reason>` form with the
         // modelled `ConflictException` reason and no generated ARN in the text.
-        if state.connector_named(&input.connector_name).is_some() {
+        // A name is unique per account and REGION, so the same name created
+        // through another region's endpoint is no conflict here.
+        if state.connector_named(&region, &input.connector_name).is_some() {
             return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorName",
@@ -292,8 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The quota on stored connectors. The real service meters this and
-        // answers the same error once it is reached.
-        if state.connector_quota_reached() {
+        // answers the same error once it is reached, per Region.
+        if state.connector_quota_reached(&region) {
             return Err(CreateConnectorErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     message: Some(format!(
@@ -307,7 +309,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         for plugin in &input.plugins {
             let reference = &plugin.custom_plugin;
-            match state.custom_plugins.get(&reference.custom_plugin_arn) {
+            // A plugin lives in one region: a connector can only be backed by a
+            // plugin of its own region, so a `customPluginArn` minted elsewhere
+            // names no plugin this endpoint holds.
+            match state.custom_plugin_in(&region, &reference.custom_plugin_arn) {
                 Some(stored) if stored.state != crate::state::CUSTOM_PLUGIN_ACTIVE => {
                     // A plugin the service has not finished taking on (or is
                     // deleting) cannot back a connector: its content is not
@@ -351,10 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create is refused rather than stored as a dangling reference the read
         // operations would then echo back.
         if let Some(reference) = &input.worker_configuration {
-            match state
-                .worker_configurations
-                .get(&reference.worker_configuration_arn)
-            {
+            match state.worker_configuration_in(&region, &reference.worker_configuration_arn) {
                 Some(stored) if stored.state != crate::state::WORKER_CONFIGURATION_ACTIVE => {
                     // A configuration the service is deleting is on its way out
                     // of the account, so a connector cannot take it on.
@@ -398,6 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let connector = crate::state::ConnectorRecord {
             arn: arn.clone(),
+            region,
             name: input.connector_name,
             description: input.connector_description,
             configuration: input.connector_configuration,

@@ -253,8 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name already taken: refused on the request member that carried it,
         // in the service's `Invalid parameter <member>: <reason>` form with the
         // modelled `ConflictException` reason, and with no generated ARN in the
-        // text (see `crate::state::NAME_ALREADY_EXISTS`).
-        if state.custom_plugin_named(&input.name).is_some() {
+        // text (see `crate::state::NAME_ALREADY_EXISTS`). A name is unique per
+        // account and REGION, so the same name created through another region's
+        // endpoint is no conflict here.
+        if state.custom_plugin_named(&region, &input.name).is_some() {
             return Err(CreateCustomPluginErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::invalid_parameter_because(
                     "name",
@@ -265,8 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The quota on stored custom plugins. The real service meters this and
-        // answers the same error once it is reached.
-        if state.custom_plugin_quota_reached() {
+        // answers the same error once it is reached, per Region.
+        if state.custom_plugin_quota_reached(&region) {
             return Err(CreateCustomPluginErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     message: Some(format!(
@@ -286,6 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let plugin = crate::state::CustomPluginRecord {
             arn: arn.clone(),
+            region,
             name: input.name,
             description: input.description,
             content_type: input.content_type,

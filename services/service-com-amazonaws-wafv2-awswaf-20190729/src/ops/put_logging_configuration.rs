@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the logging configuration the request describes in front of the web ACL its
+//! `ResourceArn` names, replacing whatever that web ACL carried under the same
+//! `LogScope`, and answers it as stored. An `ResourceArn` naming no web ACL of this
+//! account is `WAFNonexistentItemException` and one that is not a wafv2 ARN at all
+//! `WAFInvalidParameterException` (both HTTP 400). This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +210,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata, which this operation does not need:
+        // the web ACL is addressed by the configuration's own `ResourceArn`.
+        let _ = ctx;
+        let mut configuration = input.logging_configuration;
+
+        // The malformed-ARN parameter failure, as every operation here that takes an
+        // ARN reports it.
+        if !crate::state::is_wafv2_resource_arn(&configuration.resource_arn) {
+            return Err(
+                PutLoggingConfigurationErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&configuration.resource_arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutLoggingConfigurationErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // `LoggingConfiguration$ResourceArn` is "the ARN of the web ACL that you want
+        // to associate with LogDestinationConfigs", so a configuration can only be
+        // put in front of a web ACL this account holds: an ARN of another resource
+        // kind, and one naming a web ACL that was never created, both reference a
+        // resource that doesn't exist.
+        let Some(entry) = state.web_acl_by_arn(&configuration.resource_arn) else {
+            crate::state::audit(
+                "PutLoggingConfiguration",
+                "",
+                "",
+                "",
+                "WAFNonexistentItemException",
+            );
+            return Err(
+                PutLoggingConfigurationErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+        let scope = entry.scope.clone();
+        let name = entry.web_acl.name.clone();
+        let id = entry.web_acl.id.clone();
+
+        // The members WAF fills server-side on a save, materialised here so a
+        // configuration reads back the same way whatever the request left out:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLoggingConfiguration"))
+        // * `LogType` — "used to distinguish between various logging options …
+        //   Default: WAF_LOGS".
+        // * `LogScope` — "the owner of the logging configuration, which must be set
+        //   to CUSTOMER for the configurations that you manage … Default: CUSTOMER".
+        // * `ManagedByFirewallManager` — "indicates whether the logging configuration
+        //   was created by Firewall Manager". Firewall Manager cannot reach this
+        //   emulator, so a configuration put through the API is not one of its own.
+        configuration.log_type = Some(
+            configuration
+                .log_type
+                .unwrap_or_else(|| crate::state::DEFAULT_LOG_TYPE.to_string()),
+        );
+        configuration.log_scope = Some(
+            configuration
+                .log_scope
+                .unwrap_or_else(|| crate::state::DEFAULT_LOG_SCOPE.to_string()),
+        );
+        configuration.managed_by_firewall_manager = false;
+
+        // "This operation completely replaces any mutable specifications that you
+        // already have for a logging configuration with the ones that you provide to
+        // this call", and "you can define one logging destination per web ACL": the
+        // put REPLACES what the web ACL carried under this log scope.
+        state.insert_logging_configuration(configuration.clone());
+        crate::state::audit(
+            "PutLoggingConfiguration",
+            &scope,
+            &name,
+            &id,
+            "logging configuration put",
+        );
+
+        Ok(PutLoggingConfigurationOutput {
+            logging_configuration: Some(configuration),
+        })
     }
 }

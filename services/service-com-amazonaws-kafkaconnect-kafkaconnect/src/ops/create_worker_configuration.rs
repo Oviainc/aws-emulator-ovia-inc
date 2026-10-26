@@ -225,8 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rejection uses, with the modelled `ConflictException` reason. The held
         // resource's own name and generated ARN stay out of the message: the
         // conflict is the same whatever they are, and an ARN would differ on
-        // every run.
-        if state.worker_configuration_named(&input.name).is_some() {
+        // every run. A name is unique per account and REGION, so the same name
+        // created through another region's endpoint is no conflict here.
+        if state.worker_configuration_named(&region, &input.name).is_some() {
             return Err(CreateWorkerConfigurationErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::invalid_parameter_because(
                     "name",
@@ -238,8 +239,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The quota on stored worker configurations, metered the way the other
         // two resources of this service are: the real service answers the same
-        // error once its quota is reached.
-        if state.worker_configuration_quota_reached() {
+        // error once its quota is reached, per Region.
+        if state.worker_configuration_quota_reached(&region) {
             return Err(
                 CreateWorkerConfigurationErrorModeled::TooManyRequestsException(
                     TooManyRequestsException {
@@ -261,6 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let worker = crate::state::WorkerConfigurationRecord {
             arn: arn.clone(),
+            region,
             name: input.name,
             description: input.description,
             properties_file_content: input.properties_file_content,

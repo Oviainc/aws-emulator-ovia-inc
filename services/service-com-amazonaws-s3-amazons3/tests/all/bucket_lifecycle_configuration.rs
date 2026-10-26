@@ -54,7 +54,7 @@ const SECONDS_PER_DAY: u64 = 86_400;
 
 /// `PUT /<bucket>?lifecycle` — `PutBucketLifecycleConfiguration`, with the configuration as
 /// the payload and whatever bound headers the case carries.
-async fn put_lifecycle(
+pub(crate) async fn put_lifecycle(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -105,7 +105,7 @@ async fn list_parts(
 }
 
 /// The `rules` wrapped in the `LifecycleConfiguration` document a put carries.
-fn configuration(rules: &[String]) -> String {
+pub(crate) fn configuration(rules: &[String]) -> String {
     format!(
         "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}\
          </LifecycleConfiguration>",
@@ -114,7 +114,7 @@ fn configuration(rules: &[String]) -> String {
 }
 
 /// One `Rule` element from its inner elements.
-fn rule(body: &str) -> String {
+pub(crate) fn rule(body: &str) -> String {
     format!("<Rule>{body}</Rule>")
 }
 

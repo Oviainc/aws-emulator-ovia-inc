@@ -77,8 +77,9 @@ use super::types::*;
 use std::collections::BTreeMap;
 
 use crate::state::{
-    resource_location, traffic_policy_record_type, StoredTrafficPolicy,
-    StoredTrafficPolicyVersion, FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICIES,
+    invalid_traffic_policy_document, resource_location, traffic_policy_record_type,
+    StoredTrafficPolicy, StoredTrafficPolicyVersion, FIRST_TRAFFIC_POLICY_VERSION,
+    MAX_TRAFFIC_POLICIES,
 };
 
 /// The refusal text a `Name` that already names a traffic policy is answered
@@ -175,12 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The document IS the policy's definition, and the policy's `Type` is
         // the record type that document names, so a document the format does
-        // not define has no policy to create and no type to report.
-        let record_type = traffic_policy_record_type(&input.document).map_err(|reason| {
+        // not define has no policy to create and no type to report. The refusal
+        // reports EVERY constraint of the format the document violates, so a
+        // caller validating a document by submitting it learns all of its
+        // faults from this one request.
+        let record_type = traffic_policy_record_type(&input.document).map_err(|violations| {
             CreateTrafficPolicyErrorModeled::InvalidTrafficPolicyDocument(
-                InvalidTrafficPolicyDocument {
-                    message: Some(format!("Invalid traffic policy document: {reason}")),
-                },
+                invalid_traffic_policy_document(&violations),
             )
         })?;
 

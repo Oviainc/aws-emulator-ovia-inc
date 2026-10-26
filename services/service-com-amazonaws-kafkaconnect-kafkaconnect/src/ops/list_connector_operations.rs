@@ -165,14 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         // The operations are listed OF a connector, so a `connectorArn` naming
-        // no connector this emulator holds is a missing resource rather than an
-        // empty page.
-        if !state.connectors.contains_key(&input.connector_arn) {
+        // no connector this region holds — one never created, or one created
+        // through another region's endpoint — is a missing resource rather than
+        // an empty page.
+        if state.connector_in(&region, &input.connector_arn).is_none() {
             return Err(ListConnectorOperationsErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "connectorArn",

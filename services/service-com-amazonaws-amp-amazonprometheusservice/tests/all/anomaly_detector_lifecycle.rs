@@ -161,7 +161,10 @@ fn assert_well_formed_detector_id(case: &str, detector_id: &str) {
 
 /// `AnomalyDetectorArn`:
 /// `^arn:aws[-a-z]*:aps:[-a-z0-9]+:[0-9]{12}:anomalydetector/ws-.+/ad-.+$`.
-fn assert_well_formed_detector_arn(
+///
+/// `pub(crate)` so every suite that brings a detector into existence asserts its ARN
+/// against ONE statement of that form.
+pub(crate) fn assert_well_formed_detector_arn(
     case: &str,
     arn: &str,
     region: &str,

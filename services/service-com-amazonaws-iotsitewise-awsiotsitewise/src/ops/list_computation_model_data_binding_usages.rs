@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComputationModelDataBindingUsages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComputationModelDataBindingUsages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComputationModelDataBindingUsages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation lists, from the shared engine store (`crate::state`),
+//! one summary per DISTINCT data binding value that the ONE data source the request's
+//! filter names is referenced by — each naming every stored computation model whose
+//! data binding holds it, lists included — ordered by the binding itself so
+//! `nextToken` resumes a stable enumeration; a filter that does not name exactly one
+//! data source is a modelled refusal rather than an empty page. This is the ONLY file
+//! to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +85,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +157,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComputationModelDataBindingUsages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComputationModelDataBindingUsagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComputationModelDataBindingUsages"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        // Nothing a usage summary carries is scoped to the caller's region — it names
+        // computation model ids and the binding value they hold — so this listing
+        // reads no value off the request itself.
+        let _ = ctx;
+
+        // `DataBindingValueFilter` carries one optional member per kind of data
+        // source a binding may reference, so a request names exactly one of them: a
+        // filter naming none selects no data source at all and one naming several
+        // describes no single data source, which are bad requests rather than an
+        // empty page reporting them as success.
+        let filter = BindingFilter::of(&input.data_binding_value_filter)?;
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same usages.
+        let store = state.lock();
+
+        // One entry per DISTINCT binding value the filter matches, carrying every
+        // computation model that holds it: a summary is keyed by the binding ("The
+        // data binding matched by the filter criteria") and lists the models that use
+        // it ("The list of computation model IDs that use this data binding"), so two
+        // models referencing one property are ONE summary naming both rather than two
+        // summaries. The `BTreeMap` orders the enumeration by
+        // [`binding_key`] and the `BTreeSet` orders and de-duplicates the ids, so a
+        // model whose binding names one property twice is listed once.
+        let mut usages: BTreeMap<String, (DataBindingValue, BTreeSet<String>)> = BTreeMap::new();
+        for model in store.computation_models.values() {
+            for value in model.data_binding.values() {
+                for matched in matched_leaves(value, &filter) {
+                    usages
+                        .entry(binding_key(&matched))
+                        .or_insert_with(|| (matched, BTreeSet::new()))
+                        .1
+                        .insert(model.id.clone());
+                }
+            }
+        }
+
+        let summaries: Vec<(String, ComputationModelDataBindingUsageSummary)> = usages
+            .into_iter()
+            .map(|(key, (value, model_ids))| {
+                (
+                    key,
+                    ComputationModelDataBindingUsageSummary {
+                        computation_model_ids: model_ids.into_iter().collect(),
+                        matched_data_binding: MatchedDataBinding { value },
+                    },
+                )
+            })
+            .collect();
+
+        // `nextToken` is this enumeration's resume point: the key of the first
+        // summary of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
+        // is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                summaries
+                    .iter()
+                    .position(|(key, _)| *key == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(summaries.len());
+
+        Ok(ListComputationModelDataBindingUsagesOutput {
+            data_binding_usage_summaries: summaries[start..end]
+                .iter()
+                .map(|(_, summary)| summary.clone())
+                .collect(),
+            // "The token for the next set of paginated results, or null if there are
+            // no additional results": a page that leaves nothing to resume from
+            // reports no token at all.
+            next_token: summaries
+                .get(end)
+                .map(|(key, _)| ::hex::encode(key.as_bytes())),
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the operation documents `maxResults` only as "The
+/// maximum number of results returned for each paginated request". It is the
+/// default this service's other paginated listings already use, so a client that
+/// pages without asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The one data source a request's `DataBindingValueFilter` names.
+///
+/// The filter is a structure of four optional members rather than a union, so the
+/// "exactly one" rule the shape documents lives in [`BindingFilter::of`], and
+/// everything below it works with the single data source the request selected.
+enum BindingFilter<'a> {
+    /// Every binding value referencing one asset, whichever of its properties.
+    Asset { asset_id: &'a str },
+    /// Every binding value referencing one asset model, whichever of its
+    /// properties.
+    AssetModel { asset_model_id: &'a str },
+    /// One property of one asset.
+    AssetProperty {
+        asset_id: &'a str,
+        property_id: &'a str,
+    },
+    /// One property of one asset model.
+    AssetModelProperty {
+        asset_model_id: &'a str,
+        property_id: &'a str,
+    },
+}
+
+impl<'a> BindingFilter<'a> {
+    /// The data source `filter` names, or the modelled refusal when it does not
+    /// name exactly one.
+    fn of(
+        filter: &'a DataBindingValueFilter,
+    ) -> Result<Self, ListComputationModelDataBindingUsagesError> {
+        let mut named = [
+            filter.asset.as_ref().map(|asset| BindingFilter::Asset {
+                asset_id: asset.asset_id.as_str(),
+            }),
+            filter
+                .asset_model
+                .as_ref()
+                .map(|asset_model| BindingFilter::AssetModel {
+                    asset_model_id: asset_model.asset_model_id.as_str(),
+                }),
+            filter
+                .asset_property
+                .as_ref()
+                .map(|property| BindingFilter::AssetProperty {
+                    asset_id: property.asset_id.as_str(),
+                    property_id: property.property_id.as_str(),
+                }),
+            filter
+                .asset_model_property
+                .as_ref()
+                .map(|property| BindingFilter::AssetModelProperty {
+                    asset_model_id: property.asset_model_id.as_str(),
+                    property_id: property.property_id.as_str(),
+                }),
+        ]
+        .into_iter()
+        .flatten();
+        let Some(selected) = named.next() else {
+            return Err(invalid_filter(0));
+        };
+        let extra = named.count();
+        if extra > 0 {
+            return Err(invalid_filter(1 + extra));
+        }
+        Ok(selected)
+    }
+
+    /// `true` when `value` — one leaf of a computation model's data binding —
+    /// references the data source this filter names.
+    ///
+    /// An asset filter is matched by an asset property binding and an asset model
+    /// filter by an asset model property binding: the two name different data
+    /// sources, so neither filter reaches the other's bindings.
+    fn matches(&self, value: &DataBindingValue) -> bool {
+        match self {
+            BindingFilter::Asset { asset_id } => value
+                .asset_property
+                .as_ref()
+                .is_some_and(|property| property.asset_id == *asset_id),
+            BindingFilter::AssetModel { asset_model_id } => value
+                .asset_model_property
+                .as_ref()
+                .is_some_and(|property| property.asset_model_id == *asset_model_id),
+            BindingFilter::AssetProperty {
+                asset_id,
+                property_id,
+            } => value.asset_property.as_ref().is_some_and(|property| {
+                property.asset_id == *asset_id && property.property_id == *property_id
+            }),
+            BindingFilter::AssetModelProperty {
+                asset_model_id,
+                property_id,
+            } => value.asset_model_property.as_ref().is_some_and(|property| {
+                property.asset_model_id == *asset_model_id && property.property_id == *property_id
+            }),
+        }
+    }
+}
+
+/// Every leaf of one stored binding value that `filter` matches, as the
+/// `DataBindingValue` a summary reports.
+fn matched_leaves(
+    value: &ComputationModelDataBindingValue,
+    filter: &BindingFilter<'_>,
+) -> Vec<DataBindingValue> {
+    let mut matched = Vec::new();
+    collect_matched_leaves(value, filter, 1, &mut matched);
+    matched
+}
+
+/// Walk `value` and push every leaf `filter` matches onto `matched`.
+///
+/// A binding value sets exactly one of `assetModelProperty`, `assetProperty` and
+/// `list`, so a value that is not a list is itself the ONE data source a summary
+/// reports, and a list is a container whose elements are binding values in turn.
+/// `depth` is this value's own nesting level, the outermost being 1, and the walk
+/// stops at [`crate::state::MAX_BINDING_VALUE_DEPTH`] — the depth past which the
+/// create and the update refuse a value — so it cannot be driven into unbounded
+/// recursion by anything a request stored.
+fn collect_matched_leaves(
+    value: &ComputationModelDataBindingValue,
+    filter: &BindingFilter<'_>,
+    depth: usize,
+    matched: &mut Vec<DataBindingValue>,
+) {
+    if depth > crate::state::MAX_BINDING_VALUE_DEPTH {
+        return;
+    }
+    for nested in value.list.iter().flatten() {
+        collect_matched_leaves(nested, filter, depth + 1, matched);
+    }
+    let leaf = match (&value.asset_model_property, &value.asset_property) {
+        (Some(asset_model_property), _) => DataBindingValue {
+            asset_model_property: Some(asset_model_property.clone()),
+            asset_property: None,
+        },
+        (None, Some(asset_property)) => DataBindingValue {
+            asset_model_property: None,
+            asset_property: Some(asset_property.clone()),
+        },
+        (None, None) => return,
+    };
+    if filter.matches(&leaf) {
+        matched.push(leaf);
+    }
+}
+
+/// The key one matched binding value is enumerated under: the kind of data source
+/// it names and the ids that address it.
+///
+/// Every id is a modelled `ID` — a hyphenated UUID — so none can hold the
+/// separator and no two distinct binding values share a key. It is also this
+/// enumeration's resume point, which is why it is derived from the binding itself
+/// rather than from a position that shifts as models are created.
+fn binding_key(value: &DataBindingValue) -> String {
+    match (&value.asset_model_property, &value.asset_property) {
+        (Some(property), _) => format!(
+            "assetModelProperty|{}|{}",
+            property.asset_model_id, property.property_id
+        ),
+        (None, Some(property)) => {
+            format!("assetProperty|{}|{}", property.asset_id, property.property_id)
+        }
+        // Unreachable: a leaf carries one of the two members by construction; see
+        // [`collect_matched_leaves`].
+        (None, None) => String::new(),
+    }
+}
+
+/// Decode a `nextToken` back into the [`binding_key`] it resumes from.
+fn decode_token(token: &str) -> Result<String, ListComputationModelDataBindingUsagesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+///
+/// The wording every paginated operation of this service refuses an unusable
+/// token with, so a client matching on the message sees one string whichever
+/// listing it was paging.
+fn invalid_token() -> ListComputationModelDataBindingUsagesError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` for a filter that names `set` data sources
+/// rather than one.
+fn invalid_filter(set: usize) -> ListComputationModelDataBindingUsagesError {
+    invalid_request(format!(
+        "dataBindingValueFilter must set exactly one of asset, assetModel, assetProperty \
+         and assetModelProperty, but sets {set}."
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListComputationModelDataBindingUsagesError {
+    ListComputationModelDataBindingUsagesErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    )
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListComputationModelDataBindingUsagesError {
+    ListComputationModelDataBindingUsagesErrorModeled::InternalFailureException(
+        InternalFailureException {
+            message: "the IoT SiteWise store is unavailable".to_string(),
+        },
+    )
+    .into()
 }

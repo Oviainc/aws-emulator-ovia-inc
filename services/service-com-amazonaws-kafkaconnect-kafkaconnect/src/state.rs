@@ -9,6 +9,11 @@
 //! helper the list operations share. Every handler in `src/ops/` reaches this
 //! ONE struct through [`service_state`], so no two operations can read two
 //! copies of one resource.
+//!
+//! Every resource here belongs to exactly ONE region — the region the request
+//! that created it was signed for — and every lookup takes the region of the
+//! call that is asking ([`InRegion`]), so a call answered through one region's
+//! endpoint neither lists, resolves nor meters another region's resources.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -304,12 +309,22 @@ pub const MIN_PAGE_SIZE: i32 = 1;
 /// bound on repeated calls. The value is the quota AWS ships for MSK Connect
 /// connectors and custom plugins.
 ///
-/// The cap, like the name uniqueness both creates check, is counted over this
-/// emulator's ONE store: the emulator serves a single account and does not
-/// partition state by region, so a resource created under one signing region is
-/// the same resource a call signed for another region reads. Only the ARN a
-/// resource was minted with records the region of the call that created it.
+/// The cap, like the name uniqueness both creates check, is counted over the
+/// resources of the CALL'S OWN region: an AWS service quota is a per-Region
+/// quota, and a resource created under one signing region is not one a call
+/// signed for another region sees, so each region meters its own.
 pub const RESOURCE_QUOTA: usize = 100;
+
+/// Absolute ceiling on the resources of one kind this store holds across every
+/// region a caller signs for.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: the signing region
+/// comes from the request, so the per-region quota alone would still let a
+/// caller grow this store without bound by naming region after region. Sized at
+/// the per-region quota times more regions than AWS publishes, so it can only
+/// ever be reached by a caller trying to exhaust the emulator, never by a
+/// realistic client script.
+pub const RESOURCE_CEILING: usize = RESOURCE_QUOTA * 64;
 
 /// The most tags one resource's stored tag set may hold.
 ///
@@ -496,6 +511,11 @@ pub enum PendingKind {
 #[derive(Debug, Clone)]
 pub struct CustomPluginRecord {
     pub arn: String,
+    /// The region this plugin lives in: the region the request that created it
+    /// was signed for, and the region segment of its ARN. A plugin name is
+    /// unique per account and region, and a regional endpoint serves only its
+    /// own region's plugins.
+    pub region: String,
     pub name: String,
     pub description: Option<String>,
     pub content_type: String,
@@ -676,6 +696,11 @@ fn next_connector_version(current: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct ConnectorRecord {
     pub arn: String,
+    /// The region this connector lives in: the region the request that created
+    /// it was signed for, and the region segment of its ARN. A connector name
+    /// is unique per account and region, and a regional endpoint serves only
+    /// its own region's connectors.
+    pub region: String,
     pub name: String,
     pub description: Option<String>,
     pub configuration: HashMap<String, String>,
@@ -1113,6 +1138,11 @@ impl ConnectorOperationRecord {
 #[derive(Debug, Clone)]
 pub struct WorkerConfigurationRecord {
     pub arn: String,
+    /// The region this configuration lives in: the region the request that
+    /// created it was signed for, and the region segment of its ARN. A
+    /// configuration name is unique per account and region, and a regional
+    /// endpoint serves only its own region's configurations.
+    pub region: String,
     pub name: String,
     pub description: Option<String>,
     /// The base64 `connect-distributed.properties` body the create request
@@ -1149,6 +1179,115 @@ impl WorkerConfigurationRecord {
             revision: self.revision,
         }
     }
+}
+
+/// A stored resource that belongs to one region and carries a name.
+///
+/// kafkaconnect is a REGIONAL service: its `aws.api#service` trait gives it the
+/// `kafkaconnect` endpoint prefix with standard regional endpoints, so every
+/// resource it holds lives in exactly one region, every ARN it mints carries
+/// that region, and a call is answered from the resources of the region it was
+/// signed for alone. Implemented by each stored record, so the region-scoped
+/// lookups below are written ONCE rather than once per resource kind.
+pub trait RegionalResource {
+    /// The region this resource lives in.
+    fn region(&self) -> &str;
+    /// This resource's name, which is unique within its own region.
+    fn name(&self) -> &str;
+}
+
+impl RegionalResource for CustomPluginRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl RegionalResource for ConnectorRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl RegionalResource for WorkerConfigurationRecord {
+    fn region(&self) -> &str {
+        &self.region
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The record `arn` names, as an endpoint for `region` sees it.
+///
+/// A regional endpoint serves only its own region's resources, so a well-formed
+/// ARN belonging to another region resolves to `None` exactly as an ARN this
+/// store never minted does.
+fn record_in<'store, T: RegionalResource>(
+    records: &'store HashMap<String, T>,
+    region: &str,
+    arn: &str,
+) -> Option<&'store T> {
+    records.get(arn).filter(|record| record.region() == region)
+}
+
+/// The record `arn` names in `region`, mutably — the write counterpart of
+/// [`record_in`], under the same regional rule, so a mutating call resolves a
+/// resource exactly as a read does.
+fn record_in_mut<'store, T: RegionalResource>(
+    records: &'store mut HashMap<String, T>,
+    region: &str,
+    arn: &str,
+) -> Option<&'store mut T> {
+    records
+        .get_mut(arn)
+        .filter(|record| record.region() == region)
+}
+
+/// The record of `name` in `region`, if any.
+///
+/// A name identifies at most one resource of a kind PER REGION, which is what
+/// makes a repeat of it within one region a conflict while the same name in
+/// another region is a second, independent resource.
+fn record_named<'store, T: RegionalResource>(
+    records: &'store HashMap<String, T>,
+    region: &str,
+    name: &str,
+) -> Option<&'store T> {
+    records
+        .values()
+        .find(|record| record.region() == region && record.name() == name)
+}
+
+/// Every record of `region`, in no particular order.
+fn records_in<'store, T: RegionalResource>(
+    records: &'store HashMap<String, T>,
+    region: &'store str,
+) -> impl Iterator<Item = &'store T> + 'store {
+    records
+        .values()
+        .filter(move |record| record.region() == region)
+}
+
+/// Whether one more resource of this kind may be stored for a call signed for
+/// `region`: refused once that region holds [`RESOURCE_QUOTA`] of them — a
+/// service quota is per Region — or once the store as a whole reaches
+/// [`RESOURCE_CEILING`].
+fn quota_reached<T: RegionalResource>(records: &HashMap<String, T>, region: &str) -> bool {
+    records
+        .values()
+        .filter(|record| record.region() == region)
+        .count()
+        >= RESOURCE_QUOTA
+        || records.len() >= RESOURCE_CEILING
 }
 
 /// Per-service state for com-amazonaws-kafkaconnect-kafkaconnect. A handler reaches it through [`service_state`].
@@ -1224,40 +1363,124 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             .retain(|_, operation| connectors.contains_key(&operation.connector_arn));
     }
 
-    /// Whether this store already holds as many custom plugins as it may
-    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
-    /// `CreateCustomPlugin` must be refused.
-    pub fn custom_plugin_quota_reached(&self) -> bool {
-        self.custom_plugins.len() >= RESOURCE_QUOTA
+    /// The custom plugin `arn` names, as an endpoint for `region` sees it:
+    /// `None` for a plugin of another region, exactly as for one this store
+    /// does not hold.
+    pub fn custom_plugin_in(&self, region: &str, arn: &str) -> Option<&CustomPluginRecord> {
+        record_in(&self.custom_plugins, region, arn)
     }
 
-    /// Whether this store already holds as many connectors as it may
-    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
-    /// `CreateConnector` must be refused.
-    pub fn connector_quota_reached(&self) -> bool {
-        self.connectors.len() >= RESOURCE_QUOTA
+    /// The custom plugin `arn` names in `region`, mutably — the write
+    /// counterpart of [`Self::custom_plugin_in`], under the same regional rule.
+    pub fn custom_plugin_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut CustomPluginRecord> {
+        record_in_mut(&mut self.custom_plugins, region, arn)
     }
 
-    /// The stored plugin of this name, if any. A name identifies at most one
-    /// plugin, which is what makes a repeat of it a conflict.
-    pub fn custom_plugin_named(&self, name: &str) -> Option<&CustomPluginRecord> {
-        self.custom_plugins
-            .values()
-            .find(|plugin| plugin.name == name)
+    /// The custom plugins of `region` — what `ListCustomPlugins` answered
+    /// through that region's endpoint reports, and nothing of any other region.
+    pub fn custom_plugins_in<'store>(
+        &'store self,
+        region: &'store str,
+    ) -> impl Iterator<Item = &'store CustomPluginRecord> + 'store {
+        records_in(&self.custom_plugins, region)
     }
 
-    /// Whether this store already holds as many worker configurations as it may
-    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
-    /// `CreateWorkerConfiguration` must be refused.
-    pub fn worker_configuration_quota_reached(&self) -> bool {
-        self.worker_configurations.len() >= RESOURCE_QUOTA
+    /// The connector `arn` names, as an endpoint for `region` sees it: `None`
+    /// for a connector of another region, exactly as for one this store does
+    /// not hold.
+    pub fn connector_in(&self, region: &str, arn: &str) -> Option<&ConnectorRecord> {
+        record_in(&self.connectors, region, arn)
     }
 
-    /// The stored connector of this name, if any.
-    pub fn connector_named(&self, name: &str) -> Option<&ConnectorRecord> {
-        self.connectors
-            .values()
-            .find(|connector| connector.name == name)
+    /// The connector `arn` names in `region`, mutably — the write counterpart
+    /// of [`Self::connector_in`], under the same regional rule.
+    pub fn connector_in_mut(&mut self, region: &str, arn: &str) -> Option<&mut ConnectorRecord> {
+        record_in_mut(&mut self.connectors, region, arn)
+    }
+
+    /// The connectors of `region` — what `ListConnectors` answered through that
+    /// region's endpoint reports ("all the connectors in this account and
+    /// Region"), and nothing of any other region.
+    pub fn connectors_in<'store>(
+        &'store self,
+        region: &'store str,
+    ) -> impl Iterator<Item = &'store ConnectorRecord> + 'store {
+        records_in(&self.connectors, region)
+    }
+
+    /// The worker configuration `arn` names, as an endpoint for `region` sees
+    /// it: `None` for a configuration of another region, exactly as for one
+    /// this store does not hold.
+    pub fn worker_configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&WorkerConfigurationRecord> {
+        record_in(&self.worker_configurations, region, arn)
+    }
+
+    /// The worker configuration `arn` names in `region`, mutably — the write
+    /// counterpart of [`Self::worker_configuration_in`], under the same
+    /// regional rule.
+    pub fn worker_configuration_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut WorkerConfigurationRecord> {
+        record_in_mut(&mut self.worker_configurations, region, arn)
+    }
+
+    /// The connector operation `arn` names, as an endpoint for `region` sees
+    /// it.
+    ///
+    /// An operation belongs to the connector it ran against, so it lives in
+    /// that connector's region: this region holds the operation exactly when it
+    /// holds its connector.
+    pub fn connector_operation_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&ConnectorOperationRecord> {
+        let operation = self.connector_operations.get(arn)?;
+        self.connector_in(region, &operation.connector_arn)?;
+        Some(operation)
+    }
+
+    /// Whether `region` already holds as many custom plugins as it may
+    /// ([`quota_reached`]), so the next `CreateCustomPlugin` signed for it must
+    /// be refused.
+    pub fn custom_plugin_quota_reached(&self, region: &str) -> bool {
+        quota_reached(&self.custom_plugins, region)
+    }
+
+    /// Whether `region` already holds as many connectors as it may
+    /// ([`quota_reached`]), so the next `CreateConnector` signed for it must be
+    /// refused.
+    pub fn connector_quota_reached(&self, region: &str) -> bool {
+        quota_reached(&self.connectors, region)
+    }
+
+    /// The plugin of this name in `region`, if any — the per-region name rule
+    /// [`record_named`] reads under.
+    pub fn custom_plugin_named(&self, region: &str, name: &str) -> Option<&CustomPluginRecord> {
+        record_named(&self.custom_plugins, region, name)
+    }
+
+    /// Whether `region` already holds as many worker configurations as it may
+    /// ([`quota_reached`]), so the next `CreateWorkerConfiguration` signed for
+    /// it must be refused.
+    pub fn worker_configuration_quota_reached(&self, region: &str) -> bool {
+        quota_reached(&self.worker_configurations, region)
+    }
+
+    /// The connector of this name in `region`, if any — the per-region name
+    /// rule [`record_named`] reads under.
+    pub fn connector_named(&self, region: &str, name: &str) -> Option<&ConnectorRecord> {
+        record_named(&self.connectors, region, name)
     }
 
     /// Whether this store already holds as many operations against the
@@ -1291,41 +1514,40 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             .collect()
     }
 
-    /// The tags stored on the resource `arn` names, or `None` when this
-    /// emulator holds no resource of that ARN.
+    /// The tags stored on the resource `arn` names, as an endpoint for `region`
+    /// sees it, or `None` when this region holds no resource of that ARN.
     ///
     /// Every taggable resource this emulator holds is keyed by its own ARN, so
     /// one lookup covers all three kinds and a reader never has to know which
-    /// kind an ARN names.
-    pub fn tags_of(&self, arn: &str) -> Option<&HashMap<String, String>> {
-        self.custom_plugins
-            .get(arn)
+    /// kind an ARN names. The tag seam is scoped to the call's region exactly as
+    /// every other read is, so another region's resource is as absent here as
+    /// an ARN this store never minted.
+    pub fn tags_of(&self, region: &str, arn: &str) -> Option<&HashMap<String, String>> {
+        self.custom_plugin_in(region, arn)
             .map(|plugin| &plugin.tags)
-            .or_else(|| self.connectors.get(arn).map(|connector| &connector.tags))
+            .or_else(|| self.connector_in(region, arn).map(|connector| &connector.tags))
             .or_else(|| {
-                self.worker_configurations
-                    .get(arn)
+                self.worker_configuration_in(region, arn)
                     .map(|worker| &worker.tags)
             })
     }
 
-    /// The tags stored on the resource `arn` names, for a caller that is about
-    /// to change them, or `None` when this emulator holds no resource of that
-    /// ARN.
+    /// The tags stored on the resource `arn` names in `region`, for a caller
+    /// that is about to change them, or `None` when this region holds no
+    /// resource of that ARN.
     ///
-    /// The mutable twin of [`Self::tags_of`]. PRIVATE on purpose: every tag
-    /// write goes through [`Self::attach_tags`] or [`Self::remove_tags`], so the
-    /// cap on a resource's stored tag count cannot be bypassed by a handler
-    /// holding the map directly.
-    fn tags_of_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
-        if let Some(plugin) = self.custom_plugins.get_mut(arn) {
+    /// The mutable twin of [`Self::tags_of`], under the same regional rule.
+    /// PRIVATE on purpose: every tag write goes through [`Self::attach_tags`] or
+    /// [`Self::remove_tags`], so the cap on a resource's stored tag count cannot
+    /// be bypassed by a handler holding the map directly.
+    fn tags_of_mut(&mut self, region: &str, arn: &str) -> Option<&mut HashMap<String, String>> {
+        if let Some(plugin) = record_in_mut(&mut self.custom_plugins, region, arn) {
             return Some(&mut plugin.tags);
         }
-        if let Some(connector) = self.connectors.get_mut(arn) {
+        if let Some(connector) = record_in_mut(&mut self.connectors, region, arn) {
             return Some(&mut connector.tags);
         }
-        self.worker_configurations
-            .get_mut(arn)
+        record_in_mut(&mut self.worker_configurations, region, arn)
             .map(|worker| &mut worker.tags)
     }
 
@@ -1344,6 +1566,7 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
     /// refused whether or not the resource it names exists.
     pub fn attach_tags(
         &mut self,
+        region: &str,
         arn: &str,
         incoming: HashMap<String, String>,
     ) -> Result<(), TagWriteRefusal> {
@@ -1351,7 +1574,7 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             return Err(TagWriteRefusal::IllegalTag(breach));
         }
         let tags = self
-            .tags_of_mut(arn)
+            .tags_of_mut(region, arn)
             .ok_or(TagWriteRefusal::NoSuchResource)?;
         // The size the merge would leave: the keys already stored that the
         // request does not name, plus the request's own keys.
@@ -1377,12 +1600,17 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
     /// ([`tag_key_breach`]) — a key AWS reserves is not a caller's to strip —
     /// and when the ARN names no resource this emulator holds; a removal can
     /// never grow the stored set, so there is no cap to check.
-    pub fn remove_tags(&mut self, arn: &str, keys: &[String]) -> Result<(), TagWriteRefusal> {
+    pub fn remove_tags(
+        &mut self,
+        region: &str,
+        arn: &str,
+        keys: &[String],
+    ) -> Result<(), TagWriteRefusal> {
         if let Some(breach) = tag_key_breach(keys) {
             return Err(TagWriteRefusal::IllegalTag(breach));
         }
         let tags = self
-            .tags_of_mut(arn)
+            .tags_of_mut(region, arn)
             .ok_or(TagWriteRefusal::NoSuchResource)?;
         for key in keys {
             tags.remove(key);
@@ -1390,12 +1618,14 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
         Ok(())
     }
 
-    /// The stored worker configuration of this name, if any. A name identifies
-    /// at most one configuration, which is what makes a repeat of it a conflict.
-    pub fn worker_configuration_named(&self, name: &str) -> Option<&WorkerConfigurationRecord> {
-        self.worker_configurations
-            .values()
-            .find(|worker| worker.name == name)
+    /// The worker configuration of this name in `region`, if any — the
+    /// per-region name rule [`record_named`] reads under.
+    pub fn worker_configuration_named(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> Option<&WorkerConfigurationRecord> {
+        record_named(&self.worker_configurations, region, name)
     }
 
     /// Mint the random-looking suffix of a resource ARN: the UUID AWS gives a

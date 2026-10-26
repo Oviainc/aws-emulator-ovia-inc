@@ -253,6 +253,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `ChallengeConfig` is "available at the web ACL level and in each rule",
+        // and for the Challenge action the immunity time has a floor of its own,
+        // above the modelled one that applies to a CAPTCHA immunity: a save carrying
+        // a value below it is refused, so no rule group is created. A rule group
+        // models no entity-level challenge configuration of its own, so only its
+        // rules carry one.
+        if let Some(immunity_time) = crate::state::below_minimum_challenge_immunity(
+            None,
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_CHALLENGE_CONFIG,
+                    &immunity_time.to_string(),
+                    crate::state::CHALLENGE_IMMUNITY_BELOW_MINIMUM_REASON,
+                ),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateRuleGroupErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {

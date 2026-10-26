@@ -103,8 +103,8 @@
 use super::types::*;
 
 use crate::state::{
-    no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
-    MAX_VPCS_PER_HOSTED_ZONE,
+    conflicting_domain_exists, no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed,
+    vpc_region_is_modelled, MAX_VPCS_PER_HOSTED_ZONE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -256,14 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(other) =
                 store.zone_with_name_associated_to_vpc(&zone_name, &zone_id, vpc_id)
             {
+                // The refusal names the zone that ALREADY holds this VPC under
+                // the same name, beside the VPC and the region the request
+                // named: the caller knows the name it asked for, and the zone
+                // holding the VPC is what it cannot know without another read.
                 return Err(AssociateVPCWithHostedZoneErrorModeled::ConflictingDomainExists(
-                    ConflictingDomainExists {
-                        message: Some(format!(
-                            "The VPC {vpc_id} is already associated with another hosted zone \
-                             that has the name {}.",
-                            other.name
-                        )),
-                    },
+                    conflicting_domain_exists(vpc_id, vpc_region, &other.id),
                 )
                 .into());
             }

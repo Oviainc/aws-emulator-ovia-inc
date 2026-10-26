@@ -64,6 +64,9 @@ pub const CREATE_GROUP: &str = "iam:CreateGroup";
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
 
+/// `iam:ListPolicyTags`.
+pub const LIST_POLICY_TAGS: &str = "iam:ListPolicyTags";
+
 /// The decision value for a request the policies in force permit — one of the three
 /// `PolicyEvaluationDecisionType` declares
 /// (`smithy_query(query="shape",shape="PolicyEvaluationDecisionType")`).

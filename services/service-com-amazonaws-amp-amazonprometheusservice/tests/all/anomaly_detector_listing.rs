@@ -28,7 +28,10 @@ use std::collections::BTreeMap;
 
 /// `GET /workspaces/{workspaceId}/anomalydetectors` — ListAnomalyDetectors, with the
 /// `@httpQuery` members the request names.
-async fn list_detectors(
+///
+/// `pub(crate)` so a suite that creates a detector another way reads it back through this
+/// same listing rather than spelling the route out again.
+pub(crate) async fn list_detectors(
     amp: &Amp,
     region: &str,
     workspace_id: &str,

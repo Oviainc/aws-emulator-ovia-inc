@@ -26,6 +26,16 @@ use super::topics_subscriptions_publish::{Answer, Sns};
 /// value broke.
 const SUBJECT_REFUSAL: &str = "Invalid parameter: Subject";
 
+/// The sentence a `FilterPolicy` the service cannot parse is refused with: the leading
+/// clause and the parser's diagnostic for the document below, whose parse stops on the
+/// bare word `this` at the first column of the first line. Which word and which position
+/// the diagnostic names is `filter_policy_parse_diagnostic.rs`.
+const FILTER_POLICY_PARSE_REFUSAL: &str =
+    "Invalid parameter: Attributes Reason: FilterPolicy: failed to parse JSON. \
+     Unrecognized token 'this': was expecting (JSON String, Number, Array, Object or \
+     token 'null', 'true' or 'false')\n at [Source: REDACTED \
+     (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 1]";
+
 /// The longest `Subject` SNS accepts, in characters (`PublishInput$Subject` doc:
 /// "less than 100 characters long"; the service accepts exactly 100).
 const MAX_SUBJECT_CHARS: usize = 100;
@@ -160,7 +170,7 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             status: 400,
             code: "InvalidParameter",
             message: "Invalid parameter: TopicArn Reason: Both TopicArn and TargetArn \
-                      cannot be specified at the same time.",
+                      specified. Use only one or the other.",
         },
         Refusal {
             case: "Publish with a Subject one character past the bound",
@@ -411,7 +421,7 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             ]),
             status: 400,
             code: "InvalidParameter",
-            message: "Invalid parameter: Attributes Reason: FilterPolicy: failed to parse JSON.",
+            message: FILTER_POLICY_PARSE_REFUSAL,
         },
         Refusal {
             case: "Subscribe with a filter policy scope SNS does not define",

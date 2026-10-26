@@ -224,6 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let name = TopicAttributeName::from(name.clone());
             attributes.entry(name).or_insert_with(|| value.clone());
         }
+        // A FIFO topic reports the deduplication setting that governs it whether or not
+        // its owner has set one: "By default, ContentBasedDeduplication is set to false.
+        // If you create a FIFO topic and this attribute is false, you must specify a
+        // value for the MessageDeduplicationId parameter for the Publish action"
+        // (`GetTopicAttributesResponse$Attributes` doc) — so a client reading it to
+        // decide whether it must supply its own id reads the documented default rather
+        // than nothing. It applies only to FIFO topics, so only they report it, and an
+        // owner that has set it reports what it is set to (the entry above).
+        if topic.is_fifo {
+            attributes
+                .entry(state::CONTENT_BASED_DEDUPLICATION_ATTRIBUTE.into())
+                .or_insert_with(|| state::attribute_flag(false));
+        }
 
         Ok(GetTopicAttributesOutput {
             attributes: Some(attributes),

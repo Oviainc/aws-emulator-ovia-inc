@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Alias, AnywhereConfiguration, CertificateConfiguration, DesiredPlayerSession,
+    Alias, AnywhereConfiguration, Build, CertificateConfiguration, DesiredPlayerSession,
     FilterConfiguration, FleetAttributes, GameProperty, GameSession, GameSessionPlacement,
     GameSessionQueue, GameSessionQueueDestination, IpPermission, LocationModel, LocationState,
     MatchmakingConfiguration, MatchmakingRuleSet, MatchmakingTicket, PlacedPlayerSession, Player,
@@ -42,6 +42,15 @@ pub const FLEET_STATUS_NEW: &str = "NEW";
 pub const FLEET_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`FLEET_STATUS_NEW`].
 pub const FLEET_STATUS_DELETING: &str = "DELETING";
+
+/// `BuildStatus` values this slice uses (`smithy_query shape=BuildStatus`), as
+/// `Build$Status` documents them: "`INITIALIZED` -- A new build has been defined, but no
+/// files have been uploaded. You cannot create fleets for builds that are in this status.
+/// When a build is successfully created, the build status is set to this value."
+pub const BUILD_STATUS_INITIALIZED: &str = "INITIALIZED";
+/// "`READY` -- The game build has been successfully uploaded. You can now create new
+/// fleets for this build."
+pub const BUILD_STATUS_READY: &str = "READY";
 
 /// `GameSessionStatus` values this slice uses (`smithy_query shape=GameSessionStatus`).
 pub const GAME_SESSION_STATUS_ACTIVATING: &str = "ACTIVATING";
@@ -253,6 +262,12 @@ pub const MAX_CUSTOM_LOCATIONS_PER_ACCOUNT: usize = 100;
 /// error that is about the state of the account's resources rather than about a parameter
 /// value.
 pub const MAX_SCRIPTS_PER_ACCOUNT: usize = 100;
+
+/// How many custom game builds this emulator holds before `CreateBuild` refuses the next
+/// create. CHOSEN for the same reason as [`MAX_SCRIPTS_PER_ACCOUNT`], and answered with
+/// the same modelled `ConflictException`: a stored build record lives until `DeleteBuild`
+/// removes it, and `CreateBuild` models no `LimitExceededException`.
+pub const MAX_BUILDS_PER_ACCOUNT: usize = 100;
 
 /// How many matchmaking rule sets this emulator holds before `CreateMatchmakingRuleSet`
 /// answers the modelled `LimitExceededException`. CHOSEN for the same reason as
@@ -1164,6 +1179,177 @@ pub fn service_owned_script_location(region: &str, script_id: &str) -> S3Locatio
     }
 }
 
+/// A custom game build, as `CreateBuild` persisted it — the one projection every read of
+/// the build is served from.
+#[derive(Debug, Clone)]
+pub struct BuildRecord {
+    pub build_id: String,
+    pub build_arn: String,
+    /// "A descriptive label that is associated with a build. Build names do not need to be
+    /// unique", and the member is optional, so a build may carry no name at all.
+    pub name: Option<String>,
+    pub version: Option<String>,
+    /// One of [`BUILD_STATUS_INITIALIZED`] and [`BUILD_STATUS_READY`].
+    pub status: String,
+    /// "The operating system that your game server binaries run on", which "you can't
+    /// change ... later", so the create decides it once.
+    pub operating_system: String,
+    pub server_sdk_version: String,
+    pub creation_time: SystemTime,
+    /// Where the build's files are stored: the location the request named, or the
+    /// service-owned one ([`service_owned_build_location`]) the caller uploads to.
+    pub storage_location: S3Location,
+    /// When the status change the clock owes this build comes due, i.e. when the service
+    /// has finished reading the build files it found at the location the request named.
+    /// `None` for a build whose files are not there: that build has no change owed to it,
+    /// because `READY` is "the game build has been successfully uploaded" and the upload is
+    /// the caller's own next step, not something the clock does.
+    pub ready_at: Option<SystemTime>,
+    /// The credential-store id of the upload credential this build was handed, so the
+    /// credential can be rotated or withdrawn with the build it belongs to. `None` for a
+    /// build whose files are in the caller's own bucket, which needs no upload credential.
+    pub upload_credential_id: Option<String>,
+    /// The labels the create assigned to the build resource, kept with it for the
+    /// tag operations to read and write once they are implemented.
+    pub tags: Vec<Tag>,
+    /// The Region of the request that created the build, which its ARN names.
+    pub region: String,
+}
+
+impl BuildRecord {
+    /// This build as the modelled `Build`.
+    ///
+    /// `SizeOnDisk` is "file size of the uploaded game build, expressed in bytes[.] When
+    /// the build status is `INITIALIZED` or when using a custom Amazon S3 storage location,
+    /// this value is 0" — and CreateBuild's own `StorageLocation` doc: "Amazon GameLift
+    /// Servers will report a `SizeOnDisk` of 0." Those are the only two ways a build here
+    /// comes about, so every build reports 0 rather than a size nothing measured.
+    pub fn to_modelled(&self) -> Build {
+        Build {
+            build_id: Some(self.build_id.clone()),
+            build_arn: Some(self.build_arn.clone()),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            status: Some(self.status.clone()),
+            size_on_disk: Some(0),
+            operating_system: Some(self.operating_system.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            server_sdk_version: Some(self.server_sdk_version.clone()),
+        }
+    }
+}
+
+/// The `ServerSdkVersion` a build created without one carries: that member's own doc — "By
+/// default Amazon GameLift Servers sets this value to `4.0.2`."
+pub const DEFAULT_SERVER_SDK_VERSION: &str = "4.0.2";
+
+/// The Amazon GameLift Servers-owned S3 location a build's files are uploaded to when the
+/// request named no storage location of its own.
+///
+/// CreateBuild's doc: "Upload your build files to a Amazon GameLift Servers Amazon S3
+/// location. To use this option, specify a build name and operating system. This operation
+/// creates a new build resource and also returns an Amazon S3 location with temporary
+/// access credentials." The bucket belongs to the service rather than to the caller, so
+/// the location carries no `RoleArn` — that member "allows Amazon GameLift Servers to
+/// access the S3 bucket" of ANOTHER account — and no `ObjectVersion`, which is the
+/// caller's own bucket versioning. The bucket and key formats are CHOSEN (the service
+/// documents neither): the key names the build that holds the files, so two builds never
+/// share a location.
+pub fn service_owned_build_location(build_id: &str) -> S3Location {
+    S3Location {
+        bucket: Some(service_owned_build_bucket()),
+        key: Some(format!("{build_id}/build.zip")),
+        role_arn: None,
+        object_version: None,
+    }
+}
+
+/// The ONE Amazon GameLift Servers-owned bucket every build uploaded through
+/// [`service_owned_build_location`] is held in, with a key per build.
+///
+/// Nothing a caller supplies is part of the name: it is this emulator's account and a fixed
+/// label, so however many builds are created, and whatever their requests say, the object
+/// store gains at most this single bucket.
+pub fn service_owned_build_bucket() -> String {
+    format!(
+        "gamelift-build-uploads-{}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What the Amazon GameLift Servers-owned upload bucket is recorded as provisioned by in
+/// the one S3 object store (`Bucket::provisioned_by`), which keeps it out of the account's
+/// own `ListBuckets`: the bucket belongs to this service, not to the caller.
+pub const BUILD_UPLOAD_BUCKET_PROVISIONER: &str = "gamelift";
+
+/// Stand up the object store behind the service-owned location a build's files are uploaded
+/// to, so the location and credentials `CreateBuild` hands back reach something: "this
+/// operation creates a new build resource and also returns an Amazon S3 location with
+/// temporary access credentials. Use the credentials to manually upload your build files to
+/// the specified Amazon S3 location."
+///
+/// The S3 object protocol in this emulator is served by the Amazon S3 service, so the
+/// bucket is provisioned THERE rather than copied into an object map of this service's own:
+/// the caller's `PutObject` and everything this service later reads about the upload are
+/// then the one store.
+///
+/// IDEMPOTENT and BOUNDED: the name and the Region are fixed ([`service_owned_build_bucket`],
+/// [`DEFAULT_REGION`]), so a call either records that one bucket or finds it already
+/// recorded — no caller-supplied value keys an entry, and no number of requests grows the
+/// object store by more than this bucket. A bucket of that name the store holds for anybody
+/// else is NOT adopted: the upload would then be vended into a bucket that is not this
+/// service's, so the call answers `false` and the create is refused instead.
+///
+/// `false` when the store holds no such bucket of this service's and could not record one
+/// (a name in use, or its own bucket quota), `None` when that store cannot be reached at
+/// all — a router that mounts this service without Amazon S3.
+///
+/// LOCK ORDER: this takes the S3 store's lock and holds no other while it does, and hands
+/// back an owned value rather than a guard — so it must be called with NO guard of this
+/// service's store held. Keeping the cross-service access one-directional and guard-free is
+/// what makes a lock cycle between the two stores unreachable.
+pub fn provision_build_upload_bucket<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<bool> {
+    use ::service_com_amazonaws_s3_amazons3::state::BucketCreation;
+
+    let bucket = service_owned_build_bucket();
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let mut store = state.lock();
+    let recorded = match store.provision_bucket(&bucket, DEFAULT_REGION, BUILD_UPLOAD_BUCKET_PROVISIONER)
+    {
+        BucketCreation::Created => true,
+        // The name is in use, which for this one fixed name is ordinarily the bucket an
+        // earlier create recorded — but `provision_bucket` reports a name taken by ANY
+        // bucket, so the one that holds it is what decides.
+        BucketCreation::NameTaken => store
+            .bucket(&bucket)
+            .is_some_and(|held| held.provisioned_by() == Some(BUILD_UPLOAD_BUCKET_PROVISIONER)),
+        BucketCreation::QuotaReached => false,
+    };
+    Some(recorded)
+}
+
+/// Whether the build files a storage location names are in the one object store: the
+/// service can only read a build's files where they are.
+///
+/// `Build$Status`: "`READY` -- the game build has been successfully uploaded", so a location
+/// holding nothing is a build whose files nobody has uploaded. The CURRENT object at the
+/// location's key, so a key whose object has been deleted again reads as absent, exactly as
+/// a `GetObject` of it would.
+///
+/// The same LOCK ORDER as [`provision_build_upload_bucket`], and a pure read of that store.
+pub fn build_files_present<Eng: Send + Sync + 'static>(engine: &Eng, location: &S3Location) -> bool {
+    let (Some(bucket), Some(key)) = (location.bucket.as_deref(), location.key.as_deref()) else {
+        return false;
+    };
+    let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
+        return false;
+    };
+    let store = state.lock();
+    store
+        .bucket(bucket)
+        .is_some_and(|bucket| bucket.object(key).is_some())
+}
+
 /// A FlexMatch rule set, as `CreateMatchmakingRuleSet` persisted it.
 #[derive(Debug, Clone)]
 pub struct MatchmakingRuleSetRecord {
@@ -1543,6 +1729,9 @@ pub struct ComAmazonawsGameliftGameliftState {
     /// Custom locations by `LocationName`, which `CreateLocation` keeps unique: a second
     /// create under a name a location already holds answers `ConflictException`.
     pub custom_locations: HashMap<String, CustomLocationRecord>,
+    /// Custom game builds by `BuildId`, "a unique identifier for the build", while build
+    /// names "do not need to be unique" — so the id is the build's key.
+    pub builds: HashMap<String, BuildRecord>,
     /// Realtime scripts by `ScriptId`, "a unique identifier for the Realtime script",
     /// while script names "do not need to be unique" — so the id is the script's key.
     pub scripts: HashMap<String, ScriptRecord>,
@@ -1607,6 +1796,17 @@ impl ComAmazonawsGameliftGameliftState {
                 for location in &mut fleet.locations {
                     location.status = FLEET_STATUS_ACTIVE.to_string();
                 }
+            }
+        }
+
+        // A build whose files the service has finished reading is READY: "the game build
+        // has been successfully uploaded. You can now create new fleets for this build."
+        for build in self.builds.values_mut() {
+            if build.status == BUILD_STATUS_INITIALIZED
+                && build.ready_at.is_some_and(|due| now >= due)
+            {
+                build.status = BUILD_STATUS_READY.to_string();
+                build.ready_at = None;
             }
         }
 
@@ -2009,6 +2209,27 @@ impl ComAmazonawsGameliftGameliftState {
         } else {
             self.aliases.get(id_or_arn)
         }
+    }
+
+    /// The build a `BuildIdOrArn` names, or `None` when no stored build matches it.
+    ///
+    /// `Build$BuildArn`'s doc: "In a GameLift build ARN, the resource ID matches the
+    /// `BuildId` value", so either form selects the same build — which is why the member's
+    /// pattern accepts both.
+    pub fn resolve_build(&self, id_or_arn: &str) -> Option<&BuildRecord> {
+        if id_or_arn.starts_with("arn:") {
+            self.builds.values().find(|build| build.build_arn == id_or_arn)
+        } else {
+            self.builds.get(id_or_arn)
+        }
+    }
+
+    /// The `BuildId` of the build a `BuildIdOrArn` names, or `None` when no stored build
+    /// matches it — [`resolve_build`](Self::resolve_build) for a caller that needs the
+    /// record rather than the key to reach it by.
+    pub fn resolve_build_id(&self, id_or_arn: &str) -> Option<String> {
+        self.resolve_build(id_or_arn)
+            .map(|build| build.build_id.clone())
     }
 
     /// The script a `ScriptIdOrArn` names, or `None` when no stored script matches it.
