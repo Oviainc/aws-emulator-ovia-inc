@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAutoSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAutoSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAutoSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes ONE automatic snapshot of a Lightsail instance or disk: the copy the
+//! resource's automatic snapshot add-on took on the requested date.
+//!
+//! A copy has no name and no ARN of its own — it is addressed by the resource it
+//! was taken of plus the UTC date it was taken on, and the add-on takes one copy
+//! a day — so the deletion names exactly one of that resource's copies, leaves
+//! every other copy and the add-on's own schedule alone, and is reported in the
+//! operation log against the resource the copy was taken of.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +162,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAutoSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAutoSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAutoSnapshot"))
+        // `ctx` carries request metadata only: an automatic snapshot is held
+        // with the resource it was taken of, and both kinds of resource that
+        // carry one are addressed by name alone, wherever the call is made from.
+        let _ = ctx;
+
+        // `date` and `resourceName` are modelled `@required` members, each
+        // carrying its own pattern — `^[0-9]{4}-[0-9]{2}-[0-9]{2}$` on the date
+        // and `^\w[\w\-]*\w$` on the name — so the centralized walk refused
+        // anything outside them before this body ran. What is left is what the
+        // model cannot express: the name must be one of this account's instances
+        // or disks, and that resource must hold a copy taken on that date.
+        let name = input.resource_name;
+        let date = input.date;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let Some(found) = store.delete_auto_snapshot(&name, &date) else {
+                return Err(not_found(&name));
+            };
+            let (resource_type, location) = match found {
+                crate::state::AutoSnapshotDeletion::Deleted {
+                    resource_type,
+                    location,
+                } => (resource_type, location),
+                // The resource exists and holds no copy dated that way, so there
+                // is nothing for this request to delete: the service's
+                // `DoesNotExist` envelope, naming what was asked for.
+                crate::state::AutoSnapshotDeletion::NoCopyForDate { resource_type } => {
+                    return Err(no_copy_for_date(resource_type, &name, &date));
+                }
+            };
+            // The copy is gone as this call returns, so the work the operation
+            // describes is already done and the entry is terminal. It is logged
+            // against the resource the copy was taken of, because that is the
+            // resource an automatic snapshot is addressed through, and it reports
+            // no `operationType`, because the modelled `OperationType` enum
+            // defines no value for this call.
+            let operation = store.record_untyped_operation(now, resource_type, &name, &location);
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; this one deletes one copy of the one resource it
+            // names, so it answers exactly one entry.
+            Ok(DeleteAutoSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No resource automatic snapshots are taken of is stored under that name:
+/// Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist`, and a message built from the
+/// request.
+///
+/// The resources an automatic snapshot can be taken of are exactly the ones the
+/// automatic snapshot add-on can be enabled on, so this is the shared sentence
+/// every operation that resolves one refuses with: one resolution rule, one
+/// refusal. It names the request's own member rather than a resource type,
+/// because such a request names a resource without saying what kind it is.
+fn not_found(name: &str) -> DeleteAutoSnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::add_on_resource_not_found(name))
+}
+
+/// The resource holds no copy taken on the requested date — a date its add-on
+/// took nothing on, a date whose copy an earlier call already deleted, or one
+/// that is no day at all. The same `DoesNotExist` envelope, worded as the
+/// crate's resource-type/name sentence is
+/// ([`crate::scaffolded::Scaffolded::resource_does_not_exist`]) and naming what
+/// identifies an automatic snapshot: the resource the copy would have been
+/// taken of, and the date that addresses it.
+fn no_copy_for_date(resource_type: &str, name: &str, date: &str) -> DeleteAutoSnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The automatic snapshot of the {resource_type} {name} does not exist: {date}"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteAutoSnapshotError {
+    DeleteAutoSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

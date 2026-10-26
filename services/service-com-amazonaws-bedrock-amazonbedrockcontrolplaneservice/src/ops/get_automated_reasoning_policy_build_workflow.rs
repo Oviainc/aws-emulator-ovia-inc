@@ -183,10 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetAutomatedReasoningPolicyBuildWorkflowErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no build workflow {} exists for automated reasoning policy {}",
-                            input.build_workflow_id, input.policy_arn
-                        )),
+                        message: Some(
+                            crate::state::build_workflow_not_found_message().to_string(),
+                        ),
                     },
                 )
                 .into(),

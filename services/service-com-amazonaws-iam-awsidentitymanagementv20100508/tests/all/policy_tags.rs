@@ -48,7 +48,7 @@ const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":
 
 /// Create the policy `policy_name` under `path` carrying `initial`, asserting the
 /// create succeeded, and answer the ARN it reported.
-async fn create_policy(
+pub(crate) async fn create_policy(
     router: &MultiServiceRouter,
     policy_name: &str,
     path: Option<&str>,
@@ -71,7 +71,7 @@ async fn create_policy(
 }
 
 /// One `TagPolicy` call: the HTTP status and the XML body.
-async fn tag_policy(
+pub(crate) async fn tag_policy(
     router: &MultiServiceRouter,
     policy_arn: &str,
     list: &[(String, String)],
@@ -82,7 +82,7 @@ async fn tag_policy(
 
 /// The tag set `GetPolicy` reports for `policy_arn`, as a map, plus how many `<Key>`
 /// elements the response carried — so a duplicated key cannot hide inside a map.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     policy_arn: &str,
 ) -> (BTreeMap<String, String>, usize) {

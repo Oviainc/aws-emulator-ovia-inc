@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableSnapshotCopy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableSnapshotCopy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableSnapshotCopy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records on the named cluster that its snapshots are copied automatically to
+//! another Region, and reports the cluster back. The configuration IS the
+//! cluster's `ClusterSnapshotCopyStatus` — the destination Region, how long a
+//! copied automated snapshot is kept there
+//! ([`crate::state::DEFAULT_SNAPSHOT_COPY_RETENTION`] when the request names no
+//! period), how long a copied manual one is kept, and the snapshot copy grant
+//! the copies are encrypted under — so every later read of the cluster reports
+//! it and `DeleteSnapshotCopyGrant` sees the grant in use.
+//!
+//! Cross-region snapshot copy is a standing instruction rather than work done to
+//! the cluster, so the cluster stays [`crate::state::STATUS_AVAILABLE`]: this
+//! call owes the clock no transition, and the configuration is in effect for
+//! whoever reads the cluster next.
+//!
+//! The preconditions are the ones the model states: the request must name an
+//! existing cluster, in the state that admits a configuration change, that does
+//! not already have cross-region snapshot copy enabled; a destination Region
+//! must be the name of a Region ([`crate::state::names_a_region`]); each
+//! retention period must be inside the published range for the kind of snapshot
+//! it retains; and a snapshot copy grant must be one this account holds.
 //!
 //! ## Shape of an operation
 //!
@@ -117,7 +129,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `EnableSnapshotCopyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#EnableSnapshotCopy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#EnableSnapshotCopy",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum EnableSnapshotCopyErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -131,6 +146,7 @@ pub enum EnableSnapshotCopyErrorModeled {
     SnapshotCopyGrantNotFoundFault(SnapshotCopyGrantNotFoundFault),
     UnauthorizedOperation(UnauthorizedOperation),
     UnknownSnapshotCopyRegionFault(UnknownSnapshotCopyRegionFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -182,20 +198,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableSnapshotCopy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableSnapshotCopyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableSnapshotCopy"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                EnableSnapshotCopyErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        // The copy is configured ON a cluster, so the cluster has to be there,
+        // and it has to be in the state that admits a configuration change.
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(EnableSnapshotCopyErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        };
+        let cluster_status = store.clusters[position]
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(EnableSnapshotCopyErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {} is in state {cluster_status}; it must be {} to enable \
+                         cross-region snapshot copy.",
+                        input.cluster_identifier,
+                        st::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Must be the valid name of an existing cluster that does not already
+        // have cross-region snapshot copy enabled": the configuration a cluster
+        // already carries is changed through the operations that change it, and
+        // is not replaced by a second enable.
+        if store.clusters[position]
+            .cluster
+            .cluster_snapshot_copy_status
+            .is_some()
+        {
+            return Err(
+                EnableSnapshotCopyErrorModeled::SnapshotCopyAlreadyEnabledFault(
+                    SnapshotCopyAlreadyEnabledFault {
+                        message: Some(format!(
+                            "Cross-region snapshot copy is already enabled on cluster {}.",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Must be the name of a valid Amazon Web Services Region": a value that
+        // is not a Region code names no Region to copy a snapshot to. The check
+        // is on the FORM and the published area and location vocabularies, not
+        // on membership of today's Region list — see
+        // [`crate::state::names_a_region`] — so a Region AWS adds later is
+        // accepted and a shape no Region code has is not.
+        if !st::names_a_region(&input.destination_region) {
+            return Err(
+                EnableSnapshotCopyErrorModeled::UnknownSnapshotCopyRegionFault(
+                    UnknownSnapshotCopyRegionFault {
+                        message: Some(format!("Invalid region name: {}", input.destination_region)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each retention period is a day count inside its own published range,
+        // and one the request omitted is this service's documented default.
+        let retention = input
+            .retention_period
+            .unwrap_or(st::DEFAULT_SNAPSHOT_COPY_RETENTION);
+        if !st::snapshot_copy_retention_admitted(retention) {
+            return Err(EnableSnapshotCopyErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for RetentionPeriod: {retention}. It must be a value \
+                         from {} to {}.",
+                        st::SNAPSHOT_COPY_RETENTION_BOUNDS.0, st::SNAPSHOT_COPY_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+        let manual_retention = input
+            .manual_snapshot_retention_period
+            .unwrap_or(st::MANUAL_RETENTION_INDEFINITE);
+        if !st::manual_retention_admitted(manual_retention) {
+            return Err(EnableSnapshotCopyErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. \
+                         It must be either {} or an integer between {} and {}.",
+                        st::MANUAL_RETENTION_INDEFINITE,
+                        st::MANUAL_RETENTION_BOUNDS.0,
+                        st::MANUAL_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The grant is what lets Amazon Redshift encrypt the copies, so a name
+        // that identifies none of this account's grants is refused — resolved
+        // exactly as `DescribeSnapshotCopyGrants` and `DeleteSnapshotCopyGrant`
+        // resolve one, so no two paths disagree about which names identify a
+        // grant.
+        if let Some(grant_name) = input.snapshot_copy_grant_name.as_deref() {
+            if store.snapshot_copy_grant(grant_name).is_none() {
+                return Err(
+                    EnableSnapshotCopyErrorModeled::SnapshotCopyGrantNotFoundFault(
+                        SnapshotCopyGrantNotFoundFault {
+                            message: Some(format!("Snapshot copy grant not found: {grant_name}")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // What the cluster reports from here on: the destination, the two
+        // retention periods now in effect, and the grant the copies are
+        // encrypted under when the request named one. Nothing the cluster
+        // DERIVES from its own configuration changes, so the rest of the record
+        // stands exactly as it stood.
+        let stored = &mut store.clusters[position];
+        stored.cluster.cluster_snapshot_copy_status = Some(ClusterSnapshotCopyStatus {
+            destination_region: Some(input.destination_region.clone()),
+            retention_period: Some(i64::from(retention)),
+            manual_snapshot_retention_period: Some(manual_retention),
+            snapshot_copy_grant_name: input.snapshot_copy_grant_name.clone(),
+        });
+
+        Ok(EnableSnapshotCopyOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

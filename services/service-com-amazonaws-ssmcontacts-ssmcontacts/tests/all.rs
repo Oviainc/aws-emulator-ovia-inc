@@ -59,6 +59,8 @@ mod page_receipts;
 mod page_resolution;
 #[path = "all/pages_by_contact.rs"]
 mod pages_by_contact;
+#[path = "all/pages_by_contact_acknowledgements.rs"]
+mod pages_by_contact_acknowledgements;
 #[path = "all/recurrence_validity.rs"]
 mod recurrence_validity;
 #[path = "all/replication_set_precondition.rs"]
