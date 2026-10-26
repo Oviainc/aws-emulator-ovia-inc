@@ -47,6 +47,8 @@ mod execution_interpreter;
 mod execution_redrive;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
+#[path = "all/map_run_failure_budget.rs"]
+mod map_run_failure_budget;
 #[path = "all/map_run_updates.rs"]
 mod map_run_updates;
 #[path = "all/map_runs.rs"]

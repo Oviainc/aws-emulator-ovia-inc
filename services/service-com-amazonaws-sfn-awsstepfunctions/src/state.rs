@@ -140,6 +140,15 @@ pub const VALIDATION_REASON_COMPLETED_MAP_RUN: &str = "CANNOT_UPDATE_COMPLETED_M
 /// way [`LABELED_ARN_MESSAGE`] does.
 pub const COMPLETED_MAP_RUN_MESSAGE: &str = "Cannot update a completed Map Run";
 
+/// What the modelled `ValidationException` says when a configuration change names
+/// none of the settings it can change: `UpdateMapRun`'s three threshold members are
+/// each optional with a null default, so a request that carries none of them states
+/// no change at all. It names nothing from the request, the way
+/// [`COMPLETED_MAP_RUN_MESSAGE`] does.
+pub const EMPTY_MAP_RUN_UPDATE_MESSAGE: &str =
+    "Either the max concurrency, the tolerated failure count, or the tolerated failure \
+     percentage must be specified";
+
 /// What the modelled `ValidationException` says about a map-run labeled state
 /// machine ARN, on every operation that documents refusing one. It names nothing
 /// from the request, so every such operation answers exactly this.
@@ -1510,8 +1519,15 @@ pub struct MapRun {
     pub tolerated_failure_count: i64,
     pub tolerated_failure_percentage: f32,
     pub total_items: i64,
+    /// How many of the items the clock has already finished produced a result, and
+    /// how many failed: the counts GROW as each item comes due, so what a caller
+    /// reads is what the Map Run has done so far rather than what it will have done.
     pub succeeded_items: i64,
     pub failed_items: i64,
+    /// The items the clock has NOT finished yet, in the order they finish. Drained by
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::settle`] into the counts above, which
+    /// is also where the failure budget is weighed.
+    pub items: Vec<MapRunItem>,
     /// How many times the parent execution has been redriven since this Map Run was
     /// created, which re-ran the Map state this record belongs to.
     pub redrive_count: i32,
@@ -1528,6 +1544,19 @@ pub struct MapRun {
 pub struct PendingMapRunOutcome {
     pub due_at: SystemTime,
     pub status: String,
+}
+
+/// One item of a Map Run, as the clock owes it: the instant its iteration finished
+/// and whether it failed.
+///
+/// This is [`asl::MapItemOutcome`] with the walk's offset turned into an instant. A
+/// Map Run counts an item from this instant on, so the counts it reports are what its
+/// items have done SO FAR — the item ran in the walk, but nothing it produced is
+/// reported before the clock reaches the instant it produced it at.
+#[derive(Debug, Clone, Copy)]
+pub struct MapRunItem {
+    pub due_at: SystemTime,
+    pub failed: bool,
 }
 
 /// What a Map Run reports as its `maxConcurrency` for a declared limit of `limit`:
@@ -1600,10 +1629,78 @@ impl MapRun {
             + self.state_machine_arn.len()
             + self.label.len()
             + self.status.len()
+            + self.items.len().saturating_mul(std::mem::size_of::<MapRunItem>())
             + self
                 .pending
                 .as_ref()
                 .map_or(0, |pending| pending.status.len())
+    }
+
+    /// Count every item the clock has already finished, and leave `RUNNING` at the
+    /// failure that BREACHES the failure budget this record carries.
+    ///
+    /// Both are owed whether or not anybody called. An item is counted under the
+    /// status its iteration reached from the instant it finished, so a Map Run reports
+    /// what its items have done so far; and the thresholds a Map Run is running under
+    /// are a failure budget, weighed against the failures counted so far
+    /// ([`within_tolerated_failures`]) each time one is counted — the thresholds the
+    /// record carries NOW, which is what `UpdateMapRun` writes. A Map Run whose
+    /// failures are inside that budget keeps running; one whose budget a counted
+    /// failure breaches is FAILED from the instant of that failure, rather than only
+    /// once every one of its items has finished.
+    ///
+    /// The budget decides WHEN this Map Run stopped running, and the status it stops
+    /// at is the one the walk computed for it: the execution around it reached its own
+    /// outcome through the same `Map` state, so the two never come to contradict each
+    /// other.
+    fn advance(&mut self, now: SystemTime) {
+        let fails_on_budget = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.status == MAP_RUN_STATUS_FAILED);
+        let mut breached_at: Option<SystemTime> = None;
+        let mut counted = 0usize;
+        while let Some(item) = self.items.get(counted).copied() {
+            if item.due_at > now {
+                break;
+            }
+            counted += 1;
+            if !item.failed {
+                self.succeeded_items = self.succeeded_items.saturating_add(1);
+                continue;
+            }
+            self.failed_items = self.failed_items.saturating_add(1);
+            if breached_at.is_none()
+                && fails_on_budget
+                && !within_tolerated_failures(
+                    self.failed_items,
+                    self.total_items,
+                    self.tolerated_failure_count,
+                    f64::from(self.tolerated_failure_percentage),
+                )
+            {
+                breached_at = Some(item.due_at);
+            }
+        }
+        self.items.drain(..counted);
+        if let Some(breached_at) = breached_at.filter(|_| !self.is_terminal()) {
+            self.status = MAP_RUN_STATUS_FAILED.to_string();
+            self.stop_date = Some(breached_at);
+            // The clock owes this Map Run no further status: the budget decided it
+            // here, at the failure that breached it.
+            self.pending = None;
+            return;
+        }
+        // A Map Run no failure took past its budget reaches the status the walk
+        // computed, once its items are all counted and the clock makes it due.
+        if self.items.is_empty()
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.due_at <= now)
+        {
+            self.apply_pending();
+        }
     }
 
     /// Apply the terminal status the clock now owes.
@@ -1736,14 +1833,21 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             let Some(map_run) = self.map_runs.get_mut(&arn) else {
                 continue;
             };
-            let Some(pending) = map_run.pending.as_ref() else {
-                continue;
-            };
-            if pending.due_at > now {
+            let before = map_run.retained_bytes;
+            // The items the clock finished are counted, and a Map Run whose budget
+            // one of them breached stops running here.
+            map_run.advance(now);
+            map_run.retained_bytes = map_run.measure();
+            let after = map_run.retained_bytes;
+            // A Map Run is still owed something while it holds an item the clock has
+            // not reached, or the status its walk computed.
+            if map_run.pending.is_some() || !map_run.items.is_empty() {
                 still_running.push(arn);
-                continue;
             }
-            map_run.apply_pending();
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(after)
+                .saturating_sub(before);
         }
         self.pending_map_runs = still_running;
 
@@ -3395,8 +3499,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             tolerated_failure_count: plan.tolerated_failure_count,
             tolerated_failure_percentage: plan.tolerated_failure_percentage,
             total_items: plan.total_items,
-            succeeded_items: plan.succeeded_items,
-            failed_items: plan.failed_items,
+            // Nothing this Map Run iterated is counted yet: each item is counted from
+            // the instant its own iteration finished, which the clock has still to
+            // reach, exactly as the Map Run's status is.
+            succeeded_items: 0,
+            failed_items: 0,
+            items: plan.items,
             redrive_count,
             // "If you have not yet redriven [...] the redriveDate is null": the
             // instant the re-run that produced this record began.
@@ -3422,9 +3530,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// What the Map Run's items PRODUCED is not touched, and neither is the status
     /// they left it owed: the iterations are not re-run by a configuration change,
     /// and the execution around the Map Run reached its own outcome through the same
-    /// `Map` state under the thresholds that state declared — so re-deciding the Map
-    /// Run's status here alone would leave the two contradicting each other, with a
-    /// Map Run reported as succeeded inside an execution reported as failed at it.
+    /// `Map` state — so re-deciding the Map Run's status here alone would leave the
+    /// two contradicting each other, with a Map Run reported as succeeded inside an
+    /// execution reported as failed at it.
+    ///
+    /// The thresholds this writes ARE the failure budget the Map Run goes on running
+    /// under: [`MapRun::advance`] weighs the failures it counts against what this
+    /// record carries at that instant, so a budget a caller raised keeps a Map Run
+    /// running over failures the budget it started with would have stopped it on.
     ///
     /// Call [`Self::settle`] first, so a Map Run the clock has already finished is
     /// refused as the completed Map Run it is.
@@ -3500,6 +3613,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             }
             let before = map_run.retained_bytes;
             map_run.pending = None;
+            // The items the clock had not reached are never going to finish: the
+            // execution that was iterating them was stopped.
+            map_run.items.clear();
             map_run.status = MAP_RUN_STATUS_ABORTED.to_string();
             map_run.stop_date = Some(now);
             map_run.retained_bytes = map_run.measure();
@@ -5453,8 +5569,9 @@ pub struct PlannedMapRun {
     pub tolerated_failure_count: i64,
     pub tolerated_failure_percentage: f32,
     pub total_items: i64,
-    pub succeeded_items: i64,
-    pub failed_items: i64,
+    /// Each item the `Map` state iterated, with the instant its iteration finished:
+    /// what the stored record counts its items from.
+    pub items: Vec<MapRunItem>,
 }
 
 impl PlannedMapRun {
@@ -5465,6 +5582,7 @@ impl PlannedMapRun {
             + self.label.len()
             // `status` is held twice while the terminal one is still owed to the clock.
             + 2 * self.status.len()
+            + self.items.len().saturating_mul(std::mem::size_of::<MapRunItem>())
             // The three ARNs the stored record carries. Each is built from a state
             // machine name, an execution name and a state label, all of which the
             // model bounds well inside the `Arn` maximum.
@@ -5685,8 +5803,19 @@ fn plan_from_run(
             tolerated_failure_count: map_run.tolerated_failure_count,
             tolerated_failure_percentage: map_run.tolerated_failure_percentage,
             total_items: map_run.total_items,
-            succeeded_items: map_run.succeeded_items,
-            failed_items: map_run.failed_items,
+            // Each ITEM is owed the same way the Map Run around it is: its iteration
+            // finished at its own offset into the walk, and is counted one `settle`
+            // after that instant — so the last item to finish comes due exactly when
+            // the Map Run's own status does, and no item is counted in the call that
+            // started the execution.
+            items: map_run
+                .items
+                .into_iter()
+                .map(|item| MapRunItem {
+                    due_at: after(start, settle.saturating_add(item.finished_at)),
+                    failed: item.failed,
+                })
+                .collect(),
         })
         .collect();
     // A walk that SUSPENDED computed no outcome: what it produced is the task it is

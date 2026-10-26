@@ -12,7 +12,9 @@
 //!    the Map Run reaches is the one the thresholds its `Map` state ran its items
 //!    under decided — they are tolerated while the items that failed are inside the
 //!    count OR inside the percentage of them — and the execution the Map Run ran
-//!    inside reports the same outcome, so the two never contradict each other;
+//!    inside reports the same outcome, so the two never contradict each other (WHEN a
+//!    Map Run stops running does follow the budget it currently carries, which is
+//!    `map_run_failure_budget`);
 //! 3. a request the operation cannot serve is refused with the modelled error for
 //!    what is wrong with it — a defective ARN, a Map Run no record answers for, and a
 //!    Map Run that has already finished, which has no in-progress configuration to
@@ -186,11 +188,9 @@ async fn update_map_run_writes_the_settings_it_names_and_leaves_the_rest() {
         DECLARED_TOLERATED_PERCENTAGE,
     );
     let rows = [
-        SettingsCase {
-            case: "a request that names no setting at all changes nothing",
-            update: json!({}),
-            expected: declared,
-        },
+        // A request that names NO setting carries no update at all, so it is refused
+        // rather than answered as one: that rule, and every subset of the three
+        // settings a request can carry, is `map_run_failure_budget`.
         SettingsCase {
             case: "maxConcurrency alone",
             update: json!({ "maxConcurrency": 1 }),

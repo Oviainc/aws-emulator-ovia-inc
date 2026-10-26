@@ -196,15 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A JSON object that contains information about the total number of items,
         // and the item count for each processing status": which status each item is
-        // counted under follows from the Map Run's own status. While it is RUNNING
-        // nothing it iterates has finished, so every item is still pending; once it
-        // reached a terminal status the items are counted as their iterations turned
-        // out; and a Map Run its execution STOPPED finished none of them.
+        // counted under is what the record has counted so far. An item is PENDING
+        // until the instant its own iteration finished and is counted as it turned out
+        // from that instant on, so a Map Run reports the progress its items have made;
+        // the items a Map Run its execution STOPPED never finished are the ones it
+        // aborted.
         let total = map_run.total_items;
-        let (pending, succeeded, failed, aborted) = match map_run.status.as_str() {
-            crate::state::MAP_RUN_STATUS_RUNNING => (total, 0, 0, 0),
-            crate::state::MAP_RUN_STATUS_ABORTED => (0, 0, 0, total),
-            _ => (0, map_run.succeeded_items, map_run.failed_items, 0),
+        let succeeded = map_run.succeeded_items;
+        let failed = map_run.failed_items;
+        let unfinished = total.saturating_sub(succeeded.saturating_add(failed)).max(0);
+        let (pending, aborted) = match map_run.status.as_str() {
+            crate::state::MAP_RUN_STATUS_ABORTED => (0, unfinished),
+            _ => (unfinished, 0),
         };
         // "The item count for each processing status" and "the count of child workflow
         // executions for each status" are the SAME counts here: a Distributed Map runs

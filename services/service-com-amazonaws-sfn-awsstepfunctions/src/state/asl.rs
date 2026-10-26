@@ -527,6 +527,21 @@ pub struct Step {
     pub terminal: bool,
 }
 
+/// One item of a `Map` state's iteration, as the walk ran it.
+///
+/// The offset is into the RUN (the total of every `Wait` the walk passed before the
+/// iteration ended), so the caller that stores it turns it into an instant against
+/// the execution's own start — the walk never sleeps. It is what tells the item's
+/// outcome apart from the ones that are still to come: an item is finished from this
+/// offset on and not before.
+#[derive(Debug, Clone, Copy)]
+pub struct MapItemOutcome {
+    /// How far into the run this item's iteration finished.
+    pub finished_at: Duration,
+    /// Whether the iteration FAILED, which is what a Map Run's failure budget counts.
+    pub failed: bool,
+}
+
 /// One Distributed Map state the walk ran, as the Map Run it started.
 ///
 /// A Distributed Map "starts a Map Run", a resource of its own that reports the
@@ -555,10 +570,9 @@ pub struct StartedMapRun {
     pub tolerated_failure_percentage: f32,
     /// How many items the state iterated.
     pub total_items: i64,
-    /// How many of them their iteration produced a result for.
-    pub succeeded_items: i64,
-    /// How many of them their iteration failed on.
-    pub failed_items: i64,
+    /// How each item the state iterated turned out, in the order the iterations
+    /// finished: what the Map Run counts an item under, and from which offset.
+    pub items: Vec<MapItemOutcome>,
 }
 
 /// What one walk of a definition produced.
@@ -2320,6 +2334,9 @@ fn interpret(
         for map_run in &mut map_runs {
             map_run.started_at = map_run.started_at.saturating_sub(resumed.at);
             map_run.stopped_at = map_run.stopped_at.saturating_sub(resumed.at);
+            for item in &mut map_run.items {
+                item.finished_at = item.finished_at.saturating_sub(resumed.at);
+            }
         }
         if let Some(waiting) = waiting.as_mut() {
             waiting.at = waiting.at.saturating_sub(resumed.at);
@@ -2349,6 +2366,10 @@ fn interpret(
                 .filter(|map_run| map_run.started_at <= remaining)
                 .map(|mut map_run| {
                     map_run.stopped_at = map_run.stopped_at.min(remaining);
+                    // An item whose iteration would only have finished past the
+                    // timeout never finished: the execution ended first, so the Map
+                    // Run never counted it.
+                    map_run.items.retain(|item| item.finished_at <= remaining);
                     map_run
                 })
                 .collect();
@@ -2647,8 +2668,9 @@ struct Resumed {
 /// holds.
 #[derive(Debug, Default)]
 struct MapTally {
-    succeeded: i64,
-    failed: i64,
+    /// Each item that finished, with the offset it finished at, so what the Map Run
+    /// reports can follow the items one by one rather than all at once.
+    items: Vec<MapItemOutcome>,
 }
 
 impl Interpreter<'_> {
@@ -3494,6 +3516,11 @@ impl Interpreter<'_> {
         // A Distributed Map "starts a Map Run", a resource of its own; an INLINE Map
         // starts none, so only the distributed mode records one.
         if distributed {
+            // Held in the order the iterations FINISHED, which is the order the Map
+            // Run counts them in: items of one batch run at once, so the one that
+            // finished first is not always the one that started first.
+            let mut finished_items = std::mem::take(&mut tally.items);
+            finished_items.sort_by_key(|item| item.finished_at);
             self.map_runs.insert(
                 slot,
                 StartedMapRun {
@@ -3516,8 +3543,7 @@ impl Interpreter<'_> {
                         .unwrap_or(i64::MAX),
                     tolerated_failure_percentage: plan.tolerated_percentage as f32,
                     total_items: i64::try_from(plan.items.len()).unwrap_or(i64::MAX),
-                    succeeded_items: tally.succeeded,
-                    failed_items: tally.failed,
+                    items: finished_items,
                 },
             );
         }
@@ -3674,11 +3700,17 @@ impl Interpreter<'_> {
                             );
                         }
                         results.push(value);
-                        tally.succeeded += 1;
+                        tally.items.push(MapItemOutcome {
+                            finished_at: branch.end,
+                            failed: false,
+                        });
                     }
                     Err(failure) => {
                         failures += 1;
-                        tally.failed += 1;
+                        tally.items.push(MapItemOutcome {
+                            finished_at: branch.end,
+                            failed: true,
+                        });
                         if first_failure.is_none() {
                             first_failure = Some(failure);
                         }

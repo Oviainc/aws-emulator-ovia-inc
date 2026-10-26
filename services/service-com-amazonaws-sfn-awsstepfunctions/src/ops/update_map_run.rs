@@ -3,7 +3,8 @@
 //! @op UpdateMapRun
 //! IMPLEMENTED: a MUTATING operation. It writes the configuration a caller names onto
 //! the ONE in-progress Map Run record its ARN resolves to, and leaves the settings the
-//! request does not name where they are.
+//! request does not name where they are. A request that names NONE of the settings it
+//! can change carries no update at all, and is refused rather than answered as one.
 //!
 //! It changes the SETTINGS and nothing else: the items the Map Run iterated are not
 //! re-run, so what they produced — and the outcome the execution around it reached
@@ -148,6 +149,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `mapRunArn` (1..2000), `maxConcurrency` (0..), `toleratedFailureCount`
         // (0..) and `toleratedFailurePercentage` (0..100) are modelled, so the
         // centralized walk has already refused anything outside them.
+        //
+        // What the model does NOT state is that a request must carry at least one of
+        // the three: each is optional with a null default, so a request naming none of
+        // them asks for no change at all. That is a defect in the REQUEST, refused
+        // before anything is resolved, so no caller is told its Map Run was retuned by
+        // a request that retuned nothing.
+        if input.max_concurrency.is_none()
+            && input.tolerated_failure_count.is_none()
+            && input.tolerated_failure_percentage.is_none()
+        {
+            return Err(UpdateMapRunErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::EMPTY_MAP_RUN_UPDATE_MESSAGE.to_string()),
+                reason: Some(crate::state::VALIDATION_REASON_MISSING_PARAMETER.to_string()),
+            })
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
