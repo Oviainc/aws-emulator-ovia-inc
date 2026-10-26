@@ -53,6 +53,9 @@ mod sampling_rule_deletion;
 #[path = "all/sampling_rules.rs"]
 mod sampling_rules;
 
+#[path = "all/sampling_targets.rs"]
+mod sampling_targets;
+
 #[path = "all/service_graph.rs"]
 mod service_graph;
 

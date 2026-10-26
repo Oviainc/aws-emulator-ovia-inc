@@ -175,7 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(removed) = store.remove_sampling_rule(&rule_name) else {
+        let Some(removed) = store.remove_sampling_rule(&rule_name, crate::state::now_epoch_seconds())
+        else {
             return Err(invalid(
                 crate::state::SAMPLING_RULE_NOT_FOUND_MESSAGE.to_string(),
             ));

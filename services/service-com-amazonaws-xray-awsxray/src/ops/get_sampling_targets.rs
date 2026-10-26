@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSamplingTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSamplingTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSamplingTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Requests a sampling quota for rules that the service is using to sample
+//! requests": each reported `SamplingStatisticsDocument` is RECORDED against
+//! the rule it names — accumulated into that rule's ten-second reporting window,
+//! which `GetSamplingStatisticSummaries` reports, and remembered as the
+//! reporting service's claim on the rule's reservoir — and the answer is
+//! recomputed from the stored rule and from what every service using it
+//! reported, never echoed from the request.
+//!
+//! So one `SamplingTargetDocument` per rule the request reported for carries:
+//!
+//! * the rule's STORED `FixedRate`, so a rule created or updated with another
+//!   rate serves that rate from the next call on;
+//! * the share of the rule's `ReservoirSize` the ALLOCATION CYCLE that preceded
+//!   this report gave the reporting service — the pool "applies to all services
+//!   using the rule collectively", so it is divided between the services
+//!   reporting ([`crate::state::SamplingStatisticsStore::reservoir_quota`]).
+//!   Before any cycle has divided a rule's pool there is no share to report at
+//!   all, so a rule's first report carries none; once one has, every reporting
+//!   service is told its share, which is nothing for a service that joined
+//!   after the division;
+//! * when that share expires and how long to wait before reporting again.
+//!
+//! A statistics document naming a rule the account does not hold is answered in
+//! `UnprocessedStatistics` rather than with an allocation for a rule nobody
+//! configured — unless the reporting service still HOLDS an allocation for it,
+//! because deleting a rule does not reach into a share a service was already
+//! granted. The same holds for boost statistics, which are answered with a
+//! `SamplingBoost` only for a rule whose configuration asked for one.
+//!
+//! The documents are ordered by the `Priority` of the rule each one is for, the
+//! order a service applies its rules in, so a rule that matches first is
+//! answered first.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +173,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSamplingTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSamplingTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSamplingTargets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSamplingTargetsErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray sampling-rule store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_seconds();
+        let quota_ttl = crate::state::timestamp_of(
+            now + crate::state::SAMPLING_ALLOCATION_TTL_SECONDS,
+        );
+        let mut store = state.lock();
+
+        // One document per RULE: `SamplingTargetDocument` identifies what it
+        // allocates by `RuleName` alone, so a call that reports twice for one
+        // rule is answered ONE allocation for it — the last such document's,
+        // since that is the report that stands as the service's claim. Every
+        // report is recorded whichever way, so no reported result is lost.
+        let mut targets: ::std::collections::BTreeMap<String, SamplingTargetDocument> =
+            ::std::collections::BTreeMap::new();
+        // The `Priority` of each answered rule, which orders the documents.
+        let mut priorities: ::std::collections::BTreeMap<String, i32> =
+            ::std::collections::BTreeMap::new();
+        let mut unprocessed: Vec<UnprocessedStatistics> = Vec::new();
+        let mut unprocessed_boost: Vec<UnprocessedStatistics> = Vec::new();
+
+        // Every reported document is RECORDED first, and the cycle that computes
+        // the shares runs afterwards, so a call carrying reports from two
+        // services divides the pool between both of them rather than letting
+        // whichever document came first claim it. What each service is ANSWERED
+        // is the allocation it already holds from the cycle before.
+        let mut reported: Vec<ReportedRule> = Vec::new();
+        for document in &input.sampling_statistics_documents {
+            let stored = store.visible_sampling_rule(&region, &document.rule_name);
+            let Some(stored) = stored else {
+                // The rule has left the account, but a service that was already
+                // granted a share of it still holds that allocation: it is told
+                // the same thing until the allocation ages out. Only a rule
+                // nothing was ever allocated for is unprocessed.
+                match store.sampling.held_allocation(
+                    &document.rule_name,
+                    &document.client_id,
+                    now,
+                ) {
+                    Some(held) => reported.push(ReportedRule {
+                        rule_name: document.rule_name.clone(),
+                        client_id: document.client_id.clone(),
+                        rule: None,
+                        held: Some(held),
+                        cycle_is_live: true,
+                    }),
+                    None => unprocessed.push(unknown_rule(&document.rule_name)),
+                }
+                continue;
+            };
+            // Whether the rule's reservoir has been divided at all yet — read
+            // BEFORE this call's cycle runs, because what a service is told is
+            // the division that preceded its report.
+            let cycle_is_live = store.sampling.cycle_is_live(&document.rule_name, now);
+            let held = store.sampling.record(
+                &document.rule_name,
+                &document.client_id,
+                crate::state::ReportedSamplingCounts {
+                    timestamp: crate::state::epoch_seconds(&document.timestamp),
+                    request_count: i64::from(document.request_count),
+                    sampled_count: i64::from(document.sampled_count),
+                    borrow_count: i64::from(document.borrow_count),
+                },
+                now,
+            );
+            reported.push(ReportedRule {
+                rule_name: document.rule_name.clone(),
+                client_id: document.client_id.clone(),
+                rule: Some(stored),
+                held,
+                cycle_is_live,
+            });
+        }
+
+        for entry in reported {
+            // A rule still in the account serves the rate it NOW carries, so an
+            // update to it is in effect from the next call; one that has left it
+            // serves the rate the allocation was computed under.
+            let (fixed_rate, priority) = match &entry.rule {
+                Some(stored) => (stored.rule.fixed_rate, stored.rule.priority),
+                None => (
+                    entry.held.map_or(0.0, |held| held.fixed_rate),
+                    // A rule that is no longer configured has no priority to
+                    // sort by, so its cached allocation sorts last.
+                    i32::MAX,
+                ),
+            };
+            if let Some(stored) = &entry.rule {
+                store.sampling.allocate(
+                    &entry.rule_name,
+                    &entry.client_id,
+                    stored.rule.reservoir_size,
+                    stored.rule.fixed_rate,
+                    now,
+                );
+            }
+            priorities.insert(entry.rule_name.clone(), priority);
+            // Once the rule's reservoir has been divided, every service
+            // reporting for it is told its share — nothing, for one whose first
+            // report this is, because the pool was divided before it was there.
+            // Before any cycle, there is no share to tell it about at all.
+            let reservoir_quota = entry
+                .cycle_is_live
+                .then(|| entry.held.map_or(0, |held| held.reservoir_quota));
+            targets.insert(
+                entry.rule_name.clone(),
+                SamplingTargetDocument {
+                    rule_name: Some(entry.rule_name),
+                    fixed_rate,
+                    reservoir_quota,
+                    reservoir_quota_ttl: reservoir_quota.map(|_| quota_ttl),
+                    interval: Some(crate::state::SAMPLING_TARGET_INTERVAL_SECONDS),
+                    sampling_boost: None,
+                },
+            );
+        }
+
+        for document in input.sampling_boost_statistics_documents.iter().flatten() {
+            let Some(stored) = store.visible_sampling_rule(&region, &document.rule_name) else {
+                unprocessed_boost.push(unknown_rule(&document.rule_name));
+                continue;
+            };
+            // A rule is boosted only where its configuration says it may be:
+            // `SamplingRateBoost` is what "enables temporary sampling rate
+            // increases", and a rule carrying none is left at its fixed rate.
+            let Some(configured) = stored.rule.sampling_rate_boost.clone() else {
+                continue;
+            };
+            let anomaly_rate = if document.total_count > 0 {
+                f64::from(document.anomaly_count) / f64::from(document.total_count)
+            } else {
+                0.0
+            };
+            let Some(boost_rate) = store.sampling.grant_boost(
+                &document.rule_name,
+                &document.service_name,
+                anomaly_rate,
+                &configured,
+                now,
+            ) else {
+                continue;
+            };
+            let rule_name = document.rule_name.clone();
+            priorities.insert(rule_name.clone(), stored.rule.priority);
+            let target = targets
+                .entry(rule_name.clone())
+                .or_insert_with(|| SamplingTargetDocument {
+                    rule_name: Some(rule_name),
+                    fixed_rate: stored.rule.fixed_rate,
+                    // No sampling statistics were reported for this rule, so
+                    // this service has claimed no share of its reservoir.
+                    reservoir_quota: None,
+                    reservoir_quota_ttl: None,
+                    interval: Some(crate::state::SAMPLING_TARGET_INTERVAL_SECONDS),
+                    sampling_boost: None,
+                });
+            target.sampling_boost = Some(SamplingBoost {
+                boost_rate,
+                boost_rate_ttl: quota_ttl,
+            });
+        }
+
+        let last_rule_modification = crate::state::timestamp_of(store.sampling.rules_modified_at);
+        drop(store);
+
+        let mut sampling_target_documents: Vec<SamplingTargetDocument> =
+            targets.into_values().collect();
+        sampling_target_documents.sort_by_key(|target| {
+            let rule_name = target.rule_name.clone().unwrap_or_default();
+            (
+                priorities.get(&rule_name).copied().unwrap_or(i32::MAX),
+                rule_name,
+            )
+        });
+
+        Ok(GetSamplingTargetsOutput {
+            sampling_target_documents: Some(sampling_target_documents),
+            last_rule_modification: Some(last_rule_modification),
+            unprocessed_statistics: Some(unprocessed),
+            unprocessed_boost_statistics: Some(unprocessed_boost),
+        })
     }
 }
+
+/// One accepted statistics document, between the pass that RECORDS the reports
+/// of a call and the pass that runs the allocation cycle over them.
+struct ReportedRule {
+    /// The rule the document reported for.
+    rule_name: String,
+    /// The `ClientID` that reported it.
+    client_id: String,
+    /// The rule as the account holds it, or `None` for a rule that has left the
+    /// account since an allocation for it was granted.
+    rule: Option<crate::state::StoredSamplingRule>,
+    /// The allocation this service already holds for the rule, which is what it
+    /// is answered now. `None` before any cycle has run for it.
+    held: Option<crate::state::SamplingAllocation>,
+    /// Whether the rule's reservoir had been divided before this report, so
+    /// every service reporting for it is told its share of that division.
+    cycle_is_live: bool,
+}
+
+/// What a reported document naming a rule the account does not hold is answered
+/// with: the rule it named, the client-error code of the refusal a request for
+/// that rule would get, and the service's own wording for a sampling rule that
+/// does not exist — the same sentence `DeleteSamplingRule` and
+/// `UpdateSamplingRule` state it with.
+fn unknown_rule(rule_name: &str) -> UnprocessedStatistics {
+    UnprocessedStatistics {
+        rule_name: Some(rule_name.to_string()),
+        error_code: Some(UNKNOWN_RULE_ERROR_CODE.to_string()),
+        message: Some(crate::state::SAMPLING_RULE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The `UnprocessedStatistics$ErrorCode` for statistics reported against a rule
+/// the account does not hold.
+///
+/// CHOSEN, not modelled: `ErrorCode` is "the error code", an untyped `String`
+/// the model names no value for
+/// (`smithy_query(query="shape",shape="UnprocessedStatistics")`). It is set to
+/// the status a request refused for naming that rule would carry, so one entry
+/// of a batch that otherwise succeeded reports the same class of failure as a
+/// whole-request refusal would. The message beside it is not chosen: it is the
+/// service's own sentence for a sampling rule that does not exist.
+pub const UNKNOWN_RULE_ERROR_CODE: &str = "400";
