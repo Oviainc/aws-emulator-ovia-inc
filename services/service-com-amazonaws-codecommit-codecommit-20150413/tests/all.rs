@@ -93,6 +93,8 @@ mod merge_branches_squash;
 mod merge_conflicts;
 #[path = "all/merge_options.rs"]
 mod merge_options;
+#[path = "all/merge_pull_request_squash.rs"]
+mod merge_pull_request_squash;
 #[path = "all/merge_pull_request_three_way.rs"]
 mod merge_pull_request_three_way;
 #[path = "all/object_store_bounds.rs"]

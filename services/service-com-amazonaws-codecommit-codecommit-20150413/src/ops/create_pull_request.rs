@@ -699,6 +699,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 merge_option: None,
             }],
             approval_rules,
+            // Nothing has reviewed the pull request yet: it holds no approval and
+            // its rules are not overridden.
+            approvals: std::collections::BTreeMap::new(),
+            approval_rules_overridden: false,
             revision: 0,
             // Opening the pull request is the first thing that happened to it,
             // so its log starts with that event; the entry is appended below,
