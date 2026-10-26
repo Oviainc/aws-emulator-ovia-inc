@@ -681,6 +681,24 @@ pub const ANOMALY_DETECTOR_ANALYSIS_DELAY_MS: i64 = 500;
 /// suppressionPeriod is ignored." (`UpdateAnomaly$suppressionType`)
 pub const SUPPRESSION_TYPE_INFINITE: &str = "INFINITE";
 
+/// `Active`, one value of the model's `State` enum: the state an anomaly nothing has
+/// suppressed or baselined reports — "Indicates the current state of this anomaly. If it is
+/// still being treated as an anomaly, the value is `Active`." (`Anomaly$state`)
+pub const ANOMALY_STATE_ACTIVE: &str = "Active";
+
+/// `Suppressed`, one value of the model's `State` enum: the state an anomaly a suppression
+/// is in force over reports — "If you have suppressed this anomaly by using the
+/// UpdateAnomaly operation, the value is `Suppressed`." (`Anomaly$state`)
+pub const ANOMALY_STATE_SUPPRESSED: &str = "Suppressed";
+
+/// `Baseline`, one value of the model's `State` enum: the state an anomaly whose behavior
+/// has been accepted as normal reports — "If this behavior is now considered to be normal,
+/// the value is `Baseline`." (`Anomaly$state`), which is what `UpdateAnomaly$baseline` says
+/// of the suppression it places: "Set this to true to prevent CloudWatch Logs from
+/// displaying this behavior as an anomaly in the future. The behavior is then treated as
+/// baseline behavior."
+pub const ANOMALY_STATE_BASELINE: &str = "Baseline";
+
 /// How many log groups one log anomaly detector watches, from
 /// `CreateLogAnomalyDetector$logGroupArnList`: "An array containing the ARN of the log
 /// group that this anomaly detector will watch. You can specify only one log group ARN."
@@ -3053,6 +3071,15 @@ impl AnomalyDetectorRecord {
     /// This detector's anomalies as `ListAnomalies` reports them, in `anomalyId` order: the
     /// stored shape, with the detector's own ARN and log groups and the suppression members
     /// the store keeps beside it.
+    ///
+    /// `state` is DERIVED here from the suppression in force at `now_ms` rather than read
+    /// off the stored anomaly: "Indicates the current state of this anomaly. If it is still
+    /// being treated as an anomaly, the value is Active. If you have suppressed this anomaly
+    /// by using the UpdateAnomaly operation, the value is Suppressed. If this behavior is now
+    /// considered to be normal, the value is Baseline." (`Anomaly$state`) — so a suppression
+    /// placed as baseline behavior reports [`ANOMALY_STATE_BASELINE`], any other suppression
+    /// [`ANOMALY_STATE_SUPPRESSED`], and an anomaly whose suppression a later call ended or
+    /// the clock ran out of reports [`ANOMALY_STATE_ACTIVE`] again.
     pub fn reported_anomalies(&self, now_ms: i64) -> Vec<crate::ops::types::Anomaly> {
         self.anomalies
             .values()
@@ -3066,12 +3093,18 @@ impl AnomalyDetectorRecord {
                         reported.suppressed_date = suppression.suppressed_at_ms;
                         reported.suppressed_until = suppression.suppressed_until_ms.unwrap_or(0);
                         reported.is_pattern_level_suppression = Some(pattern_level);
+                        reported.state = if suppression.baseline {
+                            ANOMALY_STATE_BASELINE.to_string()
+                        } else {
+                            ANOMALY_STATE_SUPPRESSED.to_string()
+                        };
                     }
                     None => {
                         reported.suppressed = Some(false);
                         reported.suppressed_date = 0;
                         reported.suppressed_until = 0;
                         reported.is_pattern_level_suppression = Some(false);
+                        reported.state = ANOMALY_STATE_ACTIVE.to_string();
                     }
                 }
                 reported

@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, LogEvent};
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
+    ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_STATE_ACTIVE,
+};
+
 /// The region the tests' SigV4 credential scope names, so an ARN built from the request
 /// is distinguishable from one built from a hardcoded default.
 pub const REGION: &str = "eu-west-2";
@@ -224,6 +229,44 @@ pub fn batch(events: &[(i64, &str)]) -> Value {
             .map(|(timestamp, message)| serde_json::json!({"timestamp": timestamp, "message": message}))
             .collect(),
     )
+}
+
+/// Record, in the store, that the detector under `arn` has REPORTED the anomaly `anomaly`
+/// of the pattern `pattern` — what a detection pass over the watched group's events writes.
+///
+/// No REQUEST reports an anomaly ("The anomaly detector uses pattern recognition to find
+/// anomalies"), so every suite whose subject is what a client then does with a finding —
+/// listing it, suppressing it, deleting the detector that holds it — seeds it here, as the
+/// modelled `Anomaly` shape, and asserts the rest over the wire.
+pub fn report_anomaly(logs: &Logs, arn: &str, anomaly: &str, pattern: &str) {
+    let state = logs
+        .engine()
+        .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
+    let mut store = state.lock();
+    let detector = store
+        .anomaly_detectors
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("the detector under {arn} is stored"));
+    let first_seen = now_ms() - 60 * 1_000;
+    detector.anomalies.insert(
+        anomaly.to_string(),
+        Anomaly {
+            anomaly_id: anomaly.to_string(),
+            pattern_id: pattern.to_string(),
+            anomaly_detector_arn: arn.to_string(),
+            pattern_string: "ERROR <*> while handling <*>".to_string(),
+            first_seen,
+            last_seen: first_seen + 30 * 1_000,
+            description: "an unusual pattern".to_string(),
+            active: true,
+            state: ANOMALY_STATE_ACTIVE.to_string(),
+            log_samples: vec![LogEvent {
+                timestamp: Some(first_seen),
+                message: Some("ERROR 42 while handling /orders".to_string()),
+            }],
+            ..Anomaly::default()
+        },
+    );
 }
 
 /// A log group plus one stream, both created, with a retention in days when one is

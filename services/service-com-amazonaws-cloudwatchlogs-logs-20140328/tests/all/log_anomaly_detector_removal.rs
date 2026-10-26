@@ -28,14 +28,13 @@
 
 use serde_json::{json, Map, Value};
 
-use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, LogEvent};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     anomaly_detector_arn, log_group_arn, resource_not_found_message,
     ComAmazonawsCloudwatchlogsLogs20140328State, AnomalyDetectorRecord,
     ANOMALY_DETECTOR_STATUS_ANALYZING, MAX_ANOMALY_DETECTORS, SUPPRESSION_TYPE_INFINITE,
 };
 
-use crate::harness::{now_ms, Logs, REGION};
+use crate::harness::{now_ms, report_anomaly, Logs, REGION};
 
 /// The operation under test, the one that puts a detector in the store, and the readers a
 /// removal must take the detector out of.
@@ -225,38 +224,23 @@ fn padded(seed: &str, len: usize) -> String {
 /// anomalies"), so these are seeded on the stored record; everything the cases then assert
 /// about them goes over the wire like any client's call.
 fn report_findings(logs: &Logs, index: usize, arn: &str, findings: usize, suppressed: bool) {
-    let state = logs
-        .engine()
-        .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let mut store = state.lock();
-    let detector = store
-        .anomaly_detectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the detector under {arn} is stored"));
-    let first_seen = now_ms() - 60 * 1_000;
     for finding in 0..findings {
-        let id = anomaly_id(index, finding);
-        detector.anomalies.insert(
-            id.clone(),
-            Anomaly {
-                anomaly_id: id,
-                pattern_id: pattern_id(index, finding),
-                anomaly_detector_arn: arn.to_string(),
-                pattern_string: "ERROR <*> while handling <*>".to_string(),
-                first_seen,
-                last_seen: first_seen + 30 * 1_000,
-                description: "an unusual pattern".to_string(),
-                active: true,
-                state: "Active".to_string(),
-                log_samples: vec![LogEvent {
-                    timestamp: Some(first_seen),
-                    message: Some("ERROR 42 while handling /orders".to_string()),
-                }],
-                ..Anomaly::default()
-            },
+        report_anomaly(
+            logs,
+            arn,
+            &anomaly_id(index, finding),
+            &pattern_id(index, finding),
         );
     }
     if suppressed && findings > 0 {
+        let state = logs
+            .engine()
+            .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
+        let mut store = state.lock();
+        let detector = store
+            .anomaly_detectors
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("the detector under {arn} is stored"));
         detector.suppress_finding(
             &anomaly_id(index, 0),
             Some(SUPPRESSION_TYPE_INFINITE),

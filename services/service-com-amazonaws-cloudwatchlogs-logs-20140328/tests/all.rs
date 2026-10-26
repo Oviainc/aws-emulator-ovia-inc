@@ -79,6 +79,8 @@ mod ingestion_window;
 mod insights_queries;
 #[path = "all/integrations.rs"]
 mod integrations;
+#[path = "all/list_anomalies.rs"]
+mod list_anomalies;
 #[path = "all/log_anomaly_detector_removal.rs"]
 mod log_anomaly_detector_removal;
 #[path = "all/log_anomaly_detector_updates.rs"]

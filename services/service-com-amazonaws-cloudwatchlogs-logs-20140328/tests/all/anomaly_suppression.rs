@@ -27,12 +27,11 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, LogEvent};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     log_group_arn, ComAmazonawsCloudwatchlogsLogs20140328State, SUPPRESSION_TYPE_INFINITE,
 };
 
-use crate::harness::{now_ms, Logs, REGION};
+use crate::harness::{now_ms, report_anomaly, Logs, REGION};
 
 /// The operation under test.
 const UPDATE: &str = "UpdateAnomaly";
@@ -88,38 +87,11 @@ async fn detector(logs: &Logs) -> String {
 }
 
 /// Record, in the store, that the detector under `arn` has REPORTED the anomaly `anomaly`
-/// of the pattern `pattern` — what a detection pass over the group's events writes, and the
-/// set a suppression request resolves its id against. An anomaly is stored as the modelled
-/// `Anomaly` shape, so this seeds exactly what `ListAnomalies` reports back.
+/// of the pattern `pattern` — the set a suppression request resolves its id against. The
+/// seeding itself is [`crate::harness::report_anomaly`], which every suite that needs a
+/// finding in the store shares.
 fn report_finding(logs: &Logs, arn: &str, anomaly: &str, pattern: &str) {
-    let state = logs
-        .engine()
-        .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let mut store = state.lock();
-    let detector = store
-        .anomaly_detectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the detector under {arn} is stored"));
-    let first_seen = now_ms() - 60 * 1_000;
-    detector.anomalies.insert(
-        anomaly.to_string(),
-        Anomaly {
-            anomaly_id: anomaly.to_string(),
-            pattern_id: pattern.to_string(),
-            anomaly_detector_arn: arn.to_string(),
-            pattern_string: "ERROR <*> while handling <*>".to_string(),
-            first_seen,
-            last_seen: first_seen + 30 * 1_000,
-            description: "an unusual pattern".to_string(),
-            active: true,
-            state: "Active".to_string(),
-            log_samples: vec![LogEvent {
-                timestamp: Some(first_seen),
-                message: Some("ERROR 42 while handling /orders".to_string()),
-            }],
-            ..Anomaly::default()
-        },
-    );
+    report_anomaly(logs, arn, anomaly, pattern);
 }
 
 /// The suppression the store holds for `id` on the detector under `arn`: its
