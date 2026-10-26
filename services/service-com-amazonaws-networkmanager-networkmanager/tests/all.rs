@@ -53,6 +53,8 @@ mod core_network_routing_information;
 mod core_network_segment_actions;
 #[path = "all/create_connect_peer_bounds.rs"]
 mod create_connect_peer_bounds;
+#[path = "all/create_connection_bounds.rs"]
+mod create_connection_bounds;
 #[path = "all/create_vpc_attachment_bounds.rs"]
 mod create_vpc_attachment_bounds;
 #[path = "all/customer_gateway_association_lifecycle.rs"]

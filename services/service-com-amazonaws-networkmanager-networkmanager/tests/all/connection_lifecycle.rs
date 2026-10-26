@@ -70,8 +70,13 @@ pub(crate) async fn fixture(emulator: &Emulator, label: &str) -> Fixture {
     }
 }
 
-/// `CreateConnection` against `network`.
-async fn create_connection(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
+/// `CreateConnection` against `network`, with the status, so a suite can assert a refusal
+/// as well as a success (`crate::create_connection_bounds` does).
+pub(crate) async fn create_connection(
+    emulator: &Emulator,
+    network: &str,
+    body: Value,
+) -> (u16, Value) {
     emulator
         .post(&format!("/global-networks/{network}/connections"), body)
         .await
