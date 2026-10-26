@@ -73,19 +73,23 @@ const BUCKET_CANNED_ACL_VALUES: [&str; 5] = [
 ];
 
 /// One grant as `GetBucketAcl` reports it: who, named how, and what they may do.
+///
+/// `pub(crate)`, like the four helpers below it and the two readers further down: the
+/// OBJECT ACL suite ([`super::object_acl`]) reads the same `AccessControlPolicy` document
+/// off `GetObjectAcl` and must not grow a second parser for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReportedGrant {
+pub(crate) struct ReportedGrant {
     /// The `Grantee$Type` attribute value.
-    grantee_type: String,
+    pub(crate) grantee_type: String,
     /// Whichever of `ID`, `URI` or `EmailAddress` the grantee is named by.
-    identity: String,
+    pub(crate) identity: String,
     /// The `Grant$Permission`.
-    permission: String,
+    pub(crate) permission: String,
 }
 
 /// The grant giving `permission` to the predefined group named by `uri`, as a reader
 /// reports it.
-fn group_grant(uri: &str, permission: &str) -> ReportedGrant {
+pub(crate) fn group_grant(uri: &str, permission: &str) -> ReportedGrant {
     ReportedGrant {
         grantee_type: GRANTEE_GROUP.to_string(),
         identity: uri.to_string(),
@@ -95,7 +99,7 @@ fn group_grant(uri: &str, permission: &str) -> ReportedGrant {
 
 /// The grant giving `permission` to the account whose canonical user id is `id`, as a
 /// reader reports it.
-fn user_grant(id: &str, permission: &str) -> ReportedGrant {
+pub(crate) fn user_grant(id: &str, permission: &str) -> ReportedGrant {
     ReportedGrant {
         grantee_type: GRANTEE_CANONICAL_USER.to_string(),
         identity: id.to_string(),
@@ -105,27 +109,27 @@ fn user_grant(id: &str, permission: &str) -> ReportedGrant {
 
 /// The ACL every bucket carries until one is set on it: the owner's `FULL_CONTROL` alone,
 /// which is the canned `private` ACL.
-fn default_acl() -> Vec<ReportedGrant> {
+pub(crate) fn default_acl() -> Vec<ReportedGrant> {
     vec![user_grant(&canonical_user_id(), PERMISSION_FULL_CONTROL)]
 }
 
 /// One `<Grant>` of an `AccessControlPolicy` payload, spelled the way a client's XML
 /// writer spells it.
 #[derive(Debug, Clone, Copy)]
-struct GrantXml<'a> {
+pub(crate) struct GrantXml<'a> {
     /// The `xsi:type` attribute of `<Grantee>`.
-    grantee_type: &'a str,
+    pub(crate) grantee_type: &'a str,
     /// The element naming the grantee and its value — `None` for a `<Grantee>` that names
     /// nobody, which the model allows because only `Type` is required.
-    named_by: Option<(&'a str, &'a str)>,
+    pub(crate) named_by: Option<(&'a str, &'a str)>,
     /// The `<Permission>`, or `None` for a `<Grant>` that grants nothing (also allowed by
     /// the model, since `Grant$Permission` is optional).
-    permission: Option<&'a str>,
+    pub(crate) permission: Option<&'a str>,
 }
 
 impl<'a> GrantXml<'a> {
     /// A grant to the predefined group named by `uri`.
-    fn group(uri: &'a str, permission: &'a str) -> Self {
+    pub(crate) fn group(uri: &'a str, permission: &'a str) -> Self {
         Self {
             grantee_type: GRANTEE_GROUP,
             named_by: Some(("URI", uri)),
@@ -134,7 +138,7 @@ impl<'a> GrantXml<'a> {
     }
 
     /// A grant to the account whose canonical user id is `id`.
-    fn user(id: &'a str, permission: &'a str) -> Self {
+    pub(crate) fn user(id: &'a str, permission: &'a str) -> Self {
         Self {
             grantee_type: GRANTEE_CANONICAL_USER,
             named_by: Some(("ID", id)),
@@ -149,7 +153,7 @@ impl<'a> GrantXml<'a> {
 /// `xmlFlattened` (`smithy_query(query="shape",shape="AccessControlPolicy")`), so the
 /// grants are `<Grant>` children of an `<AccessControlList>` element — exactly the
 /// document S3's own API reference prints.
-fn access_control_policy(owner: Option<&str>, grants: &[GrantXml<'_>]) -> String {
+pub(crate) fn access_control_policy(owner: Option<&str>, grants: &[GrantXml<'_>]) -> String {
     let mut body = format!("<AccessControlPolicy xmlns=\"{XMLNS}\">");
     if let Some(owner) = owner {
         body.push_str(&format!("<Owner><ID>{owner}</ID></Owner>"));
@@ -219,7 +223,7 @@ async fn create_bucket_with_acls_enabled(
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the
 /// ownership-controls suite beside this one reads its payload, rather than by slicing the
 /// body — the grantee's type is an XML ATTRIBUTE, so nothing less would see it.
-fn reported_acl(answer: &Answer) -> (Option<String>, Vec<ReportedGrant>) {
+pub(crate) fn reported_acl(answer: &Answer) -> (Option<String>, Vec<ReportedGrant>) {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
@@ -280,7 +284,7 @@ fn reported_acl(answer: &Answer) -> (Option<String>, Vec<ReportedGrant>) {
 }
 
 /// Just the grants of a `GetBucketAcl` answer.
-fn reported_grants(answer: &Answer) -> Vec<ReportedGrant> {
+pub(crate) fn reported_grants(answer: &Answer) -> Vec<ReportedGrant> {
     reported_acl(answer).1
 }
 

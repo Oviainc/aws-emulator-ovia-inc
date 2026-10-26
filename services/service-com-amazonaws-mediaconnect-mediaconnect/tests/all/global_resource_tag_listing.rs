@@ -55,7 +55,14 @@ async fn list_global_tags(emulator: &Emulator, arn: &str) -> Reply {
 
 /// The tags `ListTagsForGlobalResource` reports for `arn`, asserted to be a 200 carrying a
 /// `Tags` map.
-async fn reported_tags(emulator: &Emulator, case: &str, arn: &str) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` because the global UNTAGGING suite reads what it removed back through this
+/// same report, so both suites read the store through one reader.
+pub(crate) async fn reported_tags(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let (status, code, body) = list_global_tags(emulator, arn).await;
     assert_eq!(
         (status, code.as_deref()),

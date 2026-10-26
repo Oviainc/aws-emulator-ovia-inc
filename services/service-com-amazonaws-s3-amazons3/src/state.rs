@@ -301,6 +301,26 @@ pub enum ObjectLegalHoldWrite {
     NoSuchObject,
 }
 
+/// What [`ComAmazonawsS3Amazons3State::replace_object_acl`] did, so the caller answers
+/// each outcome without re-deriving it — and cannot record an ACL without having gone
+/// through the byte budgets a stored object's members count against, per bucket AND
+/// service-wide. The shape [`ObjectRetentionWrite`] has, for the same reason: an ACL is a
+/// list of caller-supplied strings kept beside an object ([`acl_grants_bytes`] measures
+/// it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectAclWrite {
+    /// The addressed object version's ACL is now the one that was handed in.
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+    /// Keeping the ACL would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained
+    /// bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the ACL would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`] retained
+    /// bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
 /// What [`ComAmazonawsS3Amazons3State::restore_object_version`] did, so the caller answers
 /// each outcome without re-deriving it — and cannot record a restore without having gone
 /// through the byte budgets a stored object's members count against, per bucket AND
@@ -820,6 +840,11 @@ pub use crate::ops::types::PERMISSION_VALUES;
 /// from the model-generated value list, like [`PERMISSION_VALUES`].
 pub use crate::ops::types::TYPE_VALUES;
 
+/// Every value the `ObjectCannedACL` enum publishes: the canned ACLs an OBJECT may be
+/// given, which [`object_canned_acl_grants`] expands. Re-exported from the
+/// model-generated value list, like [`PERMISSION_VALUES`].
+pub use crate::ops::types::OBJECT_CANNED_A_C_L_VALUES;
+
 /// The `Grantee$Type` of a grantee named by its canonical user id — `TYPE_VALUES[1]`.
 pub const GRANTEE_CANONICAL_USER: &str = "CanonicalUser";
 
@@ -1028,6 +1053,65 @@ pub fn canned_acl_grants(canned: &str) -> Option<Vec<AclGrant>> {
     Some(grants)
 }
 
+/// The grants an `ObjectCannedACL` value stands for, or `None` for a value outside
+/// [`OBJECT_CANNED_A_C_L_VALUES`].
+///
+/// The OBJECT rows of the published *Canned ACL* table (Amazon S3 User Guide, *Canned
+/// ACL*), as [`canned_acl_grants`] carries the bucket ones:
+///
+/// * `private`, `public-read`, `public-read-write` and `authenticated-read` stand for the
+///   same grants on an object as on a bucket, so they come from that one table rather than
+///   being restated here (`log-delivery-write` is a BUCKET-only value, which is why a
+///   value the object enum does not publish is refused);
+/// * `bucket-owner-read` — "Object owner gets FULL_CONTROL. Bucket owner gets READ";
+/// * `bucket-owner-full-control` — "Both the object owner and the bucket owner get
+///   FULL_CONTROL";
+/// * `aws-exec-read` — "Owner gets FULL_CONTROL", the one grant of that row this emulator
+///   can state: the READ it also gives goes to an Amazon EC2 grantee whose canonical user
+///   id AWS publishes nowhere, and an id is not invented for it.
+///
+/// This emulator serves ONE account ([`canonical_user_id`]), so an object's owner and its
+/// bucket's owner are the same grantee: `bucket-owner-full-control` names that one
+/// grantee's `FULL_CONTROL` twice, and an ACL granting the same grantee the same
+/// permission twice grants nothing a second time, so it stands for the single grant.
+pub fn object_canned_acl_grants(canned: &str) -> Option<Vec<AclGrant>> {
+    let owner = AclGrant::to_canonical_user(canonical_user_id(), PERMISSION_FULL_CONTROL);
+    let grants = match canned {
+        "bucket-owner-read" => vec![
+            owner,
+            AclGrant::to_canonical_user(canonical_user_id(), PERMISSION_READ),
+        ],
+        "bucket-owner-full-control" | "aws-exec-read" => vec![owner],
+        shared if OBJECT_CANNED_A_C_L_VALUES.contains(&shared) => canned_acl_grants(shared)?,
+        _ => return None,
+    };
+    Some(grants)
+}
+
+/// How many bytes an ACL retains: every grant's permission, its grantee's `Type` and
+/// whichever member names that grantee, in UTF-8 bytes.
+///
+/// What the object byte budgets count an ACL kept beside an object as — see
+/// [`Object::retained_bytes`], which counts a tag set the same way ([`tag_set_bytes`]).
+pub fn acl_grants_bytes(grants: &[AclGrant]) -> usize {
+    grants
+        .iter()
+        .map(|grant| {
+            grant.permission.len()
+                + grant.grantee.grantee_type.len()
+                + [
+                    &grant.grantee.id,
+                    &grant.grantee.uri,
+                    &grant.grantee.email_address,
+                ]
+                .iter()
+                .filter_map(|member| member.as_ref())
+                .map(String::len)
+                .sum::<usize>()
+        })
+        .sum()
+}
+
 /// Why an ACL cannot be stored on a bucket or an object.
 ///
 /// Each variant is one rule the API publishes for an ACL; the caller maps it to the wire
@@ -1099,6 +1183,52 @@ impl std::fmt::Display for AclRejection {
         }
     }
 }
+
+impl AclRejection {
+    /// The wire error code S3 answers this broken rule with, and the HTTP status its
+    /// error-responses list carries for that code ([`Self::status`]).
+    ///
+    /// ONE mapping for every ACL S3 holds, so the code a client branches on is the same
+    /// whether the ACL was named in a request body, in the `x-amz-grant-*` headers or as a
+    /// canned ACL, and whether the resource is a bucket or an object.
+    pub fn code(&self) -> &'static str {
+        match self {
+            // The grantee's own identity is the parameter that is not valid, which is what
+            // `InvalidArgument` reports ("Invalid Argument", HTTP 400).
+            Self::UnknownGroupUri { .. } => INVALID_ARGUMENT_CODE,
+            // "As of October 1, 2025, Amazon S3 has discontinued support for Email Grantee
+            // Access Control Lists … the request will receive an HTTP 405 (Method Not
+            // Allowed) error", in the Regions that change affects.
+            Self::EmailGranteeDiscontinued { .. } => METHOD_NOT_ALLOWED_CODE,
+            // Everywhere else an email grantee is still taken by the API and then resolved
+            // against the accounts on record, of which this emulator has exactly one and
+            // no email address for it.
+            Self::EmailGranteeUnresolvable { .. } => UNRESOLVABLE_GRANT_BY_EMAIL_CODE,
+            // The rest are ACLs that do not validate against the schema the API publishes
+            // for one: too many grants, a value outside a published set, or a grantee whose
+            // `Type` and members disagree.
+            Self::TooManyGrants { .. }
+            | Self::UnknownPermission { .. }
+            | Self::UnknownGranteeType { .. }
+            | Self::GranteeMemberMissing { .. } => MALFORMED_ACL_CODE,
+        }
+    }
+
+    /// The HTTP status [`Self::code`] is rendered with: 400 for every one of them except
+    /// the discontinued-email refusal, whose documented status is 405.
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::EmailGranteeDiscontinued { .. } => METHOD_NOT_ALLOWED_STATUS,
+            _ => ACL_REFUSAL_STATUS,
+        }
+    }
+}
+
+/// The HTTP status an ACL refusal is rendered with, except the discontinued-email one
+/// ([`METHOD_NOT_ALLOWED_STATUS`]): 400, the status S3's error-responses list carries for
+/// `MalformedACLError`, `MissingRequestBodyError`, `AccessControlListNotSupported` and
+/// `UnresolvableGrantByEmailAddress` alike.
+pub const ACL_REFUSAL_STATUS: u16 = 400;
 
 /// Whether `grants` may be stored as the ACL of a resource in `region`, reporting the
 /// first published rule it breaks.
@@ -1309,20 +1439,70 @@ pub const INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_CODE: &str =
 pub const INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_MESSAGE: &str =
     "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting";
 
-/// Whether `grants` gives any access to a PREDEFINED GROUP that stands for people outside
-/// the bucket owner's account — `AllUsers` (anyone) or `AuthenticatedUsers` (any AWS
-/// account).
+/// Whether one ACL grant gives its permission to a PREDEFINED GROUP that stands for people
+/// outside the bucket owner's account — `AllUsers` (anyone) or `AuthenticatedUsers` (any
+/// AWS account).
 ///
 /// "The Meaning of Public" (Amazon S3 User Guide, Block Public Access): an ACL is public
 /// when it grants access to `AllUsers` or `AuthenticatedUsers`. A grant to the
 /// `LogDelivery` group is to an S3 service principal, not to the public, and a grant to a
 /// canonical user or an email address names one account.
+pub fn acl_grant_is_public(grant: &AclGrant) -> bool {
+    grant
+        .grantee
+        .uri
+        .as_deref()
+        .is_some_and(|uri| uri == ALL_USERS_GROUP_URI || uri == AUTHENTICATED_USERS_GROUP_URI)
+}
+
+/// Whether `grants` gives any access to a predefined group that stands for people outside
+/// the bucket owner's account — see [`acl_grant_is_public`], the per-grant rule this is the
+/// any-of over.
 pub fn acl_grants_public_access(grants: &[AclGrant]) -> bool {
-    grants.iter().any(|grant| {
-        grant.grantee.uri.as_deref().is_some_and(|uri| {
-            uri == ALL_USERS_GROUP_URI || uri == AUTHENTICATED_USERS_GROUP_URI
-        })
-    })
+    grants.iter().any(acl_grant_is_public)
+}
+
+/// The ARN of the S3 bucket `bucket`: `arn:aws:s3:::<bucket>`.
+///
+/// An S3 bucket's ARN leaves the Region and the account-id fields EMPTY, "because a bucket
+/// name is globally unique" (see [`ArnField`]), so it is spelled here rather than through
+/// `engine::emulator_arn`, which always carries the account. One place, so every refusal
+/// and every policy decision that names a bucket names it the same way.
+pub fn bucket_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+/// The ARN of the object `key` in `bucket`: `arn:aws:s3:::<bucket>/<key>` — the bucket's
+/// ARN ([`bucket_arn`]) with the key as the rest of the resource part, which is how S3
+/// names an object in a policy and in a refusal.
+pub fn object_arn(bucket: &str, key: &str) -> String {
+    format!("{}/{key}", bucket_arn(bucket))
+}
+
+/// The principal a request speaks for, as `sts:GetCallerIdentity` reports it: the account's
+/// own identity, `arn:aws:iam::<account>:user/emulator`, which is what a refusal names.
+///
+/// This emulator serves one account, and a request presenting its credential speaks for
+/// that account; the ARN is built through `engine::emulator_arn` so it carries the one
+/// account id this emulator presents.
+pub fn caller_principal_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The message S3 words an `AccessDenied` the Block Public Access `BlockPublicAcls` setting
+/// caused: who was refused, which IAM `action`, on which `resource`, and the setting that
+/// prevented it.
+///
+/// Every value in it comes from the request and from this emulator's own identity: the
+/// principal is the caller ([`caller_principal_arn`]), the action is the operation the
+/// request called and the resource is the bucket or object it addressed. One place, so the
+/// bucket half and the object half of the same guardrail word it identically.
+pub fn block_public_acls_denial(action: &str, resource: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {action} on resource: \"{resource}\" because \
+         public ACLs are prevented by the BlockPublicAcls setting in S3 Block Public Access.",
+        caller_principal_arn()
+    )
 }
 
 /// The versioning state a bucket carries once `PutBucketVersioning` has set one.
@@ -4145,10 +4325,38 @@ impl Bucket {
     /// still supported and return the bucket-owner-full-control ACL with the owner being
     /// the account that created the bucket" (`GetBucketAcl`'s own documentation).
     pub fn acl_grants(&self) -> Vec<AclGrant> {
-        match self.acl.as_deref() {
+        let stored = match self.acl.as_deref() {
             Some(grants) if !self.acls_disabled() => grants.to_vec(),
             _ => default_acl_grants(),
+        };
+        self.reported_acl_grants(stored)
+    }
+
+    /// The grants of `stored` an ACL READ reports, given the bucket's Block Public Access
+    /// settings: all of them, less every PUBLIC grant ([`acl_grant_is_public`]) while
+    /// `IgnorePublicAcls` is on.
+    ///
+    /// "Setting this element to TRUE causes Amazon S3 to ignore all public ACLs on this
+    /// bucket and any objects that it contains"
+    /// (`PublicAccessBlockConfiguration$IgnorePublicAcls`): a grant S3 ignores gives nobody
+    /// anything, so a read of the ACL does not report it. The stored grants are untouched —
+    /// the setting "doesn't affect the persistence of any existing ACLs" (same
+    /// documentation) — so they are reported again once it is turned off, exactly as
+    /// disabling ACLs hides them without taking them away.
+    ///
+    /// ONE rule for the bucket's own ACL and for the ACL of any object it contains, which
+    /// is what the setting says it covers.
+    fn reported_acl_grants(&self, stored: Vec<AclGrant>) -> Vec<AclGrant> {
+        if self
+            .public_access_block()
+            .is_some_and(|settings| settings.ignore_public_acls)
+        {
+            return stored
+                .into_iter()
+                .filter(|grant| !acl_grant_is_public(grant))
+                .collect();
         }
+        stored
     }
 
     /// The grants a `PutBucketAcl` (or the create's canned ACL) last set on the bucket,
@@ -4171,6 +4379,33 @@ impl Bucket {
     /// full, the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
     pub fn set_acl_grants(&mut self, grants: Vec<AclGrant>) {
         self.acl = Some(grants);
+    }
+
+    /// The grants of the access control list of `object`, one of the objects this bucket
+    /// holds: the ACL last set on that version, or the owner's `FULL_CONTROL` alone
+    /// ([`default_acl_grants`]) when none ever was.
+    ///
+    /// Derived rather than stored for an object nobody has set an ACL on, so a read reports
+    /// the default without writing one — the way [`Self::acl_grants`] reports the bucket's
+    /// own default. An object of a bucket whose ACLs are disabled
+    /// ([`Self::acls_disabled`]) reports the default too: "If your bucket uses the bucket
+    /// owner enforced setting for S3 Object Ownership, requests to read ACLs are still
+    /// supported and return the bucket-owner-full-control ACL with the owner being the
+    /// account that created the bucket" (`GetObjectAcl`'s own documentation). The grants
+    /// the version stores are untouched by that, so they are reported again once ACLs
+    /// affect permissions on the bucket.
+    ///
+    /// On the BUCKET rather than on [`Object`] because the answer turns on the bucket's
+    /// Object Ownership setting and on its Block Public Access settings
+    /// ([`Self::reported_acl_grants`], which drops the public grants S3 ignores), exactly as
+    /// [`Self::object_expiration`] lives here because it turns on the bucket's lifecycle
+    /// configuration.
+    pub fn object_acl_grants(&self, object: &Object) -> Vec<AclGrant> {
+        let stored = match object.acl.as_deref() {
+            Some(grants) if !self.acls_disabled() => grants.to_vec(),
+            _ => default_acl_grants(),
+        };
+        self.reported_acl_grants(stored)
     }
 
     /// The bucket's event notification configuration — empty when the bucket has no event
@@ -5262,6 +5497,23 @@ pub struct Object {
     /// [`ComAmazonawsS3Amazons3State::put_object_annotation`] — the one place that sees the
     /// per-object ceiling and the byte budgets an annotation has to stay inside.
     pub annotations: BTreeMap<String, Annotation>,
+    /// The grants of the access control list last set on this stored version, or `None`
+    /// while no ACL has ever been set on it — the state a write leaves a version in, and
+    /// the state whose reader reports the owner's `FULL_CONTROL` alone
+    /// ([`default_acl_grants`]), because an object is private until an ACL says otherwise.
+    ///
+    /// Set AFTER the write, like [`Self::retention`]: an ACL is set on an object by
+    /// `PutObjectAcl` ("Uses the acl subresource to set the access control list (ACL)
+    /// permissions for … an existing object in an S3 bucket", that operation's own
+    /// documentation), through
+    /// [`ComAmazonawsS3Amazons3State::replace_object_acl`] — the one place that sees the
+    /// byte budgets an ACL has to stay inside.
+    ///
+    /// The RAW record, kept whatever the bucket's Object Ownership setting is:
+    /// [`Bucket::object_acl_grants`] is what a reader reports, and it reports the default
+    /// while the bucket's ACLs are disabled — disabling them takes nothing away, so these
+    /// grants are reported again once ACLs affect permissions on the bucket.
+    pub acl: Option<Vec<AclGrant>>,
 }
 
 /// One annotation attached to one stored object version: the payload
@@ -5588,8 +5840,8 @@ impl Object {
     /// storage class is [`DEFAULT_STORAGE_CLASS`], the version id is minted by
     /// [`ComAmazonawsS3Amazons3State::put_object`] rather than here, and the members a later
     /// call places on a stored version — its tag set, its Object Lock retention and legal
-    /// hold, its restore and its annotations — are unset, which is the state a write leaves a
-    /// version in. S3's
+    /// hold, its restore, its annotations and its ACL — are unset, which is the state a write
+    /// leaves a version in. S3's
     /// own `PutObject` and `CopyObject` build the object they store themselves, because they
     /// carry the cache-control, metadata, tag set and encryption configuration of the request.
     pub fn stored(body: Vec<u8>, content_type: Option<String>) -> Self {
@@ -5613,6 +5865,7 @@ impl Object {
             legal_hold: None,
             restore: None,
             annotations: BTreeMap::new(),
+            acl: None,
         }
     }
 
@@ -5632,6 +5885,7 @@ impl Object {
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
             + self.annotation_bytes()
+            + acl_grants_bytes(self.acl.as_deref().unwrap_or_default())
             + self.encryption.retained_bytes()
             + self
                 .retention
@@ -6608,6 +6862,64 @@ impl ComAmazonawsS3Amazons3State {
         Some(ObjectLegalHoldWrite::Applied)
     }
 
+    /// Replace the access control list of the object version `version_id` names in
+    /// `bucket` — the key's current object when it names none — with `grants`. Reports what
+    /// the write did, or `None` when this emulator holds no such bucket (so an ACL write
+    /// refuses a name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Self::replace_object_tags`]
+    /// replaces a tag set: `PutObjectAcl` "uses the acl subresource to set the access
+    /// control list (ACL) permissions for a new or existing object" from the ONE ACL the
+    /// request names, so what the version carries afterwards is exactly those grants and
+    /// nothing of the ACL before it.
+    ///
+    /// This decides NOTHING about whether the write is ALLOWED: whether the bucket's Object
+    /// Ownership setting disables ACLs ([`Bucket::acls_disabled`]) and whether its Block
+    /// Public Access settings bar a public one ([`acl_grants_public_access`]) are the
+    /// handler's judgement — this is the storage seam those answers end at.
+    ///
+    /// It is the ONLY way an object's ACL is recorded, because it is the only place that
+    /// can see BOTH the per-bucket byte budget and the service-wide one: an ACL is retained
+    /// with the object ([`Object::retained_bytes`]) and is not bounded by anything
+    /// [`Self::put_object`] checked. Nothing is written unless the answer is
+    /// [`ObjectAclWrite::Applied`].
+    pub fn replace_object_acl(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        grants: Vec<AclGrant>,
+    ) -> Option<ObjectAclWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.addressed_object(key, version_id) else {
+            return Some(ObjectAclWrite::NoSuchObject);
+        };
+
+        // What the bucket and the whole store would retain with this ACL in place of the
+        // version's current one: everything they retain now, less the bytes the ACL being
+        // replaced holds, plus the bytes of the replacement.
+        let released = acl_grants_bytes(object.acl.as_deref().unwrap_or_default());
+        let taken = acl_grants_bytes(&grants);
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(ObjectAclWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self.caller_retained_bytes().saturating_sub(released) + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectAclWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.addressed_object_mut(key, version_id))
+            .map(|object| {
+                object.acl = Some(grants);
+                ObjectAclWrite::Applied
+            })
+    }
+
     /// Record `restore` on the object version `version_id` names in `bucket` — the key's
     /// current object when it names none. Reports what the write did, or `None` when this
     /// emulator holds no such bucket (so a restore refuses a name that is not a bucket
@@ -6825,6 +7137,10 @@ impl ComAmazonawsS3Amazons3State {
                     legal_hold: None,
                     restore: None,
                     annotations: BTreeMap::new(),
+                    // Nor an ACL: a published object carries the ACL every object starts
+                    // with, the owner's `FULL_CONTROL`, which a reader derives rather than
+                    // this recording it.
+                    acl: None,
                 };
                 let _ = self.put_object(published.name, object.key, stored);
             }
@@ -7894,6 +8210,8 @@ mod tests {
             restore: None,
             // And it attaches no annotation; `put_object_annotation` is what does.
             annotations: BTreeMap::new(),
+            // Nor an ACL; `replace_object_acl` is what does.
+            acl: None,
         }
     }
 
