@@ -183,22 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
 
+        // The registry must exist, and AWS owns what is in a service-owned registry, so
+        // a caller can no more delete a version of one of its schemas than the schema
+        // itself: both refusals come from the one resolution every write to a registry
+        // makes, mapped here into this operation's own errors.
         let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                DeleteSchemaVersionError::from(DeleteSchemaVersionErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    DeleteSchemaVersionError::from(
+                        DeleteSchemaVersionErrorModeled::NotFoundException(
+                            crate::state::registry_not_found(&registry),
+                        ),
+                    )
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    DeleteSchemaVersionError::from(
+                        DeleteSchemaVersionErrorModeled::ForbiddenException(
+                            crate::state::managed_registry_is_read_only(&registry),
+                        ),
+                    )
+                }
             })?;
-        // AWS owns what is in a service-owned registry, so a caller can no more delete
-        // a version of one of its schemas than the schema itself.
-        if registry.scope.is_managed() {
-            return Err(DeleteSchemaVersionErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
         let schema = registry
             .schemas
             .get_mut(&input.schema_name)

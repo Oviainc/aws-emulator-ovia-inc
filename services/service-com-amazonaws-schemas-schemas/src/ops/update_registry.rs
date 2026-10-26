@@ -164,23 +164,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one it just wrote.
         let mut state = store.lock();
 
+        // The registry must exist, and a service-owned registry is AWS's, not the
+        // caller's, so its description is not a caller's to rewrite: both refusals come
+        // from the one resolution every write to a registry makes, mapped here into this
+        // operation's own errors.
         let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                UpdateRegistryError::from(UpdateRegistryErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    UpdateRegistryError::from(UpdateRegistryErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    UpdateRegistryError::from(UpdateRegistryErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
             })?;
-
-        // A service-owned registry is AWS's, not the caller's, so its description is
-        // not a caller's to rewrite — the same refusal every other write to one gets.
-        if registry.scope.is_managed() {
-            return Err(UpdateRegistryErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
 
         // The whole point of the call: the description the request sends REPLACES the
         // stored one, so a later `DescribeRegistry`/`ListRegistries` reports it. An

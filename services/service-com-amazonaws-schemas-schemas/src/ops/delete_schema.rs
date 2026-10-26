@@ -176,22 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
 
+        // The registry must exist, and AWS owns what is in a service-owned registry, so
+        // a caller cannot delete from one: both refusals come from the one resolution
+        // every write to a registry makes, mapped here into this operation's own errors.
         let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                DeleteSchemaError::from(DeleteSchemaErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    DeleteSchemaError::from(DeleteSchemaErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    DeleteSchemaError::from(DeleteSchemaErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
             })?;
-        // AWS owns what is in a service-owned registry, so a caller cannot delete from
-        // it.
-        if registry.scope.is_managed() {
-            return Err(DeleteSchemaErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
         // Removing the schema removes every version with it: the versions live inside
         // the schema. DeleteSchemaVersion is what removes one of them.
         if registry.schemas.remove(&input.schema_name).is_none() {

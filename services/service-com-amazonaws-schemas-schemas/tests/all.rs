@@ -53,6 +53,8 @@ mod name_constraints;
 mod published_document_bytes;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
+#[path = "all/registry_write_resolution.rs"]
+mod registry_write_resolution;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tag_removal.rs"]

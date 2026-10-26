@@ -257,22 +257,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
 
-        // A policy attaches to a registry, so there has to be one to attach it to.
-        let held = state.registries.get(&registry_name).ok_or_else(|| {
-            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&registry_name),
-            ))
-        })?;
-
-        // A service-owned registry is AWS's, not the caller's, so what governs access
-        // to it is not a caller's to write — the same refusal every other write to one
-        // gets.
-        if held.scope.is_managed() {
-            return Err(PutResourcePolicyErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&registry_name),
-            )
-            .into());
-        }
+        // A policy attaches to a registry, so there has to be one to attach it to, and a
+        // service-owned registry is AWS's, not the caller's, so what governs access to
+        // it is not a caller's to write: both refusals come from the one resolution
+        // every write to a registry makes, mapped here into this operation's own errors.
+        let held = state
+            .writable_registry(&registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    PutResourcePolicyError::from(PutResourcePolicyErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    PutResourcePolicyError::from(PutResourcePolicyErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
+            })?;
 
         let current_revision = held
             .policy

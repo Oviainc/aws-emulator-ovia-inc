@@ -150,11 +150,7 @@ impl ComAmazonawsSchemasSchemasState {
             TaggedResource::Discoverer { .. } => None,
         };
         if let Some(registry) = owning_registry {
-            if self
-                .registries
-                .get(&registry)
-                .is_some_and(|held| held.scope.is_managed())
-            {
+            if self.registry_is_service_owned(&registry) {
                 return Err(ResourceArnWriteError::ServiceOwned(registry));
             }
         }
@@ -177,6 +173,47 @@ impl ComAmazonawsSchemasSchemasState {
                 .map(|held| &mut held.tags),
         };
         held.ok_or(ResourceArnWriteError::NoSuchResource)
+    }
+
+    /// Whether the registry of this name is one whose contents AWS owns.
+    ///
+    /// The one place the scope of a stored registry is read to decide ownership, so
+    /// every write that asks the question gets the same answer. A name this store
+    /// holds no registry for is not owned by AWS — it names no registry at all, which
+    /// is a different refusal ([`Self::writable_registry`]).
+    fn registry_is_service_owned(&self, name: &str) -> bool {
+        self.registries
+            .get(name)
+            .is_some_and(|held| held.scope.is_managed())
+    }
+
+    /// The registry a caller's WRITE names, resolved for mutation, or why the write
+    /// reaches none.
+    ///
+    /// Every write this service serves that names a registry — to the registry itself,
+    /// to a schema or schema version in it, or to its resource-based policy — takes the
+    /// same two steps before it changes anything: the store must hold a registry of
+    /// that name, and what is in a service-owned registry is AWS's, so a caller may
+    /// read it but not write to it. Resolving and refusing together is what keeps the
+    /// second step from being forgotten by a handler that remembers the first.
+    ///
+    /// The refusals are RETURNED rather than worded here, because each operation
+    /// answers them through its own modelled error enum; the sentences are the
+    /// service's constants ([`registry_not_found`] and
+    /// [`managed_registry_is_read_only`]), so every call site words them alike. This is
+    /// the registry-by-name counterpart of [`Self::writable_tags_for_arn`], which
+    /// resolves the same write permission through a `ResourceArn`.
+    pub fn writable_registry(&mut self, name: &str) -> Result<&mut Registry, RegistryWriteError> {
+        if !self.registries.contains_key(name) {
+            return Err(RegistryWriteError::NoSuchRegistry(name.to_string()));
+        }
+        if self.registry_is_service_owned(name) {
+            return Err(RegistryWriteError::ServiceOwned(name.to_string()));
+        }
+        Ok(self
+            .registries
+            .get_mut(name)
+            .expect("the registry resolved just above is still present"))
     }
 }
 
@@ -2824,6 +2861,21 @@ pub enum ResourceArnWriteError {
     NoSuchResource,
     /// A resource of a service-owned registry, named here — AWS owns what is in it,
     /// so a caller may read it but not write to it.
+    ServiceOwned(String),
+}
+
+/// Why a registry a request NAMES is no registry its write can reach.
+///
+/// The two refusals [`ComAmazonawsSchemasSchemasState::writable_registry`] resolves,
+/// each carrying the registry name the request supplied so the call site can word the
+/// service's sentence for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryWriteError {
+    /// This store holds no registry of that name, so the request names nothing to
+    /// write to.
+    NoSuchRegistry(String),
+    /// A service-owned registry — AWS owns what is in it, so a caller may read it but
+    /// not write to it.
     ServiceOwned(String),
 }
 

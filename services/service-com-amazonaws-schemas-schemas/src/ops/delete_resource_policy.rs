@@ -193,22 +193,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // The policy hangs off the registry, so there has to be a registry to take it
-        // from.
-        let registry = state.registries.get_mut(&registry_name).ok_or_else(|| {
-            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&registry_name),
-            ))
-        })?;
-
-        // A service-owned registry is AWS's, not the caller's, so what governs access
-        // to it is not a caller's to remove — the same refusal every other write to one
-        // gets, and the same one `PutResourcePolicy` answers for it.
-        if registry.scope.is_managed() {
-            return Err(DeleteResourcePolicyErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&registry_name),
-            )
-            .into());
-        }
+        // from, and a service-owned registry is AWS's, not the caller's, so what governs
+        // access to it is not a caller's to remove: both refusals come from the one
+        // resolution every write to a registry makes, mapped here into this operation's
+        // own errors.
+        let registry = state
+            .writable_registry(&registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    DeleteResourcePolicyError::from(
+                        DeleteResourcePolicyErrorModeled::NotFoundException(
+                            crate::state::registry_not_found(&registry),
+                        ),
+                    )
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    DeleteResourcePolicyError::from(
+                        DeleteResourcePolicyErrorModeled::ForbiddenException(
+                            crate::state::managed_registry_is_read_only(&registry),
+                        ),
+                    )
+                }
+            })?;
 
         // `take` is the whole mutation: the policy leaves the store, so every later
         // `GetResourcePolicy` of this registry reports that it does not exist and a

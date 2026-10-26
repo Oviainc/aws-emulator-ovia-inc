@@ -208,22 +208,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exist is a 404 whatever the store's size.
         let stored_bytes = crate::state::stored_content_bytes(&state);
 
+        // The registry the schema goes into must exist, and what is in a service-owned
+        // registry is AWS's, so a caller cannot add to one: both refusals come from the
+        // one resolution every write to a registry makes
+        // (`crate::state::ComAmazonawsSchemasSchemasState::writable_registry`), mapped
+        // here into this operation's own errors.
         let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                CreateSchemaError::from(CreateSchemaErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    CreateSchemaError::from(CreateSchemaErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    CreateSchemaError::from(CreateSchemaErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
             })?;
-
-        // AWS owns what is in a service-owned registry, so a caller cannot add to it.
-        if registry.scope.is_managed() {
-            return Err(CreateSchemaErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
 
         // A schema name identifies the schema within its registry; a second create
         // under the same name is refused, not taken as a new version. Versions come

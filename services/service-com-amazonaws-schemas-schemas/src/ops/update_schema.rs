@@ -183,22 +183,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             0
         };
 
+        // The registry must exist, and AWS owns the schemas in a service-owned one, so a
+        // caller cannot write a version of one: both refusals come from the one
+        // resolution every write to a registry makes, mapped here into this operation's
+        // own errors.
         let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                UpdateSchemaError::from(UpdateSchemaErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    UpdateSchemaError::from(UpdateSchemaErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    UpdateSchemaError::from(UpdateSchemaErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
             })?;
-        // AWS owns the schemas in a service-owned registry, so a caller cannot write
-        // a version of one.
-        if registry.scope.is_managed() {
-            return Err(UpdateSchemaErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
         let schema = registry
             .schemas
             .get_mut(&input.schema_name)

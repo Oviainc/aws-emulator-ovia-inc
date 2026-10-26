@@ -191,20 +191,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Deleting a registry is refused while anything still depends on it, so the
         // precondition is checked BEFORE the store is touched: a refused delete leaves
         // the registry and every schema in it exactly as they were.
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            DeleteRegistryError::from(DeleteRegistryErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
-
-        // A service-owned registry is AWS's, not the caller's, so it cannot be deleted
-        // at all.
-        if registry.scope.is_managed() {
-            return Err(DeleteRegistryErrorModeled::ForbiddenException(
-                crate::state::managed_registry_is_read_only(&input.registry_name),
-            )
-            .into());
-        }
+        //
+        // The registry must exist, and a service-owned registry is AWS's, not the
+        // caller's, so it cannot be deleted at all: both refusals come from the one
+        // resolution every write to a registry makes, mapped here into this operation's
+        // own errors.
+        let registry = state
+            .writable_registry(&input.registry_name)
+            .map_err(|refusal| match refusal {
+                crate::state::RegistryWriteError::NoSuchRegistry(registry) => {
+                    DeleteRegistryError::from(DeleteRegistryErrorModeled::NotFoundException(
+                        crate::state::registry_not_found(&registry),
+                    ))
+                }
+                crate::state::RegistryWriteError::ServiceOwned(registry) => {
+                    DeleteRegistryError::from(DeleteRegistryErrorModeled::ForbiddenException(
+                        crate::state::managed_registry_is_read_only(&registry),
+                    ))
+                }
+            })?;
 
         // A schema lives INSIDE its registry, so removing the registry would take
         // every schema and every version in it with it. That is refused: the caller
