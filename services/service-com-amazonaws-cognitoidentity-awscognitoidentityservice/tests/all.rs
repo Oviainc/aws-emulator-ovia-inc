@@ -37,6 +37,8 @@ mod open_id_token;
 mod principal_tag_attribute_map;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/response_request_id.rs"]
+mod response_request_id;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unlink_developer_identity.rs"]

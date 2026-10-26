@@ -40,9 +40,37 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header the
+//! protocol reports that id in (`x-amzn-RequestId` for `awsJson1_1`) — on a success
+//! exactly as on a failure. It is a property of the RESPONSE, not of any modelled shape:
+//! no output and no error shape of this model declares it, so no handler can set it, and
+//! the framework's `awsJson1_1` renderers do not write it. An SDK surfaces it as the
+//! call's `ResponseMetadata.RequestId`, which is what a client logs and correlates with.
+//!
+//! The rule is not restated here: `service_common::query_error_envelope` owns it for
+//! every emulated service, and this file only chooses the report this protocol takes
+//! (the header alone — `awsJson1_1` has no envelope element for the id) and wires it at
+//! the two layers every response of this service passes through:
+//!
+//! * [`RequestIdHeaderOperation`], the wrapper [`Service::override_operation`] hands the
+//!   router in place of each modelled operation, covers everything an operation answers —
+//!   a success, a modelled error, and a constraint refusal raised while that operation
+//!   was being served;
+//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a
+//!   routing failure, a transport failure detected up front, and a pre-dispatch
+//!   authentication refusal.
+//!
+//! Nothing else about a response changes: the status, the other headers and every byte
+//! of the body stay as the renderer wrote them.
 
+use service_common::query_error_envelope::{RequestIdEnvelopeDefinition, RequestIdHeaderOperation};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -52,7 +80,13 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// Serves every modelled operation, so each response an operation produced names the
+    /// request it answers. Held, not built per request: `override_operation` hands back a
+    /// borrow of it.
+    request_id: RequestIdHeaderOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,7 +95,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
+            request_id: RequestIdHeaderOperation,
         }
     }
 }
@@ -70,7 +105,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what
+        // is handed back is the shared `RequestIdEnvelopeDefinition`, which reads
+        // identity, protocol and the routing table straight off that entry and adds
+        // the request-id header to the three error renderers (see the module docs).
         &self.entry
     }
 
@@ -105,8 +143,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // NOT a re-route: the operation served is the one this service's own routing
+        // table names for the request, reached through the shared
+        // `RequestIdHeaderOperation` — the one place every operation's response passes,
+        // so no operation can answer without naming the request it answered. A request
+        // the table does not answer declines here exactly as it would there, leaving the
+        // router's routing-error path (which names the request itself, through the
+        // definition wrapper) unchanged. The wrapper declares no auth schemes of its
+        // own, so the modelled operation's still decide and this service's anonymous
+        // credential exchange stays anonymous.
+        self.entry
+            .routes(req)
+            .then_some(&self.request_id as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
