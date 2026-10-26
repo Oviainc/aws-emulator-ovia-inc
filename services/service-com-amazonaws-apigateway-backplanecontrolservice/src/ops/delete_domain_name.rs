@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored custom `DomainName` record the request's `domainName`
+//! (with `domainNameId` for a private one) addresses, so a later `GetDomainName` no longer
+//! finds it and the account's `GetDomainNames` listing stops reporting it; answers
+//! `NotFoundException` when no record answers to those identifiers, and
+//! `ConflictException` while a stored `DomainNameAccessAssociation` still names it.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // The two members together address ONE record, resolved the way `GetDomainName`
+        // resolves them: a `domainNameId` is "supported only for private custom domain
+        // names", and a private one needs it because several may carry one name. See
+        // `crate::state::domain_name_key`.
+        let key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+
+        // "Deletes the DomainName resource": removing the record is what makes a later
+        // `GetDomainName` — and the account's `GetDomainNames` listing — stop reporting
+        // it. Identifiers no stored record answers to name nothing to delete, so the call
+        // is refused with the same `NotFoundException` `GetDomainName` answers rather than
+        // reporting a silent success; that is also what makes a second delete of one
+        // record, or two concurrent ones, resolve to one success and one 404 rather than
+        // to a conflict.
+        let entry = store.domain_names.get(&key).ok_or_else(|| {
+            DeleteDomainNameErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+            })
+        })?;
+        let domain_name = entry.domain_name.clone();
+        let domain_name_arn = entry.domain_name_arn.clone();
+
+        // A `DomainNameAccessAssociation` is a record of the ACCOUNT that NAMES a stored
+        // private custom domain name — `CreateDomainNameAccessAssociation` refuses one
+        // whose `domainNameArn` resolves to no stored domain name — so an association
+        // still naming this record depends on it, and removing the record would leave an
+        // association this service says cannot exist. Such a delete is refused with the
+        // modelled conflict while the dependency stands; releasing the association is
+        // `DeleteDomainNameAccessAssociation`'s (or, for another account's,
+        // `RejectDomainNameAccessAssociation`'s) own call, not something this one does on
+        // the caller's behalf.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomainName"))
+        // Nothing the domain name itself carries conditions the removal: a record with a
+        // certificate, with mutual TLS, with a policy or carrying tags goes the same way,
+        // whatever `domainNameStatus` the clock currently owes it.
+        if store.access_associations_depend_on(&domain_name_arn) {
+            return Err(DeleteDomainNameErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::domain_name_has_access_associations(
+                        &domain_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The lookup, the dependency check and the removal share ONE hold of the store
+        // lock, so two concurrent deletes of one record cannot both remove it.
+        store.domain_names.remove(&key);
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome —
+        // the one record `crate::state::AUDIT_TARGET` documents, as the sibling
+        // `DeleteUsagePlan` handler emits it. Metadata only; a domain name's tags, policy
+        // and certificate names are the caller's data and are never fields.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?key,
+            outcome = "deleted",
+            "custom domain name deleted",
+        );
+        Ok(DeleteDomainNameOutput)
     }
 }

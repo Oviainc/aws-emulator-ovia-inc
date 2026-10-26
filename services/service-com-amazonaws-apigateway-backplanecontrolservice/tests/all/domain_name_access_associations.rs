@@ -56,7 +56,10 @@ const CONFLICT: &str = "ConflictException";
 const VPCE: &str = "VPCE";
 
 /// `CreateDomainNameAccessAssociation` with `body`.
-async fn create_association(gateway: &Gateway, body: Value) -> Answer {
+///
+/// Shared with the `delete_domain_name` suite, which needs a STORED association to show
+/// that a domain name one depends on cannot be deleted while it stands.
+pub(crate) async fn create_association(gateway: &Gateway, body: Value) -> Answer {
     gateway
         .call("POST", "/domainnameaccessassociations", Some(body))
         .await
@@ -64,7 +67,7 @@ async fn create_association(gateway: &Gateway, body: Value) -> Answer {
 
 /// The request body for an association of `source` with the domain name `domain_name_arn`,
 /// as the three required members the model declares.
-fn association_body(domain_name_arn: &str, source: &str) -> Value {
+pub(crate) fn association_body(domain_name_arn: &str, source: &str) -> Value {
     json!({
         "domainNameArn": domain_name_arn,
         "accessAssociationSourceType": VPCE,

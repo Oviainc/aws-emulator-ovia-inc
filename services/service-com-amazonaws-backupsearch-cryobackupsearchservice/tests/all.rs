@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/client_token_window.rs"]
 mod client_token_window;
+#[path = "all/export_client_token_expiry.rs"]
+mod export_client_token_expiry;
 #[path = "all/export_jobs.rs"]
 mod export_jobs;
 #[path = "all/export_listing.rs"]
