@@ -65,6 +65,8 @@ mod target_account_configuration_description;
 mod target_account_configuration_errors;
 #[path = "all/target_account_configuration_idempotency.rs"]
 mod target_account_configuration_idempotency;
+#[path = "all/target_account_configuration_page_walk.rs"]
+mod target_account_configuration_page_walk;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;
 #[path = "all/target_account_role_ownership.rs"]

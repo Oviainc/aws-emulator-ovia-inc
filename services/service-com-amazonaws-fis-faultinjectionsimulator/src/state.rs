@@ -2524,6 +2524,73 @@ pub fn target_account_page_token_account(token: &str) -> Option<&str> {
     .then_some(account_id)
 }
 
+/// The `accountId` a page of target account configurations resumes at, for the
+/// `nextToken` a request carried: `Ok(None)` when it carried none, and the
+/// `ValidationException` of [`invalid_next_token`] when it carried a token no page of
+/// target account configurations ever issued.
+///
+/// The decode is stated here rather than in each list handler, so the token a page mints
+/// ([`target_account_page_token`]) and the token the next page accepts cannot drift apart.
+/// Only the LIFT of the refusal into one operation's error enum stays in the handler,
+/// which is also why the refusal is decided before the resource is looked up: a request
+/// carrying a token this service never issued is not a request about a resource.
+pub fn target_account_page_resume_point(
+    next_token: Option<&str>,
+) -> Result<Option<&str>, ValidationException> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => target_account_page_token_account(token)
+            .map(Some)
+            .ok_or_else(invalid_next_token),
+    }
+}
+
+/// One page of a target-account-configuration list: the summaries it carries, and the
+/// `nextToken` that resumes after it.
+#[derive(Debug)]
+pub struct TargetAccountConfigurationPage<Summary> {
+    /// The summaries this page reports, in `accountId` order.
+    pub configurations: Vec<Summary>,
+    /// The token the next page resumes at, present exactly when configurations remain.
+    pub next_token: Option<String>,
+}
+
+/// The page of `configurations` that starts at `resume_at` and holds at most `page_size`
+/// entries, each entry reported as `summary` builds it.
+///
+/// The ONE page walk over the target account configurations of a template or of an
+/// experiment: both are a [`BTreeMap`] keyed by `accountId`, so one and the same rule
+/// pages them — walk the keys in order, skip every one sorting before the resumed account
+/// id (so a page is still served when the configuration a token named was deleted
+/// meanwhile), stop once the page is full, and mint the token the next page resumes at
+/// from the first entry left over. `ListTargetAccountConfigurations` walks a template's
+/// map and `ListExperimentTargetAccountConfigurations` the snapshot its experiment holds,
+/// so stating the walk once is what keeps the two paging alike: which map, which page size
+/// and which summary shape differ between them, and nothing about the paging does.
+pub fn target_account_configuration_page<Summary>(
+    configurations: &BTreeMap<String, TargetAccountConfigurationRecord>,
+    resume_at: Option<&str>,
+    page_size: usize,
+    summary: impl Fn(&TargetAccountConfigurationRecord) -> Summary,
+) -> TargetAccountConfigurationPage<Summary> {
+    let mut page = Vec::with_capacity(page_size.min(configurations.len()));
+    let mut next_token = None;
+    for (account_id, record) in configurations {
+        if resume_at.is_some_and(|from| account_id.as_str() < from) {
+            continue;
+        }
+        if page.len() >= page_size {
+            next_token = Some(target_account_page_token(account_id));
+            break;
+        }
+        page.push(summary(record));
+    }
+    TargetAccountConfigurationPage {
+        configurations: page,
+        next_token,
+    }
+}
+
 /// The `nextToken` a page of `ListExperimentResolvedTargets` hands back when resolved
 /// targets remain: the marker of [`RESOLVED_TARGET_PAGE_TOKEN_PREFIX`] followed by the
 /// POSITION in the experiment's resolution the next page resumes at.

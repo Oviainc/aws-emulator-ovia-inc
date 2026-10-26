@@ -157,21 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token is the account id the next page starts at, behind the marker a page of
         // target account configurations carries, so anything without that marker — or
-        // carrying a value no `accountId` could be — was never issued here.
-        let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::target_account_page_token_account(token) {
-                Some(account_id) => Some(account_id.to_string()),
-                None => {
-                    return Err(
-                        ListExperimentTargetAccountConfigurationsErrorModeled::ValidationException(
-                            crate::state::invalid_next_token(),
-                        )
-                        .into(),
-                    )
-                }
-            },
-        };
+        // carrying a value no `accountId` could be — was never issued here. Decoding it is
+        // the shared rule; lifting its refusal into this operation's error enum is the only
+        // part of it that belongs to this operation.
+        let resume_at = crate::state::target_account_page_resume_point(input.next_token.as_deref())
+            .map_err(ListExperimentTargetAccountConfigurationsErrorModeled::ValidationException)?;
 
         // This operation models no `maxResults`, so the page is the largest one this
         // service serves rather than a size the caller chose.
@@ -193,28 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let mut target_account_configurations =
-            Vec::with_capacity(page_size.min(experiment.target_account_configurations.len()));
-        let mut next_token = None;
-        for (account_id, record) in &experiment.target_account_configurations {
-            // Resume at the first account id at or after the token, so a page is still
-            // served when the configuration the token named is no longer there.
-            if resume_at
-                .as_deref()
-                .is_some_and(|from| account_id.as_str() < from)
-            {
-                continue;
-            }
-            if target_account_configurations.len() >= page_size {
-                next_token = Some(crate::state::target_account_page_token(account_id));
-                break;
-            }
-            target_account_configurations.push(record.to_experiment_summary());
-        }
+        // The page walk itself is the shared one, so this operation and
+        // `ListTargetAccountConfigurations` cut their pages and mint their tokens by the
+        // same rule; what belongs to this operation is the map it walks — the experiment's
+        // snapshot — the page size it serves and the summary shape it reports.
+        let page = crate::state::target_account_configuration_page(
+            &experiment.target_account_configurations,
+            resume_at,
+            page_size,
+            crate::state::TargetAccountConfigurationRecord::to_experiment_summary,
+        );
 
         Ok(ListExperimentTargetAccountConfigurationsOutput {
-            target_account_configurations: Some(target_account_configurations),
-            next_token,
+            target_account_configurations: Some(page.configurations),
+            next_token: page.next_token,
         })
     }
 }
