@@ -167,7 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Quick Setup is a regional control plane: a manager is served only by the
+        // endpoint of the Region its ARN carries, so the Region this request was signed
+        // for is part of the lookup.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteConfigurationManagerErrorModeled::InternalServerException(
                 InternalServerException {
@@ -182,9 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request looks for it, rather than being deleted a second time.
         store.settle(now);
 
-        // An ARN the store does not hold — never created, or a teardown that has
-        // already completed — is reported as absent.
-        let Some(manager) = store.managers.get(&input.manager_arn) else {
+        // An ARN this Region's endpoint does not serve — never created, created in
+        // another Region, or a teardown that has already completed — is reported as
+        // absent.
+        let Some(manager) = store.manager_in(&region, &input.manager_arn) else {
             return Err(
                 DeleteConfigurationManagerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

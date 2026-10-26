@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Quick Setup is a regional control plane: a manager is served only by the
+        // endpoint of the Region its ARN carries, so the Region this request was signed
+        // for is part of the lookup.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateConfigurationManagerErrorModeled::InternalServerException(
                 InternalServerException {
@@ -181,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for it, rather than being updated on its way out of the store.
         store.settle(now);
 
-        let Some(manager) = store.managers.get_mut(&input.manager_arn) else {
+        let Some(manager) = store.manager_in_mut(&region, &input.manager_arn) else {
             return Err(
                 UpdateConfigurationManagerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

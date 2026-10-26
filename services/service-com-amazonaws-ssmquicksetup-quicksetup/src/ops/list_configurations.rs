@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurations
-//! Reports one `ConfigurationSummary` per stored configuration — the records
-//! `CreateConfigurationManager` created, one per configuration definition — narrowed
-//! by the `ManagerArn` and `ConfigurationDefinitionId` the request names, in id
-//! order, one page at a time.
+//! Reports one `ConfigurationSummary` per configuration the signed Region's endpoint
+//! holds — the records `CreateConfigurationManager` created there, one per
+//! configuration definition and target — narrowed by the `ManagerArn` and
+//! `ConfigurationDefinitionId` the request names, in id order, one page at a time.
 //!
 //! Reporting, not mutating: the only write it makes is materialising the status
 //! changes the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]).
@@ -153,7 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Quick Setup is a regional control plane, so this listing reports the
+        // configurations of the managers created through the endpoint of the Region this
+        // request was signed for and no others.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListConfigurationsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the configuration manager store is unavailable".to_string()),
@@ -192,11 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.settle(::std::time::SystemTime::now());
+        let store = &*store;
 
-        // A manager the store does not hold is reported as absent, not as an empty
-        // page: the request named a resource that does not exist.
+        // A manager this Region's endpoint does not hold is reported as absent, not as
+        // an empty page: the request named a resource that does not exist here.
         if let Some(manager_arn) = input.manager_arn.as_deref() {
-            if !store.managers.contains_key(manager_arn) {
+            if store.manager_in(&region, manager_arn).is_none() {
                 return Err(ListConfigurationsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::manager_not_found_message(manager_arn)),
@@ -213,10 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.configurations.range(start.unwrap_or_default()..),
             crate::state::page_size(input.max_items),
             |configuration| {
-                input
-                    .manager_arn
-                    .as_ref()
-                    .is_none_or(|arn| *arn == configuration.manager_arn)
+                store.serves_configuration(&region, configuration)
+                    && input
+                        .manager_arn
+                        .as_ref()
+                        .is_none_or(|arn| *arn == configuration.manager_arn)
                     && input
                         .configuration_definition_id
                         .as_ref()

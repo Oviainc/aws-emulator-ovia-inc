@@ -147,7 +147,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceArn` is this request's only input, and the route matches only a
         // request carrying it, so nothing is left for this handler to refuse as a bad
         // request: an ARN naming nothing is the 404 below, never a 400.
-        let _ = ctx;
+        // Quick Setup is a regional control plane: a manager is served only by the
+        // endpoint of the Region its ARN carries, so the Region this request was signed
+        // for is part of the lookup.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the configuration manager store is unavailable".to_string()),
@@ -160,8 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(::std::time::SystemTime::now());
 
         // The configuration manager is this service's only ARN-addressable resource, so
-        // an ARN naming no stored manager names no taggable resource at all.
-        let Some(manager) = store.managers.get(&input.resource_arn) else {
+        // an ARN naming no manager this Region's endpoint serves names no taggable
+        // resource at all.
+        let Some(manager) = store.manager_in(&region, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::manager_not_found_message(

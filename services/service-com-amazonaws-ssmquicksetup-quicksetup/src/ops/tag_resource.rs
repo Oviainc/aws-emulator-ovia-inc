@@ -196,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every constraint `TagsMap` states on a key and a value is refused by the
         // centralized walk before this body runs, so what is checked here is only what
         // the model cannot say (see `tags_rejection`).
-        let _ = ctx;
+        // Quick Setup is a regional control plane: a manager is served only by the
+        // endpoint of the Region its ARN carries, so the Region this request was signed
+        // for is part of the lookup.
+        let region = crate::state::request_region(ctx.parts());
         if let Some(why) = tags_rejection(&input.tags) {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
@@ -217,8 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The configuration manager is this service's only ARN-addressable resource, so
-        // an ARN naming no stored manager names no taggable resource at all.
-        let Some(manager) = store.managers.get_mut(&input.resource_arn) else {
+        // an ARN naming no manager this Region's endpoint serves names no taggable
+        // resource at all.
+        let Some(manager) = store.manager_in_mut(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::manager_not_found_message(

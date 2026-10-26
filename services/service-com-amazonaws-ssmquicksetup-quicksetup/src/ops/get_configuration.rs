@@ -165,7 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Quick Setup is a regional control plane: a configuration is served only by
+        // the endpoint of the Region whose manager deployed it, so the Region this
+        // request was signed for is part of the lookup.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetConfigurationErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the configuration manager store is unavailable".to_string()),
@@ -175,9 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(::std::time::SystemTime::now());
 
-        // A configuration the store does not hold is the modelled 404: the id names a
-        // configuration that was never created, or one reclaimed with its manager.
-        let Some(configuration) = store.configurations.get(&input.configuration_id) else {
+        // A configuration this Region's endpoint does not serve is the modelled 404:
+        // the id names a configuration that was never created, one deployed by a manager
+        // of another Region, or one reclaimed with its manager.
+        let Some(configuration) = store.configuration_in(&region, &input.configuration_id) else {
             return Err(GetConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(

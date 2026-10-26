@@ -27,6 +27,8 @@ mod list_tags_for_resource;
 mod manager_not_found_message;
 #[path = "all/quick_setup_type_versions.rs"]
 mod quick_setup_type_versions;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]

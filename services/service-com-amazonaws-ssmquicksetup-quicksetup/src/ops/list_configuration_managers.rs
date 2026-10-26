@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationManagers
-//! Reports one `ConfigurationManagerSummary` per stored configuration manager, built
-//! from the store, in ARN order, one page at a time: `MaxItems` bounds the page and
-//! `NextToken` names the manager the next page starts at, so paging through N
-//! managers visits each exactly once.
+//! Reports one `ConfigurationManagerSummary` per configuration manager the signed
+//! Region's endpoint holds, built from the store, in ARN order, one page at a time:
+//! `MaxItems` bounds the page and `NextToken` names the manager the next page starts
+//! at, so paging through N managers visits each exactly once.
 //!
 //! Reporting, not mutating: the only write it makes is materialising the status
 //! changes the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]).
@@ -151,7 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Quick Setup is a regional control plane, so this listing reports the managers
+        // created through the endpoint of the Region this request was signed for and no
+        // others: a manager of another Region is not this Region's resource.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListConfigurationManagersErrorModeled::InternalServerException(
                 InternalServerException {
@@ -199,9 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.managers.range(start.unwrap_or_default()..),
             crate::state::page_size(input.max_items),
             |manager| {
-                crate::state::matches_filters(input.filters.as_deref(), |key| {
-                    manager.filter_field(key)
-                })
+                manager.region == region
+                    && crate::state::matches_filters(input.filters.as_deref(), |key| {
+                        manager.filter_field(key)
+                    })
             },
         );
 

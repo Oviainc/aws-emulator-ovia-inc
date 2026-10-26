@@ -1001,8 +1001,14 @@ impl ConfigurationRecord {
 pub struct ComAmazonawsSsmquicksetupQuicksetupState {
     /// Every configuration manager, keyed by its ARN. A `BTreeMap` so a list walks a
     /// stable, total order and a page token can name the next ARN.
+    ///
+    /// The ARN is unique across Regions, so one map holds them all; which Region's
+    /// endpoint serves a given manager is its [`ConfigurationManagerRecord::region`],
+    /// and an operation reaches it through [`Self::manager_in`] rather than through
+    /// this map, so no Region addresses another Region's resource.
     pub managers: BTreeMap<String, ConfigurationManagerRecord>,
-    /// Every configuration, keyed by its service-generated id, for the same reason.
+    /// Every configuration, keyed by its service-generated id, for the same reason —
+    /// and reached, for the same reason, through [`Self::configuration_in`].
     pub configurations: BTreeMap<String, ConfigurationRecord>,
     /// The service settings record of each region one has been written for.
     ///
@@ -1049,6 +1055,56 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
     pub fn fresh_definition_id(&mut self) -> String {
         self.next_definition_id = self.next_definition_id.saturating_add(1);
         self.next_definition_id.to_string()
+    }
+
+    /// The configuration manager `manager_arn` names as the endpoint of `region`
+    /// serves it: `None` both when no manager has that ARN at all and when the manager
+    /// that does was created through another Region's endpoint.
+    ///
+    /// Quick Setup is a regional control plane — one endpoint per Region, and a
+    /// manager's ARN carries the Region it was created in — so a manager belongs to
+    /// exactly that one Region and is reported, mutated and torn down only there. The
+    /// one place that scoping lives, so every ARN-addressed operation treats an ARN of
+    /// another Region exactly as it treats one that was never minted.
+    pub fn manager_in(
+        &self,
+        region: &str,
+        manager_arn: &str,
+    ) -> Option<&ConfigurationManagerRecord> {
+        self.managers
+            .get(manager_arn)
+            .filter(|manager| manager.region == region)
+    }
+
+    /// [`Self::manager_in`] for a caller that goes on to mutate the manager it finds.
+    pub fn manager_in_mut(
+        &mut self,
+        region: &str,
+        manager_arn: &str,
+    ) -> Option<&mut ConfigurationManagerRecord> {
+        self.managers
+            .get_mut(manager_arn)
+            .filter(|manager| manager.region == region)
+    }
+
+    /// Whether the endpoint of `region` serves `configuration`.
+    ///
+    /// A configuration is the deployment of one definition of one manager, so the
+    /// endpoint that serves it is the one that created that manager — NOT the Region
+    /// the deployment went INTO, which is what the definition's target parameters name
+    /// and what the configuration's own `Region` member reports.
+    pub fn serves_configuration(&self, region: &str, configuration: &ConfigurationRecord) -> bool {
+        self.manager_in(region, &configuration.manager_arn)
+            .is_some()
+    }
+
+    /// The configuration `id` names as the endpoint of `region` serves it, and `None`
+    /// when that endpoint serves no configuration with that id (see
+    /// [`Self::serves_configuration`]).
+    pub fn configuration_in(&self, region: &str, id: &str) -> Option<&ConfigurationRecord> {
+        self.configurations
+            .get(id)
+            .filter(|configuration| self.serves_configuration(region, configuration))
     }
 
     /// Deploy `definition` of the manager `manager_arn` to exactly `targets`: one
