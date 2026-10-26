@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the configuration of one stored bucket — its anonymous access permissions,
+//! object versioning, the accounts given read-only access, its access log and its CORS
+//! rules — and answers the record it left behind together with the operation-log entry
+//! the update wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A member the request carries replaces what the bucket held; a member it carries none
+//! of leaves the stored value alone, so one call changes exactly what it names. That
+//! holds member by member INSIDE `accessRules`, whose two members are two settings of
+//! their own, and WHOLE for `accessLogConfig` and `cors`, which the request each states
+//! completely ("if a CORS configuration exists, it is replaced with the specified
+//! configuration").
+//!
+//! Object versioning is the one setting the bucket's OBJECT store holds a half of, so a
+//! change to it is carried to that store as well; an object store that does not hold the
+//! bucket at all leaves the two halves disagreeing, which is logged rather than passed
+//! over — the shape the create records the same hand-off in.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +183,245 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made" —
+        // so the region the request is signed for is what `bucketName` addresses
+        // a bucket in, exactly as it is for the create and the read.
+        let region = crate::state::request_region(ctx.parts());
+        // The address the answered record announces is the endpoint THIS request
+        // arrived at, never an AWS hostname; a request that names no host names
+        // no endpoint to announce.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
+
+        // `bucketName` carries the modelled length and pattern, `accessRules`'
+        // `getObject` targets the modelled `AccessType` enum, a CORS rule's
+        // methods carry their modelled pattern and the caller-sized lists carry
+        // their modelled bounds, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express, and each of those is checked BEFORE the first write, so a
+        // refused request changes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBucket"))
+        // `versioning` is a free-form string in the model and a two-valued choice
+        // in its documentation, so a value outside that choice states no
+        // versioning state to apply.
+        let versioning = match &input.versioning {
+            None => None,
+            Some(asked) => {
+                Some(crate::state::object_versioning_from_update(asked).ok_or_else(|| {
+                    invalid(format!(
+                        "versioning '{asked}' is not a versioning state a bucket can be asked \
+                         for; specify {}",
+                        crate::state::BUCKET_VERSIONING_REQUEST_VALUES.join(" or ")
+                    ))
+                })?)
+            }
+        };
+        // The access log's destination and prefix belong to the ENABLED form of
+        // that configuration: the destination "is required when enabling the
+        // access log for a bucket, and should be omitted when disabling the access
+        // log", and the prefix "can be optionally specified when enabling the
+        // access log for a bucket, and should be omitted when disabling the access
+        // log".
+        if let Some(config) = &input.access_log_config {
+            if config.enabled {
+                if config.destination.is_none() {
+                    return Err(invalid(
+                        "accessLogConfig.destination must name the bucket the access logs are \
+                         saved in when accessLogConfig.enabled is true"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                if config.destination.is_some() {
+                    return Err(invalid(
+                        "accessLogConfig.destination is for enabling the access log, so it must \
+                         be omitted when accessLogConfig.enabled is false"
+                            .to_string(),
+                    ));
+                }
+                if config.prefix.is_some() {
+                    return Err(invalid(
+                        "accessLogConfig.prefix is for enabling the access log, so it must be \
+                         omitted when accessLogConfig.enabled is false"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        // "Each CORS rule must identify at least one origin and one method", so a
+        // rule carrying an empty list of either allows no cross-origin request at
+        // all and is not a rule this service stores.
+        for (index, rule) in input
+            .cors
+            .iter()
+            .flat_map(|cors| cors.rules.iter().flatten())
+            .enumerate()
+        {
+            if rule.allowed_methods.is_empty() {
+                return Err(invalid(format!(
+                    "cors.rules[{index}].allowedMethods is empty; each CORS rule must identify \
+                     at least one origin and one method"
+                )));
+            }
+            if rule.allowed_origins.is_empty() {
+                return Err(invalid(format!(
+                    "cors.rules[{index}].allowedOrigins is empty; each CORS rule must identify \
+                     at least one origin and one method"
+                )));
+            }
+        }
+        // Read-only access is granted to ACCOUNTS, and an Amazon Web Services
+        // account is identified by a 12-digit account ID, so a string that is not
+        // one names no account this bucket could be opened to.
+        for (index, account) in input
+            .readonly_access_accounts
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            if !crate::state::is_aws_account_id(account) {
+                return Err(invalid(format!(
+                    "readonlyAccessAccounts[{index}] '{account}' is not an Amazon Web Services \
+                     account ID; an account ID is {} digits",
+                    crate::state::AWS_ACCOUNT_ID_DIGITS
+                )));
+            }
+        }
+
+        let now = crate::state::now_ms();
+
+        let output = crate::state::with_state(&*self.engine, |store| {
+            // The one check that needs the STORE and is not about the addressed
+            // bucket: a bucket the access log is enabled to has to be "a
+            // Lightsail bucket in the same account, and in the same Amazon Web
+            // Services Region as the source bucket". It is answered here, while
+            // the store can still be read, and REPORTED after the bucket the
+            // call addresses has been resolved — a request about a bucket this
+            // account does not hold is that refusal whatever else it carries.
+            let unknown_destination = input
+                .access_log_config
+                .as_ref()
+                .and_then(|config| config.destination.as_ref())
+                .filter(|destination| store.bucket(&region, destination).is_none())
+                .cloned();
+
+            // The addressed bucket, taken mutably once. Every refusal below it
+            // still runs BEFORE the first write, which is what keeps "a refused
+            // request changes nothing" true.
+            let bucket = store
+                .bucket_mut(&region, &input.bucket_name)
+                .ok_or_else(|| not_found(&input.bucket_name))?;
+            if let Some(destination) = unknown_destination {
+                return Err(invalid(format!(
+                    "accessLogConfig.destination '{destination}' is not a bucket of this \
+                     account in {region}; a bucket's access logs are saved in a Lightsail \
+                     bucket in the same account and the same Amazon Web Services Region as \
+                     the source bucket"
+                )));
+            }
+
+            // The configuration itself. Each member the request carries replaces
+            // what the bucket held — the CORS configuration whole, since "if a
+            // CORS configuration exists, it is replaced with the specified
+            // configuration" — and a member it carries none of is left alone.
+            if let Some(access_rules) = &input.access_rules {
+                if let Some(get_object) = &access_rules.get_object {
+                    bucket.access_rules.get_object = Some(get_object.clone());
+                }
+                if let Some(allow_public_overrides) = access_rules.allow_public_overrides {
+                    bucket.access_rules.allow_public_overrides = Some(allow_public_overrides);
+                }
+            }
+            if let Some(versioning) = versioning {
+                bucket.object_versioning = versioning.to_string();
+            }
+            if let Some(accounts) = &input.readonly_access_accounts {
+                bucket.readonly_access_accounts = accounts.clone();
+            }
+            if let Some(access_log_config) = &input.access_log_config {
+                bucket.access_log_config = access_log_config.clone();
+            }
+            if let Some(cors) = &input.cors {
+                bucket.cors_rules = cors.rules.clone().unwrap_or_default();
+            }
+
+            // `Bucket$cors` "is only included in the response when CORS
+            // configuration is requested", and this operation's own documentation
+            // says "CORS information is only returned in a response when you
+            // update the CORS policy" — so the answered record carries it exactly
+            // when this request carried a CORS configuration. The connected
+            // resources are left out as the create leaves them out: reporting them
+            // is the read's business, under its own flag.
+            let view = bucket.view(endpoint.as_deref(), false, input.cors.is_some());
+            let location = bucket.location.clone();
+
+            // The configuration is in force as this call returns — the modelled
+            // `BucketState` has no transient code and no member of this request
+            // waits on anything — so the entry this update logs is terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_BUCKET,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok(UpdateBucketOutput {
+                bucket: Some(view),
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)??;
+
+        // Versioning of the bucket's objects is a property of the store that KEEPS
+        // those objects, so the state the record now reports is carried to this
+        // emulator's one object store — with no guard of this service's store
+        // held, which is the lock order every cross-service access here follows.
+        if let Some(versioning) = versioning {
+            let versioned = versioning == crate::state::OBJECT_VERSIONING_ENABLED;
+            if crate::state::set_bucket_object_store_versioning(
+                &*self.engine,
+                &input.bucket_name,
+                versioned,
+            ) != Some(true)
+            {
+                ::tracing::warn!(
+                    operation = "UpdateBucket",
+                    bucket_name = %input.bucket_name,
+                    versioning,
+                    "the object store did not hold the bucket whose versioning was updated, so \
+                     its objects are not kept the way the bucket now reports"
+                );
+            }
+        }
+        Ok(output)
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> UpdateBucketError {
+    UpdateBucketErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> UpdateBucketError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateBucketError {
+    UpdateBucketErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

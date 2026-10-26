@@ -33,6 +33,8 @@ mod blueprint_catalog;
 mod bucket_access_keys;
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
+#[path = "all/bucket_configuration_update.rs"]
+mod bucket_configuration_update;
 #[path = "all/bucket_distribution_origin_delete.rs"]
 mod bucket_distribution_origin_delete;
 #[path = "all/bucket_error_envelope.rs"]

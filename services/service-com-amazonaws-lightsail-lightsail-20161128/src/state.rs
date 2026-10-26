@@ -629,6 +629,8 @@ pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 /// `OperationType` enum.
 pub const OPERATION_TYPE_DELETE_BUCKET: &str = "DeleteBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_BUCKET: &str = "UpdateBucket";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
@@ -1562,10 +1564,8 @@ pub const OBJECT_VERSIONING_ENABLED: &str = "Enabled";
 /// from that member's own documentation: "`Suspended` - Object versioning was
 /// previously enabled but is currently suspended."
 ///
-/// No stored bucket carries this value yet: suspending versioning is
-/// `UpdateBucket`'s business, and that operation is still a 501 scaffold under
-/// its own issue. The constant records the modelled value the store will hold
-/// once it is implemented.
+/// What `UpdateBucket` records for a request asking to suspend versioning of the
+/// bucket's objects — see [`object_versioning_from_update`].
 pub const OBJECT_VERSIONING_SUSPENDED: &str = "Suspended";
 
 /// `Bucket$objectVersioning` when versioning was never asked for, from that
@@ -1728,6 +1728,39 @@ pub fn release_bucket_object_store<Eng: Send + Sync + 'static>(
     Some(store.remove_bucket(name))
 }
 
+/// Record the object versioning of the bucket named `name` in its object store:
+/// what makes the bucket's objects actually be kept as versions, or stop being
+/// kept, once `UpdateBucket` has changed the bucket's `objectVersioning`.
+///
+/// The control plane's value and the object store's are two halves of ONE
+/// setting — "All objects added to the bucket receive a unique version ID" — so a
+/// change to the first is carried to the second the way
+/// [`claim_bucket_object_store`] carries a create's.
+///
+/// `true` when the object store held such a bucket, `false` when it did not, and
+/// `None` when that store cannot be reached at all. The same LOCK ORDER as
+/// [`claim_bucket_object_store`].
+pub fn set_bucket_object_store_versioning<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    versioned: bool,
+) -> Option<bool> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let mut store = state.lock();
+    let Some(bucket) = store.bucket_mut(name) else {
+        return Some(false);
+    };
+    bucket.set_versioning(
+        if versioned {
+            ::service_com_amazonaws_s3_amazons3::state::VERSIONING_ENABLED_STATUS
+        } else {
+            ::service_com_amazonaws_s3_amazons3::state::VERSIONING_SUSPENDED_STATUS
+        },
+        None,
+    );
+    Some(true)
+}
+
 /// How many object keys the bucket named `name` holds in its object store — the
 /// keys with a current object plus the keys only noncurrent versions are left of,
 /// since a stored version is an object the bucket still holds.
@@ -1828,6 +1861,44 @@ pub fn object_versioning_from_request(enable_object_versioning: Option<bool>) ->
     } else {
         OBJECT_VERSIONING_NEVER_ENABLED
     }
+}
+
+/// The two values an update may ask a bucket's object versioning to become, from
+/// the `UpdateBucketRequest$versioning` documentation: "`Enabled` - Enables
+/// versioning of objects in the specified bucket" and "`Suspended` - Suspends
+/// versioning of objects in the specified bucket".
+///
+/// `NeverEnabled` is deliberately NOT among them: it is the state of a bucket
+/// versioning was never asked for, not something a request can ask a bucket to
+/// go back to.
+pub const BUCKET_VERSIONING_REQUEST_VALUES: &[&str] =
+    &[OBJECT_VERSIONING_ENABLED, OBJECT_VERSIONING_SUSPENDED];
+
+/// The `objectVersioning` a bucket reports once an update asked for
+/// `versioning`, or `None` when that is not one of the values such a request may
+/// carry ([`BUCKET_VERSIONING_REQUEST_VALUES`]).
+///
+/// The answer is the catalog's own spelling, so what the bucket reports is a
+/// modelled value rather than however the request spelled it.
+pub fn object_versioning_from_update(versioning: &str) -> Option<&'static str> {
+    BUCKET_VERSIONING_REQUEST_VALUES
+        .iter()
+        .find(|value| **value == versioning)
+        .copied()
+}
+
+/// How many digits an Amazon Web Services account ID is: the emulator's own
+/// account (`engine::emulator_account_id`) is one of them, and so is every
+/// account a caller can name in a request.
+pub const AWS_ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `value` is an Amazon Web Services account ID — [`AWS_ACCOUNT_ID_DIGITS`]
+/// decimal digits and nothing else.
+///
+/// The one place this crate decides that, for every member that takes an account
+/// of its own rather than a resource of this one.
+pub fn is_aws_account_id(value: &str) -> bool {
+    value.len() == AWS_ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The account-level block-public-access synchronization status `GetBuckets`
