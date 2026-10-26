@@ -1009,13 +1009,14 @@ fn unmet_source_precondition(
 ///
 /// An `ETag` is reported inside quotes, and a client may send the value back with or
 /// without them, as a comma-separated list, or as the `*` wildcard that names any existing
-/// entity (RFC 7232 §2.3, §3.1) — so each candidate is compared with the quotes and the
-/// weak marker stripped.
+/// entity (RFC 7232 §2.3, §3.1) — so each candidate is compared on the tag's own value
+/// ([`crate::state::etag_value`]), with the weak marker stripped too.
 fn etag_matches(header: &str, etag: &str) -> bool {
-    let stored = etag.trim_matches('"');
+    let stored = crate::state::etag_value(etag);
     header.split(',').any(|candidate| {
         let candidate = candidate.trim();
-        candidate == "*" || candidate.trim_start_matches("W/").trim_matches('"') == stored
+        candidate == "*"
+            || crate::state::etag_value(candidate.trim_start_matches("W/")) == stored
     })
 }
 

@@ -10,6 +10,10 @@
 //!   (`GetObjectAttributesRequest$ObjectAttributes`): the answer carries a field exactly
 //!   when `x-amz-object-attributes` named it, and the values are the stored object's own —
 //!   its entity tag, its size in bytes and its storage class.
+//! * The `ETag` field carries the entity tag's own VALUE — the MD5 digest of the stored
+//!   bytes, lowercase hex — and not the quoted-string rendering of the `ETag` response
+//!   header, whose double quotes are that header's syntax ("An entity-tag consists of an
+//!   opaque quoted string", RFC 9110 §8.8.3) rather than part of the tag.
 //! * The two CONTAINERS are not reported at all: this emulator computes and stores no
 //!   checksum for an object's bytes, and no object it holds is assembled from parts
 //!   (`CompleteMultipartUpload` is scaffolded), which is also what S3 reports for an object
@@ -28,13 +32,19 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send_bytes, Answer};
 use super::object_and_tagging_roundtrip::{expected_etag, put_object, text};
-use super::object_versioning::set_versioning;
+use super::object_versioning::{head_object, set_versioning};
 
 /// Every value the `ObjectAttributes` enum publishes
 /// (`smithy_query(query="shape",shape="ObjectAttributes")`), which is what the header may
 /// name.
 const OBJECT_ATTRIBUTES_VALUES: [&str; 5] =
     ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"];
+
+/// The entity tag this operation reports for `body`: the tag's own value, which is the
+/// quoted tag of the `ETag` header ([`expected_etag`]) without that header's quotes.
+fn expected_etag_value(body: &[u8]) -> String {
+    expected_etag(body).trim_matches('"').to_string()
+}
 
 /// `GET /<bucket>/<key>?attributes<query>` — `GetObjectAttributes`, asking for `attributes`.
 async fn get_object_attributes(
@@ -123,7 +133,7 @@ async fn an_answer_carries_exactly_the_fields_the_request_asked_for() {
                 etag.as_deref(),
                 attributes
                     .contains(&"ETag")
-                    .then(|| expected_etag(body))
+                    .then(|| expected_etag_value(body))
                     .as_deref(),
                 "case {label:?}: the ETag is reported exactly when it was asked for, got \
                  {etag:?} in body {:?}",
@@ -232,7 +242,7 @@ async fn the_version_a_read_names_is_the_version_it_reports() {
         );
         assert_eq!(
             answer.element("ETag").as_deref(),
-            Some(expected_etag(&body).as_str()),
+            Some(expected_etag_value(&body).as_str()),
             "case {case:?}: the ETag must be that version's, got body {:?}",
             text(&answer)
         );
@@ -329,4 +339,107 @@ async fn an_address_this_emulator_does_not_hold_is_refused_with_the_code_for_wha
         served.status,
         text(&served)
     );
+}
+
+#[tokio::test]
+async fn the_etag_field_carries_the_tags_value_and_the_etag_header_its_quoted_rendering() {
+    let router = router();
+    let bucket = "object-attributes-etag";
+    create_bucket(&router, bucket, None, None).await;
+
+    // (case, payload, the published MD5 of that payload when there is one).
+    //
+    // The rows differ along what the rule generalises over: the payload's size (empty, one
+    // byte, a line of text, a long line) and type (ASCII text, bytes including NUL and
+    // 0xFF). The hex digests are the MD5 test-suite vectors published in RFC 1321,
+    // Appendix A.5 — an expectation computed nowhere in this process.
+    let binary: Vec<u8> = (0..=255u8).chain(0..=255u8).collect();
+    let rows: &[(&str, &[u8], Option<&str>)] = &[
+        ("the empty payload", b"", Some("d41d8cd98f00b204e9800998ecf8427e")),
+        ("one byte", b"a", Some("0cc175b9c0f1b6a831c399e269772661")),
+        ("three bytes", b"abc", Some("900150983cd24fb0d6963f7d28e17f72")),
+        (
+            "a line of text",
+            b"message digest",
+            Some("f96b697d7cb7938d525a2f31aaf161d0"),
+        ),
+        (
+            "a long line of digits",
+            b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+            Some("57edf4a22be3c955ac49da2e2107b67a"),
+        ),
+        ("bytes spanning 0x00..=0xff twice", &binary, None),
+    ];
+
+    for (index, (case, body, published)) in rows.iter().enumerate() {
+        let key = format!("etag-subject-{index}.bin");
+        let written = put_object(&router, bucket, &key, body, &[]).await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: the object must be stored first, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+
+        // The tag's value: the published digest where the row publishes one, and otherwise
+        // the digest of the row's own bytes.
+        let value = published
+            .map(str::to_string)
+            .unwrap_or_else(|| expected_etag_value(body));
+        if let Some(published) = published {
+            assert_eq!(
+                expected_etag_value(body),
+                *published,
+                "case {case:?}: the published MD5 must be the digest of the row's bytes, got {:?}",
+                expected_etag_value(body)
+            );
+        }
+
+        // The `ETag` HEADER carries the quoted-string rendering, on the write and on every
+        // header-bound read of the same object.
+        let quoted = format!("\"{value}\"");
+        for (reader, answer) in [
+            ("PutObject", &written),
+            ("HeadObject", &head_object(&router, bucket, &key, "").await),
+        ] {
+            assert_eq!(
+                answer.header("etag").as_deref(),
+                Some(quoted.as_str()),
+                "case {case:?}: {reader} must report the tag inside the header's quotes \
+                 {quoted:?}, got {:?}",
+                answer.header("etag")
+            );
+        }
+
+        // The FIELD of this operation's response document carries the value alone: no
+        // quotes, escaped (`&quot;`) or not, anywhere in the body.
+        let answer = get_object_attributes(&router, bucket, &key, "", &["ETag"]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the read must be served, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        let reported = answer.element("ETag");
+        assert_eq!(
+            reported.as_deref(),
+            Some(value.as_str()),
+            "case {case:?}: expected the entity tag's value {value:?}, got {reported:?} in \
+             body {:?}",
+            text(&answer)
+        );
+        let document = text(&answer);
+        // The element's RAW text, before the harness undoes XML escaping, so a quote that
+        // travelled as `&quot;` is caught too.
+        let raw = document
+            .split_once("<ETag>")
+            .and_then(|(_, rest)| rest.split_once("</ETag>"))
+            .map(|(inner, _)| inner.to_string());
+        assert!(
+            raw.as_deref()
+                .is_some_and(|raw| !raw.contains('"') && !raw.contains("&quot;")),
+            "case {case:?}: the field must carry no quoted-string quotes, got {raw:?} in \
+             body {document:?}"
+        );
+    }
 }

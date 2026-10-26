@@ -351,7 +351,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // every answer: when the object was written, and the id of the version read.
             last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
             version_id: object.version_id.clone(),
-            e_tag: asked(crate::state::OBJECT_ATTRIBUTE_ETAG).then(|| object.etag.clone()),
+            // The tag is a FIELD of this response document rather than the `ETag` header,
+            // so it carries the tag's own value — the digest without the quoted-string
+            // quotes that header syntax requires ([`crate::state::etag_value`]).
+            e_tag: asked(crate::state::OBJECT_ATTRIBUTE_ETAG)
+                .then(|| crate::state::etag_value(&object.etag).to_string()),
             object_size: asked(crate::state::OBJECT_ATTRIBUTE_OBJECT_SIZE)
                 .then(|| i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
             storage_class: asked(crate::state::OBJECT_ATTRIBUTE_STORAGE_CLASS)

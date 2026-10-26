@@ -6734,6 +6734,19 @@ pub fn object_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
 }
 
+/// The entity tag's own VALUE: the digest [`object_etag`] rendered, without the double
+/// quotes around it.
+///
+/// Those quotes are HTTP's quoted-string syntax for the `ETag` response header — "An
+/// entity-tag consists of an opaque quoted string" (RFC 9110 §8.8.3) — so they belong to
+/// the renderings that reproduce that header verbatim (the header itself, and the legacy
+/// listing elements that echo it), not to the tag. A field that carries the tag as its own
+/// typed value in a response document, and a precondition comparison against a tag a
+/// client may send back with or without the quotes, work on this value instead.
+pub fn etag_value(etag: &str) -> &str {
+    etag.trim_matches('"')
+}
+
 /// The same digest as [`object_etag`], Base64 encoded the way the `Content-MD5` header
 /// carries it: "The Base64 encoded 128-bit MD5 digest of the data"
 /// (`PutObjectRequest$ContentMD5`), which is what makes that header checkable.
