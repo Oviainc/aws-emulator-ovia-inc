@@ -51,6 +51,8 @@ mod bundle_catalog;
 mod cloud_formation_stack;
 #[path = "all/contact_method_notifications.rs"]
 mod contact_method_notifications;
+#[path = "all/contact_method_tag_bound.rs"]
+mod contact_method_tag_bound;
 #[path = "all/contact_method_verification.rs"]
 mod contact_method_verification;
 #[path = "all/container_api_metadata.rs"]
