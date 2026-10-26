@@ -113,6 +113,18 @@
 //! so it is an account-level resource rather than one group's and lives beside the groups
 //! and not on [`LogGroupRecord`].
 //!
+//! The account's scheduled queries — the queries `CreateScheduledQuery` schedules "at regular
+//! intervals" and `GetScheduledQuery` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::scheduled_queries`], each one a
+//! [`ScheduledQueryRecord`], keyed by the name that identifies one ("The name must be unique
+//! within your account and region"). A scheduled query names the log groups it queries as a
+//! value it carries, and outlives none of them, so it is an account-level resource rather
+//! than one group's and lives beside the groups and not on [`LogGroupRecord`]. Either the name
+//! or the ARN identifies one to a reader
+//! ([`ComAmazonawsCloudwatchlogsLogs20140328State::scheduled_query`]). The scheduled query
+//! CloudWatch MANAGES for a log alarm is not here: it belongs to that alarm, so it is derived
+//! from it ([`log_alarm_queries`]) rather than copied into this store.
+//!
 //! The vended-log delivery CONFIGURATION TEMPLATES — "the valid and default values that are
 //! used when creating delivery sources, delivery destinations, and deliveries", which
 //! `DescribeConfigurationTemplates` reports — are not an account's resources at all: no
@@ -130,6 +142,9 @@ pub mod query_compile;
 
 /// Metric extraction from an ingested Embedded Metric Format log event.
 pub mod emf;
+
+/// The scheduled query CloudWatch manages on a log alarm's behalf.
+pub mod log_alarm_queries;
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Generated emulators default to `us-east-1`.
@@ -964,6 +979,11 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// `DescribeLookupTables` enumerates in table-name order without re-sorting, which is
     /// what its `lookupTableNamePrefix` filter and its pagination cursor both read.
     pub lookup_tables: BTreeMap<String, LookupTableRecord>,
+    /// Every scheduled query of this account — the one `CreateScheduledQuery` creates and
+    /// `GetScheduledQuery` reports — keyed by `ScheduledQueryName`, which is what identifies
+    /// one ("The name must be unique within your account and region"). A `BTreeMap` so the
+    /// stored order is stable in query-name order without re-sorting.
+    pub scheduled_queries: BTreeMap<String, ScheduledQueryRecord>,
     /// Every integration of this account — the resource `PutIntegration` creates,
     /// `GetIntegration` and `ListIntegrations` report and `DeleteIntegration` removes —
     /// keyed by `integrationName`, the one member every other integration operation
@@ -1088,6 +1108,19 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         self.delivery_destinations
             .values()
             .find(|destination| destination.arn == arn)
+    }
+
+    /// The scheduled query this account holds under `identifier`, if any.
+    ///
+    /// A scheduled query is keyed by its name, but every reader identifies one by "The ARN or
+    /// name of the scheduled query" (`ScheduledQueryIdentifier`), so both forms resolve to the
+    /// same record: the name is the store's key, and an ARN names the query its resource
+    /// segment does ([`scheduled_query_name_from_identifier`]).
+    pub fn scheduled_query(&self, identifier: &str) -> Option<&ScheduledQueryRecord> {
+        self.scheduled_queries.get(identifier).or_else(|| {
+            self.scheduled_queries
+                .get(scheduled_query_name_from_identifier(identifier))
+        })
     }
 
     /// The same tag set, to write. See [`Self::resource_tags`].
@@ -3502,6 +3535,183 @@ impl LookupTableRecord {
             size_bytes: Some(self.size_bytes()),
             last_updated_time: Some(self.last_updated_time_ms),
             kms_key_id: self.kms_key_id.clone(),
+        }
+    }
+}
+
+/// A scheduled query's ARN, the form `ScheduledQuerySummary$scheduledQueryArn` ("The ARN of
+/// the scheduled query") carries: a `scheduled-query` resource of this service, identified by
+/// the query's own name, which is what makes the ARN and the name interchangeable as the
+/// `ScheduledQueryIdentifier` every reader accepts.
+///
+/// This is also the form CloudWatch mints for the query it manages for a log alarm
+/// (`ScheduledQueryConfiguration$QueryARN`), which is why that ARN resolves here too
+/// ([`log_alarm_queries`]).
+pub fn scheduled_query_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("scheduled-query:{name}"))
+}
+
+/// The state a scheduled query a create named none for starts in: `CreateScheduledQuery$state`
+/// documents "The initial state of the scheduled query. Valid values are ENABLED and DISABLED.
+/// Default is ENABLED."
+pub const SCHEDULED_QUERY_STATE_ENABLED: &str = "ENABLED";
+
+/// The `ScheduleType` of a scheduled query a caller created: the schedule is the caller's,
+/// stated by its own `scheduleExpression`, so it is the customer-managed one of the two values
+/// the model enumerates (`CUSTOMER_MANAGED` | `AWS_MANAGED`) — nothing in this store creates
+/// an AWS-managed schedule, and no create member names the type.
+pub const SCHEDULE_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+
+/// THE EMULATOR'S OWN CEILING on the scheduled queries one account holds, not a quota cited
+/// from AWS: each query keeps its configuration in memory for as long as the process runs and
+/// nothing expires one, so `CreateScheduledQuery` refuses to create more than this many with
+/// the `ServiceQuotaExceededException` it models ("This request exceeds a service quota")
+/// rather than growing without bound on request.
+pub const MAX_SCHEDULED_QUERIES: usize = 1_000;
+
+/// One scheduled query — the query `CreateScheduledQuery` schedules "at regular intervals" —
+/// as it is stored. Every member of `GetScheduledQuery`'s response is reported from this
+/// record, so that reader answers from state alone.
+#[derive(Debug, Clone)]
+pub struct ScheduledQueryRecord {
+    /// `name` — "The name of the scheduled query". Also the key the store is keyed by, because
+    /// the name "must be unique within your account and region".
+    pub name: String,
+    /// `scheduledQueryArn` — the ARN [`scheduled_query_arn`] built for this query in the region
+    /// the create was signed for.
+    pub arn: String,
+    /// `description` — "The description of the scheduled query", when a call named one.
+    pub description: Option<String>,
+    /// `queryLanguage` — "The query language used by the scheduled query" (`CWLI` | `SQL` |
+    /// `PPL`). Required of a create, so every stored query carries one.
+    pub query_language: String,
+    /// `queryString` — "The query string executed by the scheduled query", verbatim as the call
+    /// that wrote it sent it.
+    pub query_string: String,
+    /// `logGroupIdentifiers` — "The log groups queried by the scheduled query", in the order
+    /// the call named them. Optional on a create, so a query naming none holds none and reports
+    /// no member at all.
+    pub log_group_identifiers: Vec<String>,
+    /// `scheduleExpression` — "The cron expression that defines when the scheduled query runs".
+    /// Required of a create, so every stored query carries one.
+    pub schedule_expression: String,
+    /// `timezone` — "The timezone used for evaluating the schedule expression", when a call
+    /// named one.
+    pub timezone: Option<String>,
+    /// `startTimeOffset` — "The time offset in seconds that defines the lookback period for the
+    /// query", when a call named one.
+    pub start_time_offset: Option<i64>,
+    /// `endTimeOffset` — "The time offset in seconds that defines the end of the lookback period
+    /// for the query", when a call named one.
+    pub end_time_offset: Option<i64>,
+    /// `destinationConfiguration` — "Configuration for where query results are delivered", as
+    /// the call that wrote it stated it.
+    pub destination_configuration: Option<crate::ops::types::DestinationConfiguration>,
+    /// `state` — "The current state of the scheduled query" (`ENABLED` | `DISABLED`), the one
+    /// the create named or [`SCHEDULED_QUERY_STATE_ENABLED`] when it named none.
+    pub state: String,
+    /// `scheduleType` — "The schedule type of the scheduled query", which for a query a caller
+    /// created is [`SCHEDULE_TYPE_CUSTOMER_MANAGED`].
+    pub schedule_type: String,
+    /// `scheduleStartTime` — "The start time for the scheduled query in Unix epoch format",
+    /// when a call named one.
+    pub schedule_start_time: Option<i64>,
+    /// `scheduleEndTime` — "The end time for the scheduled query in Unix epoch format", when a
+    /// call named one.
+    pub schedule_end_time: Option<i64>,
+    /// `executionRoleArn` — "The ARN of the IAM role used to execute the query and deliver
+    /// results". Required of a create, so every stored query carries one.
+    pub execution_role_arn: String,
+    /// `creationTime` — "The timestamp when the scheduled query was created", in epoch
+    /// milliseconds. `None` for a query whose owner records no instant of its creation, which
+    /// is a query the SERVICE manages rather than one a create minted
+    /// ([`super::state::log_alarm_queries`]).
+    pub creation_time_ms: Option<i64>,
+    /// `lastUpdatedTime` — "The timestamp when the scheduled query was last updated", in epoch
+    /// milliseconds. A query nothing has updated since it was created reports the instant it
+    /// was created.
+    pub last_updated_time_ms: Option<i64>,
+    /// `lastTriggeredTime` — "The timestamp when the scheduled query was last executed", in
+    /// epoch milliseconds, and `lastExecutionStatus` — "The status of the most recent execution
+    /// of the scheduled query". `None` on a query no execution has been recorded for, which is
+    /// every query this store holds until the execution history is implemented: both members
+    /// report an execution that happened, so neither is reported for one that has not.
+    pub last_triggered_time_ms: Option<i64>,
+    /// See [`Self::last_triggered_time_ms`].
+    pub last_execution_status: Option<String>,
+    /// The tags `CreateScheduledQuery$tags` assigned to this query. A `BTreeMap` so the stored
+    /// order is stable; no response member of a scheduled query reports them, so they are read
+    /// back through the tagging operations once those reach this resource.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ScheduledQueryRecord {
+    /// A scheduled query a caller created, from the members a create must name.
+    ///
+    /// Everything else — the description, the log groups, the timezone, the offsets, the
+    /// destination configuration, the schedule window, the state, the tags and the instants —
+    /// is left at its "the request named none" value, which for the state is the documented
+    /// default ([`SCHEDULED_QUERY_STATE_ENABLED`]), and set on the returned record by the
+    /// caller that has them.
+    pub fn new(
+        name: &str,
+        arn: &str,
+        query_language: &str,
+        query_string: &str,
+        schedule_expression: &str,
+        execution_role_arn: &str,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: arn.to_string(),
+            description: None,
+            query_language: query_language.to_string(),
+            query_string: query_string.to_string(),
+            log_group_identifiers: Vec::new(),
+            schedule_expression: schedule_expression.to_string(),
+            timezone: None,
+            start_time_offset: None,
+            end_time_offset: None,
+            destination_configuration: None,
+            state: SCHEDULED_QUERY_STATE_ENABLED.to_string(),
+            schedule_type: SCHEDULE_TYPE_CUSTOMER_MANAGED.to_string(),
+            schedule_start_time: None,
+            schedule_end_time: None,
+            execution_role_arn: execution_role_arn.to_string(),
+            creation_time_ms: None,
+            last_updated_time_ms: None,
+            last_triggered_time_ms: None,
+            last_execution_status: None,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// The scheduled query the SERVICE manages for a log alarm, from the members that alarm's
+    /// `ScheduledQueryConfiguration` carries: its schedule type is
+    /// [`log_alarm_queries::SCHEDULE_TYPE_AWS_MANAGED`] rather than the caller's, and its query
+    /// is in this service's default query language ([`DEFAULT_QUERY_LANGUAGE`]), which the
+    /// alarm states no language for.
+    ///
+    /// `arn` is the ARN the alarm's configuration names the query by
+    /// (`ScheduledQueryConfiguration$QueryARN`). The rest is set by the caller, as for
+    /// [`Self::new`].
+    pub fn managed(
+        name: &str,
+        arn: String,
+        query_string: &str,
+        schedule_expression: &str,
+        execution_role_arn: &str,
+    ) -> Self {
+        Self {
+            schedule_type: log_alarm_queries::SCHEDULE_TYPE_AWS_MANAGED.to_string(),
+            ..Self::new(
+                name,
+                &arn,
+                DEFAULT_QUERY_LANGUAGE,
+                query_string,
+                schedule_expression,
+                execution_role_arn,
+            )
         }
     }
 }
@@ -6032,6 +6242,20 @@ fn filter_pattern_structure(pattern: &str, opened: char) -> Result<(), PatternDe
         Ok(())
     } else {
         Err(PatternDefect::UnbalancedBrackets)
+    }
+}
+
+/// The scheduled query name a `ScheduledQueryIdentifier` names: the identifier itself when it
+/// is a name, or the name segment of a scheduled-query ARN ([`scheduled_query_arn`]).
+///
+/// A scheduled query is identified by "The ARN or name of the scheduled query", and the ARN
+/// is built FROM the name, so an ARN names the query its resource segment does — the way a
+/// `logGroupIdentifier` names a log group through [`log_group_name_from_identifier`].
+pub fn scheduled_query_name_from_identifier(identifier: &str) -> &str {
+    const MARKER: &str = ":scheduled-query:";
+    match identifier.find(MARKER) {
+        Some(at) => &identifier[at + MARKER.len()..],
+        None => identifier,
     }
 }
 

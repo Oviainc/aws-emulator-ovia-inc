@@ -139,6 +139,8 @@ mod resource_tag_removal;
 mod resource_tags;
 #[path = "all/retention_policy.rs"]
 mod retention_policy;
+#[path = "all/scheduled_queries.rs"]
+mod scheduled_queries;
 #[path = "all/scratch_queries.rs"]
 mod scratch_queries;
 #[path = "all/state_roundtrip.rs"]
