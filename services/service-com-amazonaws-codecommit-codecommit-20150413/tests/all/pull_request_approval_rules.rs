@@ -28,6 +28,7 @@ use sha2::Digest;
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codecommit_codecommit_20150413::state::ComAmazonawsCodecommitCodecommit20150413State as CodeCommitState;
+use service_com_amazonaws_codecommit_codecommit_20150413::state::MAX_APPROVAL_RULES_PER_PULL_REQUEST;
 
 use crate::harness::error_with_message;
 use crate::repository_lifecycle::{base64, emulator_with_engine, error, ok, string_at};
@@ -448,6 +449,77 @@ async fn deleting_a_name_the_pull_request_holds_no_rule_under_answers_no_rule_id
             rule_id.is_empty(),
             "case {name:?}: a rule the pull request does not hold leaves no id to answer, \
              got {rule_id:?}"
+        );
+    }
+}
+
+/// The sentence `NumberOfRulesExceededException` is documented with
+/// (`smithy_query(query="doc",shape="NumberOfRulesExceededException")`), which is what
+/// the refusal states before naming the bound.
+const RULES_EXCEEDED_SENTENCE: &str = "The approval rule cannot be added. The pull request \
+                                       has the maximum number of approval rules associated \
+                                       with it.";
+
+/// How many approval rules one pull request carries before a create is refused — the
+/// bound this service publishes, read from it rather than written out here, so the
+/// table below fills the pull request to exactly the bound it enforces.
+#[tokio::test]
+async fn a_pull_request_takes_no_more_rules_than_the_published_maximum() {
+    // Rows differ along how the pull request's rules got onto it: created on it alone,
+    // and created on it beside a rule an associated template applied — both count
+    // against the one bound.
+    for templates in [vec![], vec![TEMPLATE]] {
+        let fixture = fixture(&templates).await;
+        let applied = fixture.reported_rules().await.len();
+        assert_eq!(
+            applied,
+            templates.len(),
+            "case {templates:?}: each associated template applies one rule"
+        );
+        for index in applied..MAX_APPROVAL_RULES_PER_PULL_REQUEST {
+            let created = fixture
+                .create_rule(&format!("rule-{index}"), &document(1, &[]))
+                .await;
+            assert!(
+                !string_at(&created, "/approvalRule/approvalRuleId").is_empty(),
+                "case {templates:?}: rule {index} had to be created, got {created}"
+            );
+        }
+        let filled = fixture.reported_rules().await;
+        assert_eq!(
+            filled.len(),
+            MAX_APPROVAL_RULES_PER_PULL_REQUEST,
+            "case {templates:?}: the pull request had to fill up to the bound"
+        );
+
+        let (code, message) = error_with_message(
+            &fixture.router,
+            "CreatePullRequestApprovalRule",
+            &json!({
+                "pullRequestId": fixture.pull_request_id,
+                "approvalRuleName": "one-too-many",
+                "approvalRuleContent": document(1, &[]),
+            }),
+            CLIENT_ERROR_STATUS,
+        )
+        .await;
+        assert_eq!(
+            code, "NumberOfRulesExceededException",
+            "case {templates:?}: expected NumberOfRulesExceededException, got {code:?}"
+        );
+        assert!(
+            message.starts_with(RULES_EXCEEDED_SENTENCE),
+            "case {templates:?}: expected a message opening {RULES_EXCEEDED_SENTENCE:?}, \
+             got {message:?}"
+        );
+        assert!(
+            message.contains(&MAX_APPROVAL_RULES_PER_PULL_REQUEST.to_string()),
+            "case {templates:?}: the refusal must state the bound it enforces, got {message:?}"
+        );
+        assert_eq!(
+            fixture.reported_rules().await,
+            filled,
+            "case {templates:?}: the refused create must leave every rule as it was"
         );
     }
 }
