@@ -124,6 +124,58 @@ impl Emulator {
         self.call("POST", "/v1/clusters", Some(request.to_json())).await
     }
 
+    /// `CreateClusterV2`, which the model binds to `POST /api/v2/clusters`, with
+    /// `body` as given — the one call behind both cluster kinds the v2 create
+    /// accepts.
+    pub async fn create_cluster_v2(&self, body: Value) -> Reply {
+        self.call("POST", "/api/v2/clusters", Some(body)).await
+    }
+
+    /// Create a SERVERLESS cluster through `CreateClusterV2`, assert it succeeded,
+    /// and hand back the minted ARN. `vpc_configs` is one subnet list per
+    /// `VpcConfig` the create submits and `iam` turns SASL/IAM client
+    /// authentication on when the row names it, which is the whole `Serverless`
+    /// body a suite needs to stand a serverless cluster up; the full
+    /// serverless-create matrix lives in the `create_cluster_v2` suite.
+    pub async fn create_serverless_ok(
+        &self,
+        name: &str,
+        vpc_configs: &[Vec<&str>],
+        iam: Option<bool>,
+    ) -> String {
+        let mut serverless = json!({
+            "vpcConfigs": vpc_configs
+                .iter()
+                .map(|subnets| json!({ "subnetIds": subnets }))
+                .collect::<Vec<Value>>(),
+        });
+        if let Some(enabled) = iam {
+            serverless["clientAuthentication"] =
+                json!({ "sasl": { "iam": { "enabled": enabled } } });
+        }
+        let reply = self
+            .create_cluster_v2(json!({ "clusterName": name, "serverless": serverless }))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {name:?}: expected a serverless CreateClusterV2 to return 200, got {} {}",
+            reply.status, reply.body
+        );
+        reply.body["clusterArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {name:?}: a serverless CreateClusterV2 returned no clusterArn")
+            })
+            .to_string()
+    }
+
+    /// `DescribeClusterV2`, which the model binds to `GET /api/v2/clusters/{ClusterArn}`
+    /// — the reader that reports a cluster's `ClusterType`.
+    pub async fn describe_v2(&self, arn: &str) -> Reply {
+        self.call("GET", &format!("/api/v2/clusters/{}", pct(arn)), None)
+            .await
+    }
+
     pub async fn describe(&self, arn: &str) -> Reply {
         self.call("GET", &format!("/v1/clusters/{}", pct(arn)), None)
             .await

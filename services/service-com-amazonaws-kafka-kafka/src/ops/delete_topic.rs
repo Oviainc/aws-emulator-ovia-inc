@@ -14,6 +14,9 @@
 //!   can hold a topic of that name, so it is refused before any lookup;
 //! * a well-formed `ClusterArn` this endpoint's region holds no cluster for
 //!   (absent, or belonging to another region) is a `NotFoundException`;
+//! * a cluster this endpoint DOES hold whose `ClusterType` is serverless is refused
+//!   with [`crate::state::serverless_topic_apis_unsupported`], before the topic is
+//!   looked up: the Topic Management surface is not offered for that cluster kind;
 //! * a legal name the cluster holds no topic for is an
 //!   `UnknownTopicOrPartitionException`, the modelled 404 for the topic rather
 //!   than for the cluster.
@@ -211,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cluster is resolved FIRST: a topic is addressed through the cluster
         // whose brokers hold it, so a cluster this endpoint does not hold is the
         // resource that is missing, not the topic.
-        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
             return Err(
                 DeleteTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
@@ -219,6 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into(),
             );
+        };
+
+        // The Topic Management surface applies to a cluster whose brokers this
+        // service manages for the caller, so a serverless one is refused on its
+        // KIND -- before the topic is looked up and before any removal is
+        // scheduled, so the refusal leaves the registry exactly as it was.
+        if cluster.is_serverless() {
+            return Err(crate::state::serverless_topic_apis_unsupported());
         }
 
         let Some(topic) = state.begin_topic_deletion(
