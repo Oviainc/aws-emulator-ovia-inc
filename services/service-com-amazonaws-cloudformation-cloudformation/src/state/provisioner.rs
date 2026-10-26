@@ -571,15 +571,18 @@ impl Provisioner {
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
     /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
     /// half of a pair, and so do Amazon ECS's `CreateCluster`, Amazon MSK's two cluster
-    /// creates and Amazon SQS's `CreateQueue` — the last of which refuses it in its own
-    /// crate's `state::tag_refusal`, the one check both `CreateQueue`'s `tags` map and
-    /// `TagQueue` run.
+    /// creates, Amazon SQS's `CreateQueue` — which refuses it in its own crate's
+    /// `state::tag_refusal`, the one check both `CreateQueue`'s `tags` map and `TagQueue`
+    /// run — and Amazon Data Firehose's `CreateDeliveryStream`, whose `TagKey` shape is
+    /// modelled with the reserved prefix excluded, the same check its `TagDeliveryStream`
+    /// makes.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
             Self::IamRole
                 | Self::CodePipelinePipeline
                 | Self::EcsCluster
+                | Self::FirehoseDeliveryStream
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
@@ -1031,7 +1034,9 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 ///
 /// `Tags` is the one member the request does not carry verbatim: the stream carries the
 /// tags CloudFormation gives it beside the declared ones ([`tags_of`]), as the `[{Key,
-/// Value}]` list Firehose's own `Tag` shape spells.
+/// Value}]` list Firehose's own `Tag` shape spells — less the `aws:cloudformation:*` ones,
+/// which `CreateDeliveryStream` refuses to a caller like the other reserved-namespace APIs
+/// ([`Provisioner::applicable_tags`]).
 async fn create_delivery_stream(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
