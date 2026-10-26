@@ -305,6 +305,25 @@ pub const RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE: &str = "Rule groups namespace
 /// reason [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is.
 pub const LOGGING_NOT_FOUND_MESSAGE: &str = "Logging configuration not found.";
 
+/// The `message` the modelled `ValidationException` reports when the workspace's
+/// rules-and-alerting logging configuration is asked to be CREATED while the one the
+/// workspace holds is being deleted.
+///
+/// A record whose removal the clock already owes is still held, so there is nothing to
+/// create yet, and it is not a record a create can be answered from either: it is about
+/// to be dropped. Constant and id-free, like every other refusal sentence here — the
+/// workspace a caller named is already in its own request — and named for the resource it
+/// speaks about, as the neighbouring refusals of each configuration are.
+pub const LOGGING_CONFIGURATION_DELETING_MESSAGE: &str =
+    "The logging configuration is being deleted; create it again once the deletion has \
+     completed.";
+
+/// [`LOGGING_CONFIGURATION_DELETING_MESSAGE`] for the workspace's QUERY logging
+/// configuration, which is a different resource with its own lifecycle.
+pub const QUERY_LOGGING_CONFIGURATION_DELETING_MESSAGE: &str =
+    "The query logging configuration is being deleted; create it again once the deletion \
+     has completed.";
+
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no resource-based policy — constant and id-free for the same reason
 /// [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the workspace is reported in `resourceId`.

@@ -69,6 +69,7 @@ use super::{
     RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
 };
 use crate::ops::types::{
+    EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
     R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
 };
 
@@ -688,14 +689,39 @@ fn put_preferences(row: &mut ExportRow, preferences: &EffectivePreferences) {
     );
 }
 
-/// The exportable field one utilization metric lands under:
-/// `UtilizationMetrics<MetricName><Statistic>`.
+/// The exportable field one utilization metric lands under —
+/// `<prefix><MetricName><Statistic>` — as the resource type's own `Exportable*Field` enum
+/// (`fields`) declares it.
 ///
 /// The field sets spell every metric name as its own enum does, bar the CPU series: the
 /// `IdleMetricName` value is `CPU` while the field is `UtilizationMetricsCpuMaximum`.
-fn utilization_field(prefix: &str, name: &str, statistic: &str) -> String {
+///
+/// The STATISTIC a field's name carries is the one the export file reports that metric under,
+/// which need not be the statistic a recommendation reports it with: this API "returns
+/// utilization metrics using only the `Maximum` statistic" while a field set names, say, a
+/// cache hit count `UtilizationMetricsCacheHitsSum`. So the field named for the OBSERVED
+/// statistic is used wherever the enum declares it — which is what picks between the two
+/// fields a metric carrying one field per statistic has — and otherwise the single field that
+/// enum declares for the metric, so an observed metric lands in the column that names it
+/// rather than in no column at all. A metric the enum declares no unambiguous field for keeps
+/// the statistic-named field, which no column of that resource type reads, so nothing is
+/// reported under a name the model does not give it.
+fn utilization_field(fields: &[&str], prefix: &str, name: &str, statistic: &str) -> String {
     let name = if name == "CPU" { "Cpu" } else { name };
-    format!("{prefix}{name}{statistic}")
+    let stem = format!("{prefix}{name}");
+    let named = format!("{stem}{statistic}");
+    if fields.contains(&named.as_str()) {
+        return named;
+    }
+    let mut declared = fields.iter().filter(|field| {
+        field
+            .strip_prefix(stem.as_str())
+            .is_some_and(|statistic| statistic.starts_with(char::is_uppercase))
+    });
+    match (declared.next(), declared.next()) {
+        (Some(only), None) => (*only).to_string(),
+        _ => named,
+    }
 }
 
 /// The `Exportable*Field` an export file names a resource's own ARN under: each resource
@@ -919,7 +945,12 @@ fn auto_scaling_group_row(
         };
         put_number(
             &mut row,
-            &utilization_field("UtilizationMetrics", &name, &statistic),
+            &utilization_field(
+                EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES,
+                "UtilizationMetrics",
+                &name,
+                &statistic,
+            ),
             metric.value,
         );
     }
@@ -967,6 +998,7 @@ fn auto_scaling_group_row(
         put_number(
             &mut row,
             &utilization_field(
+                EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES,
                 "RecommendationOptionsProjectedUtilizationMetrics",
                 &name,
                 &statistic,
@@ -1313,7 +1345,12 @@ fn idle_row(
         };
         put_number(
             &mut row,
-            &utilization_field("UtilizationMetrics", name, statistic),
+            &utilization_field(
+                EXPORTABLE_IDLE_FIELD_VALUES,
+                "UtilizationMetrics",
+                name,
+                statistic,
+            ),
             metric.value,
         );
     }

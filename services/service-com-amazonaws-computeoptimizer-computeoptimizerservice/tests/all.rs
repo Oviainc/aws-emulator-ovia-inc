@@ -39,6 +39,8 @@ mod enrollment_and_preferences;
 mod harness;
 #[path = "all/idle_recommendations.rs"]
 mod idle_recommendations;
+#[path = "all/idle_recommendations_export.rs"]
+mod idle_recommendations_export;
 #[path = "all/lambda_function_recommendations.rs"]
 mod lambda_function_recommendations;
 #[path = "all/lambda_function_recommendations_export.rs"]

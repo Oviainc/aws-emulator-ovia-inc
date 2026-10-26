@@ -311,6 +311,24 @@ impl AppBundleRecord {
             .filter(|authorization| authorization.status == APP_AUTHORIZATION_STATUS_CONNECTED)
     }
 
+    /// This bundle's ingestion for one (application, tenant) pair, if it holds
+    /// one — the mirror of [`AppBundleRecord::authorization_for`].
+    ///
+    /// The pair is what ties an ingestion to an app authorization: an ingestion
+    /// is created for an (`app`, `tenantId`) pair and only for a pair whose
+    /// authorization has completed the connect handshake (see
+    /// [`AppBundleRecord::connected_authorization`]), so the ingestion this
+    /// answers is the one ASSOCIATED with that authorization — what a delete of
+    /// the authorization has to find gone first.
+    /// The OLDEST matching ingestion is the one answered, so a bundle that holds
+    /// more than one for the same pair names the same record on every call and a
+    /// refusal built from it reads the same twice.
+    pub fn ingestion_for(&self, app: &str, tenant: &str) -> Option<&IngestionRecord> {
+        self.ingestions_in_order()
+            .into_iter()
+            .find(|ingestion| ingestion.app == app && ingestion.tenant_id == tenant)
+    }
+
     /// This bundle's user access tasks in start order.
     pub fn user_access_tasks_in_order(&self) -> Vec<&UserAccessTaskRecord> {
         let mut tasks: Vec<&UserAccessTaskRecord> = self.user_access_tasks.values().collect();

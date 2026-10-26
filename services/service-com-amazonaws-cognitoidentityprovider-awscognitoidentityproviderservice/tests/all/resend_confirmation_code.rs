@@ -50,9 +50,9 @@ const ENDPOINT_HOST: &str = "cognito-idp.us-east-1.amazonaws.com";
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
-/// The one sentence a `UserNotFoundException` says, for every username and every
-/// operation that resolves one.
-const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+/// The one sentence a `UserNotFoundException` says for this operation, which resolves
+/// the user from the `Username` and the `ClientId` of the request together.
+const USER_NOT_FOUND_MESSAGE: &str = "Username/client id combination not found.";
 
 /// What a resend says when the pool auto-verifies nothing the user holds a value for,
 /// so the code has no address to go to.
@@ -572,7 +572,7 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
             Subject::UnknownUserHidden,
             403,
             "NotAuthorizedException",
-            "Username/client id combination not found.".to_string(),
+            USER_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "a user whose sign-up is already confirmed",

@@ -370,7 +370,7 @@ async fn fresh_page(emulator: &Emulator, contact: &str, case: &str) -> PageRecor
 }
 
 /// Whole seconds since the epoch, as the wire reports a modelled timestamp.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -378,7 +378,7 @@ fn now_secs() -> f64 {
 }
 
 /// `body[field]` as epoch seconds, when the response carries it.
-fn wire_time(body: &Value, field: &str) -> Option<f64> {
+pub(crate) fn wire_time(body: &Value, field: &str) -> Option<f64> {
     body.get(field).and_then(Value::as_f64)
 }
 

@@ -227,20 +227,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        if let Some(why) = crate::state::encryption_configuration_rejection(
+        // The rules a write's configuration has to satisfy, and the order they are
+        // applied in, are single-homed in `crate::state` — the update path applies the
+        // same chain — and the sentence it hands back is rendered as this operation's
+        // own modelled `ValidationException`.
+        if let Some(why) = crate::state::write_configuration_rejection(
             input.encryption_configuration.as_ref(),
-        )
-        .or_else(|| {
-            crate::state::cross_account_configurations_rejection(
-                input.cross_account_configurations.as_deref(),
-            )
-        })
-        .or_else(|| {
-            crate::state::collection_bounds_rejection(
-                input.tag_key_boundaries.as_deref(),
-                input.chatbot_notification_channel.as_ref(),
-            )
-        }) {
+            input.cross_account_configurations.as_deref(),
+            input.tag_key_boundaries.as_deref(),
+            input.chatbot_notification_channel.as_ref(),
+        ) {
             return Err(CreateInvestigationGroupErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
             )

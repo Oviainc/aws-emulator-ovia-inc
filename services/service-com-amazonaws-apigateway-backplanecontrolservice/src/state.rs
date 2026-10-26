@@ -1916,6 +1916,43 @@ pub enum PatchFailure {
     Conflict(String),
 }
 
+/// How ONE operation words its refusal of a patch `path` it cannot apply.
+///
+/// API Gateway does not word that refusal the same way for every resource: for some of
+/// them it is the bare sentence [`invalid_patch_path`] builds, and for others it also
+/// quotes the `op` the path rode in on and enumerates the paths the operation does
+/// accept. The wording is a property of the OPERATION, not of the mistake, so each
+/// handler names its own when it reads the request's `patchOperations`
+/// ([`parse_patches`] / [`parse_patches_refused_with`]) and every path refusal that
+/// request goes on to produce — a member the resource does not have, a pointer that is no
+/// JSON Pointer, one reaching into a single-valued member, one naming a map member with
+/// no key — reads the same.
+#[derive(Debug, Clone, Copy)]
+pub enum InvalidPathRefusal {
+    /// The fixed sentence and the path the request sent, and nothing else.
+    PathOnly,
+    /// The path quoted, the `op` of the same `patchOperations` entry, and the paths the
+    /// operation accepts — in the order the service itself prints them, which is why the
+    /// list is given rather than derived from a handler's match arms.
+    PathOpAndSupported(&'static [&'static str]),
+}
+
+impl InvalidPathRefusal {
+    /// The `BadRequestException` message for `path`, named by `op`.
+    fn message(self, path: &str, op: PatchOpKind) -> String {
+        match self {
+            Self::PathOnly => invalid_patch_path(path),
+            // The two spaces after `path` are the service's own, as is the bracketed,
+            // comma-separated list.
+            Self::PathOpAndSupported(supported) => format!(
+                "Invalid patch path  '{path}' specified for op '{}'. Must be one of: [{}]",
+                op.as_str(),
+                supported.join(", ")
+            ),
+        }
+    }
+}
+
 /// One parsed entry of `patchOperations`.
 #[derive(Debug, Clone)]
 pub struct Patch {
@@ -1931,6 +1968,8 @@ pub struct Patch {
     pub value: Option<String>,
     /// The `copy`/`move` source pointer (`PatchOperation$from`).
     pub from: Option<String>,
+    /// How the operation this patch was sent to words a refusal of its `path`.
+    pub invalid_path: InvalidPathRefusal,
 }
 
 /// Decode one JSON Pointer reference token.
@@ -1943,8 +1982,12 @@ fn unescape_pointer_token(token: &str) -> String {
 }
 
 impl Patch {
-    /// Parse one wire `PatchOperation`.
-    fn parse(operation: &crate::ops::types::PatchOperation) -> Result<Self, PatchFailure> {
+    /// Parse one wire `PatchOperation`, refusing a path it cannot read the way
+    /// `invalid_path` words it.
+    fn parse(
+        operation: &crate::ops::types::PatchOperation,
+        invalid_path: InvalidPathRefusal,
+    ) -> Result<Self, PatchFailure> {
         let op = operation.op.as_deref().ok_or_else(|| {
             PatchFailure::BadRequest(
                 "each patchOperations entry must carry an op".to_string(),
@@ -1967,7 +2010,7 @@ impl Patch {
         // root, so it begins with `/` and names at least one member.
         let tokens: Vec<String> = match path.strip_prefix('/') {
             Some(rest) if !rest.is_empty() => rest.split('/').map(unescape_pointer_token).collect(),
-            _ => return Err(PatchFailure::BadRequest(invalid_patch_path(path))),
+            _ => return Err(PatchFailure::BadRequest(invalid_path.message(path, op))),
         };
         Ok(Self {
             op,
@@ -1975,7 +2018,14 @@ impl Patch {
             tokens,
             value: operation.value.clone(),
             from: operation.from.clone(),
+            invalid_path,
         })
+    }
+
+    /// This patch's own refusal of its `path`, worded the way the operation it was sent
+    /// to words one.
+    fn invalid_path_message(&self) -> String {
+        self.invalid_path.message(&self.path, self.op)
     }
 
     /// The member the path's first reference token names.
@@ -2098,18 +2148,16 @@ impl Patch {
         if self.tokens.len() == 1 {
             return Ok(());
         }
-        Err(PatchFailure::BadRequest(invalid_patch_path(&self.path)))
+        Err(PatchFailure::BadRequest(self.invalid_path_message()))
     }
 
     /// The refusal for a path the targeted resource has no updateable member for.
     ///
     /// "Attempts to apply an unsupported operation on a resource will return an error
-    /// message" (`PatchOperation$op`), and the message API Gateway returns is
-    /// [`invalid_patch_path`]'s sentence: the fixed text and the path the request sent,
-    /// and nothing else — not the op that named it and not the paths the resource does
-    /// have.
+    /// message" (`PatchOperation$op`), and which message that is belongs to the operation
+    /// the patch was sent to — see [`InvalidPathRefusal`].
     pub fn unsupported_path(&self) -> PatchFailure {
-        PatchFailure::BadRequest(invalid_patch_path(&self.path))
+        PatchFailure::BadRequest(self.invalid_path_message())
     }
 
     /// The refusal for an op the member this path names does not support.
@@ -2145,7 +2193,7 @@ impl Patch {
     pub fn map_key(&self, depth: usize) -> Result<String, PatchFailure> {
         match self.tokens.get(depth..) {
             Some(rest) if !rest.is_empty() => Ok(rest.join("/")),
-            _ => Err(PatchFailure::BadRequest(invalid_patch_path(&self.path))),
+            _ => Err(PatchFailure::BadRequest(self.invalid_path_message())),
         }
     }
 }
@@ -2153,13 +2201,13 @@ impl Patch {
 /// The `BadRequestException` message for a patch `path` the targeted resource cannot be
 /// addressed by.
 ///
-/// API Gateway answers EVERY unaddressable path with one sentence — the fixed text
-/// `Invalid patch path` and then the path exactly as the request spelled it, as a
-/// recorded refusal of a `replace` of `/id` shows (`Invalid patch path /id`) — whichever
-/// way the pointer cannot be applied: a member the resource does not have, a pointer that
-/// is no JSON Pointer at all, one reaching into a single-valued member, or one naming a
-/// map member without a key. One copy for all of them, so a caller reading the text sees
-/// the same sentence for the same kind of mistake whichever resource it was made on.
+/// This is the wording of [`InvalidPathRefusal::PathOnly`] — the fixed text `Invalid
+/// patch path` and then the path exactly as the request spelled it, as a recorded refusal
+/// of a `replace` of `/id` shows (`Invalid patch path /id`) — and it is used whichever way
+/// the pointer cannot be applied: a member the resource does not have, a pointer that is
+/// no JSON Pointer at all, one reaching into a single-valued member, or one naming a map
+/// member without a key. One copy for all of them, so a caller reading the text sees the
+/// same sentence for the same kind of mistake on every operation that words it this way.
 pub fn invalid_patch_path(path: &str) -> String {
     format!("Invalid patch path {path}")
 }
@@ -2172,11 +2220,23 @@ pub fn invalid_patch_path(path: &str) -> String {
 pub fn parse_patches(
     operations: Option<&Vec<crate::ops::types::PatchOperation>>,
 ) -> Result<Vec<Patch>, PatchFailure> {
+    parse_patches_refused_with(operations, InvalidPathRefusal::PathOnly)
+}
+
+/// As [`parse_patches`], for an operation that words a refusal of a patch path it cannot
+/// apply its own way — see [`InvalidPathRefusal`].
+pub fn parse_patches_refused_with(
+    operations: Option<&Vec<crate::ops::types::PatchOperation>>,
+    invalid_path: InvalidPathRefusal,
+) -> Result<Vec<Patch>, PatchFailure> {
     let operations: &[crate::ops::types::PatchOperation] =
         operations.map(Vec::as_slice).unwrap_or_default();
     bound_entries("patchOperations", operations.len(), MAX_COLLECTION_ENTRIES)
         .map_err(PatchFailure::BadRequest)?;
-    operations.iter().map(Patch::parse).collect()
+    operations
+        .iter()
+        .map(|operation| Patch::parse(operation, invalid_path))
+        .collect()
 }
 
 /// The map key a patch names, refused when it is longer than a stored key may be.

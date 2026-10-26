@@ -33,10 +33,11 @@ use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
-    ChangeInfo, ConflictingDomainExists, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone,
-    HostedZoneConfig, HostedZoneFeatures, InvalidPaginationToken, InvalidTrafficPolicyDocument,
-    KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy,
-    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    ChangeInfo, ConflictingDomainExists, DelegationSet, HealthCheck, HealthCheckConfig,
+    HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
+    InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchDelegationSet,
+    NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, StatusReport, Tag,
+    TrafficPolicy, VPC, HEALTH_CHECK_REGION_VALUES, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -183,6 +184,9 @@ pub const ENDPOINT_HEALTH_CHECK_TYPES: &[&str] =
 /// (`HealthCheckType` enum).
 pub const STRING_MATCH_HEALTH_CHECK_TYPES: &[&str] = &["HTTP_STR_MATCH", "HTTPS_STR_MATCH"];
 
+/// The `HealthCheckType` that checks a TCP connection to the endpoint, rather
+/// than a response to a request (`HealthCheckType` enum).
+pub const HEALTH_CHECK_TYPE_TCP: &str = "TCP";
 /// The `HealthCheckType` that reads a CloudWatch alarm (`HealthCheckType` enum).
 pub const HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC: &str = "CLOUDWATCH_METRIC";
 /// The `HealthCheckType` that combines other health checks (`HealthCheckType` enum).
@@ -903,6 +907,11 @@ pub struct StoredHealthCheck {
     pub config: HealthCheckConfig,
     /// The `HealthCheckVersion`, starting at [`FIRST_HEALTH_CHECK_VERSION`].
     pub version: i64,
+    /// When the health check was created, in milliseconds since the Unix epoch:
+    /// the instant Route 53's checkers started checking its endpoint, and so the
+    /// base of the probe cadence [`StoredHealthCheck::last_checked_at_millis`]
+    /// reports a `CheckedTime` from.
+    pub created_at_millis: i64,
     /// The tags on this health check, keyed by tag key so one key carries one
     /// value (`ChangeTagsForResource`).
     pub tags: BTreeMap<String, String>,
@@ -935,6 +944,157 @@ impl StoredHealthCheck {
     pub fn to_tag_list(&self) -> Vec<Tag> {
         tags_to_list(&self.tags)
     }
+
+    /// Whether Route 53's health checkers are checking this health check's
+    /// endpoint at all.
+    ///
+    /// Two conditions, both from the model. The type: only the types that probe
+    /// an endpoint ([`ENDPOINT_HEALTH_CHECK_TYPES`]) have an endpoint for a
+    /// checker to report about — the others read a CloudWatch alarm, combine
+    /// child health checks or follow a routing control, and
+    /// `HealthCheckObservations` is "one HealthCheckObservation element for each
+    /// Amazon Route 53 health checker that is reporting a status about the
+    /// health check endpoint". And `Disabled`: "Route 53 stops submitting
+    /// requests to your application, server, or other resource", so a disabled
+    /// check has no checker reporting on it either.
+    pub fn endpoint_is_being_checked(&self) -> bool {
+        ENDPOINT_HEALTH_CHECK_TYPES.contains(&self.config.r#type.as_str())
+            && !self.config.disabled.unwrap_or(false)
+    }
+
+    /// The health-checking Regions this health check is checked from, in the
+    /// modelled `HealthCheckRegion` order.
+    ///
+    /// `HealthCheckConfig$Regions` is "one Region element for each region from
+    /// which you want Amazon Route 53 health checkers to check the specified
+    /// endpoint", and "if you don't specify any regions, Route 53 health
+    /// checkers automatically performs checks from all of the regions that are
+    /// listed under Valid Values" — the `HealthCheckRegion` values. Ordering by
+    /// that value list rather than by the request keeps two reads of one health
+    /// check in the same order, and drops a Region the enum does not carry.
+    pub fn checker_regions(&self) -> Vec<&'static str> {
+        let requested = self.config.regions.as_deref().unwrap_or(&[]);
+        HEALTH_CHECK_REGION_VALUES
+            .iter()
+            .copied()
+            .filter(|region| {
+                requested.is_empty() || requested.iter().any(|asked| asked == region)
+            })
+            .collect()
+    }
+
+    /// The instant of the most recent probe of this health check's endpoint, in
+    /// milliseconds since the Unix epoch.
+    ///
+    /// The checkers probe the endpoint every `RequestInterval` seconds from the
+    /// moment the health check was created, so the probe a read reports is the
+    /// last one that interval has come round for — DERIVED from the clock, so
+    /// reading the status neither starts a probe nor moves one on, and two reads
+    /// inside one interval report the same `CheckedTime`.
+    pub fn last_checked_at_millis(&self, now_millis: i64) -> i64 {
+        let seconds = self
+            .config
+            .request_interval
+            .unwrap_or(DEFAULT_REQUEST_INTERVAL)
+            .max(1);
+        let interval = i64::from(seconds) * MILLIS_PER_SECOND;
+        let elapsed = now_millis.saturating_sub(self.created_at_millis).max(0);
+        self.created_at_millis + (elapsed / interval) * interval
+    }
+
+    /// What one health checker reports about this health check's endpoint.
+    ///
+    /// The description names the criterion the check's `Type` sets — a TCP
+    /// connection for a `TCP` check, a response for the types that send a
+    /// request — and reports it as met. The emulator reaches a caller's endpoint
+    /// over no network, and its own world holds nothing that drops a connection,
+    /// answers a non-success status or withholds the body a string-match check
+    /// searches, so a checker of an endpoint this service is checking has no
+    /// failure to report. What the stored configuration decides is WHICH
+    /// checkers report ([`StoredHealthCheck::checker_regions`]), WHETHER any do
+    /// ([`StoredHealthCheck::endpoint_is_being_checked`]) and WHEN they last did
+    /// ([`StoredHealthCheck::last_checked_at_millis`]).
+    pub fn reported_status(&self) -> &'static str {
+        if self.config.r#type == HEALTH_CHECK_TYPE_TCP {
+            return STATUS_TCP_CONNECTION_ESTABLISHED;
+        }
+        STATUS_HTTP_OK
+    }
+
+    /// The modelled `HealthCheckObservation` list `GetHealthCheckStatus`
+    /// reports: one observation per health checker checking this endpoint, or
+    /// none when nothing is checking it (see
+    /// [`StoredHealthCheck::endpoint_is_being_checked`]).
+    pub fn to_health_check_observations(&self, now_millis: i64) -> Vec<HealthCheckObservation> {
+        if !self.endpoint_is_being_checked() {
+            return Vec::new();
+        }
+        let report = StatusReport {
+            status: Some(self.reported_status().to_string()),
+            checked_time: Some(::aws_smithy_types::DateTime::from_millis(
+                self.last_checked_at_millis(now_millis),
+            )),
+        };
+        self.checker_regions()
+            .into_iter()
+            .map(|region| HealthCheckObservation {
+                region: Some(region.to_string()),
+                ip_address: checker_address(region),
+                status_report: Some(report.clone()),
+            })
+            .collect()
+    }
+}
+
+/// Milliseconds in a second, for the `RequestInterval` (seconds) a probe cadence
+/// is computed from.
+const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// What a health checker reports for an endpoint that answered the request an
+/// `HTTP`, `HTTPS`, `HTTP_STR_MATCH` or `HTTPS_STR_MATCH` check sends it.
+///
+/// `StatusReport$Status` is "a description of the status of the health check
+/// endpoint as reported by one of the Amazon Route 53 health checkers" — free
+/// text the model constrains in no way — and Route 53 writes such a description
+/// as a sentence that opens with `Success: ` or `Failure: ` and names what the
+/// checker observed.
+pub const STATUS_HTTP_OK: &str = "Success: HTTP Status Code 200, OK";
+
+/// What a health checker reports for an endpoint that accepted the connection a
+/// `TCP` check opens.
+pub const STATUS_TCP_CONNECTION_ESTABLISHED: &str = "Success: TCP connection established";
+
+/// The address the health checker in `region` reports from, when `region` is one
+/// the service checks from.
+///
+/// `HealthCheckObservation$IPAddress` is "the IP address of the Amazon Route 53
+/// health checker that provided the failure reason in StatusReport", and the
+/// published table of health-checking blocks ([`CHECKER_IP_RANGES`]) says which
+/// blocks the checks come from but not which block belongs to which Region. So
+/// the pairing is this emulator's own: the Regions in the modelled
+/// `HealthCheckRegion` order each take one block in the order
+/// [`checker_ip_ranges`] reports them, and the checker's address is the first
+/// address inside that block. It is a function of those two tables alone, so
+/// every read of one health check reports the same checker address, and every
+/// address it reports is inside a block `GetCheckerIpRanges` publishes.
+pub fn checker_address(region: &str) -> Option<String> {
+    let position = HEALTH_CHECK_REGION_VALUES
+        .iter()
+        .position(|value| *value == region)?;
+    let blocks = checker_ip_ranges();
+    if blocks.is_empty() {
+        return None;
+    }
+    first_address_in(&blocks[position % blocks.len()])
+}
+
+/// The first address inside an `a.b.c.d/nn` block: the one after its network
+/// address, which is the first an interface in the block can carry.
+fn first_address_in(cidr: &str) -> Option<String> {
+    let (address, _prefix) = cidr.split_once('/')?;
+    let network = address.parse::<Ipv4Addr>().ok()?;
+    let first = u32::from(network).checked_add(1)?;
+    Some(Ipv4Addr::from(first).to_string())
 }
 
 /// `config` with the values the service fills in for a member the caller left

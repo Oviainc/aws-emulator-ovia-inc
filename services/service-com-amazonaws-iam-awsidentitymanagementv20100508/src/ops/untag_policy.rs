@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the tags whose keys this call names are dropped from the persisted
+//! customer managed policy in this service's state (`crate::state`) and the remaining
+//! set is read back by `GetPolicy` and `ListPolicyTags`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A value that is not a managed-policy ARN at all is an invalid input
+        // parameter, which is a different refusal from an ARN the account does not
+        // hold: `arnType` constrains only the length, so the form is checked here,
+        // through the one definition of the ARN grammar this crate holds — the same
+        // one `GetPolicy` reads a `PolicyArn` with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(UntagPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // This operation removes tags "from the customer managed policy": an ARN in
+        // AWS's own managed-policy namespace names a policy AWS owns and an account
+        // cannot change, so such an ARN is an out-of-range value for this parameter
+        // rather than a missing entity. The refusal does not depend on whether this
+        // emulator's catalog carries that entry, because no entry of it could carry a
+        // tag the account is able to remove either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(UntagPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be untagged.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is removed, and before the STORE is consulted for the
+        // policy — so a caller that may not change a policy's tags learns that it may not,
+        // never whether the account holds that policy. (The two refusals above are about
+        // the shape of the ARN the request supplied, which the caller already knows.) The
+        // decision is made on the ARN the request addresses, while the refusal NAMES the
+        // entity that ARN identifies: a managed policy, named by its type followed by the
+        // ARN the request carried.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UNTAG_POLICY,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
+        // The write is addressed exactly as a read of the same ARN is, so it reaches
+        // the one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist", through the one wording
+        // `crate::state` holds for a missing managed policy, which every operation
+        // taking a `PolicyArn` answers with.
+        let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
+            return Err(UntagPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "The tags with matching keys are removed from the specified policy"
+        // (`$TagKeys`): the removal, and the exact key comparison it makes, are the one
+        // shared rule in `crate::state`, so a named key the policy does not hold drops
+        // nothing rather than failing the call, and every key the request does not name
+        // keeps its value and its position in the held order.
+        let remaining = crate::state::remove_tags(
+            held.policy.tags.as_ref(),
+            input.tag_keys.iter().map(String::as_str),
+        );
+
+        // An empty tag set is the same as no tags, which is how `CreatePolicy` stores
+        // one: the member is reported only when the policy actually carries tags. The
+        // policy's `UpdateDate` is left alone — it reports when the policy's CONTENT
+        // was last updated, and a tag call creates no policy version.
+        held.policy.tags = (!remaining.is_empty()).then_some(remaining);
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // removed from which policy, so a state-changing call leaves a local record —
+        // the same shape `DeleteGroup` and the credential operations in this crate emit.
+        // The tag VALUES are not recorded, only the keys the request named.
+        ::tracing::info!(
+            audit = true,
+            operation = "UntagPolicy",
+            outcome = "untagged",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            policy_arn = %input.policy_arn,
+            tag_keys = ?input.tag_keys,
+            "tags were removed from a managed policy"
+        );
+        Ok(UntagPolicyOutput)
     }
 }
+

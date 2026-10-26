@@ -72,10 +72,11 @@
 //! reports when the ARN it is given carries that version's number.
 //!
 //! And it holds the build workflows of those policies —
-//! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them and
+//! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them,
+//! `ops/cancel_automated_reasoning_policy_build_workflow.rs` stops them and
 //! `ops/get_automated_reasoning_policy_build_workflow.rs` reads them back — each with the
 //! document the start named and the instant its non-terminal `status` is owed its move to
-//! `COMPLETED`.
+//! `COMPLETED`, or to `CANCELLED` once a cancel has asked for it.
 //!
 //! And it holds the Automated Reasoning policy tests
 //! `ops/create_automated_reasoning_policy_test_case.rs` mints and
@@ -1677,6 +1678,46 @@ pub const BUILD_WORKFLOW_STATUS_SCHEDULED: &str = "SCHEDULED";
 /// owes a build workflow [`BUILD_WORKFLOW_COMPLETE_AFTER`] from its start.
 pub const BUILD_WORKFLOW_STATUS_COMPLETED: &str = "COMPLETED";
 
+/// `AutomatedReasoningPolicyBuildWorkflowStatus$CANCEL_REQUESTED` — the status a build
+/// workflow carries from the `CancelAutomatedReasoningPolicyBuildWorkflow` that asked for
+/// its cancellation until the clock owes it [`BUILD_WORKFLOW_STATUS_CANCELLED`]. The enum
+/// carries this status beside the terminal one because stopping a running build is
+/// asynchronous: the ask is recorded first and the workflow winds down afterwards.
+pub const BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED: &str = "CANCEL_REQUESTED";
+
+/// `AutomatedReasoningPolicyBuildWorkflowStatus$CANCELLED` — the terminal status the clock
+/// owes a build workflow whose cancellation was asked for.
+pub const BUILD_WORKFLOW_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// `AutomatedReasoningPolicyBuildWorkflowStatus$FAILED` — the other terminal status the
+/// enum admits. Nothing in this emulator moves a workflow to it, and it is named here so
+/// [`AutomatedReasoningPolicyBuildWorkflowRecord::is_active`] decides on the whole set of
+/// terminal statuses rather than on the two this emulator produces.
+pub const BUILD_WORKFLOW_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `CancelAutomatedReasoningPolicyBuildWorkflow` accepts a cancellation the
+/// workflow's `status` is owed its move from [`BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED`] to
+/// [`BUILD_WORKFLOW_STATUS_CANCELLED`].
+///
+/// The emulator's own span, chosen like [`BUILD_WORKFLOW_COMPLETE_AFTER`] rather than
+/// documented by AWS, and non-zero so a caller reading straight after the cancel still
+/// sees the status that cancel recorded.
+pub const BUILD_WORKFLOW_CANCELLED_AFTER: Duration = Duration::from_millis(500);
+
+/// What a request addressing a build workflow this store does not hold answers as its
+/// `ResourceNotFoundException` message, wherever that request came from: a read of one, or
+/// the cancel of one.
+///
+/// RECORDED behaviour, and a message with NO variable parts: the corpus
+/// `simparity-behavioral-ga-prod-v1` records Amazon Bedrock naming neither the policy the
+/// request addressed nor the workflow id it carried, so the wording is the whole
+/// requirement and is shared by every operation that addresses the resource — the message
+/// belongs to the RESOURCE, not to one operation.
+#[must_use]
+pub fn build_workflow_not_found_message() -> &'static str {
+    "Build WorkflowExecution not found"
+}
+
 /// One stored Automated Reasoning policy build workflow: the identity
 /// `StartAutomatedReasoningPolicyBuildWorkflow` minted, the document that request named,
 /// and the status `GetAutomatedReasoningPolicyBuildWorkflow` reports.
@@ -1704,11 +1745,14 @@ pub struct AutomatedReasoningPolicyBuildWorkflowRecord {
     /// `AutomatedReasoningPolicyBuildWorkflowStatus`.
     pub status: &'static str,
     /// When [`Self::status`] is owed its move to [`BUILD_WORKFLOW_STATUS_COMPLETED`], or
-    /// `None` once it is terminal.
+    /// `None` once it is terminal or a cancellation has been asked for.
     ///
     /// The due INSTANT, not a timer, for the same reason
     /// [`ModelImportJobRecord::completed_due_at`] is one.
     pub completed_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to [`BUILD_WORKFLOW_STATUS_CANCELLED`], or
+    /// `None` while no cancellation is in flight.
+    pub cancelled_due_at: Option<SystemTime>,
     /// `documentName` of the source document the start carried, or `None` when it carried
     /// no document at all.
     pub document_name: Option<String>,
@@ -1723,23 +1767,58 @@ pub struct AutomatedReasoningPolicyBuildWorkflowRecord {
 
 impl AutomatedReasoningPolicyBuildWorkflowRecord {
     /// Whether this workflow is still working, so the policy it builds is in use by it.
+    ///
+    /// A workflow whose cancellation has been asked for is still winding down, so it is
+    /// still working: only a terminal status frees the policy it builds.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.status != BUILD_WORKFLOW_STATUS_COMPLETED
+        !matches!(
+            self.status,
+            BUILD_WORKFLOW_STATUS_COMPLETED
+                | BUILD_WORKFLOW_STATUS_CANCELLED
+                | BUILD_WORKFLOW_STATUS_FAILED
+        )
     }
 
-    /// Materialise the move to [`BUILD_WORKFLOW_STATUS_COMPLETED`] the clock has already
-    /// made due at `now`.
+    /// Whether a cancellation has already taken this workflow over: it is winding down, or
+    /// it has wound down.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.status == BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED
+            || self.status == BUILD_WORKFLOW_STATUS_CANCELLED
+    }
+
+    /// Materialise the status transition the clock has already made due at `now`: the
+    /// completion a start owes a workflow, or the cancellation a cancel owes one.
     ///
     /// The only write a reporting operation on this resource makes: it was owed at the due
     /// instant even if nobody had called, which is why that instant — not `now` — is the
-    /// one the workflow reports as its last update.
+    /// one the workflow reports as its last update. The two instants are mutually
+    /// exclusive: a cancel drops the completion it was owed.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
             self.status = BUILD_WORKFLOW_STATUS_COMPLETED;
             self.completed_due_at = None;
             self.updated_at = due;
         }
+        if let Some(due) = self.cancelled_due_at.filter(|due| now >= *due) {
+            self.status = BUILD_WORKFLOW_STATUS_CANCELLED;
+            self.cancelled_due_at = None;
+            self.updated_at = due;
+        }
+    }
+
+    /// Move this workflow to [`BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED`] and record when it
+    /// is owed its move to [`BUILD_WORKFLOW_STATUS_CANCELLED`].
+    ///
+    /// The caller's own write, asked for by
+    /// `CancelAutomatedReasoningPolicyBuildWorkflow` — not a clock transition. The build it
+    /// was running is being stopped, so the workflow is owed no completion any more.
+    pub fn cancel(&mut self, now: SystemTime) {
+        self.status = BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED;
+        self.cancelled_due_at = Some(now + BUILD_WORKFLOW_CANCELLED_AFTER);
+        self.completed_due_at = None;
+        self.updated_at = now;
     }
 }
 

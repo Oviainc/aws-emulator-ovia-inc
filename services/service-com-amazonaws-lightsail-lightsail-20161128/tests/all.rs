@@ -21,6 +21,8 @@ mod add_on_disable;
 mod alarm_configuration;
 #[path = "all/alarm_state_test.rs"]
 mod alarm_state_test;
+#[path = "all/auto_snapshot_delete.rs"]
+mod auto_snapshot_delete;
 #[path = "all/auto_snapshots.rs"]
 mod auto_snapshots;
 #[path = "all/blueprint_catalog.rs"]

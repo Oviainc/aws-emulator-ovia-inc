@@ -39,9 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here: `override_operation` serves every routable request
+//! through [`error_message_member::ErrorMessageMemberOperation`], so the text of a failure
+//! the FRAMEWORK rendered is reported in the `Message` member every error shape in this
+//! service's model declares — see [`error_message_member`] for the rule and why the
+//! refusal seam below cannot state it.
+
+pub mod error_message_member;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
 
@@ -55,6 +63,44 @@ use std::sync::Arc;
 /// because [`Service::override_refusal`] replaces the code and the message together.
 const INVALID_ARGUMENT_EXCEPTION: &str = "InvalidArgumentException";
 
+/// The sentence this service states a TAG it rejects with.
+///
+/// Global Accelerator validates the tags a request carries in its own frontend rather
+/// than reporting them through the per-member constraint report the rest of its input
+/// goes through: recorded wire behaviour — a request carrying a tag whose key is the
+/// empty string (outside the `@length` 1..128 `TagKey` declares) is answered `400`
+/// `InvalidArgumentException` with this fixed sentence, which names no member and echoes
+/// no value. It is the wording for the CLASS — a tag the request named is not a tag this
+/// service accepts — so it is stated for either bound the model declares for a `Tag`,
+/// rather than for the one bound a recording happened to break.
+const INVALID_PARAMETER: &str = "Invalid parameter.";
+
+/// The member that carries tags: the `Tags` list of
+/// `Tag { Key (@length 1..128), Value (@length 0..256) }`
+/// (`smithy_query(query="shape", shape="Tag,TagKey,TagValue")`), which is the member the
+/// recorded refusal above is about and the one shape a tag is submitted as.
+///
+/// The framework's constraint walk reports a violation at the lowerCamel path of the
+/// member it was found under (`tags.1.member.key`), so the member a clause is about is
+/// read off the head of that path. `UntagResource`'s `TagKeys` — a list of bare key
+/// strings, not of `Tag` — is deliberately NOT here: nothing records how this service
+/// states a refusal of one, so it keeps the per-member report.
+const TAG_PARAMETER_MEMBER: &str = "tags";
+
+/// Whether every value `violations` reports is a tag the request carried — the condition
+/// under which this service states [`INVALID_PARAMETER`] instead of the per-member
+/// constraint report.
+///
+/// ALL of them, because a request that also breaks a bound on a member of its own is
+/// stated as the report that names every clause: the tag sentence names nothing, so
+/// answering it for such a request would drop what was said about the other member.
+fn only_tag_parameters(violations: &[Violation]) -> bool {
+    !violations.is_empty()
+        && violations.iter().all(|violation| {
+            violation.path.split('.').next().unwrap_or_default() == TAG_PARAMETER_MEMBER
+        })
+}
+
 /// The `com-amazonaws-globalaccelerator-globalaccelerator-v20180706` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -62,6 +108,9 @@ const INVALID_ARGUMENT_EXCEPTION: &str = "InvalidArgumentException";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back. Stateless, and held here rather than
+    /// built per request because that seam returns a BORROW.
+    error_message_member: error_message_member::ErrorMessageMemberOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -71,6 +120,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            error_message_member: error_message_member::ErrorMessageMemberOperation,
         }
     }
 }
@@ -97,13 +147,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
-    }
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped so an error the FRAMEWORK
+        // rendered (the pre-handler refusal of a modelled constraint, the scaffold's 501)
+        // reports its text in the `Message` member every error shape in this service's
+        // model declares, rather than in the synthetic shapes' own `message`, which no
+        // client of this awsJson1_1 service reads (see [`error_message_member`]). A key
+        // the model does not name resolves to `None` here exactly as it does in the
+        // generated table, so the router's routing-error path is unchanged.
+        error_message_member::routes(&self.entry, req)
+            .then_some(&self.error_message_member as &dyn ErasedOperation)    }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal — a member
@@ -123,7 +176,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure, and the service models `AccessDeniedException`
         // for it on the operations that can answer it.
+        //
+        // This seam chooses the code and the words only; the body MEMBER they are
+        // serialized into is not reachable from here — see [`error_message_member`].
+        //
+        // The ONE class it states in its own words is a tag (see [`INVALID_PARAMETER`]),
+        // which this service validates itself and reports without naming a member.
         match refusal {
+            Refusal::Invalid(violations) if only_tag_parameters(violations) => Some(Refused {
+                code: INVALID_ARGUMENT_EXCEPTION.to_string(),
+                message: INVALID_PARAMETER.to_string(),
+            }),
             Refusal::Invalid(violations) => Some(Refused {
                 code: INVALID_ARGUMENT_EXCEPTION.to_string(),
                 message: ::aws_smithy_schema_server::envelope(violations)?,
@@ -158,5 +221,71 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_tag_parameters;
+    use smithy_server_runtime::{Violation, ViolationKind};
+
+    /// One violation at `path`, of the shape the constraint walk reports for a `@length`
+    /// maximum.
+    fn at(path: &str) -> Violation {
+        Violation {
+            path: path.to_owned(),
+            kind: ViolationKind::MaxLength(128),
+            value: Some("x".to_owned()),
+        }
+    }
+
+    /// RULE: a refusal is about tags only when EVERY clause names a member of a tag the
+    /// request carried, at whatever position in the list and whichever of the two members
+    /// it broke; anything else is the per-member constraint report.
+    #[test]
+    fn only_a_refusal_about_tags_alone_is_a_tag_refusal() {
+        // (case, the paths the walk reported, whether this is a tag refusal)
+        let rows: [(&str, &[&str], bool); 9] = [
+            ("one tag key", &["tags.1.member.key"], true),
+            ("one tag value", &["tags.1.member.value"], true),
+            ("a tag beyond the first", &["tags.7.member.key"], true),
+            (
+                "both members of one tag",
+                &["tags.1.member.key", "tags.1.member.value"],
+                true,
+            ),
+            ("the tags member itself", &["tags"], true),
+            ("a member of the request", &["trafficDialPercentage"], false),
+            (
+                "a tag and a member of the request",
+                &["tags.1.member.key", "name"],
+                false,
+            ),
+            // A list of bare tag KEYS is a different shape, and nothing records how this
+            // service states a refusal of one, so it keeps the per-member report.
+            ("a tag key on the untagging surface", &["tagKeys.1.member"], false),
+            // A member whose name merely STARTS with the tags member's name is a member of
+            // the request, not a tag: the head of the path is compared whole.
+            ("a member named like the tags member", &["tagsOfSomething"], false),
+        ];
+
+        for (case, paths, expected) in rows {
+            let violations: Vec<Violation> = paths.iter().map(|path| at(path)).collect();
+            let answered = only_tag_parameters(&violations);
+            assert_eq!(
+                answered, expected,
+                "case {case:?} over {paths:?}: expected {expected}, got {answered}"
+            );
+        }
+    }
+
+    /// Nothing to state: a refusal carrying no clause at all is not a tag refusal, so the
+    /// framework's own wording stands rather than a sentence about tags nobody mentioned.
+    #[test]
+    fn a_refusal_with_no_clause_is_not_a_tag_refusal() {
+        assert!(
+            !only_tag_parameters(&[]),
+            "expected no clause to state nothing about tags"
+        );
     }
 }

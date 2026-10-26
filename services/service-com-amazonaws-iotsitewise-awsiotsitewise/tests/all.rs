@@ -403,3 +403,9 @@ mod workspace_delete;
 #[path = "all/project_asset_disassociation.rs"]
 mod project_asset_disassociation;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/list_computation_models.rs"]
+mod list_computation_models;
+
