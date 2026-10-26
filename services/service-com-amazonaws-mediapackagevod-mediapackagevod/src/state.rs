@@ -26,6 +26,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::{RangeTrait, Violation, ViolationKind};
+
 use crate::ops::types::{
     Authorization, CmafPackage, DashManifest, DashPackage, EgressAccessLogs, EgressEndpoint,
     HlsManifest, HlsPackage, MssPackage,
@@ -934,10 +937,11 @@ pub fn resume_after(
 
 /// How many records one page of a listing carries, from the request's `MaxResults`.
 ///
-/// `MaxResults` is modelled `range(min: 1, max: 1000)`, so the boundary validator
-/// already refuses anything outside it; this enforces the same bound itself rather
-/// than depending on that, and a request that names no `MaxResults` gets the largest
-/// page the model allows.
+/// `MaxResults` is modelled `range(min: 1, max: 1000)`, and a request outside that bound
+/// is refused before any handler runs — in this same envelope, with this same phrase
+/// ([`modelled_constraint_refusal`]). The bound is still enforced here so the handler
+/// answers the same page size whoever calls it, and a request that names no `MaxResults`
+/// gets the largest page the model allows.
 pub fn page_size(
     max_results: Option<i32>,
 ) -> Result<usize, crate::scaffolded::UnprocessableEntity> {
@@ -946,10 +950,167 @@ pub fn page_size(
         Some(max) => match usize::try_from(max) {
             Ok(max) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max) => Ok(max),
             _ => Err(crate::scaffolded::UnprocessableEntity::member(
-                "maxResults",
-                format!("must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"),
+                PAGE_SIZE_QUERY,
+                between_phrase(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
             )),
         },
+    }
+}
+
+/// The query parameter every listing of this service binds its page size to
+/// (`smithy_query(query="operation",operation="ListAssets")`: `MaxResults` is
+/// `@httpQuery("maxResults")`, as it is on both other listings).
+pub const PAGE_SIZE_QUERY: &str = "maxResults";
+
+/// The phrase a value outside a bound stated at BOTH ends is refused with.
+///
+/// ONE sentence whichever end was exceeded: a caller that sent too small a value and one
+/// that sent too large a value broke the same published bound, and the bound is what they
+/// have to act on.
+pub fn between_phrase(min: impl std::fmt::Display, max: impl std::fmt::Display) -> String {
+    format!("must be between {min} and {max}")
+}
+
+/// The phrase a member that carries NO value is refused with.
+///
+/// A member the request left out and one it sent empty fail the same presence rule, so
+/// they are refused with the one phrase: this is the phrase the creates already state for
+/// an `Id` sent as the empty string, and an absent `@required` member is the same claim
+/// about the same member.
+pub const NO_VALUE_PHRASE: &str = "must not be empty";
+
+/// This service's refusal of a request that broke a rule the MODEL declares, built from
+/// the violations the framework's own boundary walk found, or `None` when it found none.
+///
+/// The envelope is the one every other parameter violation of this service travels in —
+/// HTTP 422 `UnprocessableEntityException` with `message` and the per-attribute `errors`
+/// map — so a declared rule and a rule a handler checks itself are answered alike: the
+/// caller reads one body whichever found the violation. Every violation of the request is
+/// carried, keyed by the member's WIRE name, because a request's parameters are validated
+/// together.
+pub fn modelled_constraint_refusal(
+    violations: &[Violation],
+    input_schema: &Schema,
+) -> Option<crate::scaffolded::UnprocessableEntity> {
+    crate::scaffolded::UnprocessableEntity::members(
+        violations
+            .iter()
+            .map(|violation| {
+                (
+                    wire_member_path(&violation.path, input_schema),
+                    constraint_phrase(violation, input_schema),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The phrase one violated modelled constraint is stated with, worded as every other
+/// refused member of this service is worded: the rule alone, with the member supplied by
+/// the `errors` key the envelope states it under.
+///
+/// A numeric bound is stated as the member's whole published range when the model declares
+/// both of its ends ([`between_phrase`]), rather than as only the end this value fell
+/// outside, so the caller is told the bound to satisfy instead of the half it broke.
+fn constraint_phrase(violation: &Violation, input_schema: &Schema) -> String {
+    match &violation.kind {
+        ViolationKind::MissingRequiredMember => NO_VALUE_PHRASE.to_string(),
+        ViolationKind::MinValue(min) => declared_range(&violation.path, input_schema)
+            .unwrap_or_else(|| format!("must be greater than or equal to {min}")),
+        ViolationKind::MaxValue(max) => declared_range(&violation.path, input_schema)
+            .unwrap_or_else(|| format!("must be less than or equal to {max}")),
+        ViolationKind::MinLength(min) => {
+            format!("must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => format!("must have length less than or equal to {max}"),
+        ViolationKind::Pattern(pattern) => format!("must satisfy the pattern {pattern}"),
+        ViolationKind::EnumValue(values) => format!("must be one of {}", values.join(", ")),
+        ViolationKind::UniqueItems => "must not carry a repeated entry".to_string(),
+        // `ViolationKind` is `#[non_exhaustive]`: a class the framework adds later says
+        // what little can be said about it rather than going unreported.
+        _ => "is not valid".to_string(),
+    }
+}
+
+/// The whole bound the member at `path` publishes, when the model states a `@range` with
+/// BOTH ends on it; `None` for a one-ended range and for a member whose bound this reader
+/// cannot place (one inside a nested shape).
+fn declared_range(path: &str, input_schema: &Schema) -> Option<String> {
+    let range = input_member(path, input_schema)?
+        .traits()?
+        .get(&RangeTrait::TRAIT_ID)?
+        .as_any()
+        .downcast_ref::<RangeTrait>()
+        .copied()?;
+    match (range.min, range.max) {
+        (Some(min), Some(max)) => Some(between_phrase(bound(min), bound(max))),
+        _ => None,
+    }
+}
+
+/// A `@range` bound as a phrase states it: an integral bound without a trailing `.0`, a
+/// fractional one with its decimals — the rendering the framework gives the same bound
+/// when it reports the violation itself.
+fn bound(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// A violation path as the WIRE names its members: the top-level member under the name it
+/// travels on the wire (its `@jsonName` for a body member, its `@httpQuery` for a query
+/// parameter), with any path below it kept as the walk spelled it.
+///
+/// The walk names a member by the lowerCamel of its MODEL name, which for every member of
+/// this model is also its wire name; reading the name off the model rather than assuming
+/// that is what keeps the `errors` key the one a client keys its per-field rendering on.
+fn wire_member_path(path: &str, input_schema: &Schema) -> String {
+    let (head, below) = match path.split_once('.') {
+        Some((head, below)) => (head, Some(below)),
+        None => (path, None),
+    };
+    let head = input_member(path, input_schema)
+        .map_or_else(|| head.to_string(), wire_member_name);
+    match below {
+        Some(below) => format!("{head}.{below}"),
+        None => head,
+    }
+}
+
+/// The top-level input member a violation path starts at, matched by the lowerCamel
+/// spelling the constraint walk gives a path segment. `None` when no member of the input
+/// shape has that name.
+fn input_member<'a>(path: &str, input_schema: &'a Schema) -> Option<&'a Schema> {
+    let segment = path.split('.').next()?;
+    input_schema.members().iter().copied().find(|member| {
+        member
+            .member_name()
+            .is_some_and(|name| lower_camel(name) == segment)
+    })
+}
+
+/// The name `member` travels under on the wire: its `@jsonName` when the model declares
+/// one, else the `@httpQuery` parameter it is bound to, else the lowerCamel of its member
+/// name.
+fn wire_member_name(member: &Schema) -> String {
+    if let Some(json) = member.json_name() {
+        return json.value().to_string();
+    }
+    if let Some(query) = member.http_query() {
+        return query.value().to_string();
+    }
+    member.member_name().map(lower_camel).unwrap_or_default()
+}
+
+/// `name` with its first character lowercased — the spelling the constraint walk gives a
+/// member's path segment (`MaxResults` -> `maxResults`).
+fn lower_camel(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => String::new(),
     }
 }
 
@@ -1282,9 +1443,11 @@ pub const MANIFEST_LIST_REQUIREMENT: &str = "must carry at least one manifest co
 /// OWN block's wire path, the same way [`check_speke_role_arns`] reads the SPEKE role
 /// under each format's path, so the refusal names the member the caller sent.
 ///
-/// The list is a required member, so the boundary validator refuses a request that
-/// OMITS it (a missing required member) before a handler sees it; what reaches here is
-/// a request that sent the list and sent it empty.
+/// The list is a required member, so a request that OMITS it never reaches here: it is
+/// refused in front of the operation, in this same envelope and attributed to this same
+/// member, with the phrase this service states for a member carrying no value at all
+/// ([`NO_VALUE_PHRASE`]). What reaches here is a request that sent the list and sent it
+/// empty.
 pub fn check_manifest_lists(
     hls: Option<&HlsPackage>,
     dash: Option<&DashPackage>,
@@ -1318,4 +1481,158 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMediapackagevodMediapackagevodState>)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The two halves of a refusal built from a violation the framework found: the phrase
+    //! each constraint CLASS is stated with, and the member name the `errors` map keys it
+    //! under. Both are driven over a table here because only two of the classes are
+    //! reachable through this model's wire surface (an absent `@required` member and the
+    //! `MaxResults` range) — the rest are what this service would say about a constraint
+    //! the model does not declare today. The end-to-end envelope is pinned on the wire in
+    //! `tests/all/modelled_constraint_refusals.rs`.
+
+    use super::*;
+
+    /// One violation as the framework's walk reports it: the member path it names, and
+    /// what was violated. The value echo is left unset, because no phrase this service
+    /// states quotes it.
+    fn violation(path: &str, kind: ViolationKind) -> Violation {
+        Violation {
+            path: path.to_string(),
+            kind,
+            value: None,
+        }
+    }
+
+    /// Every constraint class is stated as one verb phrase about the member, and a numeric
+    /// bound the model states at both ends is stated whole.
+    #[test]
+    fn every_constraint_class_is_stated_as_one_phrase_about_the_member() {
+        let listing = crate::ops::types::LIST_ASSETS_INPUT_SCHEMA;
+        // (case, the violation the framework found, the phrase this service states)
+        let rows: [(&str, Violation, String); 9] = [
+            (
+                "an absent required member",
+                violation("packagingGroupId", ViolationKind::MissingRequiredMember),
+                NO_VALUE_PHRASE.to_string(),
+            ),
+            (
+                "a value under the member's published range",
+                violation("maxResults", ViolationKind::MinValue("1".to_string())),
+                between_phrase(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
+            ),
+            (
+                "a value over the member's published range",
+                violation("maxResults", ViolationKind::MaxValue("1000".to_string())),
+                between_phrase(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
+            ),
+            (
+                "a minimum the model states alone",
+                violation("nextToken", ViolationKind::MinValue("3".to_string())),
+                "must be greater than or equal to 3".to_string(),
+            ),
+            (
+                "a maximum the model states alone",
+                violation("nextToken", ViolationKind::MaxValue("7".to_string())),
+                "must be less than or equal to 7".to_string(),
+            ),
+            (
+                "a length minimum",
+                violation("nextToken", ViolationKind::MinLength(1)),
+                "must have length greater than or equal to 1".to_string(),
+            ),
+            (
+                "a length maximum",
+                violation("nextToken", ViolationKind::MaxLength(256)),
+                "must have length less than or equal to 256".to_string(),
+            ),
+            (
+                "a pattern",
+                violation("nextToken", ViolationKind::Pattern("^[a-z]+$".to_string())),
+                "must satisfy the pattern ^[a-z]+$".to_string(),
+            ),
+            (
+                "an enumerated value set",
+                violation(
+                    "nextToken",
+                    ViolationKind::EnumValue(vec!["NONE".to_string(), "SEGMENTS".to_string()]),
+                ),
+                "must be one of NONE, SEGMENTS".to_string(),
+            ),
+        ];
+
+        for (case, found, expected) in rows {
+            let actual = constraint_phrase(&found, listing);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            // And the whole refusal states that one phrase twice: as the member's entry in
+            // the `errors` map, and as the message's own attribution.
+            let refusal = modelled_constraint_refusal(std::slice::from_ref(&found), listing)
+                .unwrap_or_else(|| panic!("case {case:?}: a violation is a refusal"));
+            assert_eq!(
+                refusal.errors.get(&found.path),
+                Some(&vec![expected.clone()]),
+                "case {case:?}: expected the phrase attributed to {:?}, got {:?}",
+                found.path,
+                refusal.errors
+            );
+        }
+
+        // Nothing violated is no refusal: a request that satisfies the model is not
+        // refused by this path at all.
+        let nothing = modelled_constraint_refusal(&[], listing);
+        assert!(
+            nothing.is_none(),
+            "case no violations: expected None, got {nothing:?}"
+        );
+    }
+
+    /// A violation path is keyed by the name its member travels under on the wire, at the
+    /// top level and below it, and an unplaceable path is keyed as the walk spelled it.
+    #[test]
+    fn a_violation_is_keyed_by_the_members_wire_name() {
+        let listing = crate::ops::types::LIST_ASSETS_INPUT_SCHEMA;
+        let create = crate::ops::types::CREATE_PACKAGING_CONFIGURATION_INPUT_SCHEMA;
+        // (case, the input shape the violation was found on, the walk's path, the key)
+        let rows: [(&str, &Schema, &str, &str); 6] = [
+            (
+                "a query parameter",
+                listing,
+                PAGE_SIZE_QUERY,
+                PAGE_SIZE_QUERY,
+            ),
+            ("another query parameter", listing, "nextToken", "nextToken"),
+            ("a body member", create, "packagingGroupId", "packagingGroupId"),
+            (
+                "a member of a nested structure",
+                create,
+                "hlsPackage.hlsManifests",
+                "hlsPackage.hlsManifests",
+            ),
+            (
+                "an element of a nested list",
+                create,
+                "hlsPackage.hlsManifests.1.member.manifestName",
+                "hlsPackage.hlsManifests.1.member.manifestName",
+            ),
+            (
+                "a path naming no member of the shape",
+                listing,
+                "notAMember",
+                "notAMember",
+            ),
+        ];
+
+        for (case, schema, path, expected) in rows {
+            let actual = wire_member_path(path, schema);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the key {expected:?}, got {actual:?}"
+            );
+        }
+    }
 }

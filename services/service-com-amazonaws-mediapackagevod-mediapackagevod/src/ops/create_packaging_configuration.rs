@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.id.is_empty() {
             return Err(crate::scaffolded::UnprocessableEntity::member(
                 "id",
-                "must not be empty",
+                crate::state::NO_VALUE_PHRASE,
             )
             .into());
         }

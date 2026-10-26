@@ -16,10 +16,10 @@
 //! Each test is a TABLE whose rows differ along what the rule generalises over: the
 //! packaging format (all four, so the refusal is not keyed to one block), the FORM the
 //! manifest-less block arrives in (an empty array, an empty array beside the block's
-//! other settings, and the required member omitted — which the boundary validator
-//! refuses as a missing required member before a handler sees it) and — on the
-//! accepting side — how MANY manifests the block carries and whether each names a
-//! `ManifestName`.
+//! other settings, and the required member omitted — which this service refuses in the
+//! same envelope, attributed to the same member, with the phrase it states for a member
+//! that carries no value at all) and — on the accepting side — how MANY manifests the
+//! block carries and whether each names a `ManifestName`.
 //!
 //! The refusal's consequence is asserted too, because the defect this pins was not only
 //! a missing refusal: a stored manifest-less configuration made every asset in the
@@ -45,10 +45,6 @@ const UNPROCESSABLE: (u16, &str) = (422, "UnprocessableEntityException");
 /// The modelled refusal of a resource this service does not hold
 /// (`smithy_query(query="shape",shape="NotFoundException")` — `httpError 404`).
 const NOT_FOUND: (u16, &str) = (404, "NotFoundException");
-
-/// How the request walk's boundary validator refuses a request that omits a `required`
-/// member: it never reaches a handler, so this is not the service's own refusal.
-const BOUNDARY_REFUSAL: (u16, &str) = (400, "ValidationException");
 
 /// The success status of `CreatePackagingConfiguration`, as the handler documents it.
 const ACCEPTED: u16 = 202;
@@ -128,29 +124,21 @@ impl Format {
     }
 }
 
-/// Which refusal a manifest-less row must get: the service's own, or the boundary
-/// validator's refusal of a missing `required` member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
-    /// The service judged the list it was sent: HTTP 422 attributed to the list.
-    Service,
-    /// The request never carried the list, so the request walk refused it first.
-    Boundary,
-}
-
 /// The forms a block carrying no manifest configuration arrives in, for one format:
-/// (case, the block's members, the refusal it must get).
+/// (case, the block's members, the phrase the refusal attributes to the manifest list).
 ///
-/// A client writes the empty list and the omitted list both, so both are rows; they are
-/// refused at different points, and NEITHER stores a configuration.
-fn manifest_less_blocks(format: &Format) -> Vec<(String, Value, Refusal)> {
+/// A client writes the empty list and the omitted list both, so both are rows. They are
+/// judged at different points — the handler reads a list it was sent, while a list the
+/// request never carried is refused in front of the operation, which is where a member
+/// carrying no value at all is stated — and NEITHER stores a configuration.
+fn manifest_less_blocks(format: &Format) -> Vec<(String, Value, &'static str)> {
     let mut with_others = format.other_members();
     with_others[format.list] = json!([]);
     vec![
         (
             format!("{} carrying an empty {}", format.block, format.list),
             json!({ format.list: [] }),
-            Refusal::Service,
+            vod::MANIFEST_LIST_REQUIREMENT,
         ),
         (
             format!(
@@ -158,12 +146,12 @@ fn manifest_less_blocks(format: &Format) -> Vec<(String, Value, Refusal)> {
                 format.block, format.list
             ),
             with_others,
-            Refusal::Service,
+            vod::MANIFEST_LIST_REQUIREMENT,
         ),
         (
             format!("{} omitting {} entirely", format.block, format.list),
             json!({}),
-            Refusal::Boundary,
+            vod::NO_VALUE_PHRASE,
         ),
     ]
 }
@@ -238,7 +226,7 @@ async fn a_package_block_configuring_no_manifest_is_refused_and_stores_nothing()
 
     let mut refused_ids: Vec<String> = Vec::new();
     for format in &FORMATS {
-        for (index, (case, members, refusal)) in
+        for (index, (case, members, phrase)) in
             manifest_less_blocks(format).into_iter().enumerate()
         {
             let id = format!("cfg-{}-{index}", format.block);
@@ -258,40 +246,23 @@ async fn a_package_block_configuring_no_manifest_is_refused_and_stores_nothing()
                 .and_then(Value::as_str)
                 .unwrap_or("<unset>")
                 .to_string();
-            match refusal {
-                Refusal::Service => {
-                    assert_eq!(
-                        (status, code.as_str()),
-                        UNPROCESSABLE,
-                        "case {case:?}: expected {UNPROCESSABLE:?}, got {status} {code:?} \
-                         body {body}"
-                    );
-                    assert_eq!(
-                        body.get("errors").cloned().unwrap_or(Value::Null),
-                        json!({ format.member(): [vod::MANIFEST_LIST_REQUIREMENT] }),
-                        "case {case:?}: the refusal must attribute itself to the manifest \
-                         list, got {}",
-                        body.get("errors").cloned().unwrap_or(Value::Null)
-                    );
-                    assert_eq!(
-                        message,
-                        format!("{} {}", format.message_path, vod::MANIFEST_LIST_REQUIREMENT),
-                        "case {case:?}: expected the member-and-constraint message, got {body}"
-                    );
-                }
-                Refusal::Boundary => {
-                    assert_eq!(
-                        (status, code.as_str()),
-                        BOUNDARY_REFUSAL,
-                        "case {case:?}: expected {BOUNDARY_REFUSAL:?}, got {status} {code:?} \
-                         body {body}"
-                    );
-                    assert!(
-                        message.contains(&format.member()),
-                        "case {case:?}: the refusal must name the missing list, got {message:?}"
-                    );
-                }
-            }
+            assert_eq!(
+                (status, code.as_str()),
+                UNPROCESSABLE,
+                "case {case:?}: expected {UNPROCESSABLE:?}, got {status} {code:?} body {body}"
+            );
+            assert_eq!(
+                body.get("errors").cloned().unwrap_or(Value::Null),
+                json!({ format.member(): [phrase] }),
+                "case {case:?}: the refusal must attribute itself to the manifest list, \
+                 got {}",
+                body.get("errors").cloned().unwrap_or(Value::Null)
+            );
+            assert_eq!(
+                message,
+                format!("{} {phrase}", format.message_path),
+                "case {case:?}: expected the member-and-constraint message, got {body}"
+            );
 
             // Nothing was stored: the id the refused create named does not exist.
             let described = call_raw(

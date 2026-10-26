@@ -204,6 +204,19 @@ impl SerializableStruct for ValidationException {
 /// member is at fault.
 pub const BASE_ATTRIBUTE: &str = "base";
 
+/// The wire error code a request-validation refusal is named by — the `__type` and the
+/// `x-amzn-errortype` a client branches on.
+///
+/// The MODELLED shape's name: this envelope differs from the generated
+/// `UnprocessableEntityException` only in carrying the `errors` member, so a client
+/// cannot tell which of the two answered.
+pub const UNPROCESSABLE_ENTITY_CODE: &str = "UnprocessableEntityException";
+
+/// `UnprocessableEntityException`'s modelled `httpError`
+/// (`smithy_query(query="shape",shape="UnprocessableEntityException")`: `errorKind
+/// client`, `httpError 422`).
+pub const UNPROCESSABLE_ENTITY_STATUS: u16 = 422;
+
 /// The `message` member of the synthetic `UnprocessableEntityException` shape.
 ///
 /// Named and `@jsonName`d exactly like the modelled
@@ -523,7 +536,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // The MODELLED error code: this variant differs from the generated
             // `UnprocessableEntityException` only in carrying the `errors` member,
             // so a client branching on the code cannot tell which one answered.
-            Self::Unprocessable(_) => "UnprocessableEntityException",
+            Self::Unprocessable(_) => UNPROCESSABLE_ENTITY_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -537,7 +550,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             // `UnprocessableEntityException`'s modelled `httpError`.
-            Self::Unprocessable(_) => 422,
+            Self::Unprocessable(_) => UNPROCESSABLE_ENTITY_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
