@@ -143,6 +143,8 @@ mod tenant_invalidations;
 mod tenant_web_acl_association;
 #[path = "all/tenant_web_acl_disassociation_scope.rs"]
 mod tenant_web_acl_disassociation_scope;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/verify_dns_configuration.rs"]
 mod verify_dns_configuration;
 #[path = "all/web_acl_association.rs"]

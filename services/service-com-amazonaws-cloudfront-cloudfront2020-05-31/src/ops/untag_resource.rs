@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes from one CloudFront resource, named by its ARN, the tags whose keys the
+//! request names. A MUTATION — "Remove tags from a CloudFront resource" — and the exact
+//! inverse of the add [`crate::ops::tag_resource`] performs: the named keys stop being
+//! carried, every key the request does NOT name is left exactly as it was, and a key the
+//! resource does not carry removes nothing, so the call is idempotent in the set it
+//! leaves behind. Every resource kind this emulator holds and tags is resolved here,
+//! because a tagging call is about the ARN rather than about one kind of resource, and it
+//! writes the very set `ListTagsForResource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +68,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,20 +164,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so this call does not
+        // carry a transition the store was due past it.
+        store.settle(SystemTime::now());
+
+        // "A complex type that contains zero or more Tag key elements": a request that
+        // names no key at all describes removing nothing, which leaves the resource
+        // carrying exactly the tags it carried. Each key's length and character
+        // constraints ARE modelled (`TagKey`), so they are already refused before this
+        // handler runs; and a key named twice names the SAME removal, so unlike a
+        // submitted tag set — where one key cannot carry two values — a repeated key
+        // still describes a key set and is not a refusal.
+        let keys = input.tag_keys.items.as_deref().unwrap_or_default();
+
+        // The resource is named by ARN. `ResourceARN`'s pattern is already enforced
+        // before this handler runs, so what is left to decide is whether the store holds
+        // a resource carrying that exact ARN — and an ARN it does not is
+        // `NoSuchResource`, not an invalid argument.
+        let Some(tags) = store.tags_for_resource_mut(&input.resource) else {
+            return Err(UntagResourceErrorModeled::NoSuchResource(
+                crate::state::no_such_resource(),
+            )
+            .into());
+        };
+
+        // Remove exactly the named keys from the set the resource carries. A key the
+        // resource does not carry removes nothing, and a key the request leaves unnamed is
+        // left as it was: removing tags is not replacing the tag set.
+        for key in keys {
+            tags.remove(key);
+        }
+
+        // The resource's own version token and `LastModifiedTime` are NOT touched: a tag
+        // set is associated with the resource rather than part of its configuration, so
+        // untagging neither mints a new `ETag` nor makes a conditional update of the
+        // configuration fail.
+        Ok(UntagResourceOutput)
     }
 }
