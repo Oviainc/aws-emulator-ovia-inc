@@ -129,6 +129,14 @@ fn id_refusals() -> Vec<Refusal> {
             message: control_refusal_message,
         },
         Refusal {
+            label: "StartApplicationRefresh",
+            path: "/start-application-refresh",
+            body: |reference| json!({ "ApplicationId": reference }),
+            status: 404,
+            code: RESOURCE_NOT_FOUND_EXCEPTION,
+            message: control_refusal_message,
+        },
+        Refusal {
             label: "StopApplication with every switch set",
             path: "/stop-application",
             body: |reference| {

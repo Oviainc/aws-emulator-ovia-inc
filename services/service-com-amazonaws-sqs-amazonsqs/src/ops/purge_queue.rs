@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PurgeQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PurgeQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PurgeQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Empties the queue the request names: every message it holds goes, whatever that
+//! message's visibility, and so does every receipt handle naming one, every batch a
+//! `ReceiveRequestAttemptId` remembers and every deduplication token that would have
+//! suppressed a resend. The queue's own
+//! configuration is untouched (a purge empties a queue, it does not re-create it), and
+//! the instant of the purge is remembered, because a `PurgeQueue` arriving on the same
+//! queue while that one is still deleting is refused with `PurgeQueueInProgress`.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +79,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +173,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PurgeQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PurgeQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PurgeQueue"))
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            PurgeQueueErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(PurgeQueueErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(),
+            )
+            .into());
+        };
+
+        // A purge deletes asynchronously — "the message deletion process takes up to 60
+        // seconds" — and a queue that received one inside that interval is still working
+        // through it, so a further request is refused rather than queued behind it.
+        if queue.purge_in_progress(now) {
+            return Err(PurgeQueueErrorModeled::PurgeQueueInProgress(
+                PurgeQueueInProgress {
+                    message: Some(sqs::purge_queue_in_progress_message(&queue.name)),
+                },
+            )
+            .into());
+        }
+
+        // Retention lapses and visibility timeouts the clock already owed are
+        // materialised first, so what this call discards is the state the queue really
+        // held at `now`.
+        queue.materialise_due(now);
+        queue.purge(now);
+
+        Ok(PurgeQueueOutput)
     }
 }

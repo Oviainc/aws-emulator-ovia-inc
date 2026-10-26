@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataTransformationProfileVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataTransformationProfileVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataTransformationProfileVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every version one stored data transformation profile holds — its
+//! DRAFT (version 0) and each version published from it — newest first and one
+//! page at a time. A reporting operation: it reads [`crate::state`] and writes
+//! nothing, so what a later caller sees is exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataTransformationProfileVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataTransformationProfileVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataTransformationProfileVersions"))
+        // This operation reports; `ctx` carries nothing it needs, because a
+        // profile's versions are the same for every caller.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        // A read: the handler only reads under the lock and writes nothing. A
+        // profile owes the clock no transition, so there is nothing to settle
+        // before its versions are reported.
+        let store = state.lock();
+        let Some(profile) = store.profiles.get(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // "All versions ... (DRAFT and published), in reverse chronological
+        // order (newest first)" — ordered in the one place this crate puts a
+        // profile's versions in that order, so a listing and a page resumed
+        // into it can never disagree.
+        let ordered = profile.versions_newest_first();
+
+        // `NextToken` is the version number of the first entry the next page
+        // returns, so resuming is a lookup in this same order. A token that
+        // names no version of this profile resumes nothing, which is a bad
+        // request rather than an empty page.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => ordered
+                .iter()
+                .position(|version| page_token(version.version) == token)
+                .ok_or_else(|| {
+                    validation(
+                        "NextToken does not resume a ListDataTransformationProfileVersions page",
+                    )
+                })?,
+        };
+
+        // `MaxResults` is modelled 1..100, and the model documents that a
+        // request naming none returns "up to 100 results", so an absent value
+        // pages at that maximum. The boundary validator has already refused a
+        // value outside the range, so the conversion below is a defensive floor
+        // rather than a silent re-reading of the request.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(usize::MAX));
+
+        let page: Vec<DataTransformationProfileVersionSummary> = ordered[start..]
+            .iter()
+            .take(page_size)
+            .map(|version| profile.version_summary(version))
+            .collect();
+        // A token is emitted ONLY when versions remain after this page: "If this
+        // value is null, there are no more results."
+        let next_token = ordered
+            .get(start + page.len())
+            .map(|version| page_token(version.version));
+
+        Ok(ListDataTransformationProfileVersionsOutput {
+            items: page,
+            next_token,
+        })
     }
+}
+
+/// The largest page `MaxResults` allows (modelled range 1..100), which is also
+/// the page size a request that names none gets — "If you don't specify a
+/// value, the service returns up to 100 results."
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The `NextToken` that resumes this listing at the version numbered `version`.
+///
+/// A version number is unique within its profile and the listing is a stable
+/// total order, so the number alone says where to resume. Rendered as decimal,
+/// which is one or two characters and so always inside the modelled
+/// `DataTransformationNextToken` length bound (1..2048).
+fn page_token(version: i32) -> String {
+    version.to_string()
+}
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it
+/// declares.
+fn validation(message: &str) -> ListDataTransformationProfileVersionsError {
+    ListDataTransformationProfileVersionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> ListDataTransformationProfileVersionsError {
+    ListDataTransformationProfileVersionsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> ListDataTransformationProfileVersionsError {
+    ListDataTransformationProfileVersionsErrorModeled::InternalServerException(
+        InternalServerException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
 }

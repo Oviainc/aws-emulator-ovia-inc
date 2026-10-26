@@ -27,6 +27,8 @@ mod message_lifecycle;
 mod message_move_task;
 #[path = "all/message_plane.rs"]
 mod message_plane;
+#[path = "all/purge_queue.rs"]
+mod purge_queue;
 #[path = "all/queue_configuration.rs"]
 mod queue_configuration;
 #[path = "all/queue_does_not_exist.rs"]

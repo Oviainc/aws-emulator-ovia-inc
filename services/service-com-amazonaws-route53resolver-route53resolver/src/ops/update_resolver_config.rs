@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResolverConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResolverConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResolverConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +161,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResolverConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResolverConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResolverConfig"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateResolverConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The statuses the requested setting moves the configuration through.
+        // `AutodefinedReverseFlag` is one of the values the modelled enum
+        // declares; an unmodelled value is refused rather than stored, so a
+        // later read never reports a status the status enum does not carry.
+        let Some((in_flight, settled)) =
+            crate::state::autodefined_reverse_transition(input.autodefined_reverse_flag.as_str())
+        else {
+            return Err(UpdateResolverConfigErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "AutodefinedReverseFlag must be one of {:?}",
+                        crate::ops::types::AUTODEFINED_REVERSE_FLAG_VALUES
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // "Updates the behavior configuration of Route 53 Resolver behavior for
+        // a single VPC": the configuration is a per-VPC singleton the service
+        // maintains itself, so this call moves the autodefined-reverse setting
+        // of the configuration that VPC already has — its identity (`Id`,
+        // `ResourceId`, `OwnerId`) unchanged — and reports it back.
+        let mut record = store.resolver_config(&input.resource_id);
+
+        // A request asking for the setting the configuration is already settled
+        // in, or already moving to, writes nothing — so it neither drives a
+        // settled configuration back out of its settled status nor pushes the
+        // move an earlier call made due back into the future.
+        if record.settled_status == settled {
+            return Ok(UpdateResolverConfigOutput {
+                resolver_config: Some(record.to_resolver_config(now)),
+            });
+        }
+
+        if record.seq == 0 {
+            // A VPC the store holds no record for needs one allocated, and the
+            // store is bounded: an update past the bound is refused with the
+            // limit refusal this operation models and writes nothing. An update
+            // of a VPC already stored allocates nothing, so it is never refused
+            // here.
+            if !store.can_store_another_resolver_config() {
+                return Err(UpdateResolverConfigErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "This emulator stores Resolver configurations for at most {} VPCs",
+                            crate::state::MAX_STORED_RESOLVER_CONFIGS
+                        )),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_RESOLVER_CONFIG.to_string()),
+                    },
+                )
+                .into());
+            }
+            record.seq = store.next_seq();
+        }
+
+        // The move to the settled status is the one the clock owes, so a caller
+        // reading straight after this call still observes the transient status.
+        record.status = in_flight.to_string();
+        record.settled_status = settled.to_string();
+        record.settled_at = now + crate::state::PROVISIONING_DELAY;
+        store
+            .resolver_configs
+            .insert(record.resource_id.clone(), record.clone());
+
+        Ok(UpdateResolverConfigOutput {
+            resolver_config: Some(record.to_resolver_config(now)),
+        })
     }
 }

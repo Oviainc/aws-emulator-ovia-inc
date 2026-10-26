@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource servers STORED in the named user pool, a page at a time:
+//! this is a reporting operation and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,20 +165,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceServers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The pool's stored resource servers, keyed by `Identifier` in ascending
+        // order — the stable order the pagination token indexes into. The model
+        // documents no order for this listing.
+        let identifiers: Vec<String> = pool.resource_servers.keys().cloned().collect();
+
+        // The page size this request gets: the crate's shared rule for a
+        // listing's limit — a request that asks for none, or for a value the
+        // helper reads as "no value", takes the maximum (this operation's
+        // modelled range starts at 1, so validation refuses that value before
+        // the handler runs) — bounded by the most one page of THIS listing
+        // serves. That rule answers at most the crate's query limit, so the
+        // conversion cannot fall back, and its fallback is the bound applied
+        // next anyway.
+        let page_limit = i32::try_from(crate::state::page_size(input.max_results))
+            .unwrap_or(MAX_RESOURCE_SERVERS_PER_PAGE)
+            .min(MAX_RESOURCE_SERVERS_PER_PAGE);
+
+        // The listing a pagination token belongs to: this operation over the
+        // resource servers of this pool, so a token one pool's listing issued
+        // names no page of another pool's listing or of another operation's.
+        let scope = format!("{}|{}", Self::NAME, pool.id);
+        let page = crate::state::page_of(
+            &scope,
+            &identifiers,
+            Some(page_limit),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(invalid_next_token)?;
+
+        // Rendered from the STORED resource servers: this read changes nothing.
+        let resource_servers: Vec<ResourceServerType> = page
+            .keys
+            .iter()
+            .filter_map(|identifier| pool.resource_servers.get(identifier))
+            .map(crate::state::ResourceServer::to_resource_server_type)
+            .collect();
+
+        // `ResourceServers` is a REQUIRED member, so it is present and empty when
+        // the pool holds no resource server — which is what a paginating client
+        // reads.
+        Ok(ListResourceServersOutput {
+            resource_servers,
+            next_token: page.next_token,
+        })
     }
 }
+
+/// `ListResourceServers.MaxResults` has a modelled range of 1..50
+/// (`smithy_query(query="operation",operation="ListResourceServers")`), so one
+/// page of this listing serves at most 50 resource servers however many the
+/// caller asks for.
+const MAX_RESOURCE_SERVERS_PER_PAGE: i32 = 50;
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListResourceServersError {
+    ListResourceServersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `NextToken` that names no
+/// page of this listing.
+fn invalid_next_token() -> ListResourceServersError {
+    ListResourceServersErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "NextToken is not a pagination token this operation issued for this user pool"
+                .to_string(),
+        ),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListResourceServersError {
+    ListResourceServersErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
