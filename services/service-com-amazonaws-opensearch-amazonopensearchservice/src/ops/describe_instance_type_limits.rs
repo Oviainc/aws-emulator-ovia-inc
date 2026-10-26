@@ -194,17 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An instance type the named engine release does not offer — a family
         // introduced for a later release — cannot run that version, so the pairing is
         // the modelled "invalid or not supported" refusal rather than limits for a
-        // combination that cannot exist.
-        if !crate::state::offers_instance_type(version, &input.instance_type) {
-            return Err(DescribeInstanceTypeLimitsErrorModeled::InvalidTypeException(
-                InvalidTypeException {
-                    message: Some(format!(
-                        "InstanceType {} is not supported on {}",
-                        input.instance_type, input.engine_version
-                    )),
-                },
-            )
-            .into());
+        // combination that cannot exist. The refusal is the service's one wording for
+        // such a pairing ([`crate::state::invalid_instance_type`]), which names the
+        // instance type the request asked for and not the release it was asked on.
+        if let Some(refusal) = crate::state::unoffered_instance_type_refusal(
+            version,
+            Some(input.instance_type.as_str()),
+        ) {
+            return Err(
+                DescribeInstanceTypeLimitsErrorModeled::InvalidTypeException(refusal).into(),
+            );
         }
 
         // "The name of the domain. Only specify if you need the limits for an existing

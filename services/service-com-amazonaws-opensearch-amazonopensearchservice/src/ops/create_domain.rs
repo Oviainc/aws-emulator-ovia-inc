@@ -240,6 +240,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // "Defaults to the latest version of OpenSearch" — a domain runs ONE engine
+        // release, the one the request named or the current one the service picks when
+        // it named none, and that release is what the rest of the create is judged
+        // against.
+        let engine_version = input
+            .engine_version
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ENGINE_VERSION.to_string());
+
+        // Every node of the cluster runs on the domain's engine release, so an
+        // instance type that release does not offer describes a cluster the service
+        // cannot provision and is refused rather than stored — with the service's one
+        // wording for such a pairing ([`crate::state::invalid_instance_type`]), the
+        // same text `DescribeInstanceTypeLimits` answers the same pairing with. It is
+        // checked BEFORE the storage bounds below, which are published per instance
+        // type and so mean nothing for a type the release does not run. A value that
+        // reads as no release at all names nothing to scope the types to.
+        if let (Some(version), Some(cluster)) = (
+            crate::state::parse_engine_version(&engine_version),
+            input.cluster_config.as_ref(),
+        ) {
+            if let Some(refusal) = crate::state::cluster_instance_type_refusal(version, cluster) {
+                return Err(CreateDomainErrorModeled::InvalidTypeException(refusal).into());
+            }
+        }
+
         // The storage a domain is created with has to be storage the service publishes
         // for the instance type the domain runs on: a volume sized outside that
         // published range describes a cluster the service cannot provision, so it is
@@ -294,9 +320,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let suffix = store.mint_endpoint_suffix();
-        let engine_version = input
-            .engine_version
-            .unwrap_or_else(|| DEFAULT_ENGINE_VERSION.to_string());
 
         let mut domain = Domain {
             domain_id: domain_id(&name),

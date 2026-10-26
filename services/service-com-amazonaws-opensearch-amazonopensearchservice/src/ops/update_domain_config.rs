@@ -429,6 +429,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let touched = merge(&mut merged, input, now);
         let deployment = deployment_type(&merged, &touched);
 
+        // Every node of the cluster runs on the domain's engine release, which this
+        // request does not move, so an instance type that release does not offer
+        // describes a cluster the service cannot provision. The update is judged on the
+        // MERGED record, and the refusal is the service's one wording for such a
+        // pairing. A dry run is refused too — it reports what applying the change would
+        // do, and this change cannot be applied.
+        if let Some(version) = crate::state::parse_engine_version(&merged.engine_version) {
+            if let Some(refusal) =
+                crate::state::cluster_instance_type_refusal(version, &merged.cluster_config)
+            {
+                return Err(UpdateDomainConfigErrorModeled::InvalidTypeException(refusal).into());
+            }
+        }
+
         // The storage a domain runs on has to be storage the service publishes for the
         // instance type it runs on, and the update is judged on the MERGED record: a
         // request that resizes the volume is checked against the instance type the

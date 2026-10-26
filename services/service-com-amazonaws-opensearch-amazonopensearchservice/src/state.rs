@@ -49,7 +49,8 @@ use crate::ops::types::{
     InboundConnectionStatus, Insight, InsightEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails, InternalException,
-    InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
+    InvalidPaginationTokenException, InvalidTypeException, JWTOptionsOutput,
+    LimitExceededException, Limits,
     LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
@@ -4402,6 +4403,81 @@ pub fn unknown_instance_type(member: &str, value: &str) -> ValidationException {
     ValidationException {
         message: Some(format!("{member} is not a known instance type: {value}")),
     }
+}
+
+/// The modelled refusal for an instance type the engine release in play does not
+/// offer: `InvalidTypeException`, "an exception for trying to create or access a
+/// sub-resource that's either invalid or not supported", which the model classifies
+/// `client` with HTTP 409.
+///
+/// The sentence names the INSTANCE TYPE alone, taken from the request: the engine
+/// release is what the pairing is refused for, not part of the text. This is the ONE
+/// construction of it, so every operation that refuses such a pairing words the
+/// refusal identically.
+pub fn invalid_instance_type(instance_type: &str) -> InvalidTypeException {
+    InvalidTypeException {
+        message: Some(format!("Invalid instance type: {instance_type}")),
+    }
+}
+
+/// The refusal for `instance_type` when `version` does not offer it, or `None` when
+/// the pairing is one the service offers (and for a request naming no type, which
+/// pairs nothing with the release).
+///
+/// An instance family introduced for a later engine release cannot run an earlier one
+/// ([`offers_instance_type`]), so the pairing names a cluster the service cannot
+/// provision.
+pub fn unoffered_instance_type_refusal(
+    version: EngineVersion,
+    instance_type: Option<&str>,
+) -> Option<InvalidTypeException> {
+    let instance_type = instance_type?;
+    (!offers_instance_type(version, instance_type)).then(|| invalid_instance_type(instance_type))
+}
+
+/// Every instance type `cluster` provisions a node on, in the order the cluster
+/// configuration declares them: the data nodes' type, the dedicated master type when
+/// dedicated masters are enabled, the warm type when warm storage is enabled, and the
+/// type of each enabled node option.
+///
+/// A type named beside a tier that is turned OFF provisions no node, so it is not a
+/// type the cluster runs: `DedicatedMasterType` goes with "indicates whether dedicated
+/// master nodes are enabled for the cluster", `WarmType` with "whether to enable warm
+/// storage for the cluster", and a `NodeConfig`'s type with "whether a specific node
+/// type is active or inactive".
+fn provisioned_instance_types(cluster: &ClusterConfig) -> Vec<&str> {
+    let mut types: Vec<&str> = Vec::new();
+    types.extend(cluster.instance_type.as_deref());
+    if cluster.dedicated_master_enabled.unwrap_or(false) {
+        types.extend(cluster.dedicated_master_type.as_deref());
+    }
+    if cluster.warm_enabled.unwrap_or(false) {
+        types.extend(cluster.warm_type.as_deref());
+    }
+    for option in cluster.node_options.iter().flatten() {
+        if let Some(config) = option.node_config.as_ref() {
+            if config.enabled.unwrap_or(false) {
+                types.extend(config.r#type.as_deref());
+            }
+        }
+    }
+    types
+}
+
+/// The refusal for the first instance type `cluster` provisions a node on that
+/// `version` does not offer, or `None` when the release offers every one of them.
+///
+/// A domain runs ONE engine release, so every node of its cluster runs on an instance
+/// type that release offers — the data nodes' type and the type of every other tier
+/// alike.
+pub fn cluster_instance_type_refusal(
+    version: EngineVersion,
+    cluster: &ClusterConfig,
+) -> Option<InvalidTypeException> {
+    provisioned_instance_types(cluster)
+        .into_iter()
+        .find(|instance_type| !offers_instance_type(version, instance_type))
+        .map(invalid_instance_type)
 }
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,8 @@ mod insight_details;
 mod insights;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
+#[path = "all/instance_type_engine_refusal.rs"]
+mod instance_type_engine_refusal;
 #[path = "all/instance_type_limits.rs"]
 mod instance_type_limits;
 #[path = "all/package_association_listings.rs"]
