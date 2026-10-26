@@ -984,6 +984,108 @@ pub fn no_such_resource() -> NoSuchResource {
     }
 }
 
+/// Whether `path` is one of the paths `pattern` names, with `*` standing for any run of
+/// characters and `?` for exactly one.
+///
+/// ONE matcher for the two places CloudFront matches a path against a pattern: a cache
+/// behaviour's `CacheBehavior$PathPattern` ("The pattern that specifies which requests to
+/// apply the behavior to", whose wildcards the member documents as `*` and `?`) and an
+/// invalidation's `Paths$Items` ("The path of the object to invalidate", which may end in
+/// `*`). A pattern that does not begin at the root is matched against the path without its
+/// leading `/` as well, because a path pattern may be written with or without one.
+pub fn matches_path_pattern(pattern: &str, path: &str) -> bool {
+    matches_glob(pattern, path) || matches_glob(pattern, path.trim_start_matches('/'))
+}
+
+/// The most character comparisons one wildcard match makes before it reports no match.
+///
+/// A single-backtrack glob walk is O(pattern x subject), and both come from caller-stored
+/// or caller-sent values, so the work one comparison can ask for is capped here. The cap
+/// is far above any real path and pattern (a `PathPattern` is at most 255 characters and a
+/// request path far less than this bound), so no real match reaches it; one that does is
+/// reported as NO match, which for a cache behaviour means the next behaviour (and in the
+/// end the default one) decides the request, and for an invalidation means the object is
+/// left in the cache rather than removed on the strength of a comparison that was cut
+/// short.
+const MAX_GLOB_COMPARISONS: usize = 1 << 16;
+
+/// The wildcard match itself, over characters: the standard linear walk with one
+/// backtrack point per `*`.
+fn matches_glob(pattern: &str, subject: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let subject: Vec<char> = subject.chars().collect();
+    let (mut at_pattern, mut at_subject) = (0usize, 0usize);
+    // Where the last `*` was, and how much of the subject it has consumed so far.
+    let mut star: Option<usize> = None;
+    let mut consumed = 0usize;
+    let mut comparisons = 0usize;
+    while at_subject < subject.len() {
+        comparisons += 1;
+        if comparisons > MAX_GLOB_COMPARISONS {
+            return false;
+        }
+        let literal = at_pattern < pattern.len()
+            && (pattern[at_pattern] == '?' || pattern[at_pattern] == subject[at_subject]);
+        if literal {
+            at_pattern += 1;
+            at_subject += 1;
+        } else if at_pattern < pattern.len() && pattern[at_pattern] == '*' {
+            star = Some(at_pattern);
+            consumed = at_subject;
+            at_pattern += 1;
+        } else if let Some(wildcard) = star {
+            // Give the wildcard one more character and try the rest of the pattern again.
+            at_pattern = wildcard + 1;
+            consumed += 1;
+            at_subject = consumed;
+        } else {
+            return false;
+        }
+    }
+    while at_pattern < pattern.len() && pattern[at_pattern] == '*' {
+        at_pattern += 1;
+    }
+    at_pattern == pattern.len()
+}
+
+/// One response a distribution's edge holds in its cache.
+///
+/// The in-process transport this emulator fetches an origin over carries a status and a
+/// body (see `crate::service::edge`), so those are what an entry holds, beside the
+/// instants that decide whether it may still be served.
+#[derive(Debug, Clone)]
+pub struct CachedEdgeResponse {
+    /// The status the origin answered.
+    pub status: u16,
+    /// The bytes the origin answered.
+    pub body: Vec<u8>,
+    /// The path the viewer request carried, so an invalidation can be matched against
+    /// this entry when a batch is created.
+    pub path: String,
+    /// When the origin fetch that filled this entry happened: the order the cache evicts
+    /// in when it is full.
+    pub stored_at: SystemTime,
+    /// When this entry stops being servable, from the cache behaviour's TTL.
+    pub expires_at: SystemTime,
+}
+
+/// How many cached responses one distribution's edge holds at once.
+///
+/// A real edge cache is bounded by the storage of an edge location; this emulator holds
+/// its cache in memory beside the distribution, so it is bounded by an entry count and
+/// the least recently filled entry is dropped to make room. The bound is this emulator's
+/// own, not CloudFront's: eviction is invisible to a caller except as a cache MISS, which
+/// is a thing CloudFront answers too.
+pub const MAX_EDGE_CACHE_ENTRIES: usize = 256;
+
+/// The most path-pattern comparisons one invalidation makes against the edge cache before
+/// it empties the cache instead ([`StoredDistribution::invalidate_edge_cache`]).
+///
+/// This emulator's own bound on the work one call can ask for: the cache holds at most
+/// [`MAX_EDGE_CACHE_ENTRIES`] entries and a batch names at most
+/// [`MAX_INVALIDATION_PATHS`] paths, so their product is what this caps.
+pub const MAX_INVALIDATION_MATCHES: usize = 4096;
+
 /// The CloudFront resource TYPES the tagging surface accepts, as the resource part of an
 /// ARN spells each of them.
 ///
@@ -1237,6 +1339,13 @@ pub struct StoredDistribution {
     /// and the propagation status of the distribution exactly as they were. A
     /// distribution is created without one: nothing but a create puts one here.
     pub monitoring_subscription: Option<MonitoringSubscription>,
+    /// What this distribution's edge holds in its cache, keyed by the cache key the edge
+    /// computed for the request ([`crate::service::edge`]).
+    ///
+    /// A sub-resource of the running distribution rather than a member of its
+    /// configuration: nothing reports it, and filling it changes no value any read
+    /// answers with.
+    pub edge_cache: BTreeMap<String, CachedEdgeResponse>,
 }
 
 impl StoredDistribution {
@@ -1255,6 +1364,67 @@ impl StoredDistribution {
     /// every invalidation listing uses ([`invalidations_most_recent_first`]).
     pub fn invalidations_most_recent_first(&self) -> Vec<&StoredInvalidation> {
         invalidations_most_recent_first(&self.invalidations)
+    }
+
+    /// The cached response the edge may serve for `key`, or `None` when it must fetch the
+    /// origin.
+    ///
+    /// An entry is servable while its TTL has not run out. An invalidation does not have
+    /// to be consulted here: a batch removes what it names from the cache when it is
+    /// CREATED ([`StoredDistribution::invalidate_edge_cache`]), so this is one map lookup
+    /// and a comparison however many batches the distribution has had. A READ: it reports
+    /// what the cache holds and changes nothing.
+    pub fn cached_edge_response(&self, key: &str, now: SystemTime) -> Option<&CachedEdgeResponse> {
+        self.edge_cache
+            .get(key)
+            .filter(|entry| now < entry.expires_at)
+    }
+
+    /// Remove from the edge cache every object `paths` names — "you can invalidate files
+    /// ... to remove them from CloudFront edge caches".
+    ///
+    /// Done once, by the call that creates the batch, rather than on every later cache
+    /// read: one invalidation is one pass over the at most [`MAX_EDGE_CACHE_ENTRIES`]
+    /// entries, and a viewer request pays nothing for the batches that came before it.
+    /// A batch whose paths and the cache between them would need more comparisons than
+    /// [`MAX_INVALIDATION_MATCHES`] empties the cache instead of matching: removing more
+    /// than the batch named can only cost a later request a cache MISS, which is a thing
+    /// CloudFront answers too, and it keeps the work one call can ask for bounded.
+    pub fn invalidate_edge_cache(&mut self, paths: &[String]) {
+        if self.edge_cache.is_empty() || paths.is_empty() {
+            return;
+        }
+        let comparisons = self.edge_cache.len().saturating_mul(paths.len());
+        if comparisons > MAX_INVALIDATION_MATCHES {
+            self.edge_cache.clear();
+            return;
+        }
+        self.edge_cache.retain(|_, entry| {
+            !paths
+                .iter()
+                .any(|path| matches_path_pattern(path, &entry.path))
+        });
+    }
+
+    /// Hold `entry` in this distribution's edge cache under `key`.
+    ///
+    /// Bounded by [`MAX_EDGE_CACHE_ENTRIES`]: once the cache is full the entry filled
+    /// longest ago makes room for the new one.
+    pub fn store_edge_response(&mut self, key: String, entry: CachedEdgeResponse) {
+        while self.edge_cache.len() >= MAX_EDGE_CACHE_ENTRIES {
+            let oldest = self
+                .edge_cache
+                .iter()
+                .min_by_key(|(_, held)| held.stored_at)
+                .map(|(held_key, _)| held_key.clone());
+            match oldest {
+                Some(held_key) => {
+                    self.edge_cache.remove(&held_key);
+                }
+                None => break,
+            }
+        }
+        self.edge_cache.insert(key, entry);
     }
 
     /// "The number of invalidation batches currently in progress" — counted from the
@@ -4421,6 +4591,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             // distribution this create minted carries no monitoring subscription until
             // `CreateMonitoringSubscription` puts one on it.
             monitoring_subscription: None,
+            // Nothing is cached at the edge until the edge serves a request.
+            edge_cache: BTreeMap::new(),
         };
         let created = CreatedDistribution {
             id: id.clone(),
@@ -4874,6 +5046,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// mints is ever minted twice.
     pub fn next_etag(&mut self) -> String {
         format!("E{}", self.mint(ID_BODY_LEN))
+    }
+
+    /// Mint the identifier the edge stamps on one request it serves.
+    ///
+    /// `X-Amz-Cf-Id` "identifies the request that you're interested in" — one opaque
+    /// token per request, so it is drawn fresh from the same counter every other
+    /// generated value comes from and is never derived from the request. Rendered as 32
+    /// lowercase hex characters (two draws, 128 bits): an opaque token, which is all a
+    /// client may read it as.
+    pub fn mint_edge_request_id(&mut self) -> String {
+        format!("{:016x}{:016x}", self.mint_u64(), self.mint_u64())
     }
 
     /// Replace the configuration of the distribution `id` names, and report the record

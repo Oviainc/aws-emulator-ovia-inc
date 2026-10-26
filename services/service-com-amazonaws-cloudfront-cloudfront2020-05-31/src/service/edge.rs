@@ -1,0 +1,1728 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The distribution DATA plane: how a viewer request addressed to a distribution's own
+//! domain name is recognised, decided and answered.
+//!
+//! A distribution is reached at its `Distribution$DomainName` — "the domain name that
+//! CloudFront assigns when you create a distribution, such as
+//! `d111111abcdef8.cloudfront.net`" — or at one of the alternate domain names its
+//! `Aliases` carry. That host is NOT the control plane's
+//! (`cloudfront.amazonaws.com`): its first label is the distribution's own generated
+//! label, which names no service, so the emulator's front door can resolve no target
+//! service from such a request and answers it `404 UnknownService` — for the hostname
+//! this very service told the caller to use. The one thing that is never correct is for
+//! the host to be unknown to the service.
+//!
+//! So this module is the second half of [`crate::service::EmulatedService`]: the claim
+//! ([`claims_parts`], read by `Service::can_handle`) and the serving ([`serve`], reached
+//! from `Service::override_operation`). The decisions it makes are CloudFront's OWN — the
+//! ones a viewer sees before any origin is involved — and every one of them is computed
+//! from the distribution's stored configuration:
+//!
+//! 1. the host (or the path, see below) names a distribution this service HOLDS, whose
+//!    configuration is `Enabled`; a disabled distribution serves nothing;
+//! 2. the CACHE BEHAVIOUR is selected by path pattern: `CacheBehaviors$Items` in the
+//!    order the configuration lists them, first match wins, and the
+//!    `DefaultCacheBehavior` when none matches — "If none of the path patterns match,
+//!    CloudFront applies the default cache behavior";
+//! 3. that behaviour's `AllowedMethods` decide whether the viewer's METHOD is served at
+//!    all. A method the behaviour does not allow is refused BY CLOUDFRONT with `403` and
+//!    `X-Cache: Error from cloudfront`, and no origin request is made;
+//! 4. that behaviour's `CachedMethods` and cache policy decide whether the answer may
+//!    come from the edge cache: a cacheable method whose TTL has not run out is answered
+//!    `X-Cache: Hit from cloudfront` without touching the origin, and everything else
+//!    goes to the origin and is answered `X-Cache: Miss from cloudfront`;
+//! 5. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
+//!    through the emulator this service is running within.
+//!
+//! # What the origin fetch is, and what it is not
+//!
+//! The fetch is a real HTTP request to the origin's own `DomainName`, made through the
+//! IN-PROCESS transport `OperationContext::callback` hands a handler: it is dispatched
+//! back into this same emulator and opens no connection, so the only origin it can reach
+//! is one the emulator itself hosts. An origin this emulator serves (an S3 bucket
+//! endpoint, another emulated endpoint) answers it, and whatever it answers — its status
+//! and its bytes — is what the edge serves and caches. An origin nothing in this emulator
+//! serves answers nothing, and that is reported as CloudFront reports an origin it could
+//! not reach: `502` with `X-Cache: Error from cloudfront`. Nothing is invented for an
+//! origin that did not answer, and nothing off this machine is ever addressed.
+//!
+//! One origin shape is worth naming because it is the one the Lambda-function-URL
+//! topology uses: a function URL host is served by nothing in this emulator — Lambda has
+//! no in-process runtime for a deployment package, so `Invoke` answers `501` (see
+//! `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs`) and there
+//! is no function response to fetch. The edge therefore reaches that origin and gets
+//! nothing, which is the `502` above; the enforcement in steps 1–4, which is CloudFront's
+//! own and needs no origin, is served in full.
+//!
+//! Two things the fetch will not do. A REQUEST LOOP is refused instead of followed: an
+//! origin whose host the edge itself serves, and a request that has already been through
+//! an edge (its `Via` names CloudFront), are answered with the same `502` rather than
+//! handed back to the edge they came from. And the VIEWER'S OWN CREDENTIAL is never
+//! relayed: the origin is named by the distribution's stored configuration, so an
+//! `Authorization` header (or a session token) a viewer presents is dropped rather than
+//! forwarded to a destination that viewer did not choose
+//! ([`HEADERS_NEVER_FORWARDED`]) — every other viewer header travels exactly as the
+//! behaviour's origin request policy says.
+//!
+//! The SigV4 signing an `OriginAccessControl` asks for (`SigningBehavior` `always`) is
+//! not performed on the origin request: the origin request carries the headers the
+//! behaviour's policies name and nothing else. That leg belongs to the origin-access
+//! control issue rather than to this one.
+//!
+//! # Addressing
+//!
+//! A client on the machine this emulator runs on cannot reach `d<label>.cloudfront.net`
+//! at all: nothing resolves it there, so it points at the emulator's own endpoint and
+//! carries in the PATH what it cannot carry in the host. [`resolve`] reads three
+//! addressings, and each one is checked against this service's own records, so one
+//! request still has one claimant:
+//!
+//! * HOST-STYLE: the host is a distribution's `DomainName` or one of its `Aliases`, and
+//!   the whole path is the viewer path;
+//! * PREFIXED PATH-STYLE: `/_aws/cloudfront/{distribution-id}/{viewer-path}`, read on
+//!   whatever host it arrives at — the reserved first segment is in no service's modelled
+//!   path space;
+//! * PATH-STYLE: the first path segment is a distribution id this service holds, read
+//!   only on a host that names NO SERVICE (the emulator's own endpoint) or names THIS
+//!   service, so a first segment that happens to equal a distribution id cannot take a
+//!   request away from the service whose endpoint the host names.
+//!
+//! The viewer's SCHEME is not carried on the request the router hands a service
+//! (origin-form URI plus a `Host` header), so `ViewerProtocolPolicy` — which is about
+//! HTTP versus HTTPS from the viewer — is not decided here.
+
+use aws_smithy_runtime_api::client::http::HttpConnector;
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use smithy_server_runtime::{http, OperationContext};
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{AllowedMethods, CacheBehavior, DefaultCacheBehavior, Origin};
+use crate::state::{
+    managed_cache_policy, managed_origin_request_policy, matches_path_pattern, same_domain,
+    CachedEdgeResponse, ComAmazonawsCloudfrontCloudfront20200531State, StoredDistribution,
+    DEFAULT_ALLOWED_METHODS, DEFAULT_ORIGIN_READ_TIMEOUT,
+};
+
+/// The reserved path segment that names a DATA plane on the one endpoint this emulator
+/// serves its whole surface at, ahead of the distribution id:
+/// `/_aws/cloudfront/{distribution-id}/{viewer-path}`.
+///
+/// It begins with `_`, which no modelled path segment of any service does, so the prefix
+/// cannot collide with a control-plane route however a viewer path is spelled.
+const EMULATOR_PATH_NAMESPACE: &str = "_aws";
+
+/// The second segment of the prefixed path-style addressing: the data plane this module
+/// serves.
+const EDGE_PATH_LABEL: &str = "cloudfront";
+
+/// The response header CloudFront reports a cache outcome in.
+const X_CACHE: &str = "x-cache";
+
+/// `X-Cache` for an answer the edge cache held.
+const CACHE_HIT: &str = "Hit from cloudfront";
+
+/// `X-Cache` for an answer the origin produced for this request.
+const CACHE_MISS: &str = "Miss from cloudfront";
+
+/// `X-Cache` for an answer CloudFront itself produced instead of the origin's.
+const CACHE_ERROR: &str = "Error from cloudfront";
+
+/// The response (and origin-request) header carrying the identifier of the request the
+/// edge served, from `X-Amz-Cf-Id`: "identifies the request that you're interested in".
+const X_AMZ_CF_ID: &str = "x-amz-cf-id";
+
+/// The `Server` of a response CloudFront generated itself, and the name its `Via` carries
+/// on an origin request — which is also how a request that has already been through an
+/// edge is recognised ([`carries_cloudfront_via`]).
+const SERVER: &str = "CloudFront";
+
+/// The name CloudFront's own `Via` carries.
+const VIA_CLOUDFRONT: &str = SERVER;
+
+/// The `User-Agent` CloudFront sends an origin request with when the viewer's own is not
+/// forwarded to the origin.
+const ORIGIN_USER_AGENT: &str = "Amazon CloudFront";
+
+/// The status a viewer request gets when CloudFront refuses it at the edge.
+const FORBIDDEN: u16 = 403;
+
+/// The status a viewer request gets when CloudFront could not get a response from the
+/// origin.
+const BAD_GATEWAY: u16 = 502;
+
+/// The detail line CloudFront's generated page carries for a request it refused.
+const BAD_REQUEST_DETAIL: &str = "Bad request.";
+
+/// The detail line CloudFront's generated page carries when it could not reach the
+/// origin, from CloudFront's own troubleshooting of a 502.
+const NO_ORIGIN_DETAIL: &str = "CloudFront wasn't able to connect to the origin.";
+
+/// The headers that belong to ONE hop of an HTTP connection and are never forwarded to an
+/// origin, as RFC 9110 lists them, plus the viewer's own `Authorization`.
+///
+/// A viewer credential is never relayed to an origin by this emulator: the origin is named
+/// by the distribution's stored configuration, so forwarding a caller's credential there
+/// would hand it to a destination the caller of THIS request did not choose. Every other
+/// viewer header is forwarded exactly as the behaviour's origin request policy says
+/// ([`forwards_header`]).
+const HEADERS_NEVER_FORWARDED: [&str; 10] = [
+    "authorization",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "x-amz-security-token",
+];
+
+/// An `OriginRequestPolicyHeadersConfig$HeaderBehavior` that forwards every viewer header.
+const HEADERS_ALL_VIEWER: &str = "allViewer";
+
+/// An `OriginRequestPolicyHeadersConfig$HeaderBehavior` that forwards every viewer header
+/// but the `Host` one, which the origin request carries as the origin's own host.
+const HEADERS_ALL_VIEWER_EXCEPT_HOST: &str = "allViewerExceptHostHeader";
+
+/// A header behaviour that forwards exactly the named headers.
+const HEADERS_WHITELIST: &str = "whitelist";
+
+/// The `CachePolicyCookiesConfig$CookieBehavior` that puts no cookie in the cache key.
+const COOKIES_NONE: &str = "none";
+
+/// An `OriginRequestPolicyHeadersConfig$HeaderBehavior` that forwards every viewer header
+/// and, beside them, the named CloudFront-generated ones — which this emulator does not
+/// add, so for a VIEWER header it decides exactly what `allViewer` does.
+const HEADERS_ALL_VIEWER_AND_CLOUDFRONT: &str = "allViewerAndWhitelistCloudFront";
+
+/// An `OriginRequestPolicyHeadersConfig$HeaderBehavior` that forwards the named headers
+/// beside the ones the cache key already carries.
+const HEADERS_ALL_EXCEPT: &str = "allExcept";
+
+/// What a viewer request addresses, as the wire carries it: the request's host — absent
+/// on a request that carries neither a `Host` header nor an absolute URI — its path, and
+/// its query.
+///
+/// Built from BOTH shapes the router hands this module, the buffered parts the claim
+/// reads and the runtime-API request the serving seam reads, so one rule resolves both and
+/// the claim cannot resolve a different distribution than the answer does.
+#[derive(Debug)]
+pub struct Addressed<'a> {
+    host: Option<&'a str>,
+    path: &'a str,
+    query: &'a str,
+}
+
+impl<'a> Addressed<'a> {
+    /// The addressing of the buffered request these parts came from.
+    fn of_parts(parts: &'a http::request::Parts) -> Self {
+        Self {
+            host: request_host(parts),
+            path: parts.uri.path(),
+            query: parts.uri.query().unwrap_or_default(),
+        }
+    }
+
+    /// The addressing of a runtime-API request, which carries its URI as a string.
+    fn of_request(req: &'a RtRequest) -> Self {
+        Self {
+            host: req.headers().get("host").or_else(|| authority_of(req.uri())),
+            path: path_of(req.uri()),
+            query: query_of(req.uri()),
+        }
+    }
+}
+
+/// What a viewer request addresses, as this service's records resolve it: the
+/// distribution, and the viewer path WITHIN its endpoint.
+#[derive(Debug)]
+struct Resolved<'s, 'r> {
+    distribution: &'s StoredDistribution,
+    viewer_path: &'r str,
+}
+
+/// What `addressed` addresses, or `None` when this data plane serves it not at all.
+///
+/// The three addressings are the module docs' own list, read in that order.
+fn resolve<'s, 'r>(
+    store: &'s ComAmazonawsCloudfrontCloudfront20200531State,
+    addressed: &Addressed<'r>,
+) -> Option<Resolved<'s, 'r>> {
+    if let Some(host) = addressed.host.map(bare_host) {
+        if let Some(distribution) = store
+            .distributions
+            .values()
+            .find(|distribution| serves_host(distribution, host))
+        {
+            return Some(Resolved {
+                distribution,
+                viewer_path: addressed.path,
+            });
+        }
+    }
+    // PREFIXED PATH-STYLE: the path names this data plane before it names the
+    // distribution, so it is read on whatever host it arrives at.
+    if let Some((id, viewer_path)) = split_edge_prefix(addressed.path) {
+        return store
+            .distributions
+            .get(id)
+            .map(|distribution| Resolved {
+                distribution,
+                viewer_path,
+            });
+    }
+    // PATH-STYLE, on the emulator's own endpoint or this service's: the first segment
+    // names a distribution this service holds.
+    let host_service = addressed.host.and_then(service_named_by_host);
+    if host_service
+        .as_deref()
+        .is_some_and(|service| service != crate::ROUTE_KEY)
+    {
+        return None;
+    }
+    let (first, rest) = split_first_segment(addressed.path)?;
+    store.distributions.get(first).map(|distribution| Resolved {
+        distribution,
+        viewer_path: rest,
+    })
+}
+
+/// Whether `host` is a domain name this distribution is served on: the `DomainName`
+/// CloudFront assigned it, or one of the alternate domain names its `Aliases` carry.
+///
+/// DNS names are case-insensitive, so the comparison is ([`same_domain`]). A multi-tenant
+/// distribution reports no domain of its own and so is served on none: its viewers reach
+/// it through a connection group's routing endpoint.
+///
+/// An alias is only read when it is a name a VIEWER could be sent to: the alternate domain
+/// names are caller-supplied and unverifiable here, so one spelled like another service's
+/// endpoint, like `localhost`, or like an IP literal would take over the address every
+/// client on this machine dials ([`addressable_alias`]). The domain CloudFront itself
+/// assigned is never such a name, and a distribution whose alias is one is still reachable
+/// through the reserved data-plane path.
+fn serves_host(distribution: &StoredDistribution, host: &str) -> bool {
+    if same_domain(&distribution.domain_name, host) {
+        return true;
+    }
+    if !addressable_alias(host) {
+        return false;
+    }
+    distribution
+        .config
+        .aliases
+        .as_ref()
+        .and_then(|aliases| aliases.items.as_ref())
+        .is_some_and(|aliases| aliases.iter().any(|alias| same_domain(alias, host)))
+}
+
+/// Whether `host` is a name an alternate domain name may claim: a customer domain, rather
+/// than an address this emulator — or AWS itself — is reached at.
+///
+/// An alternate domain name is a domain the customer owns and points at the distribution,
+/// so none of these is one: the loopback names a client on this machine dials (`localhost`
+/// and the names under it), any IP literal (bracketed IPv6 included), and a name in one of
+/// the zones AWS serves its own endpoints in ([`AWS_ENDPOINT_SUFFIXES`]) — which is where
+/// every other emulated service's endpoint host lives, and where CloudFront's own
+/// `cloudfront.net` domains live. A stored alias naming one of them would take over an
+/// address other callers reach this emulator at, and `Aliases` is caller-supplied and
+/// unverifiable here.
+fn addressable_alias(host: &str) -> bool {
+    let host = bare_host(host);
+    if host.is_empty() {
+        return false;
+    }
+    let lowercase = host.to_ascii_lowercase();
+    if lowercase == "localhost" || lowercase.ends_with(".localhost") {
+        return false;
+    }
+    // An IP literal: a bracketed IPv6 address, or a name that parses as an address.
+    if lowercase.starts_with('[') || lowercase.parse::<::std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    !AWS_ENDPOINT_SUFFIXES
+        .iter()
+        .any(|suffix| lowercase == suffix.trim_start_matches('.') || lowercase.ends_with(suffix))
+}
+
+/// The zones AWS serves its own endpoints in, which an alternate domain name is never in:
+/// every emulated service's endpoint host is under one of them, and so is the
+/// `cloudfront.net` domain CloudFront assigns a distribution itself.
+const AWS_ENDPOINT_SUFFIXES: [&str; 5] = [
+    ".amazonaws.com",
+    ".amazonaws.com.cn",
+    ".api.aws",
+    ".on.aws",
+    ".cloudfront.net",
+];
+
+/// The distribution id and the viewer path of a PREFIXED PATH-STYLE address, or `None`
+/// when `path` does not carry that prefix.
+///
+/// The viewer path keeps the leading `/` the host-style addressing carries, so one path is
+/// matched against a `PathPattern` however the request was addressed.
+fn split_edge_prefix(path: &str) -> Option<(&str, &str)> {
+    let (namespace, after_namespace) = split_first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (label, after_label) = split_first_segment(after_namespace)?;
+    if label != EDGE_PATH_LABEL {
+        return None;
+    }
+    split_first_segment(after_label)
+}
+
+/// The first non-empty segment of `path` and the rest of the path, which keeps a leading
+/// `/` so it reads as a path of its own.
+fn split_first_segment(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_start_matches('/');
+    let (first, rest) = match trimmed.find('/') {
+        Some(mark) => (&trimmed[..mark], &trimmed[mark..]),
+        None => (trimmed, "/"),
+    };
+    (!first.is_empty()).then_some((first, rest))
+}
+
+/// The service `host` names to the emulator's front door, or `None` when it names none.
+///
+/// The front door's OWN host reader decides it, rather than a second rule written here:
+/// the request the path addressings are read for is exactly the one that reader can place
+/// nowhere — a loopback address or `localhost`, the only endpoint a client on this machine
+/// can reach.
+fn service_named_by_host(host: &str) -> Option<String> {
+    let mut headers = http::HeaderMap::new();
+    let value = http::HeaderValue::from_str(host).ok()?;
+    headers.insert(http::header::HOST, value);
+    ::emulator_server::service_from_host(&headers)
+}
+
+/// A host without its userinfo or its port, as the front door's own host reader reads it.
+///
+/// A bracketed IPv6 literal (`[::1]:443`) keeps its brackets and all of its colons: only
+/// a port after the closing bracket is removed.
+fn bare_host(host: &str) -> &str {
+    let without_userinfo = host.rsplit('@').next().unwrap_or(host);
+    if let Some(closing) = without_userinfo.find(']') {
+        return &without_userinfo[..=closing];
+    }
+    without_userinfo
+        .split(':')
+        .next()
+        .unwrap_or(without_userinfo)
+}
+
+/// Whether THIS data plane serves the request these parts came from — the data-plane half
+/// of `Service::can_handle`.
+///
+/// Narrowed to a distribution this service HOLDS, read from the one shared store, so
+/// nothing is claimed that this service cannot answer about and exactly one service claims
+/// a request.
+pub fn claims_parts<Eng: Send + Sync + 'static>(engine: &Eng, parts: &http::request::Parts) -> bool {
+    claims(engine, &Addressed::of_parts(parts))
+}
+
+/// [`claims_parts`] for the runtime-API request the serving seam is handed.
+pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    claims(engine, &Addressed::of_request(req))
+}
+
+/// Whether `req` is addressed to the EDGE DOMAIN of a distribution this service holds —
+/// the host-style addressing alone.
+///
+/// Which plane a request belongs to is decided by its HOST: a request whose host is a
+/// distribution's own domain name is viewer traffic to that distribution, whatever its
+/// path spells, and never a call to the control plane that happens to share a path with a
+/// modelled route. The two PATH addressings are the other way round, because they arrive
+/// on a host that names the control plane or nothing: there the modelled route wins and
+/// the path addressings are read only for a path no modelled route claims.
+pub fn claims_request_by_host<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    let addressed = Addressed::of_request(req);
+    let Some(host) = addressed.host.map(bare_host) else {
+        return false;
+    };
+    crate::state::service_state(engine).is_some_and(|state| {
+        state
+            .lock()
+            .distributions
+            .values()
+            .any(|distribution| serves_host(distribution, host))
+    })
+}
+
+/// Whether this data plane serves `addressed`.
+fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> bool {
+    crate::state::service_state(engine)
+        .is_some_and(|state| resolve(&state.lock(), addressed).is_some())
+}
+
+/// The cache behaviour selected for one viewer request, flattened out of the two shapes a
+/// behaviour is modelled in (`DefaultCacheBehavior` and `CacheBehavior` carry the same
+/// members).
+#[derive(Debug)]
+struct Behavior {
+    /// `PathPattern` of the ordered behaviour that matched, or `None` for the default
+    /// behaviour, which matches by being last.
+    path_pattern: Option<String>,
+    target_origin_id: String,
+    allowed_methods: Option<AllowedMethods>,
+    cache_policy_id: Option<String>,
+    origin_request_policy_id: Option<String>,
+    /// The legacy per-behaviour TTL, for a behaviour that names no cache policy.
+    default_ttl: Option<i64>,
+    max_ttl: Option<i64>,
+}
+
+impl Behavior {
+    /// The ordered behaviour `behavior` describes.
+    fn of_ordered(behavior: &CacheBehavior) -> Self {
+        Self {
+            path_pattern: Some(behavior.path_pattern.clone()),
+            target_origin_id: behavior.target_origin_id.clone(),
+            allowed_methods: behavior.allowed_methods.clone(),
+            cache_policy_id: behavior.cache_policy_id.clone(),
+            origin_request_policy_id: behavior.origin_request_policy_id.clone(),
+            default_ttl: behavior.default_ttl,
+            max_ttl: behavior.max_ttl,
+        }
+    }
+
+    /// The default behaviour `behavior` describes.
+    fn of_default(behavior: &DefaultCacheBehavior) -> Self {
+        Self {
+            path_pattern: None,
+            target_origin_id: behavior.target_origin_id.clone(),
+            allowed_methods: behavior.allowed_methods.clone(),
+            cache_policy_id: behavior.cache_policy_id.clone(),
+            origin_request_policy_id: behavior.origin_request_policy_id.clone(),
+            default_ttl: behavior.default_ttl,
+            max_ttl: behavior.max_ttl,
+        }
+    }
+
+    /// The methods this behaviour serves at all: `AllowedMethods$Items`, or
+    /// [`DEFAULT_ALLOWED_METHODS`] for a behaviour that names none.
+    fn allows(&self, method: &str) -> bool {
+        match &self.allowed_methods {
+            Some(allowed) => allowed
+                .items
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(method)),
+            None => DEFAULT_ALLOWED_METHODS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(method)),
+        }
+    }
+
+    /// Whether this behaviour caches the response to `method`: `CachedMethods$Items`,
+    /// or [`DEFAULT_ALLOWED_METHODS`] when the behaviour names neither list.
+    ///
+    /// "The HTTP methods for which CloudFront caches responses": a method that is allowed
+    /// but not cached is forwarded to the origin every time and never answered from the
+    /// cache.
+    fn caches(&self, method: &str) -> bool {
+        match self
+            .allowed_methods
+            .as_ref()
+            .and_then(|allowed| allowed.cached_methods.as_ref())
+        {
+            Some(cached) => cached
+                .items
+                .iter()
+                .any(|cached| cached.eq_ignore_ascii_case(method)),
+            None => DEFAULT_ALLOWED_METHODS
+                .iter()
+                .any(|cached| cached.eq_ignore_ascii_case(method)),
+        }
+    }
+}
+
+/// The behaviour that applies to `viewer_path`: the first ordered behaviour whose
+/// `PathPattern` matches it, and otherwise the default behaviour.
+///
+/// "CloudFront compares the path in the viewer request with the path patterns in the cache
+/// behaviors ... in the order in which the cache behaviors are listed", and "if none of
+/// the path patterns match, CloudFront applies the default cache behavior".
+fn select_behavior(distribution: &StoredDistribution, viewer_path: &str) -> Behavior {
+    let ordered = distribution
+        .config
+        .cache_behaviors
+        .as_ref()
+        .and_then(|behaviors| behaviors.items.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|behavior| matches_path_pattern(&behavior.path_pattern, viewer_path));
+    match ordered {
+        Some(behavior) => Behavior::of_ordered(behavior),
+        None => Behavior::of_default(&distribution.config.default_cache_behavior),
+    }
+}
+
+/// The longest an object is held in the edge cache, whatever the configuration asks for:
+/// a year in seconds, the `MaxTTL` every AWS-managed cache policy that caches at all
+/// publishes ([`crate::state::MANAGED_CACHE_POLICIES`]). A stored TTL is an `i64` taken
+/// from a request, so clamping it here is what keeps an expiry instant computable.
+const MAX_CACHE_TTL_SECONDS: u64 = 31_536_000;
+
+/// How long a response the behaviour caches may be served from the edge cache, or `None`
+/// when the behaviour caches nothing at all.
+///
+/// The cache policy the behaviour names decides it — its `DefaultTTL` is "the default
+/// amount of time ... that you want objects to stay in the CloudFront cache" — and a
+/// policy whose TTLs are all zero (`Managed-CachingDisabled`) caches nothing, so such a
+/// behaviour forwards every request. A behaviour that names no cache policy carries the
+/// legacy per-behaviour `DefaultTTL` instead.
+fn cache_ttl(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+) -> Option<Duration> {
+    let seconds = match &behavior.cache_policy_id {
+        Some(id) => match store.cache_policies.get(id) {
+            Some(stored) => stored.config.default_ttl.unwrap_or(stored.config.min_ttl),
+            None => match managed_cache_policy(id) {
+                Some(managed) => managed.default_ttl,
+                // A behaviour naming a cache policy this account does not hold cannot be
+                // created, so this is a configuration that lost its policy: nothing is
+                // cached under a policy that cannot be read.
+                None => 0,
+            },
+        },
+        None => behavior
+            .default_ttl
+            .or(behavior.max_ttl)
+            .unwrap_or_default(),
+    };
+    let seconds = u64::try_from(seconds).unwrap_or_default();
+    // Clamped to the longest TTL CloudFront's own cache policies carry, so a stored TTL
+    // is a span of time rather than an instant the clock cannot reach: every published
+    // managed policy's `MaxTTL` is this value ([`crate::state::MANAGED_CACHE_POLICIES`]),
+    // and a configuration asking for more is held for this long.
+    let seconds = seconds.min(MAX_CACHE_TTL_SECONDS);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+/// The headers of the viewer request that are forwarded to the origin, as the behaviour's
+/// ORIGIN REQUEST POLICY names them.
+///
+/// `OriginRequestPolicyHeadersConfig$HeaderBehavior`: `none` forwards none of the viewer's
+/// headers, `whitelist` forwards the ones named, `allViewer` forwards all of them,
+/// `allViewerExceptHostHeader` all but `Host` — which the origin request carries as the
+/// origin's own host either way — and `allExcept` all but the ones named. A behaviour that
+/// names no origin request policy forwards none, which is CloudFront's default.
+fn forwards_header(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+    header: &str,
+) -> bool {
+    let Some(id) = behavior.origin_request_policy_id.as_deref() else {
+        return false;
+    };
+    let (header_behavior, named): (String, Vec<String>) = match store.origin_request_policies.get(id)
+    {
+        Some(stored) => (
+            stored.config.headers_config.header_behavior.clone(),
+            stored
+                .config
+                .headers_config
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.items.clone())
+                .unwrap_or_default(),
+        ),
+        None => match managed_origin_request_policy(id) {
+            Some(managed) => (
+                managed.header_behavior.to_string(),
+                managed.headers.iter().map(|&name| name.to_string()).collect(),
+            ),
+            None => return false,
+        },
+    };
+    let is_named = |header: &str| named.iter().any(|name| name.eq_ignore_ascii_case(header));
+    match header_behavior.as_str() {
+        HEADERS_ALL_VIEWER | HEADERS_ALL_VIEWER_AND_CLOUDFRONT => true,
+        HEADERS_ALL_VIEWER_EXCEPT_HOST => !header.eq_ignore_ascii_case("host"),
+        HEADERS_WHITELIST => is_named(header),
+        HEADERS_ALL_EXCEPT => !is_named(header),
+        // `none`, and any behaviour this emulator does not know: no viewer header.
+        _ => false,
+    }
+}
+
+/// What the edge does with one viewer request, decided from the stored configuration
+/// alone.
+///
+/// Owned rather than borrowed: the decision is made under the store's lock and the origin
+/// fetch happens after it is released.
+#[derive(Debug)]
+enum Plan {
+    /// CloudFront answers this itself: a status it generated and the detail line its
+    /// error page carries.
+    Generated { status: u16, detail: &'static str },
+    /// The edge cache holds the answer.
+    Hit { status: u16, body: Vec<u8> },
+    /// The origin must answer it.
+    Fetch(Box<OriginFetch>),
+}
+
+/// One origin fetch the edge is to make, and what to do with what comes back.
+#[derive(Debug)]
+struct OriginFetch {
+    /// The distribution whose cache a cacheable answer is held in.
+    distribution_id: String,
+    /// The absolute URI of the origin request.
+    uri: String,
+    /// The headers the origin request carries beside its body's own.
+    headers: Vec<(String, String)>,
+    /// How long the edge waits for the origin, from `OriginReadTimeout`.
+    read_timeout: Duration,
+    /// The cache key and TTL a cacheable answer is held under, or `None` when this
+    /// request's answer is not cached at all.
+    cache: Option<CacheDirective>,
+    /// The viewer path, which an invalidation is matched against.
+    viewer_path: String,
+}
+
+/// Where a cacheable answer is held, and for how long.
+#[derive(Debug)]
+struct CacheDirective {
+    key: String,
+    ttl: Duration,
+}
+
+/// Serve one viewer request addressed to a distribution's edge.
+///
+/// The one serving path: the claim ([`claims_request`]) and this function read the same
+/// addressing, so a request this service claimed is a request this function resolves.
+pub async fn serve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+) -> RtResponse {
+    let now = SystemTime::now();
+    let cf_id;
+    let plan;
+    {
+        let Some(state) = crate::state::service_state(engine) else {
+            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, "");
+        };
+        let mut store = state.lock();
+        // The edge reads the distribution as every other read does: through the clock,
+        // which owes a just-created configuration its deployment.
+        store.settle(now);
+        cf_id = store.mint_edge_request_id();
+        plan = plan_request(&store, req, &cf_id, now);
+    }
+    match plan {
+        Plan::Generated { status, detail } => generated(status, detail, &cf_id),
+        Plan::Hit { status, body } => served(status, body, CACHE_HIT, &cf_id),
+        Plan::Fetch(fetch) => fetch_origin(engine, ctx, *fetch, &cf_id, req).await,
+    }
+}
+
+/// Decide what the edge does with one viewer request, under the store's lock.
+fn plan_request(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    req: &RtRequest,
+    cf_id: &str,
+    now: SystemTime,
+) -> Plan {
+    let addressed = Addressed::of_request(req);
+    let Some(resolved) = resolve(store, &addressed) else {
+        // The distribution was deleted between the claim and now: an endpoint that serves
+        // no distribution of this account is refused.
+        return Plan::Generated {
+            status: FORBIDDEN,
+            detail: BAD_REQUEST_DETAIL,
+        };
+    };
+    let distribution_id = resolved.distribution.id.clone();
+    let viewer_path = resolved.viewer_path.to_string();
+    if !resolved.distribution.config.enabled {
+        // `DistributionConfig$Enabled`: "Whether the distribution is enabled to accept
+        // user requests for content." A disabled distribution accepts none.
+        return Plan::Generated {
+            status: FORBIDDEN,
+            detail: BAD_REQUEST_DETAIL,
+        };
+    }
+    let behavior = select_behavior(resolved.distribution, &viewer_path);
+    let method = req.method().to_ascii_uppercase();
+    if !behavior.allows(&method) {
+        // Enforced HERE, by CloudFront, before any origin request exists: a method the
+        // behaviour does not allow never reaches the origin.
+        ::tracing::debug!(
+            distribution = %distribution_id,
+            path_pattern = ?behavior.path_pattern,
+            %method,
+            "the cache behavior does not allow this method; the edge refuses it and makes \
+             no origin request"
+        );
+        return Plan::Generated {
+            status: FORBIDDEN,
+            detail: BAD_REQUEST_DETAIL,
+        };
+    }
+    let ttl = cache_ttl(store, &behavior);
+    let cache_key = cache_key(&method, &viewer_path, addressed.query, &keyed_values(store, &behavior, req));
+    // "The HTTP methods for which CloudFront caches responses": a cacheable method under
+    // a caching cache policy may be answered from the cache; everything else goes to the
+    // origin every time.
+    let cacheable = behavior.caches(&method).then_some(ttl).flatten();
+    if cacheable.is_some() {
+        if let Some(entry) = resolved.distribution.cached_edge_response(&cache_key, now) {
+            return Plan::Hit {
+                status: entry.status,
+                body: entry.body.clone(),
+            };
+        }
+    }
+    let Some(origin) = resolved
+        .distribution
+        .config
+        .origins
+        .items
+        .iter()
+        .find(|origin| origin.id == behavior.target_origin_id)
+    else {
+        // A behaviour whose `TargetOriginId` names no origin cannot be created, so this
+        // is a configuration that lost its origin: there is nothing to fetch.
+        return Plan::Generated {
+            status: BAD_GATEWAY,
+            detail: NO_ORIGIN_DETAIL,
+        };
+    };
+    let headers = origin_request_headers(store, &behavior, origin, req, cf_id);
+    // A REQUEST LOOP: the origin is a host the edge itself serves, or this request has
+    // already been through an edge (its `Via` names CloudFront). Either way, fetching it
+    // would hand the request back to the edge it came from, so the fetch is not made and
+    // the request is answered the way an origin CloudFront cannot get a response from is.
+    if serves_host(resolved.distribution, bare_host(&origin.domain_name))
+        || carries_cloudfront_via(req)
+    {
+        ::tracing::warn!(
+            distribution = %distribution_id,
+            origin = %origin.domain_name,
+            "this origin request would return to the edge it came from, so no origin \
+             request is made"
+        );
+        return Plan::Generated {
+            status: BAD_GATEWAY,
+            detail: NO_ORIGIN_DETAIL,
+        };
+    }
+    let fetch = OriginFetch {
+        distribution_id,
+        uri: origin_uri(origin, &viewer_path, addressed.query),
+        headers,
+        read_timeout: origin_read_timeout(origin),
+        cache: cacheable.map(|ttl| CacheDirective {
+            key: cache_key,
+            ttl,
+        }),
+        viewer_path,
+    };
+    Plan::Fetch(Box::new(fetch))
+}
+
+/// The key one request's answer is cached under: the method, the path, the query, and the
+/// values of the headers and cookies the behaviour's cache policy puts in the cache key
+/// ([`keyed_values`]).
+///
+/// The query string is part of the key whatever the policy's query-string behaviour says:
+/// keying on more of the request than the policy names can only make an answer MISS that
+/// a real edge would have hit, never serve one request's answer to a different request.
+fn cache_key(method: &str, viewer_path: &str, query: &str, keyed: &str) -> String {
+    format!("{method} {viewer_path}?{query}#{keyed}")
+}
+
+/// Which viewer HEADERS a cache policy puts in the cache key, as
+/// `CachePolicyHeadersConfig$HeaderBehavior` names them.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyedHeaders {
+    /// `none`, and a behaviour with no cache policy to read: the key carries no header.
+    None,
+    /// `whitelist`: the named headers, and only those.
+    Named(Vec<String>),
+    /// `allViewer` (and the `allViewerAndWhitelistCloudFront` spelling): every header the
+    /// viewer sent.
+    Every,
+    /// `allExcept`: every header the viewer sent but the named ones.
+    EveryExcept(Vec<String>),
+}
+
+impl KeyedHeaders {
+    /// Whether `header` — already lowercased — takes part in the cache key.
+    fn keys_on(&self, header: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Named(named) => named.iter().any(|name| name.eq_ignore_ascii_case(header)),
+            Self::Every => true,
+            Self::EveryExcept(named) => !named.iter().any(|name| name.eq_ignore_ascii_case(header)),
+        }
+    }
+
+    /// The names this reports on their own, so a header the policy keys on that the viewer
+    /// did NOT send still separates the key from one where it was sent.
+    fn named(&self) -> &[String] {
+        match self {
+            Self::Named(named) => named,
+            _ => &[],
+        }
+    }
+}
+
+/// Which headers and cookies the behaviour's CACHE POLICY puts in the cache key.
+///
+/// A behaviour that names no cache policy, or one whose policy cannot be read, keys on
+/// none of them: what such a behaviour forwards is its own legacy `ForwardedValues`
+/// member, not a cache policy's.
+fn keyed_parameters(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+) -> (KeyedHeaders, bool) {
+    let Some(id) = behavior.cache_policy_id.as_deref() else {
+        return (KeyedHeaders::None, false);
+    };
+    let (header_behavior, headers, cookie_behavior) = match store.cache_policies.get(id) {
+        Some(stored) => match &stored.config.parameters_in_cache_key_and_forwarded_to_origin {
+            Some(parameters) => (
+                parameters.headers_config.header_behavior.clone(),
+                parameters
+                    .headers_config
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| headers.items.clone())
+                    .unwrap_or_default(),
+                parameters.cookies_config.cookie_behavior.clone(),
+            ),
+            None => return (KeyedHeaders::None, false),
+        },
+        None => match managed_cache_policy(id) {
+            Some(managed) => (
+                managed.header_behavior.to_string(),
+                managed
+                    .headers
+                    .iter()
+                    .map(|&name| name.to_ascii_lowercase())
+                    .collect(),
+                managed.cookie_behavior.to_string(),
+            ),
+            None => return (KeyedHeaders::None, false),
+        },
+    };
+    let keyed = match header_behavior.as_str() {
+        HEADERS_WHITELIST => KeyedHeaders::Named(
+            headers
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+        ),
+        HEADERS_ALL_VIEWER | HEADERS_ALL_VIEWER_AND_CLOUDFRONT => KeyedHeaders::Every,
+        HEADERS_ALL_EXCEPT => KeyedHeaders::EveryExcept(
+            headers
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+        ),
+        // `none`, and a behaviour this emulator does not know: no header.
+        _ => KeyedHeaders::None,
+    };
+    // Any cookie behaviour but `none` keys on cookies the viewer sent. The names travel in
+    // the one `Cookie` header, so that header's whole value carries every value the key
+    // needs; a behaviour that names a subset therefore keys on more of it than it has to,
+    // which can only MISS where a real edge would have hit, never serve one request's
+    // answer to a different one.
+    (keyed, cookie_behavior != COOKIES_NONE)
+}
+
+/// The values of the headers and cookies the behaviour's cache policy keys on, rendered as
+/// the part of the cache key they contribute.
+///
+/// "The headers, cookies, and query strings that are included in the cache key": two
+/// requests that differ in any value the policy names therefore have different cache keys,
+/// so one viewer's answer is never served to a request the policy says is a different one.
+/// The values are rendered in name order, so the key does not depend on the order the
+/// viewer sent its headers in.
+fn keyed_values(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+    req: &RtRequest,
+) -> String {
+    let (keyed, keys_on_cookies) = keyed_parameters(store, behavior);
+    let mut parts: Vec<String> = Vec::new();
+    for (name, value) in req.headers().iter() {
+        let name = name.to_ascii_lowercase();
+        if keyed.keys_on(&name) {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    for name in keyed.named() {
+        if req.headers().get(name).is_none() {
+            parts.push(format!("{name}="));
+        }
+    }
+    if keys_on_cookies {
+        let value = req.headers().get("cookie").unwrap_or_default();
+        parts.push(format!("cookie={value}"));
+    }
+    parts.sort();
+    parts.join(";")
+}
+
+/// Whether `req` has already been through a CloudFront edge: its `Via` names CloudFront,
+/// which is the header an edge stamps on every origin request it makes
+/// ([`origin_request_headers`]).
+///
+/// Read on the INBOUND path, which is what makes the stamp a loop signal rather than
+/// decoration: a request that reaches the edge carrying it came from an edge.
+fn carries_cloudfront_via(req: &RtRequest) -> bool {
+    req.headers()
+        .get("via")
+        .is_some_and(|via| via.contains(VIA_CLOUDFRONT))
+}
+
+/// The absolute URI of the origin request: the origin's own host, its `OriginPath`, the
+/// viewer path and the viewer query.
+///
+/// `Origin$OriginPath` is "an optional path that CloudFront appends to the origin domain
+/// name when CloudFront requests content". The scheme and port come from the origin's own
+/// configuration: an `S3OriginConfig` origin is reached over HTTPS, and a
+/// `CustomOriginConfig` one over the protocol its `OriginProtocolPolicy` names, on the
+/// matching port.
+fn origin_uri(origin: &Origin, viewer_path: &str, query: &str) -> String {
+    let (scheme, port) = match &origin.custom_origin_config {
+        Some(custom) if custom.origin_protocol_policy == "http-only" => ("http", custom.http_port),
+        Some(custom) => ("https", custom.https_port),
+        None => ("https", 443),
+    };
+    let authority = match (scheme, port) {
+        ("http", 80) | ("https", 443) => origin.domain_name.clone(),
+        _ => format!("{}:{port}", origin.domain_name),
+    };
+    let origin_path = origin
+        .origin_path
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let path = if viewer_path.starts_with('/') {
+        viewer_path.to_string()
+    } else {
+        format!("/{viewer_path}")
+    };
+    if query.is_empty() {
+        format!("{scheme}://{authority}{origin_path}{path}")
+    } else {
+        format!("{scheme}://{authority}{origin_path}{path}?{query}")
+    }
+}
+
+/// The longest an origin fetch may wait, whatever the configuration asks for:
+/// `OriginReadTimeout`'s own documented maximum ("the minimum timeout is 1 second, the
+/// maximum is 120 seconds"), so one viewer request can never hold a worker longer than
+/// the member admits.
+const MAX_ORIGIN_READ_TIMEOUT_SECONDS: u64 = 120;
+
+/// How long the edge waits for the origin's response.
+///
+/// `CustomOriginConfig$OriginReadTimeout` / `S3OriginConfig$OriginReadTimeout`, in
+/// seconds, and [`DEFAULT_ORIGIN_READ_TIMEOUT`] for an origin that names none, clamped to
+/// the range that member documents.
+fn origin_read_timeout(origin: &Origin) -> Duration {
+    let seconds = origin
+        .custom_origin_config
+        .as_ref()
+        .and_then(|custom| custom.origin_read_timeout)
+        .or_else(|| {
+            origin
+                .s3_origin_config
+                .as_ref()
+                .and_then(|s3| s3.origin_read_timeout)
+        })
+        .unwrap_or(DEFAULT_ORIGIN_READ_TIMEOUT);
+    let seconds = u64::try_from(seconds).unwrap_or(0);
+    Duration::from_secs(seconds.clamp(1, MAX_ORIGIN_READ_TIMEOUT_SECONDS))
+}
+
+/// The headers one origin request carries.
+///
+/// The origin's own `CustomHeaders` ("CloudFront adds these headers to every origin
+/// request"), the `Host` of the origin, the `X-Amz-Cf-Id` of the request the origin is
+/// being fetched for, a `Via` naming CloudFront, the `User-Agent` CloudFront sends when
+/// the viewer's is not forwarded, the viewer headers the behaviour's ORIGIN REQUEST POLICY
+/// forwards ([`forwards_header`]), and the ones its CACHE POLICY keys on — "the headers,
+/// cookies, and query strings that are included in the cache key are also included in
+/// requests that CloudFront sends to the origin" ([`keyed_parameters`]). A header that
+/// belongs to one hop of a connection, and the viewer's own credential, are never
+/// forwarded ([`HEADERS_NEVER_FORWARDED`]).
+fn origin_request_headers(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+    origin: &Origin,
+    req: &RtRequest,
+    cf_id: &str,
+) -> Vec<(String, String)> {
+    let (keyed, keys_on_cookies) = keyed_parameters(store, behavior);
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (name, value) in req.headers().iter() {
+        let name = name.to_ascii_lowercase();
+        if HEADERS_NEVER_FORWARDED.contains(&name.as_str()) || name == "host" {
+            continue;
+        }
+        // The body's own description travels with the body, whatever the policies say
+        // about the viewer's other headers.
+        let carries_body = name == "content-type" || name == "content-length";
+        let in_cache_key = keyed.keys_on(&name) || (keys_on_cookies && name == "cookie");
+        if carries_body || in_cache_key || forwards_header(store, behavior, &name) {
+            headers.push((name, value.to_string()));
+        }
+    }
+    headers.push(("host".to_string(), origin.domain_name.clone()));
+    headers.push((X_AMZ_CF_ID.to_string(), cf_id.to_string()));
+    headers.push((
+        "via".to_string(),
+        format!("1.1 {cf_id}.cloudfront.net ({VIA_CLOUDFRONT})"),
+    ));
+    headers.push(("user-agent".to_string(), ORIGIN_USER_AGENT.to_string()));
+    for custom in origin
+        .custom_headers
+        .as_ref()
+        .and_then(|custom| custom.items.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        headers.push((
+            custom.header_name.to_ascii_lowercase(),
+            custom.header_value.clone(),
+        ));
+    }
+    headers
+}
+
+/// Fetch the origin, serve what it answered, and cache it when the behaviour caches it.
+///
+/// The fetch goes through the transport `OperationContext::callback` hands this handler,
+/// so an origin this emulator serves answers it in process. An origin that answers
+/// nothing at all is reported as CloudFront reports an origin it could not reach.
+async fn fetch_origin<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    fetch: OriginFetch,
+    cf_id: &str,
+    req: &RtRequest,
+) -> RtResponse {
+    let body = req.body().bytes().map(<[u8]>::to_vec).unwrap_or_default();
+    let mut builder = ::http::Request::builder()
+        .method(req.method())
+        .uri(&fetch.uri);
+    for (name, value) in &fetch.headers {
+        builder = builder.header(name, value);
+    }
+    let built = builder
+        .body(SdkBody::from(::bytes::Bytes::from(body)))
+        .map_err(|error| error.to_string())
+        .and_then(|request| RtRequest::try_from(request).map_err(|error| error.to_string()));
+    let request = match built {
+        Ok(request) => request,
+        Err(error) => {
+            ::tracing::warn!(
+                uri = %fetch.uri,
+                %error,
+                "the configured origin does not render an HTTP request, so no origin \
+                 request was made"
+            );
+            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id);
+        }
+    };
+    let transport = ctx.callback().http_connector();
+    let answered = ::tokio::time::timeout(fetch.read_timeout, transport.call(request)).await;
+    let response = match answered {
+        Err(_elapsed) => {
+            ::tracing::warn!(
+                uri = %fetch.uri,
+                timeout_seconds = fetch.read_timeout.as_secs(),
+                "the origin did not answer within its read timeout"
+            );
+            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id);
+        }
+        Ok(Err(error)) => {
+            ::tracing::warn!(
+                uri = %fetch.uri,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the configured origin could not be reached"
+            );
+            return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id);
+        }
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status().as_u16();
+    let body = response
+        .into_body()
+        .bytes()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
+    if is_transport_refusal(&body) {
+        ::tracing::warn!(
+            uri = %fetch.uri,
+            "nothing in this emulator serves the configured origin, so no origin response \
+             exists to serve"
+        );
+        return generated(BAD_GATEWAY, NO_ORIGIN_DETAIL, cf_id);
+    }
+    if let Some(directive) = fetch.cache {
+        if is_cacheable_status(status) && body.len() <= MAX_CACHED_BODY_BYTES {
+            cache(
+                engine,
+                &fetch.distribution_id,
+                directive,
+                &fetch.viewer_path,
+                status,
+                &body,
+            );
+        }
+    }
+    // The origin answered, so the answer is the origin's — a MISS, since this request is
+    // what went to the origin. An origin answer that is itself an error is reported as
+    // one CloudFront did not produce from its cache either.
+    let x_cache = if is_cacheable_status(status) || status < 400 {
+        CACHE_MISS
+    } else {
+        CACHE_ERROR
+    };
+    served(status, body, x_cache, cf_id)
+}
+
+/// The error types that are the in-process TRANSPORT's own refusal rather than an answer
+/// from an origin: this emulator serves nothing at that host, or more than one of its
+/// services claims it. Either way the fetch reached no origin, which is the same class as
+/// an origin that never answered.
+///
+/// This is the shape the Lambda-function-URL origin takes here: no service of this
+/// emulator claims a function URL host, so the fetch of such an origin reaches nothing.
+const TRANSPORT_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
+
+/// How much of an answer is read to tell the transport's own refusal from an origin's
+/// response. The refusal envelope is two short fields; anything larger is a response from
+/// something that served the request, so it is not read at all.
+const MAX_REFUSAL_ENVELOPE_BYTES: usize = 4 * 1024;
+
+/// Whether `body` is the in-process transport's OWN refusal of the origin request rather
+/// than a response from an origin that served it.
+///
+/// The refusal is told by the error type its envelope carries ([`TRANSPORT_REFUSALS`]);
+/// the bridge the request crosses keeps the body but not the headers, so the envelope is
+/// where that type can be read at all. The same reading
+/// `services/service-com-amazonaws-eventbridge-awsevents` makes of an api-destination
+/// delivery nothing served.
+fn is_transport_refusal(body: &[u8]) -> bool {
+    if body.len() > MAX_REFUSAL_ENVELOPE_BYTES {
+        return false;
+    }
+    let Ok(envelope) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(error_type) = envelope.get("__type").and_then(::serde_json::Value::as_str) else {
+        return false;
+    };
+    // The type may carry a shape namespace; the code is its last segment.
+    let code = error_type.rsplit('#').next().unwrap_or(error_type);
+    TRANSPORT_REFUSALS.contains(&code)
+}
+
+/// The largest origin response this edge holds in its cache.
+///
+/// A cached answer is held in memory beside the distribution, so what one viewer request
+/// can add to the process is bounded here as well as by the entry count: a response larger
+/// than this is served to this viewer and not held, which a caller sees only as a cache
+/// MISS. This emulator's own bound, not CloudFront's.
+const MAX_CACHED_BODY_BYTES: usize = 1024 * 1024;
+
+/// Whether a status the origin answered is one the edge may hold in its cache.///
+/// "CloudFront caches ... responses with the following status codes: 200, 203, 204, 206,
+/// 300, 301, 302, 303, 304, 307, 308, 404, 405, 410, 414, and 501" — the successful,
+/// redirect and documented error statuses; anything else is served to this viewer and not
+/// held.
+fn is_cacheable_status(status: u16) -> bool {
+    const CACHEABLE: [u16; 15] = [
+        200, 203, 204, 206, 300, 301, 302, 303, 304, 307, 308, 404, 405, 410, 414,
+    ];
+    CACHEABLE.contains(&status) || status == 501
+}
+
+/// Hold one origin answer in the distribution's edge cache.
+fn cache<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    distribution_id: &str,
+    directive: CacheDirective,
+    viewer_path: &str,
+    status: u16,
+    body: &[u8],
+) {
+    let Some(state) = crate::state::service_state(engine) else {
+        return;
+    };
+    let now = SystemTime::now();
+    // The expiry is computed BEFORE the store is locked and without arithmetic that can
+    // fail: a TTL the clock cannot reach holds the entry for the longest span the clamp
+    // admits rather than making the instant uncomputable.
+    let Some(expires_at) = now.checked_add(directive.ttl) else {
+        ::tracing::warn!(
+            distribution = %distribution_id,
+            ttl_seconds = directive.ttl.as_secs(),
+            "this cache behavior's TTL runs past the clock, so the answer is served to \
+             this viewer and not held"
+        );
+        return;
+    };
+    let mut store = state.lock();
+    let Some(distribution) = store.distributions.get_mut(distribution_id) else {
+        return;
+    };
+    distribution.store_edge_response(
+        directive.key,
+        CachedEdgeResponse {
+            status,
+            body: body.to_vec(),
+            path: viewer_path.to_string(),
+            stored_at: now,
+            expires_at,
+        },
+    );
+}
+
+/// One answer the edge serves on behalf of an origin, or out of its cache.
+fn served(status: u16, body: Vec<u8>, x_cache: &str, cf_id: &str) -> RtResponse {
+    let mut response = RtResponse::new(status_code(status), SdkBody::from(body));
+    stamp(&mut response, x_cache, cf_id);
+    response
+}
+
+/// One answer CloudFront generated itself, as its own error page.
+///
+/// The page is the one CloudFront serves for a request it did not pass to an origin: the
+/// status, the sentence it heads the page with, the detail line for that failure, and the
+/// identifier of the request it answered, which is what a report to AWS Support quotes.
+fn generated(status: u16, detail: &str, cf_id: &str) -> RtResponse {
+    let page = format!(
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \
+         \"http://www.w3.org/TR/html4/loose.dtd\">\n\
+         <HTML><HEAD><META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; \
+         charset=iso-8859-1\">\n\
+         <TITLE>ERROR: The request could not be satisfied</TITLE>\n\
+         </HEAD><BODY>\n\
+         <H1>{status} ERROR</H1>\n\
+         <H2>The request could not be satisfied.</H2>\n\
+         <HR noshade size=\"1px\">\n\
+         {detail}\n\
+         <BR clear=\"all\">\n\
+         <HR noshade size=\"1px\">\n\
+         <PRE>Generated by cloudfront (CloudFront)\nRequest ID: {cf_id}\n</PRE>\n\
+         <ADDRESS></ADDRESS>\n\
+         </BODY></HTML>"
+    );
+    let mut response = RtResponse::new(status_code(status), SdkBody::from(page.into_bytes()));
+    let _ = response
+        .headers_mut()
+        .try_insert("content-type", "text/html".to_string());
+    let _ = response
+        .headers_mut()
+        .try_insert("server", SERVER.to_string());
+    stamp(&mut response, CACHE_ERROR, cf_id);
+    response
+}
+
+/// Put the headers every edge answer carries on `response`: its cache outcome and the
+/// identifier of the request it answers.
+fn stamp(response: &mut RtResponse, x_cache: &str, cf_id: &str) {
+    let _ = response
+        .headers_mut()
+        .try_insert(X_CACHE, x_cache.to_string());
+    if !cf_id.is_empty() {
+        let _ = response
+            .headers_mut()
+            .try_insert(X_AMZ_CF_ID, cf_id.to_string());
+    }
+}
+
+/// `status` as a status code, falling back to the one CloudFront answers when it got no
+/// origin response — the only way a status this module computed is not a status code is
+/// if an origin answered one the wire cannot carry.
+fn status_code(status: u16) -> StatusCode {
+    StatusCode::try_from(status).unwrap_or_else(|_| {
+        StatusCode::try_from(BAD_GATEWAY).expect("502 is a valid HTTP status code")
+    })
+}
+
+/// The `Host` header of a buffered request, or the URI authority when the request is
+/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
+        Some(host) => Some(host),
+        None => parts.uri.authority().map(http::uri::Authority::as_str),
+    }
+}
+
+/// The authority of an absolute request URI, or `None` when the URI is origin-form.
+fn authority_of(uri: &str) -> Option<&str> {
+    let (_scheme, rest) = uri.split_once("://")?;
+    Some(match rest.find('/') {
+        Some(path_start) => &rest[..path_start],
+        None => rest,
+    })
+}
+
+/// The path component of a request URI, whether it is origin-form or absolute.
+fn path_of(uri: &str) -> &str {
+    let after_authority = match uri.split_once("://") {
+        Some((_scheme, rest)) => match rest.find('/') {
+            Some(path_start) => &rest[path_start..],
+            None => "/",
+        },
+        None => uri,
+    };
+    match after_authority.find('?') {
+        Some(mark) => &after_authority[..mark],
+        None => after_authority,
+    }
+}
+
+/// The query component of a request URI: everything after the first `?`.
+fn query_of(uri: &str) -> &str {
+    match uri.find('?') {
+        Some(mark) => &uri[mark + 1..],
+        None => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The pure rules this module owns that a wire test cannot vary cheaply: how a URI is
+    //! split into an addressing, and how an origin request URI is built. The served
+    //! behaviour is pinned end to end in `tests/all/edge_data_plane.rs`.
+
+    use super::*;
+    use crate::ops::types::CustomOriginConfig;
+
+    #[test]
+    fn a_uri_is_split_into_its_path_and_its_query() {
+        // Rows differ along the form of the URI (origin-form, absolute), whether it
+        // carries a query, and whether it carries a path at all.
+        let cases: [(&str, &str, &str); 6] = [
+            ("/", "/", ""),
+            ("/opt/thing", "/opt/thing", ""),
+            ("/opt/thing?a=1&b=2", "/opt/thing", "a=1&b=2"),
+            ("https://d1.cloudfront.net/opt", "/opt", ""),
+            ("https://d1.cloudfront.net/opt?a=1", "/opt", "a=1"),
+            ("https://d1.cloudfront.net", "/", ""),
+        ];
+        for (uri, path, query) in cases {
+            let (actual_path, actual_query) = (path_of(uri), query_of(uri));
+            assert_eq!(
+                (actual_path, actual_query),
+                (path, query),
+                "case {uri:?}: expected the path {path:?} and the query {query:?}, got \
+                 {actual_path:?} and {actual_query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_data_plane_path_prefix_names_the_distribution_before_the_viewer_path() {
+        // Rows differ along what follows the prefix (an id with a viewer path, an id
+        // alone), along the spelling of the prefix itself, and along paths that carry no
+        // prefix at all.
+        let cases: [(&str, Option<(&str, &str)>); 6] = [
+            ("/_aws/cloudfront/E123/opt/x", Some(("E123", "/opt/x"))),
+            ("/_aws/cloudfront/E123", Some(("E123", "/"))),
+            ("/_aws/cloudfront/E123/", Some(("E123", "/"))),
+            ("/_aws/cloudfront", None),
+            ("/_aws/execute-api/abc/stage", None),
+            ("/2020-05-31/distribution", None),
+        ];
+        for (path, expected) in cases {
+            let actual = split_edge_prefix(path);
+            assert_eq!(
+                actual, expected,
+                "case {path:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_origin_request_uri_carries_the_origins_scheme_port_and_path() {
+        // Rows differ along the origin protocol policy, the ports, the origin path and
+        // the viewer query — everything the rule generalises over.
+        let custom = |policy: &str, http_port: i32, https_port: i32| CustomOriginConfig {
+            http_port,
+            https_port,
+            origin_protocol_policy: policy.to_string(),
+            ..CustomOriginConfig::default()
+        };
+        let origin = |config: Option<CustomOriginConfig>, origin_path: Option<&str>| Origin {
+            id: "primary".to_string(),
+            domain_name: "origin.example.com".to_string(),
+            origin_path: origin_path.map(str::to_string),
+            custom_origin_config: config,
+            ..Origin::default()
+        };
+        let cases: [(&str, Origin, &str, &str, &str); 5] = [
+            (
+                "an https-only origin on the default port",
+                origin(Some(custom("https-only", 80, 443)), None),
+                "/index.html",
+                "",
+                "https://origin.example.com/index.html",
+            ),
+            (
+                "an http-only origin on the default port",
+                origin(Some(custom("http-only", 80, 443)), None),
+                "/index.html",
+                "",
+                "http://origin.example.com/index.html",
+            ),
+            (
+                "an https origin on a port of its own",
+                origin(Some(custom("https-only", 80, 8443)), None),
+                "/index.html",
+                "",
+                "https://origin.example.com:8443/index.html",
+            ),
+            (
+                "an origin path the viewer path is appended to",
+                origin(Some(custom("https-only", 80, 443)), Some("/prefix")),
+                "/index.html",
+                "",
+                "https://origin.example.com/prefix/index.html",
+            ),
+            (
+                "an S3 origin, over https, carrying the viewer query",
+                origin(None, None),
+                "/key",
+                "a=1",
+                "https://origin.example.com/key?a=1",
+            ),
+        ];
+        for (case, origin, viewer_path, query, expected) in cases {
+            let actual = origin_uri(&origin, viewer_path, query);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the origin URI {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_origin_request_carries_no_viewer_credential_whatever_the_policy_forwards() {
+        // The rows differ along the origin request policy's header behaviour — none (the
+        // default), `allViewer` and `allViewerExceptHostHeader`, the AWS-managed policies
+        // whose ids `MANAGED_ORIGIN_REQUEST_POLICIES` publishes — and along the viewer
+        // header: a credential, a hop-by-hop header, and an ordinary one.
+        const ALL_VIEWER: &str = "216adef6-5c7f-47e4-b989-5492eafa07d3";
+        const ALL_VIEWER_EXCEPT_HOST: &str = "b689b0a8-53d0-40ab-baf2-68738e2966ac";
+        let store = ComAmazonawsCloudfrontCloudfront20200531State::default();
+        let origin = Origin {
+            id: "primary".to_string(),
+            domain_name: "origin.example.com".to_string(),
+            ..Origin::default()
+        };
+        // (case, the policy the behaviour names, the viewer header, forwarded)
+        let cases: [(&str, Option<&str>, &str, bool); 9] = [
+            ("no policy, a credential", None, "authorization", false),
+            ("no policy, an ordinary header", None, "accept-language", false),
+            (
+                "allViewer, a credential",
+                Some(ALL_VIEWER),
+                "authorization",
+                false,
+            ),
+            (
+                "allViewer, a session token",
+                Some(ALL_VIEWER),
+                "x-amz-security-token",
+                false,
+            ),
+            (
+                "allViewer, a hop-by-hop header",
+                Some(ALL_VIEWER),
+                "connection",
+                false,
+            ),
+            (
+                "allViewer, an ordinary header",
+                Some(ALL_VIEWER),
+                "accept-language",
+                true,
+            ),
+            (
+                "allViewerExceptHostHeader, a credential",
+                Some(ALL_VIEWER_EXCEPT_HOST),
+                "authorization",
+                false,
+            ),
+            (
+                "allViewerExceptHostHeader, an ordinary header",
+                Some(ALL_VIEWER_EXCEPT_HOST),
+                "accept-language",
+                true,
+            ),
+            (
+                "a policy this account does not hold",
+                Some("00000000-0000-0000-0000-000000000000"),
+                "accept-language",
+                false,
+            ),
+        ];
+        for (case, policy, header, forwarded) in cases {
+            let behavior = Behavior {
+                path_pattern: None,
+                target_origin_id: "primary".to_string(),
+                allowed_methods: None,
+                cache_policy_id: None,
+                origin_request_policy_id: policy.map(str::to_string),
+                default_ttl: None,
+                max_ttl: None,
+            };
+            let mut req = RtRequest::new(SdkBody::empty());
+            req.set_uri("/index.html").expect("a valid URI");
+            req.headers_mut().insert(header.to_string(), "v".to_string());
+            let headers = origin_request_headers(&store, &behavior, &origin, &req, "cfid");
+            let carried = headers.iter().any(|(name, _)| name == header);
+            assert_eq!(
+                carried, forwarded,
+                "case {case:?}: expected the origin request to carry {header:?} == \
+                 {forwarded}, got {carried} (headers {headers:?})"
+            );
+            // Whatever the policy says, the origin request always names the ORIGIN's host
+            // and the request it is being made for.
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "host" && value == &origin.domain_name)
+                    && headers.iter().any(|(name, _)| name == X_AMZ_CF_ID),
+                "case {case:?}: expected the origin's host and an X-Amz-Cf-Id, got \
+                 {headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alias_may_not_claim_an_address_this_emulator_is_reached_at() {
+        // Rows differ along the shape of the stored alternate domain name: a customer
+        // domain, the loopback names and IP literals a client on this machine dials, a
+        // host that names a service endpoint, and the empty name.
+        let cases: [(&str, &str, bool); 11] = [
+            ("a customer domain", "cdn.example.com", true),
+            ("a wildcard-free subdomain", "assets.cdn.example.com", true),
+            ("the loopback name", "localhost", false),
+            ("the loopback name with a port", "localhost:9297", false),
+            ("a name under the loopback name", "edge.localhost", false),
+            ("an IPv4 literal", "127.0.0.1", false),
+            ("an IPv4 literal with a port", "127.0.0.1:9297", false),
+            ("a bracketed IPv6 literal", "[::1]:9297", false),
+            ("another service's endpoint", "s3.us-east-1.amazonaws.com", false),
+            ("an edge domain CloudFront assigns", "d111.cloudfront.net", false),
+            ("the empty name", "", false),
+        ];
+        for (case, alias, expected) in cases {
+            let actual = addressable_alias(alias);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({alias:?}): expected addressable_alias == {expected}, got \
+                 {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_key_carries_every_header_the_policy_keys_on() {
+        // Rows differ along the cache policy's header behaviour — every value
+        // `CachePolicyHeadersConfig$HeaderBehavior` and its origin-request-policy
+        // spellings take — and along the header asked about, including one named in a
+        // different case than the viewer sent it.
+        let cases: [(&str, KeyedHeaders, &str, bool); 8] = [
+            ("none keys on no header", KeyedHeaders::None, "x-viewer", false),
+            (
+                "whitelist keys on a named header",
+                KeyedHeaders::Named(vec!["x-viewer".to_string()]),
+                "x-viewer",
+                true,
+            ),
+            (
+                "whitelist is case-insensitive about the name",
+                KeyedHeaders::Named(vec!["X-Viewer".to_string()]),
+                "x-viewer",
+                true,
+            ),
+            (
+                "whitelist keys on nothing else",
+                KeyedHeaders::Named(vec!["x-viewer".to_string()]),
+                "accept-language",
+                false,
+            ),
+            (
+                "allViewer keys on every header",
+                KeyedHeaders::Every,
+                "accept-language",
+                true,
+            ),
+            (
+                "allViewer keys on a header no list names",
+                KeyedHeaders::Every,
+                "x-anything",
+                true,
+            ),
+            (
+                "allExcept keys on everything but the named",
+                KeyedHeaders::EveryExcept(vec!["host".to_string()]),
+                "accept-language",
+                true,
+            ),
+            (
+                "allExcept does not key on a named header",
+                KeyedHeaders::EveryExcept(vec!["host".to_string()]),
+                "host",
+                false,
+            ),
+        ];
+        for (case, keyed, header, expected) in cases {
+            let actual = keyed.keys_on(header);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({header}): expected keys_on == {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_that_has_already_been_through_an_edge_is_recognised() {
+        // Rows differ along the `Via` the request carries: one an edge of this emulator
+        // stamped, one another proxy did, a chain ending in one, and none at all.
+        let cases: [(&str, Option<&str>, bool); 4] = [
+            ("no Via at all", None, false),
+            (
+                "a Via an edge stamped",
+                Some("1.1 cfid.cloudfront.net (CloudFront)"),
+                true,
+            ),
+            ("another proxy's Via", Some("1.1 proxy.internal"), false),
+            (
+                "a chain whose last hop is an edge",
+                Some("1.1 proxy.internal, 1.1 cfid.cloudfront.net (CloudFront)"),
+                true,
+            ),
+        ];
+        for (case, via, expected) in cases {
+            let mut req = RtRequest::new(SdkBody::empty());
+            req.set_uri("/index.html").expect("a valid URI");
+            if let Some(via) = via {
+                req.headers_mut().insert("via".to_string(), via.to_string());
+            }
+            let actual = carries_cloudfront_via(&req);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected carries_cloudfront_via == {expected}, got {actual}"
+            );
+        }
+    }
+}

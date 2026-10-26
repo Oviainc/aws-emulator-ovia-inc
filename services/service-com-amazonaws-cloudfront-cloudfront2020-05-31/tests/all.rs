@@ -73,6 +73,8 @@ mod distributions_by_origin_request_policy_id;
 mod distributions_by_realtime_log_config;
 #[path = "all/distributions_by_response_headers_policy_id.rs"]
 mod distributions_by_response_headers_policy_id;
+#[path = "all/edge_data_plane.rs"]
+mod edge_data_plane;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/field_level_encryption_profile_lifecycle.rs"]
