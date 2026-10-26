@@ -171,17 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.multiplex_program_description(&input.multiplex_id, &input.program_name)
         else {
             // Which resource is missing is what the refusal names: a multiplex
-            // id no multiplex has, or a program name that multiplex does not
-            // hold.
-            let (resource_type, identifier) = if state.multiplexes.contains_key(&input.multiplex_id)
-            {
-                ("MultiplexProgram", input.program_name.as_str())
+            // id no multiplex has, or a program the named multiplex does not
+            // hold — which is named by that multiplex and its own name, since a
+            // program has no identifier of its own.
+            let message = if state.multiplexes.contains_key(&input.multiplex_id) {
+                crate::state::multiplex_program_not_found_message(
+                    &input.multiplex_id,
+                    &input.program_name,
+                )
             } else {
-                ("Multiplex", input.multiplex_id.as_str())
+                crate::state::not_found_message("Multiplex", &input.multiplex_id)
             };
             return Err(DescribeMultiplexProgramErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::not_found_message(resource_type, identifier)),
+                    message: Some(message),
                 },
             )
             .into());

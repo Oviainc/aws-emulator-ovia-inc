@@ -71,14 +71,15 @@
 //! ## The document plane
 //!
 //! `ExportComplianceInquiry` hands out a PRESIGNED URL, and a presigned URL is a promise
-//! that a caller can follow it: it is addressed to the document host this service
-//! publishes (`crate::state::is_document_host`), under the path
-//! `/compliance-inquiry/<inquiryId>/export/<exportId>/<object>`, which names no modelled
-//! operation. Two seams carry it, the same pair any emulated data plane uses:
+//! that a caller can follow it: it names the endpoint the CALLER reached this emulator on
+//! (`crate::state::document_url_host`), under the path
+//! `crate::state::EXPORT_DOCUMENT_PATH_PREFIX` owns, which names no modelled operation.
+//! Two seams carry it, the same pair any emulated data plane uses:
 //!
-//! - [`Service::can_handle`] also claims a request addressed to that published host,
-//!   whose first label names no service, so the router does not answer `UnknownService`
-//!   for a URL this service handed out;
+//! - [`Service::can_handle`] also claims a request to a path this service publishes its
+//!   exports at, so a fetch that carries neither a credential nor a host naming a service
+//!   — which is every fetch of a URL this service handed out — is not answered
+//!   `UnknownService`;
 //! - [`Service::override_routing_error`] serves it. A document request names no modelled
 //!   operation by construction, so the router reaches exactly this seam for it, and
 //!   reaches it BEFORE authentication — which is what lets a presigned URL be followed
@@ -652,11 +653,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if parse_document_path(parts.uri.path()).is_some() {
             return true;
         }
-        // And a request addressed to the DOCUMENT host this service publishes its
-        // presigned URLs under, whose first label names no service at all: without this
-        // the router answers `UnknownService` for a URL this service handed out. See the
-        // module docs.
-        request_host(parts).is_some_and(crate::state::is_document_host)
+        // And the same claim for the compliance-inquiry EXPORT documents, whose paths
+        // `crate::state::EXPORT_DOCUMENT_PATH_PREFIX` owns: a fetch of a presigned URL
+        // this service handed out carries no credential and no host naming a service
+        // either, so without this the router answers `UnknownService` for a URL this
+        // service announced. See the module docs.
+        crate::state::parse_export_document_path(parts.uri.path()).is_some()
     }
 
     fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
@@ -832,16 +834,4 @@ fn document_error(status: u16, code: &str, message: &str) -> RtResponse {
     resp
 }
 
-/// The `Host` header of a buffered request, or the URI authority when the request is
-/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
-///
-/// It RECOGNISES a host, which is all the claim below needs. The host a document URL is
-/// MINTED with is `crate::state::document_url_host`, which reads the same two sources and
-/// then requires a bare authority, because that value is interpolated into a URL this
-/// service hands out.
-fn request_host(parts: &http::request::Parts) -> Option<&str> {
-    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
-        Some(host) => Some(host),
-        None => parts.uri.authority().map(http::uri::Authority::as_str),
-    }
-}
+

@@ -7664,6 +7664,30 @@ pub const ORGANIZATION_ADMIN_REGION_LIMIT_MESSAGE: &str = "The request is reject
 // disagree about which resource an ARN names or where its tags are kept.
 // ---------------------------------------------------------------------------
 
+/// The `Tags` member a read of a taggable resource reports, from the tag map the
+/// resource's record holds.
+///
+/// Every `Get`/`Describe` in this service projects its resource's tags through
+/// here, so one rule answers all of them: the member is ALWAYS reported, and a
+/// resource nothing tagged reports an EMPTY map rather than no member at all —
+/// which is what GuardDuty answers for an untagged resource (the recorded
+/// `GetDetector` response of a detector created without tags carries an empty
+/// `tags` map). A client can therefore read the map on any resource of this
+/// service without a null guard.
+///
+/// The `len 1..200` the model puts on `TagMap`
+/// (`smithy_query(query="shape", shape="TagMap")`) bounds what a REQUEST may
+/// carry — which is why a create or `TagResource` sending an empty map is
+/// refused at the modelled boundary — and is not a floor on what a read of a
+/// resource reports.
+pub fn reported_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    Some(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
 /// A detector sub-resource that carries tags of its own.
 ///
 /// One variant per collection hanging off [`Detector`] whose record has a tag

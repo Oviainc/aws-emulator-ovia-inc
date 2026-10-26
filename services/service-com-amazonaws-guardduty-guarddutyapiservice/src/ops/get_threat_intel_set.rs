@@ -192,19 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             format: set.format.clone(),
             location: set.location.clone(),
             status: set.status.clone(),
-            // `TagMap` is modelled `len 1..200` (`smithy_query(shape="TagMap")`), so
-            // an untagged list reports NO map rather than an empty one that would
-            // break that constraint.
-            tags: if set.tags.is_empty() {
-                None
-            } else {
-                Some(
-                    set.tags
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                )
-            },
+            // Projected through the ONE tag-map rule every read of this service
+            // shares ([`crate::state::reported_tags`]): the member is always
+            // reported, empty when nothing tagged the list.
+            tags: crate::state::reported_tags(&set.tags),
             // "This field appears in the response only if it was provided during
             // ThreatIntelSet creation or update"
             // (`smithy_query(operation="GetThreatIntelSet")`).

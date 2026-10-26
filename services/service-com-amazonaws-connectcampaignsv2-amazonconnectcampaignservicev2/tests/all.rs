@@ -33,6 +33,8 @@ mod campaign_lifecycle;
 mod campaign_name_uniqueness;
 #[path = "all/campaign_not_found_message.rs"]
 mod campaign_not_found_message;
+#[path = "all/campaign_rename.rs"]
+mod campaign_rename;
 #[path = "all/campaign_resume.rs"]
 mod campaign_resume;
 #[path = "all/campaign_schedule_completion.rs"]

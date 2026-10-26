@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation changes the DB subnet group a request names in this
+//! service's store — the subnets it covers and, when the request carries one, its
+//! description — and answers from the stored record, so a later `DescribeDBSubnetGroups`
+//! reports the change. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records live in [`crate::state`], shared with `CreateDBSubnetGroup`,
+//! `DeleteDBSubnetGroup` and the operations that RESOLVE a `DBSubnetGroupName`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +156,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyDBSubnetGroupError::validation)?;
+        // "This value is stored as a lowercase string", so the name folds the way
+        // `CreateDBSubnetGroup` folded it when it stored the group.
+        let name = input.db_subnet_group_name.to_ascii_lowercase();
+        // "You can't modify the default subnet group" / "Must not be default": the group
+        // the real service provides alongside the account's default VPC belongs to the
+        // service, so a request naming it is refused for the VALUE it carries — not with
+        // the not-found fault, since that group does resolve for every operation that
+        // reads it. It is the refusal `DeleteDBSubnetGroup` answers for that name.
+        if name == crate::state::DEFAULT_DB_SUBNET_GROUP {
+            return Err(ModifyDBSubnetGroupError::invalid_parameter_value(format!(
+                "DBSubnetGroupName must not be {}: the DB subnet group of the account's \
+                 default VPC can't be modified",
+                crate::state::DEFAULT_DB_SUBNET_GROUP
+            )));
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // The group this call ADDRESSES is resolved first: "DBSubnetGroupName doesn't
+        // refer to an existing DB subnet group" is the modelled 404, and there is nothing
+        // to check a new subnet list against until the group it would change is known.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBSubnetGroup"))
+        // RDS is regional: only the region the request was signed for is in scope.
+        //
+        // The WORDING is the one RDS answers where the group is the SUBJECT of the call
+        // and the call changes it — the same helper `DeleteDBSubnetGroup` uses, not the
+        // lookup wording the report and the resource-placement paths share.
+        let key = (region.clone(), name.clone());
+        if !store.db_subnet_groups.contains_key(&key) {
+            return Err(
+                ModifyDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
+                    DBSubnetGroupNotFoundFault {
+                        message: Some(crate::state::db_subnet_group_does_not_exist_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The subnets the modified group would cover are the same list
+        // `CreateDBSubnetGroup` takes, checked by the one rule in `crate::state` and
+        // mapped here onto THIS operation's modelled faults.
+        if let Err(rejection) = crate::state::check_db_subnet_group_subnets(&input.subnet_ids) {
+            return Err(match rejection {
+                crate::state::SubnetListRejection::TooManySubnets(message) => {
+                    ModifyDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                        DBSubnetQuotaExceededFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::SubnetListRejection::NotASubnet(message) => {
+                    ModifyDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                        message: Some(message),
+                    })
+                }
+                crate::state::SubnetListRejection::NotEnoughAvailabilityZones(message) => {
+                    ModifyDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                        DBSubnetGroupDoesNotCoverEnoughAZs {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // `SubnetIds` is required, so the modified group covers exactly the subnets this
+        // request names, in the order it names them. `DBSubnetGroupDescription` is NOT
+        // required: a request carrying none leaves the stored description where it was
+        // rather than blanking a value the caller said nothing about.
+        if let Some(record) = store.db_subnet_groups.get_mut(&key) {
+            record.subnet_ids = input.subnet_ids;
+            if let Some(description) = input.db_subnet_group_description {
+                record.description = description;
+            }
+            return Ok(ModifyDBSubnetGroupOutput {
+                db_subnet_group: Some(record.to_wire()),
+            });
+        }
+        // The group resolved a few lines up under this very lock, so this is unreachable;
+        // the modelled 404 is still the honest answer for a group that is not there, and
+        // answering it costs nothing where a panic would cost every other caller the
+        // store.
+        Err(
+            ModifyDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
+                DBSubnetGroupNotFoundFault {
+                    message: Some(crate::state::db_subnet_group_does_not_exist_message(&name)),
+                },
+            )
+            .into(),
+        )
     }
 }

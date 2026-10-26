@@ -75,6 +75,9 @@ mod stream_enabled_table_round_trip;
 #[path = "all/stream_identity_is_minted_once.rs"]
 mod stream_identity_is_minted_once;
 
+#[path = "all/stream_record_images.rs"]
+mod stream_record_images;
+
 #[path = "all/stream_specification_with_other_members.rs"]
 mod stream_specification_with_other_members;
 

@@ -51,8 +51,8 @@ pub struct ComAmazonawsBudgetsAwsbudgetservicegatewayState {
 /// notifications and tags created alongside it.
 ///
 /// No ARN is stored: nothing in this slice reports one. The operations that name a
-/// budget by ARN (`TagResource` / `ListTagsForResource`, and `UntagResource` once it is
-/// written) resolve it the other way round — [`parse_resource_arn`] reads the account and
+/// budget by ARN (`TagResource`, `UntagResource` and `ListTagsForResource`) resolve it
+/// the other way round — [`parse_resource_arn`] reads the account and
 /// the budget name out of the ARN and looks the budget up under the key it already has,
 /// so no second copy of a budget's identity is persisted.
 #[derive(Debug, Clone)]
@@ -2339,6 +2339,21 @@ pub fn apply_tags(held: &mut Vec<ResourceTag>, supplied: Vec<ResourceTag>) {
             None => held.push(tag),
         }
     }
+}
+
+/// Drop from the tags `held` by a resource every tag whose key is named in `keys`.
+///
+/// The mirror of [`apply_tags`], from the same rule — a resource holds at most one tag
+/// per key ("each key must be unique for the resource") — so a key names at most one tag
+/// to delete and naming it is enough to delete it: no value is supplied, and a key the
+/// resource does not carry has nothing to delete, which is already the state the request
+/// asks for rather than a failure. Repeating a key in one request therefore states the
+/// same deletion twice, not two conflicting ones.
+///
+/// The tags that stay keep their relative order, so the order a read reports — the order
+/// the keys were first created in — survives a deletion in the middle of the set.
+pub fn remove_tag_keys(held: &mut Vec<ResourceTag>, keys: &[String]) {
+    held.retain(|tag| !keys.iter().any(|key| key == &tag.key));
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

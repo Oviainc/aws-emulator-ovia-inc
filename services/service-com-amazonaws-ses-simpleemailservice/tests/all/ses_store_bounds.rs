@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The bounds on the two caller-driven stores, and the quota window they share.
+//! The bounds on the caller-driven stores, and the quota window they share.
 //!
 //! Every request reaching this emulator can grow one of these stores, so each has
-//! a ceiling: the identity list at `MAX_IDENTITIES`, the send log at
+//! a ceiling: the identity list at `MAX_IDENTITIES`, the configuration sets at
+//! `MAX_CONFIGURATION_SETS`, the send log at
 //! `MAX_SENT_LOG_ENTRIES` with the 24-hour window applied on append, and the text
 //! one log entry keeps at `MAX_LOGGED_TEXT`. What is asserted here is the RULE
 //! each bound follows over a SET of sizes — at the ceiling, one past it, and well
@@ -13,7 +14,8 @@
 
 use service_com_amazonaws_ses_simpleemailservice::state::{
     logged_text, ComAmazonawsSesSimpleemailserviceState, IdentityType, SentMessage,
-    MAX_IDENTITIES, MAX_LOGGED_TEXT, MAX_SENT_LOG_ENTRIES, SEND_QUOTA_WINDOW,
+    MAX_CONFIGURATION_SETS, MAX_IDENTITIES, MAX_LOGGED_TEXT, MAX_SENT_LOG_ENTRIES,
+    SEND_QUOTA_WINDOW,
 };
 use std::time::{Duration, SystemTime};
 
@@ -95,6 +97,62 @@ async fn the_identity_list_stops_at_the_accounts_limit() {
         MAX_IDENTITIES,
         "case re-verification at the limit: the list must not grow, got {}",
         state.identities.len()
+    );
+}
+
+#[tokio::test]
+async fn the_configuration_sets_stop_at_the_accounts_limit() {
+    let mut state = ComAmazonawsSesSimpleemailserviceState::default();
+    // Filled to exactly the ceiling, over names of differing form, since the
+    // bound is on the COUNT and not on any one name.
+    for index in 0..MAX_CONFIGURATION_SETS {
+        let name = format!("config-set-{index}");
+        let recorded = state.add_configuration_set(&name);
+        assert!(
+            recorded.is_some_and(|set| set.sending_enabled),
+            "case configuration set {index}: a create inside the limit must be recorded, \
+             sending enabled"
+        );
+    }
+    assert_eq!(
+        state.configuration_sets.len(),
+        MAX_CONFIGURATION_SETS,
+        "case full store: expected {MAX_CONFIGURATION_SETS} sets, got {}",
+        state.configuration_sets.len()
+    );
+
+    // One past the ceiling is refused, and records nothing.
+    for name in ["one-too-many", "ONE_TOO_MANY-2"] {
+        assert!(
+            state.add_configuration_set(name).is_none(),
+            "case {name:?}: a create past the limit must be refused"
+        );
+        assert!(
+            !state.configuration_sets.contains_key(name),
+            "case {name:?}: a refused create must record nothing"
+        );
+    }
+
+    // A name already in the store adds nothing, so it still succeeds at the
+    // ceiling and leaves the stored record alone.
+    let existing = "config-set-0";
+    state
+        .configuration_sets
+        .get_mut(existing)
+        .expect("the set was recorded above")
+        .sending_enabled = false;
+    assert_eq!(
+        state
+            .add_configuration_set(existing)
+            .map(|set| set.sending_enabled),
+        Some(false),
+        "case {existing:?}: an existing set keeps its stored sending state"
+    );
+    assert_eq!(
+        state.configuration_sets.len(),
+        MAX_CONFIGURATION_SETS,
+        "case existing name at the limit: the store must not grow, got {}",
+        state.configuration_sets.len()
     );
 }
 

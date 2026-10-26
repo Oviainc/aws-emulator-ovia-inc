@@ -4,8 +4,10 @@
 //!
 //! Every assertion goes through the router, so each case exercises routing, restXml
 //! (de)serialization, the handler and the persisted state — the same path a client takes.
-//! The rule under test is the one the operation states: it "checks whether your domain
-//! name points to the correct routing endpoint of the connection group, such as
+//! Two rules are under test.
+//!
+//! The first is the one the operation states: it "checks whether your domain name points to
+//! the correct routing endpoint of the connection group, such as
 //! `d111111abcdef8.cloudfront.net`", so for each domain in scope — the one `Domain` names,
 //! or every domain the distribution tenant holds — the answer compares the endpoint that
 //! name resolves to against the routing endpoint of the connection group the tenant is
@@ -17,22 +19,27 @@
 //! * `unknown-configuration` when no DNS record this service can read resolves the name,
 //!   so no comparison was made — CloudFront "can't verify the DNS record".
 //!
-//! Beside it: an `Identifier` no tenant carries is `EntityNotFound`, a `Domain` that is no
-//! domain name is `InvalidArgument`, and the verification is a REPORT — it changes nothing
-//! a later caller sees.
+//! The second is the scope of a `Domain` argument: the verification is about the tenant the
+//! `Identifier` names, so a `Domain` that tenant does not hold is refused — HTTP 400,
+//! `InvalidArgument`, with the fixed sentence CloudFront answers it with, which interpolates
+//! neither the domain asked about nor the tenant. A string of no domain shape at all is one
+//! such name, so it takes the same refusal.
 //!
-//! The rows differ along everything the rule generalises over: which endpoint the domain
+//! Beside them: an `Identifier` no tenant carries is `EntityNotFound`, and the verification
+//! is a REPORT — it changes nothing a later caller sees.
+//!
+//! The rows differ along everything the rules generalise over: which endpoint the domain
 //! resolves to (the tenant's own connection group, another connection group, a
 //! distribution's own edge domain, nothing at all), whether the name is one the tenant
-//! holds, the case it is written in, how many domains are in scope, and which of the three
-//! identifiers names the tenant.
+//! holds, the case it is written in, its shape and its length, how many domains are in
+//! scope, and which of the three identifiers names the tenant.
 //!
 //! The wire harness (the router, the request helpers and the element scanner) is the one
 //! [`crate::distribution_lifecycle`] already builds.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     DISTRIBUTION_TENANT_ID_PREFIX, DNS_CONFIGURATION_INVALID, DNS_CONFIGURATION_UNKNOWN,
-    DNS_CONFIGURATION_VALID, MAX_DOMAIN_LABEL_LEN, MAX_DOMAIN_NAME_LEN,
+    DNS_CONFIGURATION_VALID, MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -44,6 +51,13 @@ use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, encode_label, escape, longest_domain, multi_tenant_distribution,
 };
 use crate::response_headers_policy_lifecycle::text;
+
+/// The message CloudFront answers a `Domain` the named distribution tenant does not hold
+/// with. FIXED text: every row below, whatever it asked about, is answered with exactly
+/// this, so the test also pins that nothing of the request reaches the message.
+const DOMAIN_NOT_ASSOCIATED: &str = "The specified domain name isn't associated with the \
+                                     distribution tenant. Specify another domain name and \
+                                     try again.";
 
 // ---------------------------------------------------------------------------
 // Calling the operation
@@ -130,6 +144,11 @@ fn one(answer: &Answer, case: &str) -> (String, String, String) {
     entries.into_iter().next().expect("one entry")
 }
 
+/// The `Message` of a refusal envelope, or `""`.
+fn message(answer: &Answer) -> &str {
+    answer.root().find_text("Message").unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // The resources every case is verified against
 // ---------------------------------------------------------------------------
@@ -171,6 +190,11 @@ async fn distribution_tenant(
     domains: &[&str],
     connection_group_id: &str,
 ) -> (String, String) {
+    assert!(
+        domains.len() <= MAX_DOMAINS_PER_TENANT,
+        "case {name}: a tenant holds at most {MAX_DOMAINS_PER_TENANT} domains, got {}",
+        domains.len()
+    );
     let mut body = format!(
         "<CreateDistributionTenantRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -227,13 +251,14 @@ async fn distribution_domain_name(router: &MultiServiceRouter, reference: &str) 
 // The rules
 // ---------------------------------------------------------------------------
 
-/// Each domain is reported against the routing endpoint of the connection group the tenant
-/// is routed through: the endpoint itself is `valid-configuration`, a name that resolves
-/// ELSEWHERE — another connection group's routing endpoint, a distribution's own edge
-/// domain — is `invalid-configuration`, and a name no DNS record this service can read
-/// resolves is `unknown-configuration`. DNS names are case-insensitive, so the case the
-/// name is written in does not change the answer, and each reason names the endpoint the
-/// comparison was made against.
+/// Each domain the tenant holds is reported against the routing endpoint of the connection
+/// group the tenant is routed through: a name that resolves to that endpoint is
+/// `valid-configuration`, one that resolves ELSEWHERE — another connection group's routing
+/// endpoint, a distribution's own edge domain — is `invalid-configuration`, and one no DNS
+/// record this service can read resolves is `unknown-configuration`. DNS names are
+/// case-insensitive, so the case the name is written in changes neither whether the tenant
+/// holds it nor the answer, and each reason names the endpoint the comparison was made
+/// against.
 #[tokio::test]
 async fn a_domain_is_verified_against_the_tenants_routing_endpoint() {
     let router = emulator();
@@ -241,12 +266,21 @@ async fn a_domain_is_verified_against_the_tenants_routing_endpoint() {
     let (own_group, own_endpoint) = connection_group(&router, "verify-dns-own").await;
     let (other_group, other_endpoint) = connection_group(&router, "verify-dns-other").await;
     let distribution_domain = distribution_domain_name(&router, "ref-verify-dns-standard").await;
+    let longest = longest_domain();
 
+    // The tenant HOLDS every name verified below — that is the scope of a `Domain`
+    // argument — and they differ along what each resolves to and how long each is.
     let (tenant_id, _) = distribution_tenant(
         &router,
         &distribution_id,
         "verify-dns-tenant",
-        &["shop.example.com", "www.example.com"],
+        &[
+            &own_endpoint,
+            &other_endpoint,
+            &distribution_domain,
+            "shop.example.com",
+            &longest,
+        ],
         &own_group,
     )
     .await;
@@ -259,11 +293,6 @@ async fn a_domain_is_verified_against_the_tenants_routing_endpoint() {
     )
     .await;
 
-    // Rows: the tenant's own routing endpoint, the same endpoint in another case, another
-    // group's routing endpoint, a distribution's own edge domain, a domain the tenant
-    // itself holds, a domain the NEIGHBOUR tenant holds, a domain nothing at all holds,
-    // and a name at each published DNS bound.
-    let label = "d".repeat(MAX_DOMAIN_LABEL_LEN);
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "the tenant's own routing endpoint",
@@ -286,28 +315,18 @@ async fn a_domain_is_verified_against_the_tenants_routing_endpoint() {
             DNS_CONFIGURATION_INVALID,
         ),
         (
-            "a domain the tenant holds",
+            "a name in the customer's own zone",
             "shop.example.com".to_string(),
             DNS_CONFIGURATION_UNKNOWN,
         ),
         (
-            "a domain another tenant holds",
-            "neighbour.example.com".to_string(),
-            DNS_CONFIGURATION_UNKNOWN,
-        ),
-        (
-            "a domain nothing holds",
-            "unclaimed.example.com".to_string(),
-            DNS_CONFIGURATION_UNKNOWN,
-        ),
-        (
-            "a name at the label bound",
-            format!("{label}.example.com"),
+            "the same customer name in mixed case",
+            "Shop.Example.COM".to_string(),
             DNS_CONFIGURATION_UNKNOWN,
         ),
         (
             "a name at the whole-name bound",
-            longest_domain(),
+            longest.clone(),
             DNS_CONFIGURATION_UNKNOWN,
         ),
     ];
@@ -332,6 +351,122 @@ async fn a_domain_is_verified_against_the_tenants_routing_endpoint() {
             reason.contains(&own_endpoint),
             "case {case}: expected the reason to name the routing endpoint {own_endpoint}, got \
              {reason:?}"
+        );
+    }
+}
+
+/// A `Domain` the resolved distribution tenant does not hold is refused: HTTP 400,
+/// `InvalidArgument`, carrying CloudFront's fixed sentence — whether the name is a
+/// well-formed domain another resource holds, one nothing holds, a relative of one the
+/// tenant does hold, or no domain name at all. The names the tenant DOES hold are verified
+/// rather than refused, in any case.
+#[tokio::test]
+async fn a_domain_the_tenant_does_not_hold_is_an_invalid_argument() {
+    let router = emulator();
+    let distribution_id = multi_tenant_distribution(&router, "ref-verify-dns-scope").await;
+    let (group, endpoint) = connection_group(&router, "verify-dns-scope").await;
+    let (other_group, _) = connection_group(&router, "verify-dns-scope-other").await;
+    let distribution_domain = distribution_domain_name(&router, "ref-verify-dns-scope-std").await;
+    let (tenant_id, _) = distribution_tenant(
+        &router,
+        &distribution_id,
+        "verify-dns-scope-tenant",
+        &["shop.example.com", "Mixed.Example.com"],
+        &group,
+    )
+    .await;
+    distribution_tenant(
+        &router,
+        &distribution_id,
+        "verify-dns-scope-neighbour",
+        &["neighbour.example.com"],
+        &other_group,
+    )
+    .await;
+
+    // Rows: a well-formed name nothing holds, one ANOTHER tenant holds, a child and the
+    // parent of a name this tenant holds, CloudFront's own minted names (the tenant's
+    // routing endpoint and a distribution's edge domain, which this tenant does not hold
+    // as domains), then the names of no domain shape at all — the empty string, a single
+    // label, an empty label, one character past each published bound, and whitespace in a
+    // label.
+    let label = "d".repeat(MAX_DOMAIN_LABEL_LEN);
+    let cases: Vec<(&str, String)> = vec![
+        ("a domain nothing holds", "unclaimed.example.com".to_string()),
+        (
+            "a domain another tenant holds",
+            "neighbour.example.com".to_string(),
+        ),
+        (
+            "a child of a domain the tenant holds",
+            "cart.shop.example.com".to_string(),
+        ),
+        (
+            "the parent of a domain the tenant holds",
+            "example.com".to_string(),
+        ),
+        ("the tenant's routing endpoint", endpoint.clone()),
+        ("a distribution's edge domain", distribution_domain.clone()),
+        ("the empty domain", String::new()),
+        ("a single label", "localhost".to_string()),
+        ("an empty label", "a..example.com".to_string()),
+        (
+            "one character past the label bound",
+            format!("{label}d.example.com"),
+        ),
+        (
+            "one character past the whole-name bound",
+            format!("{}x", longest_domain()),
+        ),
+        ("whitespace in a label", "a b.example.com".to_string()),
+    ];
+
+    for (case, domain) in cases {
+        let answer = verify_dns_configuration(&router, &tenant_id, Some(&domain)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidArgument",
+            "case {case}: expected InvalidArgument, got {}",
+            answer.raw
+        );
+        assert_eq!(
+            message(&answer),
+            DOMAIN_NOT_ASSOCIATED,
+            "case {case}: expected {DOMAIN_NOT_ASSOCIATED:?}, got {:?}",
+            message(&answer)
+        );
+    }
+
+    // The control: each name the tenant holds is verified, asked for in the case the
+    // record holds it in and in another — DNS names are case-insensitive, so membership is
+    // too — and a name exactly at the whole-name bound is a domain name, so the refusal is
+    // about the association and not about the length.
+    for (case, domain) in [
+        ("a held domain", "shop.example.com"),
+        ("a held domain in upper case", "SHOP.EXAMPLE.COM"),
+        ("a held domain stored in mixed case", "Mixed.Example.com"),
+        ("the same name in lower case", "mixed.example.com"),
+    ] {
+        let accepted = verify_dns_configuration(&router, &tenant_id, Some(domain)).await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case}: expected HTTP 200, got {} with {}",
+            accepted.status, accepted.raw
+        );
+        let (reported_domain, status, reason) = one(&accepted, case);
+        assert_eq!(
+            reported_domain, domain,
+            "case {case}: expected the verified domain back, got {reported_domain:?}"
+        );
+        assert_eq!(
+            status, DNS_CONFIGURATION_UNKNOWN,
+            "case {case}: expected {DNS_CONFIGURATION_UNKNOWN} for a name in the customer's own \
+             zone, got {status:?} ({reason})"
         );
     }
 }
@@ -428,7 +563,9 @@ async fn a_call_naming_no_domain_reports_every_domain_the_tenant_holds() {
 }
 
 /// An `Identifier` no distribution tenant carries names no entity: `EntityNotFound`
-/// (HTTP 404), whichever of the three identifier namespaces the value is shaped like.
+/// (HTTP 404), whichever of the three identifier namespaces the value is shaped like — and
+/// whatever the `Domain` argument is, since the tenant is what a domain's association is
+/// decided against.
 #[tokio::test]
 async fn an_identifier_no_tenant_carries_is_not_found() {
     let router = emulator();
@@ -460,7 +597,9 @@ async fn an_identifier_no_tenant_carries_is_not_found() {
     ];
 
     for (case, identifier) in cases {
-        for domain in [None, Some("absent.example.com")] {
+        // The domain column: absent, a domain another tenant holds, and a string of no
+        // domain shape — none of them turns a missing tenant into another refusal.
+        for domain in [None, Some("absent.example.com"), Some("not a domain")] {
             let answer = verify_dns_configuration(&router, &identifier, domain).await;
             assert_eq!(
                 answer.status, 404,
@@ -475,73 +614,4 @@ async fn an_identifier_no_tenant_carries_is_not_found() {
             );
         }
     }
-}
-
-/// A `Domain` that is no domain name at all names nothing to verify: `InvalidArgument`
-/// (HTTP 400), under the service's one rule for the shape of a domain name — and the
-/// refusal is decided before the tenant is looked up at all.
-#[tokio::test]
-async fn a_domain_that_is_no_domain_name_is_an_invalid_argument() {
-    let router = emulator();
-    let distribution_id = multi_tenant_distribution(&router, "ref-verify-dns-shape").await;
-    let (group, _) = connection_group(&router, "verify-dns-shape").await;
-    let (tenant_id, _) = distribution_tenant(
-        &router,
-        &distribution_id,
-        "verify-dns-shape-tenant",
-        &["shape.example.com"],
-        &group,
-    )
-    .await;
-
-    // Rows: the empty domain, a single label, an empty label, one character past each
-    // published bound, and a name carrying whitespace.
-    let label = "d".repeat(MAX_DOMAIN_LABEL_LEN);
-    let cases: [(&str, String); 6] = [
-        ("the empty domain", String::new()),
-        ("a single label", "localhost".to_string()),
-        ("an empty label", "a..example.com".to_string()),
-        (
-            "one character past the label bound",
-            format!("{label}d.example.com"),
-        ),
-        (
-            "one character past the whole-name bound",
-            format!("{}x", longest_domain()),
-        ),
-        ("whitespace in a label", "a b.example.com".to_string()),
-    ];
-
-    for (case, domain) in cases {
-        let answer = verify_dns_configuration(&router, &tenant_id, Some(&domain)).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} with {}",
-            answer.status, answer.raw
-        );
-        assert_eq!(
-            answer.error_code(),
-            "InvalidArgument",
-            "case {case}: expected InvalidArgument, got {}",
-            answer.raw
-        );
-        // The shape of the name is a property of the request alone, so it is refused
-        // whether or not the identifier names a tenant.
-        let absent = verify_dns_configuration(&router, "no-such-tenant", Some(&domain)).await;
-        assert_eq!(
-            absent.status, 400,
-            "case {case} (an identifier no tenant carries): expected HTTP 400, got {} with {}",
-            absent.status, absent.raw
-        );
-    }
-
-    // A name exactly at the whole-name bound is a domain name, so it is verified rather
-    // than refused.
-    let accepted = verify_dns_configuration(&router, &tenant_id, Some(&longest_domain())).await;
-    assert_eq!(
-        accepted.status, 200,
-        "case a name at the whole-name bound ({MAX_DOMAIN_NAME_LEN} characters): expected HTTP \
-         200, got {} with {}",
-        accepted.status, accepted.raw
-    );
 }

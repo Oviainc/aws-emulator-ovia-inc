@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAnomalyDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates an anomaly detection model for a CloudWatch metric in this service's
+//! store, and reports the unique identifier of the model it wrote. Implemented here, and the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAnomalyDetector"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAnomalyDetectorErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch anomaly detector store is unavailable".into()),
+            })
+        })?;
+
+        // WHICH model this call writes, under the rule both detector writers share: the
+        // `SingleMetricAnomalyDetector` structure, the `MetricMathAnomalyDetector` structure,
+        // or the deprecated flat metric members — exactly one of the three.
+        let form = crate::state::anomaly_detector_form(
+            input.single_metric_anomaly_detector.as_ref(),
+            input.metric_math_anomaly_detector.as_ref(),
+            crate::state::FlatSingleMetric {
+                namespace: input.namespace.as_deref(),
+                metric_name: input.metric_name.as_deref(),
+                dimensions: input.dimensions.as_deref(),
+                stat: input.stat.as_deref(),
+            },
+        )
+        .map_err(form_refusal)?;
+        if let Some(missing) = crate::state::anomaly_detector_form_missing(&form) {
+            return Err(missing_parameter(missing));
+        }
+        validate_metric_math(&form)?;
+        validate_configuration(input.configuration.as_ref())?;
+
+        let now_secs = crate::state::now_secs();
+        let detector_id = form.detector_id();
+        let mut store = state.lock();
+        if !store.anomaly_detectors.contains_key(&detector_id)
+            && store.anomaly_detectors.len() >= crate::state::MAX_ANOMALY_DETECTORS
+        {
+            return Err(PutAnomalyDetectorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds at most {} anomaly detection models",
+                        crate::state::MAX_ANOMALY_DETECTORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let single = form.single_metric().cloned();
+        let math = match &form {
+            crate::state::AnomalyDetectorForm::SingleMetric(_) => None,
+            crate::state::AnomalyDetectorForm::MetricMath(math) => Some(math.clone()),
+        };
+        store.anomaly_detectors.insert(
+            detector_id.clone(),
+            crate::state::StoredAnomalyDetector {
+                // Stored as the shape its reader returns, so every member this operation
+                // accepts round-trips through `DescribeAnomalyDetectors` unchanged.
+                detector: AnomalyDetector {
+                    anomaly_detector_id: Some(detector_id.clone()),
+                    // The deprecated flat members report the SAME metric the single-metric
+                    // structure carries ("Use SingleMetricAnomalyDetector.Namespace
+                    // property.", `AnomalyDetector$Namespace`), so a client reading either
+                    // spelling reads one model; a metric-math model has no single metric to
+                    // report them for.
+                    namespace: single.as_ref().and_then(|single| single.namespace.clone()),
+                    metric_name: single
+                        .as_ref()
+                        .and_then(|single| single.metric_name.clone()),
+                    dimensions: single.as_ref().and_then(|single| single.dimensions.clone()),
+                    stat: single.as_ref().and_then(|single| single.stat.clone()),
+                    configuration: input.configuration.clone(),
+                    // A write trains the model from the configuration it carries, and
+                    // training is owed a span later, so the model this call wrote is pending
+                    // training whether this call created it or updated one that was already
+                    // trained.
+                    state_value: Some(
+                        crate::state::ANOMALY_DETECTOR_PENDING_TRAINING.to_string(),
+                    ),
+                    metric_characteristics: input.metric_characteristics.clone(),
+                    single_metric_anomaly_detector: single,
+                    metric_math_anomaly_detector: math,
+                },
+                trained_due_secs: now_secs + crate::state::TRAINING_DELAY_SECS,
+            },
+        );
+
+        Ok(PutAnomalyDetectorOutput {
+            anomaly_detector_id: Some(detector_id),
+        })
     }
+}
+
+/// The refusal a request that does not name exactly one detector earns: the parameter
+/// combination fault for parameters that cannot be used together, and the missing-parameter
+/// fault for a request that names no detector to create at all.
+fn form_refusal(error: crate::state::AnomalyDetectorFormError) -> PutAnomalyDetectorError {
+    match error {
+        crate::state::AnomalyDetectorFormError::Combination(message) => {
+            PutAnomalyDetectorErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::AnomalyDetectorFormError::Missing(message) => missing_parameter(message),
+    }
+}
+
+/// Refuse the request with this operation's modelled `MissingRequiredParameterException`
+/// (HTTP 400): "An input parameter that is required is missing."
+fn missing_parameter(message: String) -> PutAnomalyDetectorError {
+    PutAnomalyDetectorErrorModeled::MissingRequiredParameterException(
+        MissingRequiredParameterException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> PutAnomalyDetectorError {
+    PutAnomalyDetectorErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Refuse a metric-math detector whose queries designate no single input series.
+///
+/// "One item in MetricDataQueries is the expression that provides the time series that the
+/// anomaly detector uses as input. Designate the expression by setting ReturnData to true for
+/// this object in the array. For all other expressions and metrics, set ReturnData to false.
+/// The designated expression must return a single time series."
+/// (`MetricMathAnomalyDetector$MetricDataQueries`) — so the model is the one query the array
+/// designates, and an array designating none, or more than one, names no series to train on.
+/// A single-metric detector carries no queries and is left alone.
+fn validate_metric_math(
+    form: &crate::state::AnomalyDetectorForm,
+) -> Result<(), PutAnomalyDetectorError> {
+    let crate::state::AnomalyDetectorForm::MetricMath(math) = form else {
+        return Ok(());
+    };
+    let queries: &[MetricDataQuery] = math.metric_data_queries.as_deref().unwrap_or_default();
+    if queries.is_empty() {
+        return Err(invalid_parameter_value(
+            "MetricMathAnomalyDetector must specify at least one MetricDataQuery".to_string(),
+        ));
+    }
+    let designated = queries
+        .iter()
+        // "If you omit this, the default of true is used." (`MetricDataQuery$ReturnData`)
+        .filter(|query| query.return_data.unwrap_or(true))
+        .count();
+    if designated != 1 {
+        return Err(invalid_parameter_value(format!(
+            "MetricMathAnomalyDetector must designate exactly one MetricDataQuery with \
+             ReturnData set to true; got {designated}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a training configuration the model cannot be trained from.
+///
+/// "The configuration specifies details about how the anomaly detection model is to be
+/// trained, including time ranges to exclude when training and updating the model. You can
+/// specify as many as 10 time ranges." (`PutAnomalyDetectorInput$Configuration`) — and a range
+/// to exclude is a span, so its end follows its start (`Range$StartTime` / `Range$EndTime`).
+fn validate_configuration(
+    configuration: Option<&AnomalyDetectorConfiguration>,
+) -> Result<(), PutAnomalyDetectorError> {
+    let Some(configuration) = configuration else {
+        return Ok(());
+    };
+    let ranges: &[Range] = configuration
+        .excluded_time_ranges
+        .as_deref()
+        .unwrap_or_default();
+    if ranges.len() > crate::state::MAX_EXCLUDED_TIME_RANGES {
+        return Err(invalid_parameter_value(format!(
+            "Configuration can specify as many as {} excluded time ranges; got {}",
+            crate::state::MAX_EXCLUDED_TIME_RANGES,
+            ranges.len()
+        )));
+    }
+    for range in ranges {
+        let start = crate::state::from_timestamp(&range.start_time);
+        let end = crate::state::from_timestamp(&range.end_time);
+        if end <= start {
+            return Err(invalid_parameter_value(format!(
+                "an excluded time range's EndTime must be later than its StartTime; got \
+                 StartTime {start} and EndTime {end} (epoch seconds)"
+            )));
+        }
+    }
+    Ok(())
 }

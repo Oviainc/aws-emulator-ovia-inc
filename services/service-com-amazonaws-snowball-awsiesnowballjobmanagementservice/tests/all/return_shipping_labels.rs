@@ -3,45 +3,57 @@
 //! `CreateReturnShippingLabel` and `DescribeReturnShippingLabel`, driven end to end over
 //! HTTP.
 //!
-//! One rule, asserted over a TABLE rather than over a single job: a
-//! `CreateReturnShippingLabel` call for a job this service persisted that still has a
-//! device to return STARTS the task that creates that job's label and answers that task's
-//! status, and `DescribeReturnShippingLabel` reports the status the clock makes true at the
-//! instant it is asked — `InProgress` while the task runs, with no label file and no expiry
-//! to report, and `Succeeded` from then on, with an Amazon S3 URI addressing THAT job's
-//! label file in the Region the request was signed for and the instant the label expires. A
-//! second create while the task is running is the "more than once when other requests are
-//! not completed" `ConflictException`, and a second create while the label is valid is
-//! `ReturnShippingLabelAlreadyExistsException`; a job no record answers to, the main job of
-//! an export order, which "aren't associated with any Snowballs"
+//! One rule, asserted over a TABLE rather than over a single job: a label "will be used to
+//! return the Snow device to Amazon Web Services", so a `CreateReturnShippingLabel` call is
+//! served only for a job this service persisted whose own device has left Amazon Web
+//! Services and has not been received back — the `JobState` values that place it on the
+//! customer's side of the journey `ShippingDetails` splits into an outbound and an inbound
+//! shipment ([`RETURNABLE_STATES`]) — and then STARTS the task that creates that job's label
+//! and answers that task's status. `DescribeReturnShippingLabel` reports the status the
+//! clock makes true at the instant it is asked — `InProgress` while the task runs, with no
+//! label file and no expiry to report, and `Succeeded` from then on, with an Amazon S3 URI
+//! addressing THAT job's label file in the Region the request was signed for and the instant
+//! the label expires. A second create while the task is running is the "more than once when
+//! other requests are not completed" `ConflictException`, and a second create while the
+//! label is valid is `ReturnShippingLabelAlreadyExistsException`; a job no record answers
+//! to, the main job of an export order, which "aren't associated with any Snowballs"
 //! (`JobListEntry$IsMaster`), and a job that has no label yet are refused as
-//! `InvalidResourceException`, and a job whose state leaves it with no device to return as
-//! `InvalidJobStateException`.
+//! `InvalidResourceException`, and every job whose state leaves it with no device to
+//! return — before the device ships as much as after it is back — as
+//! `InvalidJobStateException`, with no label recorded for it. A label the service DID
+//! persist stays that job's own record: it is still reported once the device has been
+//! received back, which is a state no new label can be created in.
 //!
-//! The rows differ along what the rule generalises over: the job type and device the order
-//! was placed for, whether the subject is a plain job or one job part of an export order,
-//! whether the return's `ShippingOption` is supplied or inherited from the job, which value
-//! of the modelled `ShippingOption` catalog it carries, the Region the call is signed for
-//! (including a scope that names no Region at all), and how many times the same job is
-//! asked.
+//! The rows differ along what the rule generalises over: the job's state (the WHOLE modelled
+//! `JobState` catalog), the job type and device the order was placed for, whether the
+//! subject is a plain job or one job part of an export order, whether the return's
+//! `ShippingOption` is supplied or inherited from the job, which value of the modelled
+//! `ShippingOption` catalog it carries, the Region the call is signed for (including a scope
+//! that names no Region at all), and how many times the same job is asked.
 //!
-//! Nothing here reaches into the state struct, so a response that is not computed from
-//! persisted state cannot pass. The one behaviour no case can reach is a label's EXPIRY:
-//! `RETURN_SHIPPING_LABEL_VALIDITY` is weeks long and this emulator has no clock a test can
-//! move, so the expiry is asserted through the instant `ExpirationDate` reports rather than
-//! by waiting for it.
+//! The shipment states this API moves a job through are not served by this emulator yet, so
+//! a row that needs a job in a state other than the one `CreateJob` mints sets that state in
+//! the service's own store before calling (`job_unlock_code::set_job_state`), the store the
+//! handler reads. Everything the rule is about still travels over the wire, so a response
+//! that is not computed from persisted state cannot pass. The one behaviour no case can
+//! reach is a label's EXPIRY: `RETURN_SHIPPING_LABEL_VALIDITY` is weeks long and this
+//! emulator has no clock a test can move, so the expiry is asserted through the instant
+//! `ExpirationDate` reports rather than by waiting for it.
 //!
-//! The harness (`router`, `ok`, `refused`, `call_in_region`, `create_address`,
+//! The harness (`router_with_engine`, `ok`, `refused`, `call_in_region`, `create_address`,
 //! `deliverable_address`, `string`) is the one `job_lifecycle` already drives the service
 //! with, so every call here goes through the same front door a client uses.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-// The values the modelled `ShippingOption` enum admits, so the table is written against
-// the catalog rather than against a list of its own.
-use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::SHIPPING_OPTION_VALUES;
+// The modelled `JobState` and `ShippingOption` catalogs, so the table is written against
+// the model rather than against a list of its own.
+use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::{
+    JOB_STATE_VALUES, SHIPPING_OPTION_VALUES,
+};
 // The windows, the bucket and the object name, read from the crate rather than restated, so
 // a case cannot drift from the rule it asserts.
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
@@ -51,8 +63,25 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::job_lifecycle::{
-    call_in_region, complete_order, create_address, deliverable_address, ok, refused, string,
+    call_in_region, complete_order, create_address, deliverable_address, ok, refused,
+    router_with_engine, string,
 };
+use super::job_unlock_code::set_job_state;
+
+/// The `JobState` values a job's own Snow device is on the customer's side of its journey
+/// in, i.e. the states a return shipping label can exist in.
+///
+/// `ShippingDetails` splits a job's journey into the `OutboundShipment` of "a Snow device
+/// being delivered to the address that you specified for a particular job" and the
+/// `InboundShipment` of "a Snow device being returned to Amazon Web Services for a
+/// particular job" (`smithy_query(query="shape", shape="ShippingDetails")`); of the modelled
+/// `JobState` values (`shared_types::JOB_STATE_VALUES`) these three are the ones in which
+/// the device has left Amazon Web Services and has not been received back.
+pub(crate) const RETURNABLE_STATES: &[&str] =
+    &["InTransitToCustomer", "WithCustomer", "InTransitToAWS"];
+
+/// The state a case puts a job into when all it needs is a device the customer can return.
+pub(crate) const A_RETURNABLE_STATE: &str = "WithCustomer";
 
 /// `ReturnShippingLabelURI` is modelled `len 1..1024`
 /// (`smithy_query(query="operation", operation="DescribeReturnShippingLabel")`).
@@ -183,12 +212,32 @@ pub(crate) async fn label_subject(
         .unwrap_or_else(|| panic!("case {case:?}: expected the export create to mint a job part"))
 }
 
-/// One row of the table: a job to return, the `ShippingOption` the return is asked for and
-/// the speed the label is then expected to travel at.
+/// The job the label is created for, put into the state `state` names: a shipment state
+/// this emulator's own operations do not move a job into yet is set in the service's own
+/// store, which is the store the handler reads.
+pub(crate) async fn label_subject_in_state(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    submitted: Value,
+    use_job_part: bool,
+    state: &str,
+    case: &str,
+) -> String {
+    let job_id = label_subject(router, submitted, use_job_part, case).await;
+    set_job_state(engine, &job_id, state);
+    job_id
+}
+
+/// One row of the table: a job to return, the state its device has reached, the
+/// `ShippingOption` the return is asked for and the speed the label is then expected to
+/// travel at.
 struct Row {
     case: &'static str,
     submitted: Value,
     use_job_part: bool,
+    /// The `JobState` the job is in when the label is asked for: one of
+    /// [`RETURNABLE_STATES`], so the rows span the states a label can be created in.
+    state: &'static str,
     /// The `ShippingOption` the `CreateReturnShippingLabel` call carries, or `None` when it
     /// names none.
     asked: Option<&'static str>,
@@ -197,13 +246,14 @@ struct Row {
     expected: Option<&'static str>,
 }
 
-/// Every row: one per job shape, per presence of the return's own `ShippingOption`, and per
-/// value of the modelled catalog (`shared_types::SHIPPING_OPTION_VALUES`) — which
+/// Every row: one per job shape, per state of [`RETURNABLE_STATES`], per presence of the
+/// return's own `ShippingOption`, and per value of the modelled catalog
+/// (`shared_types::SHIPPING_OPTION_VALUES`) — which
 /// [`the_rows_cover_the_modelled_shipping_option_catalog`] checks the rows exhaust.
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "import job shipped SECOND_DAY, returned NEXT_DAY",
+            case: "import job shipped SECOND_DAY, in transit to the customer, returned NEXT_DAY",
             submitted: json!({
                 "JobType": "IMPORT",
                 "SnowballType": "EDGE",
@@ -211,6 +261,7 @@ fn rows() -> Vec<Row> {
                 "Resources": { "S3Resources": [{ "BucketArn": "arn:aws:s3:::return-bucket" }] },
             }),
             use_job_part: false,
+            state: "InTransitToCustomer",
             asked: Some("NEXT_DAY"),
             expected: Some("NEXT_DAY"),
         },
@@ -223,13 +274,15 @@ fn rows() -> Vec<Row> {
                 "RemoteManagement": "INSTALLED_AUTOSTART",
             }),
             use_job_part: false,
+            state: "WithCustomer",
             asked: None,
             expected: Some("SECOND_DAY"),
         },
         Row {
-            case: "an order naming only its job type, returned EXPRESS",
+            case: "an order naming only its job type, already on its way back, returned EXPRESS",
             submitted: json!({ "JobType": "IMPORT" }),
             use_job_part: false,
+            state: "InTransitToAWS",
             asked: Some("EXPRESS"),
             expected: Some("EXPRESS"),
         },
@@ -241,6 +294,7 @@ fn rows() -> Vec<Row> {
                 "ShippingOption": "STANDARD",
             }),
             use_job_part: false,
+            state: "WithCustomer",
             asked: None,
             expected: Some("STANDARD"),
         },
@@ -253,6 +307,7 @@ fn rows() -> Vec<Row> {
                 "Resources": { "S3Resources": [{ "BucketArn": "arn:aws:s3:::export-bucket" }] },
             }),
             use_job_part: true,
+            state: "WithCustomer",
             asked: Some("STANDARD"),
             expected: Some("STANDARD"),
         },
@@ -284,14 +339,48 @@ fn the_rows_cover_the_modelled_shipping_option_catalog() {
     );
 }
 
+#[test]
+fn the_returnable_states_are_modelled_job_states() {
+    for state in RETURNABLE_STATES {
+        assert!(
+            JOB_STATE_VALUES.contains(state),
+            "case {state:?}: expected a state of the modelled JobState catalog \
+             {JOB_STATE_VALUES:?}"
+        );
+    }
+    assert!(
+        RETURNABLE_STATES.contains(&A_RETURNABLE_STATE),
+        "expected {A_RETURNABLE_STATE:?} among the returnable states {RETURNABLE_STATES:?}"
+    );
+}
+
+#[test]
+fn the_rows_cover_the_returnable_states() {
+    let covered: BTreeSet<&str> = rows().iter().map(|row| row.state).collect();
+    let returnable: BTreeSet<&str> = RETURNABLE_STATES.iter().copied().collect();
+    assert_eq!(
+        covered, returnable,
+        "the rows must exercise every state a label can be created in, got {covered:?} \
+         against {returnable:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_return_shipping_label_is_created_for_every_job_with_a_device_to_return() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let mut tokens: BTreeSet<String> = BTreeSet::new();
 
     for row in rows() {
         let case = row.case;
-        let job_id = label_subject(&router, row.submitted.clone(), row.use_job_part, case).await;
+        let job_id = label_subject_in_state(
+            &router,
+            &engine,
+            row.submitted.clone(),
+            row.use_job_part,
+            row.state,
+            case,
+        )
+        .await;
 
         // The create STARTS the task, so the status it answers is the task's, not a
         // finished label's.
@@ -437,9 +526,17 @@ async fn a_return_shipping_label_is_created_for_every_job_with_a_device_to_retur
 
 #[tokio::test]
 async fn describing_a_label_reports_the_region_the_request_was_signed_for() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let case = "a label every Region asks about";
-    let job_id = create_job(&router, json!({ "JobType": "IMPORT" }), case).await;
+    let job_id = label_subject_in_state(
+        &router,
+        &engine,
+        json!({ "JobType": "IMPORT" }),
+        false,
+        A_RETURNABLE_STATE,
+        case,
+    )
+    .await;
     ok(
         &router,
         "CreateReturnShippingLabel",
@@ -499,9 +596,11 @@ async fn describing_a_label_reports_the_region_the_request_was_signed_for() {
 
 #[tokio::test]
 async fn a_job_with_no_device_to_return_has_no_return_shipping_label() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
 
-    // An export order: the main job is associated with no device, its job parts are.
+    // An export order: the main job is associated with no device, its job parts are. It is
+    // put into a state a device WOULD be returnable from, so the refusal can only be about
+    // the device it lacks.
     let export_case = "export order whose main job has no device";
     let main_job = create_job(
         &router,
@@ -517,6 +616,7 @@ async fn a_job_with_no_device_to_return_has_no_return_shipping_label() {
         !job_parts(&router, &main_job, export_case).await.is_empty(),
         "case {export_case:?}: expected the export create to mint job parts"
     );
+    set_job_state(&engine, &main_job, A_RETURNABLE_STATE);
 
     // A cancelled job: `CancelJob` stops it before any appliance is prepared, so no device
     // of its own will ever ship and none can be returned.
@@ -529,6 +629,19 @@ async fn a_job_with_no_device_to_return_has_no_return_shipping_label() {
         cancelled_case,
     )
     .await;
+
+    // A job whose device has not been handed over yet: the state `CreateJob` mints, and one
+    // further along but still short of a shipment.
+    let new_case = "a job whose device has never shipped";
+    let new_job = create_job(&router, json!({ "JobType": "IMPORT" }), new_case).await;
+    let preparing_case = "a job whose shipment is still being prepared";
+    let preparing = create_job(&router, json!({ "JobType": "LOCAL_USE" }), preparing_case).await;
+    set_job_state(&engine, &preparing, "PreparingShipment");
+
+    // A job whose device is back at Amazon Web Services: there is nothing left to return.
+    let returned_case = "a job whose device is back with Amazon Web Services";
+    let returned = create_job(&router, json!({ "JobType": "IMPORT" }), returned_case).await;
+    set_job_state(&engine, &returned, "WithAWS");
 
     let rows: Vec<(&str, String, &str)> = vec![
         (
@@ -543,6 +656,9 @@ async fn a_job_with_no_device_to_return_has_no_return_shipping_label() {
         ),
         (export_case, main_job, "InvalidResourceException"),
         (cancelled_case, cancelled, "InvalidJobStateException"),
+        (new_case, new_job.clone(), "InvalidJobStateException"),
+        (preparing_case, preparing, "InvalidJobStateException"),
+        (returned_case, returned, "InvalidJobStateException"),
     ];
 
     for (case, job_id, error_code) in rows {
@@ -562,15 +678,179 @@ async fn a_job_with_no_device_to_return_has_no_return_shipping_label() {
             .await;
         }
     }
+
+    // The refused create recorded NOTHING: once the pre-shipment job's device is with the
+    // customer it still has no label, so the legitimate call later in its life is free to
+    // create one.
+    set_job_state(&engine, &new_job, A_RETURNABLE_STATE);
+    refused(
+        &router,
+        "DescribeReturnShippingLabel",
+        json!({ "JobId": new_job }),
+        "InvalidResourceException",
+        new_case,
+    )
+    .await;
+    let created = ok(
+        &router,
+        "CreateReturnShippingLabel",
+        json!({ "JobId": new_job }),
+        new_case,
+    )
+    .await;
+    assert_eq!(
+        string(&created, "Status", new_case),
+        "InProgress",
+        "case {new_case:?}: expected the create to start the task once the device is with \
+         the customer, got {created}"
+    );
+}
+
+#[tokio::test]
+async fn a_label_is_created_only_while_the_device_is_on_the_customers_side_of_its_journey() {
+    let (router, engine) = router_with_engine();
+
+    // The rows are the WHOLE modelled `JobState` catalog, so the rule is asserted over every
+    // state a job can be in rather than over the one `CreateJob` mints. Each state gets its
+    // own job, so a label one state created cannot answer for another.
+    for wire in JOB_STATE_VALUES {
+        let case = format!("a job asked for a return shipping label in state {wire}");
+        let job_id = create_job(
+            &router,
+            json!({ "JobType": "IMPORT", "SnowballType": "EDGE" }),
+            &case,
+        )
+        .await;
+        set_job_state(&engine, &job_id, wire);
+
+        if RETURNABLE_STATES.contains(wire) {
+            let created = ok(
+                &router,
+                "CreateReturnShippingLabel",
+                json!({ "JobId": job_id }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                string(&created, "Status", &case),
+                "InProgress",
+                "case {case:?}: expected the create to answer the task's status, got {created}"
+            );
+            let described = ok(
+                &router,
+                "DescribeReturnShippingLabel",
+                json!({ "JobId": job_id }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                string(&described, "Status", &case),
+                "InProgress",
+                "case {case:?}: expected the started task to be reported, got {described}"
+            );
+        } else {
+            refused(
+                &router,
+                "CreateReturnShippingLabel",
+                json!({ "JobId": job_id }),
+                "InvalidJobStateException",
+                &case,
+            )
+            .await;
+            refused(
+                &router,
+                "DescribeReturnShippingLabel",
+                json!({ "JobId": job_id }),
+                "InvalidJobStateException",
+                &case,
+            )
+            .await;
+            // And the refusal recorded no label: moving the job to a state a label CAN exist
+            // in reports none, rather than one the refused call left behind.
+            set_job_state(&engine, &job_id, A_RETURNABLE_STATE);
+            refused(
+                &router,
+                "DescribeReturnShippingLabel",
+                json!({ "JobId": job_id }),
+                "InvalidResourceException",
+                &case,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_created_label_is_still_reported_once_the_device_is_received_back() {
+    let (router, engine) = router_with_engine();
+    let case = "a labelled job whose device travels on to Amazon Web Services";
+    let job_id = label_subject_in_state(
+        &router,
+        &engine,
+        json!({ "JobType": "IMPORT", "SnowballType": "EDGE", "ShippingOption": "NEXT_DAY" }),
+        false,
+        A_RETURNABLE_STATE,
+        case,
+    )
+    .await;
+    ok(
+        &router,
+        "CreateReturnShippingLabel",
+        json!({ "JobId": job_id }),
+        case,
+    )
+    .await;
+    wait_for_the_label();
+    let described = ok(
+        &router,
+        "DescribeReturnShippingLabel",
+        json!({ "JobId": job_id }),
+        case,
+    )
+    .await;
+
+    // The modelled `JobState` values a job's device has reached Amazon Web Services in
+    // (`shared_types::JOB_STATE_VALUES`), i.e. the states no label can be CREATED in: the
+    // label this service already persisted is still that job's own record, so each of them
+    // reports the very same label rather than hiding it.
+    for state in [
+        "InTransitToAWS",
+        "WithAWSSortingFacility",
+        "WithAWS",
+        "InProgress",
+        "Complete",
+    ] {
+        let case = format!("{case}: now in state {state}");
+        assert!(
+            JOB_STATE_VALUES.contains(&state),
+            "case {case:?}: expected a state of the modelled JobState catalog \
+             {JOB_STATE_VALUES:?}"
+        );
+        set_job_state(&engine, &job_id, state);
+        let reported = ok(
+            &router,
+            "DescribeReturnShippingLabel",
+            json!({ "JobId": job_id }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            reported, described,
+            "case {case:?}: expected the label the create persisted, got {reported}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_job_whose_label_was_never_created_has_none_to_describe() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let case = "a job no return shipping label was created for";
-    let job_id = create_job(
+    let job_id = label_subject_in_state(
         &router,
+        &engine,
         json!({ "JobType": "LOCAL_USE", "SnowballType": "EDGE_CG" }),
+        false,
+        A_RETURNABLE_STATE,
         case,
     )
     .await;
@@ -587,11 +867,14 @@ async fn a_job_whose_label_was_never_created_has_none_to_describe() {
 
 #[tokio::test]
 async fn describing_a_label_changes_nothing_a_later_caller_reads() {
-    let router = super::job_lifecycle::router();
+    let (router, engine) = router_with_engine();
     let case = "a job read before and after its label is created and described";
-    let job_id = create_job(
+    let job_id = label_subject_in_state(
         &router,
+        &engine,
         json!({ "JobType": "IMPORT", "SnowballType": "EDGE", "ShippingOption": "SECOND_DAY" }),
+        false,
+        A_RETURNABLE_STATE,
         case,
     )
     .await;

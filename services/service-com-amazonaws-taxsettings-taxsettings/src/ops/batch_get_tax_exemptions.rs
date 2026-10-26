@@ -155,17 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `accountIds` is "List of unique account identifiers" and carries the
-        // model's `@length` 1..=5, which the boundary validator refuses outside
-        // of before this handler runs. An id named twice names the SAME account,
-        // so it is reported once: the response is a map keyed by account id,
-        // which could not hold it twice anyway.
-        let mut named: Vec<&str> = Vec::new();
-        for account_id in &input.account_ids {
-            if !named.contains(&account_id.as_str()) {
-                named.push(account_id.as_str());
-            }
-        }
+        // `accountIds` carries the model's `@length` 1..=5, which the boundary
+        // validator refuses outside of before this handler runs. The accounts
+        // this call reports on are the ids it names, each once — see
+        // [`crate::state::distinct_account_ids`], which is where what a repeated
+        // id means is stated for this whole service; the response is a map keyed
+        // by account id, which could not hold one twice anyway.
+        let named = crate::state::distinct_account_ids(&input.account_ids);
 
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
