@@ -13,6 +13,10 @@
 //!   the shape is one the SERVICE models and this operation does not list, so it is
 //!   widened in below, because a cluster the request names and the service does not
 //!   hold is a missing resource rather than an unparseable request;
+//! * a cluster this endpoint DOES hold whose `ClusterType` is serverless is refused
+//!   with [`crate::state::serverless_topic_apis_unsupported`]: the Topic Management
+//!   surface is not offered for that cluster kind, so the refusal comes before every
+//!   other state-dependent check below and before anything is registered;
 //! * a `TopicName` Apache Kafka itself would refuse (see
 //!   [`crate::state::topic_name_error`]) is a `BadRequestException`;
 //! * a `ReplicationFactor` above the cluster's broker count is a
@@ -253,6 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The Topic Management surface applies to a cluster whose brokers this
+        // service manages for the caller, so a serverless one is refused on its
+        // KIND -- before the broker-count bound below, which would otherwise read a
+        // kind-of-cluster refusal as a parameter the caller could lower, and before
+        // any topic is registered on a cluster that could never hold one.
+        if cluster.is_serverless() {
+            return Err(crate::state::serverless_topic_apis_unsupported());
+        }
 
         // Apache Kafka cannot place more replicas of a partition than the cluster
         // has brokers to place them on, so the replication factor is bounded by

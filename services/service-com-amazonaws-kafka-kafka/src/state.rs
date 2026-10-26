@@ -39,7 +39,9 @@
 //! [`ComAmazonawsKafkaKafkaState::topics_in`] for a listing) — the one
 //! accessor each, so every caller sees the transitions the clock already owed that
 //! topic. A cluster leaving the registry takes its topics with it, so no topic can
-//! outlive the cluster that holds it.
+//! outlive the cluster that holds it. Those operations serve a provisioned cluster
+//! only: each refuses a serverless one on its kind, in the same words, through
+//! [`serverless_topic_apis_unsupported`].
 //!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`) records a
@@ -678,6 +680,43 @@ pub const CLUSTER_TYPE_SERVERLESS: &str = "SERVERLESS";
 /// words, so the service says one thing about one condition.
 pub const PROVISIONED_ONLY_MESSAGE: &str =
     "The cluster is a serverless cluster; this operation applies to provisioned clusters only.";
+
+/// The wire error code Amazon MSK answers a Topic Management call against a cluster
+/// whose `ClusterType` is [`CLUSTER_TYPE_SERVERLESS`] with. The surface is not
+/// offered for that cluster kind at all — topics on such a cluster are created and
+/// read over the native Apache Kafka protocol — so the refusal is about the kind of
+/// cluster and nothing else about the request.
+///
+/// This service's model declares no shape for the code, so it leaves through
+/// [`crate::scaffolded::Scaffolded::unmodeled`] rather than as a modelled variant: a
+/// client branches on the code, so the code the service answers is the code that
+/// goes on the wire.
+pub const SERVERLESS_TOPIC_APIS_CODE: &str = "ServerlessUnsupportedException";
+
+/// The HTTP status that refusal carries. The call is refused because of what the
+/// named cluster IS, which no retry changes and the caller fixes by addressing a
+/// provisioned cluster (or the native protocol) instead — a client error, and 4xx
+/// so no SDK retry classifier treats it as retryable.
+pub const SERVERLESS_TOPIC_APIS_STATUS: u16 = 400;
+
+/// The whole message of that refusal: fixed text end to end, carrying no value from
+/// the request or from state.
+pub const SERVERLESS_TOPIC_APIS_MESSAGE: &str = "Topic APIs are not supported on serverless clusters.";
+
+/// The refusal every Topic Management operation answers for a serverless cluster.
+///
+/// Answered immediately after the cluster is resolved and BEFORE any further
+/// state-dependent check (a broker-count bound, a topic lookup) and before anything
+/// is registered, so the answer depends on the cluster's kind alone and a refused
+/// call leaves the registry untouched. One helper, so the service says one thing
+/// about one condition on every one of those operations.
+pub fn serverless_topic_apis_unsupported<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        SERVERLESS_TOPIC_APIS_CODE,
+        SERVERLESS_TOPIC_APIS_STATUS,
+        SERVERLESS_TOPIC_APIS_MESSAGE,
+    )
+}
 
 /// The one `NodeType` the model names: `ListNodes` reports a cluster's broker
 /// nodes, so every node it lists is of this type.
