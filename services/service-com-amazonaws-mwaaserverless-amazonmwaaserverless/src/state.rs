@@ -500,13 +500,16 @@ impl Workflow {
     }
 
     /// Start the teardown `DeleteWorkflow` describes: the workflow moves to
-    /// [`WORKFLOW_STATUS_DELETING`] and its removal falls due
-    /// [`WORKFLOW_DELETED_AFTER`] later. Nothing else is dropped here — the
-    /// versions, runs, name and tokens go with the record when the removal lands,
-    /// so a read during the teardown still reports the workflow.
+    /// [`WORKFLOW_STATUS_DELETING`], every execution of it that has not finished is
+    /// stopped ([`Self::stop_runs`]) because the cleanup the operation performs
+    /// includes "stopping any running executions", and its removal falls due
+    /// [`WORKFLOW_DELETED_AFTER`] later. Nothing is DROPPED here — the versions,
+    /// runs, name and tokens go with the record when the removal lands, so a read
+    /// during the teardown still reports the workflow and the runs it stopped.
     ///
     /// Idempotent: a second delete of a workflow already tearing down neither
-    /// restarts the teardown nor moves its deadline.
+    /// restarts the teardown nor moves its deadline, and leaves the runs the first
+    /// one stopped on the shutdown schedule they already carry.
     pub fn begin_deletion(&mut self, now: SystemTime) {
         if self.is_deleting() {
             return;
@@ -514,6 +517,37 @@ impl Workflow {
         self.status = WORKFLOW_STATUS_DELETING.to_string();
         self.modified_at = now;
         self.deletion_due_at = Some(now + WORKFLOW_DELETED_AFTER);
+        // The workflow is going, so no execution of it may keep progressing: each
+        // unfinished run enters the documented shutdown instead.
+        self.stop_runs(None, now);
+    }
+
+    /// Stop every execution the removal of `version` takes with it — or EVERY
+    /// execution of this workflow when `version` is `None`, which is the removal of
+    /// the workflow itself — and report how many runs this call moved.
+    ///
+    /// Removing a workflow definition stops the executions of it that are still in
+    /// flight: each such run enters the same shutdown [`WorkflowRun::begin_stop`]
+    /// drives for `StopWorkflowRun` ([`RUN_STATUS_STOPPING`], then
+    /// [`RUN_STATUS_STOPPED`] when [`RUN_STOPPED_AFTER`] is up), so nothing is left
+    /// being admitted to, or failed by, a definition that is on its way out.
+    ///
+    /// A run that already finished keeps the status, completion and reason it
+    /// finished with: the changes the clock already owed are applied first, so a run
+    /// is stopped out of the state it really was in at `now` rather than out of the
+    /// one it was last written in.
+    pub fn stop_runs(&mut self, version: Option<&str>, now: SystemTime) -> usize {
+        let mut stopped = 0;
+        for run in self.runs.values_mut() {
+            if version.is_some_and(|wanted| run.workflow_version != wanted) {
+                continue;
+            }
+            run.settle(now);
+            if run.begin_stop(now) {
+                stopped += 1;
+            }
+        }
+        stopped
     }
 }
 

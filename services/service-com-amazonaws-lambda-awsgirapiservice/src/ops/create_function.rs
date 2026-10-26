@@ -473,6 +473,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(invalid_parameter)?;
 
+        // "To enable code signing for this function, specify the ARN of a code-signing
+        // configuration." The association names a configuration this account already
+        // holds, so what the record keeps is that stored record's own ARN, and an ARN
+        // naming none of them is the one failure
+        // `CodeSigningConfigNotFoundException` is modelled for.
+        let code_signing_config_arn = match input.code_signing_config_arn.as_deref() {
+            None => None,
+            Some(requested) => match store.code_signing_configs.get(requested) {
+                Some(config) => Some(config.arn.clone()),
+                None => {
+                    return Err(
+                        CreateFunctionErrorModeled::CodeSigningConfigNotFoundException(
+                            CodeSigningConfigNotFoundException {
+                                r#type: None,
+                                message: Some(
+                                    crate::state::code_signing_config_not_found_message(requested),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
         let config = crate::state::FunctionConfig {
             name: reference.name.clone(),
             role: input.role.clone(),
@@ -549,6 +574,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect(),
             reserved_concurrent_executions: None,
+            // The code signing configuration this function deploys under, when the
+            // request named one; a function created without one is associated with none
+            // until `PutFunctionCodeSigningConfig` associates one.
+            code_signing_config_arn,
             // "By default, Lambda sets your function's configuration to Terminate",
             // so a new function detects recursive loops until a caller says otherwise.
             recursive_loop: crate::state::DEFAULT_RECURSIVE_LOOP.to_string(),

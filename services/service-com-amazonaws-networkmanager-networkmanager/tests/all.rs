@@ -133,6 +133,8 @@ mod transit_gateway_route_table_attachment_lifecycle;
 mod unknown_parent_reference;
 #[path = "all/update_core_network.rs"]
 mod update_core_network;
+#[path = "all/update_device.rs"]
+mod update_device;
 #[path = "all/update_link.rs"]
 mod update_link;
 #[path = "all/update_site.rs"]

@@ -197,14 +197,23 @@ async fn a_subscription_delivery_policy_is_accepted_on_every_protocol_and_reads_
                      got {stored}"
                 );
             }
-            let effective = held
-                .get("EffectiveDeliveryPolicy")
-                .cloned()
-                .unwrap_or_else(|| {
+            // The EFFECTIVE policy is the one a delivery is run under, so it is reported
+            // for the endpoints a delivery policy retries a failed delivery to — the
+            // HTTP/S ones — and for no other protocol, whichever policy its owner set.
+            let effective = held.get("EffectiveDeliveryPolicy").cloned();
+            if ["http", "https"].contains(protocol) {
+                let effective = effective.unwrap_or_else(|| {
                     panic!("case {case:?}: no EffectiveDeliveryPolicy in {held:?}")
                 });
-            let effective = document(&case, "EffectiveDeliveryPolicy", &effective);
-            assert_normalized(&case, "EffectiveDeliveryPolicy", &configured, &effective);
+                let effective = document(&case, "EffectiveDeliveryPolicy", &effective);
+                assert_normalized(&case, "EffectiveDeliveryPolicy", &configured, &effective);
+            } else {
+                assert_eq!(
+                    effective, None,
+                    "case {case:?}: no delivery to a {protocol} endpoint is retried under \
+                     a delivery policy, so none must be reported, got {held:?}"
+                );
+            }
 
             // And the same document when `Subscribe` carries the policy instead: a
             // second topic, so the write is on a subscription of its own.

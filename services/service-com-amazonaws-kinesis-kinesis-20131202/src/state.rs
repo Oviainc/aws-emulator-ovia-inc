@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    EnhancedMetrics, HashKeyRange, SequenceNumberRange, Shard, StreamDescription,
+    EnhancedMetrics, HashKeyRange, Record, SequenceNumberRange, Shard, StreamDescription,
     StreamDescriptionSummary, StreamModeDetails, Tag, WarmThroughputObject,
 };
 
@@ -134,6 +134,34 @@ pub const MAX_LIST_SHARDS_LIMIT: i32 = 1_000;
 /// you have 300 seconds to use that value" (`ListShardsOutput$NextToken`).
 pub const LIST_SHARDS_TOKEN_TTL: Duration = Duration::from_secs(300);
 
+/// How many records `GetRecords` returns when the request names no `Limit`: "The maximum
+/// number of records to return. Specify a value of up to 10,000... The default value is
+/// 10,000" (`GetRecordsInput$Limit`).
+pub const DEFAULT_GET_RECORDS_LIMIT: i32 = 10_000;
+
+/// The most records `GetRecords` returns in one call: "The maximum number of records that
+/// can be returned per call is 10,000" (`GetRecords`).
+pub const MAX_GET_RECORDS_LIMIT: i32 = 10_000;
+
+/// The most bytes one `GetRecords` call answers with: "The maximum size of data that
+/// GetRecords can return is 10 MiB" (`GetRecords`), so a page stops at this size even when
+/// the limit would admit more records.
+pub const MAX_GET_RECORDS_BYTES: usize = 10 * 1024 * 1024;
+
+/// The most records one shard of this emulator holds. A record stays in the store until
+/// its retention window passes, so the shard needs a ceiling its oldest records are
+/// dropped at; it is the emulator's OWN ceiling, set at the most one `GetRecords` call can
+/// return ([`MAX_GET_RECORDS_LIMIT`]).
+pub const MAX_RECORDS_PER_SHARD: usize = 10_000;
+
+/// The most record bytes one shard of this emulator holds, the second half of the ceiling
+/// [`MAX_RECORDS_PER_SHARD`] opens: `Data` is modelled up to 10 MiB per record, so a count
+/// alone does not bound the store's memory. Set above one maximum-size record, because the
+/// record a write just stored is never the one the ceiling drops. With
+/// [`MAX_SHARDS_TOTAL`] bounding how many shards exist at all, the two together bound what
+/// every stream of every region holds. The emulator's OWN ceiling, not a modelled limit.
+pub const MAX_RECORD_BYTES_PER_SHARD: usize = 16 * 1024 * 1024;
+
 /// How many seconds an hour of a retention window holds, so the window a stream reports in
 /// hours can be measured against stored instants.
 const SECONDS_PER_HOUR: u64 = 3_600;
@@ -161,8 +189,63 @@ impl RegionalName {
     }
 }
 
-/// One shard of a stream's shard map: the slice of the hash key space it covers and the
-/// sequence numbers it spans.
+/// One data record of a shard — "the unit of data of the Kinesis data stream, which is
+/// composed of a sequence number, a partition key, and a data blob" (`Record`) — as a
+/// write stored it and a read answers it.
+#[derive(Debug, Clone)]
+pub struct DataRecord {
+    /// `Record$SequenceNumber` — "The unique identifier of the record within its shard",
+    /// as [`record_sequence_number`] mints it.
+    pub sequence_number: String,
+    /// `Record$ApproximateArrivalTimestamp` — "The approximate time that the record was
+    /// inserted into the stream", which is also what a `AT_TIMESTAMP` reader positions by
+    /// and what the retention window is measured against.
+    pub arrived_at: SystemTime,
+    /// `Record$PartitionKey` — "Identifies which shard in the stream the data record is
+    /// assigned to". `None` for a record written to an `AUTO` stream without one, which is
+    /// the one case the member documents as absent.
+    pub partition_key: Option<String>,
+    /// `Record$Data` — "The data blob. The data in the blob is both opaque and immutable
+    /// to Kinesis Data Streams, which does not inspect, interpret, or change the data in
+    /// the blob in any way", so it is stored and answered byte for byte.
+    pub data: Vec<u8>,
+    /// `Record$EncryptionType` — "The encryption type used on the record", which is the
+    /// stream's own at the instant the record was written.
+    pub encryption_type: String,
+}
+
+impl DataRecord {
+    /// This record as the modelled `Record` shape.
+    pub fn to_shape(&self) -> Record {
+        Record {
+            sequence_number: self.sequence_number.clone(),
+            approximate_arrival_timestamp: Some(timestamp(self.arrived_at)),
+            data: self.data.clone(),
+            partition_key: self.partition_key.clone(),
+            encryption_type: Some(self.encryption_type.clone()),
+        }
+    }
+
+    /// The bytes the record occupies in the store, which is what
+    /// [`MAX_RECORD_BYTES_PER_SHARD`] bounds and what one `GetRecords` page is measured
+    /// against ([`MAX_GET_RECORDS_BYTES`]).
+    ///
+    /// Both halves of the record count, the same way a write measures what it may store:
+    /// "When the data blob (the payload before base64-encoding) is added to the partition
+    /// key size, the total size must not exceed the maximum record size"
+    /// (`PutRecordInput$Data`).
+    pub fn stored_bytes(&self) -> usize {
+        self.data.len()
+            + self
+                .partition_key
+                .as_deref()
+                .map(str::len)
+                .unwrap_or_default()
+    }
+}
+
+/// One shard of a stream's shard map: the slice of the hash key space it covers, the
+/// sequence numbers it spans, and the data records written to it.
 #[derive(Debug, Clone)]
 pub struct ShardRecord {
     /// The shard's id, as [`shard_id`] mints it.
@@ -183,9 +266,119 @@ pub struct ShardRecord {
     /// When the shard was closed, `None` while it is open. A reshard is what closes a
     /// shard, and it sets this instant and [`Self::ending_sequence_number`] together.
     pub closed_at: Option<SystemTime>,
+    /// The records written to the shard, oldest first — the order `GetRecords` reads them
+    /// in ("the shard iterator specifies the position in the shard from which you want to
+    /// start reading data records sequentially").
+    pub records: Vec<DataRecord>,
+    /// How many records have ever been written to the shard, which is what the next
+    /// sequence number is minted from ([`record_sequence_number`]). Counted rather than
+    /// taken from the stored records, so a number a trim or the store's ceiling released
+    /// is never handed out twice.
+    pub records_written: u64,
+    /// How many bytes [`Self::records`] occupies, maintained as records are appended and
+    /// dropped so the write path never re-sums the whole shard.
+    pub records_bytes: usize,
 }
 
 impl ShardRecord {
+    /// A brand-new OPEN shard covering `starting_hash_key`..`ending_hash_key`, holding no
+    /// records: what a create lays down.
+    pub fn open_at(
+        index: u32,
+        created_at: SystemTime,
+        starting_hash_key: String,
+        ending_hash_key: String,
+    ) -> Self {
+        Self {
+            shard_id: shard_id(index),
+            starting_hash_key,
+            ending_hash_key,
+            starting_sequence_number: starting_sequence_number(created_at, index),
+            // A shard a create laid down is OPEN, so it has no ending sequence number and
+            // no close instant.
+            ending_sequence_number: None,
+            created_at,
+            closed_at: None,
+            records: Vec::new(),
+            records_written: 0,
+            records_bytes: 0,
+        }
+    }
+
+    /// Append `record` to the shard and answer the sequence number it was stored under.
+    ///
+    /// The number comes from the shard's own write counter, so it is unique within the
+    /// shard and orders the records the way they were written — which is the order a
+    /// reader reads them in.
+    pub fn append(
+        &mut self,
+        partition_key: Option<String>,
+        data: Vec<u8>,
+        encryption_type: &str,
+        arrived_at: SystemTime,
+    ) -> String {
+        let sequence_number =
+            record_sequence_number(&self.starting_sequence_number, self.records_written);
+        self.records_written = self.records_written.saturating_add(1);
+        let record = DataRecord {
+            sequence_number: sequence_number.clone(),
+            arrived_at,
+            partition_key,
+            data,
+            encryption_type: encryption_type.to_string(),
+        };
+        self.records_bytes = self.records_bytes.saturating_add(record.stored_bytes());
+        self.records.push(record);
+        self.enforce_storage_ceiling();
+        sequence_number
+    }
+
+    /// Hold the shard inside the emulator's own ceilings ([`MAX_RECORDS_PER_SHARD`] /
+    /// [`MAX_RECORD_BYTES_PER_SHARD`]) by dropping its OLDEST records, which is the end a
+    /// retention window releases too.
+    ///
+    /// The NEWEST record is never dropped: a write answers the sequence number it stored a
+    /// record under, so that record has to be there for the reader that is handed it.
+    fn enforce_storage_ceiling(&mut self) {
+        let droppable = self.records.len().saturating_sub(1);
+        let mut dropped = 0usize;
+        while dropped < droppable {
+            if self.records.len() - dropped <= MAX_RECORDS_PER_SHARD
+                && self.records_bytes <= MAX_RECORD_BYTES_PER_SHARD
+            {
+                break;
+            }
+            let Some(record) = self.records.get(dropped) else {
+                break;
+            };
+            self.records_bytes = self.records_bytes.saturating_sub(record.stored_bytes());
+            dropped += 1;
+        }
+        if dropped > 0 {
+            self.records.drain(..dropped);
+            // The emulator's own ceiling, not the stream's retention window, released these
+            // records: a reader sees a shorter shard than the window would have kept, so the
+            // difference is diagnosable rather than invisible.
+            ::tracing::debug!(
+                shard_id = %self.shard_id,
+                dropped,
+                retained = self.records.len(),
+                records_bytes = self.records_bytes,
+                "dropped the shard's oldest records at the emulator's per-shard ceiling"
+            );
+        }
+    }
+
+    /// The records the shard still retains at `trim_horizon`: "a stream's data records are
+    /// accessible for 24 hours from the time they are added to the stream" and for the
+    /// stream's `RetentionPeriodHours` once that window is changed, so a record that
+    /// arrived before the horizon is trimmed rather than read.
+    pub fn retained(&self, trim_horizon: SystemTime) -> impl DoubleEndedIterator<Item = &DataRecord> {
+        self.records
+            .iter()
+            .filter(move |record| record.arrived_at >= trim_horizon)
+    }
+
     /// This record as the modelled `Shard` shape.
     pub fn to_shape(&self) -> Shard {
         Shard {
@@ -225,6 +418,20 @@ impl ShardRecord {
     /// Whether the shard is open or was closed no earlier than `instant`.
     pub fn open_or_closed_since(&self, instant: SystemTime) -> bool {
         self.closed_at.is_none_or(|closed| closed >= instant)
+    }
+
+    /// Whether `hash_key` falls inside the slice of the hash key space this shard covers
+    /// (`Shard$HashKeyRange`, "The range of possible hash key values for the shard, which
+    /// is a set of ordered contiguous positive integers"). A range this emulator did not
+    /// write — one whose bounds do not parse — covers nothing rather than everything.
+    pub fn covers(&self, hash_key: u128) -> bool {
+        let Ok(starting) = self.starting_hash_key.parse::<u128>() else {
+            return false;
+        };
+        let Ok(ending) = self.ending_hash_key.parse::<u128>() else {
+            return false;
+        };
+        (starting..=ending).contains(&hash_key)
     }
 }
 
@@ -270,6 +477,119 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// The strategy that places a record written to this stream: the one the create named,
+    /// or the documented default — "If the stream uses the USER_PARTITION_KEY record
+    /// distribution strategy (the default), a partition key is required"
+    /// (`PutRecordInput$PartitionKey`).
+    pub fn record_distribution(&self) -> &str {
+        self.record_distribution_strategy
+            .as_deref()
+            .unwrap_or(RECORD_DISTRIBUTION_USER_PARTITION_KEY)
+    }
+
+    /// Which shard of the map a record carrying `explicit_hash_key` / `partition_key` is
+    /// assigned to, by the index it occupies in [`Self::shards`].
+    ///
+    /// "Amazon Kinesis Data Streams uses the partition key as input to a hash function that
+    /// maps the partition key and associated data to a specific shard... all data records
+    /// with the same partition key map to the same shard within the stream"
+    /// (`PutRecordInput$PartitionKey`), and `ExplicitHashKey` names that hash value
+    /// directly ("The hash value used to explicitly determine the shard the data record is
+    /// assigned to"). Under the `AUTO` strategy "the partition key is optional and any
+    /// value you provide is ignored, along with any ExplicitHashKey you provide... Amazon
+    /// Kinesis Data Streams distributes the record across shards using service-managed
+    /// algorithms", so the record goes to the open shard the stream's write count selects,
+    /// advanced by `nth_in_call` — the record's position within the call being served — so
+    /// that one batch spreads over every open shard rather than landing in one.
+    pub fn placement(
+        &self,
+        explicit_hash_key: Option<&str>,
+        partition_key: Option<&str>,
+        nth_in_call: u64,
+    ) -> Result<usize, RecordPlacementFailure> {
+        let open: Vec<usize> = self
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(_, shard)| shard.is_open())
+            .map(|(index, _)| index)
+            .collect();
+        if open.is_empty() {
+            return Err(RecordPlacementFailure::NoOpenShard);
+        }
+        if self.record_distribution() == RECORD_DISTRIBUTION_AUTO {
+            let written: u64 = self
+                .shards
+                .iter()
+                .fold(0u64, |total, shard| total.saturating_add(shard.records_written));
+            let position = usize::try_from(written.wrapping_add(nth_in_call) % open.len() as u64)
+                .unwrap_or(0);
+            return open
+                .get(position)
+                .copied()
+                .ok_or(RecordPlacementFailure::NoOpenShard);
+        }
+        let hash = match explicit_hash_key {
+            // `ExplicitHashKey` is modelled `^(0|([1-9]\d{0,38}))$`, which admits values
+            // past `u128::MAX`; one of those lands in no shard's range, which is the same
+            // refusal as a value between two ranges.
+            Some(explicit) => explicit
+                .parse::<u128>()
+                .map_err(|_| RecordPlacementFailure::OutsideTheShardMap(explicit.to_string()))?,
+            None => {
+                let Some(partition_key) = partition_key else {
+                    return Err(RecordPlacementFailure::PartitionKeyRequired);
+                };
+                partition_key_hash(partition_key)
+            }
+        };
+        open.into_iter()
+            .find(|index| {
+                self.shards
+                    .get(*index)
+                    .is_some_and(|shard| shard.covers(hash))
+            })
+            .ok_or_else(|| RecordPlacementFailure::OutsideTheShardMap(hash.to_string()))
+    }
+
+    /// The most bytes one record written to this stream may carry: the stream's own
+    /// `MaxRecordSizeInKiB` when the create named one, else the documented default — "Each
+    /// data record can be up to 1 MiB in size by default. Amazon Kinesis Data Streams
+    /// supports large records up to 10 MiB in size" (`GetRecords`), the larger sizes being
+    /// what `MaxRecordSizeInKiB` opts into.
+    pub fn max_record_size_bytes(&self) -> usize {
+        let ki_b = self
+            .max_record_size_in_ki_b
+            .unwrap_or(DEFAULT_MAX_RECORD_SIZE_KI_B)
+            .max(1);
+        usize::try_from(ki_b).unwrap_or(usize::MAX).saturating_mul(1024)
+    }
+
+    /// Append one record to the shard at `index` in the shard map — the index
+    /// [`Self::placement`] resolved for it — answering that shard's id and the sequence
+    /// number the record was stored under, or `None` for an index the map does not hold.
+    ///
+    /// ONE path for every write: `PutRecord` and `PutRecords` resolve the shard by the same
+    /// rule ([`Self::placement`]) and store through this append, so a reader cannot tell
+    /// which operation wrote a record.
+    ///
+    /// The partition key is stored as the producer sent it: under the `AUTO` strategy "the
+    /// partition key is optional and any value you provide is ignored", but
+    /// `Record$PartitionKey` is still "the original value... even though it was not used to
+    /// determine shard placement".
+    pub fn append_at(
+        &mut self,
+        index: usize,
+        partition_key: Option<String>,
+        data: Vec<u8>,
+        at: SystemTime,
+    ) -> Option<(String, String)> {
+        let encryption_type = self.encryption_type.clone();
+        let shard = self.shards.get_mut(index)?;
+        let sequence_number = shard.append(partition_key, data, &encryption_type, at);
+        Some((shard.shard_id.clone(), sequence_number))
+    }
+
     /// The stream's status at `now`: `CREATING` until the transition the create armed
     /// falls due, `ACTIVE` from then on. Derived from the stored instant, so two reads at
     /// the same instant agree and no read has to write.
@@ -534,6 +854,20 @@ impl ComAmazonawsKinesisKinesis20131202State {
     }
 }
 
+/// Why a write places a record in no shard of the stream it addresses. The operation maps
+/// it onto the error ITS model declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordPlacementFailure {
+    /// The stream's records are placed by the producer's partition key, and the request
+    /// carried none ([`PARTITION_KEY_REQUIRED_MESSAGE`]).
+    PartitionKeyRequired,
+    /// The hash key the request named — explicitly, or through its partition key — lies in
+    /// no open shard's range ([`hash_key_outside_the_shard_map_message`]).
+    OutsideTheShardMap(String),
+    /// Every shard of the stream is closed, so nothing can be written to it.
+    NoOpenShard,
+}
+
 /// Why a request's `StreamName` / `StreamARN` pair names no stream a store holds. Each
 /// operation maps it onto the error ITS model declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,6 +1019,113 @@ pub fn starting_sequence_number(created_at: SystemTime, index: u32) -> String {
     format!("49{millis:013}{index:06}")
 }
 
+/// How many digits a record's sequence number appends to the shard's starting sequence
+/// number. Fixed width, so every sequence number of one shard is the same length and
+/// comparing two of them digit by digit is their numeric order — which is also the order
+/// the records were written in.
+const RECORD_SEQUENCE_NUMBER_DIGITS: usize = 12;
+
+/// The sequence number of the record a shard writes next: "the unique identifier of the
+/// record within its shard" (`Record$SequenceNumber`), inside the `SequenceNumber` pattern
+/// `^(0|([1-9]\d{0,128}))$`.
+///
+/// DERIVED from the shard's own starting sequence number and its write counter, so it lies
+/// inside the range the shard publishes (`Shard$SequenceNumberRange`), it is larger than
+/// every number written before it, and the value a read reports never changes.
+pub fn record_sequence_number(shard_starting_sequence_number: &str, written: u64) -> String {
+    format!(
+        "{shard_starting_sequence_number}{written:0width$}",
+        width = RECORD_SEQUENCE_NUMBER_DIGITS
+    )
+}
+
+/// Whether `left` is a sequence number no larger than `right`.
+///
+/// `SequenceNumber` is a decimal integer without leading zeros (`^(0|([1-9]\d{0,128}))$`),
+/// which is wider than any integer type this crate holds — so the comparison is by digit
+/// COUNT first and then lexicographic, which for that form is the numeric order.
+pub fn sequence_number_le(left: &str, right: &str) -> bool {
+    (left.len(), left) <= (right.len(), right)
+}
+
+/// The `RecordDistributionStrategy` under which the producer's partition key places the
+/// record: "If the stream uses the USER_PARTITION_KEY record distribution strategy (the
+/// default), a partition key is required" (`PutRecordInput$PartitionKey`).
+pub const RECORD_DISTRIBUTION_USER_PARTITION_KEY: &str = "USER_PARTITION_KEY";
+
+/// The `RecordDistributionStrategy` under which the service places the record itself: "If
+/// the stream uses the AUTO record distribution strategy, the partition key is optional
+/// and any value you provide is ignored, along with any ExplicitHashKey you provide"
+/// (`PutRecordInput$PartitionKey`).
+pub const RECORD_DISTRIBUTION_AUTO: &str = "AUTO";
+
+/// The 128-bit hash key a partition key maps to: "an MD5 hash function is used to map
+/// partition keys to 128-bit integer values and to map associated data records to shards.
+/// As a result of this hashing mechanism, all data records with the same partition key map
+/// to the same shard within the stream" (`PutRecordInput$PartitionKey`).
+///
+/// The digest is PROTOCOL-MANDATED record placement, not a security primitive: a client
+/// computes the same mapping to predict which shard its records land in, so the published
+/// `HashKeyRange` of a shard only means anything with this exact function. Nothing here
+/// authenticates, signs or protects anything.
+pub fn partition_key_hash(partition_key: &str) -> u128 {
+    let digest = <::md5::Md5 as ::md5::Digest>::digest(partition_key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(digest.as_slice());
+    u128::from_be_bytes(bytes)
+}
+
+/// How a write states that the request's `ExplicitHashKey` or `PartitionKey` lands in no
+/// shard of the stream. Built FROM the request, so the value at fault names it.
+pub fn hash_key_outside_the_shard_map_message(hash_key: &str) -> String {
+    format!(
+        "the hash key {hash_key} lies in no open shard of the stream; an ExplicitHashKey \
+         must fall inside one shard's HashKeyRange"
+    )
+}
+
+/// How a write refuses a request that names no `PartitionKey` for a stream whose records a
+/// partition key places: the rule `PutRecordInput$PartitionKey` publishes ("If the stream
+/// uses the USER_PARTITION_KEY record distribution strategy (the default), a partition key
+/// is required").
+pub const PARTITION_KEY_REQUIRED_MESSAGE: &str =
+    "PartitionKey is required for a stream that uses the USER_PARTITION_KEY record \
+     distribution strategy";
+
+/// The maximum size of one data record when the stream names no `MaxRecordSizeInKiB`:
+/// "Each data record can be up to 1 MiB in size by default. Amazon Kinesis Data Streams
+/// supports large records up to 10 MiB in size" (`GetRecords`) — which is also the
+/// smallest value `MaxRecordSizeInKiB` is modelled to take (`range 1024..10240`).
+pub const DEFAULT_MAX_RECORD_SIZE_KI_B: i32 = 1_024;
+
+/// The most bytes one `PutRecords` request carries across its entries: "Each PutRecords
+/// request can support up to 500 records. Each record in the request can be as large as 1
+/// MiB, up to a limit of 5 MiB for the entire request" (`PutRecords`) — the 500 is the
+/// modelled `@length(max: 500)` the boundary validator enforces, this is the aggregate it
+/// does not.
+pub const MAX_PUT_RECORDS_REQUEST_BYTES: usize = 5 * 1024 * 1024;
+
+/// How a write refuses a batch whose records total more than one request may carry
+/// ([`MAX_PUT_RECORDS_REQUEST_BYTES`]). Built FROM the request, so the total at fault and
+/// the total allowed both name it.
+pub fn batch_too_large_message(size: usize, maximum: usize) -> String {
+    format!(
+        "the records of this request total {size} bytes, past the {maximum} bytes one \
+         PutRecords request may carry"
+    )
+}
+
+/// How a write refuses a record past the stream's maximum record size: "When the data blob
+/// (the payload before base64-encoding) is added to the partition key size, the total size
+/// must not exceed the maximum record size" (`PutRecordInput$Data`). Built FROM the request
+/// and the stream, so the size at fault and the size allowed both name it.
+pub fn record_too_large_message(size: usize, maximum: usize) -> String {
+    format!(
+        "the record's data and partition key total {size} bytes, past the {maximum} bytes \
+         one record of this stream may carry"
+    )
+}
+
 /// What a `ListShards` pagination token is tagged with, so a string the service never
 /// issued is refused rather than read as a shard id.
 const SHARD_PAGE_TOKEN_TAG: &str = "listShards";
@@ -820,7 +1261,11 @@ pub enum ShardPosition {
     /// oldest data record in the shard".
     TrimHorizon,
     /// `LATEST` — "just after the most recent record in the shard, so that you always read
-    /// the most recent data in the shard".
+    /// the most recent data in the shard", PINNED when the iterator is handed out: a shard
+    /// that already held records is pinned to the newest of them
+    /// ([`Self::AfterSequenceNumber`]), so this position is only ever carried by an
+    /// iterator issued for a shard that held NONE — and every record such a shard holds
+    /// when it is read arrived after the iterator was issued.
     Latest,
     /// `AT_SEQUENCE_NUMBER` — "the position denoted by a specific sequence number".
     AtSequenceNumber(String),
@@ -1007,6 +1452,50 @@ pub fn shard_not_found_message(shard_id: &str, stream_identifier: &str) -> Strin
         "shard {shard_id} of stream {stream_identifier} not found under account {}",
         ::engine::emulator_account_id()
     )
+}
+
+/// How a write states that the stream it addresses has no open shard left to place a
+/// record in — every shard of the map has been closed by a reshard.
+pub const NO_OPEN_SHARD_MESSAGE: &str =
+    "the stream has no open shard to write to; a record is written to an open shard of the \
+     shard map";
+
+/// How a read refuses a `ShardIterator` this service never issued: it names no position in
+/// any shard, so it is the modelled "a specified parameter ... can't be used" refusal
+/// rather than an expiry. The sentence Kinesis answers for that error class.
+pub const INVALID_SHARD_ITERATOR_MESSAGE: &str = "Invalid ShardIterator.";
+
+/// How a read refuses a request whose `StreamARN` names a different stream than its
+/// `ShardIterator` does: the iterator already names the stream its position is in, so the
+/// pair has to name ONE stream — the same rule [`STREAM_IDENTIFIER_MISMATCH_MESSAGE`]
+/// states for a request that names a stream twice.
+pub const ITERATOR_STREAM_MISMATCH_MESSAGE: &str =
+    "StreamARN names a different stream than the ShardIterator does; the iterator already \
+     identifies the stream its position is in";
+
+/// How a read refuses an iterator past its lifetime: the sentence Kinesis answers for
+/// `ExpiredIteratorException` ("The provided iterator exceeds the maximum age allowed"),
+/// whose variable parts are the instant the iterator was handed out, the instant it was
+/// used at, and the lifetime `GetShardIterator` documents ("A shard iterator expires 5
+/// minutes after it is returned to the requester"), all taken from the iterator and the
+/// clock.
+pub fn iterator_expired_message(issued_at_millis: u128, now_millis: u128) -> String {
+    format!(
+        "Iterator expired. The iterator was created at time {} while right now it is {} \
+         which is further in the past than the tolerated delay of {} milliseconds.",
+        instant_text(issued_at_millis),
+        instant_text(now_millis),
+        SHARD_ITERATOR_TTL.as_millis()
+    )
+}
+
+/// An instant as a refusal spells one out, in the date-time form the wire carries a
+/// modelled `Timestamp` in.
+fn instant_text(millis: u128) -> String {
+    let millis = i64::try_from(millis).unwrap_or(i64::MAX);
+    ::aws_smithy_types::DateTime::from_millis(millis)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// How a request that pairs `NextToken` with a member the token already determines is

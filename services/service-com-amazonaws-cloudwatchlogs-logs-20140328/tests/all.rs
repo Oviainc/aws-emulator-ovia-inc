@@ -41,6 +41,8 @@ mod delivery_destination_enumeration;
 mod delivery_destination_policies;
 #[path = "all/delivery_destination_policy_reads.rs"]
 mod delivery_destination_policy_reads;
+#[path = "all/delivery_destination_policy_removal.rs"]
+mod delivery_destination_policy_removal;
 #[path = "all/delivery_destinations.rs"]
 mod delivery_destinations;
 #[path = "all/delivery_sources.rs"]

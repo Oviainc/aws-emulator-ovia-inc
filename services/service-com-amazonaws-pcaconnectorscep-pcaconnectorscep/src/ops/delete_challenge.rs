@@ -173,8 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a challenge exists only in the Region its owning
+        // connector's ARN names, so the Region the request was signed for is part of
+        // resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -182,10 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The ARN has to name a stored challenge: `@idempotent` says a retry is SAFE to
         // repeat (it removes the same record and nothing else), not that a call about a
-        // record that is not there is a success. A well-formed ARN holding no challenge —
-        // one already deleted, one never created, or one whose owning connector is gone —
-        // is the only way this operation can reach its modelled `ResourceNotFoundException`.
-        if !store.remove_challenge(&input.challenge_arn) {
+        // record that is not there is a success. A well-formed ARN holding no challenge in
+        // this Region — one already deleted, one never created, one whose owning connector is
+        // gone, or one naming another Region's challenge — is the only way this operation can
+        // reach its modelled `ResourceNotFoundException`.
+        if !store.remove_challenge(&region, &input.challenge_arn) {
             return Err(not_found(&input.challenge_arn));
         }
         Ok(DeleteChallengeOutput)

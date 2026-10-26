@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBulkImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBulkImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBulkImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -187,20 +178,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBulkImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBulkImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBulkImportJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBulkImportJobError::Modeled(
+                DescribeBulkImportJobErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // "Retrieves information about a bulk import job request": a read, so
+        // nothing here writes. How far the job has got is DERIVED from the instant
+        // the create started it, which is why two readers of one job cannot disagree
+        // and a read cannot move a job on.
+        let store = state.lock();
+
+        // `workspaceName` NARROWS the read to one workspace, so a workspace this
+        // store does not hold is the same absence every other workspace-scoped
+        // operation in this service reports, named as the workspace the request
+        // supplied.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::RESOURCE_WORKSPACE, workspace));
+            }
+        }
+
+        let record = store
+            .bulk_import_jobs
+            .get(&input.job_id)
+            // A job created for a session dataset belongs to that dataset's
+            // workspace, and one ingesting into time series outside a workspace
+            // belongs to none: either way a job the scope does not cover names no
+            // job this read can answer from.
+            //
+            // The member is documented only as "The name of the workspace", so
+            // NARROWING is this emulator's reading of it: a scope the caller named
+            // has to bear on the answer, and answering with a job from outside it
+            // would be the worse reading. A recording that shows otherwise should
+            // correct this.
+            .filter(|record| record.in_workspace(input.workspace_name.as_deref()))
+            .ok_or_else(|| {
+                not_found(crate::state::RESOURCE_BULK_IMPORT_JOB, &input.job_id)
+            })?;
+
+        Ok(DescribeBulkImportJobOutput {
+            job_id: record.job_id.clone(),
+            job_name: record.job_name.clone(),
+            job_status: record.status(now).to_string(),
+            job_role_arn: record.job_role_arn.clone(),
+            files: record.files.clone(),
+            error_report_location: record.error_report_location.clone(),
+            job_configuration: record.job_configuration.clone(),
+            job_creation_date: crate::state::to_date_time(record.created_at),
+            // "The date the job was last updated": the instant the status the read
+            // reports fell due, so the two answers are consistent with each other.
+            job_last_update_date: crate::state::to_date_time(record.last_update_date(now)),
+            adaptive_ingestion: record.adaptive_ingestion,
+            delete_files_after_import: record.delete_files_after_import,
+            dataset_id: record.dataset_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the request
+/// addressed and the identifier it supplied.
+fn not_found(resource: &str, requested: &str) -> DescribeBulkImportJobError {
+    DescribeBulkImportJobError::Modeled(
+        DescribeBulkImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        }),
+    )
 }

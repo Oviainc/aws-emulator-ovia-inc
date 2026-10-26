@@ -18,7 +18,9 @@
 //! 3. A share belongs to (template, principal): the same principal cannot hold two shares
 //!    of one template (`409 ConflictException`), an `@idempotencyToken` replay returns the
 //!    original share rather than minting a second, and the same token with different
-//!    parameters is a 409.
+//!    parameters is a 409. Shares are metered per template, so the one past the ceiling is
+//!    `402 ServiceQuotaExceededException` and records nothing, while the one at it is
+//!    served.
 //! 4. `ListTemplateShares` reports: it names the template it enumerates, narrows by
 //!    `SharedWithPrefix` and `Status`, pages over every share exactly once at any
 //!    `MaxResults`, serves each published bound of its own members and refuses one step
@@ -424,6 +426,99 @@ async fn a_share_belongs_to_one_template_and_principal() {
             "case {principal_case:?}: the principal must hold exactly one share, got {listed:?}"
         );
     }
+}
+
+/// Rule 3 at its ceiling: shares are metered per review template, so the share past the
+/// ceiling is the modelled `402 ServiceQuotaExceededException` — naming the template the
+/// quota meters and carrying the `@required` `QuotaCode` / `ServiceCode`
+/// (`smithy_query(query="shape", shape="ServiceQuotaExceededException")`) — and it records
+/// nothing, while the share AT the ceiling is still served.
+///
+/// The template is filled to one share below the ceiling through the shared state, because
+/// reaching it over HTTP would take a thousand signed requests (the seed
+/// `super::lens_shares` uses for its own ceiling); both boundary rows are crossed over HTTP.
+#[tokio::test]
+async fn the_share_past_the_per_template_ceiling_is_refused() {
+    let client = Client::new();
+    let template_arn = review_template(&client, "share-quota-host", &["wellarchitected"]).await;
+
+    for index in 0..state::MAX_SHARES_PER_REVIEW_TEMPLATE - 1 {
+        record_template_share(
+            &client,
+            &template_arn,
+            &format!("{index:012}"),
+            NEW_SHARE_STATUS,
+        );
+    }
+    assert_eq!(
+        stored_share_count(&client, &template_arn),
+        state::MAX_SHARES_PER_REVIEW_TEMPLATE - 1,
+        "the template must be seeded to one share below the ceiling, got {}",
+        stored_share_count(&client, &template_arn)
+    );
+
+    let at_the_ceiling =
+        create_share(&client, &template_arn, "111122223333", "tok-at-the-ceiling").await;
+    created_share_id(&at_the_ceiling, "at-the-ceiling");
+
+    let past = create_share(
+        &client,
+        &template_arn,
+        "444455556666",
+        "tok-past-the-ceiling",
+    )
+    .await;
+    assert_eq!(
+        past.status, 402,
+        "case \"past-the-ceiling\": expected HTTP 402, got {past:?}"
+    );
+    assert_eq!(
+        past.error_code, "ServiceQuotaExceededException",
+        "case \"past-the-ceiling\": expected ServiceQuotaExceededException, got {past:?}"
+    );
+    assert_eq!(
+        member(&past, "ResourceId"),
+        template_arn,
+        "case \"past-the-ceiling\": the refusal must name the template the quota meters, got \
+         {past:?}"
+    );
+    // `QuotaCode` and `ServiceCode` are `@required`, so both must be present and both must
+    // say WHICH quota was met: the quota is named by what it meters (the model publishes no
+    // numeric Service Quotas code for it) and the service by its signing name, spelled here
+    // as the literals rather than read back out of the code under test.
+    assert_eq!(
+        member(&past, "QuotaCode"),
+        "SharesPerReviewTemplate",
+        "case \"past-the-ceiling\": the refusal must name the quota that was met, got {past:?}"
+    );
+    assert_eq!(
+        member(&past, "ServiceCode"),
+        "wellarchitected",
+        "case \"past-the-ceiling\": the refusal must name this service, got {past:?}"
+    );
+    // `ShareResourceType` for a review-template share
+    // (`smithy_query(query="shape", shape="ShareResourceType")`).
+    assert_eq!(
+        member(&past, "ResourceType"),
+        "TEMPLATE",
+        "case \"past-the-ceiling\": expected ResourceType TEMPLATE, got {past:?}"
+    );
+    assert_eq!(
+        stored_share_count(&client, &template_arn),
+        state::MAX_SHARES_PER_REVIEW_TEMPLATE,
+        "case \"past-the-ceiling\": a refused share must record nothing, so the template still \
+         holds exactly {} shares",
+        state::MAX_SHARES_PER_REVIEW_TEMPLATE
+    );
+    let refused_principal = summaries(
+        &list_shares(&client, &template_arn, "SharedWithPrefix=4444").await,
+        "past-the-ceiling",
+    );
+    assert!(
+        refused_principal.is_empty(),
+        "case \"past-the-ceiling\": the refused principal must hold no share, got \
+         {refused_principal:?}"
+    );
 }
 
 /// Rule 4: `ListTemplateShares` narrows by `SharedWithPrefix` and by `Status` over every

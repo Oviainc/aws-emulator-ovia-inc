@@ -267,6 +267,13 @@ pub struct TopicRecord {
     /// How many of this topic's subscriptions have been deleted — the
     /// `SubscriptionsDeleted` attribute, which outlives the subscription records.
     pub subscriptions_deleted: u64,
+    /// When this topic's message archive came into force: the instant the
+    /// [`ARCHIVE_POLICY_ATTRIBUTE`] was last added to a topic that was not archiving,
+    /// and `None` while it holds no archive policy. Nothing older than it is in the
+    /// archive, so it is one half of the replayable window
+    /// ([`TopicRecord::beginning_archive_time`]); kept in step with the attribute map
+    /// by [`TopicRecord::refresh_archive_window`].
+    pub archive_enabled_at: Option<SystemTime>,
 }
 
 // =============================================================================
@@ -301,6 +308,24 @@ pub const SUBSCRIPTIONS_PENDING_ATTRIBUTE: &str = "SubscriptionsPending";
 pub const SUBSCRIPTIONS_CONFIRMED_ATTRIBUTE: &str = "SubscriptionsConfirmed";
 pub const SUBSCRIPTIONS_DELETED_ATTRIBUTE: &str = "SubscriptionsDeleted";
 pub const EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE: &str = "EffectiveDeliveryPolicy";
+
+/// The topic attribute a FIFO topic's message archive is configured under:
+/// "ArchivePolicy – The policy that sets the retention period for messages stored in the
+/// message archive of an Amazon SNS FIFO topic"
+/// (`GetTopicAttributesResponse$Attributes` doc).
+pub const ARCHIVE_POLICY_ATTRIBUTE: &str = "ArchivePolicy";
+
+/// The member of an archive policy that states how long the archive keeps a message, in
+/// DAYS — the "message retention period set by the topic's message archiving policy" the
+/// replayable window is measured by (`GetTopicAttributesResponse$Attributes` doc).
+pub const MESSAGE_RETENTION_PERIOD_MEMBER: &str = "MessageRetentionPeriod";
+
+/// The attribute SNS reports the start of a topic's replayable window under:
+/// "BeginningArchiveTime – The earliest starting point at which a message in the topic's
+/// archive can be replayed from" (`GetTopicAttributesResponse$Attributes` doc). It is
+/// COMPUTED from the archive policy and the clock, so it is not in
+/// [`TOPIC_ATTRIBUTE_NAMES`]: no caller sets it.
+pub const BEGINNING_ARCHIVE_TIME_ATTRIBUTE: &str = "BeginningArchiveTime";
 
 /// The order SNS reports a topic's attributes in, as recorded `GetTopicAttributes`
 /// responses carry it: the access policy, the owner, the pending-subscription count,
@@ -533,7 +558,7 @@ pub fn permission_statement(
             "AWS": one_or_many(
                 account_ids
                     .iter()
-                    .map(|account| format!("arn:aws:iam::{account}:root"))
+                    .map(|account| root_principal_arn(account))
                     .collect(),
             )
         })),
@@ -574,6 +599,80 @@ impl TopicRecord {
         self.attributes
             .insert(POLICY_ATTRIBUTE.to_string(), policy.to_json());
     }
+
+    /// Whether this topic archives the messages published to it: it holds an
+    /// [`ARCHIVE_POLICY_ATTRIBUTE`].
+    pub fn is_archiving(&self) -> bool {
+        self.attributes.contains_key(ARCHIVE_POLICY_ATTRIBUTE)
+    }
+
+    /// Bring [`TopicRecord::archive_enabled_at`] in step with the attribute map, after a
+    /// write that may have added or removed the archive policy.
+    ///
+    /// Called by every operation that writes a topic's attributes, so the instant the
+    /// archive came into force does not depend on which call configured it. A write that
+    /// leaves an already-archiving topic archiving keeps the instant it has: the archive
+    /// never stopped, so its window did not restart.
+    pub fn refresh_archive_window(&mut self) {
+        match (self.is_archiving(), self.archive_enabled_at) {
+            (true, None) => self.archive_enabled_at = Some(SystemTime::now()),
+            (false, Some(_)) => self.archive_enabled_at = None,
+            _ => {}
+        }
+    }
+
+    /// How long this topic's archive keeps a message, or `None` when it archives nothing
+    /// or its policy states no retention period.
+    fn archive_retention(&self) -> Option<Duration> {
+        let days = json_object(self.attributes.get(ARCHIVE_POLICY_ATTRIBUTE)?)?
+            .get(MESSAGE_RETENTION_PERIOD_MEMBER)
+            .and_then(retention_days)?;
+        Some(ONE_DAY * days)
+    }
+
+    /// The earliest instant a message in this topic's archive can be replayed from, or
+    /// `None` for a topic that archives nothing.
+    ///
+    /// "This point in time is based on the configured message retention period set by the
+    /// topic's message archiving policy" (`GetTopicAttributesResponse$Attributes` doc):
+    /// the archive holds nothing published before archiving came into force, and nothing
+    /// older than the retention period, so the window starts at the LATER of the two.
+    pub fn beginning_archive_time(&self) -> Option<SystemTime> {
+        let enabled_at = self.archive_enabled_at?;
+        let retained_from = SystemTime::now().checked_sub(self.archive_retention()?);
+        Some(match retained_from {
+            Some(horizon) if horizon > enabled_at => horizon,
+            _ => enabled_at,
+        })
+    }
+}
+
+/// One day, the unit an archive policy's retention period is stated in.
+const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The number of days an archive policy's retention member states, or `None` when the
+/// member is not a count of days at all.
+///
+/// SNS writes the member as a STRING (`{"MessageRetentionPeriod":"30"}`), which is the
+/// form a caller's document carries; a JSON number says the same thing and is read too.
+fn retention_days(value: &serde_json::Value) -> Option<u32> {
+    match value {
+        serde_json::Value::String(text) => text.parse().ok(),
+        serde_json::Value::Number(number) => {
+            number.as_u64().and_then(|days| u32::try_from(days).ok())
+        }
+        _ => None,
+    }
+}
+
+/// `at` as an RFC 3339 instant, the form this service writes every timestamp it reports
+/// in a string-valued field (a notification envelope's `Timestamp`, a topic's
+/// [`BEGINNING_ARCHIVE_TIME_ATTRIBUTE`]), or `None` for an instant the timestamp type
+/// cannot render.
+pub fn rfc3339(at: SystemTime) -> Option<String> {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }
 
 // =============================================================================
@@ -918,6 +1017,9 @@ pub struct SubscriptionRecord {
     pub protocol: String,
     pub endpoint: Option<String>,
     pub owner: String,
+    /// The principal that created the subscription, as the
+    /// [`SUBSCRIPTION_PRINCIPAL_ATTRIBUTE`] reports it.
+    pub principal: String,
     /// The caller-settable attributes (`FilterPolicy`, `RawMessageDelivery`, …).
     pub attributes: HashMap<String, String>,
     /// The subscriber has not confirmed yet, so SNS delivers nothing to it.
@@ -978,6 +1080,30 @@ pub const PROTOCOL_ATTRIBUTE: &str = "Protocol";
 pub const ENDPOINT_ATTRIBUTE: &str = "Endpoint";
 pub const PENDING_CONFIRMATION_ATTRIBUTE: &str = "PendingConfirmation";
 pub const CONFIRMATION_WAS_AUTHENTICATED_ATTRIBUTE: &str = "ConfirmationWasAuthenticated";
+
+/// The subscription attribute naming WHO created the subscription — the principal whose
+/// call to `Subscribe` minted it, which is what a client auditing a topic's subscribers
+/// reads. Computed from the record rather than stored by a caller, so it is not in
+/// [`SUBSCRIPTION_ATTRIBUTE_NAMES`] either.
+pub const SUBSCRIPTION_PRINCIPAL_ATTRIBUTE: &str = "SubscriptionPrincipal";
+
+/// The principal form an ACCOUNT is written as: its root user's ARN.
+pub fn root_principal_arn(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:root")
+}
+
+/// The IAM user name the identity this emulator's own credentials present carries.
+const EMULATOR_USER_NAME: &str = "emulator";
+
+/// The principal that made this call, as a resource it creates records it.
+///
+/// Every request this emulator serves is made by the one identity its published
+/// credentials present — the IAM user `sts:GetCallerIdentity` answers with — so that is
+/// the principal a subscription minted here was created by, and a client can match the
+/// two against each other.
+pub fn calling_principal_arn() -> String {
+    ::emulator_server::emulator_arn("iam", "", &format!("user/{EMULATOR_USER_NAME}"))
+}
 
 /// How a boolean-valued attribute is written on the wire: SNS carries every attribute
 /// value as a string, so a flag is the word, not a JSON literal.
@@ -1054,6 +1180,24 @@ pub const RAW_MESSAGE_DELIVERY_ENABLED: &str = "true";
 /// (`SetSubscriptionAttributesInput$AttributeName` doc).
 pub const FILTER_POLICY_SCOPES: &[&str] = &[DEFAULT_FILTER_POLICY_SCOPE, "MessageBody"];
 
+/// The `FilterPolicyScope` a subscription REPORTS, or `None` when it reports none.
+///
+/// The scope says which part of a message "the filter is applied on"
+/// (`GetSubscriptionAttributesResponse$Attributes` doc), so it is in force only while
+/// there is a policy to apply: a subscription that holds a `FilterPolicy` reports the
+/// scope that policy is matched under — the documented default when its owner set none —
+/// and one that holds no policy reports no scope at all, including when a scope was set
+/// for a policy the subscription does not have yet. The scope is still HELD, so setting
+/// the policy later reveals it.
+pub fn reported_filter_policy_scope(attributes: &HashMap<String, String>) -> Option<&str> {
+    attributes.get(FILTER_POLICY_ATTRIBUTE)?;
+    Some(
+        attributes
+            .get(FILTER_POLICY_SCOPE_ATTRIBUTE)
+            .map_or(DEFAULT_FILTER_POLICY_SCOPE, String::as_str),
+    )
+}
+
 /// The protocols raw message delivery may be ENABLED for: the ones whose endpoint
 /// receives the published body ITSELF — "RawMessageDelivery – When set to true, enables
 /// raw message delivery to Amazon SQS or HTTP/S endpoints"
@@ -1069,6 +1213,15 @@ pub const RAW_MESSAGE_DELIVERY_PROTOCOLS: &[&str] = &["sqs", "http", "https", "f
 /// only to Amazon Data Firehose delivery stream subscriptions: SubscriptionRoleArn"
 /// (`SetSubscriptionAttributesInput$AttributeName` doc).
 pub const SUBSCRIPTION_ROLE_ARN_PROTOCOLS: &[&str] = &["firehose"];
+
+/// The protocols an `EffectiveDeliveryPolicy` is REPORTED for: the endpoints a delivery
+/// policy governs the delivery to — "DeliveryPolicy – The policy that defines how Amazon
+/// SNS retries failed deliveries to HTTP/S endpoints" (`CreateTopicInput$Attributes`
+/// doc). A subscription over any other protocol has no such retry policy, so SNS reports
+/// no effective one for it. Recorded evidence: a confirmed `sqs` subscription reports
+/// exactly its identity, routing, confirmation state, raw-delivery flag and subscribing
+/// principal, and no delivery policy among them.
+pub const DELIVERY_POLICY_PROTOCOLS: &[&str] = &["http", "https"];
 
 /// The members of `value` when it is a JSON OBJECT, else `None` — the form every policy
 /// document a subscription attribute carries has.
@@ -1145,6 +1298,31 @@ pub fn filter_policy_pair_refusal(attributes: &HashMap<String, String>) -> Optio
         .map_or(DEFAULT_FILTER_POLICY_SCOPE, String::as_str);
     (scope == DEFAULT_FILTER_POLICY_SCOPE && filter_policy_is_nested(policy))
         .then(|| NESTED_FILTER_POLICY_REFUSAL.to_string())
+}
+
+/// The attributes of a topic or a subscription whose value is a policy DOCUMENT: the
+/// access, delivery, archive, filter, redrive and replay policies.
+pub const POLICY_DOCUMENT_ATTRIBUTES: &[&str] = &[
+    ARCHIVE_POLICY_ATTRIBUTE,
+    DELIVERY_POLICY_ATTRIBUTE,
+    FILTER_POLICY_ATTRIBUTE,
+    POLICY_ATTRIBUTE,
+    REDRIVE_POLICY_ATTRIBUTE,
+    REPLAY_POLICY_ATTRIBUTE,
+];
+
+/// Whether writing `value` to the attribute `name` REMOVES it rather than setting it.
+///
+/// An attribute whose value is a policy document is deleted by writing an EMPTY value to
+/// it — the way AWS documents removing one ("To delete a filter policy, set the
+/// `FilterPolicy` attribute to an empty value", SNS Developer Guide) — so an empty value
+/// asks for a record that holds no such policy rather than naming a document that failed
+/// to parse. The record then reports what it reports for a policy it was never given.
+///
+/// Shared by every operation that writes an attribute of either record kind, so a policy
+/// is removed the same way whichever call carried the write.
+pub fn clears_attribute(name: &str, value: &str) -> bool {
+    value.is_empty() && POLICY_DOCUMENT_ATTRIBUTES.contains(&name)
 }
 
 /// The sentence SNS refuses a `FilterPolicyScope` outside its value set with: the
@@ -1296,6 +1474,29 @@ pub fn subscription_attribute_protocol_refusal(
              {feature}."
         )
     })
+}
+
+/// The sentence SNS refuses a `ReplayPolicy` on a subscription whose topic archives
+/// nothing with: a replay reads messages back out of the topic's message archive, so
+/// there is no window to replay until the topic holds an [`ARCHIVE_POLICY_ATTRIBUTE`].
+pub const REPLAY_WITHOUT_ARCHIVE_REFUSAL: &str =
+    "Invalid parameter: Attributes Reason: ReplayPolicy: Topic ArchivePolicy attribute \
+     is missing";
+
+/// The WHOLE `InvalidParameter` message SNS refuses a subscription attribute with when
+/// the TOPIC the subscription belongs to gives it nothing to govern, or `None` when the
+/// topic accepts it.
+///
+/// A `ReplayPolicy` names a window of the topic's message archive to redeliver from
+/// (`SubscribeInput$Attributes` doc), so it can only be set where that archive exists: a
+/// topic with no archive policy archives nothing. Shared by every operation that writes a
+/// subscription attribute, so the rule does not depend on which call carried the write.
+pub fn subscription_attribute_topic_refusal(
+    name: &str,
+    topic: Option<&TopicRecord>,
+) -> Option<String> {
+    (name == REPLAY_POLICY_ATTRIBUTE && topic.is_none_or(|topic| !topic.is_archiving()))
+        .then(|| REPLAY_WITHOUT_ARCHIVE_REFUSAL.to_string())
 }
 
 /// The form a subscription attribute is STORED in: what the caller wrote, in the shape
@@ -1836,6 +2037,76 @@ impl PublishedMessage {
 }
 
 // =============================================================================
+// FIFO deduplication
+// =============================================================================
+
+/// How long one accepted deduplication id keeps collapsing its duplicates: "a token used
+/// for deduplication of sent messages within the 5 minute minimum deduplication interval"
+/// (`PublishInput$MessageDeduplicationId` doc).
+pub const DEDUPLICATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The topic attribute that decides how WIDE a FIFO topic's deduplication scope is
+/// (`CreateTopicInput$Attributes` doc).
+pub const FIFO_THROUGHPUT_SCOPE_ATTRIBUTE: &str = "FifoThroughputScope";
+
+/// The throughput scope that deduplicates within ONE message group rather than across the
+/// topic: "MessageGroup – The scope of deduplication is within each individual message
+/// group" (`CreateTopicInput$Attributes` doc). The other value, `Topic`, "is the default
+/// value", so a topic whose owner set no scope deduplicates across the whole topic.
+pub const FIFO_THROUGHPUT_SCOPE_MESSAGE_GROUP: &str = "MessageGroup";
+
+/// How many live deduplication records the store retains.
+///
+/// The records are the emulator's own memory of what each scope accepted, and a caller
+/// can mint one per publish, so the set is bounded like every other caller-grown store
+/// here: the oldest record is evicted when a new one would cross this count, rather than
+/// the publish being refused — a publish AWS accepts is not one this emulator rejects.
+/// An evicted record stops collapsing its duplicates, which is why the count is far above
+/// the number of distinct ids any one caller sends inside one
+/// [`DEDUPLICATION_INTERVAL`].
+pub const MAX_DEDUPLICATION_RECORDS: usize = 10_000;
+
+/// What one accepted publish left behind for its duplicates to answer with: the message
+/// id and sequence number SNS minted for the FIRST copy, and when that copy was accepted.
+#[derive(Debug, Clone)]
+pub struct DeduplicationRecord {
+    pub message_id: String,
+    pub sequence_number: Option<String>,
+    pub accepted_at: SystemTime,
+}
+
+/// The key one publish deduplicates under: the topic, the scope the topic deduplicates
+/// in, and the message's deduplication id.
+///
+/// "The scope of deduplication depends on the FifoThroughputScope attribute, when set to
+/// Topic the message deduplication scope is across the entire topic, when set to
+/// MessageGroup the message deduplication scope is within each individual message group"
+/// (`PublishInput$MessageDeduplicationId` doc).
+///
+/// Shared by every publishing operation, because a copy one of them accepted is a
+/// duplicate for the other: `PublishBatch` deduplicates "within the batch and across
+/// batches" (the `PublishBatch` doc) against the same records `Publish` writes.
+pub fn deduplication_key(
+    topic: &TopicRecord,
+    message_group_id: Option<&str>,
+    deduplication_id: &str,
+) -> String {
+    let per_group = topic
+        .attributes
+        .get(FIFO_THROUGHPUT_SCOPE_ATTRIBUTE)
+        .is_some_and(|scope| scope == FIFO_THROUGHPUT_SCOPE_MESSAGE_GROUP);
+    let group = if per_group {
+        message_group_id.unwrap_or_default()
+    } else {
+        ""
+    };
+    // The separator is a character neither an ARN nor an ordering id may carry (an
+    // ordering id is alphanumerics and punctuation), so two different triples cannot
+    // spell one key.
+    format!("{}\n{group}\n{deduplication_id}", topic.arn)
+}
+
+// =============================================================================
 // The SMS sandbox
 // =============================================================================
 
@@ -2238,6 +2509,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     delivery_order: VecDeque<String>,
     /// The payload bytes currently retained in `delivered`.
     retained_delivery_bytes: usize,
+    /// What each FIFO deduplication scope has accepted, keyed by
+    /// [`deduplication_key`]: the message a duplicate publish answers with instead of
+    /// being delivered again. Bounded at [`MAX_DEDUPLICATION_RECORDS`] live records, and
+    /// written through [`Self::remember_deduplication`], never by hand.
+    deduplication: HashMap<String, DeduplicationRecord>,
     /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns.
     pub sequence_counter: u64,
     /// Backs [`Self::next_unique_id`]: the monotone part of every minted id.
@@ -2489,6 +2765,67 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// The payload bytes the delivery log currently retains, for a test or a diagnostic.
     pub fn retained_delivery_bytes(&self) -> usize {
         self.retained_delivery_bytes
+    }
+
+    /// The message an earlier publish under this deduplication key was accepted as, or
+    /// `None` when the key names no message inside the deduplication interval.
+    ///
+    /// "If a message with a particular MessageDeduplicationId is sent successfully,
+    /// subsequent messages within the deduplication scope and interval, with the same
+    /// MessageDeduplicationId, are accepted successfully but aren't delivered"
+    /// (`PublishInput$MessageDeduplicationId` doc) — so a caller that retries a publish
+    /// is answered with the id and sequence number of the copy that WAS delivered.
+    ///
+    /// Forgetting the records the interval has run out on is the only write a lookup
+    /// performs, and it is one the clock already owed: a record is dead
+    /// [`DEDUPLICATION_INTERVAL`] after the publish that wrote it, whether or not anyone
+    /// looks.
+    pub fn deduplicated_publish(&mut self, key: &str) -> Option<DeduplicationRecord> {
+        self.expire_deduplication();
+        self.deduplication.get(key).cloned()
+    }
+
+    /// Remember that this deduplication key was accepted as `message_id`, so the copies
+    /// that follow it inside the interval answer with that message rather than being
+    /// delivered again. The ONLY way to write `deduplication`: writing the map directly
+    /// loses the bound.
+    pub fn remember_deduplication(
+        &mut self,
+        key: String,
+        message_id: &str,
+        sequence_number: Option<&str>,
+    ) {
+        self.expire_deduplication();
+        self.deduplication.insert(
+            key,
+            DeduplicationRecord {
+                message_id: message_id.to_string(),
+                sequence_number: sequence_number.map(str::to_string),
+                accepted_at: SystemTime::now(),
+            },
+        );
+        // The oldest record is the first to stop collapsing duplicates, which is the
+        // least a bounded memory can cost: it is the one closest to expiring anyway.
+        while self.deduplication.len() > MAX_DEDUPLICATION_RECORDS {
+            let Some(oldest) = self
+                .deduplication
+                .iter()
+                .min_by_key(|(_, held)| held.accepted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.deduplication.remove(&oldest);
+        }
+    }
+
+    /// Forget every deduplication record whose [`DEDUPLICATION_INTERVAL`] has run out:
+    /// the id is free again, so the next publish carrying it is a new message.
+    fn expire_deduplication(&mut self) {
+        let now = SystemTime::now();
+        self.deduplication.retain(|_, held| {
+            now.duration_since(held.accepted_at).unwrap_or_default() < DEDUPLICATION_INTERVAL
+        });
     }
 }
 

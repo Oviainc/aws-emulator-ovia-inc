@@ -19,6 +19,8 @@ mod child_listing_absent_parent_walk;
 mod child_listing_cursor_scope;
 #[path = "all/child_listing_error_set.rs"]
 mod child_listing_error_set;
+#[path = "all/deleted_workflow_run_cleanup.rs"]
+mod deleted_workflow_run_cleanup;
 #[path = "all/list_page_size.rs"]
 mod list_page_size;
 #[path = "all/missing_resource_lookups.rs"]

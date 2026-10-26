@@ -194,8 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string(),
             ));
         }
+        // A policy-valued attribute is REMOVED by an empty value, so such a request
+        // clears the attribute rather than naming a document that failed to parse.
+        let requested = input
+            .attribute_value
+            .filter(|value| !state::clears_attribute(&input.attribute_name, value));
+
         // And each attribute accepts only the values SNS documents for it.
-        if let Some(value) = input.attribute_value.as_deref() {
+        if let Some(value) = requested.as_deref() {
             if let Some(message) =
                 state::subscription_attribute_refusal(&input.attribute_name, value)
             {
@@ -213,6 +219,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = store.lock();
 
+        // An attribute the TOPIC gives nothing to govern is refused — a replay of a topic
+        // that archives nothing — under the rule every write of a subscription attribute
+        // shares. A subscription that is not here at all falls through to the
+        // `NotFound` below.
+        if requested.is_some() {
+            let topic_arn = store
+                .subscriptions
+                .get(&input.subscription_arn)
+                .map(|held| held.topic_arn.clone());
+            if let Some(topic_arn) = topic_arn {
+                if let Some(message) = state::subscription_attribute_topic_refusal(
+                    &input.attribute_name,
+                    store.topics.get(&topic_arn),
+                ) {
+                    return Err(invalid_parameter(message));
+                }
+            }
+        }
+
         let Some(subscription) = store.subscriptions.get_mut(&input.subscription_arn) else {
             return Err(SetSubscriptionAttributesErrorModeled::NotFoundException(
                 NotFoundException {
@@ -225,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An attribute SNS documents for certain delivery protocols alone is refused on
         // a subscription of any other: this one's protocol is what decides it. The
         // refusal states SNS's own sentence whole, so it is not framed here.
-        if let Some(value) = input.attribute_value.as_deref() {
+        if let Some(value) = requested.as_deref() {
             if let Some(message) = state::subscription_attribute_protocol_refusal(
                 &input.attribute_name,
                 value,
@@ -237,8 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What SNS holds is the MEANING of the value, in the form it reports back, so
         // every rule below judges — and the record then takes — the canonical form.
-        let stored = input
-            .attribute_value
+        let stored = requested
             .as_deref()
             .map(|value| state::stored_subscription_attribute_value(&input.attribute_name, value));
 

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers the data records the iterator's position names in one shard of one
+//! stream, read from the stored shard, with the iterator a reader continues from and how
+//! far behind the tip of the shard the page is. This is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetRecords::handle`] with real behaviour and
@@ -206,6 +207,62 @@ pub struct GetRecords<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> GetRecordsError {
+    GetRecordsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a resource this account and region do not hold: "The requested
+/// resource could not be found. The stream might not be specified correctly."
+fn not_found(message: String) -> GetRecordsError {
+    GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Where in the retained records of the shard the iterator's position starts, as an index
+/// into `retained`; the index one past the newest record when the position names nothing
+/// the shard holds yet, which is an empty page rather than a refusal ("If there are no
+/// records available in the portion of the shard that the iterator points to, GetRecords
+/// returns an empty list").
+fn start_index(
+    position: &crate::state::ShardPosition,
+    retained: &[&crate::state::DataRecord],
+) -> usize {
+    let after_the_newest = retained.len();
+    match position {
+        // "the last untrimmed record in the shard in the system, which is the oldest data
+        // record in the shard" — the first record still inside the retention window.
+        crate::state::ShardPosition::TrimHorizon => 0,
+        // "just after the most recent record in the shard", pinned when the iterator was
+        // issued: `GetShardIterator` carries this position only for a shard that held NO
+        // record then (a shard that held one is pinned to it by sequence number), so every
+        // record the shard holds now arrived after that instant and all of them are read.
+        crate::state::ShardPosition::Latest => 0,
+        crate::state::ShardPosition::AtSequenceNumber(sequence_number) => retained
+            .iter()
+            .position(|record| {
+                crate::state::sequence_number_le(sequence_number, &record.sequence_number)
+            })
+            .unwrap_or(after_the_newest),
+        crate::state::ShardPosition::AfterSequenceNumber(sequence_number) => retained
+            .iter()
+            .position(|record| {
+                !crate::state::sequence_number_le(&record.sequence_number, sequence_number)
+            })
+            .unwrap_or(after_the_newest),
+        crate::state::ShardPosition::AtTimestamp(millis) => retained
+            .iter()
+            .position(|record| crate::state::epoch_millis(record.arrived_at) >= *millis)
+            .unwrap_or(after_the_newest),
+    }
+}
+
 impl<Eng> GetRecords<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -232,18 +289,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecords"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRecordsError::from(GetRecordsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        // Reading records changes nothing a later caller sees: every part of the position
+        // travels inside the iterator, so the guard below is only ever read through.
+        let store = state.lock();
+
+        // "Specify a shard iterator using the ShardIterator parameter. The shard iterator
+        // specifies the position in the shard from which you want to start reading data
+        // records sequentially": a string this service never issued names no position.
+        let Some(token) = crate::state::ShardIteratorToken::decode(&input.shard_iterator) else {
+            return Err(invalid_argument(
+                crate::state::INVALID_SHARD_ITERATOR_MESSAGE.to_string(),
+            ));
+        };
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no stream.
+        let stream = store
+            .stream_by_arn(&region, &token.stream_arn)
+            .filter(|stream| token.names(stream))
+            .ok_or_else(|| not_found(crate::state::stream_not_found_message(&token.stream_arn)))?;
+        // The iterator already names the stream, so a `StreamARN` beside it has to name the
+        // same one rather than silently reading another stream's shard.
+        if let Some(stream_arn) = input.stream_arn.as_deref() {
+            if stream_arn != stream.arn {
+                return Err(invalid_argument(
+                    crate::state::ITERATOR_STREAM_MISMATCH_MESSAGE.to_string(),
+                ));
+            }
+        }
+        // "A shard iterator expires 5 minutes after it is returned to the requester"
+        // (`GetShardIterator`), which is the error this operation models for one past its
+        // age: "The provided iterator exceeds the maximum age allowed."
+        if token.is_expired(now) {
+            return Err(GetRecordsErrorModeled::ExpiredIteratorException(
+                ExpiredIteratorException {
+                    message: Some(crate::state::iterator_expired_message(
+                        token.issued_at_millis,
+                        crate::state::epoch_millis(now),
+                    )),
+                },
+            )
+            .into());
+        }
+        let Some(shard) = stream
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == token.shard_id)
+        else {
+            return Err(not_found(crate::state::shard_not_found_message(
+                &token.shard_id,
+                &stream.name,
+            )));
+        };
+
+        // "Checks if your request will succeed. DryRun is an optional parameter"
+        // (`GetRecordsInput$DryRun`): the request is judged in full above and then refused
+        // with the error the model declares for it, so a dry run reads no record.
+        if input.dry_run.unwrap_or(false) {
+            return Err(GetRecordsErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The maximum number of records to return... The default value is 10,000"
+        // (`GetRecordsInput$Limit`), and "the maximum number of records that can be
+        // returned per call is 10,000" (`GetRecords`). The modelled `range 1..10000` is
+        // refused before this handler runs; the clamp states the same ceiling for a caller
+        // that reaches it another way.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::DEFAULT_GET_RECORDS_LIMIT)
+                .clamp(1, crate::state::MAX_GET_RECORDS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        // A record outside the stream's retention window is trimmed, so it is not among
+        // the records any position of this shard reads.
+        let retained: Vec<&crate::state::DataRecord> =
+            shard.retained(stream.trim_horizon(now)).collect();
+        let start = start_index(&token.position, &retained);
+
+        // "The maximum size of data that GetRecords can return is 10 MiB" (`GetRecords`),
+        // so a page stops at that size — but never short of its first record, which a
+        // caller would otherwise be unable to read at all.
+        let mut records: Vec<Record> = Vec::new();
+        let mut page_bytes = 0usize;
+        for record in retained.iter().skip(start) {
+            if records.len() >= limit {
+                break;
+            }
+            // The page is measured by the DATA it answers with, which is what "the maximum
+            // size of data that GetRecords can return is 10 MiB" bounds; a record's
+            // partition key counts towards what the store holds and what a write may carry,
+            // not towards what a read returns.
+            let with_record = page_bytes.saturating_add(record.data.len());
+            if !records.is_empty() && with_record > crate::state::MAX_GET_RECORDS_BYTES {
+                break;
+            }
+            page_bytes = with_record;
+            records.push(record.to_shape());
+        }
+        // Everything up to here is what the reader has now seen: the records it was handed
+        // and, for a position that skipped past older ones, those too.
+        let seen = start.saturating_add(records.len());
+
+        // "A new shard iterator is returned by every GetRecords request in
+        // NextShardIterator, which you use in the ShardIterator parameter of the next
+        // GetRecords request" — positioned after the newest record this reader has seen, or
+        // at the position it started from when the shard held nothing to read there. "If
+        // the shard has been closed, the shard iterator can't return more data and
+        // GetRecords returns null in NextShardIterator."
+        let drained = seen == retained.len();
+        // The newest record this reader has seen, if it has seen any.
+        let last_seen = seen.checked_sub(1).and_then(|index| retained.get(index));
+        let next_shard_iterator = (shard.is_open() || !drained).then(|| {
+            let position = match last_seen {
+                Some(record) => {
+                    crate::state::ShardPosition::AfterSequenceNumber(record.sequence_number.clone())
+                }
+                None => token.position.clone(),
+            };
+            crate::state::ShardIteratorToken::new(stream, &shard.shard_id, position, now).encode()
+        });
+
+        // "The number of milliseconds the GetRecords response is from the tip of the
+        // stream, indicating how far behind current time the consumer is. A value of zero
+        // indicates that record processing is caught up, and there are no new records to
+        // process at this moment": a reader that has drained the shard is caught up, so its
+        // lag is zero however long ago the last record arrived; a reader with records still
+        // ahead of it is behind by how long ago the newest record it HAS seen arrived — the
+        // age of the newest data it holds, measured against the clock rather than against
+        // the tip's own instant, which is what "behind current time" names. (Measuring from
+        // the first record it has NOT seen would answer almost the same number and would
+        // report a lag for a reader that is caught up with everything retained.)
+        let millis_behind_latest = if drained {
+            0
+        } else {
+            let behind_from = last_seen
+                .or_else(|| retained.first())
+                .map(|record| {
+                    crate::state::epoch_millis(now)
+                        .saturating_sub(crate::state::epoch_millis(record.arrived_at))
+                })
+                .unwrap_or_default();
+            i64::try_from(behind_from).unwrap_or(i64::MAX)
+        };
+
+        Ok(GetRecordsOutput {
+            records,
+            next_shard_iterator,
+            millis_behind_latest: Some(millis_behind_latest),
+            // "The list of the current shard's child shards, returned in the GetRecords
+            // API's response only when the end of the current shard is reached": a shard is
+            // closed by a reshard, and nothing in this emulator closes one yet, so no page
+            // ever reaches the end of a closed shard's records.
+            child_shards: None,
+        })
     }
 }

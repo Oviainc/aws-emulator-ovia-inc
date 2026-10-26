@@ -176,6 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let ingestions = bundle.ingestions_in_order();
+        // Every summary is read AS OF ONE INSTANT, so a page cannot report two
+        // ingestions as of two different clocks: a disable the clock already owes
+        // one of them shows in its summary, and this reporting call writes nothing.
+        let now = ::std::time::SystemTime::now();
         // The token is scoped to THIS bundle's ingestions, so one bundle's token
         // is not read as a position in another's listing.
         let listing = crate::state::ingestion_listing(&bundle.id);
@@ -183,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &ingestions,
             &listing,
             |ingestion| ingestion.sequence,
-            crate::state::IngestionRecord::to_summary,
+            |ingestion: &crate::state::IngestionRecord| ingestion.to_summary(now),
             input.max_results,
             input.next_token.as_deref(),
         )

@@ -326,14 +326,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        store
-            .tags_by_arn
-            .insert(record.arn.clone(), record.tags.clone());
+        let arn = record.arn.clone();
         let output = PutResourceSetOutput {
             resource_set: record.resource_set(),
             resource_set_arn: record.arn.clone(),
         };
         store.resource_sets.insert(record.id.clone(), record);
+        // The ARN-keyed tag index is maintained from the record just written, by
+        // the store's single index writer.
+        store.refresh_tag_index(&arn);
         Ok(output)
     }
 }

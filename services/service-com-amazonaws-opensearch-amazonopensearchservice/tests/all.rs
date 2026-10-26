@@ -51,6 +51,8 @@ mod instance_type_limits;
 mod package_association_listings;
 #[path = "all/package_associations.rs"]
 mod package_associations;
+#[path = "all/package_listing_page_bounds.rs"]
+mod package_listing_page_bounds;
 #[path = "all/package_registry.rs"]
 mod package_registry;
 #[path = "all/package_scope.rs"]
