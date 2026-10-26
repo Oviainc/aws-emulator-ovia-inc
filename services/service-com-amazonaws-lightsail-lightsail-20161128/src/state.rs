@@ -13712,7 +13712,9 @@ pub fn tags_merged_with(record: &dyn TaggedRecord, added: &[Tag]) -> Vec<Tag> {
 /// accepted; each add-on is stored enabled, carrying the parameters its own
 /// request structure supplies. An `AutoSnapshot` request that names no
 /// `snapshotTimeOfDay` gets the hour Lightsail would pick for it, drawn here from
-/// the resource's own name so the answer is the same on every later read.
+/// the resource's own name so the answer is the same on every later read, and one
+/// that DOES name a time is held to the hourly increment its documentation
+/// requires (`is_hourly_time_of_day`) before it is stored.
 ///
 /// `member` is where the caller's request carries them, so every refusal below
 /// names a member of the request that was actually sent.
@@ -13731,18 +13733,35 @@ pub fn add_ons_from_requests(
     requests
         .iter()
         .map(|request| match request.add_on_type.as_str() {
-            "AutoSnapshot" => Ok(AddOn {
-                name: Some(ADD_ON_TYPE_AUTO_SNAPSHOT.to_string()),
-                status: Some(ADD_ON_STATUS_ENABLED.to_string()),
-                snapshot_time_of_day: Some(
-                    request
-                        .auto_snapshot_add_on_request
-                        .as_ref()
-                        .and_then(|auto| auto.snapshot_time_of_day.clone())
-                        .unwrap_or_else(|| default_snapshot_time_of_day(resource_name)),
-                ),
-                ..Default::default()
-            }),
+            "AutoSnapshot" => {
+                // The daily hour the caller asked for, if any. The modelled
+                // pattern admits every wall-clock minute, so the half of the
+                // constraint only the documentation states — the time is an
+                // hourly increment — is applied here, before the add-on is
+                // built: an hour this service would never run a snapshot at is
+                // refused rather than stored and reported back as the schedule.
+                let named = request
+                    .auto_snapshot_add_on_request
+                    .as_ref()
+                    .and_then(|auto| auto.snapshot_time_of_day.clone());
+                if let Some(time_of_day) = &named {
+                    if !is_hourly_time_of_day(time_of_day) {
+                        return Err(format!(
+                            "{}.autoSnapshotAddOnRequest.snapshotTimeOfDay '{time_of_day}' \
+                             must be in HH:00 format, and in an hourly increment",
+                            member.entry
+                        ));
+                    }
+                }
+                Ok(AddOn {
+                    name: Some(ADD_ON_TYPE_AUTO_SNAPSHOT.to_string()),
+                    status: Some(ADD_ON_STATUS_ENABLED.to_string()),
+                    snapshot_time_of_day: Some(
+                        named.unwrap_or_else(|| default_snapshot_time_of_day(resource_name)),
+                    ),
+                    ..Default::default()
+                })
+            }
             "StopInstanceOnIdle" => Ok(AddOn {
                 name: Some("StopInstanceOnIdle".to_string()),
                 status: Some(ADD_ON_STATUS_ENABLED.to_string()),
@@ -13814,7 +13833,10 @@ const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// instant still ahead of `after_ms`. An hour that is not that form (nothing
 /// this store writes) is read as the start of the day.
 fn next_auto_snapshot_due_ms(after_ms: i64, hour: &str) -> i64 {
-    let into_day_ms = minutes_of_day(hour).unwrap_or(0).saturating_mul(60_000);
+    // The one `hh24:mi` parser this module has, so the hour an automatic
+    // snapshot is scheduled at and the window members of a relational database
+    // are read the same way.
+    let into_day_ms = minute_of_day(hour).unwrap_or(0).saturating_mul(60_000);
     let day_start_ms = after_ms.div_euclid(MILLIS_PER_DAY).saturating_mul(MILLIS_PER_DAY);
     let at_ms = day_start_ms.saturating_add(into_day_ms);
     if at_ms > after_ms {
@@ -13822,14 +13844,6 @@ fn next_auto_snapshot_due_ms(after_ms: i64, hour: &str) -> i64 {
     } else {
         at_ms.saturating_add(MILLIS_PER_DAY)
     }
-}
-
-/// How many minutes into the day the `HH:MM` time of day `value` names, and
-/// `None` when it is not that form — which the modelled `TimeOfDay` pattern
-/// `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$` every stored hour satisfies.
-fn minutes_of_day(value: &str) -> Option<i64> {
-    let (hours, minutes) = value.split_once(':')?;
-    Some(hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?)
 }
 
 /// The add-ons `requests` enable on a DISK, or a refusal naming the member that
@@ -13875,6 +13889,25 @@ pub fn is_auto_snapshot_date(value: &str) -> bool {
         && [0, 1, 2, 3, 5, 6, 8, 9]
             .iter()
             .all(|index| bytes[*index].is_ascii_digit())
+}
+
+/// Whether `value` is a daily automatic-snapshot hour an `AutoSnapshot` add-on
+/// can be scheduled at.
+///
+/// `AutoSnapshotAddOnRequest$snapshotTimeOfDay` and the `AddOn` members that
+/// report it target the modelled `TimeOfDay` pattern
+/// `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$`, which admits any wall-clock minute of
+/// the day; their documentation narrows it to a value that "Must be in `HH:00`
+/// format, and in an hourly increment". That narrowing is prose the
+/// modelled-constraint walk cannot express, so — exactly as for
+/// [`is_auto_snapshot_date`] — it is enforced here: an hourly increment is a
+/// minute of the day that is a whole number of hours into it, which is also the
+/// only form this store ever writes. The time itself is read by the one
+/// `hh24:mi` parser this module has ([`minute_of_day`], which admits only two
+/// ASCII digits per component and bounds both), so the answer does not depend on
+/// the modelled pattern having been walked first.
+fn is_hourly_time_of_day(value: &str) -> bool {
+    minute_of_day(value).is_some_and(|minute| minute % 60 == 0)
 }
 
 /// The daily automatic-snapshot hour for `resource_name`, in the `HH:00` form the

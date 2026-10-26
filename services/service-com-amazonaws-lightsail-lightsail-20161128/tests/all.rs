@@ -17,6 +17,8 @@ mod account_profile;
 mod active_names;
 #[path = "all/add_on_disable.rs"]
 mod add_on_disable;
+#[path = "all/add_on_snapshot_hour.rs"]
+mod add_on_snapshot_hour;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
 #[path = "all/alarm_state_test.rs"]

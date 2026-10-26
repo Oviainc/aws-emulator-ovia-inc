@@ -172,8 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled enum and `snapshotTimeOfDay` carries the modelled `TimeOfDay`
         // pattern, so the centralized walk refused anything outside them before
         // this body ran. What is left is what the model cannot express: the name
-        // must be one of this account's add-on-carrying resources, and the
-        // add-on must be one that kind of resource can carry.
+        // must be one of this account's add-on-carrying resources, the add-on
+        // must be one that kind of resource can carry, and a snapshot time the
+        // modelled pattern admits as a wall-clock minute must still be the
+        // hourly increment the member's documentation requires.
         let name = input.resource_name;
         let request = input.add_on_request;
         let now = crate::state::now_ms();
