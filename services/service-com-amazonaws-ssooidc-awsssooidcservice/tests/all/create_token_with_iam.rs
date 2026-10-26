@@ -362,13 +362,12 @@ async fn the_refresh_grant_rotates_a_persisted_refresh_token() {
 
 /// RULE: a grant request this operation cannot resolve to something the service issued or
 /// configured is refused with the modeled error for WHY it cannot: a grant type outside
-/// the four this API serves is `UnsupportedGrantTypeException`, a grant type the named
-/// client has no configured grant for is `UnauthorizedClientException`, a member the
+/// the four this API serves is `UnsupportedGrantTypeException`, a member the
 /// grant needs that is missing or carries an unsupported value is
 /// `InvalidRequestException`, and a grant that resolves to nothing — an unknown client, an
-/// unknown token, a code or assertion this service never issued — is
-/// `InvalidGrantException`. The table varies the grant type, which member is wrong, and
-/// whether the client and the presented value are known.
+/// unknown token, a code or assertion this service never issued, or a token issued to
+/// another client — is `InvalidGrantException`. The table varies the grant type, which
+/// member is wrong, and whether the client and the presented value are known.
 #[tokio::test]
 async fn an_unresolvable_grant_is_refused_with_the_error_for_why() {
     let emulator = Emulator::new();
@@ -418,15 +417,15 @@ async fn an_unresolvable_grant_is_refused_with_the_error_for_why() {
             "invalid_grant",
         ),
         (
-            "a client configured for the device-code grant only",
+            "a client configured for the device-code grant only, presenting another\n             client's refresh token",
             json!({
                 "clientId": device_only_id,
                 "grantType": GRANT_TYPE_REFRESH_TOKEN,
                 "refreshToken": holder.refresh_token,
             }),
             400,
-            "UnauthorizedClientException",
-            "unauthorized_client",
+            "InvalidGrantException",
+            "invalid_grant",
         ),
         (
             "the refresh grant with no refreshToken",

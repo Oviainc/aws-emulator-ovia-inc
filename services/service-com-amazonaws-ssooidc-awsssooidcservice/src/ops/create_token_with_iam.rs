@@ -247,18 +247,6 @@ fn unsupported_grant_type(grant_type: &str) -> CreateTokenWithIAMError {
     .into()
 }
 
-/// `UnauthorizedClientException` (400): the grant is one this operation serves,
-/// but not one configured for the client named by `clientId`.
-fn unauthorized_client(grant_type: &str) -> CreateTokenWithIAMError {
-    CreateTokenWithIAMErrorModeled::UnauthorizedClientException(UnauthorizedClientException {
-        error: Some("unauthorized_client".to_string()),
-        error_description: Some(format!(
-            "the client has no OAuth grant configured for the {grant_type} grant"
-        )),
-    })
-    .into()
-}
-
 /// `InvalidScopeException` (400): the request asked for a scope broader than the
 /// grant being spent carries.
 fn invalid_scope(description: impl Into<String>) -> CreateTokenWithIAMError {
@@ -380,12 +368,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the clientId does not name a client with OAuth grants configured in this service",
             ));
         };
-        // `grantTypes` on the registration "is used to restrict the token granting
-        // flows available to the client", so a client restricted to other grants
-        // is not authorized for this one.
-        if !client.allows_grant(&input.grant_type) {
-            return Err(unauthorized_client(&input.grant_type));
-        }
+        // The registration's `grantTypes` is NOT an entitlement gate: it states the
+        // grants the client defined for itself, and the service does not refuse a
+        // grant for a registration that left it out — what the request presents is
+        // settled by the grant itself below.
 
         // "Through downscoping, you can use the scopes parameter to request tokens
         // with reduced permissions compared to the original client application's

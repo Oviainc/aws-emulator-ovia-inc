@@ -210,34 +210,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The pair must authenticate against a registration this service minted:
         // an unknown `clientId` or a wrong `clientSecret` is `invalid_client`.
-        let client = match store.authenticate_client(&input.client_id, &input.client_secret, now) {
-            Ok(client) => client,
-            Err(failure) => {
-                return Err(modeled(
-                    StartDeviceAuthorizationErrorModeled::InvalidClientException(
-                        InvalidClientException {
-                            error: Some("invalid_client".to_string()),
-                            error_description: Some(failure.description().to_string()),
-                        },
-                    ),
-                ))
-            }
-        };
-        // Starting the device flow is the device-code grant, so a registration
-        // that restricted its grants to others may not start one.
-        if !client.allows_grant(st::GRANT_TYPE_DEVICE_CODE) {
+        if let Err(failure) =
+            store.authenticate_client(&input.client_id, &input.client_secret, now)
+        {
             return Err(modeled(
-                StartDeviceAuthorizationErrorModeled::UnauthorizedClientException(
-                    UnauthorizedClientException {
-                        error: Some("unauthorized_client".to_string()),
-                        error_description: Some(format!(
-                            "the client is not registered for the {} grant",
-                            st::GRANT_TYPE_DEVICE_CODE
-                        )),
+                StartDeviceAuthorizationErrorModeled::InvalidClientException(
+                    InvalidClientException {
+                        error: Some("invalid_client".to_string()),
+                        error_description: Some(failure.description().to_string()),
                     },
                 ),
             ));
         }
+        // The registration's `grantTypes` is NOT an entitlement gate: it states the
+        // flows the client defined for itself, and the service does not refuse a
+        // flow for a registration that left it out — a device authorization is
+        // started for any registration that authenticates.
 
         // This authorization adds a record to the store, so refuse here — after
         // the pair authenticated — rather than grow it past its bound.

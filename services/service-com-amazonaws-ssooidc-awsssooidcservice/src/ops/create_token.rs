@@ -212,18 +212,6 @@ fn unsupported_grant_type(grant_type: &str) -> CreateTokenError {
     .into()
 }
 
-/// `UnauthorizedClientException` (400): the grant is one the service serves, but
-/// not one this registration restricted itself to.
-fn unauthorized_client(grant_type: &str) -> CreateTokenError {
-    CreateTokenErrorModeled::UnauthorizedClientException(UnauthorizedClientException {
-        error: Some("unauthorized_client".to_string()),
-        error_description: Some(format!(
-            "the client is not registered for the {grant_type} grant"
-        )),
-    })
-    .into()
-}
-
 /// `InvalidScopeException` (400): a requested scope is outside the ones the
 /// registration named.
 fn invalid_scope(scope: &str) -> CreateTokenError {
@@ -234,6 +222,82 @@ fn invalid_scope(scope: &str) -> CreateTokenError {
         )),
     })
     .into()
+}
+
+/// The persisted record the presented grant names: the grant is resolved against
+/// stored state BEFORE any client credential is read, so a grant this service never
+/// issued is an invalid grant whoever presents it.
+enum PresentedGrant {
+    /// A `deviceCode` that names a stored device authorization.
+    DeviceCode(String),
+    /// A `refreshToken` that names a stored refresh grant.
+    RefreshToken(String),
+}
+
+/// The stored grant `input` presents, or the failure the presented grant itself is.
+///
+/// This runs before the `clientId`/`clientSecret` pair is read: the grant a token
+/// request is built on is a record of this service, and whether that record exists is
+/// not a fact about the caller's credentials. A grant type the service does not serve
+/// is settled here too, so nothing further is read for a request no grant of this
+/// service could satisfy.
+fn presented_grant(
+    store: &crate::state::ComAmazonawsSsooidcAwsssooidcserviceState,
+    input: &CreateTokenInput,
+) -> Result<PresentedGrant, CreateTokenError> {
+    match input.grant_type.as_str() {
+        st::GRANT_TYPE_DEVICE_CODE => {
+            let Some(device_code) = input
+                .device_code
+                .as_deref()
+                .filter(|code| !code.is_empty())
+            else {
+                return Err(invalid_request(format!(
+                    "deviceCode is required for the {} grant",
+                    st::GRANT_TYPE_DEVICE_CODE
+                )));
+            };
+            if !store.device_auths.contains_key(device_code) {
+                return Err(invalid_grant(
+                    "the deviceCode does not name a device authorization of this service",
+                ));
+            }
+            Ok(PresentedGrant::DeviceCode(device_code.to_string()))
+        }
+        st::GRANT_TYPE_REFRESH_TOKEN => {
+            let Some(refresh_token) = input
+                .refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+            else {
+                return Err(invalid_request(format!(
+                    "refreshToken is required for the {} grant",
+                    st::GRANT_TYPE_REFRESH_TOKEN
+                )));
+            };
+            if !store.refresh_tokens.contains_key(refresh_token) {
+                return Err(invalid_grant(
+                    "the refreshToken does not name a refresh grant of this service",
+                ));
+            }
+            Ok(PresentedGrant::RefreshToken(refresh_token.to_string()))
+        }
+        st::GRANT_TYPE_AUTHORIZATION_CODE => {
+            if input.code.as_deref().is_none_or(str::is_empty) {
+                return Err(invalid_request(format!(
+                    "code is required for the {} grant",
+                    st::GRANT_TYPE_AUTHORIZATION_CODE
+                )));
+            }
+            // An authorization code is minted at the authorization endpoint, which
+            // this API does not serve, so no code presented here was ever issued by
+            // this service.
+            Err(invalid_grant(
+                "the authorization code does not name an authorization of this service",
+            ))
+        }
+        other => Err(unsupported_grant_type(other)),
+    }
 }
 
 /// The `CreateToken` operation.
@@ -294,7 +358,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that its credentials are wrong rather than anything about capacity.
         store.purge_expired_tokens(now);
 
-        // Every grant is presented by an authenticated client: "Creates and
+        // The grant the request is built on is settled first, against this
+        // service's own records; only then is the caller's credential read.
+        let grant = presented_grant(&store, &input)?;
+
+        // Every grant is then presented by an authenticated client: "Creates and
         // returns access and refresh tokens for clients that are authenticated
         // using client secrets." The registration is cloned so the checks below
         // read it without holding a borrow of the store they also write to.
@@ -302,15 +370,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(client) => client.clone(),
             Err(failure) => return Err(invalid_client(failure)),
         };
-
-        if !st::SUPPORTED_GRANT_TYPES.contains(&input.grant_type.as_str()) {
-            return Err(unsupported_grant_type(&input.grant_type));
-        }
-        // `grantTypes` on the registration "is used to restrict the token granting
-        // flows available to the client".
-        if !client.allows_grant(&input.grant_type) {
-            return Err(unauthorized_client(&input.grant_type));
-        }
 
         // `scopes` on the registration "is used to restrict permissions when
         // granting an access token", so a requested scope outside them is refused
@@ -325,18 +384,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A client may only be handed a refresh token for a grant it registered.
         let with_refresh_token = client.allows_grant(st::GRANT_TYPE_REFRESH_TOKEN);
 
-        let token = match input.grant_type.as_str() {
-            st::GRANT_TYPE_DEVICE_CODE => {
-                let Some(device_code) = input
-                    .device_code
-                    .as_deref()
-                    .filter(|code| !code.is_empty())
-                else {
-                    return Err(invalid_request(format!(
-                        "deviceCode is required for the {} grant",
-                        st::GRANT_TYPE_DEVICE_CODE
-                    )));
-                };
+        let token = match &grant {
+            PresentedGrant::DeviceCode(device_code) => {
+                let device_code = device_code.as_str();
 
                 // Resolve the persisted authorization and answer from its status.
                 // The borrow ends with this block, so the token can be minted into
@@ -439,17 +489,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 token
             }
-            st::GRANT_TYPE_REFRESH_TOKEN => {
-                let Some(refresh_token) = input
-                    .refresh_token
-                    .as_deref()
-                    .filter(|token| !token.is_empty())
-                else {
-                    return Err(invalid_request(format!(
-                        "refreshToken is required for the {} grant",
-                        st::GRANT_TYPE_REFRESH_TOKEN
-                    )));
-                };
+            PresentedGrant::RefreshToken(refresh_token) => {
+                let refresh_token = refresh_token.as_str();
                 let narrowed = (!requested_scopes.is_empty()).then_some(requested_scopes);
                 match store.rotate_refresh_token(
                     refresh_token,
@@ -490,21 +531,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             }
-            st::GRANT_TYPE_AUTHORIZATION_CODE => {
-                if input.code.as_deref().is_none_or(str::is_empty) {
-                    return Err(invalid_request(format!(
-                        "code is required for the {} grant",
-                        st::GRANT_TYPE_AUTHORIZATION_CODE
-                    )));
-                }
-                // An authorization code is minted at the authorization endpoint,
-                // which this API does not serve, so no code presented here was
-                // ever issued by this service.
-                return Err(invalid_grant(
-                    "the authorization code does not name an authorization of this service",
-                ));
-            }
-            other => return Err(unsupported_grant_type(other)),
         };
 
         Ok(CreateTokenOutput {

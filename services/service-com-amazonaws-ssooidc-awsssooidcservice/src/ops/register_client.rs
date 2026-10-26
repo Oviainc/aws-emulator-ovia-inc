@@ -243,48 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Registration RECORDS the rest of the client metadata as it is given. The
+        // service refuses only what it states a rule for — the client type, and a
+        // grant type it does not serve — and not the FORM of a value it merely
+        // stores and hands back: a redirect URI, an issuer URL and a scope are
+        // kept verbatim for the authorization endpoint that will read them, so a
+        // registration is not refused for a URI or a scope the service itself
+        // never has to resolve.
         let redirect_uris = input.redirect_uris.clone().unwrap_or_default();
-        if let Some(invalid) = redirect_uris
-            .iter()
-            .find(|uri| !st::is_absolute_uri(uri.as_str()))
-        {
-            return Err(modeled(
-                RegisterClientErrorModeled::InvalidRedirectUriException(
-                    InvalidRedirectUriException {
-                        error: Some("invalid_redirect_uri".to_string()),
-                        error_description: Some(format!(
-                            "redirectUris entry '{invalid}' is not an absolute URI"
-                        )),
-                    },
-                ),
-            ));
-        }
-
         let scopes = input.scopes.clone().unwrap_or_default();
-        if let Some(invalid) = scopes.iter().find(|scope| !st::is_scope_token(scope)) {
-            return Err(modeled(RegisterClientErrorModeled::InvalidScopeException(
-                InvalidScopeException {
-                    error: Some("invalid_scope".to_string()),
-                    error_description: Some(format!(
-                        "scopes entry '{invalid}' is not a scope token: a scope is non-empty and carries no whitespace"
-                    )),
-                },
-            )));
-        }
-
-        if let Some(issuer_url) = input.issuer_url.as_deref() {
-            if !st::is_absolute_uri(issuer_url) {
-                return Err(modeled(
-                    RegisterClientErrorModeled::InvalidRequestException(InvalidRequestException {
-                        error: Some("invalid_request".to_string()),
-                        reason: None,
-                        error_description: Some(format!(
-                            "issuerUrl '{issuer_url}' is not an absolute URI"
-                        )),
-                    }),
-                ));
-            }
-        }
 
         let now = SystemTime::now();
         let client_id_issued_at = st::epoch_seconds(now);

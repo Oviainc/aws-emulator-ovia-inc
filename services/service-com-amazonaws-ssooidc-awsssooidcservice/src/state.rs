@@ -695,13 +695,6 @@ pub fn is_absolute_uri(value: &str) -> bool {
         .is_ok_and(|uri| uri.scheme().is_some() && uri.authority().is_some())
 }
 
-/// Whether `value` is a single OAuth 2.0 scope token: scopes travel
-/// space-delimited (RFC 6749 §3.3), so a scope is non-empty and carries no
-/// whitespace.
-pub fn is_scope_token(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(char::is_whitespace)
-}
-
 /// The device-verification page IAM Identity Center sends a device-flow client
 /// to, for `region`.
 pub fn verification_uri(region: &str) -> String {

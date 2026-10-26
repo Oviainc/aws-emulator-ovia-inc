@@ -56,6 +56,18 @@ impl Emulator {
             .header("authorization", authorization)
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request builds");
+        self.send(request).await
+    }
+
+    /// Dispatch `request` through the router and return the status and the parsed JSON
+    /// body.
+    ///
+    /// The ONE place a request reaches the emulator in this crate's suites, so the
+    /// routing suite beside this file can drive a request of its own shape — unsigned, or
+    /// addressed to a host that names no service — through exactly the path every case
+    /// here uses.
+    pub(crate) async fn send(&self, request: http::Request<bytes::Bytes>) -> (u16, Value) {
+        let path = request.uri().path().to_string();
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let body = if response.body().is_empty() {
@@ -347,9 +359,8 @@ async fn register_client_mints_a_distinct_persisted_pair_for_every_registration(
 }
 
 /// RULE: RegisterClient refuses a registration whose metadata is outside what the
-/// model documents — `clientType` other than `public`, a grant type the service does
-/// not serve, a redirect or issuer URI that is not absolute, a scope that is not a
-/// scope token — each with the modeled error for that member.
+/// model documents — `clientType` other than `public`, and a grant type the service
+/// does not serve — each with the modeled error for that member.
 #[tokio::test]
 async fn register_client_refuses_metadata_outside_the_documented_rules() {
     let emulator = Emulator::new();
@@ -407,50 +418,94 @@ async fn register_client_refuses_metadata_outside_the_documented_rules() {
             "UnsupportedGrantTypeException",
             "unsupported_grant_type",
         ),
-        (
-            "a redirect URI with no scheme",
-            json!({"clientName": "demo", "clientType": "public", "redirectUris": ["/oauth/callback"]}),
-            400,
-            "InvalidRedirectUriException",
-            "invalid_redirect_uri",
-        ),
-        (
-            "a second redirect URI that is not a URI",
-            json!({
-                "clientName": "demo",
-                "clientType": "public",
-                "redirectUris": ["http://127.0.0.1:1234/cb", "not a uri at all"],
-            }),
-            400,
-            "InvalidRedirectUriException",
-            "invalid_redirect_uri",
-        ),
-        (
-            "a scope carrying whitespace",
-            json!({"clientName": "demo", "clientType": "public", "scopes": ["sso:account:access openid"]}),
-            400,
-            "InvalidScopeException",
-            "invalid_scope",
-        ),
-        (
-            "an empty scope",
-            json!({"clientName": "demo", "clientType": "public", "scopes": [""]}),
-            400,
-            "InvalidScopeException",
-            "invalid_scope",
-        ),
-        (
-            "an issuer URL that is not absolute",
-            json!({"clientName": "demo", "clientType": "public", "issuerUrl": "identitycenter"}),
-            400,
-            "InvalidRequestException",
-            "invalid_request",
-        ),
     ];
 
     for (case, body, status, shape, error) in rows {
         let (actual_status, response) = emulator.register_client(&body).await;
         assert_failure(case, actual_status, &response, status, shape, error);
+    }
+}
+
+/// RULE: RegisterClient RECORDS the client metadata it is handed and does not refuse
+/// the FORM of a value it only stores and hands back — a redirect URI, an issuer URL
+/// and a scope are kept as given, whatever they look like — so the registration is
+/// minted and authenticates afterwards. The table varies the member and the shape of
+/// the value: a relative URI, a value that is no URI at all, a scope carrying
+/// whitespace, an empty scope, and a scope no service publishes.
+#[tokio::test]
+async fn register_client_records_the_metadata_it_is_handed() {
+    let emulator = Emulator::new();
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a redirect URI with no scheme",
+            json!({"redirectUris": ["/oauth/callback"]}),
+        ),
+        (
+            "a redirect URI that is not a URI at all",
+            json!({"redirectUris": ["http://127.0.0.1:1234/cb", "not a uri at all"]}),
+        ),
+        (
+            "an issuer URL that is not absolute",
+            json!({"issuerUrl": "identitycenter"}),
+        ),
+        (
+            "a scope carrying whitespace",
+            json!({"scopes": ["sso:account:access openid"]}),
+        ),
+        ("an empty scope", json!({"scopes": [""]})),
+        (
+            "a scope no service publishes",
+            json!({"scopes": ["not-a-published-scope"]}),
+        ),
+    ];
+
+    for (case, extra) in rows {
+        let mut body = json!({"clientName": "recorded", "clientType": "public"});
+        for (member, value) in extra.as_object().cloned().unwrap_or_default() {
+            body[member] = value;
+        }
+        let (status, response) = emulator.register_client(&body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the registration to be accepted, got {status} with {response}"
+        );
+        let client_id = text(&response, "clientId");
+        let client_secret = text(&response, "clientSecret");
+
+        // The metadata is recorded as given, read back off the persisted record.
+        let stored = emulator
+            .state()
+            .lock()
+            .clients
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the registration was not persisted"));
+        for (member, value) in extra.as_object().cloned().unwrap_or_default() {
+            let recorded = match member.as_str() {
+                "redirectUris" => json!(stored.redirect_uris.clone()),
+                "scopes" => json!(stored.scopes.clone()),
+                "issuerUrl" => json!(stored.issuer_url.clone()),
+                other => panic!("case {case:?}: the table names no member {other}"),
+            };
+            assert_eq!(
+                recorded, value,
+                "case {case:?}: expected {member} recorded as {value}, got {recorded}"
+            );
+        }
+
+        // And the minted pair authenticates, so nothing about the stored metadata
+        // made the registration unusable.
+        let (status, started) = emulator
+            .start_device_authorization(&json!({
+                "clientId": client_id,
+                "clientSecret": client_secret,
+                "startUrl": START_URL,
+            }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the minted pair was refused: {started}"
+        );
     }
 }
 
@@ -732,8 +787,10 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
 }
 
 /// RULE: CreateToken answers every grant from the state the request resolves to —
-/// an unknown client, an unsupported grant, a missing member for the grant, and a
-/// grant value that resolves to nothing each get their own modeled error.
+/// the grant the request presents is resolved FIRST, so a grant value that resolves
+/// to nothing is an invalid grant whoever presents it, and only a request whose
+/// grant exists is then refused for its credentials; an unsupported grant and a
+/// missing member for the grant each get their own modeled error.
 #[tokio::test]
 async fn create_token_answers_each_grant_from_the_state_it_resolves() {
     let emulator = Emulator::new();
@@ -741,28 +798,28 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
 
     let rows: Vec<(&str, Value, u16, &str, &str)> = vec![
         (
-            "an unregistered client",
+            "an unregistered client presenting a grant nothing issued",
             json!({
                 "clientId": "never-registered",
                 "clientSecret": "whatever",
                 "grantType": GRANT_TYPE_DEVICE_CODE,
                 "deviceCode": "anything",
             }),
-            401,
-            "InvalidClientException",
-            "invalid_client",
+            400,
+            "InvalidGrantException",
+            "invalid_grant",
         ),
         (
-            "a wrong client secret",
+            "a wrong client secret with a grant nothing issued",
             json!({
                 "clientId": client_id,
                 "clientSecret": "not-the-secret",
                 "grantType": GRANT_TYPE_DEVICE_CODE,
                 "deviceCode": "anything",
             }),
-            401,
-            "InvalidClientException",
-            "invalid_client",
+            400,
+            "InvalidGrantException",
+            "invalid_grant",
         ),
         (
             "the client-credentials grant",
@@ -863,40 +920,64 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
             "InvalidGrantException",
             "invalid_grant",
         ),
-        (
-            "a scope the client did not register",
-            json!({
-                "clientId": client_id,
-                "clientSecret": client_secret,
-                "grantType": GRANT_TYPE_DEVICE_CODE,
-                "deviceCode": "anything",
-                "scope": ["sso:account:access"],
-            }),
-            400,
-            "InvalidScopeException",
-            "invalid_scope",
-        ),
     ];
 
-    // The scope row needs a client that registered a scope to be outside of.
-    let (scoped_id, scoped_secret) = emulator
-        .registered_client(json!({"scopes": ["openid"]}))
-        .await;
     for (case, body, status, shape, error) in rows {
-        let body = if case == "a scope the client did not register" {
-            json!({
-                "clientId": scoped_id,
-                "clientSecret": scoped_secret,
-                "grantType": GRANT_TYPE_DEVICE_CODE,
-                "deviceCode": "anything",
-                "scope": ["sso:account:access"],
-            })
-        } else {
-            body
-        };
         let (actual_status, response) = emulator.create_token(&body).await;
         assert_failure(case, actual_status, &response, status, shape, error);
     }
+
+    // Two refusals need a grant that EXISTS, because the grant the request presents
+    // is resolved before the credential and the requested scope are read: a stored
+    // device code presented with a wrong secret is an invalid client, and one whose
+    // request asks for a scope outside the registration is an invalid scope.
+    let (scoped_id, scoped_secret) = emulator
+        .registered_client(json!({"scopes": ["openid"]}))
+        .await;
+    let (status, started) = emulator
+        .start_device_authorization(&json!({
+            "clientId": scoped_id,
+            "clientSecret": scoped_secret,
+            "startUrl": START_URL,
+        }))
+        .await;
+    assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
+    let device_code = text(&started, "deviceCode");
+
+    let (status, refused) = emulator
+        .create_token(&json!({
+            "clientId": scoped_id,
+            "clientSecret": "not-the-secret",
+            "grantType": GRANT_TYPE_DEVICE_CODE,
+            "deviceCode": device_code,
+        }))
+        .await;
+    assert_failure(
+        "a stored device code presented with a wrong client secret",
+        status,
+        &refused,
+        401,
+        "InvalidClientException",
+        "invalid_client",
+    );
+
+    let (status, refused) = emulator
+        .create_token(&json!({
+            "clientId": scoped_id,
+            "clientSecret": scoped_secret,
+            "grantType": GRANT_TYPE_DEVICE_CODE,
+            "deviceCode": device_code,
+            "scope": ["sso:account:access"],
+        }))
+        .await;
+    assert_failure(
+        "a scope the client did not register",
+        status,
+        &refused,
+        400,
+        "InvalidScopeException",
+        "invalid_scope",
+    );
 }
 
 /// RULE: a device authorization past its `expiresIn` is an expired token, whatever
@@ -952,11 +1033,12 @@ async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
     }
 }
 
-/// RULE: `grantTypes` on the registration restricts the flows available to the
-/// client — a grant it did not register is refused, and it is handed a refresh token
-/// only when it registered the refresh-token grant.
+/// RULE: `grantTypes` on the registration is not an entitlement gate on the token
+/// endpoint — a grant the registration did not name still reaches grant lookup, and
+/// what the list decides is whether the client is handed a refresh token beside its
+/// access token.
 #[tokio::test]
-async fn a_registration_is_restricted_to_the_grants_it_named() {
+async fn a_registrations_grant_types_decide_only_whether_a_refresh_token_is_minted() {
     let emulator = Emulator::new();
 
     // Each row is a registration naming a different set of grants, with what the
@@ -1009,8 +1091,9 @@ async fn a_registration_is_restricted_to_the_grants_it_named() {
         );
 
         if !expects_refresh_token {
-            // The grant it did not register is refused as unauthorized, not as a
-            // bad request.
+            // The grant the registration did not name is NOT refused as
+            // unauthorized: the request reaches grant lookup, where a refresh
+            // token this service never issued is an invalid grant.
             let (status, refused) = emulator
                 .create_token(&json!({
                     "clientId": client_id,
@@ -1024,8 +1107,8 @@ async fn a_registration_is_restricted_to_the_grants_it_named() {
                 status,
                 &refused,
                 400,
-                "UnauthorizedClientException",
-                "unauthorized_client",
+                "InvalidGrantException",
+                "invalid_grant",
             );
         }
     }
