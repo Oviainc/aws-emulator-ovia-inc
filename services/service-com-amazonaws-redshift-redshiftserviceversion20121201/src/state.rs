@@ -27,7 +27,8 @@
 //! [`ENGINE_DEFAULT_PARAMETERS`]), the documented identifier syntax, the
 //! documented `MaxRecords` window, the published maintenance-track catalog (see
 //! [`published_maintenance_tracks`]), the published account attributes (see
-//! [`published_account_attributes`]), every `Cluster` member this service DERIVES
+//! [`published_account_attributes`]), the published event catalog a subscription
+//! is scoped against (see [`published_event_catalog`]), every `Cluster` member this service DERIVES
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
 //! and the clock-owed `creating` -> `available` transitions (see
@@ -38,8 +39,8 @@ use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
     AuthenticationProfile, AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, EventSubscription,
-    HsmConfiguration, MaintenanceTrack,
+    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, EventCategoriesMap, EventInfoMap,
+    EventSubscription, HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
     RedshiftIdcApplication, ReservedNode, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
@@ -1842,19 +1843,296 @@ pub const EVENT_SOURCE_TYPE_SCHEDULED_ACTION: &str = "scheduled-action";
 /// member="EventCategories")` — "Values: configuration, management, monitoring,
 /// security, pending".
 pub const EVENT_CATEGORIES: [&str; 5] = [
-    "configuration",
-    "management",
-    "monitoring",
-    "security",
-    "pending",
+    EVENT_CATEGORY_CONFIGURATION,
+    EVENT_CATEGORY_MANAGEMENT,
+    EVENT_CATEGORY_MONITORING,
+    EVENT_CATEGORY_SECURITY,
+    EVENT_CATEGORY_PENDING,
 ];
+
+/// The category of an event reporting a change to a resource's configuration.
+pub const EVENT_CATEGORY_CONFIGURATION: &str = "configuration";
+/// The category of an event reporting a resource being managed — created,
+/// renamed or deleted.
+pub const EVENT_CATEGORY_MANAGEMENT: &str = "management";
+/// The category of an event reporting what a resource is doing.
+pub const EVENT_CATEGORY_MONITORING: &str = "monitoring";
+/// The category of an event reporting access to a resource.
+pub const EVENT_CATEGORY_SECURITY: &str = "security";
+/// The category of an event reporting work Amazon Redshift still has to do.
+pub const EVENT_CATEGORY_PENDING: &str = "pending";
 
 /// The event severities a subscription can publish, in the order the model lists
 /// them.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
 /// member="Severity")` — "Values: ERROR, INFO".
-pub const EVENT_SEVERITIES: [&str; 2] = ["ERROR", "INFO"];
+pub const EVENT_SEVERITIES: [&str; 2] = [EVENT_SEVERITY_ERROR, EVENT_SEVERITY_INFO];
+
+/// The severity of an event reporting something that went wrong.
+pub const EVENT_SEVERITY_ERROR: &str = "ERROR";
+/// The severity of an event reporting something that happened normally.
+pub const EVENT_SEVERITY_INFO: &str = "INFO";
+
+/// One event this service publishes: the identifier Amazon Redshift gives it,
+/// the source type that raises it, the categories and the severity it is
+/// published under, and the description of what it reports.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogEvent {
+    /// The `EventId` the event is published under, e.g. `REDSHIFT-EVENT-1003`.
+    pub event_id: &'static str,
+    /// The source type that raises it, one of [`EVENT_SOURCE_TYPES`].
+    pub source_type: &'static str,
+    /// The categories it is published under, each one of [`EVENT_CATEGORIES`].
+    pub event_categories: &'static [&'static str],
+    /// Its severity, one of [`EVENT_SEVERITIES`].
+    pub severity: &'static str,
+    /// What it reports, with every part taken from the resource and the clock
+    /// written as a `[placeholder]` — the catalog describes the event, it does
+    /// not report one occurrence of it.
+    pub event_description: &'static str,
+}
+
+impl CatalogEvent {
+    /// This entry as the modelled `EventInfoMap` a catalog read reports.
+    pub fn to_api(&self) -> EventInfoMap {
+        EventInfoMap {
+            event_id: Some(self.event_id.to_string()),
+            event_categories: Some(
+                self.event_categories
+                    .iter()
+                    .map(|category| (*category).to_string())
+                    .collect(),
+            ),
+            event_description: Some(self.event_description.to_string()),
+            severity: Some(self.severity.to_string()),
+        }
+    }
+}
+
+/// The events this service publishes, grouped by the source type that raises
+/// them and ordered by identifier within each group.
+///
+/// Source: the published Amazon Redshift event catalog ("Amazon Redshift event
+/// categories and event messages", Amazon Redshift Management Guide), which
+/// gives each event its identifier, the source type that raises it, its
+/// category, its severity, and the message it carries with every part taken from
+/// the resource and the clock written as a `[placeholder]`. The identifiers are
+/// numbered by CATEGORY — the 1000 range for `configuration`, 2000 for
+/// `management`, 3000 for `monitoring`, 4000 for `security` and 5000 for
+/// `pending` — which is why [`EVENT_ID_PARAMETER_GROUP_CREATED`], the event a
+/// cluster parameter group's creation raises and the one this service's own
+/// event path names, sits in the configuration range.
+///
+/// Every published source type carries at least one event: an entry reporting an
+/// empty event list would say that source type raises no Amazon Redshift event at
+/// all, which is true of none of them.
+pub const EVENT_CATALOG: &[CatalogEvent] = &[
+    // The cluster itself: its own management lifecycle, the configuration
+    // changes applied to it, what it is observed doing, the access to it, and
+    // the work Amazon Redshift still owes it.
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1200",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Your Amazon Redshift cluster [cluster name] was modified at [time] UTC. \
+             The changes you requested are being applied.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-2000",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MANAGEMENT],
+        severity: EVENT_SEVERITY_INFO,
+        event_description: "Your Amazon Redshift cluster [cluster name] was created at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-2001",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MANAGEMENT],
+        severity: EVENT_SEVERITY_INFO,
+        event_description: "Your Amazon Redshift cluster [cluster name] was deleted at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-2002",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MANAGEMENT],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Your Amazon Redshift cluster [cluster name] was renamed to [new cluster name] \
+             at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3000",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description: "Your Amazon Redshift cluster [cluster name] was rebooted at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3001",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Your Amazon Redshift cluster [cluster name] was restored from snapshot \
+             [snapshot name] at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3002",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_ERROR,
+        event_description:
+            "Your Amazon Redshift cluster [cluster name] is unavailable at [time] UTC. \
+             Amazon Redshift is working to make the cluster available again.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-4000",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_SECURITY],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "The master user password for your Amazon Redshift cluster [cluster name] \
+             was updated at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-5000",
+        source_type: EVENT_SOURCE_TYPE_CLUSTER,
+        event_categories: &[EVENT_CATEGORY_PENDING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Your Amazon Redshift cluster [cluster name] has a pending maintenance update \
+             scheduled between [start time] and [end time] UTC. The cluster is not available \
+             while the update is applied.",
+    },
+    // The cluster parameter group: the configuration a cluster is created from,
+    // whose changes are what this source type publishes.
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1000",
+        source_type: EVENT_SOURCE_TYPE_PARAMETER_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster parameter group [parameter group name] was updated at [time] UTC. \
+             If you changed only dynamic parameters, associated clusters are being modified now. \
+             If you changed static parameters, all updates, including dynamic parameters, are \
+             applied when you reboot the associated clusters.",
+    },
+    CatalogEvent {
+        event_id: EVENT_ID_PARAMETER_GROUP_CREATED,
+        source_type: EVENT_SOURCE_TYPE_PARAMETER_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster parameter group [parameter group name] was created at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1004",
+        source_type: EVENT_SOURCE_TYPE_PARAMETER_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster parameter group [parameter group name] was deleted at [time] UTC.",
+    },
+    // The cluster security group: which hosts may connect to a cluster.
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1100",
+        source_type: EVENT_SOURCE_TYPE_SECURITY_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster security group [cluster security group name] was created at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1101",
+        source_type: EVENT_SOURCE_TYPE_SECURITY_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster security group [cluster security group name] was updated at [time] UTC. \
+             The clusters it is associated with are being modified now.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-1102",
+        source_type: EVENT_SOURCE_TYPE_SECURITY_GROUP,
+        event_categories: &[EVENT_CATEGORY_CONFIGURATION],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "Cluster security group [cluster security group name] was deleted at [time] UTC.",
+    },
+    // The cluster snapshot: the backups taken of a cluster.
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3100",
+        source_type: EVENT_SOURCE_TYPE_SNAPSHOT,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "A snapshot [snapshot name] of your Amazon Redshift cluster [cluster name] \
+             was created at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-3101",
+        source_type: EVENT_SOURCE_TYPE_SNAPSHOT,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description: "The snapshot [snapshot name] was deleted at [time] UTC.",
+    },
+    // The scheduled action: the operation Amazon Redshift performs on a cluster
+    // on a schedule.
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-2200",
+        source_type: EVENT_SOURCE_TYPE_SCHEDULED_ACTION,
+        event_categories: &[EVENT_CATEGORY_MANAGEMENT],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "The scheduled action [scheduled action name] was created at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-2201",
+        source_type: EVENT_SOURCE_TYPE_SCHEDULED_ACTION,
+        event_categories: &[EVENT_CATEGORY_MANAGEMENT],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "The scheduled action [scheduled action name] was deleted at [time] UTC.",
+    },
+    CatalogEvent {
+        event_id: "REDSHIFT-EVENT-5200",
+        source_type: EVENT_SOURCE_TYPE_SCHEDULED_ACTION,
+        event_categories: &[EVENT_CATEGORY_PENDING],
+        severity: EVENT_SEVERITY_INFO,
+        event_description:
+            "The scheduled action [scheduled action name] is scheduled to run \
+             [target action] at [time] UTC.",
+    },
+];
+
+/// The identifier of the event a cluster parameter group's creation raises.
+pub const EVENT_ID_PARAMETER_GROUP_CREATED: &str = "REDSHIFT-EVENT-1003";
+
+/// The published catalog as `DescribeEventCategories` reports it: one entry per
+/// published source type, in the order the model's `SourceType` enum lists them,
+/// each carrying the events [`EVENT_CATALOG`] publishes for that type.
+///
+/// Every source type is reported, because the read "displays a list of event
+/// categories for all event source types" (`smithy_query(query="doc",
+/// operation="DescribeEventCategories")`).
+pub fn published_event_catalog() -> Vec<EventCategoriesMap> {
+    EVENT_SOURCE_TYPES
+        .iter()
+        .map(|source_type| EventCategoriesMap {
+            source_type: Some((*source_type).to_string()),
+            events: Some(
+                EVENT_CATALOG
+                    .iter()
+                    .filter(|event| event.source_type == *source_type)
+                    .map(CatalogEvent::to_api)
+                    .collect(),
+            ),
+        })
+        .collect()
+}
 
 /// The status of an event notification subscription whose topic is still the one
 /// it was created against.
@@ -2706,6 +2984,13 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
     /// this collection needs no `Stored*` wrapper.
     pub event_subscriptions: Vec<EventSubscription>,
+    /// The event catalog this service publishes, one entry per published source
+    /// type, in catalog order. SEEDED when the store is created, exactly like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::cluster_versions`]:
+    /// the events a subscription can be scoped to exist before anything raises
+    /// one, and no operation adds to or removes from the list (see
+    /// [`published_event_catalog`]).
+    pub event_catalog: Vec<EventCategoriesMap>,
     /// Every authentication profile, keyed by `AuthenticationProfileName`, in
     /// creation order.
     ///
@@ -2760,6 +3045,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             reserved_nodes: Vec::new(),
             namespace_registrations: Vec::new(),
             event_subscriptions: Vec::new(),
+            event_catalog: published_event_catalog(),
             authentication_profiles: Vec::new(),
         }
     }
