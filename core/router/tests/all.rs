@@ -20,6 +20,11 @@
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `e…` span (where the other ecs/elbv2 suites land) are both regions concurrently
+// landing suites add their line to.
+#[path = "all/ecs_awsvpc_configuration_over_an_ec2_network.rs"]
+mod ecs_awsvpc_configuration_over_an_ec2_network;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `l…` span are both regions concurrently landing suites add their line to.
 #[path = "all/log_alarm_scheduled_query.rs"]
 mod log_alarm_scheduled_query;

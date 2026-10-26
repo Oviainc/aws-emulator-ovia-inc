@@ -319,7 +319,7 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// application
 /// ceiling it is reported with `ConflictException`, which `RegisterApplication` models,
 /// and a partition left empty is dropped
-/// ([`ComAmazonawsSsmsapSsmsapState::forget_region_if_empty`]) so only Regions that
+/// ([`ComAmazonawsSsmsapSsmsapState::settle`]) so only Regions that
 /// hold something count against it.
 pub const MAX_REGIONS: usize = 64;
 
@@ -3120,9 +3120,12 @@ impl ComAmazonawsSsmsapSsmsapState {
             region.settle(now);
         }
         // Settling a Region can empty it (the last deregistration it held completed), and
-        // a partition that holds nothing is not one this store has to keep: an absent
-        // partition and an empty one read the same ([`Self::region`]), so this is the same
-        // reclamation [`Self::forget_region_if_empty`] makes, for every Region at once.
+        // a partition that holds nothing is not one this store has to keep. This is the ONE
+        // place the store reclaims a partition: it runs for every Region on every request,
+        // so there is nothing a per-Region reclamation could add, and dropping an empty
+        // partition changes nothing a caller can observe — an absent partition and an empty
+        // one read the same ([`Self::region`]), while [`MAX_REGIONS`] then bounds only the
+        // Regions that actually hold something.
         self.regions.retain(|_, region| !region.is_empty());
     }
 
@@ -3154,16 +3157,6 @@ impl ComAmazonawsSsmsapSsmsapState {
     /// How many Region partitions the store holds, which [`MAX_REGIONS`] bounds.
     pub fn region_count(&self) -> usize {
         self.regions.len()
-    }
-
-    /// Drop `region`'s partition once nothing is left in it, so a Region that held an
-    /// application and no longer does stops counting against [`MAX_REGIONS`]. Dropping
-    /// an EMPTY partition changes nothing a caller can observe: an absent partition and
-    /// an empty one read the same ([`Self::region`]).
-    pub fn forget_region_if_empty(&mut self, region: &str) {
-        if self.regions.get(region).is_some_and(RegionState::is_empty) {
-            self.regions.remove(region);
-        }
     }
 }
 

@@ -212,10 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = match state.resolve_mut(&region, &input.key_id) {
             crate::state::KeyRefMut::Found(key) => key,
             crate::state::KeyRefMut::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRefMut::MalformedArn => {
                 return Err(invalid_arn(&input.key_id));
@@ -252,12 +249,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If no KeyMaterialId is specified, KMS deletes the current key material"
         // (that member's documentation). A `KeyMaterialId` that names no key material
-        // this key holds — neither the current version nor one a rotation retained —
-        // identifies nothing to delete, which is the modelled `NotFoundException`.
+        // this key holds — not the current version, not one a rotation retained, and not
+        // one waiting for a rotation — identifies nothing to delete, which is the modelled
+        // `NotFoundException`.
         let requested = input.key_material_id.as_deref();
         let current = key.current_key_material_id.clone();
         let names_current = requested.is_none() || requested == current.as_deref();
-        if !names_current && !key.retains_key_material(requested.unwrap_or_default()) {
+        // "Key material in PENDING_ROTATION state is not permanently associated with the
+        // KMS key. You can delete this key material and import different key material in
+        // its place"
+        // (`smithy_query(query="doc",shape="RotationsListEntry",member="KeyMaterialState")`),
+        // so it is deletable by name like any version the key holds.
+        let names_pending = requested.is_some()
+            && requested == key.pending_rotation_key_material_id().as_deref();
+        if !names_current
+            && !names_pending
+            && !key.retains_key_material(requested.unwrap_or_default())
+        {
             return Err(DeleteImportedKeyMaterialErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(format!(
@@ -275,15 +283,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CURRENT material is what leaves the key with none, and "when the specified KMS
         // key is in the PendingDeletion state, this operation does not change the KMS
         // key's state. Otherwise, it changes the KMS key's state to PendingImport."
-        // Deleting a version a rotation retained leaves the material the key encrypts
-        // under, and so leaves the key usable.
+        // Deleting a version a rotation retained, or one that is only waiting for a
+        // rotation, leaves the material the key encrypts under, and so leaves the key
+        // usable.
         //
         // `BackingKeyIdResponseType` is `@length(0, 64)` where the request member is
         // `@length(64, 64)` (`smithy_query(query="operation",operation="DeleteImportedKeyMaterial")`),
         // so a call that found no material to delete reports the empty identifier rather
         // than refusing: the key already has no imported key material, which is the
         // state this call asks for.
-        let deleted = if names_current {
+        let deleted = if names_pending {
+            key.forget_pending_key_material()
+        } else if names_current {
             key.delete_current_key_material()
         } else {
             key.forget_key_material(requested.unwrap_or_default())

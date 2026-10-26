@@ -22,11 +22,22 @@
 //! `EndDate` bound, in one deterministic order, cut into pages of at most `PageSize`
 //! entries whose `NextToken` resumes the walk strictly after the last entry returned,
 //! and refuses a `NextToken` this listing never minted with a terminal 400
-//! `InvalidNextTokenException`. Those tables span the selections, each reason subset,
+//! `InvalidNextTokenException`, and a window whose `EndDate` precedes its `StartDate`
+//! with a terminal 400 `BadRequestException` naming both bounds. Those tables span the
+//! selections, each reason subset,
 //! each side of the window and its bounds, every page size from one to past the end,
 //! and the ways a token can fail to be a position in this listing.
 //!
-//! One further rule, under both of those: an entry's storage key names exactly one
+//! The rule the write cases pin: `PutSuppressedDestination` puts the address the
+//! request names on the list it selects — a tenant's when it carries `TenantName`, the
+//! account-level list otherwise — carrying the `Reason` the request supplies and the
+//! instant of the write, replacing whatever entry that list already held for the
+//! address, and refuses the write with a terminal 400 `BadRequestException` while the
+//! account has not been granted production access, leaving every list untouched. Those
+//! tables span both reasons, both kinds of list, the spellings of an address, a
+//! repeated write of one address, and each way a write is refused.
+//!
+//! One further rule, under all of those: an entry's storage key names exactly one
 //! (list, address) pair and carries its own list's prefix and no other's — whatever
 //! either part of the pair holds — which is what keeps one list's entries, and one
 //! listing's page tokens, out of another's.
@@ -224,6 +235,30 @@ impl Ses {
             "case {:?}: expected the suppression-list entry to be stored",
             record.email_address
         );
+    }
+
+    /// `PutSuppressedDestination`: the address and the reason in the request body,
+    /// plus the tenant whose list to write to when the case names one.
+    async fn put_suppressed(&self, address: &str, reason: &str, tenant: Option<&str>) -> Reply {
+        let mut body = json!({"EmailAddress": address, "Reason": reason});
+        if let Some(tenant) = tenant {
+            body["TenantName"] = json!(tenant);
+        }
+        self.call("PUT", "/v2/email/suppression/addresses", Some(body))
+            .await
+    }
+
+    /// Grant this account production access, which is what takes it out of the
+    /// sandbox.
+    ///
+    /// It is set on the one account record every account operation reads and writes
+    /// (the record `GetAccount` reports `ProductionAccessEnabled` from), so a case
+    /// that needs a suppression write to be permitted grants it here.
+    fn grant_production_access(&self) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
+        state.lock().account.production_access_enabled = true;
     }
 
     /// Every stored entry, as `(key, reason, address)`, so a case can show that a
@@ -1001,12 +1036,12 @@ async fn the_listing_narrows_to_the_reasons_and_the_window_the_request_names() {
             expected: Vec::new(),
         },
         FilterCase {
-            name: "a window that begins after it ends",
+            name: "a window as wide as one second",
             query: vec![
-                ("StartDate", date_time(before(base, 100))),
-                ("EndDate", date_time(before(base, 400))),
+                ("StartDate", date_time(before(base, 301))),
+                ("EndDate", date_time(before(base, 300))),
             ],
-            expected: Vec::new(),
+            expected: vec!["bravo@example.com"],
         },
         FilterCase {
             name: "a reason and a window together",
@@ -1247,6 +1282,103 @@ async fn a_next_token_this_listing_never_minted_is_refused() {
     );
 }
 
+/// One bound of a listing window, as the refusal of an inverted window names it: the
+/// wire value the request carried, cut where the minutes end.
+fn to_the_minute(at: SystemTime) -> String {
+    date_time(at)
+        .chars()
+        .take("YYYY-MM-DDThh:mm".len())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_listing_window_whose_end_precedes_its_start_is_refused() {
+    let (ses, base) = seeded().await;
+
+    // The rows differ along the size of the inversion and the list selected: a second
+    // apart, a whole day apart, past every stored entry, and on a tenant's list.
+    let inverted: [(&str, SystemTime, SystemTime, Option<&str>); 4] = [
+        (
+            "the end one second before the start",
+            before(base, 100),
+            before(base, 101),
+            None,
+        ),
+        (
+            "the end a day before the start",
+            base,
+            before(base, 86_400),
+            None,
+        ),
+        (
+            "both bounds before every stored entry",
+            before(base, 100_000),
+            before(base, 200_000),
+            None,
+        ),
+        (
+            "an inverted window on a tenant's list",
+            before(base, 10),
+            before(base, 500),
+            Some("tenant_one"),
+        ),
+    ];
+
+    for (case, start, end, tenant) in inverted {
+        let mut query = selection(tenant);
+        query.push(("StartDate", date_time(start)));
+        query.push(("EndDate", date_time(end)));
+        let reply = ses.list_suppressed(&query).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected 400 BadRequestException for an inverted window, got {} {} {:?}",
+            reply.status,
+            reply.error_code(),
+            reply.body
+        );
+        // The refusal names both bounds as the request gave them.
+        let expected = format!(
+            "Start date {} must be before end date {}",
+            to_the_minute(start),
+            to_the_minute(end)
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected the refusal to read {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+
+    // The bounds themselves are accepted: the window is closed, so a window whose two
+    // bounds are the same instant still holds the entry stamped there, and one a
+    // second wide holds it too.
+    let bravo = before(base, 300);
+    for (case, start, end) in [
+        ("the two bounds are the same instant", bravo, bravo),
+        ("a window one second wide", before(base, 301), bravo),
+    ] {
+        let reply = ses
+            .list_suppressed(&[
+                ("StartDate", date_time(start)),
+                ("EndDate", date_time(end)),
+            ])
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200 for a window that is not inverted, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            listed(&reply),
+            vec!["bravo@example.com".to_string()],
+            "case {case:?}: expected the entry stamped inside the window, got {:?}",
+            reply.body
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_tenant_the_account_does_not_hold_is_refused_before_the_list_is_listed() {
     // The same two refusals the read makes, for the same reasons: the documented
@@ -1357,6 +1489,483 @@ async fn listing_the_suppression_list_changes_nothing_a_later_caller_sees() {
         "case {:?}: expected the suppression table untouched by the listings, got {:?}",
         "repeat listing",
         ses.stored()
+    );
+}
+
+/// One row of the write table: the request the case makes, and the address the read
+/// after it asks about.
+struct WriteCase {
+    name: &'static str,
+    address: &'static str,
+    reason: &'static str,
+    /// The tenant whose list the write targets, or the account-level list.
+    tenant: Option<&'static str>,
+    /// The address the read spells, which need not be the written spelling: a lookup
+    /// compares the domain without regard to case.
+    lookup: &'static str,
+}
+
+/// The window one write happened in, as the epoch seconds either side of it.
+///
+/// A second of slack each way, so the assertion is about the stamp being the instant
+/// of the write rather than about the clock's resolution.
+fn window() -> f64 {
+    epoch_seconds(SystemTime::now())
+}
+
+/// Assert the entry a write left is what the read after it reports, member for
+/// member, with `LastUpdateTime` inside the window the write happened in.
+fn assert_written(case: &WriteCase, opened: f64, closed: f64, reply: &Reply) {
+    let name = case.name;
+    assert_eq!(
+        reply.status, 200,
+        "case {name:?}: expected 200 reading the written entry back, got {} {:?}",
+        reply.status, reply.body
+    );
+    // The address is reported exactly as the write spelled it: the local part belongs
+    // to the receiving mailbox.
+    assert_eq!(
+        reply.text_at(&["SuppressedDestination", "EmailAddress"]),
+        Some(case.address.to_string()),
+        "case {name:?}: expected EmailAddress {:?}, got {:?}",
+        case.address,
+        reply.body
+    );
+    assert_eq!(
+        reply.text_at(&["SuppressedDestination", "Reason"]),
+        Some(case.reason.to_string()),
+        "case {name:?}: expected Reason {:?}, got {:?}",
+        case.reason,
+        reply.body
+    );
+    // `TenantName` "is present only when the suppressed destination is on a tenant's
+    // suppression list", so an account-level entry reports none.
+    assert_eq!(
+        reply.text_at(&["SuppressedDestination", "TenantName"]),
+        case.tenant.map(str::to_string),
+        "case {name:?}: expected TenantName {:?}, got {:?}",
+        case.tenant,
+        reply.body
+    );
+    // No message and no feedback event caused this suppression — the caller asked for
+    // it — so the entry carries no `Attributes` at all.
+    let attributes = reply.at(&["SuppressedDestination", "Attributes"]);
+    assert!(
+        attributes.is_null(),
+        "case {name:?}: expected no Attributes on an entry the caller wrote, got {attributes:?}"
+    );
+    let stamped = reply.number_at(&["SuppressedDestination", "LastUpdateTime"]);
+    assert!(
+        stamped.is_some_and(|at| at >= opened && at <= closed),
+        "case {name:?}: expected LastUpdateTime within {opened}..{closed}, got {stamped:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_accepted_suppression_write_reads_back_member_for_member() {
+    let (bounce, complaint) = modelled_reasons();
+    // The rows differ along what the rule generalises over: the reason, the list the
+    // write selects, and the spelling of the address.
+    let cases = [
+        WriteCase {
+            name: "account list, bounce",
+            address: "written-bounce@example.com",
+            reason: bounce,
+            tenant: None,
+            lookup: "written-bounce@example.com",
+        },
+        WriteCase {
+            name: "account list, complaint",
+            address: "written-complaint@example.com",
+            reason: complaint,
+            tenant: None,
+            lookup: "written-complaint@example.com",
+        },
+        WriteCase {
+            name: "tenant list, bounce",
+            address: "tenant-bounce@example.com",
+            reason: bounce,
+            tenant: Some("tenant_one"),
+            lookup: "tenant-bounce@example.com",
+        },
+        WriteCase {
+            name: "another tenant's list, complaint",
+            address: "tenant-complaint@example.com",
+            reason: complaint,
+            tenant: Some("tenant-two"),
+            lookup: "tenant-complaint@example.com",
+        },
+        WriteCase {
+            name: "the domain is matched without regard to case",
+            address: "Mixed.Case@Example.COM",
+            reason: bounce,
+            tenant: None,
+            lookup: "Mixed.Case@EXAMPLE.com",
+        },
+        WriteCase {
+            name: "a plus-tagged local part",
+            address: "tagged+suppression@example.com",
+            reason: complaint,
+            tenant: None,
+            lookup: "tagged%2Bsuppression%40example.com",
+        },
+        WriteCase {
+            name: "a long local part in a subdomain",
+            address: "a-very-long-local-part-that-a-mailbox-may-well-have@sub.domain.example.org",
+            reason: bounce,
+            tenant: Some("tenant_one"),
+            lookup: "a-very-long-local-part-that-a-mailbox-may-well-have@sub.domain.example.org",
+        },
+    ];
+
+    let ses = Ses::new();
+    // A write to a tenant's list targets a tenant the account really holds.
+    ses.create_tenants(&["tenant_one", "tenant-two"]).await;
+    // The account-wide restriction is not what these rows are about: this account
+    // holds production access, so each write below is permitted.
+    ses.grant_production_access();
+
+    for case in &cases {
+        let opened = window() - 1.0;
+        let accepted = ses
+            .put_suppressed(case.address, case.reason, case.tenant)
+            .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {:?}: expected 200 from the suppression write, got {} {:?}",
+            case.name, accepted.status, accepted.body
+        );
+        let closed = window() + 1.0;
+        let reply = ses.get_suppressed(case.lookup, case.tenant).await;
+        assert_written(case, opened, closed, &reply);
+    }
+
+    // Every row wrote one entry, and no row wrote any other: the table holds exactly
+    // one entry per row.
+    let stored = ses.stored();
+    assert_eq!(
+        stored.len(),
+        cases.len(),
+        "case {:?}: expected one stored entry per written row, got {stored:?}",
+        "write table"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_suppression_write_replaces_the_one_entry_it_names() {
+    let (bounce, complaint) = modelled_reasons();
+    let ses = Ses::new();
+    ses.create_tenants(&["tenant_one"]).await;
+    ses.grant_production_access();
+
+    // One address, written repeatedly to each of the two lists it can be on. The
+    // sequences differ so the list each write landed on is visible in the reason the
+    // read after it reports.
+    let address = "Repeat.Writes@Example.com";
+    let plan: [(&str, Option<&str>, [&str; 3]); 2] = [
+        ("account list", None, [bounce, complaint, complaint]),
+        ("tenant list", Some("tenant_one"), [complaint, bounce, bounce]),
+    ];
+
+    for (case, tenant, reasons) in plan {
+        let mut previous_stamp = 0.0_f64;
+        for reason in reasons {
+            let accepted = ses.put_suppressed(address, reason, tenant).await;
+            assert_eq!(
+                accepted.status, 200,
+                "case {case:?}: expected 200 from the repeated write, got {} {:?}",
+                accepted.status, accepted.body
+            );
+            let reply = ses.get_suppressed(address, tenant).await;
+            assert_eq!(
+                reply.text_at(&["SuppressedDestination", "Reason"]),
+                Some(reason.to_string()),
+                "case {case:?}: expected the latest write to leave Reason {reason:?}, got {:?}",
+                reply.body
+            );
+            // The entry was written again, so its `LastUpdateTime` cannot have moved
+            // backwards.
+            let stamp = reply
+                .number_at(&["SuppressedDestination", "LastUpdateTime"])
+                .unwrap_or_default();
+            assert!(
+                stamp >= previous_stamp,
+                "case {case:?}: expected LastUpdateTime at or after the previous write's \
+                 {previous_stamp}, got {stamp}"
+            );
+            previous_stamp = stamp;
+        }
+    }
+
+    // Three writes to each of the two lists left one entry per list, each holding the
+    // reason its own last write supplied: the lists do not see each other's entry.
+    let stored = ses.stored();
+    assert_eq!(
+        stored.len(),
+        2,
+        "case {:?}: expected one entry per list written to, got {stored:?}",
+        "repeat write"
+    );
+    for (case, tenant, expected) in [
+        ("account list", None, complaint),
+        ("tenant list", Some("tenant_one"), bounce),
+    ] {
+        let reply = ses.get_suppressed(address, tenant).await;
+        assert_eq!(
+            reply.text_at(&["SuppressedDestination", "Reason"]),
+            Some(expected.to_string()),
+            "case {case:?}: expected the list to still hold Reason {expected:?}, got {:?}",
+            reply.body
+        );
+    }
+}
+
+/// One row of the sandbox table: the write a sandboxed account attempts.
+struct SandboxCase {
+    name: &'static str,
+    address: &'static str,
+    reason: &'static str,
+    tenant: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn an_account_without_production_access_adds_no_address_to_any_suppression_list() {
+    let (bounce, complaint) = modelled_reasons();
+    let cases = [
+        SandboxCase {
+            name: "account list, bounce",
+            address: "sandboxed-bounce@example.com",
+            reason: bounce,
+            tenant: None,
+        },
+        SandboxCase {
+            name: "account list, complaint",
+            address: "sandboxed-complaint@example.com",
+            reason: complaint,
+            tenant: None,
+        },
+        SandboxCase {
+            name: "tenant list, bounce",
+            address: "sandboxed-tenant@example.com",
+            reason: bounce,
+            tenant: Some("tenant_one"),
+        },
+        SandboxCase {
+            name: "another tenant's list, complaint",
+            address: "sandboxed-other-tenant@example.com",
+            reason: complaint,
+            tenant: Some("tenant-two"),
+        },
+        SandboxCase {
+            name: "a mixed-case domain",
+            address: "Sandboxed.Mixed@Example.COM",
+            reason: bounce,
+            tenant: None,
+        },
+        SandboxCase {
+            name: "a plus-tagged local part",
+            address: "sandboxed+tagged@example.com",
+            reason: complaint,
+            tenant: None,
+        },
+    ];
+
+    // The restriction is account-wide, so the refusal says what the account's state is
+    // and carries no part of the request: every row expects the same sentence.
+    let expected = "Your account is still in the sandbox.";
+
+    for case in &cases {
+        // A fresh emulator per row: an account nobody has granted production access to
+        // is in the sandbox, which is the state under test.
+        let ses = Ses::new();
+        ses.create_tenants(&["tenant_one", "tenant-two"]).await;
+
+        let refused = ses
+            .put_suppressed(case.address, case.reason, case.tenant)
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {:?}: expected 400 BadRequestException, got {} {} {:?}",
+            case.name,
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            expected,
+            "case {:?}: expected the refusal to read {expected:?}, got {:?}",
+            case.name,
+            refused.message()
+        );
+
+        // The effect is absent: nothing was stored, so the read after the refusal
+        // still misses.
+        let stored = ses.stored();
+        assert!(
+            stored.is_empty(),
+            "case {:?}: expected the refused write to store nothing, got {stored:?}",
+            case.name
+        );
+        let missed = ses.get_suppressed(case.address, case.tenant).await;
+        assert_eq!(
+            (missed.status, missed.error_code().as_str()),
+            (404, "NotFoundException"),
+            "case {:?}: expected 404 NotFoundException after the refused write, got {} {} {:?}",
+            case.name,
+            missed.status,
+            missed.error_code(),
+            missed.body
+        );
+
+        // The control: the very same request from an account that holds production
+        // access is accepted, so what the refusal above reports is the account's
+        // restriction and not anything about the request.
+        ses.grant_production_access();
+        let accepted = ses
+            .put_suppressed(case.address, case.reason, case.tenant)
+            .await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {:?}: expected 200 once the account holds production access, got {} {:?}",
+            case.name, accepted.status, accepted.body
+        );
+        let served = ses.get_suppressed(case.address, case.tenant).await;
+        assert_eq!(
+            served.status, 200,
+            "case {:?}: expected the permitted write to be readable back, got {} {:?}",
+            case.name, served.status, served.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_suppression_write_the_account_cannot_make_stores_nothing() {
+    let (bounce, _complaint) = modelled_reasons();
+    // The same two `TenantName` refusals the read and the listing make, for the same
+    // reasons: the documented form bounds the name, and a well-formed name the account
+    // never created names no list.
+    let longest = "t".repeat(MAX_TENANT_NAME_CHARS);
+    let too_long = "t".repeat(MAX_TENANT_NAME_CHARS + 1);
+    let tenant_cases = [
+        TenantCase {
+            name: "a well-formed tenant the account never created",
+            tenant: "absent_tenant".to_string(),
+            status: 404,
+            code: "NotFoundException",
+            message: "Tenant absent_tenant does not exist.".to_string(),
+        },
+        TenantCase {
+            name: "a name at the documented length bound the account never created",
+            tenant: longest.clone(),
+            status: 404,
+            code: "NotFoundException",
+            message: format!("Tenant {longest} does not exist."),
+        },
+        TenantCase {
+            name: "a name one character past the documented length bound",
+            tenant: too_long.clone(),
+            status: 400,
+            code: "BadRequestException",
+            message: format!(
+                "Invalid tenant name: {too_long}. The name can contain up to \
+                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
+                 hyphens (-) and underscores (_) only."
+            ),
+        },
+        TenantCase {
+            name: "a name carrying a character the form excludes",
+            tenant: "tenant.one".to_string(),
+            status: 400,
+            code: "BadRequestException",
+            message: format!(
+                "Invalid tenant name: tenant.one. The name can contain up to \
+                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
+                 hyphens (-) and underscores (_) only."
+            ),
+        },
+    ];
+
+    let ses = Ses::new();
+    ses.create_tenants(&["tenant_one"]).await;
+    // Production access is granted, so no row below is refused for the account's
+    // sandbox restriction.
+    ses.grant_production_access();
+
+    for case in &tenant_cases {
+        let refused = ses
+            .put_suppressed("named-tenant@example.com", bounce, Some(&case.tenant))
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (case.status, case.code),
+            "case {:?}: expected {} {}, got {} {} {:?}",
+            case.name,
+            case.status,
+            case.code,
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            case.message,
+            "case {:?}: expected the refusal to read {:?}, got {:?}",
+            case.name,
+            case.message,
+            refused.message()
+        );
+        let stored = ses.stored();
+        assert!(
+            stored.is_empty(),
+            "case {:?}: expected the refused write to store nothing, got {stored:?}",
+            case.name
+        );
+    }
+
+    // A `Reason` outside the modelled `SuppressionListReason` catalog names no reason
+    // an address can be suppressed for, so the write is refused and stores nothing.
+    // The catalog is the model's — `smithy_query(query="shape",
+    // shape="SuppressionListReason")` — so the constraint is refused before the
+    // handler runs, with the input error this operation models; what is asserted here
+    // is the refusal and that no entry appeared.
+    for reason in ["SUPPRESSED", "bounce", "", "BOUNCE,COMPLAINT"] {
+        let refused = ses
+            .put_suppressed("unmodelled-reason@example.com", reason, None)
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {reason:?}: expected 400 BadRequestException for a reason outside the modelled \
+             catalog, got {} {} {:?}",
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+        for value in SUPPRESSION_LIST_REASON_VALUES {
+            assert!(
+                refused.message().contains(value),
+                "case {reason:?}: expected the refusal to name the catalog value {value:?}, got \
+                 {:?}",
+                refused.message()
+            );
+        }
+        let stored = ses.stored();
+        assert!(
+            stored.is_empty(),
+            "case {reason:?}: expected the refused write to store nothing, got {stored:?}"
+        );
+    }
+
+    // The control: the tenant the account does hold, and a reason from the catalog.
+    let accepted = ses
+        .put_suppressed("named-tenant@example.com", bounce, Some("tenant_one"))
+        .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case {:?}: expected 200 for the tenant the account holds, got {} {:?}",
+        "an existing tenant", accepted.status, accepted.body
     );
 }
 

@@ -126,6 +126,89 @@ pub(crate) fn error_code(payload: &Value) -> String {
         .to_string()
 }
 
+/// The `message` an error body carries, which is a separate member from the `__type`
+/// [`error_code`] reports — and is absent on the refusal classes AWS words without one.
+pub(crate) fn error_message(payload: &Value) -> String {
+    payload["message"]
+        .as_str()
+        .or_else(|| payload["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Call an operation that must fail, and report its status, wire error code and message.
+pub(crate) async fn refused(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, String) {
+    let (status, payload) = call(router, region, operation, body).await;
+    assert_ne!(
+        status, 200,
+        "case {operation} {body}: expected a failure, got HTTP 200 with {payload}"
+    );
+    (status, error_code(&payload), error_message(&payload))
+}
+
+/// Wrap `material` under the public wrapping key `GetParametersForImport` answered, with
+/// the wrapping algorithm the parameters were asked for — what a caller importing key
+/// material does before calling `ImportKeyMaterial`.
+///
+/// The two `RSAES_OAEP_*` algorithms encrypt the material directly under the RSA public
+/// key; the two `RSA_AES_KEY_WRAP_*` ones encrypt a freshly generated 256-bit AES key
+/// under it and wrap the material with that AES key, then concatenate the two — which is
+/// the only form long material (an RSA private key) fits in.
+pub(crate) fn wrap(
+    case: &str,
+    public_key: &[u8],
+    wrapping_algorithm: &str,
+    material: &[u8],
+) -> Vec<u8> {
+    use aws_lc_rs::key_wrap::KeyWrapPadded;
+
+    let (algorithm, aes_key_wrap) = match wrapping_algorithm {
+        "RSAES_OAEP_SHA_256" => (&aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256, false),
+        "RSAES_OAEP_SHA_1" => (&aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1, false),
+        "RSA_AES_KEY_WRAP_SHA_256" => (&aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256, true),
+        "RSA_AES_KEY_WRAP_SHA_1" => (&aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1, true),
+        other => panic!("case {case}: {other} is not a wrapping algorithm this test uses"),
+    };
+    let public_key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(public_key)
+        .unwrap_or_else(|error| panic!("case {case}: the public key is DER: {error}"));
+    let oaep = aws_lc_rs::rsa::OaepPublicEncryptingKey::new(public_key)
+        .unwrap_or_else(|error| panic!("case {case}: the public key wraps: {error}"));
+
+    // What the RSA public key encrypts: the material itself, or the ephemeral AES key
+    // that wrapped it.
+    let mut aes_wrapped = Vec::new();
+    let mut aes_key = Vec::new();
+    if aes_key_wrap {
+        aes_key = service_com_amazonaws_kms_trentservice::state::random_bytes(32)
+            .unwrap_or_else(|| panic!("case {case}: the platform produces entropy"));
+        let kek = aws_lc_rs::key_wrap::AesKek::new(&aws_lc_rs::key_wrap::AES_256, &aes_key)
+            .unwrap_or_else(|error| panic!("case {case}: the AES key wraps: {error}"));
+        // The padded key wrap grows the material by at most one block plus the 8-byte
+        // integrity check value.
+        let mut wrapped = vec![0u8; material.len() + 16];
+        let len = kek
+            .wrap_with_padding(material, &mut wrapped)
+            .unwrap_or_else(|error| panic!("case {case}: the material wraps: {error}"))
+            .len();
+        wrapped.truncate(len);
+        aes_wrapped = wrapped;
+    }
+    let sealed: &[u8] = if aes_key_wrap { &aes_key } else { material };
+    let mut wrapped = vec![0u8; oaep.key_size_bytes()];
+    let len = oaep
+        .encrypt(algorithm, sealed, &mut wrapped, None)
+        .unwrap_or_else(|error| panic!("case {case}: the material wraps: {error}"))
+        .len();
+    wrapped.truncate(len);
+    wrapped.extend_from_slice(&aes_wrapped);
+    wrapped
+}
+
 /// A blob as awsJson1_1 carries it.
 pub(crate) fn b64(bytes: &[u8]) -> String {
     aws_smithy_types::base64::encode(bytes)

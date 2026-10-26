@@ -230,6 +230,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An index is served by the CLUSTER, so every file its analysis settings name
+        // has to be there to be read: each path they name under a custom package's
+        // mount point is resolved against the packages this domain holds in place, and
+        // one that resolves to nothing — no such package on the domain, or one whose
+        // association has not landed — means the create cannot be served. Refused
+        // before anything is stored, so no index is created.
+        if let Some(reference) = domain.unresolved_package_reference(&input.index_schema) {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::package_file_not_readable(&reference.setting),
+            )
+            .into());
+        }
+
         domain.indexes.insert(
             input.index_name.clone(),
             Index {

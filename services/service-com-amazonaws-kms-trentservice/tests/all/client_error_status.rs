@@ -26,17 +26,16 @@ use service_com_amazonaws_kms_trentservice::scaffolded::wire_status;
 
 // The wire plumbing lives in `tests/all/harness.rs`, shared with every other suite
 // in this crate.
-use super::harness::{b64, call, create_key, error_code, ok, router, text, REGION};
+use super::harness::{
+    b64, call, create_key, error_code, error_message, ok, router, text, REGION,
+};
 
-/// The `message` an error body carries. The harness reports the `__type`; only this
-/// suite asserts on the wording, so the accessor lives here.
-fn error_message(payload: &Value) -> String {
-    payload["message"]
-        .as_str()
-        .or_else(|| payload["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
+/// The refusal classes AWS words with NO message at all, so an empty `message` is the
+/// right answer for them and a sentence is not: a ciphertext, its encryption context and
+/// the key that sealed it are what `InvalidCiphertextException` reports on, and a caller
+/// presenting a ciphertext this key cannot open is told none of the three. Recorded
+/// behavior; the exception shape's own documentation is API-reference prose.
+const WORDLESS_REFUSALS: &[&str] = &["InvalidCiphertextException", "InvalidImportTokenException"];
 
 /// Create a key with `description` and return its `KeyMetadata`.
 async fn described_key(
@@ -271,10 +270,17 @@ async fn every_client_error_answers_http_400_with_its_own_type() {
             code, expected_code,
             "case {case:?}: expected __type {expected_code}, got {code:?} in {payload}"
         );
-        assert!(
-            !error_message(&payload).is_empty(),
-            "case {case:?}: an error must say what was refused, got {payload}"
-        );
+        if WORDLESS_REFUSALS.contains(&code.as_str()) {
+            assert!(
+                error_message(&payload).is_empty(),
+                "case {case:?}: AWS words this refusal with no message at all, got {payload}"
+            );
+        } else {
+            assert!(
+                !error_message(&payload).is_empty(),
+                "case {case:?}: an error must say what was refused, got {payload}"
+            );
+        }
     }
 }
 

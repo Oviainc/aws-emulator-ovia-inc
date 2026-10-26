@@ -43,7 +43,7 @@ use crate::ops::types::{
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
-    EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
+    EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus, ErrorDetails,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IamIdentityCenterOptions,
     IamIdentityCenterOptionsInput, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
@@ -353,6 +353,20 @@ pub fn tagged_resource_absent() -> ValidationException {
 /// the transient state and the states that go with it. The due instant is stored on
 /// the record and materialised by whichever later call reads it — nothing sleeps.
 pub const PROVISIONING: Duration = Duration::from_millis(500);
+
+/// How long a change to one domain's package associations takes before the clock owes
+/// its outcome: an association stays `ASSOCIATING` for this long before it owes the
+/// status being put in place left it in, and one a dissociation has asked to remove
+/// stays `DISSOCIATING` for this long before it owes its removal — or the failure that
+/// keeps it on the domain.
+///
+/// Longer than [`PROVISIONING`], and the longest span this emulator owes any clock
+/// move, because the window it opens is what SERIALIZES writers: the service runs one
+/// such change per domain at a time, so a client that issues a second associate or
+/// dissociate for the domain right after the call that started a change — on another
+/// thread, or after building a second client — must still find that change in flight
+/// and be refused rather than overtaking it. OpenSearch Service takes minutes.
+pub const PACKAGE_ASSOCIATION_CHANGE: Duration = Duration::from_millis(750);
 
 /// The service software release a domain runs when it is created.
 ///
@@ -1420,6 +1434,136 @@ fn write_member(
     }
     if let Document::Object(members) = node {
         members.insert(name.clone(), value);
+    }
+}
+
+/// The `IndexSchema` section an index's analysis settings live in: the tokenizers,
+/// filters and analyzers the domain's cluster builds the index's text pipeline from.
+///
+/// Looked for wherever it appears rather than at one fixed depth, because the same
+/// settings reach the cluster both directly under the index's settings and under the
+/// `index` section inside them.
+const SCHEMA_ANALYSIS: &str = "analysis";
+
+/// The suffix of an analysis setting that names its content BY PATH rather than inline
+/// (`synonyms_path`, `stopwords_path`, `rules_path`, …): the form every such file
+/// reference takes in the engine's own settings, which is why the suffix rather than a
+/// hand-written list of setting names is what identifies one.
+const PATH_SETTING_SUFFIX: &str = "_path";
+
+/// One file an index's analysis settings resolve by path on the cluster nodes, as the
+/// index names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageReference {
+    /// The analysis setting that carried the path (`synonyms_path`) — what a refusal
+    /// names, because it is the setting whose file the cluster could not read.
+    pub setting: String,
+    /// The path the setting carries, relative to the cluster nodes' package directory
+    /// — the same form as [`package_reference_path`].
+    pub path: String,
+    /// The `PackageID` the path names under the analyzers directory: the package that
+    /// has to be in place on the domain for the file to be there to read.
+    pub package_id: String,
+}
+
+impl PackageReference {
+    /// Whether this reference resolves content the package `package_id` names provides:
+    /// the package's own directory, or a file inside it.
+    pub fn names_package(&self, package_id: &str) -> bool {
+        self.package_id == package_id
+    }
+}
+
+/// Every package file `schema`'s analysis settings name by path.
+///
+/// An index's analysis settings reference a custom dictionary package's content BY the
+/// relative path the package is mounted at ([`package_reference_path`]), so this walks
+/// the schema's analysis sections and reads out each path setting that names one.
+/// Ordered by setting name, so the same document always reports the same first
+/// reference, and iterative rather than recursive, so a deeply nested document costs no
+/// stack.
+pub fn package_references(schema: &::aws_smithy_types::Document) -> Vec<PackageReference> {
+    use ::aws_smithy_types::Document;
+
+    // The analysis sections first: a path setting outside one names no analyzer's
+    // content, so only what is under them is read out.
+    let mut analysis: Vec<&Document> = Vec::new();
+    let mut pending = vec![schema];
+    while let Some(node) = pending.pop() {
+        match node {
+            Document::Object(members) => {
+                for (name, child) in members {
+                    if name == SCHEMA_ANALYSIS {
+                        analysis.push(child);
+                    } else {
+                        pending.push(child);
+                    }
+                }
+            }
+            Document::Array(elements) => pending.extend(elements.iter()),
+            _ => {}
+        }
+    }
+
+    let mut references: Vec<PackageReference> = Vec::new();
+    let mut pending = analysis;
+    while let Some(node) = pending.pop() {
+        match node {
+            Document::Object(members) => {
+                for (name, child) in members {
+                    match child {
+                        Document::String(value) if name.ends_with(PATH_SETTING_SUFFIX) => {
+                            if let Some(package_id) = referenced_package(value) {
+                                references.push(PackageReference {
+                                    setting: name.clone(),
+                                    path: value.clone(),
+                                    package_id,
+                                });
+                            }
+                        }
+                        other => pending.push(other),
+                    }
+                }
+            }
+            Document::Array(elements) => pending.extend(elements.iter()),
+            _ => {}
+        }
+    }
+    references.sort_by(|left, right| left.setting.cmp(&right.setting));
+    references
+}
+
+/// The `PackageID` `path` names under the analyzers directory, or `None` where the path
+/// names no package's content at all.
+///
+/// The documented form of such a reference is the analyzers directory followed by the
+/// package's id ([`package_reference_path`]), optionally followed by a file inside it,
+/// so the id is the segment after the directory.
+fn referenced_package(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(ANALYZERS_DIRECTORY)?.strip_prefix('/')?;
+    let package_id = rest.split('/').next()?;
+    (!package_id.is_empty()).then(|| package_id.to_string())
+}
+
+/// The `ValidationException` payload for an index whose analysis settings name a file
+/// the cluster cannot read, because the domain holds no association in place with the
+/// package that provides it.
+///
+/// The cluster builds the index's analysis pipeline by READING each file its settings
+/// name, so the refusal is the failure to read that one setting's file, reported the way
+/// the engine reports it: the setting it was reading, followed by the suffix the engine
+/// appends to whatever setting it was handed, and what went wrong. The managed layer
+/// hands it the member key it found in the schema, so a member a request carries as
+/// `<name>_path` is reported as `<name>_path_path` — the engine's own formatting applied
+/// to the request's own member name. The only observed sentence of this class is for a
+/// synonym filter's path setting; whether the managed layer hands the engine the member
+/// key for EVERY path setting is not established, so the wording for the other path
+/// settings follows from this one derivation rather than from an observation of each.
+pub fn package_file_not_readable(setting: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "IOException while reading {setting}{PATH_SETTING_SUFFIX}: file not readable"
+        )),
     }
 }
 
@@ -3191,23 +3335,97 @@ impl Domain {
     }
 
     /// Materialise what the clock owes this domain's package associations: a status
-    /// move that has fallen due lands, and a removal that has fallen due takes the
-    /// record off the domain.
+    /// move that has fallen due lands, and a removal that has fallen due either takes
+    /// the record off the domain or FAILS, leaving it there.
     ///
-    /// ONE method rather than a loop at each call site, because the two halves belong
-    /// together: a record whose removal has fallen due must not be reported by ANY
-    /// read of the set, and `DomainPackageStatus` has no value for a package that is
-    /// no longer on the domain. [`Self::settle`] calls it, and so does every operation
-    /// that reports associations.
+    /// Which of the two a due removal does is decided here, at the instant it happens,
+    /// from the indexes the domain holds then: taking a package off means taking its
+    /// content off the cluster nodes, so a domain holding an index whose analysis
+    /// settings resolve a file that package provides cannot let go of it. Such a
+    /// removal leaves the association in [`DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED`]
+    /// carrying what there is to say about it ([`PACKAGE_IN_USE`]), so the index keeps
+    /// reading the file it names and a caller is told to remove the dependency first.
+    /// Deciding it HERE rather than at the call is what makes the dangling state
+    /// unreachable whichever order the two calls arrive in: an index created while the
+    /// removal is in flight still depends on the package when the removal falls due.
+    ///
+    /// ONE method rather than a loop at each call site, because the parts belong
+    /// together: a record whose removal has happened must not be reported by ANY read of
+    /// the set, and `DomainPackageStatus` has no value for a package that is no longer
+    /// on the domain. [`Self::settle`] calls it, and so does every operation that
+    /// reports associations.
     ///
     /// This is the only write such a report makes, and it writes only what was already
-    /// owed at the same instant had nobody called.
+    /// owed at the same instant had nobody called — which is why a failed removal is
+    /// stamped with the instant it fell DUE rather than with the instant of the call
+    /// that happened to observe it.
     pub fn settle_package_associations(&mut self, now: SystemTime) {
         for association in self.package_associations.values_mut() {
             association.settle(now);
         }
-        self.package_associations
-            .retain(|_, association| association.removal_due.is_none_or(|due| now < due));
+        let due: Vec<(String, SystemTime)> = self
+            .package_associations
+            .iter()
+            .filter_map(|(package_id, association)| {
+                let due = association.removal_due.filter(|due| now >= *due)?;
+                Some((package_id.clone(), due))
+            })
+            .collect();
+        for (package_id, due) in due {
+            if self.index_resolving(&package_id).is_some() {
+                if let Some(association) = self.package_associations.get_mut(&package_id) {
+                    association.status = DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED.to_string();
+                    association.removal_due = None;
+                    association.last_updated = due;
+                    association.error_details = Some(ErrorDetails {
+                        error_type: Some(DOMAIN_PACKAGE_ERROR_TYPE_IN_USE.to_string()),
+                        error_message: Some(PACKAGE_IN_USE.to_string()),
+                    });
+                }
+            } else {
+                self.package_associations.remove(&package_id);
+            }
+        }
+    }
+
+    /// The index of this domain whose analysis settings resolve a file the package
+    /// `package_id` names provides, if the domain holds one.
+    ///
+    /// What makes a package IN USE on the domain: its content is read by an index that
+    /// is there, so taking the package off would leave that index's analyzers pointing
+    /// at nothing. Iterated in name order, so the same set always answers the same
+    /// index.
+    ///
+    /// Reads ONLY, and reads the schema each index was created or last updated with —
+    /// which is the schema the cluster resolves.
+    pub fn index_resolving(&self, package_id: &str) -> Option<&Index> {
+        self.indexes.values().find(|index| {
+            package_references(&index.schema)
+                .iter()
+                .any(|reference| reference.names_package(package_id))
+        })
+    }
+
+    /// The first package file `schema`'s analysis settings name that this domain cannot
+    /// resolve, or `None` when it can resolve every one of them.
+    ///
+    /// An index is served by the cluster, so a file its analysis settings name has to
+    /// BE there to be read: the package that provides it must be in place on the domain
+    /// ([`PackageAssociation::in_place`]). A path naming a package the domain does not
+    /// hold, or holds only an association that has not landed yet, resolves to nothing.
+    ///
+    /// Reads ONLY, and is read AFTER [`Self::settle_package_associations`], so an
+    /// association whose removal has fallen due is already off the domain.
+    pub fn unresolved_package_reference(
+        &self,
+        schema: &::aws_smithy_types::Document,
+    ) -> Option<PackageReference> {
+        package_references(schema).into_iter().find(|reference| {
+            !self
+                .package_associations
+                .get(&reference.package_id)
+                .is_some_and(PackageAssociation::in_place)
+        })
     }
 
     /// The next instant this domain's off-peak window opens after `now` — where a
@@ -5198,6 +5416,27 @@ pub const DOMAIN_PACKAGE_STATUS_ACTIVE: &str = "ACTIVE";
 /// domain.
 pub const DOMAIN_PACKAGE_STATUS_DISSOCIATING: &str = "DISSOCIATING";
 
+/// `DomainPackageStatus`'s `DISSOCIATION_FAILED`: the removal was attempted and did not
+/// happen, so the package is still on the domain — the status an association rests in
+/// when the domain cannot let go of the package.
+pub const DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED: &str = "DISSOCIATION_FAILED";
+
+/// `ErrorDetails$ErrorMessage` for a removal the domain could not perform because one
+/// of its indexes still resolves a file by the package's reference path.
+///
+/// The service's own fixed sentence for that condition: it carries no value of the
+/// request and names neither the package nor the index.
+pub const PACKAGE_IN_USE: &str = "Operation not allowed. Package is in use.";
+
+/// `ErrorDetails$ErrorType` for an association whose last transition failed — "the type
+/// of error that occurred".
+///
+/// A transition the domain cannot perform because the package is still being used by
+/// one of its indexes is the condition this API models as `ConflictException` ("the
+/// client attempts to remove a resource that is currently in use"), so that is the
+/// error class the details name.
+pub const DOMAIN_PACKAGE_ERROR_TYPE_IN_USE: &str = "ConflictException";
+
 /// `PackageType`'s `TXT-DICTIONARY` value: the dictionary content a domain's index
 /// settings reference BY PATH, which is what gives an association of it a
 /// `ReferencePath`.
@@ -5241,9 +5480,14 @@ pub struct PackageAssociation {
     /// A removal needs its own due instant rather than an [`OwedStatus`] because
     /// `DomainPackageStatus` has no value for a package that is no longer on the
     /// domain: the record rests in [`DOMAIN_PACKAGE_STATUS_DISSOCIATING`] until the
-    /// span has passed and is then GONE ([`Domain::settle`]), which is what makes the
-    /// package disappear from the domain's associations.
+    /// span has passed and the removal then either takes it off the domain or fails,
+    /// leaving it there ([`Domain::settle_package_associations`]).
     pub removal_due: Option<SystemTime>,
+    /// `DomainPackageDetails$ErrorDetails`: "additional information if the package is
+    /// in an error state. Null otherwise." — so it is populated exactly while this
+    /// association's last transition left it in one, and cleared by the next
+    /// transition that lands.
+    pub error_details: Option<ErrorDetails>,
 }
 
 impl PackageAssociation {
@@ -5261,6 +5505,9 @@ impl PackageAssociation {
         };
         self.status = owed.status;
         self.last_updated = owed.due;
+        // A move that LANDED is not an error state: whatever an earlier transition of
+        // this association failed at is not this one's.
+        self.error_details = None;
     }
 
     /// Whether this association still has a status move outstanding, meaning the
@@ -5270,6 +5517,22 @@ impl PackageAssociation {
     /// read as one still in flight.
     pub fn in_flight(&self) -> bool {
         self.owed.is_some() || self.removal_due.is_some()
+    }
+
+    /// Whether the package's content is in place on the domain for an index's analysis
+    /// settings to read a file from.
+    ///
+    /// The content is there from the moment being put in place has landed until the
+    /// record leaves the domain: an association still `ASSOCIATING` has not put it
+    /// there yet, and one whose removal failed still has it there, which is what keeps
+    /// a dependent index working.
+    pub fn in_place(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            DOMAIN_PACKAGE_STATUS_ACTIVE
+                | DOMAIN_PACKAGE_STATUS_DISSOCIATING
+                | DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED
+        )
     }
 
     /// This record as `DomainPackageDetails` — the shape every operation that
@@ -5295,8 +5558,9 @@ impl PackageAssociation {
                 .then(|| self.prerequisite_package_ids.clone()),
             reference_path: package_reference_path(package),
             // "Additional information if the package is in an error state. Null
-            // otherwise." This association is not in one.
-            error_details: None,
+            // otherwise." — the stored details of the transition that left this
+            // association in one, and absent for every association that is not.
+            error_details: self.error_details.clone(),
             association_configuration: self.association_configuration.clone(),
         }
     }
@@ -6065,7 +6329,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             owed: Some(OwedStatus {
                 status: DOMAIN_PACKAGE_STATUS_ACTIVE.to_string(),
                 message: None,
-                due: now + PROVISIONING,
+                due: now + PACKAGE_ASSOCIATION_CHANGE,
             }),
             // The version this association puts on the domain is the one the package
             // has available now, so a package whose content was updated reaches the
@@ -6080,6 +6344,9 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             // This call puts the package ON the domain, so nothing about it is owed a
             // removal: a dissociation is what asks for one.
             removal_due: None,
+            // The package is being put in place, which is not an error state; whatever
+            // an earlier association of the same package failed at is not this one's.
+            error_details: None,
         };
         // Answered from the STORED record, through the projection every read path
         // reports an association with: the slot the write went into IS the record, so
@@ -6158,7 +6425,11 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// The package is still on the domain the instant the call returns: it is being
     /// taken off, so the association rests in [`DOMAIN_PACKAGE_STATUS_DISSOCIATING`]
-    /// and the clock owes it the removal that makes it disappear ([`Domain::settle`]).
+    /// and the clock owes it the OUTCOME of that removal
+    /// ([`PACKAGE_ASSOCIATION_CHANGE`]) — which is decided when it falls due, from the
+    /// indexes the domain holds then ([`Domain::settle_package_associations`]), not
+    /// here: an index created while the removal is in flight still depends on the
+    /// package by the time the removal would happen.
     pub fn remove_package_association(
         &mut self,
         domain_name: &str,
@@ -6168,11 +6439,12 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         let domain = self.domains.get_mut(domain_name)?;
         let association = domain.package_associations.get_mut(&package.package_id)?;
         association.status = DOMAIN_PACKAGE_STATUS_DISSOCIATING.to_string();
-        // Whatever move was outstanding is replaced by the removal this call asked
-        // for: the association is on its way off the domain, not on its way to any
-        // other status.
+        // Whatever move was outstanding is replaced by the removal this call asked for:
+        // the association is on its way off the domain, not on its way to any other
+        // status, and it is not in an error state while that is in flight.
         association.owed = None;
-        association.removal_due = Some(now + PROVISIONING);
+        association.removal_due = Some(now + PACKAGE_ASSOCIATION_CHANGE);
+        association.error_details = None;
         association.last_updated = now;
         // Answered from the STORED record, through the projection every read path
         // reports an association with.

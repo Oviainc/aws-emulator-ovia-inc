@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveNotificationChannel
-//! Deletes the stored notification channel with the given id. IDEMPOTENT — an id that
-//! names no stored channel, including one an earlier call already removed, is a
-//! successful no-op that returns the empty output.
+//! Deletes the stored notification channel with the given id. The id names the resource
+//! the call is about, so an id that names no stored channel — one never minted, or one an
+//! earlier call already removed — is refused with `ResourceNotFoundException` (404)
+//! naming that id and its resource type; only a removal that deleted a channel returns
+//! the empty output.
 //!
 //! ## Shape of an operation
 //!
@@ -158,13 +160,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // IDEMPOTENT BY TARGET. Removal states that the id names no channel; the first
-        // call establishes that, and for every repeat it already holds. So an id that
-        // names no stored channel is a successful no-op rather than a failure, which is
-        // what lets a teardown path and a retry after an ambiguous network result
-        // converge instead of having to special-case an error.
-        guard.notification_channels.remove(&input.id);
+        // Remove, then decide from the removal: the id either named a channel this store
+        // held — now gone, which frees its SNS topic for a fresh registration — or it
+        // named none, which is a not-found refusal that changed nothing. An id that was
+        // never minted and an id an earlier removal already consumed are the same case:
+        // neither names a channel, so the caller can tell "deleted now" from "never
+        // existed" instead of reading success for both.
+        if guard.notification_channels.remove(&input.id).is_none() {
+            return Err(
+                RemoveNotificationChannelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no notification channel with id {} exists", input.id),
+                        resource_id: input.id.clone(),
+                        resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
 
+        // `RemoveNotificationChannelResponse` models no member: the deletion is the answer.
         Ok(RemoveNotificationChannelOutput::default())
     }
 }

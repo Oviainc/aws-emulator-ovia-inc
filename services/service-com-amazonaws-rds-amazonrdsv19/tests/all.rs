@@ -45,6 +45,8 @@ mod db_instances;
 mod db_major_engine_versions;
 #[path = "all/db_parameter_group_deletion.rs"]
 mod db_parameter_group_deletion;
+#[path = "all/db_parameter_group_provisioning.rs"]
+mod db_parameter_group_provisioning;
 #[path = "all/db_parameter_groups.rs"]
 mod db_parameter_groups;
 #[path = "all/db_parameters.rs"]

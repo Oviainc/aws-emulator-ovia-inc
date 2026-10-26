@@ -214,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             // An identifier that is an ARN this endpoint cannot resolve is answered
             // the same way as one that resolves to no key: the key was not found, and
@@ -237,9 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetKeyLastUsageOutput {
-            // KMS answers with the key ARN, not the identifier the request used — the
-            // way every other operation in this service reports the key it read.
-            key_id: Some(key.arn.clone()),
+            // "The globally unique identifier for the KMS key"
+            // (`smithy_query(query="doc",shape="GetKeyLastUsageResponse",member="KeyId")`):
+            // this response names the key by its key ID, not by its ARN as the
+            // operations whose own member says "the Amazon Resource Name (key ARN)" do,
+            // and not by the identifier the request used.
+            key_id: Some(key.key_id.clone()),
             // "Contains usage information about the last time the KMS key was used for
             // a successful cryptographic operation. If the key has not been used since
             // tracking began, this response element is empty" — so the member is absent

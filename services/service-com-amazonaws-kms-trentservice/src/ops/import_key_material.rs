@@ -15,11 +15,18 @@
 //! precondition is the key's ORIGIN, the same gate `GetParametersForImport` and
 //! `DeleteImportedKeyMaterial` apply.
 //!
-//! What this emulator cannot import is an asymmetric key pair: it holds no private key
-//! for one (see [`crate::state::KeyMaterial::KeyPairNotGenerated`]), and the `RSA_AES`
-//! wrapping algorithms such a key calls for wrap an AES key that wraps the material
-//! rather than wrapping it directly, so those requests are answered as not implemented
-//! rather than with a key whose material is not what was sent.
+//! The material a key of an ASYMMETRIC spec takes is the PRIVATE KEY of the key pair
+//! that spec names, as PKCS#8 DER, and it is parsed and checked against the spec before
+//! it becomes the key's material ([`crate::state::imported_key_pair`]). Its wrapping is
+//! the `RSA_AES` one such a key calls for, which seals an AES key under the RSA public
+//! key and the material under that AES key; both steps are really performed.
+//!
+//! An import never replaces material with the SAME material: `ImportType`
+//! `NEW_KEY_MATERIAL` says the material is not one this key already has, and material it
+//! does have is refused, so a replayed import is not a second one. New material for a key
+//! that already holds some does not become the material the key encrypts under either: it
+//! waits in `PENDING_ROTATION` until `RotateKeyOnDemand` completes the rotation it was
+//! imported for.
 //!
 //! ## Shape of an operation
 //!
@@ -308,38 +315,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checks below do not hold a borrow of the store while it is being written.
         // `state_message` is how every operation in this service words a refusal caused
         // by the key's own key state ([`crate::state::invalid_state_message`]).
-        let (key_id, key_arn, origin, key_state, state_message, key_spec, held_material_id) =
-            match state.resolve(&region, &input.key_id) {
-                crate::state::KeyRef::Found(key) => (
-                    key.key_id.clone(),
-                    key.arn.clone(),
-                    key.origin.clone(),
-                    key.reported_key_state().to_string(),
-                    crate::state::invalid_state_message(key),
-                    key.key_spec.clone(),
-                    key.current_key_material_id.clone(),
-                ),
-                crate::state::KeyRef::UnauthorizedAccount => {
-                    return Err(crate::state::unauthorized_account(
-                        Self::NAME,
-                        &input.key_id,
-                    ));
-                }
-                crate::state::KeyRef::MalformedArn => {
-                    return Err(invalid_arn(&input.key_id));
-                }
-                crate::state::KeyRef::NotFound => {
-                    return Err(ImportKeyMaterialErrorModeled::NotFoundException(
-                        NotFoundException {
-                            message: Some(crate::state::key_not_found_message(
-                                &region,
-                                &input.key_id,
-                            )),
-                        },
-                    )
-                    .into());
-                }
-            };
+        let KeyFacts {
+            key_id,
+            key_arn,
+            origin,
+            key_state,
+            state_message,
+            key_spec,
+            held_material_id,
+            holds_material,
+            symmetric_encryption,
+        } = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => KeyFacts {
+                key_id: key.key_id.clone(),
+                key_arn: key.arn.clone(),
+                origin: key.origin.clone(),
+                key_state: key.reported_key_state().to_string(),
+                state_message: crate::state::invalid_state_message(key),
+                key_spec: key.key_spec.clone(),
+                held_material_id: key.current_key_material_id.clone(),
+                holds_material: key.has_key_material(),
+                symmetric_encryption: key.is_symmetric_encryption(),
+            },
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(Self::NAME));
+            }
+            crate::state::KeyRef::MalformedArn => {
+                return Err(invalid_arn(&input.key_id));
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(ImportKeyMaterialErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(
+                            &region,
+                            &input.key_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
 
         // "The Origin of the KMS key must be EXTERNAL" (the `KeyId` member's
         // documentation): a key whose material KMS generated cannot be given material by
@@ -376,7 +391,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wrapping key pair at all, and one minted for ANOTHER key cannot be used here,
         // because "the public key and its import token are permanently linked and must
         // be used together" with the key they were issued for. Both are the modelled
-        // `InvalidImportTokenException`.
+        // `InvalidImportTokenException`, which carries NO message: what the token is
+        // bound to is not reported to a caller who presented a token that is not bound
+        // to this key.
         let token = ::hex::encode(&input.import_token);
         let Some(parameters) = state
             .import_parameters
@@ -385,13 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
         else {
             return Err(ImportKeyMaterialErrorModeled::InvalidImportTokenException(
-                InvalidImportTokenException {
-                    message: Some(format!(
-                        "The import token is not valid for {key_arn}. Call \
-                         GetParametersForImport for a public key and import token to use \
-                         with it."
-                    )),
-                },
+                InvalidImportTokenException { message: None },
             )
             .into());
         };
@@ -470,11 +481,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Indicates whether the key material being imported is previously associated
-        // with this KMS key or not"; "you cannot specify a key material ID with
-        // ImportType set to NEW_KEY_MATERIAL", and after the first import the parameter
-        // "defaults to EXISTING_KEY_MATERIAL".
+        // with this KMS key or not"; "if no key material has ever been imported into the
+        // KMS key, and this parameter is omitted, the parameter defaults to
+        // NEW_KEY_MATERIAL. After the first key material is imported, if this parameter
+        // is omitted then the parameter defaults to EXISTING_KEY_MATERIAL" (that member's
+        // documentation) — so the default follows whether the key HAS material, and "you
+        // cannot specify a key material ID with ImportType set to NEW_KEY_MATERIAL".
         let import_type = input.import_type.clone().unwrap_or_else(|| {
-            if held_material_id.is_some() {
+            if holds_material {
                 IMPORT_TYPE_EXISTING_KEY_MATERIAL.to_string()
             } else {
                 IMPORT_TYPE_NEW_KEY_MATERIAL.to_string()
@@ -487,24 +501,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The key material a key of this spec holds, which is what the imported bytes
-        // have to be. An asymmetric key pair is material this service does not hold the
-        // bytes of, so such a key is answered as not implemented rather than given
-        // material it cannot use.
+        // The key material a key of this spec is: as many bytes as its kind holds for a
+        // symmetric or HMAC key, and the private key of a key pair for an asymmetric one.
         let Some(profile) = crate::state::key_spec_profile(&key_spec) else {
             return Err(internal("the key spec of the KMS key is not supported"));
         };
-        if profile.material.material_len().is_none() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "ImportKeyMaterial for a {key_spec} KMS key"
-            )));
-        }
         // "The key material must be encrypted under the public wrapping key that
         // GetParametersForImport returned, using the wrapping algorithm that you
-        // specified in the same GetParametersForImport request." The `RSA_AES` wrapping
-        // algorithms wrap an AES key that wraps the material, and `SM2PKE` is not RSA at
-        // all; neither is unwrapped here, so such a request is answered as not
-        // implemented rather than with material that was never opened.
+        // specified in the same GetParametersForImport request." `SM2PKE` is not a
+        // wrapping under an RSA key pair at all, and this service generates no SM2
+        // wrapping key, so such a request is answered as not implemented rather than
+        // with material that was never opened.
         if !crate::state::unwraps_wrapping_algorithm(&parameters.wrapping_algorithm) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "ImportKeyMaterial with key material wrapped using {}",
@@ -524,8 +531,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Material that opened but is not material of the kind this key holds "does not
         // meet the requirements" of the key — the modelled
-        // `IncorrectKeyMaterialException`.
-        let Some(material) = crate::state::KeyMaterial::from_bytes(profile.material, &opened) else {
+        // `IncorrectKeyMaterialException`. A key of an asymmetric spec takes the private
+        // key of a key pair of THAT spec, which is what makes a private key of another
+        // spec, or bytes that are no private key at all, material this key cannot hold;
+        // a key pair whose private key nothing here parses has nothing to judge the
+        // bytes against, so it is answered as not implemented rather than refusing
+        // correct material as incorrect.
+        let material = match profile.material {
+            crate::state::MaterialKind::Aes256 | crate::state::MaterialKind::Hmac(_) => {
+                crate::state::KeyMaterial::from_bytes(profile.material, &opened)
+            }
+            crate::state::MaterialKind::KeyPair => {
+                if !crate::state::parses_key_pair(&key_spec) {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "ImportKeyMaterial for a {key_spec} KMS key"
+                    )));
+                }
+                crate::state::imported_key_pair(&key_spec, &opened)
+            }
+        };
+        let Some(material) = material else {
             return Err(incorrect_key_material(&key_arn));
         };
 
@@ -549,21 +574,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let crate::state::KeyRefMut::Found(key) = state.resolve_mut(&region, &input.key_id) else {
             return Err(internal("the KMS key is no longer held"));
         };
+        // "Indicates whether the key material being imported is previously associated
+        // with this KMS key or not": an import that states the material is NEW is an
+        // import of material this key does not already have, so material it does have
+        // is not what the request said it was — the exception shape's own documentation
+        // describes exactly this case, "KMS expected new key material but the key
+        // material being imported is already associated with the KMS key"
+        // (`smithy_query(query="doc",shape="IncorrectKeyMaterialException")`), as one of
+        // the examples in its prose; the sentence the wire carries for it is the recorded
+        // one below, which is that clause as the service words it on its own. It is what
+        // makes one (token, material) pair import once: presented again, the material is
+        // the key's own by then.
+        if import_type == IMPORT_TYPE_NEW_KEY_MATERIAL && key.associates_key_material(&material) {
+            return Err(ImportKeyMaterialErrorModeled::IncorrectKeyMaterialException(
+                IncorrectKeyMaterialException {
+                    message: Some(
+                        "expected new key material but the key material being imported \
+                         is already associated with the KMS key"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
         // "Without its key material, the KMS key is unusable": the key now has some, so
         // a key that was waiting for it becomes usable, and what the caller stated about
         // the material is kept for `DescribeKey` to report and for the material to
         // expire by.
-        let key_material_id = key.import_key_material(
-            material,
-            crate::state::ImportedKeyMaterial {
-                expiration_model,
-                valid_to,
-                // "If you do not specify a key material description, KMS retains the
-                // value you specified when you last imported the same key material into
-                // this KMS key."
-                description: input.key_material_description.clone(),
-            },
-        );
+        //
+        // NEW material for a key that ALREADY has material is not that: it "has been
+        // imported for on-demand key rotation but the rotation hasn't completed"
+        // (`smithy_query(query="doc",shape="RotationsListEntry",member="KeyMaterialState"`),
+        // so it waits in `PENDING_ROTATION` beside the material the key still encrypts
+        // under until `RotateKeyOnDemand` makes it current. That state is "only used in
+        // symmetric encryption keys with imported key material" (the same doc), as
+        // `ImportType` itself is "only usable with symmetric encryption keys", so for
+        // every other key an import IS the key's material, whatever it held before.
+        let imported = crate::state::ImportedKeyMaterial {
+            expiration_model,
+            valid_to,
+            // "If you do not specify a key material description, KMS retains the
+            // value you specified when you last imported the same key material into
+            // this KMS key."
+            description: input.key_material_description.clone(),
+        };
+        // Material whose `ValidTo` has passed is material KMS has already taken away —
+        // "when the key material expires, KMS deletes the key material from the KMS key.
+        // Without its key material, the KMS key is unusable"
+        // (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`),
+        // which is why a reader reports such a key as waiting for material — so a key
+        // holding only expired material has nothing to rotate FROM, and this import is
+        // the material it gets rather than one waiting for a rotation.
+        let stages_rotation = import_type == IMPORT_TYPE_NEW_KEY_MATERIAL
+            && symmetric_encryption
+            && holds_material
+            && !key.key_material_expired();
+        let key_material_id = if stages_rotation {
+            key.stage_key_material(material, imported)
+        } else {
+            key.import_key_material(material, imported)
+        };
 
         Ok(ImportKeyMaterialOutput {
             // KMS answers with the key ARN, not the identifier the request used.
@@ -571,6 +641,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_material_id,
         })
     }
+}
+
+/// Everything about the KMS key an import is judged against, read from the store ONCE
+/// so no check holds a borrow of it while the import is written.
+///
+/// A record rather than a tuple because the facts are of the same types and are read in
+/// different places: `key_state` and `state_message` are the key's own key state and the
+/// refusal that state words, `held_material_id` is the `KeyMaterialId` a request may
+/// name, and `holds_material` and `symmetric_encryption` are what decide whether an
+/// import of NEW material replaces the key's material or waits for a rotation.
+struct KeyFacts {
+    key_id: String,
+    key_arn: String,
+    origin: String,
+    key_state: String,
+    state_message: String,
+    key_spec: String,
+    held_material_id: Option<String>,
+    holds_material: bool,
+    symmetric_encryption: bool,
 }
 
 /// Refuse an identifier this operation cannot resolve to a key: `InvalidArnException`

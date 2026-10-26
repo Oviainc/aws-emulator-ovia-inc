@@ -41,8 +41,9 @@ use super::data_source_registry::created_domain;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 use super::index_registry::{created_index, get as get_index};
 
-/// `UpdateIndex`: `PUT /opensearch/domain/{DomainName}/index/{IndexName}`.
-async fn update(emulator: &Emulator, domain: &str, index: &str, schema: &Value) -> Answer {
+/// `UpdateIndex`: `PUT /opensearch/domain/{DomainName}/index/{IndexName}`. A sibling
+/// suite drives the same path, rather than growing a second copy of it.
+pub(crate) async fn update(emulator: &Emulator, domain: &str, index: &str, schema: &Value) -> Answer {
     emulator
         .call(
             "PUT",
@@ -53,7 +54,13 @@ async fn update(emulator: &Emulator, domain: &str, index: &str, schema: &Value) 
 }
 
 /// An update that must be accepted, asserting the status it reports.
-async fn updated_index(emulator: &Emulator, domain: &str, index: &str, schema: &Value, case: &str) {
+pub(crate) async fn updated_index(
+    emulator: &Emulator,
+    domain: &str,
+    index: &str,
+    schema: &Value,
+    case: &str,
+) {
     let answer = update(emulator, domain, index, schema).await;
     assert_eq!(
         answer.status, 200,
@@ -73,7 +80,7 @@ async fn updated_index(emulator: &Emulator, domain: &str, index: &str, schema: &
 }
 
 /// The schema `GetIndex` reports for `index`, with the case named on failure.
-async fn read_schema(emulator: &Emulator, domain: &str, index: &str, case: &str) -> Value {
+pub(crate) async fn read_schema(emulator: &Emulator, domain: &str, index: &str, case: &str) -> Value {
     let read = get_index(emulator, domain, index).await;
     assert_eq!(
         read.status, 200,

@@ -31,9 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The API version every path of this service is prefixed with.
 pub(crate) const PREFIX: &str = "/2021-01-01";
 
-/// Long enough for the emulator's provisioning span (500 ms) to have fallen due, so
-/// the next read materialises the settled configuration.
-pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(700);
+/// Long enough for the LONGEST span this emulator owes a clock move (the 750 ms a
+/// change to a domain's package associations takes; a domain's own provisioning span is
+/// shorter) to have fallen due, so the next read materialises the settled record.
+pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(900);
 
 /// One emulator with this service mounted on a fresh shared engine.
 pub(crate) struct Emulator {
