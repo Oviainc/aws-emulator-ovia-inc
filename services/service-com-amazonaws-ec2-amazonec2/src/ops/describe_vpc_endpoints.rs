@@ -246,7 +246,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state_handle = state::require_service_state(&*self.engine)?;
-        let store = state_handle.lock();
+        let mut store = state_handle.lock();
+        // A `Pending` endpoint reaches `Available` at an instant the clock owes it, whether
+        // or not anybody called — so the moves already due are applied before this report
+        // reads the store, and two reports either side of that instant differ because the
+        // CLOCK passed it and not because this call changed anything
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+        store.materialize_due_transitions();
 
         // "The IDs of the VPC endpoints" (`VpcEndpointIds`): an id that names no endpoint
         // of the account is an error and not an absent row — which is what lets a client
