@@ -589,6 +589,29 @@ fn cost_types_apply(budget: &Budget) -> bool {
         && budget.metrics.is_none()
 }
 
+/// Store the cost-types selection the budget HAS, and nothing else.
+///
+/// `CostTypes` is a member of the budget only while [`cost_types_apply`] holds: it is
+/// "the types of costs that are included in this `COST` budget", and a budget of any
+/// other type "do[es] not have `CostTypes`" (`Budget$CostTypes`). So the write path
+/// settles the member against the budget it is writing rather than only defaulting it:
+///
+/// * a budget that has cost types reads back with every member of them, each the value
+///   the caller sent or the documented per-member default
+///   ([`apply_cost_type_defaults`]), so one is stored even for a request that carried
+///   none;
+/// * a budget that has none reads back with NO `CostTypes` at all, whatever the request
+///   carried for it — a selection the budget cannot hold is dropped rather than
+///   persisted and echoed by every later read, the same treatment a member the service
+///   itself owns gets ([`drop_service_derived`]).
+fn settle_cost_types(budget: &mut Budget) {
+    if !cost_types_apply(budget) {
+        budget.cost_types = None;
+        return;
+    }
+    apply_cost_type_defaults(budget.cost_types.get_or_insert_with(CostTypes::default));
+}
+
 /// The `BudgetType` that has cost types.
 const COST_BUDGET_TYPE: &str = "COST";
 
@@ -712,8 +735,8 @@ fn is_period_start(time_unit: &str, secs: i64) -> bool {
 /// * `TimePeriod` — a budget always covers a period; an absent `Start` or `End` takes
 ///   its documented default (see [`default_time_period_start`] / [`default_time_period_end`]).
 /// * `CostTypes` — the unset members of a `COST` budget's cost types take their
-///   documented defaults, unless the budget uses the `FilterExpression`/`Metrics` syntax
-///   instead (see [`cost_types_apply`]).
+///   documented defaults, and a budget whose type has no cost types at all is stored
+///   with none whatever the request carried (see [`settle_cost_types`]).
 /// * `HealthStatus` — the operational state of the billing-view-derived resource, which
 ///   the caller does not set. `previous` carries the status the budget already had: the
 ///   status did not change because somebody edited the budget, so neither does its
@@ -738,9 +761,7 @@ pub fn stamp_service_owned(budget: &mut Budget, at: SystemTime, previous: Option
         period.end = Some(default_time_period_end());
     }
 
-    if cost_types_apply(budget) {
-        apply_cost_type_defaults(budget.cost_types.get_or_insert_with(CostTypes::default));
-    }
+    settle_cost_types(budget);
 
     budget.health_status = Some(previous.unwrap_or_else(|| HealthStatus {
         status: Some(HEALTH_STATUS_HEALTHY.to_string()),

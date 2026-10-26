@@ -319,11 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let mut budget = input.budget;
             // The members the service, not the caller, decides — the `LastUpdatedTime` it
-            // stamps, the defaulted `TimePeriod` / `CostTypes` / utilization `BudgetLimit`,
-            // the `HealthStatus`, and the spend and auto-adjust figures it derives from
-            // the cost it tracks (dropped, not echoed) — are materialised here, so every
-            // later read reports what was stored rather than recomputing anything per
-            // request.
+            // stamps, the defaulted `TimePeriod` / utilization `BudgetLimit`, the
+            // `CostTypes` settled against the budget's own type, the `HealthStatus`, and
+            // the spend and auto-adjust figures it derives from the cost it tracks
+            // (dropped, not echoed) — are materialised here, so every later read reports
+            // what was stored rather than recomputing anything per request.
             crate::state::stamp_service_owned(&mut budget, now, None);
             let notifications: Vec<crate::state::StoredNotification> = input
                 .notifications_with_subscribers
