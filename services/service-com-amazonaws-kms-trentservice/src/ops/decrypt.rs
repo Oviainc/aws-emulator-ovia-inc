@@ -433,11 +433,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::KeyRef::Found(_) => {
                     return Err(DecryptErrorModeled::IncorrectKeyException(
                         IncorrectKeyException {
-                            message: Some(format!(
-                                "The key {requested} cannot decrypt the ciphertext, which \
-                                 was encrypted by {}.",
-                                key.arn
-                            )),
+                            message: Some(crate::state::INCORRECT_KEY_MESSAGE.to_string()),
                         },
                     )
                     .into());

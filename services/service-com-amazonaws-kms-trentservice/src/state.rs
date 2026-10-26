@@ -951,6 +951,20 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
     }
 }
 
+/// How a request that pins a ciphertext to a KMS key other than the one that sealed it
+/// is refused: "the KeyId in a Decrypt request and the SourceKeyId in a ReEncrypt
+/// request must identify the same KMS key that was used to encrypt the ciphertext"
+/// (`smithy_query(query="doc",shape="IncorrectKeyException")`).
+///
+/// KMS words this refusal as entirely FIXED text that names neither key: the identifier
+/// the request gave is the whole of what is wrong with it, and the key that did seal the
+/// ciphertext is not disclosed to a caller who never named it.
+///
+/// One constant for the whole service, so `Decrypt` and `ReEncrypt` cannot word the same
+/// refusal differently.
+pub const INCORRECT_KEY_MESSAGE: &str =
+    "The key ID in the request does not identify a CMK that can perform this operation.";
+
 /// How a request addressing a resource through an ARN that names no account is
 /// refused: KMS answers an authorization failure, and words it the way every AWS
 /// service words one — naming the principal it refused, the IAM action it refused, and

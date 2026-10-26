@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReEncrypt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReEncrypt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: opens the ciphertext with the key material that sealed it and re-seals
+//! the recovered plaintext under the destination KMS key. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReEncrypt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is exactly `Decrypt` followed by `Encrypt`, performed entirely inside
+//! the service: [`crate::state::parse_envelope`] reads which key sealed the blob,
+//! [`crate::state::unseal`] recovers the plaintext under the SOURCE encryption context
+//! (trying every retained material version, so a ciphertext sealed before a rotation
+//! still opens), and [`crate::state::seal`] builds a fresh envelope under the
+//! destination key's CURRENT material and the DESTINATION encryption context. The
+//! plaintext never leaves the handler, and the two reported key material ids are read
+//! from the material that actually did each half.
+//!
+//! One deliberate divergence, the same one `Encrypt` and `Decrypt` carry: `GrantTokens`.
+//! A request that presents one is treated as drawing its permission FROM the grant the
+//! token names — the grant must be on that key, permit `ReEncryptFrom` (source) or
+//! `ReEncryptTo` (destination), and have its encryption-context constraints met. In the
+//! real service a grant token is ADDITIVE, but a handler here has no caller identity to
+//! evaluate a key or IAM policy against, so a presented token is the only permission
+//! there is to judge.
 //!
 //! ## Shape of an operation
 //!
@@ -299,18 +310,425 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReEncrypt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReEncryptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReEncrypt"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ReEncryptErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+        let dry_run = input.dry_run == Some(true);
+        // "DryRunModifiers is an optional parameter that only applies when DryRun is set
+        // to true. When set to IGNORE_CIPHERTEXT, KMS performs only authorization
+        // validation without ciphertext validation"
+        // (`smithy_query(query="doc",shape="ReEncryptRequest",member="DryRunModifiers")`).
+        let ignore_ciphertext = dry_run
+            && input
+                .dry_run_modifiers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|modifier| modifier == DRY_RUN_MODIFIER_IGNORE_CIPHERTEXT);
+
+        // The envelope of a symmetric ciphertext names the key whose material sealed it,
+        // which is why `SourceKeyId` is optional: "KMS can get this information from
+        // metadata that it adds to the symmetric ciphertext blob". Waiving ciphertext
+        // validation is the one case with no envelope to read, so there the request has
+        // to name the source key itself.
+        let envelope = if ignore_ciphertext {
+            None
+        } else {
+            let Some(blob) = input.ciphertext_blob.as_deref() else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "CiphertextBlob is required and was not provided",
+                ));
+            };
+            match crate::state::parse_envelope(blob) {
+                Some(envelope) => Some(envelope),
+                None => return Err(invalid_ciphertext()),
+            }
+        };
+
+        // Every read of the store happens inside this block, so the shared borrow it
+        // takes is over before the key usage below is recorded.
+        let rewrapped = {
+            let grants = match state.grants_for_tokens(&region, &tokens) {
+                Ok(grants) => grants,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(ReEncryptErrorModeled::InvalidGrantTokenException(
+                        InvalidGrantTokenException {
+                            message: Some("The specified grant token is not valid.".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+
+            let source_key = match &envelope {
+                Some(envelope) => {
+                    // The key the envelope names is the only one that can open the
+                    // ciphertext. A key that no longer exists in this Region cannot.
+                    let Some(sealed_under) = state.key_in(&region, &envelope.key_id) else {
+                        return Err(not_found(crate::state::key_not_found_message(
+                            &region,
+                            &envelope.key_id,
+                        )));
+                    };
+                    // "When you use the SourceKeyId parameter to specify a KMS key, KMS
+                    // uses only the KMS key you specify. If the ciphertext was encrypted
+                    // under a different KMS key, the ReEncrypt operation fails" — with
+                    // `IncorrectKeyException`, whose documentation names this exact
+                    // check. An identifier that names no key at all is the same
+                    // `NotFoundException` any other operation answers for it.
+                    if let Some(requested) = input.source_key_id.as_deref() {
+                        match state.resolve(&region, requested) {
+                            crate::state::KeyRef::Found(key)
+                                if key.key_id == sealed_under.key_id => {}
+                            crate::state::KeyRef::Found(_) => {
+                                return Err(ReEncryptErrorModeled::IncorrectKeyException(
+                                    IncorrectKeyException {
+                                        message: Some(
+                                            crate::state::INCORRECT_KEY_MESSAGE.to_string(),
+                                        ),
+                                    },
+                                )
+                                .into());
+                            }
+                            crate::state::KeyRef::UnauthorizedAccount => {
+                                return Err(crate::state::unauthorized_account(
+                                    Self::NAME,
+                                    requested,
+                                ));
+                            }
+                            crate::state::KeyRef::NotFound
+                            | crate::state::KeyRef::MalformedArn => {
+                                return Err(not_found(crate::state::key_not_found_message(
+                                    &region, requested,
+                                )));
+                            }
+                        }
+                    }
+                    sealed_under
+                }
+                None => {
+                    // "This parameter is required … when DryRun is true and
+                    // DryRunModifiers is set to IGNORE_CIPHERTEXT"
+                    // (`smithy_query(query="doc",shape="ReEncryptRequest",member="SourceKeyId")`).
+                    let Some(requested) = input.source_key_id.as_deref() else {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "SourceKeyId is required when DryRunModifiers is \
+                             IGNORE_CIPHERTEXT",
+                        ));
+                    };
+                    match state.resolve(&region, requested) {
+                        crate::state::KeyRef::Found(key) => key,
+                        crate::state::KeyRef::UnauthorizedAccount => {
+                            return Err(crate::state::unauthorized_account(Self::NAME, requested));
+                        }
+                        crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                            return Err(not_found(crate::state::key_not_found_message(
+                                &region, requested,
+                            )));
+                        }
+                    }
+                }
+            };
+
+            // "To reencrypt the data, you must use the DestinationKeyId parameter to
+            // specify the KMS key that re-encrypts the data after it is decrypted."
+            let destination_key = match state.resolve(&region, &input.destination_key_id) {
+                crate::state::KeyRef::Found(key) => key,
+                crate::state::KeyRef::UnauthorizedAccount => {
+                    return Err(crate::state::unauthorized_account(
+                        Self::NAME,
+                        &input.destination_key_id,
+                    ));
+                }
+                crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                    return Err(not_found(crate::state::key_not_found_message(
+                        &region,
+                        &input.destination_key_id,
+                    )));
+                }
+            };
+
+            // Both halves run on a key that has to be usable right now, and the
+            // destination is judged even though nothing is written to it: a dry run and
+            // a real call refuse the same requests.
+            let source_algorithm = input
+                .source_encryption_algorithm
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string()
+                });
+            let destination_algorithm = input
+                .destination_encryption_algorithm
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string()
+                });
+
+            for (key, algorithm, verb, asymmetric) in [
+                (
+                    source_key,
+                    source_algorithm.as_str(),
+                    "decrypt",
+                    "ReEncrypt with an asymmetric source KMS key",
+                ),
+                (
+                    destination_key,
+                    destination_algorithm.as_str(),
+                    "encrypt",
+                    "ReEncrypt with an asymmetric destination KMS key",
+                ),
+            ] {
+                if let Some(refusal) = key_state_refusal(key) {
+                    return Err(refusal);
+                }
+                if let Some(refusal) = capability_refusal(key, algorithm, verb, asymmetric) {
+                    return Err(refusal);
+                }
+            }
+
+            // Each half draws on its own grant permission and its own encryption
+            // context, which is why KMS grants the two halves separately.
+            if !tokens.is_empty() {
+                for (key, grant_operation, context) in [
+                    (
+                        source_key,
+                        GRANT_OPERATION_RE_ENCRYPT_FROM,
+                        input.source_encryption_context.as_ref(),
+                    ),
+                    (
+                        destination_key,
+                        GRANT_OPERATION_RE_ENCRYPT_TO,
+                        input.destination_encryption_context.as_ref(),
+                    ),
+                ] {
+                    if let Some(refusal) = grant_refusal(&grants, key, grant_operation, context) {
+                        return Err(refusal);
+                    }
+                }
+            }
+
+            let Some(envelope) = &envelope else {
+                // Only a dry run that waived ciphertext validation gets here, and a dry
+                // run never produces a ciphertext.
+                return Err(dry_run_refusal());
+            };
+
+            // The source encryption context is authenticated, not stored: a context that
+            // differs from the one the ciphertext was sealed with fails the tag, exactly
+            // as a tampered ciphertext does.
+            let Some(opened) = crate::state::unseal(
+                source_key,
+                envelope,
+                input.source_encryption_context.as_ref(),
+            ) else {
+                return Err(invalid_ciphertext());
+            };
+
+            // A dry run that did validate the ciphertext is refused here: every check
+            // has run and nothing has been produced.
+            if dry_run {
+                return Err(dry_run_refusal());
+            }
+
+            let Some(ciphertext_blob) = crate::state::seal(
+                destination_key,
+                &opened.plaintext,
+                input.destination_encryption_context.as_ref(),
+            ) else {
+                return Err(ReEncryptErrorModeled::KMSInternalException(KMSInternalException {
+                    message: Some("the plaintext could not be reencrypted".to_string()),
+                })
+                .into());
+            };
+
+            Rewrapped {
+                ciphertext_blob,
+                source_key_id: source_key.key_id.clone(),
+                source_arn: source_key.arn.clone(),
+                // The material that actually opened the ciphertext, which after a
+                // rotation need not be the source key's current one.
+                source_key_material_id: opened.key_material_id,
+                source_algorithm,
+                destination_key_id: destination_key.key_id.clone(),
+                destination_arn: destination_key.arn.clone(),
+                // The material that sealed the new ciphertext, which is the destination
+                // key's current one.
+                destination_key_material_id: destination_key.material.id(),
+                destination_algorithm,
+            }
+        };
+
+        // Both keys were just used in a successful cryptographic operation, which is
+        // what `GetKeyLastUsage` reports. A reencrypt to the same key used it once.
+        state.record_last_usage(&region, &rewrapped.source_key_id, Self::NAME);
+        if rewrapped.destination_key_id != rewrapped.source_key_id {
+            state.record_last_usage(&region, &rewrapped.destination_key_id, Self::NAME);
+        }
+
+        // KMS answers with each key's ARN, not the identifier the request used.
+        Ok(ReEncryptOutput {
+            ciphertext_blob: Some(rewrapped.ciphertext_blob),
+            source_key_id: Some(rewrapped.source_arn),
+            key_id: Some(rewrapped.destination_arn),
+            source_encryption_algorithm: Some(rewrapped.source_algorithm),
+            destination_encryption_algorithm: Some(rewrapped.destination_algorithm),
+            source_key_material_id: rewrapped.source_key_material_id,
+            destination_key_material_id: rewrapped.destination_key_material_id,
+        })
     }
+}
+
+/// The `DryRunModifierType` that waives ciphertext validation
+/// (`crate::ops::types::DRY_RUN_MODIFIER_TYPE_VALUES`).
+const DRY_RUN_MODIFIER_IGNORE_CIPHERTEXT: &str = "IGNORE_CIPHERTEXT";
+
+/// The `GrantOperation` that permits the DECRYPT half of this operation
+/// (`crate::state::GRANT_OPERATION_PROFILES`).
+const GRANT_OPERATION_RE_ENCRYPT_FROM: &str = "ReEncryptFrom";
+
+/// The `GrantOperation` that permits the ENCRYPT half of this operation. See
+/// [`GRANT_OPERATION_RE_ENCRYPT_FROM`].
+const GRANT_OPERATION_RE_ENCRYPT_TO: &str = "ReEncryptTo";
+
+/// What the two halves produced, as owned values — so the store's shared borrow is
+/// released before this operation's key usage is written.
+struct Rewrapped {
+    ciphertext_blob: Vec<u8>,
+    source_key_id: String,
+    source_arn: String,
+    source_key_material_id: Option<String>,
+    source_algorithm: String,
+    destination_key_id: String,
+    destination_arn: String,
+    destination_key_material_id: Option<String>,
+    destination_algorithm: String,
+}
+
+/// Refuse a key whose key state is not one a cryptographic operation can run under: a
+/// disabled key answers `DisabledException`, and any other unusable state answers
+/// `KMSInvalidStateException`, which names the state the key is actually in.
+fn key_state_refusal(key: &crate::state::Cmk) -> Option<ReEncryptError> {
+    if key.is_usable() {
+        return None;
+    }
+    if key.key_state == crate::state::KEY_STATE_DISABLED {
+        return Some(
+            ReEncryptErrorModeled::DisabledException(DisabledException {
+                message: Some(crate::state::invalid_state_message(key)),
+            })
+            .into(),
+        );
+    }
+    Some(
+        ReEncryptErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+            message: Some(crate::state::invalid_state_message(key)),
+        })
+        .into(),
+    )
+}
+
+/// Refuse a key that cannot perform `verb`, or an algorithm its key spec does not
+/// support: "for encrypting, decrypting, re-encrypting, and generating data keys, the
+/// KeyUsage must be ENCRYPT_DECRYPT"
+/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+///
+/// An asymmetric ENCRYPT_DECRYPT key is a valid key for this operation, but it has no
+/// key pair here and the RSAES-OAEP / SM2PKE scheme it calls for is not implemented, so
+/// `asymmetric` reports that rather than answering with a ciphertext another scheme
+/// produced — the same treatment `Encrypt` gives it.
+fn capability_refusal(
+    key: &crate::state::Cmk,
+    algorithm: &str,
+    verb: &str,
+    asymmetric: &str,
+) -> Option<ReEncryptError> {
+    if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
+        return Some(invalid_key_usage(format!(
+            "{} has KeyUsage {}, which cannot be used to {verb}; it must be {}.",
+            key.arn,
+            key.key_usage,
+            crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+        )));
+    }
+    if key.key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT {
+        return Some(crate::scaffolded::Scaffolded::not_implemented(asymmetric));
+    }
+    if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
+        return Some(invalid_key_usage(format!(
+            "The encryption algorithm {algorithm} is incompatible with the key spec {} of \
+             {}; it must be {}.",
+            key.key_spec,
+            key.arn,
+            crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT
+        )));
+    }
+    None
+}
+
+/// Refuse one half of the operation when no grant the request's tokens name carries the
+/// permission it needs on that key.
+fn grant_refusal(
+    grants: &[&crate::state::Grant],
+    key: &crate::state::Cmk,
+    grant_operation: &str,
+    context: Option<&::std::collections::HashMap<String, String>>,
+) -> Option<ReEncryptError> {
+    if grants
+        .iter()
+        .any(|grant| grant.permits(&key.key_id, grant_operation, context))
+    {
+        return None;
+    }
+    Some(crate::scaffolded::Scaffolded::access_denied(
+        crate::state::grant_access_denied_message(grant_operation, &key.arn),
+    ))
+}
+
+/// Refuse a key or algorithm that cannot perform this operation.
+fn invalid_key_usage(message: impl Into<String>) -> ReEncryptError {
+    ReEncryptErrorModeled::InvalidKeyUsageException(InvalidKeyUsageException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The refusal for an identifier that names no key this endpoint holds.
+fn not_found(message: String) -> ReEncryptError {
+    ReEncryptErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "The request was rejected because the DryRun parameter was specified"
+/// (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run checks the
+/// request and then always fails, having produced nothing.
+fn dry_run_refusal() -> ReEncryptError {
+    ReEncryptErrorModeled::DryRunOperationException(DryRunOperationException {
+        message: Some(crate::state::DRY_RUN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The ciphertext is not one this service can open: it is not an envelope, or its
+/// authentication tag did not verify under the source key and encryption context given.
+fn invalid_ciphertext() -> ReEncryptError {
+    ReEncryptErrorModeled::InvalidCiphertextException(InvalidCiphertextException {
+        message: Some(
+            "The request was rejected because the specified ciphertext, or additional \
+             authenticated data incorporated into the ciphertext, such as the encryption \
+             context, is corrupted, missing, or otherwise invalid."
+                .to_string(),
+        ),
+    })
+    .into()
 }
