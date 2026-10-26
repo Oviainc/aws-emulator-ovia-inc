@@ -2236,6 +2236,20 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
         format_id(EXPERIMENT_ID_PREFIX, self.experiment_seq)
     }
 
+    /// The tag map of the resource `resource` names, for a call that REPORTS it
+    /// (`ListTagsForResource`), or `None` when this store holds no such record.
+    ///
+    /// Resolved exactly as [`Self::tags_mut`] resolves it, but through a shared borrow: the
+    /// tags a tag call wrote are the tags this reports, and reporting them changes nothing.
+    pub fn tags(&self, resource: TaggedResource<'_>) -> Option<&HashMap<String, String>> {
+        match resource {
+            TaggedResource::ExperimentTemplate(id) => {
+                self.experiment_templates.get(id).map(|record| &record.tags)
+            }
+            TaggedResource::Experiment(id) => self.experiments.get(id).map(|record| &record.tags),
+        }
+    }
+
     /// The tag map of the resource `resource` names, for a call that CHANGES it
     /// (`TagResource`), or `None` when this store holds no such record.
     ///

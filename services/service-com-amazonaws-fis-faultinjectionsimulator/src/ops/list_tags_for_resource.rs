@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags the resource `resourceArn` names carries, as the store holds them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read of the ONE tag map `TagResource` writes and the resource's own reader
+//! (`GetExperimentTemplate`, `GetExperiment`) reports, resolved through the same
+//! namespace resolver a tag call uses ([`crate::state::tagged_resource`]): an ARN that
+//! addresses nothing here is a bad request, an ARN naming a resource of this service the
+//! store holds no record of is a miss, and nothing changes either way.
 //!
 //! ## Shape of an operation
 //!
@@ -58,7 +56,19 @@
 //!
 //! ## Output
 //!
-//! * `tags` (TagMap, len 0..50) — The tags for the resource.
+//! * `tags` (TagMap, len 0..50) — The tags for the resource. Always reported, so a
+//!   resource carrying none answers an empty map rather than an absent member.
+//!
+//! ## Errors
+//!
+//! The operation shape lists none, so both refusals below are shapes this SERVICE models,
+//! widened in through `extra_errors` — the same two a tag call of the same resource
+//! answers, so a read and a write cannot disagree about which ARNs this service addresses:
+//!
+//! * `ValidationException` (HTTP 400) — the `resourceArn` is not a well-formed ARN of this
+//!   service naming a resource that carries tags.
+//! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
+//!   that the store holds no record of.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -71,12 +81,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.fis#ListTagsForResource")]
+// here — hence the `ListTagsForResourceError` alias below. This operation shape lists NO
+// errors, so the two this service models for every operation that resolves caller-supplied
+// input are widened in through `extra_errors`: `ValidationException` for a `resourceArn`
+// this service cannot address, and `ResourceNotFoundException` for an ARN naming a resource
+// the store does not hold.
+#[smithy_macros::operation_error(
+    "com.amazonaws.fis#ListTagsForResource",
+    extra_errors = ["ValidationException", "ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    ValidationException(ValidationException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -130,18 +147,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // Nothing here depends on request metadata: the resource is named by the ARN the
+        // request carries, not by the region it was signed for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // WHICH resource the ARN names is a property of the request, so it is read before
+        // the store is reached: an ARN that addresses nothing in this service's namespace
+        // is a bad request rather than a missing resource.
+        let resource = crate::state::tagged_resource(&input.resource_arn)
+            .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
+
+        // Reporting only: the guard is taken immutably, so this read cannot change what a
+        // later caller sees.
+        let store = state.lock();
+        let Some(tags) = store.tags(resource) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(resource),
+            )
+            .into());
+        };
+
+        // Reported even when it is empty: the member is the resource's tag map, and a
+        // resource carrying no tags has an empty one rather than none.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone()),
+        })
     }
 }

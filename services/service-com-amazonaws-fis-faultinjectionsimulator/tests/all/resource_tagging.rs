@@ -23,6 +23,11 @@
 //!
 //! The refusal tables assert the other half of the rule, each with the stored tags read
 //! back afterwards: a refused call writes NOTHING.
+//!
+//! The harness below — the resource builders, the tag-map helpers, the modelled ceilings
+//! and the table of ARNs this service cannot address — is `pub(crate)` because the tag
+//! READ suite (`list_tags_for_resource`) asserts its half of the same rule over the same
+//! resources, and the two suites must not drift on either.
 
 use std::collections::BTreeMap;
 
@@ -34,34 +39,34 @@ use crate::experiment_lifecycle::{create_template, emulator, send, Answer, FALLB
 /// `TagKey`'s published ceiling (`@length(min: 0, max: 128)` on
 /// `smithy_query(query="shape", shape="TagKey", …)`), spelled out here rather than
 /// imported from the crate so a wrong bound in `src/state.rs` fails this suite.
-const TAG_KEY_CEILING: usize = 128;
+pub(crate) const TAG_KEY_CEILING: usize = 128;
 
 /// `TagValue`'s published ceiling (`@length(min: 0, max: 256)`), spelled out for the same
 /// reason.
-const TAG_VALUE_CEILING: usize = 256;
+pub(crate) const TAG_VALUE_CEILING: usize = 256;
 
 /// The most tags one resource carries: `TagMap` is modelled `@length(min: 0, max: 50)`, so
 /// a resource holding more could not be reported in one.
-const TAGS_PER_RESOURCE: usize = 50;
+pub(crate) const TAGS_PER_RESOURCE: usize = 50;
 
 /// A well-formed IAM role ARN for the templates this suite creates. The emulator's IAM
 /// store holds no role for it, which is what lets `StartExperiment` accept it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-tagging-suite";
 
 /// The account id every ARN this emulator mints carries.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// A wait inside the 1..720 minutes FIS documents for `aws:fis:wait`'s `duration`.
 const WAIT_DURATION: &str = "PT5M";
 
 /// The `@httpLabel` form of an ARN: `resourceArn` is a NON-greedy label, so a client
 /// percent-encodes the `:` and `/` it carries before putting it in the path.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// A `clientToken` (`pattern ^[\S]+$`) derived from a case name.
-fn client_token(prefix: &str, case: &str) -> String {
+pub(crate) fn client_token(prefix: &str, case: &str) -> String {
     let slug: String = case
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -70,7 +75,11 @@ fn client_token(prefix: &str, case: &str) -> String {
 }
 
 /// `TagResource`: apply `tags` to the resource `resource_arn` names.
-async fn tag_resource(router: &MultiServiceRouter, resource_arn: &str, tags: &Value) -> Answer {
+pub(crate) async fn tag_resource(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tags: &Value,
+) -> Answer {
     send(
         router,
         "POST",
@@ -84,13 +93,13 @@ async fn tag_resource(router: &MultiServiceRouter, resource_arn: &str, tags: &Va
 /// Which taggable resource a case tags. These are the two records of this service that
 /// carry caller tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     ExperimentTemplate,
     Experiment,
 }
 
 impl Kind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ExperimentTemplate => "experiment template",
             Self::Experiment => "experiment",
@@ -99,19 +108,19 @@ impl Kind {
 }
 
 /// One live resource: the ARN a tag call names it by, and where its own reader reports it.
-struct Resource {
-    arn: String,
-    read_uri: String,
-    member: &'static str,
+pub(crate) struct Resource {
+    pub(crate) arn: String,
+    pub(crate) read_uri: String,
+    pub(crate) member: &'static str,
 }
 
 /// The `aws:fis:wait` action every template in this suite declares.
-fn wait_action() -> Value {
+pub(crate) fn wait_action() -> Value {
     json!({ "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } })
 }
 
 /// Create a template carrying `tags` and report its id and ARN.
-async fn new_template(
+pub(crate) async fn new_template(
     router: &MultiServiceRouter,
     case: &str,
     tags: &Value,
@@ -146,7 +155,7 @@ async fn new_template(
 }
 
 /// One resource of kind `kind`, created carrying `tags`.
-async fn new_resource(
+pub(crate) async fn new_resource(
     router: &MultiServiceRouter,
     kind: Kind,
     case: &str,
@@ -201,7 +210,11 @@ async fn new_resource(
 }
 
 /// The resource as its own reader reports it.
-async fn read_resource(router: &MultiServiceRouter, resource: &Resource, case: &str) -> Value {
+pub(crate) async fn read_resource(
+    router: &MultiServiceRouter,
+    resource: &Resource,
+    case: &str,
+) -> Value {
     let answer = send(router, "GET", &resource.read_uri, None, FALLBACK_REGION).await;
     assert_eq!(
         answer.status, 200,
@@ -212,7 +225,7 @@ async fn read_resource(router: &MultiServiceRouter, resource: &Resource, case: &
 }
 
 /// The tag map a reported resource carries.
-fn tags_of(record: &Value, case: &str) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(record: &Value, case: &str) -> BTreeMap<String, String> {
     record["tags"]
         .as_object()
         .unwrap_or_else(|| panic!("case {case:?}: no tags map in {record:?}"))
@@ -236,7 +249,7 @@ fn without_tags(record: &Value) -> Value {
 }
 
 /// A JSON tag map from pairs.
-fn tag_map(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(String, String)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -246,7 +259,7 @@ fn tag_map(pairs: &[(String, String)]) -> Value {
 }
 
 /// `count` distinct tags, for the rows about how many a resource carries.
-fn generated(count: usize, value: &str) -> Vec<(String, String)> {
+pub(crate) fn generated(count: usize, value: &str) -> Vec<(String, String)> {
     (0..count)
         .map(|index| (format!("key-{index:02}"), format!("{value}-{index:02}")))
         .collect()
@@ -254,14 +267,14 @@ fn generated(count: usize, value: &str) -> Vec<(String, String)> {
 
 /// One row: the tags the resource is created with, the tag maps applied to it in order,
 /// and the tags its reader must report afterwards.
-struct Row {
-    case: String,
-    initial: Vec<(String, String)>,
-    applies: Vec<Vec<(String, String)>>,
-    expected: Vec<(String, String)>,
+pub(crate) struct Row {
+    pub(crate) case: String,
+    pub(crate) initial: Vec<(String, String)>,
+    pub(crate) applies: Vec<Vec<(String, String)>>,
+    pub(crate) expected: Vec<(String, String)>,
 }
 
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -404,7 +417,7 @@ async fn applied_tags_are_merged_onto_the_resource_its_reader_reports() {
 }
 
 /// An ARN that addresses nothing in this service's namespace, with the reason it does not.
-fn unaddressable_arns() -> Vec<(&'static str, String)> {
+pub(crate) fn unaddressable_arns() -> Vec<(&'static str, String)> {
     vec![
         (
             "a value that is not an ARN at all",
