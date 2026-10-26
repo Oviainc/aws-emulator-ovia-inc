@@ -116,19 +116,89 @@ fn resource_tag_pair(tag: &ResourceTag) -> (&str, &str) {
     )
 }
 
+/// The modelled 402 envelope every quota refusal of this service takes: the bound's own
+/// sentence, and the sole `Reason` the model declares for the error.
+///
+/// Each quota below states its own `message` and nothing else, so no caller of this
+/// module re-types the reason enum or decides again which members the body carries.
+fn quota_exceeded(message: String) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(message),
+        reason: Some(SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
+    }
+}
+
 /// The modelled 402 for a request that would push a resource tag key and value pair
 /// past [`MAX_RULES_PER_RESOURCE_TAG`].
 ///
 /// The message states the quota, not the pair the request named: the bound is a fact of
 /// the service, and nothing of the request is echoed back.
 pub fn resource_tag_quota_exceeded() -> ServiceQuotaExceededException {
-    ServiceQuotaExceededException {
-        message: Some(format!(
-            "The request would exceed the quota of {MAX_RULES_PER_RESOURCE_TAG} retention \
-             rules per resource tag key and value pair"
-        )),
-        reason: Some(SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
+    quota_exceeded(format!(
+        "The request would exceed the quota of {MAX_RULES_PER_RESOURCE_TAG} retention \
+         rules per resource tag key and value pair"
+    ))
+}
+
+/// Which retention rule a request past the tags-per-resource quota would have left
+/// holding its tags, which is all the refusal's wording turns on: the rule the request
+/// asked to MINT, or the stored rule it addressed.
+///
+/// The two operations held to [`MAX_TAGS_PER_RULE`] — `CreateRule` and `TagResource` —
+/// differ in nothing else, so both reach the body through [`tag_quota_exceeded`] and
+/// neither can word the refusal class its own way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedRule {
+    /// The rule a create would have minted carrying the request's tags.
+    Created,
+    /// The stored rule a tag assignment addressed.
+    Addressed,
+}
+
+impl TaggedRule {
+    /// What the message says the request would do, ahead of the tag count.
+    fn clause(self) -> &'static str {
+        match self {
+            Self::Created => "create a retention rule with",
+            Self::Addressed => "leave the retention rule with",
+        }
     }
+}
+
+/// The modelled 402 for a request that would leave a retention rule carrying more tags
+/// than [`MAX_TAGS_PER_RULE`] allows.
+///
+/// `tags` is the number the rule would be left HOLDING, not the number the request
+/// names: assignment replaces a key's value rather than adding a second tag for it.
+pub fn tag_quota_exceeded(rule: TaggedRule, tags: usize) -> ServiceQuotaExceededException {
+    quota_exceeded(format!(
+        "The request would {} {tags} tags, exceeding the quota of {MAX_TAGS_PER_RULE} \
+         tags per resource",
+        rule.clause()
+    ))
+}
+
+/// The modelled 402 for a create the Region's own published quota of retention rules
+/// ([`MAX_RULES`]) leaves no room for.
+///
+/// The message states the quota alone: how many rules the Region already holds is the
+/// count that reached it, and the bound is the fact the caller can act on.
+pub fn rule_quota_exceeded() -> ServiceQuotaExceededException {
+    quota_exceeded(format!(
+        "The request would exceed the quota of {MAX_RULES} retention rules per Region"
+    ))
+}
+
+/// The modelled 402 for a create the emulator's own ceiling on the WHOLE store
+/// ([`RULE_STORE_LIMIT`]) leaves no room for, whatever Region the request is signed for.
+///
+/// `stored` is how many rules the store holds, which is what distinguishes this refusal
+/// from the per-Region one above.
+pub fn rule_store_full(stored: usize) -> ServiceQuotaExceededException {
+    quota_exceeded(format!(
+        "this emulator already holds {stored} retention rules, the most it \
+         stores ({RULE_STORE_LIMIT})"
+    ))
 }
 
 /// Assign `tags` to the tag list `held`, keyed by tag key.

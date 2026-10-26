@@ -249,15 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::upsert_tags(&mut tags, input.tags.unwrap_or_default());
         if tags.len() > crate::state::MAX_TAGS_PER_RULE {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "The request would create a retention rule with {} tags, \
-                         exceeding the quota of {} tags per resource",
-                        tags.len(),
-                        crate::state::MAX_TAGS_PER_RULE
-                    )),
-                    reason: Some("SERVICE_QUOTA_EXCEEDED".to_string()),
-                },
+                crate::state::tag_quota_exceeded(crate::state::TaggedRule::Created, tags.len()),
             )
             .into());
         }
@@ -269,14 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store.rules.len();
         if stored >= crate::state::RULE_STORE_LIMIT {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this emulator already holds {stored} retention rules, the most it \
-                         stores ({})",
-                        crate::state::RULE_STORE_LIMIT
-                    )),
-                    reason: Some(crate::state::SERVICE_QUOTA_REASON_EXCEEDED.to_string()),
-                },
+                crate::state::rule_store_full(stored),
             )
             .into());
         }
@@ -288,13 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // neither this Region's quota nor its endpoint.
         if store.rule_count_in_region(&region) >= crate::state::MAX_RULES {
             return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "The request would exceed the quota of {} retention rules per Region",
-                        crate::state::MAX_RULES
-                    )),
-                    reason: Some("SERVICE_QUOTA_EXCEEDED".to_string()),
-                },
+                crate::state::rule_quota_exceeded(),
             )
             .into());
         }
