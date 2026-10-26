@@ -161,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // "Lists the Recycle Bin retention rules in the Region": a rule exists only in
+        // the Region it was created in, so this reports the rules of the Region the
+        // request is signed for and no other's.
+        let region = crate::state::request_region(ctx.parts());
 
         // A `NextToken` this service did not mint resolves to no cursor at all;
         // answering the first page instead would silently restart the walk.
@@ -200,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut rules = Vec::new();
         let mut last_reported: Option<&String> = None;
         let mut next_token = None;
-        for (identifier, rule) in store.page_from(resume_after.as_deref()) {
+        for (identifier, rule) in store.page_from(&region, resume_after.as_deref()) {
             // Only rules of the requested type, with the requested lock state (when
             // one was named), carrying every resource/exclusion tag named as a filter.
             if rule.resource_type != input.resource_type {

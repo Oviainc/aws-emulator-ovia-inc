@@ -34,9 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AgentDetails, AggregateStatus, AntennaDemodDecodeDetails, ComponentStatusData, ConfigDetails,
-    ConfigTypeData, ContactVersion, AzElSegmentsData, DataflowDetail, Destination, DiscoveryData,
-    Eirp, EndpointDetails, EphemerisData, EphemerisMetaData, Frequency, FrequencyBandwidth,
+    AgentDetails, AggregateStatus, AntennaDemodDecodeDetails, AzElSegments, ComponentStatusData,
+    ConfigDetails, ConfigTypeData, ContactVersion, AzElSegmentsData, DataflowDetail, Destination,
+    DiscoveryData, Eirp, Elevation, EndpointDetails, EphemerisData, EphemerisMetaData, Frequency,
+    FrequencyBandwidth,
     InvalidParameterException, KmsKey, S3Object, S3RecordingDetails, Source, SpectrumConfig,
     TrackingOverrides,
 };
@@ -822,14 +823,24 @@ pub fn paginate<T: Clone>(
     offset: usize,
 ) -> (Vec<T>, Option<String>) {
     let start = offset.min(items.len());
-    let limit = match max_results {
-        Some(max) if max > 0 => (max as usize).min(MAX_PAGE_SIZE),
-        _ => MAX_PAGE_SIZE,
-    };
+    let limit = page_size(max_results);
     let end = start.saturating_add(limit).min(items.len());
     let page = items[start..end].to_vec();
     let next = (end < items.len()).then(|| encode_page_token(scope, end));
     (page, next)
+}
+
+/// How many items one page holds for a caller's `maxResults`: what it asked for, bounded by
+/// [`MAX_PAGE_SIZE`], and that bound when it asked for nothing.
+///
+/// [`paginate`] reads this to cut the page; a listing that COMPUTES its items reads it to
+/// know how many it can be asked for at most, so it materialises no more than the page it
+/// is answering can carry.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    match max_results {
+        Some(max) if max > 0 => (max as usize).min(MAX_PAGE_SIZE),
+        _ => MAX_PAGE_SIZE,
+    }
 }
 
 /// What an ARN this service minted points at, so an ARN-valued reference resolves in
@@ -1034,6 +1045,16 @@ pub const CONTACT_POSTPASS: &str = "POSTPASS";
 
 /// See [`CONTACT_PREPASS`].
 pub const CONTACT_COMPLETED: &str = "COMPLETED";
+
+/// The `ContactStatus` of a contact window the service OFFERS and nothing has reserved —
+/// the model's own value again (`smithy_query(query="shape", shape="ContactStatus")`).
+///
+/// No contact this store holds carries it: a reservation is admitted in
+/// [`CONTACT_SCHEDULING`] and never returns to being merely offered, so a listing asked for
+/// this status answers with the windows the pairing it names can still fly
+/// ([`ComAmazonawsGroundstationGroundstationState::available_contact_windows`]) rather than
+/// with anything selected from the store.
+pub const CONTACT_AVAILABLE: &str = "AVAILABLE";
 
 /// The statuses a contact moves through as the clock crosses its OWN timestamps, in
 /// lifecycle order; it is also the set of statuses that move along it at all.
@@ -2492,6 +2513,127 @@ pub fn ephemeris_invalid_reason(data: &EphemerisData) -> Option<&'static str> {
         .then_some(EPHEMERIS_TIME_RANGE_INVALID)
 }
 
+/// The elevation at which a satellite crosses a ground station's horizon, in either unit
+/// an `AzElSegments` measures its angles in: ZERO.
+///
+/// The model documents a pointing angle's `el` as "0 is the horizon, 90 is zenith, and
+/// negative values are below the horizon" for `DEGREE_ANGLE` and "0 is the horizon, π/2 is
+/// zenith, and negative values are below the horizon" for `RADIAN`
+/// (`smithy_query(query="doc", shape="TimeAzEl", member="el")`), so an angle puts the
+/// satellite above the horizon exactly when its `el` is at least this, whichever unit the
+/// segments carrying it are measured in.
+pub const HORIZON_ELEVATION: f64 = 0.0;
+
+/// One pass of a satellite over a ground station: the span the pointing data in force for
+/// that pairing keeps the antenna at or above the station's horizon, and the highest
+/// elevation the satellite reaches inside it.
+#[derive(Debug, Clone)]
+pub struct PassWindow {
+    /// The instant the satellite rises above the horizon.
+    pub start_time: DateTime,
+    /// The instant it sets below the horizon again.
+    pub end_time: DateTime,
+    /// The highest elevation the pointing data carries inside the window, in the
+    /// `angleUnit` of the segments it was read from — what a response reports as a
+    /// contact's `maximumElevation`.
+    pub maximum_elevation: Elevation,
+    /// The ephemeris whose pointing data this pass was read from.
+    pub ephemeris_id: String,
+    /// That ephemeris's `EphemerisType` ([`ephemeris_type_of`]).
+    pub ephemeris_type: String,
+}
+
+/// Most time-tagged pointing points ONE availability search reads, across every ephemeris in
+/// force for the pairing it is for; past it the search stops looking for further passes and
+/// answers with what it has.
+///
+/// NOT an AWS quota: `TimeAzElList` carries a minimum of five points and NO maximum
+/// (`smithy_query(query="shape", shape="TimeAzElList")`), so the pointing data an account can
+/// store is bounded only by the requests that stored it. This bounds the WORK one read of it
+/// does, so no single request can make a listing scan without limit — the same reason
+/// [`MAX_RECORDS_PER_STORE`] bounds the store itself. It is far above any pointing data a
+/// ground station network supplies: `AzElSegments` holds at most 100 segments
+/// (`smithy_query(query="shape", shape="AzElSegments")`), so this leaves 200 points per
+/// segment.
+pub const MAX_POINTING_POINTS_READ: usize = 20_000;
+
+/// Most passes ONE availability search reads, whatever window it asks about: past it the
+/// search stops and answers with the passes it has, so a window spanning decades
+/// materialises no more than this. A caller that wants fewer says so with `maxResults`,
+/// which cuts the page further ([`page_size`]).
+///
+/// It is a CONSTANT rather than something the request names, so every page of one search
+/// resolves the SAME sequence of windows and an offset into it means the same thing on
+/// every call. CHOSEN bound: [`MAX_PAGE_SIZE`] pages of it, so a caller can page through
+/// everything a search answers rather than being offered more than it can reach.
+pub const MAX_OFFERED_WINDOWS: usize = 5 * MAX_PAGE_SIZE;
+
+/// One pass as the azimuth-elevation segments carry it, before it is placed against the
+/// ephemeris it was read from: the span the satellite is above the horizon and the peak
+/// elevation inside it, in the segments' own `angleUnit`.
+struct AzElPass {
+    start: f64,
+    end: f64,
+    peak: f64,
+}
+
+/// The passes the azimuth-elevation segments `segments` describe.
+///
+/// A segment is time-tagged pointing data: each point gives "the antenna pointing direction
+/// at a specific time offset from the segment's reference epoch" (`smithy_query(query="shape",
+/// shape="TimeAzEl")`), so a point's instant is the segment's `referenceEpoch` plus its `dt`.
+/// A pass is then a maximal RUN of consecutive points at or above the horizon
+/// ([`HORIZON_ELEVATION`]) lying inside the segment's own `validTimeRange`, which is the span
+/// the segment's data is declared to cover; a run of a single point is an instant rather than
+/// a window, so it describes no pass.
+///
+/// `budget` is how many points may still be read ([`MAX_POINTING_POINTS_READ`]), counted down
+/// as they are: a search that spends it stops where it stands, so the work this does is
+/// bounded whatever the stored data holds.
+fn az_el_passes(segments: &AzElSegments, budget: &mut usize) -> Vec<AzElPass> {
+    let mut passes: Vec<AzElPass> = Vec::new();
+    for segment in &segments.az_el_segment_list {
+        let epoch = segment.reference_epoch.as_secs_f64();
+        let valid = (
+            segment.valid_time_range.start_time.as_secs_f64(),
+            segment.valid_time_range.end_time.as_secs_f64(),
+        );
+        // The run under way: its first instant, its latest instant and the highest
+        // elevation seen in it so far.
+        let mut run: Option<AzElPass> = None;
+        for point in &segment.az_el_list {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let at = epoch + point.dt;
+            let usable =
+                at >= valid.0 && at <= valid.1 && point.el >= HORIZON_ELEVATION;
+            if usable {
+                run = Some(match run {
+                    None => AzElPass {
+                        start: at,
+                        end: at,
+                        peak: point.el,
+                    },
+                    Some(open) => AzElPass {
+                        start: open.start,
+                        end: at,
+                        peak: open.peak.max(point.el),
+                    },
+                });
+            } else if let Some(pass) = run.take() {
+                passes.push(pass);
+            }
+        }
+        if let Some(pass) = run.take() {
+            passes.push(pass);
+        }
+    }
+    passes.retain(|pass| pass.end > pass.start);
+    passes
+}
+
 /// An ephemeris as `CreateEphemeris` stored it.
 #[derive(Debug, Clone)]
 pub struct Ephemeris {
@@ -3712,6 +3854,172 @@ impl ComAmazonawsGroundstationGroundstationState {
         self.placement_antennas(ground_station)
             .into_iter()
             .find(|antenna| !held.contains(antenna.as_str()))
+    }
+
+    /// The passes of the satellite `satellite_arn` over `ground_station` that the pointing
+    /// data in force for that pairing describes, in start-time order; empty when no pointing
+    /// data is in force for it.
+    ///
+    /// Pointing data is in force when it belongs to an ENABLED ephemeris
+    /// ([`EPHEMERIS_ENABLED`] — the same reading of "in force" as
+    /// [`Self::contacts_using_ephemeris`]) that applies to that satellite and was supplied
+    /// for that station: az/el data "is specific to this ground station and can't be used at
+    /// other locations" (`smithy_query(query="doc", shape="AzElEphemeris",
+    /// member="groundStation")`).
+    ///
+    /// Where two ephemerides describe the same instants, the HIGHER PRIORITY one is the one
+    /// used — `priority` is "a priority score that determines which ephemeris to use when
+    /// multiple ephemerides overlap. Higher numbers take precedence."
+    /// (`smithy_query(query="shape", shape="EphemerisItem")`) — so a pass overlapping one
+    /// already read from a higher-priority ephemeris is left out, and ties are broken by
+    /// `ephemerisId` so the answer is the same on every call.
+    ///
+    /// Only the az/el form yields a pass: it IS pointing angles for one station, so the
+    /// geometry is READ rather than computed. A `tle` or `oem` ephemeris carries orbital
+    /// elements that would have to be propagated against the station's coordinates, which
+    /// nothing in this service records, and data held in an Amazon S3 object is not in this
+    /// store at all; neither describes a pass here.
+    ///
+    /// BOUNDED work, so no stored data and no window asked about can make this scan without
+    /// limit: `accept` is asked about each pass as it is read and only the ones it admits are
+    /// kept, at most [`MAX_OFFERED_WINDOWS`] of them, and at most
+    /// [`MAX_POINTING_POINTS_READ`] points are read whatever is still unexamined. A search
+    /// that reaches either bound answers with the passes it has. Both bounds are CONSTANTS,
+    /// so two reads of the same store resolve the same sequence of passes and a positional
+    /// offset into it addresses the same window on every call — which is what lets a caller
+    /// page through them.
+    pub fn pointing_passes(
+        &self,
+        satellite_arn: &str,
+        ground_station: &str,
+        accept: impl Fn(f64, f64) -> bool,
+    ) -> Vec<PassWindow> {
+        // The ephemeris and the segments it supplies for this station, read once here
+        // rather than again per pass.
+        let mut in_force: Vec<(&Ephemeris, &AzElSegments)> = self
+            .ephemerides
+            .values()
+            .filter(|ephemeris| ephemeris.status == EPHEMERIS_ENABLED)
+            .filter(|ephemeris| {
+                ephemeris
+                    .satellite_id
+                    .as_deref()
+                    .and_then(|satellite_id| self.satellites.get(satellite_id))
+                    .is_some_and(|satellite| satellite.satellite_arn == satellite_arn)
+            })
+            .filter_map(|ephemeris| {
+                az_el_segments_for(ephemeris, ground_station)
+                    .map(|segments| (ephemeris, segments))
+            })
+            .collect();
+        in_force.sort_by(|first, second| {
+            second
+                .0
+                .priority
+                .cmp(&first.0.priority)
+                .then_with(|| first.0.ephemeris_id.cmp(&second.0.ephemeris_id))
+        });
+
+        let mut budget = MAX_POINTING_POINTS_READ;
+        // Held in start-time order and never overlapping, so the pass before the candidate
+        // is the only one it can collide with: the overlap test is a binary search rather
+        // than a scan of everything kept so far.
+        let mut passes: Vec<PassWindow> = Vec::new();
+        for (ephemeris, segments) in in_force {
+            if passes.len() >= MAX_OFFERED_WINDOWS || budget == 0 {
+                break;
+            }
+            for pass in az_el_passes(segments, &mut budget) {
+                if passes.len() >= MAX_OFFERED_WINDOWS {
+                    break;
+                }
+                if !accept(pass.start, pass.end) {
+                    continue;
+                }
+                let after =
+                    passes.partition_point(|kept| kept.start_time.as_secs_f64() <= pass.end);
+                if after > 0 && passes[after - 1].end_time.as_secs_f64() >= pass.start {
+                    continue;
+                }
+                let at = passes.partition_point(|kept| kept.start_time.as_secs_f64() < pass.start);
+                passes.insert(
+                    at,
+                    PassWindow {
+                        start_time: DateTime::from_secs_f64(pass.start),
+                        end_time: DateTime::from_secs_f64(pass.end),
+                        maximum_elevation: Elevation {
+                            value: pass.peak,
+                            unit: segments.angle_unit.clone(),
+                        },
+                        ephemeris_id: ephemeris.ephemeris_id.clone(),
+                        ephemeris_type: ephemeris.ephemeris_type.clone(),
+                    },
+                );
+            }
+        }
+        passes
+    }
+
+    /// The contact windows the pairing of the satellite `satellite_arn`, the ground station
+    /// `ground_station` and the mission profile `profile` can still fly inside `window`
+    /// (`(start, end)` in epoch seconds), as at the instant `now`, in start-time order;
+    /// only the ones the ephemeris `pointed_by` names determine, when it names one.
+    ///
+    /// These are the passes the pointing data in force describes ([`Self::pointing_passes`]),
+    /// less the ones nothing could reserve: a pass whose own window does not touch the window
+    /// asked about, one whose end the clock has already passed (antenna time that has elapsed
+    /// holds nothing left to hold), one shorter than the profile's
+    /// `minimumViableContactDurationSeconds`, and one every antenna at the station is already
+    /// held for ([`Self::free_antenna`]). Those are exactly the conditions `ReserveContact`
+    /// refuses a reservation on, so a window this answers is a window that can then be
+    /// reserved, and a window already reserved stops being offered.
+    ///
+    /// The conditions are asked in that order, cheapest first, so the one that reads the
+    /// store is only reached for a pass the window and the clock admit.
+    ///
+    /// `pointed_by` is applied to the RESOLVED windows rather than to the pointing data it
+    /// chooses between: which ephemeris determines a window is settled by priority first, so
+    /// a window a higher-priority ephemeris points is not offered for a filter naming a
+    /// lower-priority one.
+    pub fn available_contact_windows(
+        &self,
+        satellite_arn: &str,
+        ground_station: &str,
+        profile: &MissionProfile,
+        window: (f64, f64),
+        now: f64,
+        pointed_by: Option<&str>,
+    ) -> Vec<PassWindow> {
+        let minimum = f64::from(profile.minimum_viable_contact_duration_seconds);
+        self.pointing_passes(satellite_arn, ground_station, |start, end| {
+            windows_overlap((start, end), window)
+                && end > now
+                && end - start >= minimum
+                && self.free_antenna(ground_station, (start, end)).is_some()
+        })
+        .into_iter()
+        .filter(|pass| pointed_by.is_none_or(|id| pass.ephemeris_id == id))
+        .collect()
+    }
+}
+
+/// The azimuth-elevation segments `ephemeris` supplies INLINE for `ground_station`, or
+/// `None` when it supplies none for that station — because it is of another type, was
+/// supplied for another station, or holds its data in an Amazon S3 object this store cannot
+/// read. See [`ComAmazonawsGroundstationGroundstationState::pointing_passes`].
+fn az_el_segments_for<'a>(
+    ephemeris: &'a Ephemeris,
+    ground_station: &str,
+) -> Option<&'a AzElSegments> {
+    let EphemerisData::azEl(az_el) = &ephemeris.supplied_data else {
+        return None;
+    };
+    if az_el.ground_station != ground_station {
+        return None;
+    }
+    match &az_el.data {
+        AzElSegmentsData::azElData(segments) => Some(segments),
+        AzElSegmentsData::s3Object(_) => None,
     }
 }
 

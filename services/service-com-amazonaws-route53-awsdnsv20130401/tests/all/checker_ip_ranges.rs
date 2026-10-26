@@ -35,7 +35,10 @@ use crate::hosted_zone_records::{
 ///
 /// A 501 here means the operation is still a scaffold, which is exactly what the
 /// message says, so a regression to the stub reads as one.
-async fn reported_blocks(router: &MultiServiceRouter) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite checks a health checker's address against the
+/// SAME published blocks rather than growing a second copy of this reader.
+pub(crate) async fn reported_blocks(router: &MultiServiceRouter) -> Vec<String> {
     let reply = call(router, "GET", "/2013-04-01/checkeripranges", "").await;
     assert_eq!(
         reply.status, 200,

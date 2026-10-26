@@ -30,7 +30,10 @@ use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Answ
 type Row = (&'static str, Vec<Value>, Vec<(&'static str, Value)>);
 
 /// One `patchOperations` entry, as a client spells it on the wire.
-fn op(kind: &str, path: &str, value: Option<&str>) -> Value {
+///
+/// `pub(crate)` so a sibling suite spells an entry of any op the one way rather than
+/// keeping its own copy (the `update_api_key_patch_path_refusal` suite does).
+pub(crate) fn op(kind: &str, path: &str, value: Option<&str>) -> Value {
     match value {
         Some(value) => json!({ "op": kind, "path": path, "value": value }),
         None => json!({ "op": kind, "path": path }),
@@ -87,7 +90,10 @@ fn baseline_key() -> Value {
 }
 
 /// A created baseline key: its id and the created body.
-async fn baseline(gateway: &Gateway, case: &str) -> (String, Value) {
+///
+/// `pub(crate)` so a sibling suite patches the same baseline record rather than creating
+/// one of its own (the `update_api_key_patch_path_refusal` suite does).
+pub(crate) async fn baseline(gateway: &Gateway, case: &str) -> (String, Value) {
     let created = create_key(gateway, case, baseline_key()).await;
     let id = string_member(&created, "id", case);
     (id, created)
@@ -116,9 +122,8 @@ async fn a_patched_api_key_member_is_stored_and_read_back() {
     // Rows differ along what the rule generalises over: which member the path names,
     // that member's type (string, boolean, a string absent by default), how many ops
     // one request carries, and whether two ops target one member. Every row uses
-    // `replace`, because that is the op the ApiKey's single-valued members take — see
-    // `an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_supported_set`
-    // for the per-op path sets and
+    // `replace`, because that is the op the ApiKey's single-valued members take — see the
+    // `update_api_key_patch_path_refusal` suite for the per-op path sets and
     // `an_api_key_collection_path_takes_an_add_and_a_remove` for the collections.
     let cases: Vec<Row> = vec![
         (
@@ -391,45 +396,15 @@ async fn a_patch_this_service_cannot_apply_is_refused_and_changes_nothing() {
 
 #[tokio::test]
 async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
-    // The refusal's TEXT is part of the rule here: API Gateway answers a path the
-    // resource cannot be addressed by with one fixed sentence and the path exactly as
-    // the request spelled it — a recorded refusal of a `replace` of `/id` reads
-    // `Invalid patch path /id` — and names neither the op nor the paths the resource
-    // does have.
+    // The refusal's TEXT is part of the rule here: for these resources API Gateway
+    // answers a path the resource cannot be addressed by with one fixed sentence and the
+    // path exactly as the request spelled it — a recorded refusal of a `replace` of `/id`
+    // reads `Invalid patch path /id` — and names neither the op nor the paths the resource
+    // does have. `UpdateApiKey` words its own refusal, covered by the
+    // `update_api_key_patch_path_refusal` suite.
     let gateway = Gateway::new();
-    let (id, _) = baseline(&gateway, "unsupported api key paths").await;
 
-    // Rows differ in the member the path names — a service-assigned one, a secret, a
-    // collection, a map entry, a single-valued one — and in the op offered for it.
-    for (path, kind) in [
-        ("/id", "replace"),
-        ("/value", "replace"),
-        ("/createdDate", "replace"),
-        ("/stageKeys", "replace"),
-        ("/nosuchmember", "replace"),
-        ("/lastUpdatedDate", "remove"),
-        ("/description", "remove"),
-        ("/name", "add"),
-        ("/tags/team", "add"),
-    ] {
-        let case = format!("UpdateApiKey({kind} {path})");
-        let answer = patch(
-            &gateway,
-            &format!("/apikeys/{id}"),
-            vec![op(kind, path, Some("x"))],
-        )
-        .await;
-        assert_failure(&answer, 400, "BadRequestException", &case);
-        assert_eq!(
-            answer.body["message"].as_str(),
-            Some(format!("Invalid patch path {path}").as_str()),
-            "case {case}: the refusal must be the fixed sentence and the path, got {:?}",
-            answer.body["message"]
-        );
-    }
-
-    // The same rule on the other PATCH-style operations, whichever resource the path
-    // named.
+    // Rows differ in the member the path names and in the resource it was named on.
     let (api, root) = create_api(&gateway, "unsupported-paths").await;
     let resource = create_resource(&gateway, &api, &root, "pets").await;
     let resource_id = string_member(&resource, "id", "pets");

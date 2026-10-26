@@ -266,6 +266,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // clock owes it its completion.
             status: crate::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
             completed_due_at: Some(now + crate::state::BUILD_WORKFLOW_COMPLETE_AFTER),
+            // Nothing has asked for this workflow to stop, so it is owed no cancellation.
+            cancelled_due_at: None,
             document_name: document.map(|document| document.document_name.clone()),
             document_content_type: document
                 .map(|document| document.document_content_type.clone()),

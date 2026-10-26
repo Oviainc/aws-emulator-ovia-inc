@@ -931,6 +931,16 @@ async fn a_channel_is_only_addressable_under_its_own_cluster() {
         ),
         (
             owner.clone(),
+            // The same absent channel, named without the channel id the service's
+            // own records carry: the identity is the cluster, the cluster's id and
+            // the channel name, so this resolves to a missing channel rather than
+            // a malformed request.
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:channel/owner/abc-1/absent"),
+            404,
+            "NotFoundException",
+        ),
+        (
+            owner.clone(),
             "not-an-arn".to_string(),
             400,
             "BadRequestException",
@@ -943,7 +953,9 @@ async fn a_channel_is_only_addressable_under_its_own_cluster() {
         ),
         (
             owner.clone(),
-            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:channel/owner/abc-1/short"),
+            // Too few segments to identify a channel at all: a channel ARN names
+            // the cluster, the cluster's id and the channel.
+            format!("arn:aws:kafka:{REGION}:{ACCOUNT}:channel/owner"),
             400,
             "BadRequestException",
         ),

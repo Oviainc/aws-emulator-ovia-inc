@@ -152,7 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same resolution the writers use, so this reader cannot report tags
         // for an ARN they would refuse, nor refuse one they accept.
-        let tags = match state.resource_tags_in(&region, &input.resource_arn) {
+        let tags = match state.resource_tags_in(
+            &region,
+            &input.resource_arn,
+            std::time::SystemTime::now(),
+        ) {
             Ok(tags) => tags,
             Err(crate::state::TagTargetRejected::NotAnArn) => {
                 return Err(

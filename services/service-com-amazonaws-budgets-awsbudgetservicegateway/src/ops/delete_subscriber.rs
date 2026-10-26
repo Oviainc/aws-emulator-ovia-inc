@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSubscriber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSubscriber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSubscriber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE subscriber from a notification a budget already holds. A subscriber
+//! carries no id: its subscription type and its address are its identity
+//! ([`crate::state::same_subscriber`]), so the caller names the one to remove by value,
+//! and the notification holding it is named by value too
+//! ([`crate::state::same_notification`]) on the budget `(AccountId, BudgetName)`
+//! identifies. The notification's remaining subscribers keep their value and their
+//! order (the order a paginated `DescribeSubscribersForNotification` indexes into).
+//!
+//! "Deleting the last subscriber to a notification also deletes the notification", so a
+//! call that empties a notification's subscriber set removes the notification with it —
+//! which is also what keeps every stored set inside the modelled `@length(min: 1)` of
+//! `Subscribers`, since a notification is never left holding none.
+//!
+//! A budget this account does not hold, a notification that budget does not alert on,
+//! or a subscriber that notification does not hold is a `NotFoundException`. The
+//! `Subscriber` only NAMES the subscriber to remove — whatever it names is already
+//! stored or absent — so its address is not held to the form a write that ESTABLISHES a
+//! subscriber is held to.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +160,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSubscriber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSubscriberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSubscriber"))
+        // Nothing here needs request metadata: a delete is resolved entirely from the
+        // members the caller names and the store.
+        let _ = ctx;
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(DeleteSubscriberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSubscriberErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // The one door into the store (`crate::state::store_at`): the deletions the clock
+        // already owes — a budget past its end date, with everything held inside it — are
+        // materialised before this call resolves anything, so a subscriber of an expired
+        // budget is as absent here as it is to every read.
+        let mut store = crate::state::store_at(&state, now);
+        // A subscriber is held inside the notification, which is held inside the budget,
+        // so the budget is resolved by the same `(AccountId, BudgetName)` identity every
+        // other operation uses.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DeleteSubscriberErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete subscriber: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+
+        // A notification carries no id either: the caller names the one holding the
+        // subscriber by value, and `crate::state::same_notification` holds which members
+        // that identity is made of (the service-owned alarm state is not one of them).
+        // Its POSITION is what is resolved, because emptying its subscriber set removes
+        // the notification from this budget below.
+        let found = stored.notifications.iter().position(|held| {
+            crate::state::same_notification(&held.notification, &input.notification)
+        });
+        let Some(notification_index) = found else {
+            // The refusal names the notification the caller asked for by the members that
+            // identify it, so it reads as the notification being missing rather than the
+            // budget that was found.
+            return Err(DeleteSubscriberErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete subscriber: {} - the notification doesn't exist \
+                         (NotificationType {}, ComparisonOperator {}, Threshold {}, \
+                         ThresholdType {}).",
+                        input.budget_name,
+                        input.notification.notification_type,
+                        input.notification.comparison_operator,
+                        input.notification.threshold,
+                        input
+                            .notification
+                            .threshold_type
+                            .as_deref()
+                            .unwrap_or(crate::state::THRESHOLD_TYPE_PERCENTAGE)
+                    )),
+                },
+            )
+            .into());
+        };
+        let held = &mut stored.notifications[notification_index];
+
+        // The subscription type and the address are what identify a subscriber, so
+        // `Subscriber` names at most one of the notification's subscribers.
+        let found = held
+            .subscribers
+            .iter()
+            .position(|subscriber| crate::state::same_subscriber(subscriber, &input.subscriber));
+        let Some(subscriber_index) = found else {
+            return Err(DeleteSubscriberErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete subscriber: {} - the subscriber doesn't exist.",
+                        input.budget_name
+                    )),
+                },
+            )
+            .into());
+        };
+        // Removed in place, so the notification's remaining subscribers keep their
+        // relative order — the order a paginated read indexes into.
+        held.subscribers.remove(subscriber_index);
+
+        // "Deleting the last subscriber to a notification also deletes the notification":
+        // the notification this call emptied goes away with its final subscriber, and the
+        // budget's other notifications keep their relative order.
+        if held.subscribers.is_empty() {
+            stored.notifications.remove(notification_index);
+        }
+
+        Ok(DeleteSubscriberOutput {})
     }
 }

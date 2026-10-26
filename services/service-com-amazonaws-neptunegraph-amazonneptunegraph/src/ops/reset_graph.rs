@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Empties the data a graph holds, optionally taking a final snapshot of that data
+//! first, and takes the graph through the modelled `RESETTING` status back into
+//! service.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetGraph"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResetGraphErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A graph lives in exactly one Region, so the Region this request was signed for
+        // is part of the lookup: a graph of another Region is not resettable through
+        // this endpoint.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // The lookup settles the transitions the clock has already made due first, so a
+        // graph whose provisioning has come due is resettable.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
+            return Err(ResetGraphErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+        // The facts the rest of this handler needs, read off the record before the store
+        // is written to, so the decisions below and the writes they drive never hold a
+        // borrow of one graph across a change to the store.
+        let graph_id = graph.id.clone();
+        let graph_name = graph.name.clone();
+        let graph_status = graph.status;
+        // A snapshot of an encrypted graph is encrypted with the graph's own key: the
+        // key belongs to the data being snapshotted, not to this request, which carries
+        // no key member at all.
+        let kms_key_identifier = graph.kms_key_identifier.clone();
+        // A final snapshot captures the graph it is taken of the same way an explicitly
+        // named one does: the data it holds and the configuration it is provisioned
+        // with, so a restore of it reproduces the graph as this call found it.
+        let source_configuration = crate::state::GraphConfiguration::from(graph);
+        let graph_data = graph.data.clone();
+
+        // Emptying a graph's data is a write to its data plane, and that plane serves
+        // only while the graph is serving: a graph that is provisioning, reconfiguring,
+        // importing, snapshotting, stopped or on its way out has no data to empty
+        // through, which is the precondition `CreateGraphSnapshot` and `UpdateGraph`
+        // state too. A reset does not remove the graph, so deletion protection — which
+        // holds back a DELETION — does not hold this request back.
+        if graph_status != crate::state::GraphStatus::Available {
+            return Err(ResetGraphErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "graph {graph_id} is in status {} and cannot be reset",
+                    graph_status.as_wire()
+                ),
+                reason: None,
+            })
+            .into());
+        }
+
+        // `skipSnapshot` is required, and `false` asks for a FINAL snapshot of the
+        // graph, taken before the reset carries its data away — the same final-snapshot
+        // rule `DeleteGraph` states. The request carries no name for it, so the service
+        // names it (`free_final_snapshot_name`), the way it mints the id.
+        let final_snapshot = if input.skip_snapshot {
+            None
+        } else {
+            // The snapshot store grows by one entry per final snapshot, so it has the
+            // same ceiling `CreateGraphSnapshot` enforces. This operation models no
+            // quota error, so a store with no room for the snapshot the caller asked
+            // for is reported as the conflict it is: the request cannot be carried out
+            // against what the store already holds.
+            if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
+                return Err(ResetGraphErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "a final snapshot of graph {graph_id} cannot be taken because this \
+                         emulator holds at most {} graph snapshots; delete a snapshot or pass \
+                         skipSnapshot=true",
+                        crate::state::MAX_SNAPSHOTS
+                    ),
+                    reason: None,
+                })
+                .into());
+            }
+            let id = store.next_snapshot_id();
+            let name = store.free_final_snapshot_name(&graph_name, &id, &region);
+            Some(crate::state::Snapshot {
+                arn: ::engine::emulator_arn(
+                    crate::state::ARN_NAMESPACE,
+                    &region,
+                    &format!("graph-snapshot/{id}"),
+                ),
+                id,
+                name,
+                // The final snapshot lives in the Region of the graph it was taken of,
+                // which is the Region this request was signed for.
+                region: region.clone(),
+                source_graph_id: graph_id.clone(),
+                // Not restorable when the call returns; the clock owes the move to
+                // AVAILABLE a fixed span later, exactly as for an explicitly named
+                // snapshot.
+                status: crate::state::SnapshotStatus::Creating,
+                settles_at: Some(now + crate::state::PROVISIONING_SPAN),
+                snapshot_create_time: ::std::time::SystemTime::now(),
+                kms_key_identifier,
+                // The request carries no tags, and a snapshot's tags are its own: the
+                // graph's tag set is not copied onto it.
+                tags: ::std::collections::BTreeMap::new(),
+                source_configuration,
+                data: graph_data,
+            })
+        };
+
+        if let Some(snapshot) = final_snapshot {
+            store.insert_snapshot(snapshot);
+        }
+
+        let Some(resetting) = store.settled_graph_mut(&graph_id, &region, now) else {
+            // Unreachable: the lookup above resolved under the same lock.
+            return Err(ResetGraphErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+        // The data this call empties is gone once it returns: the graph keeps its
+        // identity, configuration, tags and encryption key, and only the nodes and edges
+        // it held go, with the statistics over the emptied data recomputed as of now.
+        resetting.data.clear(::std::time::SystemTime::now());
+        // Coming back up on empty data is ACCEPTED, not finished: the graph reports the
+        // modelled `RESETTING` status until the clock makes the move back to AVAILABLE
+        // due a fixed span later, so a caller that reads it straight after this call
+        // still sees the transient status. No handler sleeps for it.
+        resetting.begin_transition(
+            crate::state::GraphStatus::Resetting,
+            crate::state::GraphStatus::Available,
+            now,
+        );
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraph answers while the reset is in flight.
+        Ok(Self::Output::from(&*resetting))
     }
 }

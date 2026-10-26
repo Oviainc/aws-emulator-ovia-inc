@@ -1048,8 +1048,10 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// `TagResource` through [`tag_map`], and `UntagResource` with its `ResourceTagKeys` —
 /// refuses that one namespace the same way and cannot drift apart. The offenders are
 /// sorted and deduplicated, so a request naming one of them twice reports it once and the
-/// text does not depend on iteration order, and each is clipped the way every other
-/// refusal of this service quotes a caller-supplied value.
+/// text does not depend on iteration order, each is clipped the way every other refusal of
+/// this service quotes a caller-supplied value, and the LIST of them is budgeted by
+/// [`clip_list_for_message`] — a tagging request names up to 200 keys, so quoting all of
+/// them would carry the message past its own modelled bound.
 pub fn check_tag_keys_not_reserved<'a>(
     member: &str,
     keys: impl IntoIterator<Item = &'a str>,
@@ -1063,16 +1065,22 @@ pub fn check_tag_keys_not_reserved<'a>(
     }
     reserved.sort_unstable();
     reserved.dedup();
-    let offenders = reserved
-        .into_iter()
-        .map(clip_for_message)
-        .collect::<Vec<String>>()
-        .join(", ");
+    let quoted: Vec<String> = reserved.into_iter().map(clip_for_message).collect();
+    let quoted: Vec<&str> = quoted.iter().map(String::as_str).collect();
+    // The sentence is built before the keys so the room they get is what it leaves of the
+    // message's own modelled bound (the trailing `.` included), rather than a figure
+    // restated here that a reworded sentence would silently invalidate.
+    let sentence = format!(
+        "{member} names tag keys in the reserved {RESERVED_TAG_KEY_PREFIX} namespace, \
+         which a caller cannot set or remove: "
+    );
+    let offenders = clip_list_for_message(
+        &quoted,
+        ", ",
+        MESSAGE_LENGTH_LIMIT.saturating_sub(sentence.len() + ".".len()),
+    );
     Err(ValidationException {
-        message: format!(
-            "{member} names tag keys in the reserved {RESERVED_TAG_KEY_PREFIX} namespace, \
-             which a caller cannot set or remove: {offenders}."
-        ),
+        message: format!("{sentence}{offenders}."),
         reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: member.to_string(),
@@ -1178,7 +1186,177 @@ pub(crate) fn clip_for_message(value: &str) -> String {
     format!("{head}...")
 }
 
+/// The most a refusal message may run to, in bytes.
+///
+/// `ValidationException$Message` is `@length(0, 1024)` (smithy_query shape
+/// `ValidationException`), and that bound counts CHARACTERS — a byte budget bounds those
+/// too, since no character is shorter than a byte, and is what the message's own parts can
+/// be measured in as they are assembled.
+pub(crate) const MESSAGE_LENGTH_LIMIT: usize = 1024;
+
+/// How a refusal message quotes the several values it was built from: `items` joined with
+/// `separator` for as many as `budget` bytes admit, and the number of items left unquoted
+/// stated in place of them (`…, and 191 more`).
+///
+/// [`clip_for_message`] bounds ONE echoed value, but a refusal built from a LIST is as long
+/// as the list, and these lists are caller-sized: a tagging request names up to 200 tag
+/// keys of 128 characters each (smithy_query shapes `ResourceTagKeyList`,
+/// `ResourceTagList`, `ResourceTagKey`) and a refused request is stated clause by clause,
+/// one clause per offending value — either of which runs to tens of thousands of
+/// characters, while a message admits [`MESSAGE_LENGTH_LIMIT`]. So the WHOLE quote is
+/// budgeted and not merely each item of it, and the result is at most `budget` bytes
+/// INCLUDING the count it ends with: a caller passes what its own sentence leaves of the
+/// message's bound, and the refusal then stays inside that bound however many values the
+/// request carried.
+///
+/// The items quoted are the leading ones, so the quote is a prefix of the list as the
+/// caller sent it rather than an arbitrary selection, and a budget too small for even the
+/// first value whole still quotes what it can of it — because a refusal naming no
+/// offending value leaves the caller nothing to act on. Whatever is not quoted WHOLE is
+/// counted, so the quote and the count together always account for the list.
+pub(crate) fn clip_list_for_message(items: &[&str], separator: &str, budget: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    // What the trailing count costs when `left` items go unquoted.
+    let tail = |left: usize| -> String {
+        if left == 0 {
+            String::new()
+        } else {
+            format!("{separator}and {left} more")
+        }
+    };
+
+    let mut quoted = String::new();
+    let mut taken = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let joiner = if index == 0 { "" } else { separator };
+        let left = items.len() - index - 1;
+        if quoted.len() + joiner.len() + item.len() + tail(left).len() > budget {
+            break;
+        }
+        quoted.push_str(joiner);
+        quoted.push_str(item);
+        taken = index + 1;
+    }
+    if taken == 0 {
+        // Not even the first value fits whole. As much of it as the budget admits is
+        // quoted, cut on a character boundary — never mid-UTF-8 — and the count then
+        // covers EVERY value, this one included, so nothing is reported as quoted that
+        // was not quoted whole. A budget with room for neither quotes nothing: the
+        // sentence still states the member and the rule.
+        let Some(first) = items.first() else {
+            return String::new();
+        };
+        let head = budget
+            .saturating_sub(tail(items.len()).len())
+            .saturating_sub("...".len());
+        let mut end = head.min(first.len());
+        while end > 0 && !first.is_char_boundary(end) {
+            end -= 1;
+        }
+        return match first.get(..end) {
+            Some(fragment) if !fragment.is_empty() => {
+                format!("{fragment}...{}", tail(items.len()))
+            }
+            _ => String::new(),
+        };
+    }
+    format!("{quoted}{}", tail(items.len() - taken))
+}
+
 // The export's data query — its parsing, its bounds and its refusals — lives in
 // [`query`], which `CreateExport` and `UpdateExport` both read through
 // [`validate_data_query`]: a definition cannot be judged one way by one and another way
 // by the other.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The budget [`clip_list_for_message`] promises, over the list sizes, item sizes and
+    /// character widths a request can carry. The end-to-end rule — that the refusals built
+    /// on it satisfy `ValidationException$Message`'s modelled bound — is asserted over the
+    /// wire in `tests/all/refusal_message_bound.rs`; this pins the contract the builders
+    /// rely on, including budgets too small for one whole item.
+    #[test]
+    fn a_quoted_list_stays_inside_its_budget_and_counts_what_it_left_out() {
+        for (label, count, item_chars, filler, budget) in [
+            ("one short item", 1usize, 4usize, 'k', 1024usize),
+            ("a handful of short items", 8, 4, 'k', 1024),
+            ("the tag-list ceiling of short items", MAX_RESOURCE_TAGS, 4, 'k', 1024),
+            (
+                "the tag-list ceiling at the tag-key ceiling",
+                MAX_RESOURCE_TAGS,
+                MESSAGE_VALUE_CLIP,
+                'k',
+                1024,
+            ),
+            (
+                // Four bytes per character, so the characters fit where the bytes do not.
+                "multi-byte items at the tag-key ceiling",
+                MAX_RESOURCE_TAGS,
+                MESSAGE_VALUE_CLIP,
+                '𝄞',
+                1024,
+            ),
+            ("a budget below one whole item", 20, 64, 'k', 40),
+            ("a budget below one multi-byte item", 20, 64, '𝄞', 40),
+            ("no budget at all", 20, 64, 'k', 0),
+        ] {
+            let items: Vec<String> = (0..count)
+                .map(|index| format!("{index:03}{}", filler.to_string().repeat(item_chars)))
+                .collect();
+            let items: Vec<&str> = items.iter().map(String::as_str).collect();
+            let quoted = clip_list_for_message(&items, ", ", budget);
+
+            assert!(
+                quoted.len() <= budget,
+                "case {label:?}: expected at most {budget} bytes, got {}: {quoted:?}",
+                quoted.len()
+            );
+            let spelled = items.iter().filter(|item| quoted.contains(**item)).count();
+            let left_out: usize = quoted
+                .rsplit_once("and ")
+                .and_then(|(_, tail)| tail.strip_suffix(" more"))
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(0);
+            if quoted.is_empty() {
+                // Only a budget with room for nothing at all quotes nothing.
+                assert_eq!(
+                    budget, 0,
+                    "case {label:?}: a budget of {budget} bytes must quote something"
+                );
+                continue;
+            }
+            assert_eq!(
+                spelled + left_out,
+                count,
+                "case {label:?}: expected all {count} items accounted for, got {spelled} spelled and {left_out} counted: {quoted:?}"
+            );
+            // The quote begins at the head of the list the caller sent: every item of a
+            // row opens with its own three-digit index.
+            assert!(
+                quoted.starts_with(&items[0][..3]),
+                "case {label:?}: expected the quote to begin with the first item, got {quoted:?}"
+            );
+            if budget >= MESSAGE_LENGTH_LIMIT {
+                assert!(
+                    quoted.contains(items[0]),
+                    "case {label:?}: a message-sized budget must quote the first item whole, got {quoted:?}"
+                );
+            }
+        }
+    }
+
+    /// An empty list has nothing to quote: the callers only build a refusal when they
+    /// found an offending value, and the helper must not invent one.
+    #[test]
+    fn an_empty_list_quotes_nothing() {
+        let quoted = clip_list_for_message(&[], ", ", MESSAGE_LENGTH_LIMIT);
+        assert!(
+            quoted.is_empty(),
+            "expected no quote for an empty list, got {quoted:?}"
+        );
+    }
+}

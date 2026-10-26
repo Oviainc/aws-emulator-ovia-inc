@@ -39,11 +39,13 @@ use super::workload_harness::{
 };
 
 /// The deletes this service IMPLEMENTS that bind a `ClientRequestToken`, so the rule is
-/// asserted over the class rather than over one operation. `DeleteLens`,
-/// `DeleteWorkloadShare`, `DeleteLensShare`, `DeleteProfileShare` and
-/// `DeleteTemplateShare` bind the member too and are still stubs, each with its own issue;
-/// `DeleteAgentGoal`, `DeleteAgentContext` and `DeleteAgentProfile` bind no token at all
-/// (`smithy_query(query="operation", operation="DeleteAgentGoal")`), so the rule has
+/// asserted over the class rather than over one operation. `DeleteLensShare`,
+/// `DeleteProfileShare` and `DeleteTemplateShare` bind the member too and assert this same
+/// rule in their own suites, each against the resource whose share it revokes
+/// (`lens_share_deletion`, `profile_share_deletion`, `template_share_deletion`);
+/// `DeleteLens` and `DeleteWorkloadShare` bind it and are still stubs, each with its own
+/// issue; `DeleteAgentGoal`, `DeleteAgentContext` and `DeleteAgentProfile` bind no token at
+/// all (`smithy_query(query="operation", operation="DeleteAgentGoal")`), so the rule has
 /// nothing to say about them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deletable {
