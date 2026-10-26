@@ -72,6 +72,16 @@ pub const MAX_CONTACT_LISTS: usize = 1_000;
 /// `CreateContact`.
 pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
 
+/// Configuration sets the account may hold: SES's documented quota is 10,000
+/// configuration sets per account per Region, and `CreateConfigurationSet` refuses
+/// past it with the `LimitExceededException` its model binds.
+pub const MAX_CONFIGURATION_SETS: usize = 10_000;
+
+/// The longest a `ConfigurationSetName` may be, from the member's own
+/// documentation: "The name can contain up to 64 alphanumeric characters, including
+/// letters, numbers, hyphens (-) and underscores (_) only."
+pub const MAX_CONFIGURATION_SET_NAME_LEN: usize = 64;
+
 /// Per-service state for com-amazonaws-sesv2-simpleemailservice-v2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -83,6 +93,11 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
     /// Ordered, so `ListContactLists` enumerates and pages deterministically.
     pub contact_lists: BTreeMap<String, ContactListRecord>,
+    /// Configuration sets, keyed by the `ConfigurationSetName` they were created
+    /// with. The name is an identifier the API echoes back as given and compares
+    /// exactly, so it is keyed exactly as supplied. Ordered, so
+    /// `ListConfigurationSets` enumerates and pages deterministically.
+    pub configuration_sets: BTreeMap<String, ConfigurationSetRecord>,
     /// The outbound-message log, oldest first: one entry per accepted `SendEmail`.
     pub sent_messages: Vec<SentMessage>,
     /// Per-account send counters, bumped by `SendEmail`.
@@ -576,6 +591,156 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
         "Contact with email address: {email_address} doesn't exist in list: \
          {contact_list_name}."
     )
+}
+
+/// One configuration set: the rules a send that names it is subject to.
+///
+/// Every member is the EFFECTIVE configuration, with the documented default already
+/// resolved at create time, so a read reports what a send would be subject to rather
+/// than re-deriving a default per reader.
+#[derive(Debug, Clone)]
+pub struct ConfigurationSetRecord {
+    /// The `ConfigurationSetName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `TrackingOptions`: the custom open/click redirect domain, when the caller
+    /// configured one. SES tracks through its own domain otherwise, so an
+    /// unconfigured set holds nothing here.
+    pub tracking_options: Option<crate::ops::types::TrackingOptions>,
+    /// `DeliveryOptions$TlsPolicy`.
+    pub tls_policy: String,
+    /// `DeliveryOptions$MaxDeliverySeconds`, when the caller bounded delivery.
+    pub max_delivery_seconds: Option<i64>,
+    /// `ReputationOptions$ReputationMetricsEnabled`.
+    pub reputation_metrics_enabled: bool,
+    /// `SendingOptions$SendingEnabled`.
+    pub sending_enabled: bool,
+    /// `SuppressionOptions`, as supplied: a set that configures none falls back to
+    /// the tenant or account suppression preferences, so nothing is stored.
+    pub suppression_options: Option<crate::ops::types::SuppressionOptions>,
+    /// `VdmOptions`, as supplied.
+    pub vdm_options: Option<crate::ops::types::VdmOptions>,
+    /// `MessageSecurityOptions`, as supplied.
+    pub message_security_options: Option<crate::ops::types::MessageSecurityOptions>,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the set was created.
+    pub created_at: SystemTime,
+    /// When the set's reputation metrics were last given a fresh start.
+    ///
+    /// `ReputationOptions$LastFreshStart` is "the date and time when the reputation
+    /// metrics were last given a fresh start", and SES documents that where sending
+    /// has never been disabled and re-enabled this is the time the configuration set
+    /// was created \u2014 so it starts at the create instant and moves only when a fresh
+    /// start happens.
+    pub last_fresh_start: SystemTime,
+}
+
+impl ConfigurationSetRecord {
+    /// A set as `CreateConfigurationSet` stores it when the request configures
+    /// nothing: SES's own defaults.
+    pub fn new(name: &str, now: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            tracking_options: None,
+            // `TlsPolicy`: "If the value is Require, messages are only delivered if
+            // a TLS connection can be established. If the value is Optional,
+            // messages can be delivered in plain text if a TLS connection can't be
+            // established." SES delivers opportunistically unless a caller asks for
+            // the stricter policy, so a set that configures none is Optional.
+            tls_policy: TLS_POLICY_OPTIONAL.to_string(),
+            max_delivery_seconds: None,
+            // The member's modelled default.
+            reputation_metrics_enabled: false,
+            // Sending through a configuration set is something a caller PAUSES
+            // (`PutConfigurationSetSendingOptions` "enable or disable email sending
+            // for messages that use this configuration set"), so a newly created set
+            // does not itself hold sending back.
+            sending_enabled: true,
+            suppression_options: None,
+            vdm_options: None,
+            message_security_options: None,
+            tags: Vec::new(),
+            created_at: now,
+            last_fresh_start: now,
+        }
+    }
+
+    /// The modelled `DeliveryOptions` view of this record.
+    ///
+    /// One projection shared by every operation that reports a set's delivery
+    /// configuration, so a create and the read after it cannot disagree.
+    pub fn delivery_options(&self) -> crate::ops::types::DeliveryOptions {
+        crate::ops::types::DeliveryOptions {
+            tls_policy: Some(self.tls_policy.clone()),
+            // The dedicated IP pool a set sends from is a resource no implemented
+            // operation of this service keeps, so no set holds one.
+            sending_pool_name: None,
+            max_delivery_seconds: self.max_delivery_seconds,
+        }
+    }
+
+    /// The modelled `ReputationOptions` view of this record.
+    pub fn reputation_options(&self) -> crate::ops::types::ReputationOptions {
+        crate::ops::types::ReputationOptions {
+            reputation_metrics_enabled: self.reputation_metrics_enabled,
+            last_fresh_start: Some(::aws_smithy_types::DateTime::from(self.last_fresh_start)),
+        }
+    }
+
+    /// The modelled `SendingOptions` view of this record.
+    pub fn sending_options(&self) -> crate::ops::types::SendingOptions {
+        crate::ops::types::SendingOptions {
+            sending_enabled: self.sending_enabled,
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The `TlsPolicy` value a configuration set holds when the caller configured none.
+pub const TLS_POLICY_OPTIONAL: &str = "OPTIONAL";
+
+/// Whether `name` is a `ConfigurationSetName` SES accepts.
+///
+/// From the member's documentation: "The name can contain up to 64 alphanumeric
+/// characters, including letters, numbers, hyphens (-) and underscores (_) only" —
+/// so a name is a non-empty run of at most [`MAX_CONFIGURATION_SET_NAME_LEN`] ASCII
+/// letters, digits, hyphens and underscores.
+pub fn configuration_set_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_CONFIGURATION_SET_NAME_LEN
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// How this service words the refusal of a `ConfigurationSetName` outside the
+/// documented character and length rule, stated once for every operation that takes
+/// one.
+pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
+    format!(
+        "Configuration set name {configuration_set_name} is invalid. The name can contain up to \
+         {MAX_CONFIGURATION_SET_NAME_LEN} alphanumeric characters, including letters, numbers, \
+         hyphens (-) and underscores (_) only."
+    )
+}
+
+/// How this service words `NotFoundException` for a configuration set it does not
+/// hold.
+///
+/// One wording for every operation that takes a `ConfigurationSetName`, so a client
+/// sees the same sentence whichever call first tells it the set is not there.
+pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
+    format!("Configuration set {configuration_set_name} does not exist.")
 }
 
 /// One accepted outbound message.
