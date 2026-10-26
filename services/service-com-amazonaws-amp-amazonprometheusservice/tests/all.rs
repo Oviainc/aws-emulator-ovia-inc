@@ -25,6 +25,8 @@ mod anomaly_detector_update;
 mod create_while_a_removal_is_owed;
 #[path = "all/default_scraper_configuration.rs"]
 mod default_scraper_configuration;
+#[path = "all/describe_scraper.rs"]
+mod describe_scraper;
 #[path = "all/kms_key_arn_and_parent_resolution.rs"]
 mod kms_key_arn_and_parent_resolution;
 #[path = "all/list_paging_rule.rs"]
