@@ -294,6 +294,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .version
             .clone()
             .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string());
+        // The version this add-on is installed at when the request names none: the
+        // one the add-on catalog publishes as the default for that Kubernetes version
+        // (`DescribeAddonVersions`), so an installed add-on reports a version the
+        // catalog offers. The catalog publishes the Amazon EKS-managed add-ons for
+        // the Kubernetes versions the calendar carries, and this handler accepts any
+        // well-formed add-on name (see LAYER 4 below), so a name or a cluster version
+        // the catalog does not cover falls back to the derived form.
+        let default_addon_version = guard
+            .default_addon_version(&input.addon_name, &cluster_version, now)
+            .unwrap_or_else(|| state::derive_default_addon_version(&cluster_version));
 
         // LAYER 4 — the body's own members. Each is a rule the model cannot express,
         // so the boundary validator passed the request and this is where it is caught.
@@ -316,11 +326,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The set of configuration values for the add-on that's created. The values
         // that you provide are validated against the schema returned by
-        // DescribeAddonConfiguration" — that operation is still a scaffold here (its
-        // own gap issue), so there is no schema to validate against. What IS checked is
-        // that a document which opens like JSON is well-formed JSON: an add-on
-        // configuration is JSON or YAML, and a JSON document that does not parse can
-        // never satisfy any schema.
+        // DescribeAddonConfiguration" — and the schema that operation publishes for a
+        // build of an Amazon EKS-managed add-on requires no property and restricts
+        // none (`crate::state::AddonCatalogRecord::configuration_schema`), so every
+        // well-formed document satisfies it. What IS checked is that a document which
+        // opens like JSON is well-formed JSON: an add-on configuration is JSON or
+        // YAML, and a JSON document that does not parse can never satisfy any schema.
         if let Some(values) = input
             .configuration_values
             .as_deref()
@@ -619,7 +630,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .addon_version
                 .clone()
                 .filter(|version| !version.trim().is_empty())
-                .unwrap_or_else(|| state::derive_default_addon_version(&cluster_version)),
+                .unwrap_or(default_addon_version),
             status: ADDON_STATUS_CREATING.to_string(),
             created_at: now,
             modified_at: now,

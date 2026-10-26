@@ -52,6 +52,12 @@
 //! reports ([`ClusterVersionRecord`]), which is seeded once because it is what
 //! Amazon EKS publishes rather than per-account data.
 //!
+//! It also holds the add-on catalog ([`AddonCatalogRecord`]), seeded once for
+//! the same reason: `DescribeAddonVersions` reports it, `DescribeAddonConfiguration`
+//! answers one entry of it, and `CreateAddon` takes the version it installs from
+//! it when the caller names none, so the versions a caller can pick and the
+//! versions an installed add-on reports have one source.
+//!
 //! An asynchronous cluster update lives ON the cluster it updates
 //! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` and
 //! `AssociateIdentityProviderConfig` write one there, `DescribeUpdate` reads it
@@ -79,16 +85,18 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessConfigResponse, AccessEntry, AccessScope, Addon, AddonHealth,
-    AddonNamespaceConfigResponse, AssociatedAccessPolicy, BadRequestException, Cancellation,
-    Capability,
+    AccessConfigResponse, AccessEntry, AccessScope, Addon, AddonHealth, AddonInfo,
+    AddonNamespaceConfigResponse, AddonPodIdentityConfiguration, AddonVersionInfo,
+    AssociatedAccessPolicy, BadRequestException, Cancellation,
+    Capability, Compatibility,
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
     Certificate, ClientException, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, FargateProfile, FargateProfileHealth,
     FargateProfileSelector, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
-    KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, NodeRepairConfig,
+    KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, MarketplaceInformation,
+    NodeRepairConfig,
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
     OidcIdentityProviderConfig, OutpostConfigResponse, PodIdentityAssociation,
     PodIdentityAssociationSummary, RemoteAccessConfig, RemoteNetworkConfigResponse,
@@ -772,6 +780,20 @@ pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
         message: Some(message),
         ..Default::default()
     }
+}
+
+/// The sentence this service refuses a `(addonName, addonVersion)` pair the
+/// add-on catalog publishes no build of with.
+///
+/// `DescribeAddonConfiguration` resolves that pair as ONE published build ("The
+/// version must match one of the versions returned by `DescribeAddonVersions`"),
+/// so whichever half of it the catalog does not carry, the build the caller
+/// asked about does not exist — and this service states a resource it could not
+/// resolve in one sentence, [`RESOURCE_NOT_FOUND_MESSAGE`], naming neither half
+/// (see [`resource_not_found`], the same form the reads of a resource inside a
+/// cluster carry).
+pub fn addon_not_found() -> ResourceNotFoundException {
+    resource_not_found()
 }
 
 /// The sentence every Amazon EKS-managed-plane operation refuses a cluster this
@@ -2178,6 +2200,15 @@ pub const ADDON_OWNER_AWS: &str = "aws";
 /// See [`ADDON_OWNER_AWS`].
 pub const ADDON_PUBLISHER_EKS: &str = "eks";
 
+/// The `owner` of an add-on a caller subscribes to through AWS Marketplace
+/// rather than one Amazon EKS manages.
+///
+/// `DescribeAddonVersions$owners` filters on it, and the catalog publishes both
+/// kinds (see [`ADDON_CATALOG`]): a Marketplace add-on is owned by
+/// `aws-marketplace`, published by its VENDOR rather than by `eks`, and carries
+/// the `marketplaceInformation` of the listing it is subscribed through.
+pub const ADDON_OWNER_MARKETPLACE: &str = "aws-marketplace";
+
 /// The Kubernetes namespace an add-on is installed into when the request names
 /// none.
 ///
@@ -3168,6 +3199,626 @@ fn seed_cluster_versions() -> Vec<ClusterVersionRecord> {
         .collect()
 }
 
+/// The processor architectures every build in the add-on catalog is published
+/// for.
+///
+/// `AddonVersionInfo$architecture` is "The architectures that the version
+/// supports", and Amazon EKS publishes each managed add-on for both the
+/// architectures its node groups run ([`crate::ops::types::AMI_TYPES_VALUES`]
+/// carries the same two in its AMI families: `x86_64` and `ARM_64`).
+const ADDON_ARCHITECTURES: &[&str] = &["amd64", "arm64"];
+
+/// The `platformVersions` entry a compatibility carries when the add-on build
+/// runs on every platform version of the cluster version it supports.
+///
+/// `Compatibility$platformVersions` is "The supported Amazon EKS platform
+/// versions", and this service publishes ONE platform version per cluster
+/// version ([`PLATFORM_VERSION`]), so no published build is restricted to a
+/// subset of them.
+pub const ADDON_ANY_PLATFORM_VERSION: &str = "*";
+
+/// The JSON Schema dialect `DescribeAddonConfiguration` publishes its
+/// configuration schema in.
+///
+/// `DescribeAddonConfigurationResponse$configurationSchema` is "A JSON schema
+/// that's used to validate the configuration values you provide when an add-on
+/// is created or updated", so the document names the dialect it is written in,
+/// as every JSON Schema does.
+const ADDON_CONFIGURATION_SCHEMA_DIALECT: &str = "http://json-schema.org/draft-06/schema#";
+
+/// One row of the add-on catalog seed: an Amazon EKS-managed add-on, and the
+/// version line its published builds run along.
+///
+/// The catalog is a PUBLICATION, like the Kubernetes version calendar
+/// ([`VERSION_CALENDAR`]): it is what Amazon EKS offers, not per-account data,
+/// so it is seeded once and no operation writes it.
+struct AddonCatalogSeed {
+    /// The add-on's name, the value `CreateAddon$addonName` takes.
+    addon_name: &'static str,
+    /// Who owns the add-on ([`ADDON_OWNER_AWS`] or
+    /// [`ADDON_OWNER_MARKETPLACE`]), which `DescribeAddonVersions$owners`
+    /// filters on.
+    owner: &'static str,
+    /// Who publishes the add-on ([`ADDON_PUBLISHER_EKS`] for an Amazon
+    /// EKS-managed add-on, the vendor for a Marketplace one), which
+    /// `DescribeAddonVersions$publishers` filters on.
+    publisher: &'static str,
+    /// The category Amazon EKS publishes the add-on under
+    /// (`AddonInfo$type`), which `DescribeAddonVersions$types` filters on.
+    addon_type: &'static str,
+    /// The Kubernetes namespace the add-on's workloads are installed into
+    /// (`AddonInfo$defaultNamespace`).
+    default_namespace: &'static str,
+    /// Whether the add-on needs IAM permissions of its own
+    /// (`AddonVersionInfo$requiresIamPermissions`).
+    requires_iam_permissions: bool,
+    /// The configuration properties the add-on cannot be installed without.
+    /// EMPTY for an add-on whose configuration values are optional, which is
+    /// what makes `AddonVersionInfo$requiresConfiguration` false for it and
+    /// what leaves the published configuration schema with no required
+    /// property: the flag and the schema have this one source.
+    required_configuration: &'static [&'static str],
+    /// The Kubernetes service accounts the add-on runs as, each with the
+    /// managed policies Amazon EKS recommends for it — what
+    /// `DescribeAddonConfiguration$podIdentityConfiguration` reports ("The
+    /// Kubernetes service account name used by the add-on, and any suggested
+    /// IAM policies"). Empty for an add-on that runs as no service account of
+    /// its own.
+    pod_identity: &'static [(&'static str, &'static [&'static str])],
+    /// `(major, minor, patch)` of the build published for the OLDEST Kubernetes
+    /// version in [`VERSION_CALENDAR`]. An add-on's version tracks the ADD-ON,
+    /// not the control plane, so each add-on carries its own line.
+    oldest_build: (u32, u32, u32),
+}
+
+/// The add-ons this service publishes.
+///
+/// The Amazon EKS-managed rows are the add-ons the "Amazon EKS add-ons" section
+/// of the Amazon EKS User Guide publishes: the name a caller installs them by,
+/// the category they are published under, the namespace their workloads run in,
+/// whether they need IAM permissions of their own, and the service account each
+/// one runs as with the managed policies the guide recommends for it. They are
+/// owned by [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
+///
+/// The rest are AWS Marketplace add-ons ([`ADDON_OWNER_MARKETPLACE`]), published
+/// by their VENDOR and carrying the `marketplaceInformation` of the listing they
+/// are subscribed through. They are in the catalog because the owner, publisher
+/// and `requiresConfiguration` an add-on reports are properties of the add-on,
+/// not of Amazon EKS: a Marketplace add-on that cannot run without its vendor's
+/// credentials is the kind that reports `requiresConfiguration` true, and the
+/// configuration properties named here are the ones that vendor's own
+/// documentation requires.
+///
+/// Rows are written in add-on NAME order, which is the order the catalog is
+/// published in ([`seed_addon_catalog`]). The table is fixed, so it also bounds
+/// this part of the store.
+const ADDON_CATALOG: &[AddonCatalogSeed] = &[
+    AddonCatalogSeed {
+        addon_name: "adot",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: "opentelemetry-operator-system",
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (0, 102, 1),
+    },
+    AddonCatalogSeed {
+        addon_name: "amazon-cloudwatch-observability",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: "amazon-cloudwatch",
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[(
+            "cloudwatch-agent",
+            &[
+                "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
+                "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess",
+            ],
+        )],
+        oldest_build: (1, 5, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "aws-ebs-csi-driver",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "storage",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[(
+            "ebs-csi-controller-sa",
+            &["arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"],
+        )],
+        oldest_build: (1, 31, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "aws-efs-csi-driver",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "storage",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[(
+            "efs-csi-controller-sa",
+            &["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
+        )],
+        oldest_build: (2, 0, 7),
+    },
+    AddonCatalogSeed {
+        addon_name: "aws-guardduty-agent",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "security",
+        default_namespace: "amazon-guardduty",
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (1, 6, 1),
+    },
+    AddonCatalogSeed {
+        addon_name: "aws-mountpoint-s3-csi-driver",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "storage",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (1, 7, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "coredns",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "networking",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (1, 11, 1),
+    },
+    AddonCatalogSeed {
+        addon_name: "datadog_operator",
+        owner: ADDON_OWNER_MARKETPLACE,
+        publisher: "datadog",
+        addon_type: "monitoring",
+        default_namespace: "datadog-agent",
+        requires_iam_permissions: false,
+        // The Datadog Operator sends telemetry to a Datadog organisation, which
+        // it cannot do without that organisation's API key.
+        required_configuration: &["apiKey"],
+        pod_identity: &[],
+        oldest_build: (1, 8, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "dynatrace_dynatrace-operator",
+        owner: ADDON_OWNER_MARKETPLACE,
+        publisher: "dynatrace",
+        addon_type: "monitoring",
+        default_namespace: "dynatrace",
+        requires_iam_permissions: false,
+        // The Dynatrace Operator connects to one Dynatrace environment, which it
+        // cannot do without that environment's API URL and token.
+        required_configuration: &["apiUrl", "apiToken"],
+        pod_identity: &[],
+        oldest_build: (1, 3, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "eks-node-monitoring-agent",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (1, 0, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "eks-pod-identity-agent",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "security",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (1, 2, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "kube-proxy",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "networking",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        // kube-proxy is the one add-on whose version IS the Kubernetes version
+        // it runs with, so its line starts at the oldest calendar row's version.
+        oldest_build: (1, 30, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "kubecost_kubecost",
+        owner: ADDON_OWNER_MARKETPLACE,
+        publisher: "kubecost",
+        addon_type: "cost-management",
+        default_namespace: "kubecost",
+        requires_iam_permissions: false,
+        // Kubecost reports on the cluster it runs in, so it needs no vendor
+        // credentials: a Marketplace add-on requires configuration only when it
+        // cannot run without it.
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (2, 3, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "metrics-server",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (0, 7, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "snapshot-controller",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "storage",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        oldest_build: (8, 1, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "vpc-cni",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "networking",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[("aws-node", &["arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"])],
+        oldest_build: (1, 18, 0),
+    },
+];
+
+/// One Kubernetes version a published add-on build supports, as the catalog
+/// holds it: the modelled `Compatibility`.
+#[derive(Debug, Clone)]
+pub struct AddonCompatibilityRecord {
+    /// The Kubernetes minor version this build supports, a
+    /// [`VERSION_CALENDAR`] row.
+    pub cluster_version: String,
+    /// The platform versions of that cluster version the build runs on
+    /// ([`ADDON_ANY_PLATFORM_VERSION`]).
+    pub platform_versions: Vec<String>,
+    /// Whether this build is the one `CreateAddon` installs on a cluster of
+    /// that Kubernetes version when the caller names no `addonVersion`.
+    pub default_version: bool,
+}
+
+impl AddonCompatibilityRecord {
+    /// This row as the modelled `Compatibility` shape.
+    pub fn to_compatibility(&self) -> Compatibility {
+        Compatibility {
+            cluster_version: Some(self.cluster_version.clone()),
+            platform_versions: Some(self.platform_versions.clone()),
+            default_version: self.default_version,
+        }
+    }
+}
+
+/// One published build of one add-on, as the catalog holds it: the modelled
+/// `AddonVersionInfo`.
+#[derive(Debug, Clone)]
+pub struct AddonCatalogVersionRecord {
+    /// The build's version, in the `vX.Y.Z-eksbuild.N` form every Amazon EKS
+    /// add-on version takes.
+    pub addon_version: String,
+    /// When Amazon EKS published this build — the release date of the
+    /// Kubernetes version it was published for. A build the clock has not
+    /// reached is not one the catalog offers yet, exactly as an unreleased
+    /// Kubernetes version is not ([`ClusterVersionRecord::is_released`]).
+    pub published_at: SystemTime,
+    /// The architectures the build is published for ([`ADDON_ARCHITECTURES`]).
+    pub architecture: Vec<String>,
+    /// The Kubernetes versions the build supports, oldest first.
+    pub compatibilities: Vec<AddonCompatibilityRecord>,
+    /// The configuration properties the build cannot be installed without; see
+    /// [`AddonCatalogSeed::required_configuration`].
+    pub required_configuration: Vec<String>,
+    /// Whether the build needs IAM permissions of its own.
+    pub requires_iam_permissions: bool,
+}
+
+impl AddonCatalogVersionRecord {
+    /// Whether Amazon EKS has published this build at `now`.
+    pub fn is_published(&self, now: SystemTime) -> bool {
+        now >= self.published_at
+    }
+
+    /// Whether this build supports a Kubernetes version.
+    pub fn supports(&self, cluster_version: &str) -> bool {
+        self.compatibilities
+            .iter()
+            .any(|entry| entry.cluster_version == cluster_version)
+    }
+
+    /// Whether this build cannot be installed without configuration values —
+    /// `AddonVersionInfo$requiresConfiguration`, which is exactly "this build
+    /// has a required configuration property".
+    pub fn requires_configuration(&self) -> bool {
+        !self.required_configuration.is_empty()
+    }
+
+    /// Whether this build is the default one for a Kubernetes version.
+    pub fn is_default_for(&self, cluster_version: &str) -> bool {
+        self.compatibilities
+            .iter()
+            .any(|entry| entry.cluster_version == cluster_version && entry.default_version)
+    }
+
+    /// This build as the modelled `AddonVersionInfo` shape.
+    ///
+    /// `cluster_version`, when given, is the Kubernetes version the listing was
+    /// filtered to: the reported compatibilities are then the ones for that
+    /// version alone, because a filtered listing answers about that version.
+    pub fn to_addon_version_info(&self, cluster_version: Option<&str>) -> AddonVersionInfo {
+        AddonVersionInfo {
+            addon_version: Some(self.addon_version.clone()),
+            architecture: Some(self.architecture.clone()),
+            // `computeTypes` is "The type of compute associated with the
+            // add-on version": no build this catalog publishes is restricted to
+            // one, so there is nothing to report.
+            compute_types: None,
+            compatibilities: Some(
+                self.compatibilities
+                    .iter()
+                    .filter(|entry| {
+                        cluster_version.is_none_or(|wanted| wanted == entry.cluster_version)
+                    })
+                    .map(AddonCompatibilityRecord::to_compatibility)
+                    .collect(),
+            ),
+            requires_configuration: self.requires_configuration(),
+            requires_iam_permissions: self.requires_iam_permissions,
+        }
+    }
+}
+
+/// One add-on the catalog publishes, with every build of it: the modelled
+/// `AddonInfo`.
+#[derive(Debug, Clone)]
+pub struct AddonCatalogRecord {
+    pub addon_name: String,
+    pub addon_type: String,
+    pub owner: String,
+    pub publisher: String,
+    pub default_namespace: String,
+    /// The AWS Marketplace listing this add-on is subscribed through, for an
+    /// add-on owned by [`ADDON_OWNER_MARKETPLACE`]; `None` for an Amazon
+    /// EKS-managed one, which is not listed on Marketplace at all.
+    pub marketplace_information: Option<MarketplaceInformation>,
+    /// The service accounts the add-on runs as, with the managed policies
+    /// recommended for each; see [`AddonCatalogSeed::pod_identity`].
+    pub pod_identity: Vec<(String, Vec<String>)>,
+    /// Every build of this add-on, NEWEST FIRST — the order the catalog
+    /// publishes versions in, so a caller reading it to pick a version sees the
+    /// newest build at the head of the list.
+    pub versions: Vec<AddonCatalogVersionRecord>,
+}
+
+impl AddonCatalogRecord {
+    /// The builds of this add-on Amazon EKS has published at `now`, newest
+    /// first.
+    pub fn published_versions(
+        &self,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &AddonCatalogVersionRecord> + '_ {
+        self.versions
+            .iter()
+            .filter(move |version| version.is_published(now))
+    }
+
+    /// This add-on as the modelled `AddonInfo` shape, reporting `versions`.
+    pub fn to_addon_info(&self, versions: Vec<AddonVersionInfo>) -> AddonInfo {
+        AddonInfo {
+            addon_name: Some(self.addon_name.clone()),
+            r#type: Some(self.addon_type.clone()),
+            addon_versions: Some(versions),
+            publisher: Some(self.publisher.clone()),
+            owner: Some(self.owner.clone()),
+            marketplace_information: self.marketplace_information.clone(),
+            default_namespace: Some(self.default_namespace.clone()),
+        }
+    }
+
+    /// The service accounts this add-on runs as, as the modelled
+    /// `AddonPodIdentityConfiguration` list.
+    pub fn to_pod_identity_configuration(&self) -> Vec<AddonPodIdentityConfiguration> {
+        self.pod_identity
+            .iter()
+            .map(|(service_account, policies)| AddonPodIdentityConfiguration {
+                service_account: Some(service_account.clone()),
+                recommended_managed_policies: Some(policies.clone()),
+            })
+            .collect()
+    }
+
+    /// The JSON schema `DescribeAddonConfiguration` publishes for one build of
+    /// this add-on: "A JSON schema that's used to validate the configuration
+    /// values you provide when an add-on is created or updated".
+    ///
+    /// Every property it declares is one the catalog holds a value for — the
+    /// namespace the add-on is installed into, the service account it runs as,
+    /// and the properties the build cannot be installed without — so the schema
+    /// says what this service can actually act on rather than describing
+    /// settings nothing here honours. Its `required` list is the build's own
+    /// [`AddonCatalogVersionRecord::required_configuration`], which is also what
+    /// makes [`AddonCatalogVersionRecord::requires_configuration`] true: a build
+    /// that requires configuration publishes a schema that requires it, and one
+    /// that does not publishes a schema with nothing required.
+    pub fn configuration_schema(&self, version: &AddonCatalogVersionRecord) -> String {
+        let mut properties = ::serde_json::Map::new();
+        properties.insert(
+            "namespace".to_string(),
+            ::serde_json::json!({
+                "type": "string",
+                "default": self.default_namespace,
+                "description": "The Kubernetes namespace the add-on is installed into.",
+            }),
+        );
+        if let Some((service_account, _)) = self.pod_identity.first() {
+            properties.insert(
+                "serviceAccount".to_string(),
+                ::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "default": service_account,
+                            "description":
+                                "The Kubernetes service account the add-on runs as.",
+                        },
+                    },
+                }),
+            );
+        }
+        for property in &version.required_configuration {
+            properties.insert(
+                property.clone(),
+                ::serde_json::json!({
+                    "type": "string",
+                    "description": format!(
+                        "Required to install {}: the add-on cannot run without it.",
+                        self.addon_name
+                    ),
+                }),
+            );
+        }
+        ::serde_json::json!({
+            "$schema": ADDON_CONFIGURATION_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": ::serde_json::Value::Object(properties),
+            "required": version.required_configuration,
+        })
+        .to_string()
+    }
+}
+
+/// The AWS Marketplace listing one Marketplace add-on is subscribed through.
+///
+/// `MarketplaceInformation` is the listing's `productId` and `productUrl`. This
+/// emulator holds no AWS Marketplace subscription, so there is no real listing
+/// to report: both are DERIVED from the add-on's name through the one
+/// derivation this service's UUID-shaped identifiers use
+/// ([`derive_uuid_from_seed`]), which makes them distinct per add-on and stable
+/// for as long as the catalog publishes it — the properties a caller can rely
+/// on — and the URL is the `prodview-<id>` form a Marketplace listing is
+/// published at.
+fn marketplace_listing(addon_name: &str) -> MarketplaceInformation {
+    let product_id = derive_uuid_from_seed(addon_name);
+    let view_id: String = product_id.chars().filter(char::is_ascii_alphanumeric).take(13).collect();
+    MarketplaceInformation {
+        product_id: Some(product_id),
+        product_url: Some(format!(
+            "https://aws.amazon.com/marketplace/pp/prodview-{view_id}"
+        )),
+    }
+}
+
+/// Build the add-on catalog this service publishes from [`ADDON_CATALOG`].
+///
+/// An add-on publishes one build per Kubernetes minor version the calendar
+/// carries, along its own version line: the build published alongside a
+/// Kubernetes version supports that version and the one before it — an add-on
+/// build keeps working on the cluster version it was released on — and it is the
+/// DEFAULT version for the Kubernetes version it was published for. So for any
+/// Kubernetes version the catalog names exactly ONE default build per add-on,
+/// while the newer build that still supports that version is offered as a
+/// non-default choice, which is what `CreateAddon` resolves an absent
+/// `addonVersion` through ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]).
+///
+/// Each add-on's builds come out NEWEST FIRST, the order the catalog publishes
+/// them in; the add-ons themselves keep [`ADDON_CATALOG`]'s name order.
+fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
+    ADDON_CATALOG
+        .iter()
+        .map(|seed| {
+            let (major, minor, patch) = seed.oldest_build;
+            let mut versions: Vec<AddonCatalogVersionRecord> = VERSION_CALENDAR
+                .iter()
+                .enumerate()
+                .map(|(index, (cluster_version, release, _, _))| {
+                    let mut compatibilities = Vec::with_capacity(2);
+                    if let Some((previous, _, _, _)) = index.checked_sub(1).and_then(|earlier| VERSION_CALENDAR.get(earlier))
+                    {
+                        compatibilities.push(AddonCompatibilityRecord {
+                            cluster_version: (*previous).to_string(),
+                            platform_versions: vec![ADDON_ANY_PLATFORM_VERSION.to_string()],
+                            default_version: false,
+                        });
+                    }
+                    compatibilities.push(AddonCompatibilityRecord {
+                        cluster_version: (*cluster_version).to_string(),
+                        platform_versions: vec![ADDON_ANY_PLATFORM_VERSION.to_string()],
+                        default_version: true,
+                    });
+                    AddonCatalogVersionRecord {
+                        addon_version: format!(
+                            "v{major}.{}.{patch}-eksbuild.1",
+                            minor + index as u32
+                        ),
+                        published_at: calendar_instant(release),
+                        architecture: ADDON_ARCHITECTURES
+                            .iter()
+                            .map(|architecture| (*architecture).to_string())
+                            .collect(),
+                        compatibilities,
+                        required_configuration: seed
+                            .required_configuration
+                            .iter()
+                            .map(|property| (*property).to_string())
+                            .collect(),
+                        requires_iam_permissions: seed.requires_iam_permissions,
+                    }
+                })
+                .collect();
+            versions.reverse();
+            AddonCatalogRecord {
+                addon_name: seed.addon_name.to_string(),
+                addon_type: seed.addon_type.to_string(),
+                owner: seed.owner.to_string(),
+                publisher: seed.publisher.to_string(),
+                default_namespace: seed.default_namespace.to_string(),
+                marketplace_information: (seed.owner == ADDON_OWNER_MARKETPLACE)
+                    .then(|| marketplace_listing(seed.addon_name)),
+                pod_identity: seed
+                    .pod_identity
+                    .iter()
+                    .map(|(service_account, policies)| {
+                        (
+                            (*service_account).to_string(),
+                            policies.iter().map(|policy| (*policy).to_string()).collect(),
+                        )
+                    })
+                    .collect(),
+                versions,
+            }
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-eks-awswesleyfrontend. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEksAwswesleyfrontendState {
@@ -3262,6 +3913,13 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// Kubernetes version first, see [`seed_cluster_versions`]) that the listing
     /// and its page tokens follow.
     pub cluster_versions: Vec<ClusterVersionRecord>,
+    /// The add-on catalog `DescribeAddonVersions` reports and
+    /// `DescribeAddonConfiguration` answers from, seeded once from
+    /// [`ADDON_CATALOG`] (see [`AddonCatalogRecord`]) and never written by a
+    /// request: it is what Amazon EKS publishes, not per-account data. A `Vec`
+    /// because the catalog has a publication ORDER (add-on name order, see
+    /// [`seed_addon_catalog`]) that the listing reports it in.
+    pub addon_catalog: Vec<AddonCatalogRecord>,
     /// How many update ids this store has minted. Mixed into the next one (see
     /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
     /// collide.
@@ -3284,6 +3942,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
             pod_identity_associations: BTreeMap::new(),
             minted_associations: 0,
             cluster_versions: seed_cluster_versions(),
+            addon_catalog: seed_addon_catalog(),
             minted_updates: 0,
         }
     }
@@ -3336,6 +3995,47 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 key_region == region && key_cluster == cluster_name
             })
             .map(|(_, _, addon_name)| addon_name.as_str())
+    }
+
+    /// The add-ons the catalog publishes at `now`, in the catalog's own
+    /// publication order (add-on name order).
+    ///
+    /// An add-on none of whose builds Amazon EKS has published yet is not one
+    /// the catalog offers, so it is not reported at all.
+    pub fn published_addons(
+        &self,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &AddonCatalogRecord> + '_ {
+        self.addon_catalog
+            .iter()
+            .filter(move |addon| addon.published_versions(now).next().is_some())
+    }
+
+    /// The catalog entry for one add-on name, when the catalog publishes it at
+    /// `now`.
+    pub fn published_addon(
+        &self,
+        addon_name: &str,
+        now: SystemTime,
+    ) -> Option<&AddonCatalogRecord> {
+        self.published_addons(now)
+            .find(|addon| addon.addon_name == addon_name)
+    }
+
+    /// The version the catalog publishes as the DEFAULT build of one add-on for
+    /// one Kubernetes version — the version `CreateAddon` installs when the
+    /// caller names none — or `None` when this catalog publishes no build of
+    /// that add-on for that Kubernetes version.
+    pub fn default_addon_version(
+        &self,
+        addon_name: &str,
+        kubernetes_version: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        self.published_addon(addon_name, now)?
+            .published_versions(now)
+            .find(|version| version.is_default_for(kubernetes_version))
+            .map(|version| version.addon_version.clone())
     }
 
     /// Drop every add-on installed on one cluster.
@@ -3860,24 +4560,27 @@ pub fn derive_addon_arn(
     )
 }
 
-/// The version `CreateAddon` assigns when the caller names none.
+/// The version `CreateAddon` assigns when the caller names none and the add-on
+/// catalog publishes no build of that add-on for the cluster's Kubernetes
+/// version.
 ///
 /// "The version of the add-on. The version must match one of the versions
 /// returned by `DescribeAddonVersions`" (`CreateAddon$addonVersion`) — and when
 /// the member is absent the real service installs the default version for the
-/// cluster's Kubernetes version. `DescribeAddonVersions` is still a scaffold in
-/// this emulator (its own gap issue,
-/// `issues/.../eks-describeaddonversions-stub.md`), so there is no catalog to
-/// pick that version from: this builds a version in the `vX.Y.Z-eksbuild.N` form
-/// every EKS add-on version takes, out of the cluster's own Kubernetes version,
-/// so a cluster on one Kubernetes version always reports the same default and
-/// the value a caller reads back is the one the record was created with.
+/// cluster's Kubernetes version. That default comes from the catalog
+/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]), which is
+/// the ONE source of a published add-on's versions, so the catalog and an
+/// installed add-on cannot disagree.
 ///
-/// It is a CHOSEN default, not a real one: a real add-on's version tracks the
-/// ADD-ON, not the control plane (`vpc-cni` on a 1.31 cluster is a `v1.19.x`
-/// build), and nothing here can know it. When the version catalog lands, the
-/// default must come from it and this function must go, so the two cannot
-/// disagree.
+/// This is the fallback for a request the catalog cannot answer: the published
+/// catalog is the Amazon EKS-managed add-ons ([`ADDON_CATALOG`]) for the
+/// Kubernetes versions the calendar carries ([`VERSION_CALENDAR`]), and an
+/// add-on name outside it is still accepted ([`is_addon_name_shaped`]), so a
+/// version has to come from somewhere. It builds one in the `vX.Y.Z-eksbuild.N`
+/// form every EKS add-on version takes out of the cluster's own Kubernetes
+/// version, so a cluster on one Kubernetes version always reports the same
+/// default and the value a caller reads back is the one the record was created
+/// with.
 pub fn derive_default_addon_version(kubernetes_version: &str) -> String {
     let mut parts = kubernetes_version
         .split('.')
@@ -3896,9 +4599,9 @@ pub fn derive_default_addon_version(kubernetes_version: &str) -> String {
 /// so the boundary validator accepts anything — including the empty string —
 /// and this is the check that refuses a value no add-on name can be. It is a
 /// FORM check, not a catalog check: "the name must match one of the names
-/// returned by `DescribeAddonVersions`", and that operation is still a scaffold
-/// here (its own gap issue), so this emulator holds no catalog to match
-/// against, and a hand-written subset of it would refuse add-ons the real
+/// returned by `DescribeAddonVersions`", and the catalog this emulator
+/// publishes ([`ADDON_CATALOG`]) is the Amazon EKS-managed add-ons alone, so
+/// matching against it would refuse the AWS Marketplace add-ons the real
 /// service accepts. The character set is the one every published add-on name
 /// uses, EKS-managed (`vpc-cni`) and Marketplace (`<publisher>_<product>`)
 /// alike.

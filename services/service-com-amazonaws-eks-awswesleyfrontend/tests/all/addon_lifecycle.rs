@@ -682,15 +682,62 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
 
 // ---------------------------------------------------------------------------
 // RULE: the version an add-on reports is the one the caller named; with none
-// named it is the default for the cluster's own Kubernetes version, in the
-// `vX.Y.Z-eksbuildN` form every EKS add-on version takes.
+// named it is the version the add-on catalog publishes as the default for the
+// cluster's own Kubernetes version, and where the catalog publishes no build for
+// that pair, one in the `vX.Y.Z-eksbuild.N` form every EKS add-on version takes.
 // ---------------------------------------------------------------------------
+
+/// The version the catalog publishes as the default build of one add-on for one
+/// Kubernetes version, read through `DescribeAddonVersions` — so this suite
+/// checks `CreateAddon` against the catalog a caller reads, not against a
+/// repeated constant. `None` when the catalog publishes no build for the pair.
+async fn catalog_default_version(
+    router: &MultiServiceRouter,
+    addon_name: &str,
+    kubernetes_version: &str,
+) -> Option<String> {
+    let answer = call(
+        router,
+        REGION,
+        "GET",
+        &format!(
+            "/addons/supported-versions?addonName={}&kubernetesVersion={}",
+            encode_label(addon_name),
+            encode_label(kubernetes_version)
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "setup DescribeAddonVersions {addon_name}/{kubernetes_version}: got {answer:?}"
+    );
+    answer.body["addons"]
+        .as_array()?
+        .first()?
+        .get("addonVersions")?
+        .as_array()?
+        .iter()
+        .find(|build| {
+            build["compatibilities"]
+                .as_array()
+                .is_some_and(|compatibilities| {
+                    compatibilities.iter().any(|compatibility| {
+                        compatibility["defaultVersion"].as_bool() == Some(true)
+                    })
+                })
+        })?
+        .get("addonVersion")?
+        .as_str()
+        .map(str::to_owned)
+}
 
 #[tokio::test]
 async fn the_addon_version_is_the_one_named_or_the_cluster_default() {
     let router = emulator();
     // Rows differ along the cluster's Kubernetes version, which is what the default
-    // is taken from.
+    // is taken from: two the published calendar does not carry (so the catalog has
+    // no build for them) and one it does.
     let versions = ["1.28", "1.29", "1.31"];
     for version in versions {
         let mut request = cluster_request(&format!("k8s-{}", version.replace('.', "-")));
@@ -701,6 +748,12 @@ async fn the_addon_version_is_the_one_named_or_the_cluster_default() {
 
     for version in versions {
         let cluster = format!("k8s-{}", version.replace('.', "-"));
+        let expected = match catalog_default_version(&router, "vpc-cni", version).await {
+            Some(published) => published,
+            // No build is published for that Kubernetes version, so the version has
+            // to come from the cluster's own Kubernetes version.
+            None => format!("v{version}.0-eksbuild.1"),
+        };
         let defaulted = create_addon(
             &router,
             &cluster,
@@ -713,8 +766,8 @@ async fn the_addon_version_is_the_one_named_or_the_cluster_default() {
         );
         assert_eq!(
             defaulted.addon()["addonVersion"],
-            serde_json::json!(format!("v{version}.0-eksbuild.1")),
-            "case {version:?}: the default version follows the cluster's Kubernetes \
+            serde_json::json!(expected),
+            "case {version:?}: expected the default version for the cluster's Kubernetes \
              version, got {:?}",
             defaulted.addon()["addonVersion"]
         );

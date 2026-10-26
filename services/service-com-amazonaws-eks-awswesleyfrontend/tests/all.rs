@@ -21,6 +21,8 @@ mod access_policy_catalog;
 mod access_policy_revocation;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
+#[path = "all/addon_versions.rs"]
+mod addon_versions;
 #[path = "all/cancel_update.rs"]
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]
