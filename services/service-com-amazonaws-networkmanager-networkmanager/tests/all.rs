@@ -15,6 +15,8 @@
 mod arn_scoping;
 #[path = "all/associate_customer_gateway_scoping.rs"]
 mod associate_customer_gateway_scoping;
+#[path = "all/associate_link_refusals.rs"]
+mod associate_link_refusals;
 #[path = "all/attachment_acceptance.rs"]
 mod attachment_acceptance;
 #[path = "all/attachment_lifecycle.rs"]

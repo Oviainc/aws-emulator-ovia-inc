@@ -18,7 +18,15 @@ use crate::global_network_lifecycle::{error_code, Emulator, PAST_SETTLE};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 
 /// `AssociateLink` for the `device`/`link` pair of `network`.
-async fn associate(emulator: &Emulator, network: &str, device: &str, link: &str) -> (u16, Value) {
+///
+/// Shared with the suite that tables this operation's refusals
+/// (`crate::associate_link_refusals`), so a request is built in exactly one place.
+pub(crate) async fn associate(
+    emulator: &Emulator,
+    network: &str,
+    device: &str,
+    link: &str,
+) -> (u16, Value) {
     emulator
         .post(
             &format!("/global-networks/{network}/link-associations"),
@@ -28,7 +36,14 @@ async fn associate(emulator: &Emulator, network: &str, device: &str, link: &str)
 }
 
 /// `AssociateLink` that must succeed, answering the `LinkAssociation` it reported.
-async fn associate_ok(emulator: &Emulator, network: &str, device: &str, link: &str) -> Value {
+///
+/// Shared with [`associate`]'s other caller.
+pub(crate) async fn associate_ok(
+    emulator: &Emulator,
+    network: &str,
+    device: &str,
+    link: &str,
+) -> Value {
     let (status, body) = associate(emulator, network, device, link).await;
     assert_eq!(
         status, 200,
@@ -47,7 +62,13 @@ async fn disassociate(emulator: &Emulator, network: &str, device: &str, link: &s
 }
 
 /// `GetLinkAssociations` on `network` with `query` appended to the URI.
-async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+///
+/// Shared with [`associate`]'s other caller, which reads an association back through it.
+pub(crate) async fn get_associations(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/link-associations")
     } else {
@@ -57,7 +78,9 @@ async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u
 }
 
 /// The device/link pairs a `GetLinkAssociations` page lists, in the order returned.
-fn pairs_of(body: &Value) -> Vec<(String, String)> {
+///
+/// Shared with [`associate`]'s other caller.
+pub(crate) fn pairs_of(body: &Value) -> Vec<(String, String)> {
     body["LinkAssociations"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a LinkAssociations array in {body}"))

@@ -43,9 +43,9 @@ pub(crate) const GLOBAL_NETWORK: &str = "global-network";
 /// See [`GLOBAL_NETWORK`].
 const SITE: &str = "site";
 /// See [`GLOBAL_NETWORK`].
-const LINK: &str = "link";
+pub(crate) const LINK: &str = "link";
 /// See [`GLOBAL_NETWORK`].
-const DEVICE: &str = "device";
+pub(crate) const DEVICE: &str = "device";
 /// See [`GLOBAL_NETWORK`].
 const CORE_NETWORK: &str = "core-network";
 
