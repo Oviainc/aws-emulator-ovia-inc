@@ -20,11 +20,10 @@
 //! published window (both sides of the bound and one well past it), and how many times the
 //! same job is asked.
 //!
-//! The shipment states this API moves a job through are not served by this emulator yet,
-//! so a row that needs a job in a state other than the one `CreateJob` mints sets that
-//! state in the service's own store before calling — the store the handler reads, reached
-//! the way the service reaches it. Everything the rule is about still travels over the
-//! wire.
+//! No operation of this API ships a device, so a row that needs a job in a state other
+//! than the one `CreateJob` mints sets that state in the service's own store before calling —
+//! the store the handler reads, reached the way the service reaches it. Everything the rule
+//! is about still travels over the wire.
 //!
 //! The call harness (`call_in_region`, `ok`, `refused`, `string`, `create_address`,
 //! `deliverable_address`) is the one `job_lifecycle` already drives the service with.

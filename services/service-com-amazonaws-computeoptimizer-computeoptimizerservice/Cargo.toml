@@ -31,6 +31,12 @@ service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = tru
 # The observed utilization an ECS service recommendation is computed from: the
 # `AWS/ECS` `CPUUtilization` / `MemoryUtilization` datapoints published for the service.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The object store a recommendations export writes its .csv export file and .json metadata
+# file into: "to an existing Amazon Simple Storage Service (Amazon S3) bucket that you
+# specify".
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The comma-separated-values codec the export file is written with.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
