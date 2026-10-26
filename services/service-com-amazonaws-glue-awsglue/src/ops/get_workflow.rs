@@ -143,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported
             // as that rather than as a client error the caller could act on.
@@ -159,7 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due to this workflow's runs, so the last execution it reports is the one the
         // clock had already reached.
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // "Specifies whether to include a graph when returning the workflow resource
+        // metadata": the reader that did not ask for one is answered without it, which is
+        // also what a request that named no `IncludeGraph` asked for, and the reader that
+        // asked gets the components this workflow's triggers make it of. Read before the
+        // record is borrowed to write to, so the projection is handed the graph it reports.
+        let graph = input
+            .include_graph
+            .unwrap_or(false)
+            .then(|| store.workflow_graph(&region, &input.name));
         let Some(entry) = store.workflow_mut(&input.name) else {
             return Err(GetWorkflowErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
@@ -171,11 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         entry.settle_due_runs(now);
 
-        // "Specifies whether to include a graph when returning the workflow resource
-        // metadata": the reader that did not ask for one is answered without it, which is
-        // also what a request that named no `IncludeGraph` asked for.
         Ok(GetWorkflowOutput {
-            workflow: Some(entry.to_workflow(input.include_graph.unwrap_or(false))),
+            workflow: Some(entry.to_workflow(graph)),
         })
     }
 }

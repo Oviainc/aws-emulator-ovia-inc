@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutWorkflowRunProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutWorkflowRunProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutWorkflowRunProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the request's properties onto one run of a workflow
+//! ([`crate::state::WorkflowRunEntry::run_properties`]): "if a property already exists for
+//! the specified run, then it overrides the value otherwise adds the property to existing
+//! properties", so a put is a per-key write over what the run already holds and never a
+//! replacement of the whole map. `GetWorkflowRunProperties` reads the map back, and a
+//! workflow or a run the store does not hold is refused with the modelled
+//! `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutWorkflowRunProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutWorkflowRunPropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(PutWorkflowRunPropertiesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name`, `RunId` and `RunProperties` are all `@required`, and the two names are
+        // held to `length 1..255` at the boundary: reaching here, the only question is
+        // whether this account holds that workflow and that workflow holds that run.
+        let mut store = state.lock();
+        let Some(workflow) = store.workflow_mut(&input.name) else {
+            return Err(not_found(crate::state::messages::workflow_not_found(
+                &input.name,
+            )));
+        };
+        let Some(run) = workflow.run_mut(&input.run_id) else {
+            return Err(not_found(crate::state::messages::workflow_run_not_found(
+                &input.name,
+                &input.run_id,
+            )));
+        };
+
+        // "If a property already exists for the specified run, then it overrides the value
+        // otherwise adds the property to existing properties": the keys the request carries
+        // are written over what the run holds, and every other key it holds is left as it
+        // was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutWorkflowRunProperties"))
+        // The store is resident memory and this put is reachable by any caller, so what one
+        // run will hold is bounded. Past the ceiling the put is refused with the operation's
+        // own modelled limit error, and nothing is written.
+        if run.properties_after(&input.run_properties) > crate::state::MAX_RUN_PROPERTIES_PER_RUN {
+            return Err(
+                PutWorkflowRunPropertiesErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "A workflow run cannot hold more than {} run properties",
+                            crate::state::MAX_RUN_PROPERTIES_PER_RUN
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let written = input.run_properties.len();
+        run.run_properties.extend(input.run_properties);
+        ::tracing::info!(
+            operation = "PutWorkflowRunProperties",
+            workflow = %input.name,
+            run = %input.run_id,
+            properties = written,
+            "wrote Glue workflow run properties"
+        );
+
+        // The operation models no output members: what it answers is the 200 itself.
+        Ok(PutWorkflowRunPropertiesOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> PutWorkflowRunPropertiesError {
+    PutWorkflowRunPropertiesErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

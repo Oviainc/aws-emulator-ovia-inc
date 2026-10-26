@@ -158,7 +158,9 @@
 
 pub mod catalog_encryption;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -177,12 +179,12 @@ use crate::ops::types::{
     DataCatalogEncryptionSettings, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
-    EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
+    Edge, EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
     ExecutionAttempt, ExecutionProperty, FederatedDatabase,
     FederatedTable, GlueTable, Job, MLTransform,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
-    NotificationProperty, Partition, PartitionInput, Predicate, PrincipalPermissions,
+    Node, NotificationProperty, Partition, PartitionInput, Predicate, PrincipalPermissions,
     ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
@@ -192,7 +194,7 @@ use crate::ops::types::{
     StartJobRunInput, StartWorkflowRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
-    Trigger,
+    Trigger, TriggerNodeDetails,
     UpdateCrawlerInput, Workflow, WorkflowGraph, WorkflowRun, WorkflowRunStatistics,
 };
 
@@ -443,6 +445,21 @@ pub const TRIGGER_TYPE_SCHEDULED: &str = "SCHEDULED";
 /// the request's `Predicate` is required ("This field is required when the trigger type is
 /// CONDITIONAL" — `CreateTriggerRequest$Predicate`).
 pub const TRIGGER_TYPE_CONDITIONAL: &str = "CONDITIONAL";
+
+/// The `NodeType` of a workflow-graph node that stands for a trigger. One of the modelled
+/// `NodeType` values, whose published list the generated
+/// [`crate::ops::types::NODE_TYPE_VALUES`] carries (`CRAWLER`, `JOB`, `TRIGGER`).
+pub const NODE_TYPE_TRIGGER: &str = "TRIGGER";
+
+/// The `NodeType` of a node that stands for a job definition. See [`NODE_TYPE_TRIGGER`].
+pub const NODE_TYPE_JOB: &str = "JOB";
+
+/// The `NodeType` of a node that stands for a crawler. See [`NODE_TYPE_TRIGGER`].
+pub const NODE_TYPE_CRAWLER: &str = "CRAWLER";
+
+/// The widest `NameString` the model accepts, which `Node$Name` and `Node$UniqueId` are
+/// both of: "length 1..255" (`smithy_query shape=Node`).
+const MAX_NAME_STRING_CHARS: usize = 255;
 
 /// The `Version` a crawler carries straight after `CreateCrawler`: the first version of
 /// a crawler is 1, and an update moves it on. The model's `@default` of 0 on
@@ -1315,6 +1332,64 @@ impl ComAmazonawsGlueAwsglueState {
             trigger.workflow_name.as_deref() == Some(workflow_name)
                 && trigger.trigger_type != TRIGGER_TYPE_CONDITIONAL
         })
+    }
+
+    /// The graph of the workflow `workflow_name`: "all the Glue components present in the
+    /// workflow and all the directed connections between them" (`WorkflowGraph`).
+    ///
+    /// A workflow holds the triggers whose `WorkflowName` names it, and each of those
+    /// triggers names the components it works with: "the actions initiated by this trigger"
+    /// (`Trigger$Actions`), each naming a job or a crawler, and the conditions of "the
+    /// predicate of this trigger, which defines when it will fire" (`Trigger$Predicate`),
+    /// each naming the job or crawler whose state it waits on. So the nodes are those
+    /// triggers plus every component they name, and an edge is directed the way the work
+    /// flows: from a trigger to what it initiates, and from a component to the trigger that
+    /// waits on it. A component named twice is one node, and a connection named twice is
+    /// one edge.
+    ///
+    /// `region` is the Region the read is served in, which is where a trigger lives — a
+    /// trigger is served only through the endpoint that created it — while a workflow is
+    /// per-account, so a workflow read in another Region reports the components attached
+    /// there.
+    ///
+    /// The walk is over that Region's triggers, bounded by [`MAX_TRIGGERS`], and takes them
+    /// in name order (the map is ordered), so two reads of an unchanged store report the
+    /// same graph.
+    pub fn workflow_graph(&self, region: &str, workflow_name: &str) -> WorkflowGraph {
+        let mut graph = WorkflowGraphBuilder::default();
+        let attached = self
+            .triggers
+            .get(region)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|trigger| trigger.workflow_name.as_deref() == Some(workflow_name));
+        for trigger in attached {
+            let trigger_id = graph.node(NODE_TYPE_TRIGGER, &trigger.name, Some(trigger));
+            for action in &trigger.actions {
+                for (node_type, name) in
+                    named_components(action.job_name.as_deref(), action.crawler_name.as_deref())
+                {
+                    let initiated = graph.node(node_type, name, None);
+                    graph.edge(&trigger_id, &initiated);
+                }
+            }
+            for condition in trigger
+                .predicate
+                .as_ref()
+                .and_then(|predicate| predicate.conditions.as_ref())
+                .into_iter()
+                .flatten()
+            {
+                for (node_type, name) in named_components(
+                    condition.job_name.as_deref(),
+                    condition.crawler_name.as_deref(),
+                ) {
+                    let waited_on = graph.node(node_type, name, None);
+                    graph.edge(&waited_on, &trigger_id);
+                }
+            }
+        }
+        graph.build()
     }
 
     /// Store `entry` as this account's workflow under its own name, which is the key every
@@ -7061,6 +7136,11 @@ impl WorkflowEntry {
         self.runs.iter().find(|run| run.id == run_id)
     }
 
+    /// [`Self::run`] mutably: where every write to one of this workflow's runs lands.
+    pub fn run_mut(&mut self, run_id: &str) -> Option<&mut WorkflowRunEntry> {
+        self.runs.iter_mut().find(|run| run.id == run_id)
+    }
+
     /// How many of this workflow's runs have not finished.
     ///
     /// Call [`Self::settle_due_runs`] first, or a run the clock has already finished still
@@ -7081,11 +7161,11 @@ impl WorkflowEntry {
     /// Rebuild the modelled `Workflow` shape from what is stored, so a listing reports
     /// the same workflow a single read does.
     ///
-    /// `include_graph` is the reader's own `IncludeGraph` ("Specifies whether to include a
-    /// graph when returning the workflow resource metadata"): a reader that asked for none
-    /// is answered without one at all, and one that asked for the graph gets the graph of
-    /// the components this workflow holds ([`workflow_graph`]).
-    pub fn to_workflow(&self, include_graph: bool) -> Workflow {
+    /// `graph` is the graph the reader asked for with its own `IncludeGraph` ("Specifies
+    /// whether to include a graph when returning the workflow resource metadata") —
+    /// [`ComAmazonawsGlueAwsglueState::workflow_graph`] for this workflow — and `None` when
+    /// it asked for none, because an unasked-for graph is reported as no graph at all.
+    pub fn to_workflow(&self, graph: Option<WorkflowGraph>) -> Workflow {
         Workflow {
             name: Some(self.name.clone()),
             description: self.description.clone(),
@@ -7096,8 +7176,8 @@ impl WorkflowEntry {
             // recently started run this workflow holds, and nothing at all for a workflow
             // no run has been started of. The nested run carries no graph of its own —
             // `IncludeGraph` asks for the WORKFLOW's graph, which is reported beside it.
-            last_run: self.runs.last().map(|run| run.to_workflow_run(false)),
-            graph: include_graph.then(workflow_graph),
+            last_run: self.runs.last().map(|run| run.to_workflow_run(None)),
+            graph,
             max_concurrent_runs: self.max_concurrent_runs,
             // "The details of the blueprint that this particular workflow is created
             // from": a workflow `CreateWorkflow` registered was created from none.
@@ -7151,6 +7231,15 @@ pub const WORKFLOW_RUN_ID_PREFIX: &str = "wr_";
 /// own window, for the reason [`MAX_RUNS_PER_JOB`] gives. The OLDEST record is dropped
 /// first, so the runs a caller is most likely to read are kept.
 pub const MAX_RUNS_PER_WORKFLOW: usize = 100;
+
+/// Ceiling on the run properties ONE workflow run may hold.
+///
+/// This emulator's own capacity, NOT an AWS quota, for the reason
+/// [`MAX_DATABASES_PER_CATALOG`] gives: `PutWorkflowRunProperties` adds to the map a run
+/// holds and is reachable by any caller, so what one process will hold for a run is bounded
+/// here. A put that would take the run past the ceiling is refused with that operation's
+/// modelled `ResourceNumberLimitExceededException` rather than written.
+pub const MAX_RUN_PROPERTIES_PER_RUN: usize = 100;
 
 /// How many workflow run ids this process has minted. A nonce source for
 /// [`new_workflow_run_id`], exactly as [`MINTED_JOB_RUN_IDS`] is for a job run id.
@@ -7258,6 +7347,16 @@ impl WorkflowRunEntry {
         TERMINAL_WORKFLOW_RUN_STATUSES.contains(&self.status.as_str())
     }
 
+    /// How many properties this run would hold once `incoming` had been written over what
+    /// it holds: the keys it already has, plus the ones the put brings that are new to it.
+    pub fn properties_after(&self, incoming: &HashMap<String, String>) -> usize {
+        self.run_properties.len()
+            + incoming
+                .keys()
+                .filter(|property| !self.run_properties.contains_key(*property))
+                .count()
+    }
+
     /// Move this run into the status the clock owed it at `now`, if it owed one.
     ///
     /// The run was due to leave the status a call put it in at [`Self::settles_at`] whether
@@ -7285,9 +7384,10 @@ impl WorkflowRunEntry {
 
     /// Rebuild the modelled `WorkflowRun` shape from what is stored.
     ///
-    /// `include_graph` is the reader's own `IncludeGraph` ("Specifies whether to include
-    /// the workflow graph in response or not"), handled as a workflow read handles it.
-    pub fn to_workflow_run(&self, include_graph: bool) -> WorkflowRun {
+    /// `graph` is the graph the reader asked for with its own `IncludeGraph` ("Specifies
+    /// whether to include the workflow graph in response or not"), handled as a workflow
+    /// read handles it ([`WorkflowEntry::to_workflow`]).
+    pub fn to_workflow_run(&self, graph: Option<WorkflowGraph>) -> WorkflowRun {
         WorkflowRun {
             name: Some(self.workflow_name.clone()),
             workflow_run_id: Some(self.id.clone()),
@@ -7300,7 +7400,7 @@ impl WorkflowRunEntry {
             status: Some(self.status.clone()),
             error_message: self.error_message.clone(),
             statistics: Some(self.statistics()),
-            graph: include_graph.then(workflow_graph),
+            graph,
             // "The batch condition that started the workflow run": only an EVENT trigger's
             // batch condition starts a run, and a start a caller made carries none.
             starting_event_batch_condition: None,
@@ -7322,20 +7422,123 @@ impl WorkflowRunEntry {
     }
 }
 
-/// A workflow's graph: "all the Glue components present in the workflow and all the
-/// directed connections between them".
+/// A workflow's graph under construction: the nodes and the directed connections
+/// [`ComAmazonawsGlueAwsglueState::workflow_graph`] has placed so far.
 ///
-/// The nodes are the triggers, jobs and crawlers attached to a workflow and the edges are
-/// the dependencies between them. Nothing can be attached to a workflow until the trigger
-/// operations are implemented, so the graph does not depend on the stored record yet: a
-/// workflow nothing is attached to is reported as the graph it is — present, with no
-/// components and no connections — rather than as no graph at all, which is what an
-/// unasked-for graph is.
-pub fn workflow_graph() -> WorkflowGraph {
-    WorkflowGraph {
-        nodes: Some(Vec::new()),
-        edges: Some(Vec::new()),
+/// Each component gets ONE node and each connection ONE edge however many of a workflow's
+/// triggers name it, which is what the two sets of placed ids are for; the lists keep the
+/// order the walk placed them in, so the graph is the same on every read of an unchanged
+/// store.
+#[derive(Debug, Default)]
+struct WorkflowGraphBuilder {
+    /// "A list of the the Glue components belong to the workflow represented as nodes."
+    nodes: Vec<Node>,
+    /// "A list of all the directed connections between the nodes belonging to the
+    /// workflow."
+    edges: Vec<Edge>,
+    /// The `UniqueId` of every node already placed.
+    placed_nodes: HashSet<String>,
+    /// The `(SourceId, DestinationId)` of every edge already placed.
+    placed_edges: HashSet<(String, String)>,
+}
+
+impl WorkflowGraphBuilder {
+    /// Place the node for the component `name` of type `node_type` unless it is already
+    /// placed, and answer its `UniqueId` either way.
+    ///
+    /// `trigger` is the stored trigger a TRIGGER node stands for, and `None` for the job and
+    /// crawler nodes: "details of the Trigger when the node represents a Trigger"
+    /// (`Node$TriggerDetails`).
+    fn node(&mut self, node_type: &str, name: &str, trigger: Option<&TriggerEntry>) -> String {
+        let unique_id = workflow_node_id(node_type, name);
+        if self.placed_nodes.insert(unique_id.clone()) {
+            self.nodes.push(Node {
+                r#type: Some(node_type.to_string()),
+                name: Some(name.to_string()),
+                unique_id: Some(unique_id.clone()),
+                trigger_details: trigger.map(|trigger| TriggerNodeDetails {
+                    trigger: Some(trigger.to_trigger()),
+                }),
+                // "The information for the job runs represented by the job node"
+                // (`JobNodeDetails$JobRuns`) and "a list of crawls represented by the crawl
+                // node" (`CrawlerNodeDetails$Crawls`): nothing here runs the actions a
+                // workflow's triggers initiate, so no run of that job and no crawl of that
+                // crawler belongs to this workflow to report.
+                job_details: None,
+                crawler_details: None,
+            });
+        }
+        unique_id
     }
+
+    /// Place the connection from the node `source_id` to the node `destination_id` unless
+    /// it is already placed.
+    fn edge(&mut self, source_id: &str, destination_id: &str) {
+        if self
+            .placed_edges
+            .insert((source_id.to_string(), destination_id.to_string()))
+        {
+            self.edges.push(Edge {
+                source_id: Some(source_id.to_string()),
+                destination_id: Some(destination_id.to_string()),
+            });
+        }
+    }
+
+    /// The modelled graph the walk built. A workflow nothing is attached to yields the
+    /// graph it is — present, with no components and no connections — rather than no graph
+    /// at all, which is what an unasked-for graph is.
+    fn build(self) -> WorkflowGraph {
+        WorkflowGraph {
+            nodes: Some(self.nodes),
+            edges: Some(self.edges),
+        }
+    }
+}
+
+/// The components one `Action` or `Condition` of a trigger names, as the node type and name
+/// of each: both shapes carry a `JobName` and a `CrawlerName`, and which of them is set
+/// says whether the component is a job or a crawler.
+fn named_components<'a>(
+    job_name: Option<&'a str>,
+    crawler_name: Option<&'a str>,
+) -> impl Iterator<Item = (&'static str, &'a str)> {
+    job_name
+        .map(|name| (NODE_TYPE_JOB, name))
+        .into_iter()
+        .chain(crawler_name.map(|name| (NODE_TYPE_CRAWLER, name)))
+}
+
+/// `Node$UniqueId`: "the unique Id assigned to the node within the workflow."
+///
+/// Derived from what identifies the component inside the workflow — its type and its name
+/// — so every read of the graph reports the same id for it, and a job and a trigger of the
+/// same name are still two nodes. `Node$UniqueId` is itself a `NameString`, so a component
+/// named at that bound leaves no room for the type: such a name keeps as much of itself as
+/// there IS room for, followed by a digest of the whole name, so two components whose names
+/// agree only on the part that fits still get two ids.
+fn workflow_node_id(node_type: &str, name: &str) -> String {
+    let prefix = format!("{}_", node_type.to_ascii_lowercase());
+    let room = MAX_NAME_STRING_CHARS.saturating_sub(prefix.chars().count());
+    if name.chars().count() <= room {
+        return format!("{prefix}{name}");
+    }
+    let digest = format!("_{:016x}", name_digest(name));
+    let held: String = name
+        .chars()
+        .take(room.saturating_sub(digest.chars().count()))
+        .collect();
+    format!("{prefix}{held}{digest}")
+}
+
+/// A 64-bit digest of `name`, which is what keeps two long component names apart in
+/// [`workflow_node_id`]. The standard library's own hasher, so nothing here hand-rolls one;
+/// it answers the same value for the same name throughout a process, which is what a stable
+/// id needs. NOT a cryptographic hash, and nothing here uses it as one.
+fn name_digest(name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

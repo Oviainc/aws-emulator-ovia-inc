@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported
             // as that rather than as a client error the caller could act on.
@@ -159,7 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        // "Specifies whether to include the workflow graph in response or not": the
+        // reader that did not ask for one is answered without it, which is also what a
+        // request that named no `IncludeGraph` asked for, and the reader that asked gets
+        // the graph of the workflow this is a run of. Read before the record is borrowed to
+        // write to, so the projection is handed the graph it reports.
+        let graph = input
+            .include_graph
+            .unwrap_or(false)
+            .then(|| store.workflow_graph(&region, &input.name));
         // `Name` and `RunId` are both `@required` with `length 1..255`, so an absent or
         // over-long one is refused at the boundary: reaching here, the only question is
         // whether this account holds that workflow and that workflow holds that run.
@@ -178,11 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        // "Specifies whether to include the workflow graph in response or not": the
-        // reader that did not ask for one is answered without it, which is also what a
-        // request that named no `IncludeGraph` asked for.
         Ok(GetWorkflowRunOutput {
-            run: Some(run.to_workflow_run(input.include_graph.unwrap_or(false))),
+            run: Some(run.to_workflow_run(graph)),
         })
     }
 }
