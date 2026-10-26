@@ -127,6 +127,8 @@ mod object_legal_hold;
 mod object_listing_and_deletion;
 #[path = "all/object_listing_encoding.rs"]
 mod object_listing_encoding;
+#[path = "all/object_listing_v1.rs"]
+mod object_listing_v1;
 #[path = "all/object_retention.rs"]
 mod object_retention;
 #[path = "all/object_restore.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListObjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListObjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the keys actually stored in the bucket, in ascending UTF-8
+//! byte order, honouring Prefix, Marker, Delimiter, MaxKeys and EncodingType, and
+//! reporting `NextMarker` where this revision of the listing owes one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListObjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: it reports the stored objects and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +180,12 @@ impl From<ListObjectsErrorModeled> for ListObjectsError {
     }
 }
 
+/// The most entries one page may carry: "Sets the maximum number of keys returned in the
+/// response. By default, the action returns up to 1,000 key names. The response might
+/// contain fewer keys but will never contain more" (`MaxKeys`,
+/// `com.amazonaws.s3#ListObjectsRequest`). A larger `max-keys` is answered with this many.
+const MAX_KEYS_PER_PAGE: i32 = 1000;
+
 /// The `ListObjects` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -218,20 +220,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // A listing needs nothing from the request beyond its deserialized input.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListObjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListObjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListObjects"))
+
+        // `OptionalObjectAttributes` asks for restore state, which is an archive tier this
+        // store does not model at all, and `RequestPayer` confirms a charge it does not
+        // model either; answering a plain listing would be answering something the request
+        // did not ask for, so each keeps the scaffold's 501 the way the sibling listings
+        // keep it. `encoding-type` IS served (below): it decides how the key-name elements
+        // of this response are written rather than which entries it reports.
+        for (member, present) in [
+            ("x-amz-request-payer", input.request_payer.is_some()),
+            (
+                "x-amz-optional-object-attributes",
+                input
+                    .optional_object_attributes
+                    .as_ref()
+                    .is_some_and(|attributes| !attributes.is_empty()),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "ListObjects with {member}"
+                )));
+            }
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `ExpectedBucketOwner`, judged the way every other bucket-scoped
+        // operation here judges it: this emulator serves one account, so that account owns
+        // every bucket it holds. Judged BEFORE the bucket is looked up, so a caller naming
+        // an account that owns nothing here learns nothing about which buckets exist.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // `encoding-type` names the ONE value the model's `EncodingType` enum declares
+        // (`url`), and the boundary refuses anything else before this handler runs; this
+        // guard is what keeps a listing from answering 200 with its keys written verbatim
+        // while echoing back an encoding it did not apply.
+        if let Some(requested) = input.encoding_type.as_deref() {
+            if requested != crate::state::ENCODING_TYPE_URL {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    "Invalid Encoding Method specified in Request",
+                ));
+            }
+        }
+
+        let max_keys = match input.max_keys {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Argument max-keys must be an integer between 0 and 2147483647: \
+                         {requested}"
+                    ),
+                ))
+            }
+            Some(requested) => requested.min(MAX_KEYS_PER_PAGE),
+            None => MAX_KEYS_PER_PAGE,
+        };
+        let page_limit = max_keys as usize;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        // Read-only: the guard is taken, the entries are copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let bucket = store
+            .bucket(&input.bucket)
+            .ok_or(ListObjectsErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let delimiter = input.delimiter.clone().unwrap_or_default();
+        // "The owner of the object" (`Object$Owner`). This revision of the listing reports
+        // it on every entry — it is `ListObjectsV2` that made the member opt-in, "the owner
+        // field is not present in ListObjectsV2 by default … set the FetchOwner field to
+        // true" (`ListObjectsV2Request$FetchOwner`) — and this emulator serves one account,
+        // whose canonical user id the store names once (`state::canonical_user_id`), the
+        // same id every other owner this service reports carries. The id is read ONCE here
+        // rather than per entry, because every entry of a listing carries the same owner.
+        // No `DisplayName`: that is an account's friendly name, which nothing here records.
+        let owner = Owner {
+            id: Some(crate::state::canonical_user_id()),
+            display_name: None,
+        };
+
+        let mut contents: Vec<Object> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+        // The last entry this page reported — a key, or a rolled-up common prefix — and
+        // whether anything was left unreported.
+        let mut last_entry: Option<String> = None;
+        let mut truncated = false;
+
+        // `max-keys=0` asks for no entries at all, which is an empty page and NOT a
+        // truncated one — reporting it as truncated would hand a paginating client a marker
+        // that makes no progress — so the walk below is skipped entirely.
+        if page_limit > 0 {
+            // The store keys objects in a `BTreeMap<String, _>`, so this walk is already in
+            // ascending UTF-8 byte order and every key rolling into one common prefix is
+            // contiguous within it.
+            for (key, object) in bucket.objects() {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                // "Marker is where you want Amazon S3 to start listing from. Amazon S3
+                // starts listing AFTER this specified key" — exclusive, and the marker "can
+                // be any key in the bucket", stored or not.
+                if input
+                    .marker
+                    .as_deref()
+                    .is_some_and(|marker| key <= marker)
+                {
+                    continue;
+                }
+
+                // With a delimiter, a key whose remainder after the prefix contains one is
+                // reported as the prefix up to and including that delimiter, not as an entry
+                // of its own.
+                let rolled_up = if delimiter.is_empty() {
+                    None
+                } else {
+                    key[prefix.len()..]
+                        .find(delimiter.as_str())
+                        .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+                };
+
+                if let Some(rolled_up) = rolled_up {
+                    // "All of the keys that roll up into a common prefix count as a single
+                    // return": a key under a prefix already on this page consumes no slot.
+                    if common_prefixes.last() == Some(&rolled_up) {
+                        continue;
+                    }
+                    // "CommonPrefixes is filtered out from results if it is not
+                    // lexicographically greater than the key-marker"
+                    // (`ListObjectsRequest$Delimiter`) — which is what keeps the page after
+                    // one that ended on a rolled-up prefix from reporting that prefix, and
+                    // the keys under it, a second time.
+                    if input
+                        .marker
+                        .as_deref()
+                        .is_some_and(|marker| rolled_up.as_str() <= marker)
+                    {
+                        continue;
+                    }
+                    if contents.len() + common_prefixes.len() >= page_limit {
+                        truncated = true;
+                        break;
+                    }
+                    last_entry = Some(rolled_up.clone());
+                    common_prefixes.push(rolled_up);
+                    continue;
+                }
+
+                // One slot per entry, shared by Contents and CommonPrefixes. Out of slots
+                // means there is more to report: this page is truncated, and it resumes at
+                // the entry after the last one it DID report.
+                if contents.len() + common_prefixes.len() >= page_limit {
+                    truncated = true;
+                    break;
+                }
+                last_entry = Some(key.to_string());
+                contents.push(Object {
+                    key: Some(key.to_string()),
+                    owner: Some(owner.clone()),
+                    // The instant the store recorded for the write, rendered the way
+                    // `GetObject` and `HeadObject` render it.
+                    last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+                    e_tag: Some(object.etag.clone()),
+                    size: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
+                    storage_class: Some(object.storage_class.clone()),
+                    // `RestoreStatus` needs an archive tier this store does not model, and
+                    // the checksum members a checksum `PutObject` did not compute.
+                    ..Object::default()
+                });
+            }
+        }
+
+        // "When the response is truncated … you can use the key name in this field as the
+        // marker parameter in the subsequent request to get the next set of objects. …
+        // This element is returned ONLY if you have the delimiter request parameter
+        // specified. If the response does not include the NextMarker element and it is
+        // truncated, you can use the value of the last Key element in the response as the
+        // marker parameter" (`ListObjectsOutput$NextMarker`) — so it names the LAST entry
+        // this page reported, which is the one a marker-resumed page starts after, and a
+        // listing that named no delimiter owes none because its last `Key` already is that
+        // entry. With a delimiter the last entry may be a rolled-up prefix, which appears
+        // under no `Key` at all, and that is exactly the case this element exists for.
+        let next_marker = match (truncated, delimiter.is_empty(), &last_entry) {
+            (true, false, Some(entry)) => Some(entry.clone()),
+            _ => None,
+        };
+
+        // The key-name elements of this listing, encoded when the request asked for an
+        // encoding type: `EncodingType` is the "encoding type used by Amazon S3 to encode
+        // the object keys in the response", and the key names here are `Prefix`,
+        // `Delimiter`, each entry's `Key`, the marker the request carried, the one it hands
+        // back, and the rolled-up `CommonPrefixes`.
+        let encode = |value: String| match input.encoding_type.as_deref() {
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            _ => value,
+        };
+
+        Ok(ListObjectsOutput {
+            name: Some(input.bucket.clone()),
+            prefix: input.prefix.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(&encode),
+            max_keys: Some(max_keys),
+            // "Indicates where in the bucket listing begins. Marker is included in the
+            // response if it was sent with the request."
+            marker: input.marker.clone().map(&encode),
+            // Truncated exactly when an entry was left for the next page.
+            is_truncated: Some(truncated),
+            next_marker: next_marker.map(&encode),
+            contents: (!contents.is_empty()).then(|| {
+                contents
+                    .into_iter()
+                    .map(|mut entry| {
+                        entry.key = entry.key.map(&encode);
+                        entry
+                    })
+                    .collect()
+            }),
+            common_prefixes: (!common_prefixes.is_empty()).then(|| {
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix {
+                        prefix: Some(encode(prefix)),
+                    })
+                    .collect()
+            }),
+            // `EncodingType` is "included in the response" exactly when the request asked
+            // for one, which is when the elements above are encoded; `RequestCharged`
+            // reports a Requester Pays charge this emulator does not model.
+            encoding_type: input.encoding_type.clone(),
+            request_charged: None,
+        })
     }
 }
