@@ -40,6 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -87,6 +88,92 @@ fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> 
 /// `ROUTE_PATH_SEGMENTS`: that name belongs to the generated crate-level constant, which
 /// is empty.
 const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
+/// The error code the query protocols name a refusal of a value outside a DECLARED BOUND
+/// with (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), and the code the framework
+/// itself would have answered this refusal with. It is restated here because [`Refused`]
+/// replaces the code and the message TOGETHER and only the message changes below: a
+/// client branches on the code, so it must stay the one it would have seen.
+const BOUND_REFUSAL_CODE: &str = "ValidationError";
+
+/// The member every paginated listing of this service takes its page size in, spelled the
+/// way a validation path spells it (lowerCamel, as
+/// `aws_smithy_schema_server::constraints::path::member` builds it).
+///
+/// It is one member name shared by the whole listing surface: `smithy_query(query=
+/// "operation", operation="ListInstanceProfiles,ListRoles,ListUsers")` shows each taking
+/// `MaxItems` against the same `maxItemsType` (range 1..1000).
+const PAGE_SIZE_MEMBER: &str = "MaxItems";
+
+/// Whether `violation` is a page size outside the `@range` [`PAGE_SIZE_MEMBER`] declares.
+///
+/// The member is matched on the LAST path segment, because that is the member the clause
+/// names however deeply the walk reached it.
+fn is_page_size_bound(violation: &Violation) -> bool {
+    let bound = matches!(
+        violation.kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    );
+    bound
+        && violation
+            .path
+            .rsplit('.')
+            .next()
+            .is_some_and(|member| member.eq_ignore_ascii_case(PAGE_SIZE_MEMBER))
+}
+
+/// A boundary refusal restated so a PAGE SIZE outside its declared range names the member
+/// and the bound it broke and nothing of the number itself, or `None` when the request
+/// broke no page-size bound and the framework's own wording stands.
+///
+/// This service states that class of refusal without echoing the rejected number — the
+/// clause reads `Value at 'maxItems' failed to satisfy constraint: Member must have value
+/// less than or equal to <bound>` — while every other class (a string outside its
+/// `@pattern` or `@length`, another numeric member outside its own range, an absent
+/// required member) keeps the framework's sentence, value and all. Only the
+/// `Value '<the number>' at` opening is lifted out: the envelope, the member path and the
+/// requirement are the framework's, built from the same two fields the renderer
+/// interpolated, so the two cannot drift and the replacement matches the echo whatever the
+/// number is.
+///
+/// The class is the one the service's recorded answers cover — the page size every
+/// paginated listing takes ([`PAGE_SIZE_MEMBER`]). The observed answer to a listing whose
+/// `MaxItems` was above the modelled maximum is `1 validation error detected: Value at
+/// 'maxItems' failed to satisfy constraint: Member must have value less than or equal to
+/// 1000`: the member, the bound the model declares and no number from the request. The
+/// rewording is deliberately no wider than that — a member with no observed answer is
+/// better left as the framework states it than reworded on a guess, which is why
+/// `MaxSessionDuration` and every other numeric member keep the framework's sentence
+/// (pinned, both ways, by `tests/all/range_refusal_wording.rs`).
+///
+/// A refusal carrying an ABSENT required member is declined whole: that one renders under
+/// a different code than a failed bound, and restating it under [`BOUND_REFUSAL_CODE`]
+/// would change what a client branches on.
+fn without_page_size_value_echo(violations: &[Violation]) -> Option<Refused> {
+    let absent_member = violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember));
+    if absent_member || !violations.iter().any(is_page_size_bound) {
+        return None;
+    }
+    let mut message = envelope(violations)?;
+    for violation in violations
+        .iter()
+        .filter(|violation| is_page_size_bound(violation))
+    {
+        let Some(value) = violation.value.as_deref() else {
+            continue;
+        };
+        message = message.replace(
+            &format!("Value '{value}' at '{}'", violation.path),
+            &format!("Value at '{}'", violation.path),
+        );
+    }
+    Some(Refused {
+        code: BOUND_REFUSAL_CODE.to_string(),
+        message,
+    })
+}
 
 /// The `com-amazonaws-iam-awsidentitymanagementv20100508` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -154,14 +241,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording; the one class this service words differently is a page size
+        // outside its declared range, which it states without echoing the number
+        // (see [`without_page_size_value_echo`], which answers with the code the
+        // framework would have chosen).
+        match refusal {
+            Refusal::Invalid(violations) => without_page_size_value_echo(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
