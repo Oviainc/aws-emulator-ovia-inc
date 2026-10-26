@@ -17,7 +17,7 @@
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
 //! `BatchGetReportGroups`, `BatchGetReports`, `ListProjects`, `ListSharedProjects`,
-//! `ListBuildsForProject`, `ListSandboxes`, `ListSandboxesForProject`,
+//! `ListBuildsForProject`, `ListBuildBatches`, `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.
 //!
 //! Sharing is its own record: a [`StoredResourcePolicy`] is the resource-based
@@ -1516,6 +1516,56 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         let stored = self.build_batches.get_mut(id)?;
         stored.settle(now_millis);
         Some(stored)
+    }
+
+    /// Every batch build id this account holds, OLDEST FIRST, keeping only those
+    /// whose status is `status` when one is given — each record first brought up
+    /// to date with the transition the clock already owes it
+    /// ([`Self::settled_build_batch`]'s rule, applied to the whole store, which
+    /// is what lets a status this call filters on be the current one).
+    ///
+    /// Ordered by the instant each batch build STARTED, which is the order the
+    /// service's own answers come back in: a listing of two batch builds reports
+    /// the LATER-started one first by default, which sorting the ids cannot
+    /// produce. `ListBuildBatchesInput$sortOrder` words its two directions as
+    /// "by identifier", but a batch build id is `<projectName>:<uuid>`, so
+    /// sorting the ids themselves groups by project and then by an opaque uuid —
+    /// no order a caller can act on — and CodeBuild makes that point itself about
+    /// the sibling list, whose `sortOrder` documents "The results are sorted by
+    /// build number, not the build identifier". Do not "correct" this back to id
+    /// order: the start instant is that recency order account-wide — within one
+    /// project it is `buildBatchNumber` order (`build_batches_by_project`), and
+    /// across projects it interleaves them as they ran.
+    ///
+    /// Two batch builds that started in the same millisecond fall back to their
+    /// project and then to their own `buildBatchNumber` — the order that project
+    /// started them in — and finally to the id, so the sequence is total, stable
+    /// across calls, and never reports one project's batch builds out of their
+    /// start order.
+    pub fn build_batch_ids_by_start(
+        &mut self,
+        now_millis: i64,
+        status: Option<&str>,
+    ) -> Vec<String> {
+        type StartKey<'a> = (i64, Option<&'a String>, Option<i64>, &'a String);
+
+        let mut started: Vec<StartKey<'_>> = Vec::new();
+        for (id, stored) in self.build_batches.iter_mut() {
+            stored.settle(now_millis);
+            let keeps = status.is_none_or(|wanted| {
+                stored.build_batch.build_batch_status.as_deref() == Some(wanted)
+            });
+            if keeps {
+                started.push((
+                    stored.start_millis,
+                    stored.build_batch.project_name.as_ref(),
+                    stored.build_batch.build_batch_number,
+                    id,
+                ));
+            }
+        }
+        started.sort();
+        started.into_iter().map(|(.., id)| id.clone()).collect()
     }
 
     /// Persist `stored` under `id` and record it as the newest sandbox of its
