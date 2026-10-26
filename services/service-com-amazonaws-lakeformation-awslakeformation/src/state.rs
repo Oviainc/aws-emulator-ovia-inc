@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal, DatabaseResource, LFTag,
-    PrincipalResourcePermissions, Resource, TableWithColumnsResource,
+    ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal, DataLakeSettings,
+    DatabaseResource, LFTag, PrincipalPermissions, PrincipalResourcePermissions, Resource,
+    TableWithColumnsResource,
 };
 
 /// The Glue Data Catalog's own store, in the same shared engine.
@@ -172,6 +173,10 @@ impl PermissionGrant {
 ///
 /// `data_cells_filters` is bounded by [`MAX_DATA_CELLS_FILTERS`], checked in
 /// `CreateDataCellsFilter`, the single site that inserts into it.
+///
+/// `data_lake_settings` holds one record per Data Catalog, bounded by
+/// [`MAX_DATA_LAKE_SETTINGS_CATALOGS`] checked in `PutDataLakeSettings`, the single site
+/// that inserts into it — needed because the catalog id is request-supplied.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// Catalog id -> (tag key -> tag). Both levels are `BTreeMap`s so enumeration order
@@ -198,6 +203,16 @@ pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// `GetDataCellsFilter` answers with and what `ListDataCellsFilter` pages over; a
     /// `BTreeMap` so those readers enumerate in a stable, sorted order.
     pub data_cells_filters: BTreeMap<String, DataCellsFilter>,
+    /// Catalog id -> the data lake settings last written for that Data Catalog.
+    ///
+    /// Keyed per catalog because both operations of the pair address one
+    /// (`CatalogId`, "by default, the account ID"), and the whole modelled structure is
+    /// kept because `PutDataLakeSettings` REPLACES it ("This API replaces the current list
+    /// of data lake admins with the new list being passed") and `GetDataLakeSettings`
+    /// answers with exactly it. A catalog with no entry was never configured and reads
+    /// back [`default_data_lake_settings`]. A `BTreeMap` for the same reason as the stores
+    /// above: a stable, sorted enumeration order.
+    pub data_lake_settings: BTreeMap<String, DataLakeSettings>,
 }
 
 impl ComAmazonawsLakeformationAwslakeformationState {
@@ -212,6 +227,16 @@ impl ComAmazonawsLakeformationAwslakeformationState {
         self.lf_tags
             .get(catalog_id)
             .is_some_and(|catalog| catalog.contains_key(tag_key))
+    }
+
+    /// The data lake settings `catalog_id` reads back: the ones last written for it, else
+    /// the settings a Data Catalog nobody has configured starts with
+    /// ([`default_data_lake_settings`]).
+    pub fn data_lake_settings_for(&self, catalog_id: &str) -> DataLakeSettings {
+        self.data_lake_settings
+            .get(catalog_id)
+            .cloned()
+            .unwrap_or_else(default_data_lake_settings)
     }
 }
 
@@ -435,10 +460,212 @@ pub const IAM_ALLOWED_PRINCIPALS: &str = "IAM_ALLOWED_PRINCIPALS";
 /// (`smithy_query(query="doc",shape="DataLakeSettings",member="CreateDatabaseDefaultPermissions")`).
 pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
 
+/// The most Data Catalogs this store will hold data lake settings for.
+///
+/// `CatalogId` is request-supplied, so without a ceiling a caller that varies it would
+/// grow the store without end. `PutDataLakeSettings` declares no numerical-limit error, so
+/// a write that would open one catalog too many is refused with the modelled
+/// `InvalidInputException` it does declare. Emulator-chosen, like the ceilings above.
+pub const MAX_DATA_LAKE_SETTINGS_CATALOGS: usize = 1_000;
+
+/// The `CreateDatabaseDefaultPermissions` / `CreateTableDefaultPermissions` value that
+/// selects "Use only IAM access control": [`DEFAULT_IAM_ACCESS_CONTROL_PERMISSION`] to
+/// [`IAM_ALLOWED_PRINCIPALS`], the one entry those two members admit beside the empty list.
+pub fn iam_access_control_default_permissions() -> Vec<PrincipalPermissions> {
+    vec![PrincipalPermissions {
+        principal: Some(DataLakePrincipal {
+            data_lake_principal_identifier: Some(IAM_ALLOWED_PRINCIPALS.to_string()),
+        }),
+        permissions: Some(vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()]),
+    }]
+}
+
+/// The settings a Data Catalog nothing has written settings for reads back.
+///
+/// The two create-default members carry the "Use only IAM access control" value, which is
+/// from the model rather than chosen: it is the setting that "is for backward compatibility
+/// with the Glue permission model implemented by IAM permissions"
+/// (see [`DEFAULT_IAM_ACCESS_CONTROL_PERMISSION`]), so it is what a catalog that has not
+/// been handed to Lake Formation is under — and it is what [`default_database_grants`]
+/// reports for the databases such a catalog holds.
+///
+/// Nothing has been designated yet, so the two administrator lists and the two list members
+/// that name accounts read back EMPTY, while every member whose absence the model gives a
+/// meaning of its own — the nullable flags, and `Parameters` — is left absent rather than
+/// filled with a value nothing set.
+pub fn default_data_lake_settings() -> DataLakeSettings {
+    DataLakeSettings {
+        data_lake_admins: Some(Vec::new()),
+        read_only_admins: Some(Vec::new()),
+        create_database_default_permissions: Some(iam_access_control_default_permissions()),
+        create_table_default_permissions: Some(iam_access_control_default_permissions()),
+        parameters: None,
+        trusted_resource_owners: Some(Vec::new()),
+        allow_external_data_filtering: None,
+        allow_full_table_external_data_access: None,
+        external_data_filtering_allow_list: Some(Vec::new()),
+        authorized_session_tag_value_list: Some(Vec::new()),
+    }
+}
+
+/// The `Parameters` keys the model documents a value set for, and the values each admits.
+///
+/// From the model: "CROSS_ACCOUNT_VERSION - Accepted values are 1, 2, 3, 4, and 5" and
+/// "SET_SOURCE_IDENTITY - Accepted values are TRUE and FALSE"
+/// (`smithy_query(query="doc",shape="DataLakeSettings",member="Parameters")`). A key the
+/// model documents no value set for is stored as written.
+pub const DOCUMENTED_SETTINGS_PARAMETERS: [(&str, &[&str]); 2] = [
+    ("CROSS_ACCOUNT_VERSION", &["1", "2", "3", "4", "5"]),
+    ("SET_SOURCE_IDENTITY", &["TRUE", "FALSE"]),
+];
+
+/// Whether `entry` is the one create-default entry that selects "Use only IAM access
+/// control": [`DEFAULT_IAM_ACCESS_CONTROL_PERMISSION`] and nothing else, to
+/// [`IAM_ALLOWED_PRINCIPALS`].
+fn is_iam_access_control_default(entry: &PrincipalPermissions) -> bool {
+    let principal = entry
+        .principal
+        .as_ref()
+        .and_then(|principal| principal.data_lake_principal_identifier.as_deref());
+    let only_permission = match entry.permissions.as_deref().unwrap_or_default() {
+        [permission] => Some(permission.as_str()),
+        _ => None,
+    };
+    principal == Some(IAM_ALLOWED_PRINCIPALS)
+        && only_permission == Some(DEFAULT_IAM_ACCESS_CONTROL_PERMISSION)
+}
+
+/// `Ok(())` when `settings` are data lake settings the service can store, else why they are
+/// not — the message of the modelled `InvalidInputException` `PutDataLakeSettings` answers
+/// with.
+///
+/// Three rules the model states but cannot express as constraints:
+///
+/// * every designated administrator is an IAM user or an IAM role — "A list of Lake
+///   Formation principals. Supported principals are IAM users or IAM roles."
+///   (`DataLakeSettings$DataLakeAdmins`, and the same sentence on `ReadOnlyAdmins`), which
+///   [`is_iam_principal`] is;
+/// * each create-default member is the empty list or the single entry that selects "Use
+///   only IAM access control" — "The only permitted values are an empty array or an array
+///   that contains a single JSON object that grants ALL to IAM_ALLOWED_PRINCIPALS";
+/// * a `Parameters` key the model documents a value set for carries one of those values
+///   ([`DOCUMENTED_SETTINGS_PARAMETERS`]). The comparison folds case, so the documented
+///   value spelled in another case is stored rather than refused.
+pub fn validate_data_lake_settings(settings: &DataLakeSettings) -> Result<(), String> {
+    for (member, admins) in [
+        ("DataLakeAdmins", &settings.data_lake_admins),
+        ("ReadOnlyAdmins", &settings.read_only_admins),
+    ] {
+        for admin in admins.iter().flatten() {
+            let identifier = admin
+                .data_lake_principal_identifier
+                .as_deref()
+                .unwrap_or_default();
+            if !is_iam_principal(identifier) {
+                return Err(format!(
+                    "{member} principal {identifier:?} is not supported: a data lake \
+                     administrator is an IAM user or an IAM role"
+                ));
+            }
+        }
+    }
+
+    for (member, entries) in [
+        (
+            "CreateDatabaseDefaultPermissions",
+            &settings.create_database_default_permissions,
+        ),
+        (
+            "CreateTableDefaultPermissions",
+            &settings.create_table_default_permissions,
+        ),
+    ] {
+        let permitted = match entries.as_deref().unwrap_or_default() {
+            [] => true,
+            [only] => is_iam_access_control_default(only),
+            _ => false,
+        };
+        if !permitted {
+            return Err(format!(
+                "The only permitted values for {member} are an empty array or an array that \
+                 contains a single JSON object that grants \
+                 {DEFAULT_IAM_ACCESS_CONTROL_PERMISSION} to {IAM_ALLOWED_PRINCIPALS}"
+            ));
+        }
+    }
+
+    for (key, value) in settings.parameters.iter().flatten() {
+        for (documented, accepted) in DOCUMENTED_SETTINGS_PARAMETERS {
+            if key == documented && !accepted.contains(&value.to_uppercase().as_str()) {
+                return Err(format!(
+                    "Parameter {key} accepts only {}, got {value:?}",
+                    accepted.join(", ")
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The permissions `settings`' `CreateDatabaseDefaultPermissions` grants `principal` on a
+/// database created under them, in first-named order with duplicates dropped.
+///
+/// A setting that names no entry for the principal grants it nothing, and so does an absent
+/// member: "A null value indicates access control by Lake Formation permissions"
+/// (`DataLakeSettings$CreateDatabaseDefaultPermissions`), which is to say nothing is held
+/// until something grants it.
+pub fn create_database_default_permissions(
+    settings: &DataLakeSettings,
+    principal: &str,
+) -> Vec<String> {
+    let granted: Vec<&String> = settings
+        .create_database_default_permissions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| {
+            entry
+                .principal
+                .as_ref()
+                .and_then(|named| named.data_lake_principal_identifier.as_deref())
+                == Some(principal)
+        })
+        .flat_map(|entry| entry.permissions.iter().flatten())
+        .collect();
+    dedup_values(granted)
+}
+
+/// The principals `settings`' `CreateDatabaseDefaultPermissions` names, in first-named
+/// order with duplicates dropped — the principals a listing reports a created database's
+/// default grant under.
+pub fn create_database_default_principals(settings: &DataLakeSettings) -> Vec<String> {
+    let named: Vec<&String> = settings
+        .create_database_default_permissions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .principal
+                .as_ref()?
+                .data_lake_principal_identifier
+                .as_ref()
+        })
+        .collect();
+    dedup_values(named)
+}
+
 /// The grant a Data Catalog DATABASE is created carrying, until a revoke takes it away:
-/// `ALL` to `IAM_ALLOWED_PRINCIPALS`, the account's "use only IAM access control" default
-/// (see [`DEFAULT_IAM_ACCESS_CONTROL_PERMISSION`]). `None` — nothing is held by default —
-/// for anything that default does not cover.
+/// what `settings`' `CreateDatabaseDefaultPermissions` grants `principal`, which on a
+/// catalog nothing has configured is `ALL` to `IAM_ALLOWED_PRINCIPALS`, the "Use only IAM
+/// access control" default (see [`default_data_lake_settings`]). `None` — nothing is held
+/// by default — for anything that setting does not cover.
+///
+/// `settings` is the ADDRESSED catalog's, read from the store
+/// ([`ComAmazonawsLakeformationAwslakeformationState::data_lake_settings_for`]), so what a
+/// database is created holding follows what `PutDataLakeSettings` last wrote rather than a
+/// value fixed here.
 ///
 /// Why it stops at databases: the default a resource is created with comes from the
 /// account's data lake settings for a DATABASE
@@ -449,9 +676,11 @@ pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
 /// one this store can answer for.
 ///
 /// It is rendered per request rather than written when the database is created, because
-/// this store never sees a database being created. That is observationally the same:
-/// `RevokePermissions` is the only call that can take the default away, and what it leaves
-/// behind is recorded in `revoked_default_grants`, which answers every later call.
+/// this store never sees a database being created. The two calls that can change what it
+/// renders are `RevokePermissions`, which takes the grant away for one database — recorded
+/// in `revoked_default_grants`, which answers every later call — and `PutDataLakeSettings`,
+/// which changes the setting itself for every database of the catalog at once rather than
+/// only for the ones created after it.
 ///
 /// One consequence of this rendering, deliberate: every database NAME carries the default
 /// on the REVOKE path, including one the Data Catalog does not hold, so a revoke against a
@@ -465,25 +694,29 @@ pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
 /// What a LISTING reports is [`default_database_grants`], which renders the same grant for
 /// the databases the Data Catalog actually holds.
 pub fn default_database_grant(
+    settings: &DataLakeSettings,
     resource: &Resource,
     principal: &str,
     condition: Option<&str>,
 ) -> Option<Vec<String>> {
     // The default carries no condition, so a condition-scoped request addresses a
     // different grant from the default one.
-    if resource.database.is_none() || principal != IAM_ALLOWED_PRINCIPALS || condition.is_some() {
+    if resource.database.is_none() || condition.is_some() {
         return None;
     }
-    Some(vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()])
+    let permissions = create_database_default_permissions(settings, principal);
+    (!permissions.is_empty()).then_some(permissions)
 }
 
 /// The default grants a listing in `catalog_id` must report, keyed by [`grant_key`] so
 /// each one merges with the explicit grant on the same resource.
 ///
-/// A Data Catalog database is created carrying the account's
-/// `DataLakeSettings$CreateDatabaseDefaultPermissions` as a DATABASE-level grant — by
-/// default `ALL` to [`IAM_ALLOWED_PRINCIPALS`] — and holds it until a revoke takes it
-/// away, so a reader of that database's permissions sees it. The permissions a database
+/// A Data Catalog database is created carrying the addressed catalog's
+/// `DataLakeSettings$CreateDatabaseDefaultPermissions` as a DATABASE-level grant — on a
+/// catalog nothing has configured, `ALL` to [`IAM_ALLOWED_PRINCIPALS`] — and holds it until
+/// a revoke takes it away, so a reader of that database's permissions sees it. One entry is
+/// rendered per principal that setting names ([`create_database_default_principals`]), so a
+/// listing reports the grant under whoever holds it. The permissions a database
 /// hands to the TABLES created in it are a different setting
 /// (`Database$CreateTableDefaultPermissions`, held in the Data Catalog), so they change
 /// nothing here.
@@ -509,6 +742,7 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
     engine: &Eng,
     catalog_id: &str,
     resource_filter: Option<&Resource>,
+    settings: &DataLakeSettings,
 ) -> Vec<(String, PermissionGrant)> {
     let (database_catalog, named) = match resource_filter {
         Some(resource) => {
@@ -548,29 +782,42 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
         }
     };
 
-    names
+    // One grant per (database, principal the setting grants to), with the permissions each
+    // principal is granted computed once: they depend on the setting alone, not on which
+    // database carries them. A principal the setting names with no permission at all is
+    // dropped here — an entry carrying nothing is not a grant.
+    let granted: Vec<(String, Vec<String>)> = create_database_default_principals(settings)
         .into_iter()
-        .map(|name| {
+        .map(|principal| {
+            let permissions = create_database_default_permissions(settings, &principal);
+            (principal, permissions)
+        })
+        .filter(|(_, permissions)| !permissions.is_empty())
+        .collect();
+    let mut grants: Vec<(String, PermissionGrant)> = Vec::new();
+    for name in names {
+        for (principal, permissions) in &granted {
             let resource = Resource {
                 database: Some(DatabaseResource {
                     catalog_id: Some(database_catalog.clone()),
-                    name,
+                    name: name.clone(),
                 }),
                 ..Resource::default()
             };
             let grant = PermissionGrant {
                 catalog_id: catalog_id.to_string(),
-                principal: IAM_ALLOWED_PRINCIPALS.to_string(),
+                principal: principal.clone(),
                 resource,
-                permissions: vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()],
+                permissions: permissions.clone(),
                 // The default carries no grant option and no condition.
                 permissions_with_grant_option: Vec::new(),
                 condition_expression: None,
             };
             let key = grant_key(catalog_id, &grant.principal, &grant.resource, None);
-            (key, grant)
-        })
-        .collect()
+            grants.push((key, grant));
+        }
+    }
+    grants
 }
 
 /// The `arn:<partition>:iam::<account>:<type>/…` resource types that name an IAM

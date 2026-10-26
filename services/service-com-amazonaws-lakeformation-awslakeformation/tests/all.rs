@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/data_cells_filters.rs"]
 mod data_cells_filters;
+#[path = "all/data_lake_settings.rs"]
+mod data_lake_settings;
 #[path = "all/default_database_grant.rs"]
 mod default_database_grant;
 #[path = "all/glue_catalog.rs"]

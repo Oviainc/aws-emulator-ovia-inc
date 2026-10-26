@@ -272,10 +272,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The creation-time default, unless a revoke already took it away. It is not a
         // record, so it is held ON TOP of whatever `GrantPermissions` wrote: a principal
         // that was granted SELECT on a database created under the IAM-access-control
-        // default holds both.
-        let default_grant =
-            crate::state::default_database_grant(&resource, principal, condition.as_deref())
-                .filter(|_| !store.revoked_default_grants.contains(&key));
+        // default holds both. What the default IS comes from the addressed catalog's own
+        // data lake settings, as `PutDataLakeSettings` last wrote them.
+        let settings = store.data_lake_settings_for(&catalog_id);
+        let default_grant = crate::state::default_database_grant(
+            &settings,
+            &resource,
+            principal,
+            condition.as_deref(),
+        )
+        .filter(|_| !store.revoked_default_grants.contains(&key));
         let mut missing: Vec<String> = Vec::new();
         for (scoped_key, permissions, permissions_with_grant_option) in &scoped {
             let held = store.permission_grants.get(scoped_key);

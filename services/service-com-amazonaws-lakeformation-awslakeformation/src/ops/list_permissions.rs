@@ -258,11 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The default grant each of the addressed databases was created carrying, read
         // from the Data Catalog BEFORE this service's store is locked (the helper takes
-        // Glue's lock).
+        // Glue's lock). What that default IS comes from the addressed catalog's own data
+        // lake settings, so it is read out of this store first and the guard dropped
+        // again, leaving neither lock held while the other is taken.
+        let settings = state.lock().data_lake_settings_for(&catalog_id);
         let default_grants = crate::state::default_database_grants(
             &*self.engine,
             &catalog_id,
             resource_filter.as_ref(),
+            &settings,
         );
 
         // "If both Principal and Resource parameters are provided, the response returns
