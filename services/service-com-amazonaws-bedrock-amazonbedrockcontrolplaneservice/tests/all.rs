@@ -51,6 +51,8 @@ mod marketplace_model_endpoints;
 mod model_customization_jobs;
 #[path = "all/model_import_jobs.rs"]
 mod model_import_jobs;
+#[path = "all/model_invocation_jobs.rs"]
+mod model_invocation_jobs;
 #[path = "all/model_invocation_logging.rs"]
 mod model_invocation_logging;
 #[path = "all/prompt_routers.rs"]
