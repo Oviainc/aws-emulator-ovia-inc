@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/key_value_lifecycle.rs"]
 mod key_value_lifecycle;
+#[path = "all/sigv4_flavour_routing.rs"]
+mod sigv4_flavour_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
