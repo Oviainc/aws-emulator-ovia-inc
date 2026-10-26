@@ -4,7 +4,9 @@
 //! the rules more than one operation in the site + Outpost lifecycle applies: id
 //! and ARN minting, scoping a resource to the region it was created in, resolving the
 //! `id OR ARN` identifier forms the modelled
-//! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
+//! `@httpLabel` patterns accept — against the endpoint the request was addressed to,
+//! since an ARN names a partition, a Region and an account of its own —
+//! projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, selecting a site's two addresses by the
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
 //! step with it, projecting an Outpost's private connectivity configuration
@@ -58,6 +60,26 @@ pub const SITE_RESOURCE_TYPE: &str = "site";
 /// The ARN resource TYPE an Outpost's ARN carries (`…:outpost/op-…`), from the
 /// modelled `OutpostArn` pattern. See [`SITE_RESOURCE_TYPE`].
 pub const OUTPOST_RESOURCE_TYPE: &str = "outpost";
+
+/// The ARN resource TYPE a quote's ARN carries (`…:quote/oq-…`), from the ARN branch
+/// of the modelled `QuoteIdentifier` pattern. See [`SITE_RESOURCE_TYPE`].
+pub const QUOTE_RESOURCE_TYPE: &str = "quote";
+
+/// The prefix a site id carries (`os-…`), as the bare-id branch of the modelled
+/// `SiteId` pattern spells it.
+///
+/// Minting an id ([`ComAmazonawsOutpostsOutpostsolafserviceState::mint_id`]) and
+/// reading one back ([`resolve_id`]) name the kind through this one constant, so the
+/// two can never disagree about what a site id looks like.
+pub const SITE_ID_PREFIX: &str = "os";
+
+/// The prefix an Outpost id carries (`op-…`), from the bare-id branch of the modelled
+/// `OutpostId` / `OutpostIdentifier` patterns. See [`SITE_ID_PREFIX`].
+pub const OUTPOST_ID_PREFIX: &str = "op";
+
+/// The prefix a quote id carries (`oq-…`), from the bare-id branch of the modelled
+/// `QuoteIdentifier` pattern. See [`SITE_ID_PREFIX`].
+pub const QUOTE_ID_PREFIX: &str = "oq";
 
 /// The `LifeCycleStatus` a freshly created Outpost carries.
 ///
@@ -3548,8 +3570,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 .quote
                 .outpost_arn
                 .as_deref()
-                .and_then(resolve_outpost_id);
-            if quote_outpost.as_deref() != Some(outpost_id)
+                .and_then(outpost_id_in_arn);
+            if quote_outpost != Some(outpost_id)
                 || record.quote.quote_status.as_deref() != Some(QUOTE_STATUS_ORDER_SUBMITTED)
             {
                 return false;
@@ -4111,41 +4133,160 @@ pub fn private_connectivity_config(
     }
 }
 
-/// The bare resource id an Outposts identifier names, whether it arrived as the id
-/// or as the full ARN.
+/// The fields one AWS resource ARN carries:
+/// `arn:<partition>:<service>:<region>:<account>:<resource type>/<resource id>`.
 ///
-/// Every identifier member in this API is modelled
-/// `^(arn:…:<kind>/)?(<prefix>-[a-f0-9]{17})$` — the ARN prefix is optional — so one
-/// resolver serves `SiteId`, `OutpostId` and the ARN forms alike: take the segment
-/// after the last `/` when the value is an ARN, then require the bare id to be the
-/// `<prefix>-` plus exactly 17 lowercase hex characters the pattern allows.
-/// `None` means the value is not an identifier this service could have minted.
-pub fn resolve_id(identifier: &str, prefix: &str) -> Option<String> {
-    let bare = match identifier.starts_with("arn:") {
-        true => identifier.rsplit('/').next()?,
-        false => identifier,
-    };
-    let suffix = bare.strip_prefix(prefix)?.strip_prefix('-')?;
+/// Both ARN shapes this API models are written out to that last field — the `Arn` the
+/// tagging operations bind, and the ARN form every identifier member accepts — so one
+/// reader serves them both. The fields borrow the value they were read out of, so
+/// answering a question about an ARN copies nothing.
+struct ResourceArn<'a> {
+    partition: &'a str,
+    service: &'a str,
+    region: &'a str,
+    account: &'a str,
+    resource_type: &'a str,
+    resource_id: &'a str,
+}
+
+/// The ARN `value` is, or `None` when it is not an ARN naming a typed resource at
+/// all.
+fn parse_resource_arn(value: &str) -> Option<ResourceArn<'_>> {
+    let mut fields = value.strip_prefix("arn:")?.splitn(5, ':');
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let account = fields.next()?;
+    let (resource_type, resource_id) = fields.next()?.split_once('/')?;
+    Some(ResourceArn {
+        partition,
+        service,
+        region,
+        account,
+        resource_type,
+        resource_id,
+    })
+}
+
+impl ResourceArn<'_> {
+    /// Whether this ARN names a resource of the endpoint a request addressed to
+    /// `region` reached.
+    ///
+    /// An ARN is an ABSOLUTE identity: the partition, the Region and the account id
+    /// are part of the name, so the resource it names belongs to the endpoint being
+    /// called only when all three are that endpoint's own — the Region the request is
+    /// addressed to, the partition that Region belongs to ([`partition_for`]) and the
+    /// one account this emulator presents, which are exactly the segments
+    /// [`resource_arn`] mints the ARN of a local resource from. An ARN differing in
+    /// any of them names a resource of some other endpoint, which this one holds no
+    /// record of however familiar the bare resource id inside it looks.
+    fn names_endpoint(&self, region: &str) -> bool {
+        self.partition == partition_for(region)
+            && self.region == region
+            && self.account == ::engine::emulator_account_id()
+    }
+}
+
+/// What an identifier member of this API names at the endpoint the request was
+/// addressed to.
+///
+/// Every identifier member is modelled `^(arn:…:<kind>/)?(<prefix>-[a-f0-9]{17})$`,
+/// and the two branches do not say the same thing: the bare id names a resource of
+/// the endpoint being called, while an ARN states an identity of its own
+/// ([`ResourceArn::names_endpoint`]) that may belong to another endpoint entirely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedIdentifier {
+    /// A resource of THIS endpoint's inventory, named by the bare id to look it up
+    /// by.
+    Here(String),
+    /// A resource of ANOTHER endpoint: an ARN whose partition, Region or account id
+    /// is not this endpoint's own. This endpoint holds no record of it, so a call
+    /// naming it is answered exactly as a call naming a resource that never existed.
+    Elsewhere,
+}
+
+impl ResolvedIdentifier {
+    /// The bare id to look this endpoint's inventory up by, or `None` when the value
+    /// named another endpoint's resource — which is nothing this endpoint can report
+    /// on, change or delete.
+    pub fn here(&self) -> Option<&str> {
+        match self {
+            Self::Here(resource_id) => Some(resource_id),
+            Self::Elsewhere => None,
+        }
+    }
+}
+
+/// The resource an Outposts identifier names at the endpoint a request addressed to
+/// `region` reached, whether the identifier arrived as the bare id or as the full
+/// ARN.
+///
+/// One resolver serves `SiteId`, `OutpostId` / `OutpostIdentifier` and
+/// `QuoteIdentifier` alike, because every one of them is modelled
+/// `^(arn:…:<resource_type>/)?(<prefix>-[a-f0-9]{17})$`: read the bare id out of the
+/// value, and — for the ARN form — judge the identity that ARN states against this
+/// endpoint's own. `None` means the value is not an identifier of this kind at all:
+/// not an ARN of this service's namespace, not this kind of resource, or not the
+/// `<prefix>-` plus exactly 17 lowercase hex characters the bare-id branch admits.
+pub fn resolve_id(
+    identifier: &str,
+    resource_type: &str,
+    prefix: &str,
+    region: &str,
+) -> Option<ResolvedIdentifier> {
+    if !identifier.starts_with("arn:") {
+        let resource_id = bare_id(identifier, prefix)?;
+        return Some(ResolvedIdentifier::Here(resource_id.to_string()));
+    }
+    let arn = parse_resource_arn(identifier)?;
+    if arn.service != ARN_NAMESPACE || arn.resource_type != resource_type {
+        return None;
+    }
+    let resource_id = bare_id(arn.resource_id, prefix)?;
+    Some(match arn.names_endpoint(region) {
+        true => ResolvedIdentifier::Here(resource_id.to_string()),
+        false => ResolvedIdentifier::Elsewhere,
+    })
+}
+
+/// The bare `<prefix>-…` resource id `value` is, or `None` when it is not one: the
+/// id form every identifier pattern of this API spells `<prefix>-[a-f0-9]{17}`.
+fn bare_id<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = value.strip_prefix(prefix)?.strip_prefix('-')?;
     let well_formed = suffix.len() == 17
         && suffix
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    well_formed.then(|| bare.to_string())
+    well_formed.then_some(value)
 }
 
-/// The `os-…` id a `SiteId` names. See [`resolve_id`].
-pub fn resolve_site_id(identifier: &str) -> Option<String> {
-    resolve_id(identifier, "os")
+/// The site a `SiteId` names here. See [`resolve_id`].
+pub fn resolve_site_id(identifier: &str, region: &str) -> Option<ResolvedIdentifier> {
+    resolve_id(identifier, SITE_RESOURCE_TYPE, SITE_ID_PREFIX, region)
 }
 
-/// The `op-…` id an `OutpostId` names. See [`resolve_id`].
-pub fn resolve_outpost_id(identifier: &str) -> Option<String> {
-    resolve_id(identifier, "op")
+/// The Outpost an `OutpostId` / `OutpostIdentifier` names here. See [`resolve_id`].
+pub fn resolve_outpost_id(identifier: &str, region: &str) -> Option<ResolvedIdentifier> {
+    resolve_id(identifier, OUTPOST_RESOURCE_TYPE, OUTPOST_ID_PREFIX, region)
 }
 
-/// The `oq-…` id a `QuoteIdentifier` names. See [`resolve_id`].
-pub fn resolve_quote_id(identifier: &str) -> Option<String> {
-    resolve_id(identifier, "oq")
+/// The quote a `QuoteIdentifier` names here. See [`resolve_id`].
+pub fn resolve_quote_id(identifier: &str, region: &str) -> Option<ResolvedIdentifier> {
+    resolve_id(identifier, QUOTE_RESOURCE_TYPE, QUOTE_ID_PREFIX, region)
+}
+
+/// The `op-…` id an `OutpostArn` this service MINTED carries.
+///
+/// For an ARN the service stored itself — the `OutpostArn` a quote copies off the
+/// Outpost it is associated with — which already names a resource of that resource's
+/// own region. An identifier a REQUEST supplied is resolved against the endpoint it
+/// was sent to instead ([`resolve_outpost_id`]).
+pub fn outpost_id_in_arn(arn: &str) -> Option<&str> {
+    let arn = parse_resource_arn(arn)?;
+    if arn.service != ARN_NAMESPACE || arn.resource_type != OUTPOST_RESOURCE_TYPE {
+        return None;
+    }
+    bare_id(arn.resource_id, OUTPOST_ID_PREFIX)
 }
 
 /// Now, as the modelled `ISO8601Timestamp` members of this API carry an instant.
@@ -4171,13 +4312,9 @@ pub fn timestamp(at: std::time::SystemTime) -> ::aws_smithy_types::DateTime {
 /// this service's own ARN namespace. `None` means the value is not an ARN of this
 /// service at all.
 pub fn resource_arn_parts(arn: &str) -> Option<(String, String)> {
-    let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
-    let _partition = fields.next()?;
-    let service = fields.next()?;
-    let _region = fields.next()?;
-    let _account = fields.next()?;
-    let (resource_type, resource_id) = fields.next()?.split_once('/')?;
-    (service == ARN_NAMESPACE).then(|| (resource_type.to_string(), resource_id.to_string()))
+    let arn = parse_resource_arn(arn)?;
+    (arn.service == ARN_NAMESPACE)
+        .then(|| (arn.resource_type.to_string(), arn.resource_id.to_string()))
 }
 
 /// Which Availability Zone identifiers a request addressed to a region may name.
