@@ -65,15 +65,19 @@ fn task_configuration() -> Value {
 /// status a successful call answers, the body it sends for a given case suffix
 /// (with `tags` added by the caller), and where the ARN of the tagged resource is
 /// found afterwards.
-struct Target {
-    label: &'static str,
-    uri: String,
-    success: u16,
-    body: Box<dyn Fn(&str) -> Value>,
+///
+/// `pub(crate)` with its parts: the sibling `reserved_tag_keys` suite drives the
+/// SAME set of operations over the other half of the tag-key rule, so the two
+/// share one table and cannot drift apart as operations are implemented.
+pub(crate) struct Target {
+    pub(crate) label: &'static str,
+    pub(crate) uri: String,
+    pub(crate) success: u16,
+    pub(crate) body: Box<dyn Fn(&str) -> Value>,
     /// The ARN whose tag set `ListTagsForResource` must then report, read off the
     /// successful response (a create) or fixed (an operation that tags a resource
     /// that already exists).
-    arn: Box<dyn Fn(&Value) -> String>,
+    pub(crate) arn: Box<dyn Fn(&Value) -> String>,
 }
 
 /// Read a required string member off a response body.
@@ -93,7 +97,9 @@ fn member(body: &Value, name: &str) -> String {
 /// scaffolded 501 stubs and are left to their own stub issues;
 /// `CreateApplication` and `CreateComputationModel` are implemented and carry
 /// this same tag-key cover in their own suites).
-async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>) {
+///
+/// `pub(crate)` for the reason [`Target`] is.
+pub(crate) async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>) {
     // A stored asset model: the operation that creates an asset needs one to
     // point at, and the operation that tags an existing resource needs a real
     // resource ARN.
@@ -245,7 +251,9 @@ async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>) {
 }
 
 /// The body `target` sends for `case_at`, carrying `key` as its one tag key.
-fn body_with_key(target: &Target, case_at: usize, key: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`Target`] is.
+pub(crate) fn body_with_key(target: &Target, case_at: usize, key: &str) -> Value {
     let mut body = (target.body)(&format!("{}-{case_at}", target.label.to_lowercase()));
     body.as_object_mut()
         .expect("an object body")
@@ -255,7 +263,9 @@ fn body_with_key(target: &Target, case_at: usize, key: &str) -> Value {
 
 /// How many resources of every kind the store holds, beside the tag set of
 /// `arn` — the fingerprint a refused call must leave exactly as it was.
-async fn fingerprint(
+///
+/// `pub(crate)` for the reason [`Target`] is.
+pub(crate) async fn fingerprint(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,

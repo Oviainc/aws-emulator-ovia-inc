@@ -20,6 +20,14 @@
 #[path = "all/actions.rs"]
 mod actions;
 
+// `reserved_tag_keys` is declared here too, at the head of the file, for the
+// reason the note above gives: the sorted list and the tail of the file are both
+// where every concurrent iotsitewise change puts a declaration of its own, and
+// each attempt to land this one in either collided with a branch that had just
+// inserted beside it. Fold it into the list once the churn settles.
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
+
 // `property_aggregates` is declared here, ahead of the sorted list, rather than in
 // its alphabetical place: every other suite this crate has gained was inserted
 // into that list or appended after it, so those are the two spots a concurrent

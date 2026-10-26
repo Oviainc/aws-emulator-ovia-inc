@@ -5747,22 +5747,66 @@ pub fn parse_resource_arn(arn: &str) -> Option<(&str, &str)> {
     Some((resource_type, id))
 }
 
-/// Refuse a tag key outside the modelled `TagKey` bounds, in the wording the
-/// boundary validator uses for a map's keys.
+/// The tag-key namespace Amazon Web Services keeps for the tags it applies
+/// itself.
+///
+/// The tag restrictions the `tags` member of every create links to — "Tagging
+/// your IoT SiteWise resources" in the IoT SiteWise User Guide — state that this
+/// prefix is reserved for Amazon Web Services use and that a caller can neither
+/// set nor remove a tag whose key carries it. `TagKey` declares `@length` and no
+/// `@pattern`, so no boundary constraint can express the reservation and it is
+/// enforced in [`check_tag_key`] below instead, which is what every operation
+/// taking caller-supplied tag keys calls.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] names.
+///
+/// Matched without regard to ASCII case, because the reservation is of the
+/// NAMESPACE: a differently cased spelling of the prefix names the same reserved
+/// tags, so it may not be used to slip one past the check. The prefix is matched
+/// on the key's leading bytes, so a key whose first characters are multi-byte —
+/// and therefore cannot spell the ASCII prefix — is not in the namespace.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Why a caller-supplied `key` in the reserved namespace is refused, naming the
+/// key the request carried so a caller sending several tags learns which one
+/// failed.
+pub fn reserved_tag_key_message(key: &str) -> String {
+    format!(
+        "The tag key '{key}' is not valid: tag keys beginning with \
+         '{RESERVED_TAG_KEY_PREFIX}' are reserved for Amazon Web Services use."
+    )
+}
+
+/// Refuse a tag key a caller may not supply: one outside the modelled `TagKey`
+/// bounds, in the wording the boundary validator uses for a map's keys, or one in
+/// the namespace [`RESERVED_TAG_KEY_PREFIX`] names.
 ///
 /// The framework's constraint walk reaches a map's VALUES but not its KEYS, so
 /// `TagMap`'s `@length(min: 1, max: 128)` on `TagKey` is the handler's to
-/// enforce; the length is in characters, as `@length` counts them.
+/// enforce; the length is in characters, as `@length` counts them. The reserved
+/// namespace is no constraint the model can carry at all, so it is enforced here
+/// too — one function, so every operation that accepts caller-supplied tag keys
+/// answers one key the same way, whether the keys arrive on a create or on
+/// `TagResource`.
 pub fn check_tag_key(key: &str) -> Result<(), String> {
     let length = key.chars().count();
-    if (TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length) {
-        return Ok(());
+    if !(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length) {
+        return Err(format!(
+            "1 validation error detected: Value at 'tags' failed to satisfy constraint: \
+             Map keys must satisfy constraint: [Member must have length greater than or equal \
+             to {TAG_KEY_MIN_LENGTH}, Member must have length less than or equal to \
+             {TAG_KEY_MAX_LENGTH}]"
+        ));
     }
-    Err(format!(
-        "1 validation error detected: Value at 'tags' failed to satisfy constraint: \
-         Map keys must satisfy constraint: [Member must have length greater than or equal to \
-         {TAG_KEY_MIN_LENGTH}, Member must have length less than or equal to {TAG_KEY_MAX_LENGTH}]"
-    ))
+    if is_reserved_tag_key(key) {
+        return Err(reserved_tag_key_message(key));
+    }
+    Ok(())
 }
 
 /// The canonical ARN of a gateway in `region`, in the form `CreateGateway`

@@ -6,6 +6,10 @@
 //! where `ListTagsForResource` reads the remainder back; this is the ONLY file to touch
 //! for it.
 //!
+//! A key in the namespace [`crate::state::RESERVED_TAG_KEY_PREFIX`] names is a tag
+//! Amazon Web Services applies itself, which a caller may neither set nor remove, so a
+//! request naming one is refused and removes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,6 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The value '{}' at 'resourceArn' is not the ARN of an IoT SiteWise resource.",
                 input.resource_arn
             )));
+        }
+
+        // A key in the reserved namespace names a tag Amazon Web Services applies
+        // itself, which a caller may neither set nor remove, so naming one here is a
+        // malformed request rather than a removal that finds nothing. Every key is
+        // checked before anything is removed, so a list holding one reserved key
+        // removes nothing at all — the same all-or-nothing reading `TagResource`
+        // takes of a batch it refuses. `tagKeys` is a LIST, whose member constraint
+        // the boundary validator does reach, so `TagKey`'s own length bound is
+        // already enforced before this handler runs and only the reservation is left.
+        for key in &input.tag_keys {
+            if crate::state::is_reserved_tag_key(key) {
+                return Err(invalid_request(crate::state::reserved_tag_key_message(key)));
+            }
         }
 
         let mut store = state.lock();

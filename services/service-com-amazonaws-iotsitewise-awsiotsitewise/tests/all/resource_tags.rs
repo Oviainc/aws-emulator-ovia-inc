@@ -191,7 +191,10 @@ fn encode_query(value: &str) -> String {
 ///
 /// `DELETE /tags?resourceArn=…&tagKeys=…`: both members are `@httpQuery`, and
 /// `tagKeys` is a list, so each key is its own repeated `tagKeys=` parameter.
-async fn untag_resource(
+///
+/// `pub(crate)` because the sibling `reserved_tag_keys` suite removes keys through
+/// the same route: one definition of it, so the two cannot drift.
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     keys: &[String],
