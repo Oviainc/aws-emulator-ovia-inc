@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNodeRegistrationScript
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNodeRegistrationScript`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNodeRegistrationScript::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues the script that registers hardware units as nodes of one cluster — a
+//! cluster the account must already hold, since the script creates its nodes "in
+//! the specified Cluster". The registration script slice of the store renders
+//! the script from that cluster, from the node a re-registration names and from
+//! the parameters this request carried, keeps it under an id of its own and
+//! hands the STORED text back, so a retried request (the same
+//! `@idempotencyToken` `RequestId`) answers with the script the first attempt
+//! issued rather than a second one (see `crate::state::node_registration_scripts`).
+//!
+//! No node is created here: one script registers every unit of the cluster, and
+//! it is the script, run on a unit, that creates that unit's node. So this
+//! operation writes a script and never a node — `CreateNode` is what puts a node
+//! in the store.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +170,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNodeRegistrationScript` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNodeRegistrationScriptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNodeRegistrationScript"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The script addresses the region the request was signed for, which is
+        // the region the cluster and its nodes live in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does, so a
+        // node whose deregistration has come due is already in its terminal
+        // state when a re-registration script is asked for it.
+        state.settle(now);
+
+        // A retried request (the same `@idempotencyToken` `RequestId`, presented
+        // to the same cluster's endpoint) must answer with the script that one
+        // issued: a second script would register a second node per hardware unit.
+        if let Some(issued) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.node_registration_script_for_token(&input.cluster_id, token))
+        {
+            return Ok(CreateNodeRegistrationScriptOutput {
+                node_registration_script: Some(issued.to_string()),
+            });
+        }
+
+        // The cluster the script registers nodes in, the node a re-registration
+        // names, the bound on the caller-chosen mapping list and the rendering
+        // all live in the registration script slice, so this handler only turns
+        // its refusal into one of this operation's own modelled errors.
+        let requested = crate::state::NewNodeRegistrationScript {
+            node_id: input.id,
+            name: input.name,
+            role: input.role,
+            node_interface_mappings: input.node_interface_mappings.unwrap_or_default(),
+        };
+        let id = state
+            .issue_node_registration_script(&region, &input.cluster_id, requested)
+            .map_err(|refused| refusal(refused, &input.cluster_id))?;
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the script it issued.
+            state.record_node_registration_script_token(&input.cluster_id, token, &id);
+        }
+
+        // Read back out of the store, so the response reports the script that was
+        // written rather than one assembled from this request.
+        let script = state
+            .node_registration_script(&input.cluster_id, &id)
+            .ok_or_else(unavailable)?;
+        Ok(CreateNodeRegistrationScriptOutput {
+            node_registration_script: Some(script.to_string()),
+        })
     }
+}
+
+/// One [`crate::state::NodeRegistrationScriptRefusal`] as this operation's own
+/// modelled error.
+///
+/// This operation models NO `NotFoundException` (`smithy_query(query="operation",
+/// operation="CreateNodeRegistrationScript")`), so a `ClusterId` naming no stored
+/// cluster, and an `Id` naming no live node of it, are answered with the modelled
+/// client error for a request that cannot be satisfied, carrying the same wording
+/// every reader of this service uses for a resource that is not there and for one
+/// whose delete it has already accepted — which is what `CreateNode` does with a
+/// `ClusterId` nothing holds and what `UpdateNode` does with a node whose
+/// deregistration was accepted. A request that carries more interface mappings
+/// than the emulator stores is a bad request too: the request itself is out of
+/// bounds, and it is refused with the bound `CreateNode` words the same way.
+///
+/// The `ConflictException` (409) this operation models is left unreached: a
+/// script is not a named resource, so nothing it is issued for can clash with one
+/// the account already holds the way a cluster's or a node's `Name` does.
+fn refusal(
+    refusal: crate::state::NodeRegistrationScriptRefusal,
+    cluster_id: &str,
+) -> CreateNodeRegistrationScriptError {
+    use crate::state::NodeRegistrationScriptRefusal as Refusal;
+    let message = match refusal {
+        Refusal::ClusterNotFound => crate::state::not_found_message("Cluster", cluster_id),
+        Refusal::NodeNotFound(node_id) => crate::state::not_found_message("Node", &node_id),
+        Refusal::NodeDeleteAccepted(node_id) => {
+            crate::state::already_deleted_message(&format!("Node {node_id}"))
+        }
+        Refusal::TooManyInterfaceMappings(count) => {
+            crate::state::too_many_interface_mappings_message(count)
+        }
+    };
+    CreateNodeRegistrationScriptErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to issue the script from. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateNodeRegistrationScriptError {
+    CreateNodeRegistrationScriptErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

@@ -168,6 +168,21 @@ pub const FIRST_SDI_CARD_NUMBER: i32 = 1;
 pub const SDI_SOURCE_MAPPING_MEMBERS_MESSAGE: &str =
     "every entry of sdiSourceMappings must specify cardNumber, channelNumber and sdiSource";
 
+/// The message a request that lists more `NodeInterfaceMappings` than this
+/// emulator stores is refused with: how many the request carried and the
+/// ceiling.
+///
+/// ONE copy for the two operations whose request carries that list —
+/// `CreateNode` and `CreateNodeRegistrationScript`, which name the member
+/// identically and store it under the same ceiling — so the bound they enforce
+/// cannot be worded two ways, the same reason
+/// [`too_many_sdi_source_mappings_message`] is one function.
+pub fn too_many_interface_mappings_message(count: usize) -> String {
+    format!(
+        "nodeInterfaceMappings carries {count} mappings; at most {MAX_NODE_INTERFACE_MAPPINGS} are accepted"
+    )
+}
+
 /// The message a request that lists more `SdiSourceMappings` than this emulator
 /// stores is refused with: how many the request carried and the ceiling, worded
 /// as `CreateNode` words the same class of bound on a node's other

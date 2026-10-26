@@ -310,13 +310,27 @@ pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_des
 pub mod nodes;
 
 pub use nodes::{
-    card_number_out_of_range_message, node_state, too_many_sdi_source_mappings_message, NodeChanges,
-    NodeRecord, NodeRefusal, NodeStateRefusal, NodeUpdateRefusal, FIRST_SDI_CARD_NUMBER, MAX_NODES,
-    MAX_NODE_INTERFACE_MAPPINGS, MAX_NODE_SDI_SOURCE_MAPPINGS, MAX_NODE_TOKENS,
-    NODE_CONNECTION_STATE, SDI_SOURCE_MAPPING_MEMBERS_MESSAGE,
+    card_number_out_of_range_message, node_state, too_many_interface_mappings_message,
+    too_many_sdi_source_mappings_message, NodeChanges, NodeRecord, NodeRefusal, NodeStateRefusal,
+    NodeUpdateRefusal, FIRST_SDI_CARD_NUMBER, MAX_NODES, MAX_NODE_INTERFACE_MAPPINGS,
+    MAX_NODE_SDI_SOURCE_MAPPINGS, MAX_NODE_TOKENS, NODE_CONNECTION_STATE,
+    SDI_SOURCE_MAPPING_MEMBERS_MESSAGE,
 };
 
 pub(crate) use nodes::node_description_output;
+
+/// The node REGISTRATION SCRIPT slice — the artifact
+/// `CreateNodeRegistrationScript` issues for a cluster, in a module of its own
+/// beside the [`nodes`] slice it registers nodes into. What stays in this file is
+/// the part the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`].
+pub mod node_registration_scripts;
+
+pub use node_registration_scripts::{
+    NewNodeRegistrationScript, NodeRegistrationScriptRecord, NodeRegistrationScriptRefusal,
+    MAX_NODE_REGISTRATION_SCRIPTS, MAX_NODE_REGISTRATION_SCRIPT_TOKENS,
+};
+
 
 /// The eventbridge rule TEMPLATE slice: its record, its bounds, its refusal, the
 /// store's methods and its output projection, in one module of its own for the
@@ -2169,6 +2183,25 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// against one cluster's endpoint. PRIVATE for the same reason as
     /// [`Self::channel_tokens`].
     node_tokens: IdempotencyTokens,
+    /// Every node registration script this account has been issued, keyed by the
+    /// id the registration script slice minted for it, in id order — which is
+    /// also the order they were issued in, so the ring that bounds the map drops
+    /// the oldest.
+    ///
+    /// PRIVATE, so the ring's bound, the per-cluster lookup and the rendering
+    /// stay invariants of the [`node_registration_scripts`] slice's own methods
+    /// rather than of each handler. The operation reports a script's TEXT and no
+    /// id, so nothing outside that slice resolves a record.
+    node_registration_scripts: BTreeMap<String, NodeRegistrationScriptRecord>,
+    /// Mint counter behind the registration script slice's
+    /// `mint_node_registration_script_id`.
+    next_node_registration_script_id: u64,
+    /// `CreateNodeRegistrationScript`'s `RequestId` (`@idempotencyToken`) -> the
+    /// script it issued, keyed per cluster by that slice's
+    /// `node_registration_script_token_key` because a script is issued against
+    /// one cluster's endpoint. PRIVATE for the same reason as
+    /// [`Self::channel_tokens`].
+    node_registration_script_tokens: IdempotencyTokens,
     /// Every reservation the account has purchased, keyed by its minted `Id`, in
     /// id order for the same reason as [`Self::channels`]: a reader walks it in
     /// id order on every call.

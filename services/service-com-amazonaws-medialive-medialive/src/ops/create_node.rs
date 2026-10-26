@@ -263,10 +263,7 @@ fn refusal(refusal: crate::state::NodeRefusal, cluster_id: &str) -> CreateNodeEr
         }
         crate::state::NodeRefusal::TooManyInterfaceMappings(count) => {
             CreateNodeErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "nodeInterfaceMappings carries {count} mappings; at most {} are accepted",
-                    crate::state::MAX_NODE_INTERFACE_MAPPINGS
-                )),
+                message: Some(crate::state::too_many_interface_mappings_message(count)),
             })
             .into()
         }

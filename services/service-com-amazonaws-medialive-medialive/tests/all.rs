@@ -254,6 +254,9 @@ mod node_lifecycle;
 #[path = "all/node_listing.rs"]
 mod node_listing;
 
+#[path = "all/node_registration_script.rs"]
+mod node_registration_script;
+
 #[path = "all/node_settings_update.rs"]
 mod node_settings_update;
 
