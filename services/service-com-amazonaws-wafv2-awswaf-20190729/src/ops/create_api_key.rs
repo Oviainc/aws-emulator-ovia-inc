@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let api_key = crate::state::new_api_key(&input.scope, &input.token_domains);
-        let created_at_millis = now_millis();
+        let created_at_millis = crate::state::now_millis();
         let mut state = state.lock();
 
         // The store refuses a key past the per-scope bound, which is the quota
@@ -278,12 +278,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             api_key: Some(entry.api_key),
         })
     }
-}
-
-/// Milliseconds since the Unix epoch, now — the instant a key is created at, at the
-/// resolution `crate::state::date_time_millis` compares a modelled timestamp at.
-fn now_millis() -> i64 {
-    ::std::time::SystemTime::now()
-        .duration_since(::std::time::UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }

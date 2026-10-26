@@ -25,6 +25,8 @@ mod forecast_datapoints;
 mod forecast_window_precision;
 #[path = "all/scaling_instruction_validation.rs"]
 mod scaling_instruction_validation;
+#[path = "all/scaling_mode_conditional_members.rs"]
+mod scaling_mode_conditional_members;
 #[path = "all/scaling_plan_lifecycle.rs"]
 mod scaling_plan_lifecycle;
 #[path = "all/state_roundtrip.rs"]

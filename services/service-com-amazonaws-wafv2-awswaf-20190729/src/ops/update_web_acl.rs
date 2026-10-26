@@ -312,6 +312,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `ChallengeConfig` is "available at the web ACL level and in each rule",
+        // and for the Challenge action the immunity time has a floor of its own,
+        // above the modelled one that applies to a CAPTCHA immunity: a save carrying
+        // a value below it is refused, so nothing is stored and the lock token does
+        // not rotate.
+        if let Some(immunity_time) = crate::state::below_minimum_challenge_immunity(
+            input.challenge_config.as_ref(),
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_CHALLENGE_CONFIG,
+                    &immunity_time.to_string(),
+                    crate::state::CHALLENGE_IMMUNITY_BELOW_MINIMUM_REASON,
+                ),
+            )
+            .into());
+        }
+
         // A rule group — managed or customer-owned — can only be run by a rule's own
         // top-level statement, which is judged before any reference is resolved.
         if let Some((field, reason)) = crate::state::misplaced_rule_group_statement(

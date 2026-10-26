@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use crate::ops::get_scaling_plan_resource_forecast_data::FORECAST_INTERVAL_SECONDS;
 use crate::ops::types::{
     ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction,
     TargetTrackingConfiguration, LOAD_METRIC_TYPE_VALUES, METRIC_STATISTIC_VALUES,
@@ -601,15 +602,26 @@ fn validate_scaling_instruction(
 
     // "The amount of time, in seconds, to buffer the run time of scheduled scaling
     // actions": the model already bounds this at 0, which is checked again here so the
-    // same refusal holds however the value reaches the handler.
-    if instruction
-        .scheduled_action_buffer_time
-        .is_some_and(|seconds| seconds < 0)
-    {
-        return Err(format!(
-            "{}: a time in seconds cannot be negative",
-            at("ScheduledActionBufferTime")
-        ));
+    // same refusal holds however the value reaches the handler; the upper bound and the
+    // mode condition the same paragraph states are enforced beside it.
+    if let Some(seconds) = instruction.scheduled_action_buffer_time {
+        let member = at("ScheduledActionBufferTime");
+        if seconds < 0 {
+            return Err(format!("{member}: a time in seconds cannot be negative"));
+        }
+        // "The value must be less than the forecast interval duration of 3600 seconds
+        // (60 minutes)."
+        if i64::from(seconds) >= FORECAST_INTERVAL_SECONDS {
+            return Err(format!(
+                "{member}: Value '{seconds}' failed to satisfy constraint: Member must be \
+                 less than the forecast interval duration of {FORECAST_INTERVAL_SECONDS} \
+                 seconds"
+            ));
+        }
+        // "Only valid when configuring predictive scaling."
+        if !configures_predictive_scaling(instruction) {
+            return Err(predictive_scaling_only(&member));
+        }
     }
     if let Some(behavior) = instruction.scaling_policy_update_behavior.as_deref() {
         one_of(
@@ -617,6 +629,10 @@ fn validate_scaling_instruction(
             behavior,
             SCALING_POLICY_UPDATE_BEHAVIOR_VALUES,
         )?;
+        // "Only valid when configuring dynamic scaling."
+        if !configures_dynamic_scaling(instruction) {
+            return Err(dynamic_scaling_only(&at("ScalingPolicyUpdateBehavior")));
+        }
     }
 
     validate_target_tracking_configurations(index, instruction)?;
@@ -787,6 +803,46 @@ fn validate_predefined_scaling_metric(
     Ok(metric.to_string())
 }
 
+/// Whether this instruction configures predictive scaling.
+///
+/// "The predefined load metric to use for predictive scaling. This parameter or a
+/// CustomizedLoadMetricSpecification is required when configuring predictive scaling,
+/// and cannot be used otherwise" — so a load metric specification is exactly what turns
+/// predictive scaling on, and every member documented "Only valid when configuring
+/// predictive scaling" is refused without one.
+fn configures_predictive_scaling(instruction: &ScalingInstruction) -> bool {
+    instruction.predefined_load_metric_specification.is_some()
+        || instruction.customized_load_metric_specification.is_some()
+}
+
+/// Whether this instruction configures dynamic scaling.
+///
+/// `DisableDynamicScaling` "Controls whether dynamic scaling by AWS Auto Scaling is
+/// disabled… The default is enabled (`false`)", so dynamic scaling is configured unless
+/// the caller turned it off, and every member documented "Only valid when configuring
+/// dynamic scaling" is refused once it is off.
+fn configures_dynamic_scaling(instruction: &ScalingInstruction) -> bool {
+    !instruction.disable_dynamic_scaling.unwrap_or(false)
+}
+
+/// How the service refuses a member documented "Only valid when configuring predictive
+/// scaling" on an instruction that configures none, naming the member at fault.
+fn predictive_scaling_only(member: &str) -> String {
+    format!(
+        "{member}: only valid when configuring predictive scaling, which requires a load \
+         metric specification"
+    )
+}
+
+/// The same refusal for a member documented "Only valid when configuring dynamic
+/// scaling" on an instruction that disabled it.
+fn dynamic_scaling_only(member: &str) -> String {
+    format!(
+        "{member}: only valid when configuring dynamic scaling, which is disabled by \
+         DisableDynamicScaling"
+    )
+}
+
 /// The predictive-scaling members of one instruction, each of which is documented as
 /// valid only when a load metric specification configures predictive scaling.
 fn validate_predictive_scaling(
@@ -832,7 +888,7 @@ fn validate_predictive_scaling(
         }
     }
 
-    let predictive = predefined.is_some() || customized.is_some();
+    let predictive = configures_predictive_scaling(instruction);
     if let Some(mode) = instruction.predictive_scaling_mode.as_deref() {
         one_of(&at("PredictiveScalingMode"), mode, PREDICTIVE_SCALING_MODE_VALUES)?;
     }
@@ -847,11 +903,9 @@ fn validate_predictive_scaling(
         )?;
         // "Only valid when configuring predictive scaling."
         if !predictive {
-            return Err(format!(
-                "{}: only valid when configuring predictive scaling, which requires a load \
-                 metric specification",
-                at("PredictiveScalingMaxCapacityBehavior")
-            ));
+            return Err(predictive_scaling_only(&at(
+                "PredictiveScalingMaxCapacityBehavior",
+            )));
         }
     }
 
@@ -860,6 +914,10 @@ fn validate_predictive_scaling(
     // 1-100."
     let above_forecast = behavior == Some(BEHAVIOR_ABOVE_FORECAST_CAPACITY);
     match instruction.predictive_scaling_max_capacity_buffer {
+        // "Only valid when configuring predictive scaling."
+        Some(_) if !predictive => Err(predictive_scaling_only(&at(
+            "PredictiveScalingMaxCapacityBuffer",
+        ))),
         Some(_) if !above_forecast => Err(format!(
             "{}: can only be specified when PredictiveScalingMaxCapacityBehavior is \
              {BEHAVIOR_ABOVE_FORECAST_CAPACITY}",

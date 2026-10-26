@@ -212,17 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let arn = entry.ip_set.arn.clone();
-        if let Some(referrer) = state.web_acl_referencing(&arn) {
-            let referrer_name = referrer.web_acl.name.clone();
+        if let Some(referrer) = state.rule_tree_referencing(&arn) {
             crate::state::audit(
                 "DeleteIPSet",
                 &input.scope,
                 &input.name,
                 &input.id,
-                // Which web ACL still references the set is a diagnostic, so it is
-                // recorded here; the refusal itself carries the exception type's
-                // constant sentence.
-                &format!("WAFAssociatedItemException: referenced by WebACL {referrer_name:?}"),
+                // WHICH stored rule tree still references the set is a diagnostic, so
+                // it is recorded here; the refusal itself carries the exception
+                // type's constant sentence.
+                &format!("WAFAssociatedItemException: referenced by {referrer}"),
             );
             return Err(DeleteIPSetErrorModeled::WAFAssociatedItemException(
                 crate::state::associated_item_exception(),

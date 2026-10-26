@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutManagedRuleSetVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutManagedRuleSetVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Publishes versions of the managed rule set `(Scope, Name, Id)` names, once its
+//! `LockToken` still matches the stored one. An identity no managed rule set of this
+//! account carries is `WAFNonexistentItemException`, a stale token
+//! `WAFOptimisticLockException` and an `AssociatedRuleGroupArn` WAF will not accept
+//! `WAFInvalidParameterException` (all HTTP 400). This is the ONLY file to touch for
+//! this operation.
 //!
-//! It does, however, REFUSE a request WAF would refuse, before reaching that 501:
-//! the resource references `VersionsToPublish` names are resolved, and only then is
-//! the optimistic-lock token's own modelled constraint checked. That ordering is
+//! An `AssociatedRuleGroupArn` that is not a well-formed rule-group ARN is refused
+//! BEFORE the optimistic-lock token's own modelled constraint. That ordering is
 //! WAF's, and it is why `LockToken` carries `skip_validation` on the input struct
 //! (see `super::types::put_managed_rule_set_versions_types`): the request boundary
 //! runs every modelled constraint BEFORE any handler, so a token left there is
-//! reported instead of the unresolvable reference. A refusal is not an
-//! implementation, so the marker above stays until the operation itself is written.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutManagedRuleSetVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! reported instead of the reference.
 //!
 //! ## Shape of an operation
 //!
@@ -208,27 +203,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A validation-only pass: nothing here writes to the store, and `ctx`
-        // carries only request metadata, which this pass does not need.
+        // `ctx` carries only request metadata, which this operation does not need: a
+        // put never mints the set's ARN, so it needs no region.
         let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(PutManagedRuleSetVersionsErrorModeled::WAFInternalErrorException(
-                WAFInternalErrorException {
-                    message: Some("the wafv2 store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
 
-        // WAF resolves what the request REFERENCES first. Each entry of
+        // The version keys the request publishes under are `VersionKeyString`s, and a
+        // map's KEYS do not reach the request boundary's walk (it visits a map's
+        // values), so a key that violates that shape's own constraints is checked
+        // here against the same constraints, in the framework's own envelope — WAF
+        // reports it against the map member's path, with the key as the value and the
+        // key shape's whole constraint set in one bracketed clause. A request the
+        // service cannot even read a version key out of is refused before anything is
+        // resolved.
+        if let Some(envelope) = crate::state::map_key_constraint_envelope(
+            &crate::state::member_path("VersionsToPublish"),
+            &published_version_keys(&input),
+            crate::state::VERSION_KEY_CONSTRAINTS,
+            &crate::state::M_VERSIONS_TO_PUBLISH,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(envelope));
+        }
+
+        // WAF judges the ARNs the request carries first. Each entry of
         // `VersionsToPublish` names "the Amazon Resource Name (ARN) of the vendor's
         // rule group that's used in the published managed rule group version"
-        // (`VersionToPublish$AssociatedRuleGroupArn`), and an ARN WAF will not accept
-        // for that parameter is the modelled `WAFInvalidParameterException` — "Your
-        // request references an ARN that is malformed, or corresponds to a resource
-        // with which [it] can't be [used]", from that error's own doc — carrying
-        // `Field` RESOURCE_ARN, the rejected ARN as `Parameter`, and why as `Reason`.
-        if let Some(arn) = unresolvable_rule_group_reference(&state.lock(), &input) {
+        // (`VersionToPublish$AssociatedRuleGroupArn`), and a value WAF will not
+        // accept there AT ALL — not an ARN, another service's ARN, or a wafv2 ARN of
+        // a kind that is not a rule group — is the modelled
+        // `WAFInvalidParameterException`: "Your request references an ARN that is
+        // malformed, or corresponds to a resource with which [it] can't be [used]",
+        // from that error's own doc, carrying `Field` RESOURCE_ARN, the rejected ARN
+        // as `Parameter` and why as `Reason`. Whether a well-formed rule-group ARN
+        // names a rule group that EXISTS is resolution, not syntax, and is judged
+        // below with the rest of the request's target resolution.
+        if let Some(arn) = unacceptable_rule_group_reference(&input) {
             return Err(
                 PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(
                     crate::state::invalid_arn_exception(&arn),
@@ -238,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Only then the optimistic-lock token's own modelled constraints, which this
-        // operation took over from the boundary so they run AFTER the resolution
+        // operation took over from the boundary so they run AFTER the reference
         // above (`skip_validation` on `PutManagedRuleSetVersionsInput`).
         let violations = crate::state::validate_members(&[(
             &crate::state::M_LOCK_TOKEN,
@@ -250,36 +258,232 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // A well-formed request still reaches the 501: publishing a managed rule set
-        // version is not implemented yet, which is why the SCAFFOLDED marker at the
-        // top of this file stays. Refusing a bad request is not implementing the
-        // operation — and answering 501 for one would claim "nobody has written this
-        // yet" about a request that can never succeed.
-        Err(crate::scaffolded::Scaffolded::not_implemented(
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutManagedRuleSetVersionsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The TARGET of the put is the managed rule set `(Scope, Name, Id)` names, so
+        // it is resolved before anything else about the request is judged: an
+        // identity no managed rule set of this account carries names a resource that
+        // doesn't exist, whatever else the request says, and nothing is published
+        // under it.
+        if state
+            .managed_rule_set(&input.scope, &input.name, &input.id)
+            .is_none()
+        {
+            crate::state::audit(
+                "PutManagedRuleSetVersions",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // Every rule group a published version is defined by has to exist IN THIS
+        // SCOPE: a version offered to customers runs the vendor's own rule group, a
+        // scope is a namespace, and a reference to a rule group this account does
+        // not hold there references a resource that doesn't exist. Priced here too,
+        // out of the entries read before the set is borrowed to write through:
+        // `ManagedRuleSetVersion$Capacity` is "the web ACL capacity units (WCUs)
+        // required for this rule group", which is the declared capacity of the rule
+        // group that defines the version.
+        let mut published_capacities: ::std::collections::HashMap<String, i64> =
+            ::std::collections::HashMap::new();
+        for arn in rule_group_references(&input) {
+            let Some(entry) = state
+                .rule_group_by_arn(&arn)
+                .filter(|entry| entry.scope == input.scope)
+            else {
+                crate::state::audit(
+                    "PutManagedRuleSetVersions",
+                    &input.scope,
+                    &input.name,
+                    &input.id,
+                    &format!("WAFNonexistentItemException: no RuleGroup with the ARN {arn} exists"),
+                );
+                return Err(
+                    PutManagedRuleSetVersionsErrorModeled::WAFNonexistentItemException(
+                        crate::state::nonexistent_item_exception(),
+                    )
+                    .into(),
+                );
+            };
+            published_capacities.insert(arn, entry.rule_group.capacity);
+        }
+
+        let now = ::aws_smithy_types::DateTime::from_millis(crate::state::now_millis());
+        // Resolved again — by the same triple, under the same lock — to write
+        // through, now that nothing holds an immutable borrow of the store.
+        let Some(entry) = state.managed_rule_set_mut(&input.scope, &input.name, &input.id) else {
+            return Err(PutManagedRuleSetVersionsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Checked BEFORE anything is written, so a stale token leaves the stored set
+        // and its published versions exactly as they were.
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "PutManagedRuleSetVersions",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFOptimisticLockException(
+                    crate::state::optimistic_lock_exception(),
+                )
+                .into(),
+            );
+        }
+
+        let mut published = entry
+            .managed_rule_set
+            .published_versions
+            .take()
+            .unwrap_or_default();
+        // A put ADDS to what the set offers, so the bound on how many versions one
+        // set holds is checked against the union of the two, before anything is
+        // written: a set is left exactly as it was when the put would take it past
+        // the bound. `PutManagedRuleSetVersions` models no quota error, so this is
+        // the parameter failure its `ENTITY_LIMIT` field names.
+        let after_publish: ::std::collections::BTreeSet<&String> = published
+            .keys()
+            .chain(
+                input
+                    .versions_to_publish
+                    .as_ref()
+                    .map(|versions| versions.keys())
+                    .unwrap_or_default(),
+            )
+            .collect();
+        if after_publish.len() > crate::state::MAX_PUBLISHED_VERSIONS_PER_MANAGED_RULE_SET {
+            let offered = after_publish.len();
+            entry.managed_rule_set.published_versions = Some(published);
+            crate::state::audit(
+                "PutManagedRuleSetVersions",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFInvalidParameterException: too many published versions",
+            );
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_ENTITY_LIMIT,
+                        &offered.to_string(),
+                        &format!(
+                            "a managed rule set offers at most {} versions",
+                            crate::state::MAX_PUBLISHED_VERSIONS_PER_MANAGED_RULE_SET
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+        for (version, to_publish) in input.versions_to_publish.clone().unwrap_or_default() {
+            let capacity = to_publish
+                .associated_rule_group_arn
+                .as_deref()
+                .and_then(|arn| published_capacities.get(arn).copied());
+            let stored = published.entry(version).or_default();
+            // `PublishTimestamp` is "the time that you FIRST published this version"
+            // and `LastUpdateTimestamp` "the last time that you updated this
+            // version", so re-publishing a version keeps the first instant and moves
+            // only the second. Its `ExpiryTimestamp` is kept for the same reason: the
+            // expiry a vendor set with `UpdateManagedRuleSetVersionExpiryDate` is a
+            // property of the version, not of this call.
+            stored.publish_timestamp = stored.publish_timestamp.or(Some(now));
+            stored.last_update_timestamp = Some(now);
+            stored.associated_rule_group_arn = to_publish.associated_rule_group_arn;
+            stored.forecasted_lifetime = to_publish.forecasted_lifetime;
+            stored.capacity = capacity;
+        }
+        entry.managed_rule_set.published_versions = Some(published);
+        // "The version that you would like your customers to use"
+        // (`ManagedRuleSet$RecommendedVersion`): what the request names replaces what
+        // was recommended, and a request naming none leaves the set recommending
+        // nothing.
+        entry.managed_rule_set.recommended_version = input.recommended_version.clone();
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working.
+        let next_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_lock_token.clone();
+        crate::state::audit(
             "PutManagedRuleSetVersions",
-        ))
+            &input.scope,
+            &input.name,
+            &input.id,
+            "versions published",
+        );
+
+        Ok(PutManagedRuleSetVersionsOutput {
+            next_lock_token: Some(next_lock_token),
+        })
     }
 }
 
-/// The `AssociatedRuleGroupArn` of the first `VersionsToPublish` entry WAF cannot
-/// resolve to a rule group, if any.
+/// Every version key the request publishes under, in order, so a request with
+/// several bad ones is refused with the same clause on every call.
+fn published_version_keys(input: &PutManagedRuleSetVersionsInput) -> Vec<String> {
+    let Some(versions) = input.versions_to_publish.as_ref() else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = versions.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Every `AssociatedRuleGroupArn` the request publishes a version by, in version-key
+/// order.
 ///
-/// Resolution is
-/// [`crate::state::ComAmazonawsWafv2Awswaf20190729State::holds_rule_group`]: the
-/// ARN must be a well-formed wafv2 `rulegroup` ARN that this service holds. The
-/// entries are visited in key order so a request naming several unresolvable
-/// references is refused with the same one on every call — the map comes off the
-/// wire unordered, and a refusal that named a different parameter each time could
-/// not be acted on.
-fn unresolvable_rule_group_reference(
-    state: &crate::state::ComAmazonawsWafv2Awswaf20190729State,
-    input: &PutManagedRuleSetVersionsInput,
-) -> Option<String> {
-    let versions = input.versions_to_publish.as_ref()?;
+/// The entries are visited in key order so a request naming several references WAF
+/// refuses is refused with the same one on every call — the map comes off the wire
+/// unordered, and a refusal that named a different parameter each time could not be
+/// acted on.
+fn rule_group_references(input: &PutManagedRuleSetVersionsInput) -> Vec<String> {
+    let Some(versions) = input.versions_to_publish.as_ref() else {
+        return Vec::new();
+    };
     let mut keys: Vec<&String> = versions.keys().collect();
     keys.sort();
-    keys.into_iter().find_map(|key| {
-        let arn = versions.get(key)?.associated_rule_group_arn.as_deref()?;
-        (!state.holds_rule_group(arn)).then(|| arn.to_string())
+    keys.into_iter()
+        .filter_map(|key| {
+            versions
+                .get(key)?
+                .associated_rule_group_arn
+                .clone()
+        })
+        .collect()
+}
+
+/// The first `AssociatedRuleGroupArn` of this request that is not a rule-group ARN
+/// at all, if any.
+///
+/// A value WAF cannot read as a reference to one of the vendor's rule groups is a
+/// bad PARAMETER, judged from the request alone: it must be a well-formed wafv2
+/// resource ARN ([`crate::state::is_wafv2_resource_arn`]) whose resource kind is
+/// `rulegroup` ([`crate::state::RULE_GROUP_ARN_KIND`]). Whether such an ARN names a
+/// rule group that exists is a different question, answered against state.
+fn unacceptable_rule_group_reference(input: &PutManagedRuleSetVersionsInput) -> Option<String> {
+    rule_group_references(input).into_iter().find(|arn| {
+        crate::state::arn_resource_kind(arn) != Some(crate::state::RULE_GROUP_ARN_KIND)
     })
 }

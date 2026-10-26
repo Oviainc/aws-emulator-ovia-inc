@@ -22,9 +22,10 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    BlockAction, ChallengeAction, CountAction, IPSet, LabelSummary, ManagedProductDescriptor,
-    MonetizationFilter, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup,
-    RuleSummary, SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
+    BlockAction, ChallengeAction, ChallengeConfig, CountAction, IPSet, LabelSummary,
+    LoggingConfiguration, ManagedProductDescriptor, ManagedRuleSet, MonetizationFilter,
+    OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
+    SettlementRecord, Statement, Tag, TimeWindow, WAFAssociatedItemException,
     WAFDuplicateItemException, WAFExpiredManagedRuleGroupVersionException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
     WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
@@ -87,11 +88,14 @@ pub const OPTIMISTIC_LOCK_MESSAGE: &str = "AWS WAF couldn’t save your changes 
 pub const NONEXISTENT_ITEM_MESSAGE: &str =
     "AWS WAF couldn’t perform the operation because your resource doesn’t exist.";
 
-/// The sentence `WAFAssociatedItemException` carries: the shape's own documented
-/// sentence (`smithy_query(query="shape",shape="WAFAssociatedItemException")`, its
-/// wrapping whitespace flattened), which is what pins it as constant per exception
-/// type.
-pub const ASSOCIATED_ITEM_MESSAGE: &str = "WAF couldn’t perform the operation \
+/// The sentence `WAFAssociatedItemException` carries, whatever the request named.
+///
+/// The wire wording WAF answers with, as the recorded wafv2 responses show it: the
+/// shape's own documented sentence
+/// (`smithy_query(query="shape",shape="WAFAssociatedItemException")`, its wrapping
+/// whitespace flattened) prefixed with the service name, the way every other
+/// exception of this family words it (see [`DUPLICATE_ITEM_MESSAGE`]).
+pub const ASSOCIATED_ITEM_MESSAGE: &str = "AWS WAF couldn’t perform the operation \
      because your resource is being used by another resource or it’s associated \
      with another resource.";
 
@@ -317,6 +321,32 @@ pub struct RuleGroupEntry {
     /// restrictions [`permission_policy_is_valid`] checks — so
     /// `GetPermissionPolicy` answers the caller's own text.
     pub permission_policy: Option<String>,
+}
+
+/// A managed rule set as stored: the modelled shape plus its scope and its
+/// optimistic-lock token.
+///
+/// A `ManagedRuleSet` is "a set of rules that is managed by Amazon Web Services and
+/// Amazon Web Services Marketplace sellers to provide versioned managed rule groups
+/// for customers of WAF", and the model's note on the shape says the
+/// managed-rule-set APIs are "intended for use only by vendors of managed rule
+/// sets". Those four operations — `ListManagedRuleSets`, `GetManagedRuleSet`,
+/// `PutManagedRuleSetVersions` and `UpdateManagedRuleSetVersionExpiryDate` — list,
+/// read and UPDATE a set; none of them creates one, because a vendor's set comes
+/// into being when the vendor is onboarded as a WAF managed-rule-set vendor, which
+/// no operation in this model performs. So an account holds no managed rule set
+/// until one is provisioned through
+/// [`ComAmazonawsWafv2Awswaf20190729State::insert_managed_rule_set`], and each of
+/// the operations above answers its nonexistent-item failure for an identity the
+/// store does not hold.
+#[derive(Debug, Clone)]
+pub struct ManagedRuleSetEntry {
+    /// The scope the managed rule set lives in.
+    pub scope: String,
+    /// Exactly what `GetManagedRuleSet` answers with.
+    pub managed_rule_set: ManagedRuleSet,
+    /// The current optimistic-lock token, rotated on every successful mutation.
+    pub lock_token: String,
 }
 
 /// An API key as stored: the encrypted key value, the token domains it carries
@@ -814,6 +844,21 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// `(Scope, Name)` to `Id`, for rule groups: duplicate-name detection and
     /// Name+Id lookup.
     pub rule_group_names: HashMap<(String, String), String>,
+    /// Managed rule sets by `(Scope, Id)`. See [`ManagedRuleSetEntry`].
+    pub managed_rule_sets: HashMap<(String, String), ManagedRuleSetEntry>,
+    /// The logging configuration of each web ACL, by
+    /// `(LoggingConfiguration$ResourceArn, LogScope)`.
+    ///
+    /// "You can define one logging destination per web ACL"
+    /// (`LoggingConfiguration`'s own doc), so a web ACL carries at most one
+    /// configuration per `LogScope` — the member that says who owns the
+    /// configuration ("the owner of the logging configuration, which must be set to
+    /// CUSTOMER for the configurations that you manage") — and a request that names
+    /// no `LogScope` addresses the customer-owned one, the member's documented
+    /// default ([`DEFAULT_LOG_SCOPE`]). Keyed by the web ACL's ARN because that is
+    /// how every logging operation addresses it, and a logging configuration has no
+    /// identity of its own.
+    pub logging_configurations: HashMap<(String, String), LoggingConfiguration>,
     /// API keys by `(Scope, APIKey)`: the key value is the key's identity within
     /// its scope. See [`ApiKeyEntry`].
     pub api_keys: HashMap<(String, String), ApiKeyEntry>,
@@ -971,11 +1016,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     }
 
     /// Drop a web ACL and every index entry that pointed at it.
+    ///
+    /// A logging configuration belongs to the web ACL its `ResourceArn` names and
+    /// has no identity of its own, so it goes with the web ACL: a configuration left
+    /// behind would be one a listing of the scope could not report (it resolves the
+    /// ARN to a web ACL) while a read of the dead ARN still answered it, and it would
+    /// attach itself to the next web ACL minted under the same ARN.
     pub fn remove_web_acl(&mut self, scope: &str, id: &str) -> Option<WebAclEntry> {
         let entry = self.web_acls.remove(&(scope.to_string(), id.to_string()))?;
         self.web_acl_names
             .remove(&(entry.scope.clone(), entry.web_acl.name.clone()));
         self.arn_index.remove(&entry.web_acl.arn);
+        self.logging_configurations
+            .retain(|(resource_arn, _), _| resource_arn != &entry.web_acl.arn);
         Some(entry)
     }
 
@@ -985,6 +1038,15 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         self.ip_set_names
             .remove(&(entry.scope.clone(), entry.ip_set.name.clone()));
         self.arn_index.remove(&entry.ip_set.arn);
+        Some(entry)
+    }
+
+    /// Drop a rule group and every index entry that pointed at it.
+    pub fn remove_rule_group(&mut self, scope: &str, id: &str) -> Option<RuleGroupEntry> {
+        let entry = self.rule_groups.remove(&(scope.to_string(), id.to_string()))?;
+        self.rule_group_names
+            .remove(&(entry.scope.clone(), entry.rule_group.name.clone()));
+        self.arn_index.remove(&entry.rule_group.arn);
         Some(entry)
     }
 
@@ -1261,21 +1323,41 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// A resource that a web ACL still references cannot be deleted, so this is
     /// what a delete consults, whatever KIND of resource is being deleted: an ARN
     /// identifies one resource of one kind, so the walk asks only whether any
-    /// reference statement names this ARN. It walks the whole tree, because a
-    /// reference statement can sit inside `AndStatement`, `OrStatement`,
-    /// `NotStatement` or a rate-based/managed-rule-group scope-down statement.
+    /// reference statement names this ARN. The walk itself is
+    /// [`rules_reference_arn`], shared with [`Self::rule_group_referencing`] so one
+    /// change to it cannot drift between the two kinds of entity that store rules.
     pub fn web_acl_referencing(&self, arn: &str) -> Option<&WebAclEntry> {
-        self.web_acls.values().find(|entry| {
-            entry
-                .web_acl
-                .rules
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|rule| {
-                    statement_references_arn(&rule.statement, arn, MAX_STATEMENT_NESTING_DEPTH)
-                })
-        })
+        self.web_acls
+            .values()
+            .find(|entry| rules_reference_arn(entry.web_acl.rules.as_deref(), arn))
+    }
+
+    /// The live rule group whose rule tree references `arn`, if any.
+    ///
+    /// The rule-group counterpart of [`Self::web_acl_referencing`]: `Rule` is "a
+    /// single rule, which you can use in a WebACL **or a RuleGroup**", so the very
+    /// same reference statements sit in a rule group's rules, and a resource one of
+    /// them names is in use by that rule group. The same walk answers both.
+    pub fn rule_group_referencing(&self, arn: &str) -> Option<&RuleGroupEntry> {
+        self.rule_groups
+            .values()
+            .find(|entry| rules_reference_arn(entry.rule_group.rules.as_deref(), arn))
+    }
+
+    /// How `arn` is in use by a stored rule tree, worded for a refusal's audit
+    /// record, or `None` when nothing references it.
+    ///
+    /// What a delete consults: a resource is "being used by another resource" as
+    /// soon as ANY stored rule tree names it, and this model stores rule trees in
+    /// two kinds of entity — a web ACL and a rule group — so both are asked. One
+    /// place, so every delete that has to refuse a resource in use asks the same
+    /// question of the same set of rule trees.
+    pub fn rule_tree_referencing(&self, arn: &str) -> Option<String> {
+        if let Some(entry) = self.web_acl_referencing(arn) {
+            return Some(format!("WebACL {:?}", entry.web_acl.name));
+        }
+        self.rule_group_referencing(arn)
+            .map(|entry| format!("RuleGroup {:?}", entry.rule_group.name))
     }
 
     /// The web ACL `arn` names, or `None` when it names no web ACL this service
@@ -1341,6 +1423,168 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     pub fn disassociate_web_acl(&mut self, resource_arn: &str) -> bool {
         self.web_acl_associations.remove(resource_arn).is_some()
     }
+
+    /// The managed rule set stored under `(scope, id)` when it is also the one
+    /// called `name`. See [`Self::web_acl`].
+    pub fn managed_rule_set(
+        &self,
+        scope: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&ManagedRuleSetEntry> {
+        let entry = self
+            .managed_rule_sets
+            .get(&(scope.to_string(), id.to_string()))?;
+        (entry.managed_rule_set.name == name).then_some(entry)
+    }
+
+    /// [`Self::managed_rule_set`], mutably.
+    pub fn managed_rule_set_mut(
+        &mut self,
+        scope: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&mut ManagedRuleSetEntry> {
+        let entry = self
+            .managed_rule_sets
+            .get_mut(&(scope.to_string(), id.to_string()))?;
+        (entry.managed_rule_set.name == name).then_some(entry)
+    }
+
+    /// Provision a managed rule set for the vendor `vendor_name` in `scope`, and
+    /// answer it as stored.
+    ///
+    /// The one way a managed rule set comes into being here, because no operation of
+    /// this model creates one (see [`ManagedRuleSetEntry`]): a vendor's set, its id
+    /// and its first lock token are minted the way every other entity of this
+    /// service mints them ([`new_uuid`]), and its ARN by [`resource_arn`] under
+    /// [`MANAGED_RULE_SET_ARN_KIND`]. `PublishedVersions` starts empty — a set is
+    /// provisioned before its vendor publishes any version, which is what
+    /// `PutManagedRuleSetVersions` then does.
+    pub fn insert_managed_rule_set(
+        &mut self,
+        scope: &str,
+        vendor_name: &str,
+        name: &str,
+        request_region: &str,
+        description: Option<String>,
+    ) -> ManagedRuleSetEntry {
+        let id = new_uuid();
+        let entry = ManagedRuleSetEntry {
+            scope: scope.to_string(),
+            managed_rule_set: ManagedRuleSet {
+                name: name.to_string(),
+                id: id.clone(),
+                arn: resource_arn(
+                    scope,
+                    request_region,
+                    MANAGED_RULE_SET_ARN_KIND,
+                    name,
+                    &id,
+                ),
+                description: stored_description(description),
+                published_versions: Some(HashMap::new()),
+                recommended_version: None,
+                // `ManagedRuleSet$LabelNamespace` is "the label namespace prefix for
+                // the managed rule groups that are offered to customers from this
+                // managed rule set", and the member's own doc gives its syntax as
+                // `awswaf:managed:<vendor>:<rule group name>:` — the same form
+                // `ManagedRuleGroupDescriptor::managed_label_namespace` renders for a
+                // catalogued group, built from the vendor this set belongs to and the
+                // name its customers see.
+                label_namespace: Some(format!("awswaf:managed:{vendor_name}:{name}:")),
+            },
+            lock_token: new_uuid(),
+        };
+        self.managed_rule_sets
+            .insert((scope.to_string(), id), entry.clone());
+        entry
+    }
+
+    /// Every managed rule set of `scope`, ordered by name so a listing enumerates
+    /// them the same way round on every call.
+    pub fn managed_rule_sets_in_scope(&self, scope: &str) -> Vec<&ManagedRuleSetEntry> {
+        let mut entries: Vec<&ManagedRuleSetEntry> = self
+            .managed_rule_sets
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .collect();
+        entries.sort_by(|left, right| {
+            left.managed_rule_set
+                .name
+                .cmp(&right.managed_rule_set.name)
+        });
+        entries
+    }
+
+    /// The logging configuration of the web ACL `resource_arn` under `log_scope`,
+    /// or `None` when the web ACL has none there.
+    ///
+    /// A request that names no `LogScope` addresses the customer-owned
+    /// configuration, the member's documented default
+    /// ([`DEFAULT_LOG_SCOPE`]).
+    pub fn logging_configuration(
+        &self,
+        resource_arn: &str,
+        log_scope: Option<&str>,
+    ) -> Option<&LoggingConfiguration> {
+        self.logging_configurations
+            .get(&logging_configuration_key(resource_arn, log_scope))
+    }
+
+    /// Put `configuration` in front of the web ACL its `ResourceArn` names, and
+    /// answer what it replaced.
+    ///
+    /// A web ACL carries one logging configuration per `LogScope`, so putting one
+    /// REPLACES whatever was there rather than adding a second.
+    pub fn insert_logging_configuration(
+        &mut self,
+        configuration: LoggingConfiguration,
+    ) -> Option<LoggingConfiguration> {
+        let key = logging_configuration_key(
+            &configuration.resource_arn,
+            configuration.log_scope.as_deref(),
+        );
+        self.logging_configurations.insert(key, configuration)
+    }
+
+    /// Take the logging configuration of `resource_arn` under `log_scope` away, and
+    /// answer the one that was there, if any.
+    pub fn remove_logging_configuration(
+        &mut self,
+        resource_arn: &str,
+        log_scope: Option<&str>,
+    ) -> Option<LoggingConfiguration> {
+        self.logging_configurations
+            .remove(&logging_configuration_key(resource_arn, log_scope))
+    }
+}
+
+/// The `LogScope` value a request that names none addresses.
+///
+/// Source: `LoggingConfiguration$LogScope`'s own documentation — "The owner of the
+/// logging configuration, which must be set to `CUSTOMER` for the configurations
+/// that you manage. […] Default: `CUSTOMER`".
+pub const DEFAULT_LOG_SCOPE: &str = "CUSTOMER";
+
+/// The `LogType` value a request that names none addresses.
+///
+/// Source: `LoggingConfiguration$LogType`'s own documentation — "Used to
+/// distinguish between various logging options. Currently, there is one option. […]
+/// Default: `WAF_LOGS`".
+pub const DEFAULT_LOG_TYPE: &str = "WAF_LOGS";
+
+/// The resource-kind segment a managed rule set's ARN carries. See
+/// [`RULE_GROUP_ARN_KIND`].
+pub const MANAGED_RULE_SET_ARN_KIND: &str = "managedruleset";
+
+/// The key a logging configuration is held under: the web ACL's ARN and the
+/// `LogScope` the configuration belongs to, defaulted by [`DEFAULT_LOG_SCOPE`].
+fn logging_configuration_key(resource_arn: &str, log_scope: Option<&str>) -> (String, String) {
+    (
+        resource_arn.to_string(),
+        log_scope.unwrap_or(DEFAULT_LOG_SCOPE).to_string(),
+    )
 }
 
 /// The deepest a rule's statement tree may nest.
@@ -1418,6 +1662,18 @@ pub const MAX_TOKEN_DOMAINS_PER_API_KEY: usize = 5;
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
 /// be, beside the serve path's own 16 MiB request-body cap.
 pub const MAX_IP_SET_ADDRESSES: usize = 10_000;
+
+/// The most versions one managed rule set offers at a time: this store's own bound,
+/// not a documented AWS limit.
+///
+/// `PutManagedRuleSetVersions` adds to the set's `PublishedVersions`, so without a
+/// bound a caller could grow one stored entry without limit by publishing fresh
+/// version keys. Neither the model nor the operation's documentation states a
+/// ceiling for the map, so the figure here is the store's, chosen to match the
+/// per-scope entity bounds this service already holds itself to (see
+/// [`MAX_WEB_ACLS_PER_SCOPE`]): a put that would take a set past it is refused
+/// rather than stored.
+pub const MAX_PUBLISHED_VERSIONS_PER_MANAGED_RULE_SET: usize = 100;
 
 // ---------------------------------------------------------------------------
 // The managed rule group catalogue
@@ -2553,6 +2809,22 @@ pub fn misplaced_rule_group_statement(
     None
 }
 
+/// `true` when any rule of `rules` references `arn`, at the top level of its
+/// statement or anywhere nested inside it.
+///
+/// The one walk over a stored rule LIST that every "is this resource in use?"
+/// question runs, whichever entity holds the list (see
+/// [`ComAmazonawsWafv2Awswaf20190729State::web_acl_referencing`] and
+/// [`ComAmazonawsWafv2Awswaf20190729State::rule_group_referencing`]). It descends
+/// the whole tree, because a reference statement can sit inside `AndStatement`,
+/// `OrStatement`, `NotStatement` or a rate-based/managed-rule-group scope-down
+/// statement.
+fn rules_reference_arn(rules: Option<&[Rule]>, arn: &str) -> bool {
+    rules.unwrap_or_default().iter().any(|rule| {
+        statement_references_arn(&rule.statement, arn, MAX_STATEMENT_NESTING_DEPTH)
+    })
+}
+
 /// `true` when `statement`, or anything nested inside it, is a reference statement
 /// naming `arn`.
 ///
@@ -2765,6 +3037,16 @@ pub fn date_time_millis(value: &::aws_smithy_types::DateTime) -> i64 {
         .secs()
         .saturating_mul(1_000)
         .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
+}
+
+/// Milliseconds since the Unix epoch, now — the instant a mutation records itself
+/// at, at the resolution [`date_time_millis`] compares a modelled timestamp at.
+pub fn now_millis() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// A fresh lowercase, hyphenated UUIDv4 — the form every `EntityId` and
@@ -3328,6 +3610,68 @@ pub const DEFAULT_ALB_LOW_REPUTATION_MODE: &str = "ACTIVE_UNDER_DDOS";
 /// stored.
 pub const DEFAULT_EVALUATION_WINDOW_SEC: i64 = 300;
 
+/// The smallest `ImmunityTime` WAF accepts for a CHALLENGE immunity, in seconds.
+///
+/// Source: `ImmunityTimeProperty$ImmunityTime`'s own documentation — "The amount of
+/// time, in seconds, that a `CAPTCHA` or challenge timestamp is considered valid by
+/// WAF. The default setting is 300. For the Challenge action, the minimum setting
+/// is 300." The member's modelled `@range` (60..259200, from `TimeWindowSecond`) is
+/// the bound the request boundary enforces and is the CAPTCHA floor; the Challenge
+/// floor is this higher one, which only the service knows, so it is checked here.
+pub const MIN_CHALLENGE_IMMUNITY_TIME_SEC: i64 = 300;
+
+/// The `ErrorReason` a challenge immunity below [`MIN_CHALLENGE_IMMUNITY_TIME_SEC`]
+/// carries: the rule the value broke, in the words the model states that rule in
+/// (`smithy_query(query="doc",shape="ImmunityTimeProperty",member="ImmunityTime")` —
+/// "For the Challenge action, the minimum setting is 300.").
+///
+/// The `Reason` of a `WAFInvalidParameterException` is request-derived prose beside
+/// the `Field` and the `Parameter` the response also carries, and the sentence WAF
+/// itself words for this class is not in the model, so what is emitted here is the
+/// model's own statement of the broken rule.
+pub const CHALLENGE_IMMUNITY_BELOW_MINIMUM_REASON: &str =
+    "For the Challenge action, the minimum setting is 300.";
+
+/// The `ImmunityTime` of the first challenge configuration in this save that is
+/// below the Challenge floor, if any.
+///
+/// A `ChallengeConfig` "specifies how WAF should handle Challenge evaluations. This
+/// is available at the web ACL level and in each rule", so every one of them in a
+/// save is judged: the entity-level configuration `web_acl_challenge_config` carries
+/// (a web ACL has one; a rule group has none) and each rule's own. The rules are
+/// visited in order, so a save carrying several below-floor values is refused with
+/// the same one on every call.
+///
+/// A CAPTCHA immunity keeps the modelled floor of 60 and is NOT judged here: the
+/// 300-second floor is documented for the Challenge action alone.
+pub fn below_minimum_challenge_immunity(
+    web_acl_challenge_config: Option<&ChallengeConfig>,
+    rules: &[Rule],
+) -> Option<i64> {
+    web_acl_challenge_config
+        .into_iter()
+        .chain(rules.iter().filter_map(|rule| rule.challenge_config.as_ref()))
+        .filter_map(|config| config.immunity_time_property.as_ref())
+        .map(|property| property.immunity_time)
+        .find(|immunity_time| *immunity_time < MIN_CHALLENGE_IMMUNITY_TIME_SEC)
+}
+
+/// Put `rules` in the order WAF evaluates them: ascending `Priority`.
+///
+/// `Rule$Priority` is the evaluation order itself — "WAF evaluates each request
+/// against the Rules in order based on the value of Priority. WAF processes rules
+/// with lower priority first. The priorities don't need to be consecutive, but they
+/// must all be different" — so a stored rule list is held in that order and every
+/// read hands it back in it, whatever order the save submitted the rules in. A
+/// client reading an entity back to reason about evaluation order, or diffing it
+/// against a template, therefore sees the order the rules actually run in.
+///
+/// The sort is STABLE, so two rules WAF would refuse for sharing a priority keep
+/// the order they were given rather than being shuffled by the normalisation.
+pub fn normalize_rule_order(rules: &mut [Rule]) {
+    rules.sort_by_key(|rule| rule.priority);
+}
+
 /// Materialise, in place, every default WAF applies inside a saved rule tree.
 ///
 /// Walked with an explicit worklist, like [`validate_statement_nesting`]: the tree
@@ -3355,7 +3699,8 @@ pub fn apply_rule_defaults(rules: &mut [Rule]) {
 /// see a web ACL that was created one way and updated another:
 ///
 /// * `Description` — [`stored_description`].
-/// * `Rules` — always a list, so a read of a rule-less web ACL answers `[]` rather
+/// * `Rules` — in ascending `Priority` ([`normalize_rule_order`]), and always a
+///   list, so a read of a rule-less web ACL answers `[]` rather
 ///   than omitting the member; `Rules` is "the Rule statements used to identify the
 ///   web requests that you want to manage", and a web ACL with none has an empty
 ///   collection of them, not an unknown one.
@@ -3370,6 +3715,7 @@ pub fn apply_web_acl_defaults(
     web_acl.description = stored_description(web_acl.description.take());
     let mut rules = web_acl.rules.take().unwrap_or_default();
     apply_rule_defaults(&mut rules);
+    normalize_rule_order(&mut rules);
     web_acl.capacity = web_acl_capacity(&rules, rule_group_capacities);
     web_acl.rules = Some(rules);
     web_acl.on_source_d_do_s_protection_config = Some(
@@ -3447,8 +3793,9 @@ pub fn rule_group_consumed_labels(rules: &[Rule]) -> Vec<LabelSummary> {
 /// back the same way however it was last saved:
 ///
 /// * `Description` — [`stored_description`].
-/// * `Rules` — always a list, for the same reason the web ACL's is: a rule group
-///   with no rules has an empty collection of them, not an unknown one.
+/// * `Rules` — in ascending `Priority` ([`normalize_rule_order`]), and always a
+///   list, for the same reason the web ACL's is: a rule group with no rules has an
+///   empty collection of them, not an unknown one.
 /// * `AvailableLabels` / `ConsumedLabels` — derived from the stored rules by
 ///   [`rule_group_available_labels`] and [`rule_group_consumed_labels`], which is
 ///   why they are computed AFTER the rule defaults are applied.
@@ -3461,6 +3808,7 @@ pub fn apply_rule_group_defaults(rule_group: &mut RuleGroup) {
     rule_group.description = stored_description(rule_group.description.take());
     let mut rules = rule_group.rules.take().unwrap_or_default();
     apply_rule_defaults(&mut rules);
+    normalize_rule_order(&mut rules);
     rule_group.available_labels = Some(rule_group_available_labels(&rules));
     rule_group.consumed_labels = Some(rule_group_consumed_labels(&rules));
     rule_group.rules = Some(rules);
@@ -3554,6 +3902,10 @@ pub const FIELD_ENTITY_LIMIT: &str = "ENTITY_LIMIT";
 /// The `ParameterExceptionField` value naming a token domain. See
 /// [`FIELD_RESOURCE_ARN`].
 pub const FIELD_TOKEN_DOMAIN: &str = "TOKEN_DOMAIN";
+
+/// The `ParameterExceptionField` value naming a challenge configuration. See
+/// [`FIELD_RESOURCE_ARN`].
+pub const FIELD_CHALLENGE_CONFIG: &str = "CHALLENGE_CONFIG";
 
 /// The `ErrorReason` WAF carries for an ARN it will not accept, as the recorded
 /// WAF responses show it.
@@ -3721,6 +4073,10 @@ const UUID_PATTERN: &str = r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$";
 /// (`smithy_query(query="shape",shape="TokenDomain")`).
 const TOKEN_DOMAIN_PATTERN: &str = r"^[\w\.\-/]+$";
 
+/// `^[\w#:\.\-/]+$` — `VersionKeyString`'s `@pattern`
+/// (`smithy_query(query="shape",shape="VersionKeyString")`).
+const VERSION_KEY_PATTERN: &str = r"^[\w#:\.\-/]+$";
+
 /// `LockToken`: `@length(1..36)` plus [`UUID_PATTERN`].
 static LOCK_TOKEN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
     let mut traits = TraitMap::new();
@@ -3744,6 +4100,14 @@ static TOKEN_DOMAINS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
     let mut traits = TraitMap::new();
     traits.insert(Box::new(LengthTrait::new(Some(1), None)));
     traits.insert(Box::new(ElementConstraintsTrait::new(&TOKEN_DOMAIN_TRAITS)));
+    traits
+});
+
+/// `VersionKeyString`: `@length(1..64)` plus [`VERSION_KEY_PATTERN`].
+static VERSION_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(64))));
+    traits.insert(Box::new(PatternTrait::new(VERSION_KEY_PATTERN)));
     traits
 });
 
@@ -3775,6 +4139,26 @@ pub static M_TOKEN_DOMAINS: Schema = Schema::new_member(
 )
 .with_traits(&TOKEN_DOMAINS_TRAITS);
 
+/// `VersionsToPublish`, whose KEYS are `VersionKeyString`s.
+///
+/// A map's keys carry the key shape's constraints, and the request boundary's walk
+/// visits a map's VALUES: a key that violates `VersionKeyString`'s own constraints
+/// reaches the handler, which checks it here against those constraints re-declared
+/// in the framework's own representation — so a version key refused by the handler
+/// reads exactly like a member refused at the boundary. The clause names the map
+/// member, because the key is part of that member's value.
+pub static M_VERSIONS_TO_PUBLISH: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.wafv2#ConstrainedInput$VersionsToPublish",
+        NAMESPACE,
+        "VersionsToPublish",
+    ),
+    ShapeType::String,
+    "VersionsToPublish",
+    2,
+)
+.with_traits(&VERSION_KEY_TRAITS);
+
 /// `TokenDomain`'s constraints as the aggregated clause lists them — every
 /// constraint of the element shape, in one set, whichever of them an element
 /// failed.
@@ -3790,6 +4174,18 @@ pub const TOKEN_DOMAIN_CONSTRAINTS: &[&str] = &[
     "Member must have length less than or equal to 253",
     "Member must have length greater than or equal to 1",
     r"Member must satisfy regular expression pattern: ^[\w\.\-/]+$",
+];
+
+/// `VersionKeyString`'s constraints as the aggregated clause lists them.
+///
+/// The counterpart of [`TOKEN_DOMAIN_CONSTRAINTS`] for a MAP KEY: the same
+/// framework wording for each requirement, each bound `VersionKeyString`'s own
+/// (declared once in [`VERSION_KEY_TRAITS`] above), in the order WAF's request
+/// validator lists them — the length ceiling, the length floor, then the pattern.
+pub const VERSION_KEY_CONSTRAINTS: &[&str] = &[
+    "Member must have length less than or equal to 64",
+    "Member must have length greater than or equal to 1",
+    r"Member must satisfy regular expression pattern: ^[\w#:\.\-/]+$",
 ];
 
 /// The root of the shadow input the walk is driven over. Its member list is empty
@@ -3915,6 +4311,50 @@ pub fn collection_constraint_envelope(
             element_constraints.join(", ")
         ));
     }
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// The envelope WAF's request validator answers for MAP KEYS that fail the key
+/// shape's own constraints — or `None` when none of them do.
+///
+/// The map-key counterpart of [`collection_constraint_envelope`]: a map's keys carry
+/// the key shape's constraints, and WAF reports a key that breaks one against the
+/// MAP member's path, with the KEY as the value and every constraint of the key
+/// shape listed in one bracketed set. One clause per offending key, since each key
+/// is its own value.
+///
+/// `member_path` is the map member's path as the envelope names it (use
+/// [`member_path`]), `keys` are the keys the request sent, `key_constraints` is the
+/// key shape's constraint set (e.g. [`VERSION_KEY_CONSTRAINTS`]) and `key_schema` is
+/// the shadow member schema carrying those constraints, over which the framework's
+/// own walk decides which keys are at fault.
+pub fn map_key_constraint_envelope(
+    member_path: &str,
+    keys: &[String],
+    key_constraints: &[&str],
+    key_schema: &'static Schema,
+) -> Option<String> {
+    let clauses: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            !validate_members(&[(key_schema, ConstrainedValue::Text(key.as_str()))]).is_empty()
+        })
+        .map(|key| {
+            format!(
+                "Value '{}' at '{member_path}' failed to satisfy constraint: \
+                 Map keys must satisfy constraint: [{}]",
+                echoed(key),
+                key_constraints.join(", ")
+            )
+        })
+        .collect();
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),
