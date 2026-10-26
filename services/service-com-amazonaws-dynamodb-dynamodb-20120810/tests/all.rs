@@ -135,3 +135,6 @@ mod value_rules_and_resource_policy;
 
 #[path = "all/vector_indexes.rs"]
 mod vector_indexes;
+
+#[path = "all/vector_search.rs"]
+mod vector_search;

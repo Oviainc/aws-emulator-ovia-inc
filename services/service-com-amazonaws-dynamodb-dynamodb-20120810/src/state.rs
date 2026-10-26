@@ -1085,7 +1085,7 @@ impl VectorIndex {
     /// value of every attribute the search schema partitions the index by
     /// ([`SEARCH_SCHEMA_PARTITION_KEY`]). An `INLINE_FILTER` attribute is optional, so an
     /// item that leaves one out is still indexed.
-    fn covers(&self, item: &Item) -> bool {
+    pub fn covers(&self, item: &Item) -> bool {
         item.contains_key(&self.vector_attribute.attribute_name)
             && self
                 .search_schema
@@ -1094,22 +1094,63 @@ impl VectorIndex {
                 .all(|element| item.contains_key(&element.attribute_name))
     }
 
-    /// The bytes this index stores for one covered item: the attributes it consumes, the
-    /// table's own key attributes, and whatever its `Projection` adds — the same
-    /// projection rule a secondary index is sized by ([`index_projects`]).
-    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
+    /// Which of a covered item's attributes this index STORES, or `None` when it stores
+    /// every one of them.
+    ///
+    /// An index holds "attributes that are copied (projected) from the table into the
+    /// vector index" (`VectorIndex$Projection`): the attributes it consumes (its vector
+    /// attribute and its search schema), the table's own key attributes, and whatever its
+    /// `Projection` adds by the same rule a secondary index is projected by
+    /// ([`index_projects`]). `ALL` stores the whole item, which is `None` here.
+    pub fn stored_attributes(
+        &self,
+        table_key_schema: &[KeySchemaElement],
+    ) -> Option<BTreeSet<String>> {
         if self.projection.projection_type.as_deref().unwrap_or("ALL") == "ALL" {
-            return item_size(item);
+            return None;
         }
-        let projected: Item = item
-            .iter()
-            .filter(|(name, _)| {
-                self.consumed_attributes().any(|consumed| consumed == *name)
-                    || index_projects(&[], &self.projection, table_key_schema, name)
-            })
-            .map(|(name, value)| (name.clone(), value.clone()))
+        let mut names: BTreeSet<String> = self
+            .consumed_attributes()
+            .map(ToString::to_string)
             .collect();
-        item_size(&projected)
+        // Which of the TABLE's attributes a non-`ALL` projection adds is
+        // [`index_projects`]'s rule to state, so the candidates are filtered through it
+        // rather than re-derived here.
+        names.extend(
+            table_key_schema
+                .iter()
+                .map(|element| element.attribute_name.as_str())
+                .chain(
+                    self.projection
+                        .non_key_attributes
+                        .iter()
+                        .flatten()
+                        .map(String::as_str),
+                )
+                .filter(|name| index_projects(&[], &self.projection, table_key_schema, name))
+                .map(ToString::to_string),
+        );
+        Some(names)
+    }
+
+    /// The entry this index holds for one covered item: just the attributes it stores
+    /// ([`Self::stored_attributes`]), which is what a search through it can report.
+    pub fn index_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
+        match self.stored_attributes(table_key_schema) {
+            None => item.clone(),
+            Some(stored) => item
+                .iter()
+                .filter(|(name, _)| stored.contains(name.as_str()))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    /// The bytes this index stores for one covered item: the size of the entry it holds
+    /// for it, so what the index is sized by and what a search through it reports are the
+    /// same projection.
+    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
+        item_size(&self.index_entry(item, table_key_schema))
     }
 
     /// Project this index into the `VectorIndexDescription` every table description
@@ -5151,7 +5192,12 @@ pub fn duplicate_tag_key(key: &str) -> RequestError {
 /// client sees for "the table you addressed is not there", so nothing about this
 /// store's contents (which name was looked up, whether it exists in another
 /// status) leaks through the data-plane refusal.
-fn item_resource_not_found() -> RequestError {
+///
+/// A data-plane read of an INDEX that the table declares but that is not serving yet
+/// answers the same sentence, for the same reason: the operation's own
+/// `ResourceNotFoundException` covers both ("The operation tried to access a nonexistent
+/// table or index … or its status might not be ACTIVE").
+pub fn item_resource_not_found() -> RequestError {
     RequestError::NotFound("Requested resource not found".to_string())
 }
 
@@ -5161,14 +5207,25 @@ fn item_resource_not_found() -> RequestError {
 /// An index named in a statement's source — or in an `IndexName` member — is part of the
 /// request's own shape rather than a resource the caller addressed: the table was found,
 /// and what is wrong is that it has no such index, which AWS states with this fixed
-/// sentence, naming no index. (A caller that addresses an index AS THE RESOURCE, by table
-/// and index name, is answered by [`index_not_found`] instead: there the index is what it
-/// asked for.)
+/// sentence. A statement's source is refused with the sentence alone; a member that
+/// carries the name is answered the name as well ([`unknown_index_named`]). (A caller that
+/// addresses an index AS THE RESOURCE, by table and index name, is answered by
+/// [`index_not_found`] instead: there the index is what it asked for.)
 pub const UNKNOWN_INDEX_MESSAGE: &str = "The table does not have the specified index";
 
 /// That message as the refusal it is.
 pub fn unknown_index() -> RequestError {
     RequestError::Validation(UNKNOWN_INDEX_MESSAGE.to_string())
+}
+
+/// The same refusal for a request that names the index in an `IndexName` MEMBER, which
+/// AWS answers with that sentence and the name the request sent appended after a colon.
+///
+/// The name echoed is the caller's own input, so the refusal still reports nothing of
+/// what the table does carry — a caller that misspelled a member learns which value was
+/// not resolved, which is why AWS echoes it here and not for a statement's source.
+pub fn unknown_index_named(index_name: &str) -> RequestError {
+    RequestError::Validation(format!("{UNKNOWN_INDEX_MESSAGE}: {index_name}"))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -6213,7 +6270,7 @@ pub fn expression_size_exceeded(member: &str) -> RequestError {
 
 /// The refusal for an expression this service cannot parse. The member is named so the
 /// caller knows which one to fix; the expression itself is not echoed back.
-fn expression_syntax_error(member: &str) -> RequestError {
+pub fn expression_syntax_error(member: &str) -> RequestError {
     RequestError::Validation(format!("Invalid {member}: syntax error"))
 }
 
@@ -6326,6 +6383,50 @@ pub fn tokenize_expression(
     Ok(tokens)
 }
 
+/// The TOP-LEVEL attribute names one `ProjectionExpression` names: "A string that
+/// identifies one or more attributes to retrieve … Separate attribute names with commas"
+/// (`ProjectionExpression`), each written out or reached through an
+/// `ExpressionAttributeNames` alias.
+///
+/// `Ok(None)` is the one well-formed case this does not answer a name list for: a path
+/// that reaches INSIDE an attribute (`a.b`, `a[1]`). Whether that is served is the
+/// caller's to decide — a reader that does not serve nested paths answers the scaffold's
+/// 501 for it rather than refusing a request the real service accepts.
+///
+/// Lives here beside [`tokenize_expression`] and [`Substitutions`] so every operation
+/// that serves the member reads it the same way.
+pub fn projection_expression_attributes(
+    member: &str,
+    expression: &str,
+    substitutions: Substitutions<'_>,
+) -> Result<Option<BTreeSet<String>>, RequestError> {
+    let tokens = tokenize_expression(member, expression)?;
+    let mut attributes: BTreeSet<String> = BTreeSet::new();
+    // The list reads as name (`,` name)*, so a name is expected at the start and after
+    // every comma, and nowhere else.
+    let mut expecting_name = true;
+    for token in &tokens {
+        match token {
+            ExprToken::Word(name) if expecting_name => {
+                attributes.insert(name.clone());
+                expecting_name = false;
+            }
+            ExprToken::Alias(alias) if expecting_name => {
+                attributes.insert(substitutions.name(alias)?);
+                expecting_name = false;
+            }
+            ExprToken::Comma if !expecting_name => expecting_name = true,
+            ExprToken::Dot | ExprToken::Index(_) => return Ok(None),
+            _ => return Err(expression_syntax_error(member)),
+        }
+    }
+    if expecting_name {
+        // Nothing, or a trailing comma: the list names an attribute it never gives.
+        return Err(expression_syntax_error(member));
+    }
+    Ok(Some(attributes))
+}
+
 /// The substitution tables an expression resolves its names and values through:
 /// `ExpressionAttributeNames` and `ExpressionAttributeValues`, exactly as the request
 /// sent them.
@@ -6345,7 +6446,7 @@ impl<'a> Substitutions<'a> {
 
     /// The attribute name an `#alias` stands for. An alias with no entry is the
     /// caller's mistake, not an empty name.
-    fn name(&self, alias: &str) -> Result<String, RequestError> {
+    pub fn name(&self, alias: &str) -> Result<String, RequestError> {
         self.names
             .and_then(|names| names.get(alias))
             .cloned()
@@ -6398,6 +6499,16 @@ impl DocumentPath {
             Some(PathStep::Attribute(name)) => name.as_str(),
             // Unreachable by construction: every path starts at an attribute.
             _ => "",
+        }
+    }
+
+    /// The whole path as ONE top-level attribute, when that is all it is: `a` yes, `a.b`
+    /// and `a[0]` no. What tells a path that READS an attribute from one that reaches
+    /// inside it.
+    pub fn single_attribute(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [PathStep::Attribute(name)] => Some(name.as_str()),
+            _ => None,
         }
     }
 
@@ -7036,6 +7147,110 @@ impl ParsedCondition {
         let absent = Item::new();
         evaluate_condition(&self.node, item.unwrap_or(&absent))
     }
+
+    /// How this condition READS each top-level attribute it mentions: every attribute it
+    /// reads, each with the kinds of read it makes of it.
+    ///
+    /// What it is for: a condition that may only speak about a named set of attributes, and
+    /// only in certain ways — the search schema of a vector index, whose partitioning
+    /// attribute may only be pinned by equality — is held to that from the parsed tree,
+    /// rather than guessed from the expression's text.
+    pub fn attribute_reads(&self) -> BTreeMap<String, BTreeSet<AttributeRead>> {
+        let mut reads = BTreeMap::new();
+        collect_condition_attributes(&self.node, &mut reads);
+        reads
+    }
+}
+
+/// How a condition reads one top-level attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttributeRead {
+    /// Pinned to one value by the equality operator: `attr = <value>`, or the same
+    /// comparison written the other way round.
+    Equality,
+    /// Read in any other way: another comparison operator, a range, a function, or a
+    /// document path that reaches INSIDE the attribute.
+    Other,
+}
+
+/// Collect how one condition node reads each top-level attribute into `reads`.
+///
+/// Recursion follows the parsed tree, whose depth the parser holds at
+/// [`MAX_EXPRESSION_DEPTH`], so the number of frames is a constant of this service
+/// rather than a function of the request.
+fn collect_condition_attributes(
+    node: &ConditionNode,
+    reads: &mut BTreeMap<String, BTreeSet<AttributeRead>>,
+) {
+    // An equality between an attribute and a VALUE pins that attribute; every other
+    // comparison, and an equality against another attribute, reads it some other way.
+    if let ConditionNode::Compare(left, CompareOp::Equal, right) = node {
+        if let Some((Operand::Path(path), Operand::Value(_))) = match (left, right) {
+            (Operand::Path(_), Operand::Value(_)) => Some((left, right)),
+            (Operand::Value(_), Operand::Path(_)) => Some((right, left)),
+            _ => None,
+        } {
+            if let Some(attribute) = path.single_attribute() {
+                reads
+                    .entry(attribute.to_string())
+                    .or_default()
+                    .insert(AttributeRead::Equality);
+                return;
+            }
+        }
+    }
+    match node {
+        ConditionNode::All(nodes) | ConditionNode::Any(nodes) => {
+            for node in nodes {
+                collect_condition_attributes(node, reads);
+            }
+        }
+        ConditionNode::Not(inner) => collect_condition_attributes(inner, reads),
+        ConditionNode::Compare(left, _, right)
+        | ConditionNode::BeginsWith(left, right)
+        | ConditionNode::Contains(left, right) => {
+            collect_operand_attributes(left, reads);
+            collect_operand_attributes(right, reads);
+        }
+        ConditionNode::Between(value, low, high) => {
+            collect_operand_attributes(value, reads);
+            collect_operand_attributes(low, reads);
+            collect_operand_attributes(high, reads);
+        }
+        ConditionNode::In(value, candidates) => {
+            collect_operand_attributes(value, reads);
+            for candidate in candidates {
+                collect_operand_attributes(candidate, reads);
+            }
+        }
+        ConditionNode::Exists(path, _) => {
+            read_otherwise(path, reads);
+        }
+        ConditionNode::AttributeType(path, operand) => {
+            read_otherwise(path, reads);
+            collect_operand_attributes(operand, reads);
+        }
+    }
+}
+
+/// How one operand reads a top-level attribute, if it reads one at all: a literal value
+/// reads none, and anything an operand does other than the equality above is `Other`.
+fn collect_operand_attributes(
+    operand: &Operand,
+    reads: &mut BTreeMap<String, BTreeSet<AttributeRead>>,
+) {
+    match operand {
+        Operand::Path(path) | Operand::Size(path) => read_otherwise(path, reads),
+        Operand::Value(_) => {}
+    }
+}
+
+/// Record that `path`'s top-level attribute is read some way other than being pinned.
+fn read_otherwise(path: &DocumentPath, reads: &mut BTreeMap<String, BTreeSet<AttributeRead>>) {
+    reads
+        .entry(path.attribute().to_string())
+        .or_default()
+        .insert(AttributeRead::Other);
 }
 
 /// Evaluate one condition node.
@@ -8104,7 +8319,11 @@ pub fn projected_return_values(
 
 /// Just the named attributes of an item, which is what the `UPDATED_*` forms report:
 /// "Returns only the updated attributes".
-fn project_attributes(item: &Item, names: &BTreeSet<String>) -> Item {
+///
+/// The same rule narrows any read to the attributes a request named — a projection over
+/// an index entry, say — so a name the item does not carry reports nothing for it rather
+/// than a null.
+pub fn project_attributes(item: &Item, names: &BTreeSet<String>) -> Item {
     names
         .iter()
         .filter_map(|name| {

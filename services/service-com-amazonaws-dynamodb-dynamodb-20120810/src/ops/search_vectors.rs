@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchVectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchVectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: scores every item the named vector index holds against the search
+//! vector with the index's own distance function, and reports the `TopK` most similar
+//! of them, most similar first, each with its score and the attributes the index
+//! projects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchVectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything reported is computed from stored state: the index comes from the table
+//! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
+//! index covers, carrying a vector of the index's dimensions), and each result item is
+//! the ENTRY the index holds for it ([`crate::state::VectorIndex::index_entry`]) — the
+//! same projection the index is sized by, so a search can report only what the index
+//! stores.
+//!
+//! The refusals, each grounded in the operation's own contract:
+//!
+//! * a table that is absent or not serving items, and an index the table declares but
+//!   that is not `ACTIVE` yet, are answered `ResourceNotFoundException` — "The operation
+//!   tried to access a nonexistent table or index … or its status might not be ACTIVE";
+//! * an `IndexName` the table declares no vector index for is answered the
+//!   `ValidationException` this service words for an index a request names and the table
+//!   does not have, over the name the request sent
+//!   ([`crate::state::unknown_index_named`]);
+//! * a `SearchVector` whose length differs from the index's `Dimensions`, a
+//!   `ProjectionExpression` naming an attribute the index does not project, and a
+//!   `SearchConditionExpression` that reads an attribute outside the index's search
+//!   schema, reads a `HASH` element any way other than by pinning it with `=`, or leaves
+//!   a `HASH` element unpinned, are refused as `ValidationException`s;
+//! * a table whose resource-based policy denies the caller `dynamodb:SearchVectors` is
+//!   answered `AccessDeniedException` instead of its items.
+//!
+//! Every size one request can choose is bounded: the expression members by the shared
+//! expression ceilings ([`crate::state::tokenize_expression`]), the work by the number of
+//! items the store admits, and the response by the store's own page budget
+//! ([`crate::state::MAX_PAGE_BYTES`]), so a large `TopK` cannot amplify into a response
+//! the size of the table — a search whose results would pass that budget answers the ones
+//! that fit, as a shorter `SearchResults` list.
+//!
+//! Two residual gaps answer the scaffold's 501 rather than a refusal the real service
+//! does not make, and are the only parts of this operation still unwritten: a
+//! `ProjectionExpression` path that reaches INSIDE an attribute (`a.b`, `a[0]`), which no
+//! reader in this crate serves yet, and an index whose stored `DistanceFunction` is
+//! outside the model's `VectorDistanceFunction` enum, which no create or update can store.
 //!
 //! ## Shape of an operation
 //!
@@ -119,8 +151,19 @@
 //!   detailed information about why the request was throttled and the ARN of the impacted
 //!   resource, find the ThrottlingReason field in the returned exception.
 
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The most data this response carries, which is the store's own page budget: one read
+/// cannot amplify into a response the size of the table, however large a `TopK` it asks
+/// for. The first result always fits, the way DynamoDB always returns at least one item
+/// it found; the results past the budget are left out, so a page that stops there is a
+/// SHORTER `SearchResults` list — this operation carries no continuation token to resume
+/// from.
+use crate::state::MAX_PAGE_BYTES;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -193,18 +236,445 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchVectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchVectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let table_name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        // Everything that speaks only about the REQUEST is checked before any table is
+        // looked up, the way the item writes order their validation.
+        let search_vector = read_search_vector(&input.search_vector).map_err(lift)?;
+        let requested_attributes = projected_attributes(&input)?;
+        for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
+            crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+        }
+        let condition = input
+            .search_condition_expression
+            .as_deref()
+            .map(|expression| {
+                crate::state::ParsedCondition::parse(
+                    SEARCH_CONDITION_EXPRESSION,
+                    expression,
+                    crate::state::Substitutions::new(
+                        input.expression_attribute_names.as_ref(),
+                        input.expression_attribute_values.as_ref(),
+                    ),
+                )
+            })
+            .transpose()
+            .map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .active_table(&region, &table_name, now)
+            .map_err(lift)?;
+        // A table whose resource-based policy denies the caller this action answers the
+        // denial, not its items.
+        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:SearchVectors", now) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+        // An `IndexName` the table declares no vector index for is the REQUEST's mistake:
+        // the table was found and has no such index, which AWS states over the name the
+        // request sent.
+        let index = table
+            .vector_indexes
+            .iter()
+            .find(|candidate| candidate.name == input.index_name)
+            .ok_or_else(|| lift(crate::state::unknown_index_named(&input.index_name)))?;
+        // "The index must be in the ACTIVE state" (`SearchVectors$IndexName`): one that is
+        // still becoming active serves no search yet, which is the case the operation's
+        // `ResourceNotFoundException` describes as "its status might not be ACTIVE".
+        if index.status(now) != crate::state::IndexStatus::Active {
+            return Err(lift(crate::state::item_resource_not_found()));
+        }
+        // "The number of dimensions must match the number of dimensions configured for the
+        // vector index" (`SearchVectors$SearchVector`).
+        if i64::try_from(search_vector.len()).unwrap_or(i64::MAX) != index.dimensions {
+            return Err(lift(dimension_mismatch(
+                search_vector.len(),
+                index.dimensions,
+            )));
+        }
+        // "Only attributes projected into the vector index can be retrieved"
+        // (`SearchVectors$ProjectionExpression`). An index that projects `ALL` stores every
+        // attribute of an item, so there is no name it could refuse.
+        let stored_attributes = index.stored_attributes(&table.key_schema);
+        if let (Some(requested), Some(stored)) =
+            (requested_attributes.as_ref(), stored_attributes.as_ref())
+        {
+            if requested.iter().any(|name| !stored.contains(name)) {
+                return Err(lift(crate::state::RequestError::Validation(
+                    UNPROJECTED_ATTRIBUTE_MESSAGE.to_string(),
+                )));
+            }
+        }
+        // How the condition may read the index's search schema, from
+        // `SearchVectors$SearchConditionExpression` and
+        // `SearchSchemaElement$SearchSchemaElementType`:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchVectors"))
+        // * "Only top-level attributes from the search schema can be referenced";
+        // * "Only the equality operator (=) is supported for HASH attributes. Comparison
+        //   and range operators are supported for INLINE_FILTER attributes";
+        // * a `HASH` element partitions the index, and "when specified, you must provide
+        //   this attribute's value in the SearchConditionExpression" — so a search of an
+        //   index that declares one must pin it, whether or not it carries a condition at
+        //   all. An `INLINE_FILTER` element is "optional in the
+        //   SearchConditionExpression".
+        let reads = condition
+            .as_ref()
+            .map(crate::state::ParsedCondition::attribute_reads)
+            .unwrap_or_default();
+        for (attribute, kinds) in &reads {
+            let Some(element) = index
+                .search_schema
+                .iter()
+                .find(|element| &element.attribute_name == attribute)
+            else {
+                return Err(lift(crate::state::RequestError::Validation(
+                    SEARCH_SCHEMA_ATTRIBUTE_MESSAGE.to_string(),
+                )));
+            };
+            if element.search_schema_element_type == crate::state::SEARCH_SCHEMA_PARTITION_KEY
+                && kinds
+                    .iter()
+                    .any(|kind| *kind != crate::state::AttributeRead::Equality)
+            {
+                return Err(lift(crate::state::RequestError::Validation(
+                    PARTITION_KEY_EQUALITY_MESSAGE.to_string(),
+                )));
+            }
+        }
+        let partition_pinned = |element: &SearchSchemaElement| {
+            reads
+                .get(&element.attribute_name)
+                .is_some_and(|kinds| kinds.contains(&crate::state::AttributeRead::Equality))
+        };
+        if index
+            .search_schema
+            .iter()
+            .filter(|element| {
+                element.search_schema_element_type == crate::state::SEARCH_SCHEMA_PARTITION_KEY
+            })
+            .any(|element| !partition_pinned(element))
+        {
+            return Err(lift(crate::state::RequestError::Validation(
+                PARTITION_KEY_REQUIRED_MESSAGE.to_string(),
+            )));
+        }
+        let Some(distance) = DistanceFunction::resolve(&index.distance_function) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "SearchVectors over a {} vector index",
+                index.distance_function
+            )));
+        };
+
+        // The index holds an entry per item it covers, so the search reads those entries:
+        // the vector each is found by, and the attributes the condition filters on "at the
+        // storage layer during search" (`SearchSchemaElement$SearchSchemaElementType`).
+        let mut read_bytes: i64 = 0;
+        let mut ranked: Vec<(f64, &crate::state::Item)> = Vec::new();
+        for item in table.items.values() {
+            if !index.covers(item) {
+                continue;
+            }
+            let Some(indexed_vector) = indexed_vector(
+                item,
+                &index.vector_attribute.attribute_name,
+                index.dimensions,
+            ) else {
+                continue;
+            };
+            let entry = index.index_entry(item, &table.key_schema);
+            read_bytes = read_bytes.saturating_add(crate::state::item_size(&entry));
+            if let Some(condition) = condition.as_ref() {
+                if !condition.evaluate(Some(&entry)).map_err(lift)? {
+                    continue;
+                }
+            }
+            ranked.push((distance.score(&search_vector, &indexed_vector), item));
+        }
+
+        // "returns the most similar items sorted by similarity score based on the distance
+        // function configured for the index" (the operation's doc): which end of the score
+        // range is "most similar" is the distance function's to say. The sort is stable, so
+        // items that score alike keep the store's key order and one request answered twice
+        // reports them in the same order.
+        ranked.sort_by(|(left, _), (right, _)| distance.most_similar_first(*left, *right));
+
+        let top_k = usize::try_from(input.top_k).unwrap_or(0);
+        let mut search_results: Vec<SearchResultItem> = Vec::new();
+        let mut reported_bytes: i64 = 0;
+        for (score, item) in ranked.into_iter().take(top_k) {
+            if !search_results.is_empty() && reported_bytes >= MAX_PAGE_BYTES {
+                break;
+            }
+            let entry = index.index_entry(item, &table.key_schema);
+            let projected = match requested_attributes.as_ref() {
+                Some(requested) => crate::state::project_attributes(&entry, requested),
+                None => entry,
+            };
+            reported_bytes = reported_bytes.saturating_add(crate::state::item_size(&projected));
+            search_results.push(SearchResultItem {
+                item: Some(projected),
+                score,
+            });
+        }
+
+        Ok(SearchVectorsOutput {
+            search_results: Some(search_results),
+            consumed_capacity: consumed_vector_capacity(
+                input.return_consumed_capacity.as_deref(),
+                read_bytes,
+            ),
+        })
+    }
+}
+
+/// The member name the shared expression machinery reports a bad
+/// `SearchConditionExpression` under, which is how the request spells it.
+const SEARCH_CONDITION_EXPRESSION: &str = "SearchConditionExpression";
+
+/// The same for `ProjectionExpression`.
+const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
+
+/// How a `SearchVector` whose length is not the index's `Dimensions` is refused: the rule
+/// the model states for that member ("The number of dimensions must match the number of
+/// dimensions configured for the vector index" — `SearchVectors$SearchVector`), over the
+/// length the request sent and the one the index was created with, so the caller can see
+/// which of the two to change.
+fn dimension_mismatch(provided: usize, configured: i64) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "The number of dimensions in the search vector must match the number of dimensions \
+         configured for the vector index: provided {provided}, configured {configured}"
+    ))
+}
+
+/// How a `ProjectionExpression` naming an attribute the index does not hold is refused:
+/// the rule the model states for that member ("Only attributes projected into the vector
+/// index can be retrieved" — `SearchVectors$ProjectionExpression`).
+const UNPROJECTED_ATTRIBUTE_MESSAGE: &str =
+    "Only attributes projected into the vector index can be retrieved";
+
+/// How a `SearchConditionExpression` that reads an attribute outside the index's search
+/// schema is refused: the rule the model states for that member ("Only top-level
+/// attributes from the search schema can be referenced" —
+/// `SearchVectors$SearchConditionExpression`).
+const SEARCH_SCHEMA_ATTRIBUTE_MESSAGE: &str =
+    "Only top-level attributes from the vector index search schema can be referenced in a \
+     SearchConditionExpression";
+
+/// How a condition that reads a `HASH` search-schema element any other way than by
+/// pinning it is refused: the rule the model states ("Only the equality operator (=) is
+/// supported for HASH attributes" — `SearchVectors$SearchConditionExpression`).
+const PARTITION_KEY_EQUALITY_MESSAGE: &str =
+    "Only the equality operator (=) is supported for HASH attributes in a \
+     SearchConditionExpression";
+
+/// How a search of an index that partitions by a `HASH` search-schema element is refused
+/// when the condition does not pin it: "When specified, you must provide this attribute's
+/// value in the SearchConditionExpression" (`SearchSchemaElement$SearchSchemaElementType`).
+/// The element is not named, so the refusal reports nothing of the index's configuration.
+const PARTITION_KEY_REQUIRED_MESSAGE: &str =
+    "The value of each HASH attribute of the vector index search schema must be provided in \
+     the SearchConditionExpression";
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> SearchVectorsError {
+    SearchVectorsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> SearchVectorsError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            SearchVectorsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The search vector as numbers: "Each element is a 32-bit IEEE-754 floating point
+/// number, provided in DynamoDB list format" (`SearchVectors$SearchVector`), so an
+/// element that is not a number — or is a number no 32-bit float can hold — is refused
+/// rather than silently skipped.
+fn read_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, crate::state::RequestError> {
+    values
+        .iter()
+        .map(|value| match value {
+            AttributeValue::N(text) => text
+                .parse::<f32>()
+                .ok()
+                .filter(|number| number.is_finite())
+                .ok_or_else(invalid_search_vector),
+            _ => Err(invalid_search_vector()),
+        })
+        .collect()
+}
+
+/// How an element of `SearchVector` that is not a 32-bit float is refused, inside the
+/// validation envelope this service words every member refusal in.
+fn invalid_search_vector() -> crate::state::RequestError {
+    crate::state::invalid_member(
+        "searchVector",
+        None,
+        "Member must hold only numbers, each a 32-bit IEEE-754 floating point value",
+    )
+}
+
+/// The vector one stored item is found by in an index of `dimensions` dimensions, or
+/// `None` when the item holds no such vector.
+///
+/// An index entry exists only for an item whose vector attribute is a list of
+/// `dimensions` 32-bit floats, so an item carrying something else under that name — a
+/// list of the wrong length, a value of another type — is not in the index and is not
+/// searched. It is skipped rather than refused: the request is about the index, not about
+/// that item.
+fn indexed_vector(
+    item: &crate::state::Item,
+    attribute: &str,
+    dimensions: i64,
+) -> Option<Vec<f32>> {
+    let AttributeValue::L(values) = item.get(attribute)? else {
+        return None;
+    };
+    if i64::try_from(values.len()).unwrap_or(i64::MAX) != dimensions {
+        return None;
+    }
+    values
+        .iter()
+        .map(|value| match value {
+            AttributeValue::N(text) => text
+                .parse::<f32>()
+                .ok()
+                .filter(|number| number.is_finite()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The attributes a `ProjectionExpression` asks for, or `None` when the request names
+/// none — in which case "the operation returns all attributes projected into the vector
+/// index" (`SearchVectors$ProjectionExpression`).
+///
+/// The name list is read by the shared reader
+/// ([`crate::state::projection_expression_attributes`]). A path that reaches INSIDE an
+/// attribute, which that reader answers `None` for, is not served here yet and says so
+/// with the scaffold's 501 rather than a refusal the real service does not answer.
+fn projected_attributes(
+    input: &SearchVectorsInput,
+) -> Result<Option<BTreeSet<String>>, SearchVectorsError> {
+    let Some(expression) = input.projection_expression.as_deref() else {
+        return Ok(None);
+    };
+    let substitutions =
+        crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None);
+    crate::state::projection_expression_attributes(PROJECTION_EXPRESSION, expression, substitutions)
+        .map_err(lift)?
+        .map(Some)
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented(
+                "SearchVectors with a ProjectionExpression path into an attribute",
+            )
+        })
+}
+
+/// What a search consumed, as this operation reports it, or `None` when the request asked
+/// for `NONE` (or did not ask at all).
+///
+/// `VectorCapacity` denominates a search in BYTES ("ConsumedCapacity … Contains
+/// VectorSearchRequestBytes, which represents the vector search capacity consumed" —
+/// `SearchVectors$ConsumedCapacity`), so what is reported is the index data this search
+/// read: the entries of every item the index holds that the search scored or filtered.
+/// Nothing was written, so the write figure is left out.
+fn consumed_vector_capacity(requested: Option<&str>, read_bytes: i64) -> Option<VectorCapacity> {
+    match requested {
+        Some("TOTAL" | "INDEXES") => Some(VectorCapacity {
+            // Exact: the store admits far fewer bytes than an `f64` carries whole numbers
+            // for, so the figure reported is the figure counted.
+            vector_search_request_bytes: Some(read_bytes.max(0) as f64),
+            vector_write_request_bytes: None,
+        }),
+        _ => None,
+    }
+}
+
+/// How an index scores a stored vector against the search vector, and which end of the
+/// range is the most similar — "the distance function used to calculate similarity
+/// between vectors" (`VectorIndex$DistanceFunction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistanceFunction {
+    Cosine,
+    Euclidean,
+    DotProduct,
+}
+
+impl DistanceFunction {
+    /// The function one stored index names, or `None` for a value this emulator cannot
+    /// score with. The three it serves are the whole of the model's
+    /// `VectorDistanceFunction` enum, which is what a create or update is held to.
+    fn resolve(distance_function: &str) -> Option<Self> {
+        match distance_function {
+            "COSINE" => Some(Self::Cosine),
+            "EUCLIDEAN" => Some(Self::Euclidean),
+            "DOT_PRODUCT" => Some(Self::DotProduct),
+            _ => None,
+        }
+    }
+
+    /// The score this function gives one indexed vector against the search vector.
+    ///
+    /// The arithmetic is done in `f64` over the `f32` elements both vectors carry, so a
+    /// rounding of the input is never compounded by the accumulation.
+    fn score(self, search: &[f32], indexed: &[f32]) -> f64 {
+        let products = || {
+            search
+                .iter()
+                .zip(indexed)
+                .map(|(left, right)| (f64::from(*left), f64::from(*right)))
+        };
+        match self {
+            // "Scores range from 0 (identical) to 2 (opposite). Lower scores indicate
+            // higher similarity" (the operation's doc): the cosine DISTANCE, one minus the
+            // cosine of the angle between the vectors. A vector of zero length has no
+            // direction, so it is no closer to one vector than to another: its similarity
+            // is 0 and its score the midpoint of the range.
+            Self::Cosine => {
+                let dot: f64 = products().map(|(left, right)| left * right).sum();
+                let search_norm: f64 = products().map(|(left, _)| left * left).sum::<f64>().sqrt();
+                let indexed_norm: f64 = products().map(|(_, right)| right * right).sum::<f64>().sqrt();
+                if search_norm == 0.0 || indexed_norm == 0.0 {
+                    return 1.0;
+                }
+                (1.0 - dot / (search_norm * indexed_norm)).clamp(0.0, 2.0)
+            }
+            // "Scores represent the Euclidean distance between vectors. Lower scores
+            // indicate higher similarity".
+            Self::Euclidean => products()
+                .map(|(left, right)| (left - right) * (left - right))
+                .sum::<f64>()
+                .sqrt(),
+            // "Higher scores indicate higher similarity": the inner product itself.
+            Self::DotProduct => products().map(|(left, right)| left * right).sum(),
+        }
+    }
+
+    /// Order two scores most similar first: the smallest score for the two distances, the
+    /// largest for the inner product ("Returns the items with the k smallest scores" /
+    /// "the k highest scores" — the operation's doc).
+    fn most_similar_first(self, left: f64, right: f64) -> Ordering {
+        let ordering = match self {
+            Self::Cosine | Self::Euclidean => left.partial_cmp(&right),
+            Self::DotProduct => right.partial_cmp(&left),
+        };
+        ordering.unwrap_or(Ordering::Equal)
     }
 }
