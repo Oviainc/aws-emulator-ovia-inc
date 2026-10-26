@@ -72,6 +72,10 @@ pub struct StoredBudget {
 /// A notification plus the subscribers attached to it. A notification cannot exist
 /// without at least one subscriber (`Subscribers` is `@length(min: 1)`), so the two
 /// are stored together.
+///
+/// The notification holds only what the CALLER owns: its `NotificationState` is dropped on
+/// the write path ([`drop_notification_derived`]) and computed on every read
+/// ([`project_notification`]), the way a budget's `CalculatedSpend` is.
 #[derive(Debug, Clone)]
 pub struct StoredNotification {
     pub notification: Notification,
@@ -815,14 +819,154 @@ fn apply_percentage_limit_default(budget: &mut Budget) {
     });
 }
 
-/// Stamp the members of `notification` the SERVICE owns, on the write path that creates
-/// it: a notification the caller did not place in alarm starts out of alarm
-/// ([`NOTIFICATION_STATE_OK`]).
-pub fn stamp_notification(notification: &mut Notification) {
-    if notification.notification_state.is_none() {
-        notification.notification_state = Some(NOTIFICATION_STATE_OK.to_string());
+/// Discard the member of `notification` whose value the SERVICE derives, on every write
+/// path that stores one, so that nothing a request carried for it is persisted or echoed
+/// back by a later read.
+///
+/// `NotificationState` "specifies whether this notification is in alarm. If a budget
+/// notification is in the `ALARM` state, you passed the set threshold for the budget"
+/// (`Notification$NotificationState`): it is the service's own reading of the spend it
+/// tracks against the notification's threshold, not a value a caller chooses — exactly
+/// like `Budget$CalculatedSpend`, which the write path drops for the same reason
+/// ([`drop_service_derived`]). Every read reports the state computed from the budget's
+/// own figures instead ([`notification_state`]).
+pub fn drop_notification_derived(notification: &mut Notification) {
+    notification.notification_state = None;
+}
+
+/// `notification` as a READ reports it: the members the caller supplied, plus the
+/// `NotificationState` the service computes for it ([`notification_state`]).
+///
+/// `budget` is the budget as a read reports it ([`project_budget`] / [`budget_as_read`]),
+/// so the alarm state a notification is reported in is read off the same figures
+/// `DescribeBudget` reports for the budget that owns it.
+pub fn project_notification(budget: &Budget, notification: &Notification) -> Notification {
+    let mut reported = notification.clone();
+    reported.notification_state = Some(notification_state(budget, notification).to_string());
+    reported
+}
+
+/// The `NotificationState` the service reports for `notification` of `budget` — whether
+/// the notification is in alarm, as of the figures `budget` reads back with.
+///
+/// A notification is one alert condition over the spend the budget tracks: which spend it
+/// watches is `NotificationType` ("whether the notification is for how much you have
+/// spent (`ACTUAL`) or for how much that you're forecasted to spend (`FORECASTED`)"),
+/// what it is measured against is `Threshold` read through `ThresholdType`
+/// ([`threshold_amount`]), and how the two are compared is `ComparisonOperator`. The
+/// notification is in [`NOTIFICATION_STATE_ALARM`] exactly while that comparison holds —
+/// "if a budget notification is in the `ALARM` state, you passed the set threshold for
+/// the budget" — and in [`NOTIFICATION_STATE_OK`] otherwise.
+///
+/// `OK` is also the answer wherever there is nothing to compare, because nothing has
+/// passed a threshold that was never measured: a `FORECASTED` notification of a budget no
+/// forecast is reported for (every budget here — see [`calculated_spend`]), a budget whose
+/// read reports no `CalculatedSpend` at all, a `PERCENTAGE` threshold of a budget that
+/// reports no limit to take a percentage of, and a comparison or threshold type this
+/// service does not know.
+pub fn notification_state(budget: &Budget, notification: &Notification) -> &'static str {
+    if notification_in_alarm(budget, notification) {
+        NOTIFICATION_STATE_ALARM
+    } else {
+        NOTIFICATION_STATE_OK
     }
 }
+
+/// Whether the spend `notification` watches has passed the threshold it alerts on.
+fn notification_in_alarm(budget: &Budget, notification: &Notification) -> bool {
+    let Some(spent) = watched_spend(budget, notification) else {
+        return false;
+    };
+    let Some(threshold) = threshold_amount(budget, notification) else {
+        return false;
+    };
+    match notification.comparison_operator.as_str() {
+        COMPARISON_OPERATOR_GREATER_THAN => spent > threshold,
+        COMPARISON_OPERATOR_LESS_THAN => spent < threshold,
+        COMPARISON_OPERATOR_EQUAL_TO => spent == threshold,
+        // A comparison this service does not know is one it cannot make.
+        _ => false,
+    }
+}
+
+/// The figure `notification` watches, out of the `CalculatedSpend` `budget` reads back
+/// with: the actual spend for an `ACTUAL` notification, the forecast for a `FORECASTED`
+/// one. `None` when the budget reports no such figure.
+fn watched_spend(budget: &Budget, notification: &Notification) -> Option<f64> {
+    let spend = budget.calculated_spend.as_ref()?;
+    let watched = match notification.notification_type.as_str() {
+        NOTIFICATION_TYPE_ACTUAL => Some(&spend.actual_spend),
+        NOTIFICATION_TYPE_FORECASTED => spend.forecasted_spend.as_ref(),
+        // A notification type this service does not know watches nothing it holds.
+        _ => None,
+    }?;
+    numeric_amount(&watched.amount)
+}
+
+/// The amount `notification`'s `Threshold` names, in the unit the watched spend is
+/// measured in.
+///
+/// `ThresholdType$ABSOLUTE_VALUE` is that amount itself ("Amazon Web Services notifies you
+/// when you go over or are forecasted to go over your total cost threshold"), while
+/// `PERCENTAGE` — the type a notification that names none carries, since "thresholds are
+/// always a percentage" — is that percentage OF the budgeted amount: "if you have a budget
+/// for 200 dollars and you have a `PERCENTAGE` threshold of 80%, Amazon Web Services
+/// notifies you when you go over 160 dollars" (`Notification$ThresholdType`). So a budget
+/// whose read reports no `BudgetLimit` has no amount for a percentage to be of, and there
+/// is nothing to compare.
+fn threshold_amount(budget: &Budget, notification: &Notification) -> Option<f64> {
+    match notification
+        .threshold_type
+        .as_deref()
+        .unwrap_or(THRESHOLD_TYPE_PERCENTAGE)
+    {
+        THRESHOLD_TYPE_ABSOLUTE_VALUE => Some(notification.threshold),
+        THRESHOLD_TYPE_PERCENTAGE => {
+            let limit = numeric_amount(&budget.budget_limit.as_ref()?.amount)?;
+            Some(limit * notification.threshold / PERCENT)
+        }
+        // A threshold type this service does not know names no amount.
+        _ => None,
+    }
+}
+
+/// The number `amount` names, for a `Spend$Amount` or `BudgetLimit` figure that is about
+/// to be compared. `NumericValue` is a STRING (`^([0-9]*\.)?[0-9]+$`), so the comparison
+/// reads the number out of it rather than comparing the spelling; `None` for anything that
+/// is not a finite number.
+///
+/// The comparison that follows is therefore binary-floating-point: a limit written with
+/// more significant digits than a `f64` carries is compared as the nearest one it has.
+fn numeric_amount(amount: &str) -> Option<f64> {
+    amount
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+/// The whole of a `PERCENTAGE` threshold's base: a threshold of `100` is the budgeted
+/// amount itself.
+const PERCENT: f64 = 100.0;
+
+/// `ThresholdType$ABSOLUTE_VALUE` — the threshold read as an amount in the budget's own
+/// unit rather than as a percentage of the budgeted amount.
+pub const THRESHOLD_TYPE_ABSOLUTE_VALUE: &str = "ABSOLUTE_VALUE";
+
+/// `NotificationType$ACTUAL` — the notification that watches "how much you have spent".
+pub const NOTIFICATION_TYPE_ACTUAL: &str = "ACTUAL";
+
+/// `NotificationType$FORECASTED` — the notification that watches "how much that you're
+/// forecasted to spend".
+pub const NOTIFICATION_TYPE_FORECASTED: &str = "FORECASTED";
+
+/// `ComparisonOperator$GREATER_THAN` — the watched spend is above the threshold.
+pub const COMPARISON_OPERATOR_GREATER_THAN: &str = "GREATER_THAN";
+
+/// `ComparisonOperator$LESS_THAN` — the watched spend is below the threshold.
+pub const COMPARISON_OPERATOR_LESS_THAN: &str = "LESS_THAN";
+
+/// `ComparisonOperator$EQUAL_TO` — the watched spend is exactly the threshold.
+pub const COMPARISON_OPERATOR_EQUAL_TO: &str = "EQUAL_TO";
 
 /// `ThresholdType$PERCENTAGE` — the threshold type a notification that names none
 /// carries: "Thresholds are always a percentage" (`Notification$Threshold`), so an
@@ -1189,7 +1333,14 @@ pub fn planned_limit_in_force(planned: &HashMap<String, Spend>, at: SystemTime) 
 /// * `CalculatedSpend`, the cost or usage the budget tracks (see [`calculated_spend`]),
 ///   which no request can set and every read reports.
 pub fn project_budget(stored: &StoredBudget, at: SystemTime) -> Budget {
-    let mut budget = stored.budget.clone();
+    budget_as_read(&stored.budget, at)
+}
+
+/// The same projection as [`project_budget`], over a `Budget` held on its own — what a
+/// write path that has just built the budget it is about to store reads back for it,
+/// without first having a [`StoredBudget`] to project.
+pub fn budget_as_read(budget: &Budget, at: SystemTime) -> Budget {
+    let mut budget = budget.clone();
     if budget.budget_limit.is_none() {
         if let Some(planned) = &budget.planned_budget_limits {
             budget.budget_limit = planned_limit_in_force(planned, at);

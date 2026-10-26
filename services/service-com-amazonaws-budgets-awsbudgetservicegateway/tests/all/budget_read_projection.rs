@@ -853,10 +853,15 @@ async fn a_planned_limit_budget_reports_the_limit_in_force() {
 
 /// RULE: every notification a budget was created with is reported by
 /// `DescribeNotificationsForBudget`, with the members the caller sent and a
-/// `NotificationState` — the one the caller set, or `OK` for a notification that was not
-/// placed in alarm.
+/// `NotificationState` the SERVICE decides — so the state reported for one notification
+/// is the SAME whichever state the request carried for it, and is always one of the
+/// modelled values.
+///
+/// Which state that is, per what the notification alerts on, is the table in
+/// `tests/all/notification_alarm_state.rs`; what this rule pins is that the request has
+/// no say in it.
 #[tokio::test]
-async fn a_notification_is_reported_with_the_state_it_was_created_in() {
+async fn a_notification_is_reported_with_the_state_the_service_computes() {
     // The catalogs are the generated `NOTIFICATION_TYPE_VALUES` /
     // `COMPARISON_OPERATOR_VALUES` / `NOTIFICATION_STATE_VALUES` constants, and the
     // thresholds are both published bounds of `NotificationThreshold`
@@ -865,15 +870,18 @@ async fn a_notification_is_reported_with_the_state_it_was_created_in() {
     let mut index = 0_u64;
     for notification_type in NOTIFICATION_TYPE_VALUES {
         for comparison in COMPARISON_OPERATOR_VALUES {
+            let threshold = thresholds[(index as usize) % thresholds.len()];
+            index += 1;
+            // What each read reported, keyed by the state the REQUEST carried, so the
+            // three can be compared against each other below.
+            let mut reported_states: Vec<(String, String)> = Vec::new();
             for sent_state in ::std::iter::once(None)
                 .chain(NOTIFICATION_STATE_VALUES.iter().map(|state| Some(*state)))
             {
-                let threshold = thresholds[(index as usize) % thresholds.len()];
                 let case =
                     format!("{notification_type}/{comparison}/{sent_state:?}/{threshold}");
                 let account_id = caller_account();
                 let router = router();
-                index += 1;
                 let name = "notified";
                 let mut notification = json!({
                     "NotificationType": notification_type,
@@ -935,15 +943,36 @@ async fn a_notification_is_reported_with_the_state_it_was_created_in() {
                         "case {case:?}: expected {member} = {expected}, got {actual}"
                     );
                 }
-                // The literal `OK`, not the crate's own constant, for the same reason as
-                // the health status above.
-                let expected_state = sent_state.unwrap_or("OK");
-                let actual_state = read.get("NotificationState").and_then(Value::as_str);
+                // The reported state is one the model declares, and it is the service's
+                // own: the comparison across the three requests below is what pins that
+                // the request had no say in it.
+                let actual_state = read
+                    .get("NotificationState")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected a NotificationState, got {read}")
+                    });
+                assert!(
+                    NOTIFICATION_STATE_VALUES.contains(&actual_state),
+                    "case {case:?}: expected a modelled NotificationState, got \
+                     {actual_state:?}"
+                );
+                reported_states.push((
+                    sent_state.unwrap_or("absent").to_string(),
+                    actual_state.to_string(),
+                ));
+            }
+            let (first_sent, first_state) = reported_states
+                .first()
+                .cloned()
+                .expect("every notification was read back");
+            for (sent, state) in &reported_states {
                 assert_eq!(
-                    actual_state,
-                    Some(expected_state),
-                    "case {case:?}: expected NotificationState {expected_state}, \
-                     got {actual_state:?}"
+                    state, &first_state,
+                    "case {notification_type}/{comparison}/{threshold}: the notification \
+                     sent with NotificationState {sent:?} read back as {state:?}, while \
+                     the one sent with {first_sent:?} read back as {first_state:?} — the \
+                     state a read reports must not depend on the request"
                 );
             }
         }

@@ -262,8 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // Read before the notification is replaced, because an alert names the budget
-            // the notification belongs to.
-            let source = crate::state::alerts::source(&input.account_id, &stored.budget);
+            // the notification belongs to, and whether that notification is in alarm is
+            // read off the figures the budget reports.
+            let source = crate::state::alerts::source(
+                &input.account_id,
+                &crate::state::budget_as_read(&stored.budget, now),
+            );
             // Replaced IN PLACE at the position just resolved, so the budget's
             // notifications keep their relative order (the order a paginated read indexes
             // into) and the subscribers held with this notification stay attached to it —
@@ -272,17 +276,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let held = &mut stored.notifications[index];
             let mut notification = input.new_notification;
             // `NotificationState` "specifies whether this notification is in alarm" — a
-            // member the SERVICE owns and moves as spend crosses the threshold, and not
-            // part of what names a notification. An update that does not carry it
-            // therefore leaves the alarm state the notification already had rather than
-            // clearing it, so a read after this call reports the state the service last
-            // computed.
-            if notification.notification_state.is_none() {
-                notification.notification_state = held.notification.notification_state.clone();
-            }
-            // ... and a notification that carries no alarm state at all is out of alarm,
-            // the same stamp the create path applies.
-            crate::state::stamp_notification(&mut notification);
+            // member the SERVICE owns and reads off the spend behind the budget, and not
+            // part of what names a notification. Neither the state this update carried
+            // nor the one the replaced notification was stored with is kept: the state is
+            // computed on every read from the budget's own figures, so an update changes
+            // it only by changing what the notification alerts on.
+            crate::state::drop_notification_derived(&mut notification);
             held.notification = notification;
             // A notification this write leaves in alarm has passed its threshold, so it
             // owes the alert it exists to deliver to every subscriber still attached to

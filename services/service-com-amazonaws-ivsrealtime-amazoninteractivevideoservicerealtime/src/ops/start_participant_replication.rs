@@ -216,15 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Replication is INTO another stage: the destination holds a replica of a
         // participant publishing somewhere else, so a request naming one stage twice
         // describes no replication at all. The model cannot say "these two members
-        // differ", so it is refused here.
+        // differ", so it is refused here, in the words both operations that take the two
+        // ends of a replication state it with
+        // (`crate::state::same_stage_replication_message`).
         if input.source_stage_arn == input.destination_stage_arn {
             return Err(crate::state::validation_failed(
                 StartParticipantReplicationErrorModeled::ValidationException,
-                format!(
-                    "{}.destinationStageArn is required to name a stage other than \
-                     sourceStageArn, found {}",
+                crate::state::same_stage_replication_message(
                     Self::NAME,
-                    input.destination_stage_arn,
+                    &input.destination_stage_arn,
                 ),
             ));
         }
