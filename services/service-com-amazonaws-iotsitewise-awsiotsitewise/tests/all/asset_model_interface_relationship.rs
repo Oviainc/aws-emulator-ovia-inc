@@ -35,21 +35,21 @@ use super::asset_lifecycle::{call, error_code, is_modelled_id, router};
 
 /// Long enough for the transition the clock owes (`ACTIVATION_DELAY`) to fall
 /// due, with room for a slow machine.
-const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The route both interface-relationship operations address, for the pair of
 /// `CustomID` labels `asset_model` and `interface`.
-fn relationship_uri(asset_model: &str, interface: &str) -> String {
+pub(crate) fn relationship_uri(asset_model: &str, interface: &str) -> String {
     format!("/asset-models/{asset_model}/interface/{interface}/asset-model-interface-relationship")
 }
 
 /// One measurement property definition under `name`.
-fn property(name: &str) -> Value {
+pub(crate) fn property(name: &str) -> Value {
     json!({ "name": name, "dataType": "DOUBLE", "unit": "Celsius", "type": {"measurement": {}} })
 }
 
 /// Create an asset model from `body` and return its id.
-async fn create_model(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+pub(crate) async fn create_model(router: &MultiServiceRouter, case: &str, body: Value) -> String {
     let (status, created) = call(router, "POST", "/asset-models", Some(body)).await;
     assert_eq!(status, 202, "case {case}: create model got {status} {created}");
     created["assetModelId"]
@@ -60,7 +60,7 @@ async fn create_model(router: &MultiServiceRouter, case: &str, body: Value) -> S
 
 /// Create an asset model of `model_type` carrying one measurement property per
 /// name in `properties`.
-async fn model_with(
+pub(crate) async fn model_with(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -81,14 +81,14 @@ async fn model_with(
 
 /// The `assetModelProperties` / `assetModelHierarchies` of a stored model, as
 /// `DescribeAssetModel` reports them.
-async fn describe_model(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn describe_model(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let (status, body) = call(router, "GET", &format!("/asset-models/{id}"), None).await;
     assert_eq!(status, 200, "case {case}: DescribeAssetModel got {status} {body}");
     body
 }
 
 /// The id of the property named `name` in an `assetModelProperties` list.
-fn id_of(properties: &Value, case: &str, name: &str) -> String {
+pub(crate) fn id_of(properties: &Value, case: &str, name: &str) -> String {
     properties
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected a property list, got {properties}"))
@@ -101,7 +101,7 @@ fn id_of(properties: &Value, case: &str, name: &str) -> String {
 }
 
 /// Every id in an `assetModelProperties` list.
-fn ids(properties: &Value) -> BTreeSet<String> {
+pub(crate) fn ids(properties: &Value) -> BTreeSet<String> {
     properties
         .as_array()
         .map(|list| {

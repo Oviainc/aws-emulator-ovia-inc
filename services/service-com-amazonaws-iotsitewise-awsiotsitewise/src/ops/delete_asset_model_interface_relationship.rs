@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssetModelInterfaceRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAssetModelInterfaceRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAssetModelInterfaceRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation removes an interface asset model's application to
+//! an asset model from the shared engine store (`crate::state`); this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +163,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAssetModelInterfaceRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssetModelInterfaceRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAssetModelInterfaceRelationship"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay, exactly as
+        // `PutAssetModelInterfaceRelationship` leaves it: this change stores no
+        // token -> answer mapping, so no answer is fabricated for a retry.
+        let mut store = state.lock();
+
+        // Both members are `CustomID` labels: a raw UUID or the `externalId:` form.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        let interface_asset_model_id = store
+            .resolve_asset_model_id(&input.interface_asset_model_id)
+            .ok_or_else(|| model_not_found(&input.interface_asset_model_id))?;
+
+        // Two models that exist are not a relationship: only an application of the
+        // interface to the model makes one, so a pair nothing applied is a
+        // not-found rather than a success that deleted nothing — the same absence
+        // `DescribeAssetModelInterfaceRelationship` reports for that pair.
+        let key =
+            crate::state::interface_relationship_key(&asset_model_id, &interface_asset_model_id);
+        if !store.interface_relationships.contains_key(&key) {
+            return Err(not_found(format!(
+                "The asset model {} does not implement the interface asset model {}.",
+                input.asset_model_id, input.interface_asset_model_id
+            )));
+        }
+
+        // Nothing can be refused from here on, so the two writes land together:
+        // the record this call writes to is reached FIRST, the way the sibling
+        // application orders every refusal ahead of its writes. The two maps are
+        // borrowed as the distinct fields they are, so one lookup answers each.
+        let store = &mut *store;
+        let record = store
+            .asset_models
+            .get_mut(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        // The applied-to model's PROPERTIES stay: what this call deletes is the
+        // relationship, which is all the request names, and the mappings that went
+        // with it pair properties of that model — an override maps an interface
+        // property onto one the model declared long before the interface was
+        // applied — so removing them would delete definitions, and the samples
+        // written against them, that nothing asked to delete.
+        store.interface_relationships.remove(&key);
+        // The model no longer implements the interface, so it carries a new version
+        // and owes a transition back to `ACTIVE` — the rule every mutating call on
+        // a record follows, kept on the record itself, and what the reported status
+        // is derived from. The definition it supersedes is read before this call's
+        // write lands, so it stays the model's ACTIVE version until the new one
+        // settles.
+        let superseded = record.definition();
+        record.begin_update(superseded, now);
+
+        Ok(DeleteAssetModelInterfaceRelationshipOutput {
+            asset_model_id: record.id.clone(),
+            interface_asset_model_id,
+            asset_model_arn: record.arn.clone(),
+            asset_model_status: record.status(now),
+        })
     }
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> DeleteAssetModelInterfaceRelationshipError {
+    DeleteAssetModelInterfaceRelationshipErrorModeled::InternalFailureException(
+        InternalFailureException {
+            message: "the IoT SiteWise store is unavailable".to_string(),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset-model label that
+/// resolved to nothing.
+fn model_not_found(label: &str) -> DeleteAssetModelInterfaceRelationshipError {
+    not_found(crate::state::not_found_message(
+        crate::state::RESOURCE_ASSET_MODEL,
+        label,
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DeleteAssetModelInterfaceRelationshipError {
+    DeleteAssetModelInterfaceRelationshipErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    )
+    .into()
 }
