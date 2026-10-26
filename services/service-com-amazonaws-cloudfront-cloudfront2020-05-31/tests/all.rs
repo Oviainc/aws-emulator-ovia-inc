@@ -147,6 +147,8 @@ mod realtime_log_config_lifecycle;
 mod realtime_log_config_list;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
+#[path = "all/resource_policy_lifecycle.rs"]
+mod resource_policy_lifecycle;
 #[path = "all/response_headers_policy_config_read.rs"]
 mod response_headers_policy_config_read;
 #[path = "all/response_headers_policy_lifecycle.rs"]

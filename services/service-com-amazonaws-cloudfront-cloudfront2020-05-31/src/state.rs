@@ -17,7 +17,11 @@
 //! real-time log
 //! configuration: each record is put
 //! there by the call that creates it and is what every later read of that resource answers
-//! from. None of a response headers policy, an origin request policy, a cache policy, an
+//! from. A resource policy is carried the same way, except that it is keyed by the ARN of
+//! the resource it is attached to rather than by an id of its own: that ARN is the only
+//! identifier the resource-policy surface addresses a policy by.
+//!
+//! None of a response headers policy, an origin request policy, a cache policy, an
 //! origin access control, a public key, a key group or a real-time log configuration has a
 //! status
 //! member or a propagation deadline, so
@@ -179,6 +183,19 @@ pub const MAX_ITEMS: i32 = 100;
 /// `TooManyDistributions`: "Processing your request would cause you to exceed the maximum
 /// number of distributions allowed."
 pub const MAX_DISTRIBUTIONS: usize = 10_000;
+
+/// The most resource policies this emulator holds — one per resource that carries one.
+///
+/// Same construct and same reasoning as [`MAX_DISTRIBUTIONS`]: a policy record is what
+/// `GetResourcePolicy` answers from, so it cannot be evicted, and the bound is a maximum
+/// entry count refused on the write path before anything is inserted. Real CloudFront needs
+/// no bound of its own here, because a policy exists only for a VPC origin and the quota on
+/// those is enforced where one is created, which is why `PutResourcePolicy` models no limit
+/// error at all; the refusal over this bound is therefore the modelled `InvalidArgument`,
+/// the one general client refusal that operation declares. A write that REPLACES the policy
+/// of a resource already in the store grows nothing, so it is never refused by it, and the
+/// count sits far above any realistic client workflow.
+pub const MAX_RESOURCE_POLICIES: usize = 1_000;
 
 /// The most streaming (RTMP) distributions this emulator holds.
 ///
@@ -3784,6 +3801,16 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// same reason as `distributions`: one stable total order for a listing to page
     /// through. Everything that reads or writes it lives in [`realtime_log_configs`].
     pub realtime_log_configs: BTreeMap<String, StoredRealtimeLogConfig>,
+    /// The resource policy of every resource that carries one, keyed by the ARN of the
+    /// resource it is attached to — the one identifier the resource-policy surface
+    /// addresses a policy by, in all three of its operations, so a policy written under an
+    /// ARN is the policy every later read of that ARN answers from. A `BTreeMap` for the
+    /// same reason as `distributions`: one stable total order.
+    ///
+    /// The value is the policy document exactly as it was submitted: the surface stores a
+    /// document, never a re-derivation of one, so what a read reports is byte for byte what
+    /// the last write persisted.
+    pub resource_policies: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -3815,6 +3842,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The key value store `name` names, or `None` when the store holds none.
     pub fn key_value_store(&self, name: &str) -> Option<&StoredKeyValueStore> {
         self.key_value_stores.get(name)
+    }
+
+    /// The resource policy attached to the resource `arn` names, or `None` when that
+    /// resource carries none.
+    pub fn resource_policy(&self, arn: &str) -> Option<&str> {
+        self.resource_policies.get(arn).map(String::as_str)
+    }
+
+    /// Attach `document` to the resource `arn` names as its resource policy, replacing
+    /// whatever policy that resource carried before.
+    ///
+    /// One policy per resource: the surface's write is a PUT, so a second write under the
+    /// same ARN supersedes the first rather than adding a second policy beside it.
+    pub fn put_resource_policy(&mut self, arn: &str, document: &str) {
+        self.resource_policies
+            .insert(arn.to_string(), document.to_string());
     }
 
     /// The origin access identity `id` names, or `None` when the store holds none.
@@ -6008,6 +6051,112 @@ pub fn distribution_tenant_arn(id: &str) -> String {
 /// type this service's own `/connection-group` routes name.
 pub fn connection_group_arn(id: &str) -> String {
     ::engine::emulator_arn("cloudfront", "", &format!("connection-group/{id}"))
+}
+
+/// The resource type a resource policy may be attached to, as the resource part of an ARN
+/// spells it.
+///
+/// CloudFront's resource-policy surface scopes cross-account sharing of ONE kind of
+/// resource, a VPC origin, and the model spells that type the same way the service's own
+/// routes do (`/2020-05-31/vpc-origin/{Id}`), as every other resource type of this service
+/// is spelled in its ARN ([`arn_resource_type`]).
+pub const RESOURCE_POLICY_RESOURCE_TYPE: &str = "vpc-origin";
+
+/// The ARN of a VPC origin. CloudFront is a GLOBAL service, so the ARN's region segment is
+/// empty: `arn:aws:cloudfront::<account>:vpc-origin/<Id>`, the resource type this service's
+/// own `/vpc-origin` routes name.
+pub fn vpc_origin_arn(id: &str) -> String {
+    ::engine::emulator_arn(
+        "cloudfront",
+        "",
+        &format!("{RESOURCE_POLICY_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// The resource a `ResourceArn` names for the resource-policy surface — the id of the VPC
+/// origin it addresses — or `None` where the ARN names no such resource.
+///
+/// `ResourceArn` is modelled as a plain `string` with no pattern, so nothing is refused
+/// before a handler runs and reading the ARN is this check: it is an ARN of this service
+/// (`arn:<partition>:cloudfront:…`) whose resource part names
+/// [`RESOURCE_POLICY_RESOURCE_TYPE`] and carries an id. A string that is no ARN at all, an
+/// ARN of another service and an ARN naming another resource type all answer `None`, which
+/// is the one condition the surface refuses as a bad parameter
+/// ([`invalid_resource_policy_resource_type`]).
+pub fn resource_policy_resource(arn: &str) -> Option<&str> {
+    // The resource TYPE, read through the one helper this crate decomposes an ARN's
+    // resource part with.
+    if arn_resource_type(arn)? != RESOURCE_POLICY_RESOURCE_TYPE {
+        return None;
+    }
+    // `arn:<partition>:cloudfront:` — the prefix, a named partition and this service's own
+    // namespace. The region and account segments that follow are the owner's and narrow
+    // nothing about which resource the ARN names.
+    let mut segments = arn.splitn(6, ':');
+    if segments.next()? != "arn" || segments.next()?.is_empty() || segments.next()? != "cloudfront"
+    {
+        return None;
+    }
+    // The id the resource part carries after its type, which the check above pinned: what
+    // remains of it is the separator and the id.
+    let id = segments
+        .nth(2)?
+        .strip_prefix(RESOURCE_POLICY_RESOURCE_TYPE)?
+        .strip_prefix('/')?;
+    (!id.is_empty()).then_some(id)
+}
+
+/// The sentence the resource-policy surface refuses a `ResourceArn` naming anything but a
+/// VPC origin with: the whole text is fixed, so nothing of the request — neither the ARN
+/// nor the type it names — reaches it. Recorded behaviour, and the same text answers every
+/// operation of the surface, which all take the one `ResourceArn`.
+pub const INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE: &str =
+    "The specified resource type isn't valid. Specify a VPC origin and try again.";
+
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy call naming a resource the
+/// surface does not attach policies to is refused with — "An argument is invalid."
+///
+/// Decided BEFORE any policy lookup: a `ResourceArn` the surface cannot attach a policy to
+/// is a parameter the caller has to fix, whether or not a policy or a resource exists,
+/// which is what leaves [`resource_policy_not_found`] for "a resource this surface does
+/// accept, carrying no policy".
+pub fn invalid_resource_policy_resource_type() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_RESOURCE_POLICY_RESOURCE_TYPE_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) a resource-policy write that would grow the
+/// store past [`MAX_RESOURCE_POLICIES`] is refused with, beside the other refusals of this
+/// surface rather than built at its one call site.
+///
+/// The BOUND is this emulator's, so the sentence is too: real CloudFront bounds the
+/// policies an account can hold through the quota on the resources they are attached to and
+/// models no limit error on this operation at all.
+pub fn too_many_resource_policies() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "This emulator holds resource policies for at most {MAX_RESOURCE_POLICIES} \
+             resources; delete one before attaching another"
+        )),
+    }
+}
+
+/// The sentence a read of a resource policy that was never written answers with: the
+/// CONDITION, carrying nothing from the request, as every other not-found sentence of this
+/// service states its own condition ([`KEY_VALUE_STORE_NOT_FOUND_MESSAGE`],
+/// [`CONNECTION_GROUP_NOT_FOUND_MESSAGE`]).
+pub const RESOURCE_POLICY_NOT_FOUND_MESSAGE: &str = "The specified resource policy does not exist.";
+
+/// The modelled `EntityNotFound` (HTTP 404) for a resource that carries no resource policy
+/// — "The entity was not found."
+///
+/// Takes no ARN: what the refusal states is that no policy is attached to the resource
+/// asked about, which is a property of the store rather than of the value submitted.
+pub fn resource_policy_not_found() -> EntityNotFound {
+    EntityNotFound {
+        message: Some(RESOURCE_POLICY_NOT_FOUND_MESSAGE.to_string()),
+    }
 }
 
 /// Whether two domain names are the same name. DNS names are case-insensitive, so the

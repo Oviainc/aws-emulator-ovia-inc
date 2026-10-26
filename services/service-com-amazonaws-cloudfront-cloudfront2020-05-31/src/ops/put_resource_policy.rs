@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the submitted `PolicyDocument` to the CloudFront resource `ResourceArn` names,
+//! in [`crate::state`]'s resource-policy slice, so a later `GetResourcePolicy` on that ARN
+//! answers from the one stored record. A PUT: a second write under the same ARN supersedes
+//! the first rather than adding a second policy beside it.
+//!
+//! The surface attaches policies to ONE resource type
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so an ARN naming anything else — a
+//! string that is no ARN, an ARN of another service, an ARN of another CloudFront resource
+//! type — is a bad PARAMETER, refused 400 `InvalidArgument` before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // The PARAMETER gate, decided before anything is written: the surface attaches
+        // policies to one resource type, so an ARN naming any other resource is refused
+        // and the store is left exactly as it was.
+        if crate::state::resource_policy_resource(&input.resource_arn).is_none() {
+            return Err(PutResourcePolicyErrorModeled::InvalidArgument(
+                crate::state::invalid_resource_policy_resource_type(),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The store grows only here and a policy cannot be evicted (a later read has to
+        // answer with what this write persisted), so the bound is an entry count refused
+        // before the insert. A write that replaces the policy of a resource the store
+        // already holds grows nothing, so it is never refused by it.
+        if !store.resource_policies.contains_key(&input.resource_arn)
+            && store.resource_policies.len() >= crate::state::MAX_RESOURCE_POLICIES
+        {
+            return Err(PutResourcePolicyErrorModeled::InvalidArgument(
+                crate::state::too_many_resource_policies(),
+            )
+            .into());
+        }
+        // The document exactly as submitted: what a later read reports is byte for byte
+        // what this call persisted, never a re-rendering of it.
+        store.put_resource_policy(&input.resource_arn, &input.policy_document);
+
+        Ok(PutResourcePolicyOutput {
+            resource_arn: Some(input.resource_arn.clone()),
+        })
     }
 }
