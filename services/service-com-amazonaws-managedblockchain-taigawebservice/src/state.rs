@@ -216,6 +216,61 @@ pub const STATUS_CREATING: &str = "CREATING";
 /// The settled status the clock owes a created network, member or node.
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// The non-terminal status a member or node whose configuration is being changed is
+/// reported in ("`UPDATING` - The member is in the process of being updated" —
+/// `Member$Status`; "`UPDATING` - The node is in the process of being updated" —
+/// `Node$Status`).
+///
+/// An update STARTS that change rather than completing it: the record is stored in this
+/// status, stays readable and listable, and the clock owes it [`STATUS_AVAILABLE`] a
+/// [`TRANSITION_SPAN`] later — the same shape as `CREATING`. `NetworkStatus` declares no
+/// such value, so only a member or node ever carries it.
+pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// The statuses a member or node waits in for its `available_at` instant: a creation
+/// still running, and a configuration change still running.
+const PENDING_AVAILABLE_STATUSES: &[&str] = &[STATUS_CREATING, STATUS_UPDATING];
+
+/// The statuses a network waits in for its `available_at` instant: `NetworkStatus`
+/// declares no in-progress value other than the creation's.
+const NETWORK_PENDING_AVAILABLE_STATUSES: &[&str] = &[STATUS_CREATING];
+
+/// Start the configuration change of a record carrying `status` and `available_at`, which
+/// reports [`STATUS_UPDATING`] while the change runs and is owed [`STATUS_AVAILABLE`] a
+/// [`TRANSITION_SPAN`] later.
+///
+/// Only a record that is in service ([`is_in_service`]) has a configuration change to
+/// start: one still creating is already waiting on its own transition, and one whose
+/// removal has begun or finished is on its way out, so neither is moved here (nothing can
+/// bring a record back out of a terminal status). A record already `UPDATING` is in
+/// service too, and each update starts a change of its own, so the later one's span runs
+/// from the call that asked for it rather than ending when the earlier one would have.
+fn begin_update_of(status: &mut String, available_at: &mut SystemTime, now: SystemTime) {
+    if !is_in_service(status) {
+        return;
+    }
+    *status = STATUS_UPDATING.to_string();
+    *available_at = now + TRANSITION_SPAN;
+}
+
+/// Materialise the `pending` -> [`STATUS_AVAILABLE`] transition the clock already owes a
+/// record carrying `status` and `available_at`.
+///
+/// `pending` is the set of in-progress statuses that record's own status enum declares —
+/// [`PENDING_AVAILABLE_STATUSES`] for a member or node, which reach `AVAILABLE` from a
+/// creation and from an update alike, and [`NETWORK_PENDING_AVAILABLE_STATUSES`] for a
+/// network, which reaches it only from a creation.
+fn settle_availability_of(
+    status: &mut String,
+    available_at: SystemTime,
+    pending: &[&str],
+    now: SystemTime,
+) {
+    if now >= available_at && pending.contains(&status.as_str()) {
+        *status = STATUS_AVAILABLE.to_string();
+    }
+}
+
 /// The `NetworkStatus` / `MemberStatus` / `NodeStatus` value of a record the service has
 /// begun removing ("`DELETING` - The member and all associated resources are in the
 /// process of being deleted" — `Member$Status`; "`DELETING` - The node is in the process
@@ -303,9 +358,11 @@ fn settle_deletion_of(
 /// Read off the status enums a taggable record reports (`NetworkStatus`, `MemberStatus`,
 /// `NodeStatus`, `AccessorStatus`): `CREATING` is a creation still running, `DELETING` and
 /// `PENDING_DELETION` a removal already under way. Every OTHER value of those enums is one
-/// the record is settled in — in service (`AVAILABLE`, `UPDATING`, `UNHEALTHY`) or ended
-/// (`CREATE_FAILED`, `FAILED`, `DELETED`, `INACCESSIBLE_ENCRYPTION_KEY`) — which is why
-/// `DeleteMember` and `DeleteNode` likewise refuse only the transient one.
+/// in which the resource exists for an operation to act on — in service (`AVAILABLE` and
+/// `UPDATING`, which a record that participates in the network reports while only its
+/// configuration changes, plus `UNHEALTHY`) or ended (`CREATE_FAILED`, `FAILED`,
+/// `DELETED`, `INACCESSIBLE_ENCRYPTION_KEY`) — which is why `DeleteMember` and
+/// `DeleteNode` likewise refuse only the transient one.
 pub const TRANSIENT_STATUSES: &[&str] = &[
     STATUS_CREATING,
     STATUS_DELETING,
@@ -318,6 +375,16 @@ pub const TRANSIENT_STATUSES: &[&str] = &[
 /// status that can complete the operation") answers.
 pub fn is_transient_status(status: &str) -> bool {
     TRANSIENT_STATUSES.contains(&status)
+}
+
+/// Whether a record carrying `status` is IN SERVICE: it "has been created and can
+/// participate in the network" (`Member$Status` / `Node$Status`'s `AVAILABLE`).
+///
+/// A configuration change still running does not take the record out of service: the
+/// member or node keeps participating while it runs, which is why `UPDATING` counts here
+/// too. Every other value is a record that is not (yet, or any longer) participating.
+pub fn is_in_service(status: &str) -> bool {
+    status == STATUS_AVAILABLE || status == STATUS_UPDATING
 }
 
 /// The `ProposalStatus` a freshly created proposal is reported in: "`IN_PROGRESS` - The
@@ -662,9 +729,12 @@ impl StoredNetwork {
     /// This is the ONLY write a reporting operation makes: each change was owed at this
     /// instant whether or not anybody called.
     fn settle(&mut self, now: SystemTime) {
-        if self.status == STATUS_CREATING && now >= self.available_at {
-            self.status = STATUS_AVAILABLE.to_string();
-        }
+        settle_availability_of(
+            &mut self.status,
+            self.available_at,
+            NETWORK_PENDING_AVAILABLE_STATUSES,
+            now,
+        );
         settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
         for member in self.members.values_mut() {
             member.settle(now);
@@ -873,7 +943,8 @@ pub struct StoredMember {
     pub log_publishing_configuration: Option<MemberLogPublishingConfiguration>,
     /// A `MemberStatus` value.
     pub status: String,
-    /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
+    /// When `CREATING` -> `AVAILABLE`, or `UPDATING` -> `AVAILABLE`, falls due. See
+    /// [`TRANSITION_SPAN`].
     pub available_at: SystemTime,
     /// When `DELETING` -> `DELETED` falls due. `None` until a delete starts the removal.
     /// See [`DELETION_SPAN`].
@@ -887,12 +958,23 @@ pub struct StoredMember {
 
 impl StoredMember {
     /// Materialise the status transitions the clock already owes this member: a creation
-    /// that has run its course reports `AVAILABLE`, a removal that has reports `DELETED`.
+    /// or a configuration change that has run its course reports `AVAILABLE`, a removal
+    /// that has reports `DELETED`.
     fn settle(&mut self, now: SystemTime) {
-        if self.status == STATUS_CREATING && now >= self.available_at {
-            self.status = STATUS_AVAILABLE.to_string();
-        }
+        settle_availability_of(
+            &mut self.status,
+            self.available_at,
+            PENDING_AVAILABLE_STATUSES,
+            now,
+        );
         settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
+    }
+
+    /// Start this member's configuration change: "The member is in the process of being
+    /// updated" (`Member$Status`'s `UPDATING`), so the record reports that status until
+    /// the clock owes it `AVAILABLE` again.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        begin_update_of(&mut self.status, &mut self.available_at, now);
     }
 
     /// Start this member's removal: "The member and all associated resources are in the
@@ -1046,7 +1128,8 @@ pub struct StoredNode {
     pub state_db: Option<String>,
     /// A `NodeStatus` value.
     pub status: String,
-    /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
+    /// When `CREATING` -> `AVAILABLE`, or `UPDATING` -> `AVAILABLE`, falls due. See
+    /// [`TRANSITION_SPAN`].
     pub available_at: SystemTime,
     /// When `DELETING` -> `DELETED` falls due. `None` until a delete starts the removal.
     /// See [`DELETION_SPAN`].
@@ -1060,13 +1143,24 @@ pub struct StoredNode {
 }
 
 impl StoredNode {
-    /// Materialise the status transitions the clock already owes this node: a creation
-    /// that has run its course reports `AVAILABLE`, a removal that has reports `DELETED`.
+    /// Materialise the status transitions the clock already owes this node: a creation or
+    /// a configuration change that has run its course reports `AVAILABLE`, a removal that
+    /// has reports `DELETED`.
     fn settle(&mut self, now: SystemTime) {
-        if self.status == STATUS_CREATING && now >= self.available_at {
-            self.status = STATUS_AVAILABLE.to_string();
-        }
+        settle_availability_of(
+            &mut self.status,
+            self.available_at,
+            PENDING_AVAILABLE_STATUSES,
+            now,
+        );
         settle_deletion_of(&mut self.status, self.deleted_at, STATUS_DELETING, now);
+    }
+
+    /// Start this node's configuration change: "The node is in the process of being
+    /// updated" (`Node$Status`'s `UPDATING`), so the record reports that status until the
+    /// clock owes it `AVAILABLE` again.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        begin_update_of(&mut self.status, &mut self.available_at, now);
     }
 
     /// Start this node's removal: "`DELETING` - The node is in the process of being
