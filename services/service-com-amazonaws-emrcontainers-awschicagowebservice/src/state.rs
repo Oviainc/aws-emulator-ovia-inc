@@ -14,7 +14,8 @@
 //! * [`ComAmazonawsEmrcontainersAwschicagowebserviceState::mint_id`] — the one place a
 //!   `ResourceIdString` (`^[0-9a-z]+$`) is minted.
 //! * [`ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`] — the one place a
-//!   status transition the clock has already made due is materialised. Every handler,
+//!   status transition the clock has already made due is materialised, and where a
+//!   managed-endpoint session past its `expiresAt` leaves the store. Every handler,
 //!   reporting or mutating, calls it first, so a reader never has to know which other
 //!   call started the transition. It is also where a job run's start waits for a running
 //!   slot when its virtual cluster configures a `maxConcurrentJobRuns`, so the counts
@@ -35,9 +36,10 @@ use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConfigurationOverrides, ContainerInfo, ContainerProvider, Endpoint, JobDriver, JobRun,
-    JobTemplate, JobTemplateData, RetryPolicyConfiguration, SchedulerConfiguration,
-    SchedulerStatus, SecurityConfiguration, SecurityConfigurationData, VirtualCluster,
+    ConfigurationOverrides, ContainerInfo, ContainerProvider, Credentials, Endpoint,
+    GetManagedEndpointSessionCredentialsOutput, JobDriver, JobRun, JobTemplate, JobTemplateData,
+    RetryPolicyConfiguration, SchedulerConfiguration, SchedulerStatus, SecurityConfiguration,
+    SecurityConfigurationData, VirtualCluster,
 };
 
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
@@ -206,6 +208,36 @@ pub const MAX_RESOURCE_TAGS: usize = 50;
 /// growing the store without bound.
 pub const MAX_MANAGED_ENDPOINTS: usize = 200;
 
+/// The most managed-endpoint sessions this emulator keeps at once.
+///
+/// Not an AWS quota: the emulator's own retention cap, on the same terms as
+/// [`MAX_MANAGED_ENDPOINTS`]. A session leaves the store on its own expiry
+/// ([`ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`]), so the cap is only
+/// reached by sessions that are all still valid — and then a further
+/// `GetManagedEndpointSessionCredentials` is refused rather than growing the store with
+/// the number of requests served.
+pub const MAX_ENDPOINT_SESSIONS: usize = 200;
+
+/// The one `credentialType` a managed-endpoint session is issued for.
+///
+/// `GetManagedEndpointSessionCredentialsRequest$credentialType` documents the value
+/// itself: "Type of the token requested. Currently supported and default value of this
+/// field is TOKEN", so a request naming another type asks for a credential kind the
+/// operation does not issue.
+pub const SESSION_CREDENTIAL_TYPE_TOKEN: &str = "TOKEN";
+
+/// How long a managed-endpoint session token is valid when the request names no
+/// `durationInSeconds`.
+///
+/// `GetManagedEndpointSessionCredentialsRequest$durationInSeconds`: "Duration in seconds
+/// for which the session token is valid. The default duration is 15 minutes and the
+/// maximum is 12 hours."
+pub const DEFAULT_SESSION_DURATION_SECONDS: i32 = 15 * 60;
+
+/// The longest a managed-endpoint session token may be asked for: the 12-hour maximum the
+/// sentence quoted on [`DEFAULT_SESSION_DURATION_SECONDS`] documents.
+pub const MAX_SESSION_DURATION_SECONDS: i32 = 12 * 60 * 60;
+
 /// The idempotency scope `CreateVirtualCluster` remembers a `clientToken` under.
 ///
 /// A token is scoped to the operation that minted the resource, so the same token on
@@ -241,6 +273,15 @@ pub fn start_job_run_scope(virtual_cluster_id: &str) -> String {
 /// identifies one creation in it.
 pub fn create_managed_endpoint_scope(virtual_cluster_id: &str) -> String {
     format!("CreateManagedEndpoint:{virtual_cluster_id}")
+}
+
+/// The idempotency scope `GetManagedEndpointSessionCredentials` remembers a `clientToken`
+/// under: scoped to the managed endpoint as well as the operation, because a session is
+/// issued FOR one endpoint of one virtual cluster
+/// (`POST /virtualclusters/{virtualClusterIdentifier}/endpoints/{endpointIdentifier}/credentials`)
+/// and the token identifies one such request.
+pub fn endpoint_session_scope(virtual_cluster_id: &str, endpoint_id: &str) -> String {
+    format!("GetManagedEndpointSessionCredentials:{virtual_cluster_id}/{endpoint_id}")
 }
 
 /// The idempotency scope `CreateJobTemplate` remembers a `clientToken` under. A job
@@ -545,6 +586,37 @@ pub fn parse_tagged_resource_arn(arn: &str) -> Option<TaggedResource> {
         }
         _ => None,
     }
+}
+
+/// Whether a request-supplied identifier is written as an ARN rather than as a bare id.
+///
+/// An `arn:` prefix is what tells the two forms apart: `ResourceIdString` is
+/// `^[0-9a-z]+$`, so no id of this service can begin with one.
+fn looks_like_an_arn(identifier: &str) -> bool {
+    identifier.starts_with("arn:")
+}
+
+/// A fresh session token for connecting a client to one managed endpoint, for
+/// `GetManagedEndpointSessionCredentials` ("Generate a session token to connect to a
+/// managed endpoint").
+///
+/// The token authenticates to the ENDPOINT's gateway, not to this emulator, so it must
+/// never be accepted as a SigV4 credential — but it is still a secret handed to a caller,
+/// and nothing in a service may construct a secret itself. It is therefore minted by the
+/// one component that generates secrets, the emulator's credential store, and then removed
+/// from that store again: the caller gets the secret, the emulator keeps no credential it
+/// would accept, and nothing accumulates per call.
+///
+/// `None` when the store minted no session-token secret, which leaves the operation to
+/// refuse rather than report a token it made up.
+pub fn mint_session_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The session token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    token
 }
 
 /// The region to build an ARN in and to resolve a resource in for this request: the
@@ -1351,12 +1423,86 @@ impl ManagedEndpointRecord {
     }
 }
 
+/// One managed-endpoint session, as `GetManagedEndpointSessionCredentials` issued it.
+///
+/// The operation does not report a resource: it MINTS one ("Generate a session token to
+/// connect to a managed endpoint"), so the session is persisted and the response is read
+/// back out of the stored record. Nothing else reads a session: it exists so the
+/// `@idempotencyToken` replay of the request that minted it answers with the SAME session,
+/// and so the store stays bounded.
+#[derive(Debug, Clone)]
+pub struct EndpointSessionRecord {
+    /// The `ResourceIdString` the response reports as `id` ("The identifier of the session
+    /// token returned"), minted by [`ComAmazonawsEmrcontainersAwschicagowebserviceState::mint_id`].
+    pub id: String,
+    /// The region whose endpoint issued this session, on the terms
+    /// [`VirtualClusterRecord::region`] states.
+    pub region: String,
+    pub virtual_cluster_id: String,
+    pub endpoint_id: String,
+    /// `executionRoleArn` — "The IAM Execution Role ARN that will be used by the job run" —
+    /// as the request asked for it. The emulator resolves nothing against IAM, so it is
+    /// recorded as part of the session this call asked for rather than checked.
+    pub execution_role_arn: String,
+    /// The `credentialType` the session was issued for
+    /// ([`SESSION_CREDENTIAL_TYPE_TOKEN`] is the only one this operation accepts).
+    pub credential_type: String,
+    /// `logContext` — "String identifier used to separate sections of the execution logs
+    /// uploaded to S3" — when the request carried one.
+    pub log_context: Option<String>,
+    /// The session token handed to the caller, minted by the emulator's credential store
+    /// ([`mint_session_token`]).
+    ///
+    /// Held here ONLY so a replay of the request that minted it answers with the same
+    /// session rather than a second one; it goes nowhere else — no file, no log — and
+    /// leaves the store with the record when the session expires.
+    pub token: String,
+    /// How long the session was issued for, in the `durationInSeconds` the request named or
+    /// [`DEFAULT_SESSION_DURATION_SECONDS`] when it named none.
+    pub duration_seconds: i32,
+    pub issued_at_millis: i64,
+    /// The wall-clock instant the response reports as `expiresAt`.
+    pub expires_at_millis: i64,
+    /// The monotonic instant the session expires at — what actually decides expiry, the way
+    /// [`PendingTransition::due_at`] decides a status transition, so a wall clock stepped
+    /// between the two calls cannot keep an expired session alive.
+    pub expires_at: Instant,
+    /// The `clientToken` this session was issued under, when the request carried one: the
+    /// member is optional, so a request naming none is simply not replayable.
+    pub client_token: Option<String>,
+    /// [`request_fingerprint`] of the request that minted this session, so a later call
+    /// carrying the same `clientToken` is answered as a replay only when it is the same
+    /// request.
+    pub request_fingerprint: String,
+    /// Issue sequence, so sessions minted within one millisecond still have a total order
+    /// for the oldest-first reclaim to walk.
+    pub sequence: u64,
+}
+
+impl EndpointSessionRecord {
+    /// The modelled response this session answers with.
+    ///
+    /// The model declares TWO members for the credentials this call returns — `credentials`
+    /// ("The structure containing the session credentials") and `endpointCredentials` ("The
+    /// session credentials that the operation returns") — and there is one session token to
+    /// report, so both name it: a client reading either member reaches the same session.
+    pub fn to_session_credentials(&self) -> GetManagedEndpointSessionCredentialsOutput {
+        GetManagedEndpointSessionCredentialsOutput {
+            id: Some(self.id.clone()),
+            credentials: Some(Credentials::Token(self.token.clone())),
+            endpoint_credentials: Some(Credentials::Token(self.token.clone())),
+            expires_at: Some(date_time(self.expires_at_millis)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-emrcontainers-awschicagowebservice. A handler reaches it through [`service_state`].
 ///
 /// # Bounding the store
 ///
 /// Every record set is CAPPED ([`MAX_VIRTUAL_CLUSTERS`], [`MAX_JOB_RUNS`],
-/// [`MAX_JOB_TEMPLATES`], [`MAX_SECURITY_CONFIGURATIONS`], [`MAX_MANAGED_ENDPOINTS`]) and
+/// [`MAX_JOB_TEMPLATES`], [`MAX_SECURITY_CONFIGURATIONS`], [`MAX_MANAGED_ENDPOINTS`],
+/// [`MAX_ENDPOINT_SESSIONS`]) and
 /// retired
 /// records are reclaimed oldest-first when a cap is reached, so the store cannot grow
 /// with the number of requests served: a caller that creates resources in a loop ends up
@@ -1384,6 +1530,9 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub managed_endpoints: HashMap<String, ManagedEndpointRecord>,
     /// Managed-endpoint ids per virtual cluster, in creation order.
     pub managed_endpoints_by_cluster: HashMap<String, Vec<String>>,
+    /// Managed-endpoint sessions by `id`, capped at [`MAX_ENDPOINT_SESSIONS`]. A session
+    /// leaves on its own expiry ([`Self::settle`]).
+    pub endpoint_sessions: HashMap<String, EndpointSessionRecord>,
     /// Job templates by `id`. Capped by [`MAX_JOB_TEMPLATES`]; a template leaves only
     /// when `DeleteJobTemplate` removes it.
     pub job_templates: HashMap<String, JobTemplateRecord>,
@@ -1513,6 +1662,20 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             if still_pending {
                 self.pending_managed_endpoints.insert(id);
             }
+        }
+        // A session's own expiry is the change the clock owes it: past its `expiresAt` the
+        // token authenticates nothing, so the record goes — owed at that instant whether or
+        // not anybody called. Every stored session owes exactly this one change, so walking
+        // them all walks only records with a change in flight, and the walk is capped by
+        // [`MAX_ENDPOINT_SESSIONS`].
+        let expired: Vec<String> = self
+            .endpoint_sessions
+            .values()
+            .filter(|record| now >= record.expires_at)
+            .map(|record| record.id.clone())
+            .collect();
+        for id in expired {
+            self.remove_endpoint_session(&id);
         }
     }
 
@@ -1814,6 +1977,140 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .into_iter()
             .flatten()
             .filter_map(|id| self.managed_endpoints.get(id))
+    }
+
+    /// The virtual cluster a `virtualClusterIdentifier` names, for a request signed for
+    /// `region`.
+    ///
+    /// The member is a `String2048` documented as "The ARN of the Virtual Cluster", while
+    /// every other operation of this service names a cluster by its `ResourceIdString` id,
+    /// so BOTH forms resolve here. An ARN is matched in FULL against the stored record's
+    /// own `arn`, the way a tagging call's `resourceArn` is matched
+    /// ([`Self::resource_tags_mut`]): one that names another partition, region or account —
+    /// a cluster some other endpoint holds — resolves to nothing rather than to this
+    /// endpoint's cluster of the same id.
+    pub fn identified_virtual_cluster(
+        &self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<&VirtualClusterRecord> {
+        if let Some(TaggedResource::VirtualCluster { id }) = parse_tagged_resource_arn(identifier) {
+            return self
+                .virtual_cluster(region, &id)
+                .filter(|record| record.arn == identifier);
+        }
+        // An ARN that names no virtual cluster names none to resolve; anything that is not
+        // an ARN at all is the id itself.
+        if looks_like_an_arn(identifier) {
+            return None;
+        }
+        self.virtual_cluster(region, identifier)
+    }
+
+    /// The managed endpoint an `endpointIdentifier` names under this virtual cluster, on
+    /// the terms [`Self::identified_virtual_cluster`] states: its `ResourceIdString` id, or
+    /// its full `EndpointArn`.
+    ///
+    /// An endpoint ARN carries the cluster the endpoint belongs to, so one offered under a
+    /// DIFFERENT cluster matches no record of that cluster.
+    pub fn identified_managed_endpoint(
+        &self,
+        region: &str,
+        virtual_cluster_id: &str,
+        identifier: &str,
+    ) -> Option<&ManagedEndpointRecord> {
+        if let Some(TaggedResource::ManagedEndpoint { id, .. }) =
+            parse_tagged_resource_arn(identifier)
+        {
+            return self
+                .managed_endpoint(region, virtual_cluster_id, &id)
+                .filter(|record| record.arn == identifier);
+        }
+        if looks_like_an_arn(identifier) {
+            return None;
+        }
+        self.managed_endpoint(region, virtual_cluster_id, identifier)
+    }
+
+    /// Make room for one more managed-endpoint session, reclaiming the oldest RETIRED ones
+    /// (a session that has expired, or one issued for an endpoint the store no longer
+    /// holds) when the cap is reached.
+    ///
+    /// `false` when every slot holds a valid session of a live endpoint: the caller must
+    /// then refuse the request rather than grow the store.
+    pub fn reserve_endpoint_session(&mut self) -> bool {
+        while self.endpoint_sessions.len() >= MAX_ENDPOINT_SESSIONS {
+            let now = Instant::now();
+            let retired = self
+                .endpoint_sessions
+                .values()
+                .filter(|record| {
+                    now >= record.expires_at
+                        || self
+                            .managed_endpoint(
+                                &record.region,
+                                &record.virtual_cluster_id,
+                                &record.endpoint_id,
+                            )
+                            .is_none()
+                })
+                .min_by_key(|record| (record.issued_at_millis, record.sequence))
+                .map(|record| record.id.clone());
+            let Some(id) = retired else {
+                return false;
+            };
+            self.remove_endpoint_session(&id);
+        }
+        true
+    }
+
+    /// Store a freshly issued managed-endpoint session, with the idempotency entry its
+    /// `clientToken` earns when it carried one. One function, so a record can never be
+    /// stored without it.
+    pub fn insert_endpoint_session(&mut self, record: EndpointSessionRecord) {
+        if let Some(client_token) = record.client_token.clone() {
+            self.idempotency.insert(
+                (
+                    record.region.clone(),
+                    endpoint_session_scope(&record.virtual_cluster_id, &record.endpoint_id),
+                    client_token,
+                ),
+                record.id.clone(),
+            );
+        }
+        self.endpoint_sessions.insert(record.id.clone(), record);
+    }
+
+    /// Drop one stored session together with the idempotency entry it earned, so a token
+    /// never names a session that is gone.
+    fn remove_endpoint_session(&mut self, id: &str) {
+        let Some(record) = self.endpoint_sessions.remove(id) else {
+            return;
+        };
+        if let Some(client_token) = record.client_token {
+            self.idempotency.remove(&(
+                record.region,
+                endpoint_session_scope(&record.virtual_cluster_id, &record.endpoint_id),
+                client_token,
+            ));
+        }
+    }
+
+    /// The stored session with this id, only when it really was issued for this endpoint of
+    /// this cluster IN this region: a session id offered against another endpoint names
+    /// nothing, not that endpoint's session.
+    pub fn endpoint_session(
+        &self,
+        region: &str,
+        virtual_cluster_id: &str,
+        endpoint_id: &str,
+        id: &str,
+    ) -> Option<&EndpointSessionRecord> {
+        self.endpoint_sessions.get(id).filter(|record| {
+            record.region == region
+                && record.virtual_cluster_id == virtual_cluster_id
+                && record.endpoint_id == endpoint_id
+        })
     }
 
     /// Make room for one more job template.

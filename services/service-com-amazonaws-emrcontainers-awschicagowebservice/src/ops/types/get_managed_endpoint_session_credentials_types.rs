@@ -23,12 +23,11 @@ pub struct GetManagedEndpointSessionCredentialsInput {
     pub client_token: Option<String>,
 }
 
-/// `expiresAt` targets `Date` (`@timestampFormat("date-time")`), so the day a handler
-/// reports this shape its schema has to come from `emrc_schema_and_codec!` — see
-/// `types/date_time_wire.rs` — or the instant goes onto the wire as an epoch number.
-/// `GetManagedEndpointSessionCredentials` still answers HTTP 501, so no value of this
-/// shape reaches the wire and the derive stands until the operation is implemented.
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#GetManagedEndpointSessionCredentialsResponse")]
+/// `expiresAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`; the derive would
+/// put the instant onto the wire as an epoch number. Member set, order and requiredness
+/// from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#GetManagedEndpointSessionCredentialsResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct GetManagedEndpointSessionCredentialsOutput {
     pub id: Option<String>,
@@ -36,6 +35,32 @@ pub struct GetManagedEndpointSessionCredentialsOutput {
     pub endpoint_credentials: Option<Credentials>,
     pub expires_at: Option<::aws_smithy_types::DateTime>,
 }
+
+emrc_schema_and_codec!(
+    GetManagedEndpointSessionCredentialsOutput,
+    GET_MANAGED_ENDPOINT_SESSION_CREDENTIALS_OUTPUT_SCHEMA,
+    "com.amazonaws.emrcontainers#GetManagedEndpointSessionCredentialsResponse",
+    "com.amazonaws.emrcontainers",
+    "GetManagedEndpointSessionCredentialsResponse",
+    (M_ID, id, "id", 0, opt, string),
+    (
+        M_CREDENTIALS,
+        credentials,
+        "credentials",
+        1,
+        opt,
+        union_of(Credentials)
+    ),
+    (
+        M_ENDPOINT_CREDENTIALS,
+        endpoint_credentials,
+        "endpointCredentials",
+        2,
+        opt,
+        union_of(Credentials)
+    ),
+    (M_EXPIRES_AT, expires_at, "expiresAt", 3, opt, date_time),
+);
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.emrcontainers#Credentials")]
 #[allow(clippy::large_enum_variant)]

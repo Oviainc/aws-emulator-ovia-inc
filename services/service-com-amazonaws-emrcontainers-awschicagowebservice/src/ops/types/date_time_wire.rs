@@ -93,14 +93,19 @@ macro_rules! emrc_shape_type {
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
+    (union_of) => {
+        ::aws_smithy_schema::ShapeType::Union
+    };
 }
 
 /// One member's schema, as the vendored codegen would emit it, plus the
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `boolean`, `date_time`, `map_of_string`, `list_of_string` or
-/// `struct_of(T)`.
+/// string-encoded), `boolean`, `date_time`, `map_of_string`, `list_of_string`,
+/// `struct_of(T)` or `union_of(T)`. A union is written and read exactly as a structure is
+/// — the vendored union codegen emits the same `SerializableStruct`/`DeserializableStruct`
+/// pair — and differs only in the `ShapeType` its member schema reports.
 macro_rules! emrc_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -155,6 +160,7 @@ macro_rules! emrc_write_member {
         })?;
     };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
+    ($s:ident, $m:expr, $v:expr, union_of($inner:ty)) => { $s.write_struct($m, $v)?; };
 }
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for that kind.
@@ -187,6 +193,9 @@ macro_rules! emrc_read_member {
         __out
     }};
     ($d:ident, $m:expr, struct_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
+    };
+    ($d:ident, $m:expr, union_of($inner:ty)) => {
         <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
     };
 }

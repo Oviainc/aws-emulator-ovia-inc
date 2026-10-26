@@ -1364,26 +1364,18 @@ async fn the_virtual_cluster_store_is_capped_and_reclaims_retired_clusters() {
 
 /// RULE 6: the operations this slice does not implement still answer 501, so a client
 /// cannot mistake an unwritten operation for an implemented one.
+///
+/// `GetManagedEndpointSessionCredentials` left this list when it was implemented; the suite
+/// that drives it is [`crate::managed_endpoint_session_credentials`].
 #[tokio::test]
 async fn operations_outside_this_slice_still_answer_501() {
     let emr = Emr::new();
-    let cases = [
-        (
-            "DeleteManagedEndpoint",
-            "DELETE",
-            "/virtualclusters/doesnotexist1/endpoints/doesnotexist2".to_string(),
-            None,
-        ),
-        (
-            "GetManagedEndpointSessionCredentials",
-            "POST",
-            "/virtualclusters/doesnotexist1/endpoints/doesnotexist2/credentials".to_string(),
-            Some(json!({
-                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
-                "credentialType": "TOKEN",
-            })),
-        ),
-    ];
+    let cases = [(
+        "DeleteManagedEndpoint",
+        "DELETE",
+        "/virtualclusters/doesnotexist1/endpoints/doesnotexist2".to_string(),
+        None,
+    )];
 
     for (label, method, path, body) in cases {
         let answer = emr.send(method, &path, body).await;

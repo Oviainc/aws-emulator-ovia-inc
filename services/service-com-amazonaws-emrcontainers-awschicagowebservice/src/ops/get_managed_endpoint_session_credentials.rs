@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedEndpointSessionCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedEndpointSessionCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Issues one session for a managed endpoint this store HOLDS and persists it in
+//! [`crate::state`]: a fresh `ResourceIdString` id, the session token the emulator's
+//! credential store minted ([`crate::state::mint_session_token`]) and the instant the
+//! session expires at, so the response is read back out of the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedEndpointSessionCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation MINTS a credential rather than reporting one ("Generate a session token
+//! to connect to a managed endpoint"), so a write is what the spec asks of it. The session
+//! leaves the store again on its own expiry, which the clock owes it
+//! ([`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`]).
+//!
+//! The two `@httpLabel` identifiers resolve the endpoint before anything is minted: they
+//! are `String2048`s documented as ARNs, while every other operation here names a cluster
+//! and an endpoint by their `ResourceIdString` ids, so both forms are accepted
+//! ([`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::identified_virtual_cluster`],
+//! [`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState::identified_managed_endpoint`]).
+//! An endpoint that is not `ACTIVE` serves no client yet, so no session is issued for it.
+//!
+//! `clientToken` is `@idempotencyToken`, so a token already spent on this endpoint does
+//! NOT mint a second session: the same request replayed answers with the session the first
+//! call issued, and that same token carrying a DIFFERENT request is refused with the
+//! modelled `ValidationException` ([`crate::state::request_fingerprint`] is what tells the
+//! two apart).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +173,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedEndpointSessionCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedEndpointSessionCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedEndpointSessionCredentials"))
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| server_error("the managed endpoint store is unavailable"))?;
+        let region = crate::state::request_region(ctx);
+
+        // "Currently supported and default value of this field is TOKEN": the member is
+        // `@required`, so a request has to name the type, and the only type a session is
+        // issued for is that one.
+        if input.credential_type != crate::state::SESSION_CREDENTIAL_TYPE_TOKEN {
+            return Err(invalid_request(format!(
+                "Invalid credential type {}, the only supported credential type is {}",
+                input.credential_type,
+                crate::state::SESSION_CREDENTIAL_TYPE_TOKEN
+            )));
+        }
+
+        // "The default duration is 15 minutes and the maximum is 12 hours." A request that
+        // sizes its session itself is held to that maximum, and to a duration a token can
+        // be valid for at all.
+        let duration_seconds = input
+            .duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_SESSION_DURATION_SECONDS);
+        if !(1..=crate::state::MAX_SESSION_DURATION_SECONDS).contains(&duration_seconds) {
+            return Err(invalid_request(format!(
+                "Invalid duration {duration_seconds}, durationInSeconds must be between 1 and {} seconds",
+                crate::state::MAX_SESSION_DURATION_SECONDS
+            )));
+        }
+
+        // The request this `clientToken` stands for, digested before the store is locked:
+        // it depends on nothing in state, and the lock is what serialises racing requests
+        // that share one token.
+        let fingerprint = crate::state::request_fingerprint(&input);
+        let mut state = store.lock();
+        state.settle();
+
+        // The endpoint this session is for, resolved out of state in the region this
+        // request is signed for: one created at another region's endpoint does not exist
+        // here. Each identifier is the resource's own id or its own ARN.
+        let Some(virtual_cluster_id) = state
+            .identified_virtual_cluster(&region, &input.virtual_cluster_identifier)
+            .map(|record| record.id.clone())
+        else {
+            return Err(cluster_not_found(&input.virtual_cluster_identifier));
+        };
+        let Some((endpoint_id, endpoint_state)) = state
+            .identified_managed_endpoint(&region, &virtual_cluster_id, &input.endpoint_identifier)
+            .map(|record| (record.id.clone(), record.state.clone()))
+        else {
+            return Err(endpoint_not_found(
+                &input.endpoint_identifier,
+                &input.virtual_cluster_identifier,
+            ));
+        };
+        // A session connects a client THROUGH the endpoint's gateway, and only an ACTIVE
+        // endpoint has one: an endpoint still being provisioned, or one that has been torn
+        // down, accepts no client, so no session is issued for it.
+        if endpoint_state != crate::state::ENDPOINT_ACTIVE {
+            return Err(invalid_request(format!(
+                "Endpoint {endpoint_id} is in {endpoint_state} state, a session token is issued only for an endpoint in {} state",
+                crate::state::ENDPOINT_ACTIVE
+            )));
+        }
+
+        // `clientToken` is `@idempotencyToken`: the same token replayed names the session
+        // the first call issued rather than minting a second credential. The same token
+        // carrying a DIFFERENT request is not a replay — answering it with the first
+        // session would silently drop the duration or the role this call asked for — so it
+        // is refused.
+        let scope = crate::state::endpoint_session_scope(&virtual_cluster_id, &endpoint_id);
+        if let Some(client_token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_idempotency(&region, &scope, client_token)
+                .cloned();
+            if let Some(existing) = replayed.and_then(|id| {
+                state.endpoint_session(&region, &virtual_cluster_id, &endpoint_id, &id)
+            }) {
+                if existing.request_fingerprint != fingerprint {
+                    return Err(invalid_request(format!(
+                        "clientToken {client_token} was already used to issue session credentials {}, with different parameters",
+                        existing.id
+                    )));
+                }
+                return Ok(existing.to_session_credentials());
+            }
+        }
+
+        // The store is capped, and a session that has expired or whose endpoint is gone is
+        // reclaimed to make room. Once every slot holds a valid session there is nothing to
+        // reclaim and the request is refused instead of growing the store without bound.
+        // The cap is the EMULATOR's own retention bound, not an AWS quota.
+        if !state.reserve_endpoint_session() {
+            return Err(invalid_request(format!(
+                "This emulator retains at most {} managed endpoint sessions; retry once one expires",
+                crate::state::MAX_ENDPOINT_SESSIONS
+            )));
+        }
+
+        // Minted only once every refusal above is behind us, so a refused request issues no
+        // credential. Nothing in a service constructs a secret itself: the emulator's
+        // credential store mints the token and this operation reports it.
+        let Some(token) = crate::state::mint_session_token(ctx.credential_store()) else {
+            return Err(server_error(
+                "no session token could be minted for the managed endpoint",
+            ));
+        };
+
+        let id = state.mint_id();
+        let sequence = state.id_counter;
+        let issued_at_millis = crate::state::now_millis();
+        let validity = ::std::time::Duration::from_secs(u64::try_from(duration_seconds).unwrap_or(
+            u64::try_from(crate::state::DEFAULT_SESSION_DURATION_SECONDS).unwrap_or_default(),
+        ));
+        let record = crate::state::EndpointSessionRecord {
+            id: id.clone(),
+            // The region this request was signed for — the region of the endpoint resolved
+            // above — so the session belongs to that endpoint and nowhere else.
+            region: region.clone(),
+            virtual_cluster_id: virtual_cluster_id.clone(),
+            endpoint_id: endpoint_id.clone(),
+            execution_role_arn: input.execution_role_arn,
+            credential_type: input.credential_type,
+            log_context: input.log_context,
+            token,
+            duration_seconds,
+            issued_at_millis,
+            expires_at_millis: issued_at_millis
+                .saturating_add(i64::from(duration_seconds).saturating_mul(1_000)),
+            expires_at: ::std::time::Instant::now() + validity,
+            client_token: input.client_token,
+            request_fingerprint: fingerprint,
+            sequence,
+        };
+        // `insert_endpoint_session` is what writes the
+        // `(GetManagedEndpointSessionCredentials:{cluster}/{endpoint}, clientToken) -> id`
+        // entry the replay lookup above reads, in this same lock, so a session can never be
+        // stored without it.
+        state.insert_endpoint_session(record);
+
+        // Answered out of the STORED session, so the response reports what was persisted
+        // rather than values assembled beside it.
+        let Some(stored) = state.endpoint_session(&region, &virtual_cluster_id, &endpoint_id, &id)
+        else {
+            return Err(server_error(
+                "the managed endpoint session could not be stored",
+            ));
+        };
+        Ok(stored.to_session_credentials())
     }
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a request this operation cannot
+/// answer: "There are invalid parameters in the client request."
+fn invalid_request(message: String) -> GetManagedEndpointSessionCredentialsError {
+    GetManagedEndpointSessionCredentialsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `InternalServerException` (HTTP 500) for a store this operation could not
+/// reach or write: a session is never reported unless it was really issued and stored.
+fn server_error(message: &str) -> GetManagedEndpointSessionCredentialsError {
+    GetManagedEndpointSessionCredentialsErrorModeled::InternalServerException(
+        InternalServerException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for a `virtualClusterIdentifier` that names no virtual cluster of
+/// this region, worded the way every read of a virtual cluster in this service words it.
+fn cluster_not_found(identifier: &str) -> GetManagedEndpointSessionCredentialsError {
+    GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!("Virtual cluster {identifier} was not found")),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for an `endpointIdentifier` that names no managed endpoint of this
+/// cluster, worded the way `DescribeManagedEndpoint` words it. The identifiers are reported
+/// as the request spelled them, so a caller sees which pair was not found.
+fn endpoint_not_found(
+    identifier: &str,
+    virtual_cluster_identifier: &str,
+) -> GetManagedEndpointSessionCredentialsError {
+    GetManagedEndpointSessionCredentialsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!(
+                "Endpoint {identifier} was not found in virtual cluster {virtual_cluster_identifier}"
+            )),
+        },
+    )
+    .into()
 }

@@ -23,6 +23,8 @@ mod managed_endpoint_create_admission;
 mod managed_endpoint_describe;
 #[path = "all/managed_endpoint_listing.rs"]
 mod managed_endpoint_listing;
+#[path = "all/managed_endpoint_session_credentials.rs"]
+mod managed_endpoint_session_credentials;
 #[path = "all/managed_endpoint_wire_form.rs"]
 mod managed_endpoint_wire_form;
 #[path = "all/paginated_page_bounds.rs"]
