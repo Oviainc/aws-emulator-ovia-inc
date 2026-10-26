@@ -198,7 +198,12 @@ pub(crate) fn issued_code(em: &Emulator, arn: &str) -> Option<String> {
         .expect("the emulator's own engine must expose this service's store")
         .lock()
         .contact(arn)
-        .and_then(|contact| contact.pending_activation_code.clone())
+        .and_then(|contact| {
+            contact
+                .activation_token
+                .as_ref()
+                .map(|token| token.code.clone())
+        })
 }
 
 /// Whether the store still holds any record at all for `arn`.

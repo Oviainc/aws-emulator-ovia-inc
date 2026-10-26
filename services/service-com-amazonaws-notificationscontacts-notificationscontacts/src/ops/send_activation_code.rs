@@ -2,7 +2,8 @@
 
 //! @op SendActivationCode
 //! Issues the activation code for the stored email contact the request's ARN names:
-//! generates a fresh `^[a-z0-9]{7}$` token and persists it on that record in
+//! generates a fresh `^[a-z0-9]{7}$` token, stamps it with the instant its documented
+//! lifetime runs from and a full attempt budget, and persists it on that record in
 //! [`crate::state`], so the `ActivateEmailContact` that follows can verify it. The
 //! modelled 404 for an ARN the store does not hold, and the modelled 409 for a
 //! contact that is already active and so has nothing to activate.
@@ -154,9 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // A fresh code is drawn before the record is borrowed mutably, since both
-        // need the one store guard.
+        // A fresh code, and the instant it is issued at, are both drawn before the
+        // record is borrowed mutably, since all three need the one store guard. The
+        // issue instant is what the code's documented lifetime runs from, so it is
+        // read from the clock here rather than inferred later.
         let code = store.fresh_activation_code();
+        let issued_at = crate::state::now_epoch_millis();
         let contact = store.contact_mut(&input.arn).ok_or_else(|| {
             SendActivationCodeErrorModeled::ResourceNotFoundException(
                 crate::state::contact_not_found(&input.arn),
@@ -179,9 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Sending another activation email supersedes the previous code: exactly one
-        // code is outstanding per contact, the last one issued. `updateTime` does not
-        // move — no member this service reports about the contact changed.
-        contact.pending_activation_code = Some(code);
+        // code is outstanding per contact, the last one issued — and it carries its own
+        // lifetime and its own full attempt budget, so a code whose budget the previous
+        // attempts spent is replaced by a usable one. `updateTime` does not move — no
+        // member this service reports about the contact changed.
+        contact.activation_token = Some(crate::state::ActivationToken::issued(code, issued_at));
 
         Ok(SendActivationCodeOutput {})
     }

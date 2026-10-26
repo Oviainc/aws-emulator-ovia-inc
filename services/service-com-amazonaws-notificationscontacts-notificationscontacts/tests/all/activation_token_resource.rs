@@ -21,7 +21,8 @@
 
 use serde_json::Value;
 use service_com_amazonaws_notificationscontacts_notificationscontacts::state::{
-    ACTIVATION_CODE_LEN, CONTACT_RESOURCE_TYPE, STATUS_ACTIVE, STATUS_INACTIVE,
+    ACTIVATION_CODE_LEN, CONTACT_RESOURCE_TYPE, MAX_ACTIVATION_ATTEMPTS, STATUS_ACTIVE,
+    STATUS_INACTIVE,
 };
 
 use crate::email_contacts::{
@@ -186,7 +187,15 @@ async fn the_refusal_turns_on_whether_the_token_resource_exists() {
         ACTIVATION_CODE_LEN,
         "the issued token must be {ACTIVATION_CODE_LEN} characters, got {issued:?}"
     );
-    for wrong in WELL_FORMED_CODES.iter().filter(|c| **c != issued) {
+    // The outstanding token admits `MAX_ACTIVATION_ATTEMPTS` attempts in all, and the
+    // row that follows this loop — the issued code — is one of them, so the wrong-code
+    // rows stop one short of that budget. The budget itself, and the lifetime beside
+    // it, are what `activation_code_bounds.rs` owns.
+    for wrong in WELL_FORMED_CODES
+        .iter()
+        .filter(|c| **c != issued)
+        .take(MAX_ACTIVATION_ATTEMPTS as usize - 1)
+    {
         let case = format!("token outstanding, {wrong:?} submitted");
         let (status, body) = activate(&em, &arn, wrong).await;
         assert_eq!(

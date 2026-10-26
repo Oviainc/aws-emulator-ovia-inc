@@ -207,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time_millis: created_at,
             update_time_millis: created_at,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
-            // No activation code exists until a `SendActivationCode` issues one.
-            pending_activation_code: None,
+            // No activation token exists until a `SendActivationCode` issues one.
+            activation_token: None,
         });
 
         Ok(CreateEmailContactOutput { arn })

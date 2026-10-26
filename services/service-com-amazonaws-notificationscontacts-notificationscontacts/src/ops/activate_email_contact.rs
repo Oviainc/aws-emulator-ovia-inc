@@ -6,9 +6,11 @@
 //! flips that record's status to `active` and moves its `updateTime`, both observable
 //! through a later `GetEmailContact` or `ListEmailContacts`. The modelled 404 for an
 //! ARN the store does not hold AND for a contact that holds no outstanding activation
-//! token (none was ever sent), and the modelled 400 for a code that is not the token
-//! outstanding for this contact. Idempotent: activating an already-active contact
-//! with its own code changes nothing and still answers 200.
+//! token — none was ever sent, or the one that was has run past the lifetime its
+//! `code` documents or spent the attempt budget it documents — and the modelled 400
+//! for a code that is not the token outstanding for this contact. Each call against an
+//! outstanding token spends one of its attempts. Idempotent: activating an
+//! already-active contact with its own code changes nothing and still answers 200.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +78,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Why the modelled 400 blames `code` when the token outstanding for this contact is
+/// not the code submitted. The code is `@sensitive`, so the refusal never echoes it.
+const WRONG_CODE: &str = "is not the activation code outstanding for this email contact";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,7 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let already_active = {
+        let now = crate::state::now_epoch_millis();
+        let (code_matches, already_active, outstanding) = {
             let contact = store.contact(&input.arn).ok_or_else(|| {
                 ActivateEmailContactErrorModeled::ResourceNotFoundException(
                     crate::state::contact_not_found(&input.arn),
@@ -176,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // naming the absent token. Only once a token is outstanding does a
             // submitted code that differs from it become a bad field — the modelled
             // 400. The submitted code is `@sensitive`, so neither echoes it back.
-            let Some(outstanding) = contact.pending_activation_code.as_deref() else {
+            let Some(token) = contact.activation_token.as_ref() else {
                 return Err(
                     ActivateEmailContactErrorModeled::ResourceNotFoundException(
                         crate::state::activation_token_not_found(&input.arn),
@@ -184,26 +191,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            if outstanding != input.code.as_str() {
-                return Err(ActivateEmailContactErrorModeled::ValidationException(
-                    crate::state::field_validation_failure(
-                        "code",
-                        "is not the activation code outstanding for this email contact",
-                    ),
-                )
-                .into());
-            }
-            contact.is_active()
+            (
+                token.code == input.code,
+                contact.is_active(),
+                token.is_outstanding(now),
+            )
         };
 
-        // Activating an already-active contact is a no-op, so `updateTime` moves only
-        // on the call that actually changes the status.
-        if !already_active {
-            let activated_at = store.next_instant_millis();
-            if let Some(contact) = store.contact_mut(&input.arn) {
+        // An activated contact has nothing left to activate, so repeating the call
+        // that activated it is the no-op this `@idempotent` operation answers 200 for,
+        // whatever has become of the code since: the bounds below govern whether a
+        // code can still ACTIVATE a contact.
+        if already_active {
+            return if code_matches {
+                Ok(ActivateEmailContactOutput {})
+            } else {
+                Err(ActivateEmailContactErrorModeled::ValidationException(
+                    crate::state::field_validation_failure("code", WRONG_CODE),
+                )
+                .into())
+            };
+        }
+
+        // A code is honoured only while the token it belongs to is still outstanding:
+        // inside the lifetime and the attempt budget its own documentation states. Once
+        // either bound is past, this contact holds no activation token until a new send
+        // mints one, which is the same missing resource as a contact that was never
+        // sent a code — so the attempt changes nothing and the contact stays inactive.
+        if !outstanding {
+            return Err(
+                ActivateEmailContactErrorModeled::ResourceNotFoundException(
+                    crate::state::activation_token_not_found(&input.arn),
+                )
+                .into(),
+            );
+        }
+
+        // The code was submitted against an outstanding token, so this call is one of
+        // the attempts that token admits — spent whether or not the code turns out to
+        // be the right one, because what the budget bounds is attempts.
+        //
+        // Activating an already-active contact is a no-op (handled above), so
+        // `updateTime` moves only on the call that actually changes the status.
+        let activated_at = code_matches.then(|| store.next_instant_millis());
+        if let Some(contact) = store.contact_mut(&input.arn) {
+            if let Some(token) = contact.activation_token.as_mut() {
+                token.record_attempt();
+            }
+            if let Some(activated_at) = activated_at {
                 contact.status = crate::state::STATUS_ACTIVE.to_string();
                 contact.update_time_millis = activated_at;
             }
+        }
+
+        if !code_matches {
+            return Err(ActivateEmailContactErrorModeled::ValidationException(
+                crate::state::field_validation_failure("code", WRONG_CODE),
+            )
+            .into());
         }
 
         Ok(ActivateEmailContactOutput {})
