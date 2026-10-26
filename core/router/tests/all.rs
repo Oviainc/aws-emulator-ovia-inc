@@ -367,6 +367,11 @@ mod sts_web_identity_federation;
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
 mod transfer_user_with_iam_role;
+// Declared HERE, in sorted position in this quiet span, rather than at the head of this
+// file or in its appended tail: both of those are where every concurrently landing suite
+// puts its line, so a declaration there conflicts with all of them.
+#[path = "all/unsigned_entry_points_reach_their_service.rs"]
+mod unsigned_entry_points_reach_their_service;
 #[path = "all/wisdom_qconnect_signing_name_routing.rs"]
 mod wisdom_qconnect_signing_name_routing;
 
