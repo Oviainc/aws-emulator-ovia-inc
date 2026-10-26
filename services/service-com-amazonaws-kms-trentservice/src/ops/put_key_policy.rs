@@ -234,10 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = match state.resolve_mut(&region, &input.key_id) {
             crate::state::KeyRefMut::Found(key) => key,
             crate::state::KeyRefMut::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRefMut::MalformedArn => {
                 return Err(PutKeyPolicyErrorModeled::InvalidArnException(InvalidArnException {

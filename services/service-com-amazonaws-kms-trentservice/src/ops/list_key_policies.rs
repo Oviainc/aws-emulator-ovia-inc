@@ -193,10 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(_) => {}
             crate::state::KeyRef::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRef::MalformedArn => {
                 return Err(ListKeyPoliciesErrorModeled::InvalidArnException(

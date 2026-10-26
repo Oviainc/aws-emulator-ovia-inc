@@ -360,7 +360,6 @@ pub fn authorize_master_key<Eng: Send + Sync + 'static>(
                 return Err(KeyRefusal::AccessDenied(relayed(
                     &kms_store::unauthorized_account_message(
                         action.strip_prefix("kms:").unwrap_or(action),
-                        master_key_id,
                     ),
                     "AccessDeniedException",
                 )))

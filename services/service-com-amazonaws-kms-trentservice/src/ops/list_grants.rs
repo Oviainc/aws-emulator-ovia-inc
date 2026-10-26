@@ -265,10 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key_id = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key.key_id.clone(),
             crate::state::KeyRef::UnauthorizedAccount => {
-                return Err(crate::state::unauthorized_account(
-                    Self::NAME,
-                    &input.key_id,
-                ));
+                return Err(crate::state::unauthorized_account(Self::NAME));
             }
             crate::state::KeyRef::MalformedArn => {
                 return Err(ListGrantsErrorModeled::InvalidArnException(InvalidArnException {

@@ -1129,7 +1129,7 @@ async fn a_queue_key_arn_whose_account_segment_names_no_account_relays_the_denia
         "GenerateDataKey",
     )] {
         let (status, refused) = emulator.sqs(ACCOUNT_KEY, operation, &body).await;
-        let expected = kms_unauthorized_account_message(kms_operation, &addressed);
+        let expected = kms_unauthorized_account_message(kms_operation);
         let message = refused
             .get("message")
             .or_else(|| refused.get("Message"))

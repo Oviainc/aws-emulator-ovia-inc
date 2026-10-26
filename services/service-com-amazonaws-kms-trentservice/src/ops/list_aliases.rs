@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => match state.resolve(&region, requested) {
                 crate::state::KeyRef::Found(key) => Some(key.key_id.clone()),
                 crate::state::KeyRef::UnauthorizedAccount => {
-                    return Err(crate::state::unauthorized_account(Self::NAME, requested));
+                    return Err(crate::state::unauthorized_account(Self::NAME));
                 }
                 crate::state::KeyRef::MalformedArn => {
                     return Err(ListAliasesErrorModeled::InvalidArnException(
