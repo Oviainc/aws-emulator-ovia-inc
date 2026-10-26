@@ -25,6 +25,10 @@ mod error_classification;
 mod error_envelope;
 #[path = "all/health_check_creation.rs"]
 mod health_check_creation;
+// Declared beside the other health-check suites: this one is the `ChildHealthChecks`
+// length bound, which the creation suite's tables do not reach.
+#[path = "all/health_check_child_list_bound.rs"]
+mod health_check_child_list_bound;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
 #[path = "all/health_check_status.rs"]

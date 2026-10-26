@@ -316,6 +316,12 @@ mod rds_shared_signing_name_routing;
 mod rds_signing_name_routing;
 #[path = "all/resiliencehub_signing_name_routing.rs"]
 mod resiliencehub_signing_name_routing;
+// Declared HERE, in the sorted list at its own name, rather than appended at the end of
+// this file: the tail is where every concurrently landing router suite appends its line, so
+// a declaration there conflicts with every one of them, while these neighbouring lines are
+// stable.
+#[path = "all/route53_health_check_status_metric.rs"]
+mod route53_health_check_status_metric;
 #[path = "all/s3files_create_file_system_bucket.rs"]
 mod s3files_create_file_system_bucket;
 #[path = "all/scheduler_execution_role.rs"]

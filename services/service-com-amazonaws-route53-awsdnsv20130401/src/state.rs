@@ -29,6 +29,10 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The periodic assessment of a health check, and the CloudWatch series Route 53
+/// publishes that assessment as.
+pub mod health_check_status;
+
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
@@ -193,6 +197,14 @@ pub const HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC: &str = "CLOUDWATCH_METRIC";
 pub const HEALTH_CHECK_TYPE_CALCULATED: &str = "CALCULATED";
 /// The `HealthCheckType` that follows a routing control (`HealthCheckType` enum).
 pub const HEALTH_CHECK_TYPE_RECOVERY_CONTROL: &str = "RECOVERY_CONTROL";
+
+/// The most `ChildHealthChecks` entries a `CALCULATED` health check may name.
+///
+/// The member's own published maximum (`HealthCheckConfig$ChildHealthChecks`
+/// targets `ChildHealthCheckList`, `len 0..256`). Stated here as well as in the
+/// model because the list is walked for every assessment of the check, so its
+/// length is a bound the service enforces rather than one it assumes.
+pub const MAX_CHILD_HEALTH_CHECKS: usize = 256;
 
 /// The `RequestInterval`, in seconds, a health check that asks for none gets.
 ///
@@ -896,6 +908,11 @@ pub fn vpc_position_in(vpcs: &[VPC], vpc_id: &str) -> Option<usize> {
 /// defaults the service fills in already applied (see
 /// [`health_check_config_with_defaults`]), so the create that persisted it and
 /// every later read report the same configuration.
+///
+/// Beside the configuration sits the periodic ASSESSMENT of the thing it
+/// describes ([`StoredHealthCheck::evaluation`]): a health check is not only a
+/// record, it is evaluated, and that assessment is what
+/// [`health_check_status`] publishes as the health check's CloudWatch series.
 #[derive(Debug, Clone)]
 pub struct StoredHealthCheck {
     /// The health check id, which is also this record's key in
@@ -915,6 +932,10 @@ pub struct StoredHealthCheck {
     /// The tags on this health check, keyed by tag key so one key carries one
     /// value (`ChangeTagsForResource`).
     pub tags: BTreeMap<String, String>,
+    /// This health check's periodic assessment, or `None` for a type that has no
+    /// probe schedule at all; see
+    /// [`health_check_status::HealthCheckEvaluation`].
+    pub evaluation: Option<health_check_status::HealthCheckEvaluation>,
 }
 
 impl StoredHealthCheck {
@@ -943,6 +964,31 @@ impl StoredHealthCheck {
     /// This health check's tags as the modelled `Tag` list.
     pub fn to_tag_list(&self) -> Vec<Tag> {
         tags_to_list(&self.tags)
+    }
+
+    /// The status Route 53 reports for this health check right now, or `None`
+    /// when nothing assesses it (a type with no probe schedule).
+    ///
+    /// This is the AGGREGATE assessment — the debounced one
+    /// [`health_check_status`] publishes as the check's CloudWatch series — and
+    /// not the single-probe observation one checker reports
+    /// ([`StoredHealthCheck::reported_status`]), which is a different plane of
+    /// the API.
+    ///
+    /// The assessment, then the two members that override it: `Disabled` first
+    /// ("After you disable a health check, Route 53 considers the status of the
+    /// health check to always be healthy"), `Inverted` after it ("whether you
+    /// want Amazon Route 53 to invert the status of a health check") — the order
+    /// the `Disabled` documentation implies when it tells a caller to "change the
+    /// value of Inverted" to stop traffic reaching a disabled check's resource.
+    pub fn reported_healthy(&self) -> Option<bool> {
+        let assessed = self.evaluation.as_ref()?.is_healthy();
+        let base = self.config.disabled == Some(true) || assessed;
+        Some(if self.config.inverted == Some(true) {
+            !base
+        } else {
+            base
+        })
     }
 
     /// Whether Route 53's health checkers are checking this health check's
@@ -1144,6 +1190,15 @@ pub fn health_check_member_given(member: Option<&str>) -> bool {
 pub fn health_check_config_problem(config: &HealthCheckConfig) -> Option<String> {
     let given = |member: &Option<String>| health_check_member_given(member.as_deref());
     let kind = config.r#type.as_str();
+    // The children a CALCULATED check adds up are read on every assessment of it,
+    // so the list's published maximum is held to here, whatever a request sends.
+    let children = config.child_health_checks.as_deref().unwrap_or_default().len();
+    if children > MAX_CHILD_HEALTH_CHECKS {
+        return Some(format!(
+            "HealthCheckConfig.ChildHealthChecks can name at most \
+             {MAX_CHILD_HEALTH_CHECKS} child health checks; got {children}"
+        ));
+    }
     if ENDPOINT_HEALTH_CHECK_TYPES.contains(&kind) {
         // `IPAddress`: "If you don't specify a value for IPAddress, Route 53
         // sends a DNS request to resolve the domain name that you specify in
@@ -1305,6 +1360,16 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// this store is created and only ever read afterwards, so every call
     /// answers the same list.
     checker_ip_ranges: Vec<String>,
+    /// Whether the one checker clock that publishes the health checks' status
+    /// series ([`health_check_status::drive_health_check_metrics`]) is running, so
+    /// a second write does not start a second one.
+    pub(crate) checker_clock_running: bool,
+    /// The claim the running checker clock holds, so a clock that ends on its
+    /// wake-up cap releases only its OWN claim.
+    pub(crate) checker_clock_generation: u64,
+    /// The running checker clock's task handle, held so the task a write started
+    /// stays stoppable and so a replaced one is aborted rather than left running.
+    pub(crate) checker_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// The store a fresh engine starts with: no zones and no changes, and the
@@ -1323,6 +1388,9 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             delegation_set_by_caller_reference: HashMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
+            checker_clock_running: false,
+            checker_clock_generation: 0,
+            checker_clock: None,
         }
     }
 }

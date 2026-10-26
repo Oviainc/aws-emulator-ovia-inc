@@ -102,8 +102,9 @@
 use super::types::*;
 
 use crate::state::{
-    health_check_config_problem, health_check_config_with_defaults, now_millis, resource_location,
-    StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION, MAX_HEALTH_CHECKS,
+    health_check_config_problem, health_check_config_with_defaults, health_check_status,
+    now_millis, resource_location, StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION,
+    MAX_HEALTH_CHECKS,
 };
 use std::collections::BTreeMap;
 
@@ -275,6 +276,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let health_check = StoredHealthCheck {
             id: id.clone(),
             caller_reference: input.caller_reference.clone(),
+            // The health check's evaluation starts with the create: Route 53
+            // begins assessing the endpoint (or the alarm, or the children) the
+            // configuration names, and reports that assessment as the health
+            // check's CloudWatch series.
+            evaluation: health_check_status::HealthCheckEvaluation::new(
+                &config,
+                ::std::time::SystemTime::now(),
+            ),
             config,
             version: FIRST_HEALTH_CHECK_VERSION,
             // Creating the health check is what starts Route 53 checking its
@@ -296,6 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(id.clone())
             .or_insert(health_check)
             .to_health_check();
+        // The store guard goes before the assessment runs: publishing a probe
+        // reaches the CloudWatch metric store, and the two stores are never
+        // locked at once.
+        drop(store);
+        health_check_status::drive_health_check_metrics(&self.engine);
         Ok(CreateHealthCheckOutput {
             health_check: stored,
             location: resource_location(ctx, &format!("healthcheck/{id}")),
