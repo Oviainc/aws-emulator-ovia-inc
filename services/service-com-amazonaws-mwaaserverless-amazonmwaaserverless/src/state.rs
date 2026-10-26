@@ -555,6 +555,45 @@ impl Workflow {
         self.next_scheduled_run_at = self.is_scheduled().then(|| now + SCHEDULED_RUN_EVERY);
     }
 
+    /// Make the newest APPENDED version of this workflow its ONLY latest one, and
+    /// re-derive from that version everything the workflow reports as its current
+    /// configuration.
+    ///
+    /// Exactly one version is the latest at any instant: the flag is cleared on every
+    /// record and set on the one record holding the greatest
+    /// [`WorkflowVersionRecord::sequence`] — the newest APPENDED version, which is
+    /// also the last of the append order a version listing walks
+    /// ([`format_version_listing_key`]). The append position, not the wall clock,
+    /// decides, because two records can carry the same `created_at` instant while
+    /// their sequence is unique and only ever grows.
+    ///
+    /// Called wherever the set of versions changes the active one — a version
+    /// appended by an update, or the latest version removed by a delete — so
+    /// [`Workflow::current_version`], [`Workflow::revision_id`],
+    /// [`Workflow::code_snapshotted_at`] and the automated trigger
+    /// ([`Self::configure_trigger`]) always describe the one version
+    /// [`Self::version`] resolves with no version named. A workflow holding no
+    /// version left has nothing to promote, and keeps what it last reported.
+    pub fn promote_newest_version(&mut self, now: SystemTime) {
+        let newest = self
+            .versions
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, record)| record.sequence)
+            .map(|(index, _)| index);
+        for record in &mut self.versions {
+            record.is_latest = false;
+        }
+        let Some(newest) = newest else {
+            return;
+        };
+        self.versions[newest].is_latest = true;
+        self.current_version = self.versions[newest].version.clone();
+        self.code_snapshotted_at = self.versions[newest].created_at;
+        self.revision_id = mint_revision_id(&self.arn, &self.current_version);
+        self.configure_trigger(now);
+    }
+
     /// Start the teardown `DeleteWorkflow` describes: the workflow moves to
     /// [`WORKFLOW_STATUS_DELETING`], every execution of it that has not finished is
     /// stopped ([`Self::stop_runs`]) and its automated trigger stops firing, because

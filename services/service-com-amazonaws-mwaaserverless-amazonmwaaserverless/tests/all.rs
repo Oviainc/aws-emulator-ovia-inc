@@ -67,3 +67,5 @@ mod workflow_update_versions;
 mod workflow_version_cursor_continuity;
 #[path = "all/workflow_version_listing.rs"]
 mod workflow_version_listing;
+#[path = "all/workflow_version_promotion.rs"]
+mod workflow_version_promotion;

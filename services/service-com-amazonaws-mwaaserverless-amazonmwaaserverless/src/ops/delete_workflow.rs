@@ -283,24 +283,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // THAT version, and no run of a version this delete keeps.
                     workflow.versions.retain(|rec| rec.version != version);
                     workflow.stop_runs(Some(version), now);
-                    // Deleting the latest version promotes the newest one left, which
-                    // is what the workflow then reports as its current configuration.
+                    // Removing the latest version promotes the newest one LEFT, which
+                    // is what the workflow then reports as its current configuration:
+                    // exactly one version is latest, and it is the newest APPENDED one
+                    // (`crate::state::Workflow::promote_newest_version` — the same
+                    // promotion an update performs). Removing a version that was NOT
+                    // the latest changes no active version, so the flag and the
+                    // configuration the workflow reports stay where they were.
                     if !workflow.versions.iter().any(|rec| rec.is_latest) {
-                        let newest = workflow
-                            .versions
-                            .iter()
-                            .map(|rec| rec.created_at)
-                            .max()
-                            .unwrap_or(workflow.created_at);
-                        for record in &mut workflow.versions {
-                            record.is_latest = record.created_at == newest;
-                        }
-                        if let Some(latest) = workflow.versions.iter().find(|rec| rec.is_latest) {
-                            workflow.current_version = latest.version.clone();
-                            workflow.code_snapshotted_at = latest.created_at;
-                            workflow.revision_id =
-                                crate::state::mint_revision_id(&arn, &latest.version);
-                        }
+                        workflow.promote_newest_version(now);
                     }
                     workflow.modified_at = now;
                 }

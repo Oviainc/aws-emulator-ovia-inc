@@ -284,7 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let nonce = store.next_nonce(now);
         let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
-        let revision_id = crate::state::mint_revision_id(&arn, &version);
         // The append position this version keeps: the mint counter the nonce above
         // just advanced, which is what a version listing pages over.
         let sequence = store.mint_seq;
@@ -305,28 +304,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let workflow = store.workflow_in_mut(&region, &arn).ok_or_else(unavailable)?;
-        // "Creates a new version with the updated configuration and disables scheduling on
-        // all previous versions to ensure only one version is actively scheduled at a
-        // time": the appended version becomes the workflow's only latest one, and every
-        // earlier version keeps the configuration it froze.
-        for record in &mut workflow.versions {
-            record.is_latest = false;
-        }
         workflow.versions.push(crate::state::WorkflowVersionRecord {
-            version: version.clone(),
+            version,
             created_at: now,
-            is_latest: true,
+            is_latest: false,
             snapshot,
             sequence,
         });
-        workflow.current_version = version;
-        workflow.revision_id = revision_id;
+        // "Creates a new version with the updated configuration and disables scheduling on
+        // all previous versions to ensure only one version is actively scheduled at a
+        // time": the version just appended becomes the workflow's only latest one, and
+        // every earlier version keeps the configuration it froze and stops being
+        // scheduled. The promotion — the flag, what the workflow reports as its current
+        // configuration and the trigger in force — is
+        // `crate::state::Workflow::promote_newest_version`, so an update and a
+        // version-scoped delete settle the active version the same single way.
+        workflow.promote_newest_version(now);
         workflow.modified_at = now;
-        workflow.code_snapshotted_at = now;
-        // "Disables scheduling on all previous versions": the trigger in force is the
-        // one the new version asks for, so an update into automated execution starts
-        // producing runs of its own and an update out of it stops.
-        workflow.configure_trigger(now);
 
         // Answer from the stored record, so the response can only ever be what was
         // persisted.

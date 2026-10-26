@@ -40,7 +40,14 @@ use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// Create a workflow holding `versions` immutable versions: the create makes the first
 /// one and each update appends another. Answers its ARN.
-async fn workflow_with_versions(harness: &Harness, name: &str, versions: usize) -> String {
+///
+/// `pub(crate)` so another suite of this target builds a version history the same way
+/// rather than writing a second setup.
+pub(crate) async fn workflow_with_versions(
+    harness: &Harness,
+    name: &str,
+    versions: usize,
+) -> String {
     assert!(versions >= 1, "setup: a workflow always holds one version");
     let (status, created) = harness
         .call(
@@ -86,7 +93,14 @@ async fn workflow_with_versions(harness: &Harness, name: &str, versions: usize) 
 /// Edit the stored workflow in place. `deletion_due_at` is the clock field the teardown
 /// is driven from, so setting it is how a row puts the removal deadline in the past (or
 /// safely out of reach) without sleeping for it.
-fn with_workflow<R>(harness: &Harness, arn: &str, edit: impl FnOnce(&mut Workflow) -> R) -> R {
+///
+/// `pub(crate)` so another suite of this target reads and seeds the same stored record
+/// rather than reaching into the store a second way.
+pub(crate) fn with_workflow<R>(
+    harness: &Harness,
+    arn: &str,
+    edit: impl FnOnce(&mut Workflow) -> R,
+) -> R {
     let state = harness
         .engine()
         .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>();
