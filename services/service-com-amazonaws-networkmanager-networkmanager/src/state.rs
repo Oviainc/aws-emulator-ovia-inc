@@ -905,11 +905,14 @@ pub const POLICY_ALIAS_LATEST: &str = "LATEST";
 /// [`CHANGE_SET_PENDING_GENERATION`] until the span the clock owes elapses and then reads
 /// [`CHANGE_SET_READY_TO_EXECUTE`]; one whose document is being put in force reads
 /// [`CHANGE_SET_EXECUTING`] and then [`CHANGE_SET_EXECUTION_SUCCEEDED`]
-/// ([`CoreNetworkPolicyRecord::change_set_state_at`]). `FAILED_GENERATION` is unreachable
-/// here because a document that does not pass [`validate_policy_document`] is refused
-/// synchronously with `CoreNetworkPolicyException` and never stored, and `OUT_OF_DATE`
-/// belongs to `ExecuteCoreNetworkChangeSet` — the operation that moves the LIVE policy,
-/// and still a scaffold stub.
+/// ([`CoreNetworkPolicyRecord::change_set_state_at`]). An unexecuted version whose change
+/// set was generated against a document that is no longer in force — because another
+/// version has been put in force since — reads [`CHANGE_SET_OUT_OF_DATE`] instead and can
+/// no longer be executed ([`CoreNetworkRecord::execute_policy_version`]), since the
+/// differences it describes are no longer the ones executing it would apply.
+/// `FAILED_GENERATION` is unreachable here because a document that does not pass
+/// [`validate_policy_document`] is refused synchronously with `CoreNetworkPolicyException`
+/// and never stored.
 pub const CHANGE_SET_PENDING_GENERATION: &str = "PENDING_GENERATION";
 /// See [`CHANGE_SET_PENDING_GENERATION`].
 pub const CHANGE_SET_READY_TO_EXECUTE: &str = "READY_TO_EXECUTE";
@@ -917,6 +920,8 @@ pub const CHANGE_SET_READY_TO_EXECUTE: &str = "READY_TO_EXECUTE";
 pub const CHANGE_SET_EXECUTING: &str = "EXECUTING";
 /// See [`CHANGE_SET_PENDING_GENERATION`].
 pub const CHANGE_SET_EXECUTION_SUCCEEDED: &str = "EXECUTION_SUCCEEDED";
+/// See [`CHANGE_SET_PENDING_GENERATION`].
+pub const CHANGE_SET_OUT_OF_DATE: &str = "OUT_OF_DATE";
 
 /// The members of `ChangeStatus` one change of a stored policy version's change set
 /// reports (`smithy_query shape=ChangeStatus`: NOT_STARTED, IN_PROGRESS, COMPLETE, FAILED
@@ -1263,8 +1268,19 @@ pub struct CoreNetworkPolicyRecord {
     /// executed. The version a create carries is executed by the create itself ("A
     /// subsequent change set is created showing the differences between the LIVE policy and
     /// the submitted policy", `smithy_query query="doc" shape="PutCoreNetworkPolicy"` — a
-    /// put only PREPARES one).
+    /// put only PREPARES one); the change set a put or a restore prepared is executed by
+    /// `ExecuteCoreNetworkChangeSet` ([`CoreNetworkRecord::execute_policy_version`]).
     pub executed_at: Option<SystemTime>,
+    /// Whether this version's change set describes differences from a document that is no
+    /// longer in force, which is what makes it [`CHANGE_SET_OUT_OF_DATE`].
+    ///
+    /// A change set is generated ONCE, against the document in force at that moment, so
+    /// putting ANOTHER version in force leaves every change set still waiting to be
+    /// executed describing a comparison that no longer holds — it is the stored flag rather
+    /// than a function of the clock because what invalidates it is that later execution,
+    /// not the passing of time. An executed version is unaffected: its change set has
+    /// already been applied.
+    pub out_of_date: bool,
     /// The changes this version's change set carries: the difference between the policy
     /// that was in force when this version was stored and this version's own document
     /// ([`policy_changes`]).
@@ -1287,9 +1303,16 @@ impl CoreNetworkPolicyRecord {
         self.executed_at.is_some()
     }
 
-    /// This version's `ChangeSetState` as of `now` — a function of the clock, so reading a
-    /// version never writes. See [`CHANGE_SET_PENDING_GENERATION`].
+    /// This version's `ChangeSetState` as of `now` — a function of the clock and of the
+    /// stored record, so reading a version never writes. See
+    /// [`CHANGE_SET_PENDING_GENERATION`].
     pub fn change_set_state_at(&self, now: SystemTime) -> &'static str {
+        // A change set superseded by another version's execution can never be executed, so
+        // it reports that instead of the state the clock would otherwise give it; only an
+        // unexecuted one can be superseded.
+        if !self.executed() && self.out_of_date {
+            return CHANGE_SET_OUT_OF_DATE;
+        }
         match (self.executed(), now >= self.settled_at) {
             (false, false) => CHANGE_SET_PENDING_GENERATION,
             (false, true) => CHANGE_SET_READY_TO_EXECUTE,
@@ -1774,6 +1797,13 @@ pub struct CoreNetworkRecord {
     /// force. A version that has not been executed is not in force, so putting one leaves
     /// this untouched.
     pub topology: PolicyTopology,
+    /// The instant the `UPDATING` -> `AVAILABLE` transition the clock owes becomes due,
+    /// set by the execution that put a policy version in force and `None` while no
+    /// execution has ever been started here. See [`CoreNetworkRecord::state_at`].
+    pub updating_until: Option<SystemTime>,
+    /// Whether the CREATE of this core network carried a policy document, which is what
+    /// makes its first version the one [`Self::created_policy_document`] answers.
+    pub created_with_policy_document: bool,
     /// The `ClientToken` of the request that minted this record, kept so a retry of that
     /// request answers this record instead of minting a second one.
     pub client_token: Option<String>,
@@ -1784,16 +1814,19 @@ impl CoreNetworkRecord {
     /// The document the CREATE of this core network carried: its first policy version,
     /// `None` for a core network created without a document.
     ///
-    /// The version is identified by being both the FIRST and an EXECUTED one — a create
-    /// executes the change set of the document it carries, a put never does — so a put
-    /// that mints version 1 on a core network created without a document does not make
-    /// this answer the put's document. This, and not the LIVE document, is what a retried
-    /// create compares itself against: the LIVE document moves to whichever version is
-    /// executed next, while the document a create carried is the one it is idempotent in.
+    /// The version is the FIRST one of a core network the create gave a document to
+    /// ([`Self::created_with_policy_document`]), so a put that mints version 1 on a core
+    /// network created without a document does not make this answer the put's document
+    /// — not even once that version's change set has been executed. This, and not the LIVE
+    /// document, is what a retried create compares itself against: the LIVE document moves
+    /// to whichever version is executed next, while the document a create carried is the
+    /// one it is idempotent in.
     pub fn created_policy_document(&self) -> Option<&str> {
+        if !self.created_with_policy_document {
+            return None;
+        }
         self.policy_versions
             .get(&FIRST_POLICY_VERSION)
-            .filter(|version| version.executed())
             .map(|version| version.document.as_str())
     }
 
@@ -1886,6 +1919,10 @@ impl CoreNetworkRecord {
             document,
             client_token,
             executed_at: executed.then_some(now),
+            // Freshly generated against the document in force a moment ago, so it is the
+            // comparison that holds right now; a later execution of ANOTHER version is
+            // what supersedes it.
+            out_of_date: false,
             changes,
         };
         let alias = if executed {
@@ -1901,12 +1938,54 @@ impl CoreNetworkRecord {
         shape
     }
 
+    /// Put the policy version `version_id`'s document in force: what executing that
+    /// version's change set does. A no-op for a version this core network does not hold,
+    /// which a caller refuses before reaching here.
+    ///
+    /// Executing a change set makes its version the LIVE one and the topology its document
+    /// describes the one the core network reports, starts the `EXECUTING` ->
+    /// `EXECUTION_SUCCEEDED` span the clock then owes that change set (and with it the
+    /// `IN_PROGRESS` -> `COMPLETE` span of each of its changes,
+    /// [`CoreNetworkPolicyRecord::change_events_at`]) and the `UPDATING` -> `AVAILABLE`
+    /// span it owes the core network being deployed to. Every OTHER change set still
+    /// waiting to be executed described its differences from the document this one
+    /// replaces, so none of them is a comparison that still holds: they are superseded
+    /// ([`CoreNetworkPolicyRecord::out_of_date`]).
+    pub fn execute_policy_version(&mut self, version_id: i32, now: SystemTime) {
+        let Some(version) = self.policy_versions.get_mut(&version_id) else {
+            return;
+        };
+        version.executed_at = Some(now);
+        version.settled_at = now + SETTLE_DELAY;
+        // The document is the one this service stored, already capped by
+        // [`validate_policy_document`] where it was accepted, so deriving its topology here
+        // is bounded work on a value no caller of THIS request chose.
+        let topology = policy_topology(&version.document);
+        for (id, superseded) in self.policy_versions.iter_mut() {
+            if *id != version_id && superseded.executed_at.is_none() {
+                superseded.out_of_date = true;
+            }
+        }
+        self.live_policy_version = Some(version_id);
+        self.topology = topology;
+        self.updating_until = Some(now + SETTLE_DELAY);
+    }
+
     /// This core network's lifecycle state as of `now`.
+    ///
+    /// Both transitions are a function of the clock, so reading one never writes: a core
+    /// network is `UPDATING` while a policy version it is being deployed is still being
+    /// put in force, `CREATING` until the create settles, and `AVAILABLE` once neither is
+    /// outstanding. A deployment OUTSTANDING is what it reports even when the create has
+    /// not settled yet, since that execution is the later of the two requests it is still
+    /// working on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
+        if self.updating_until.is_some_and(|due| now < due) {
+            STATE_UPDATING
+        } else if now < self.available_at {
             STATE_CREATING
+        } else {
+            STATE_AVAILABLE
         }
     }
 
@@ -1921,9 +2000,10 @@ impl CoreNetworkRecord {
     /// A core network's segments and edges exist only once its policy is in force, which
     /// is what the `CREATING` -> `AVAILABLE` transition stands for, so before that instant
     /// the topology is reported empty and afterwards it is the one derived from the stored
-    /// policy document.
+    /// policy document. A policy being deployed over it (`UPDATING`) does not take the
+    /// topology away: a policy IS in force there, the one that execution put in force.
     pub fn to_shape_with_state(&self, state: &str) -> CoreNetwork {
-        let topology = if state == STATE_AVAILABLE {
+        let topology = if state == STATE_AVAILABLE || state == STATE_UPDATING {
             ::std::borrow::Cow::Borrowed(&self.topology)
         } else {
             ::std::borrow::Cow::Owned(PolicyTopology::default())

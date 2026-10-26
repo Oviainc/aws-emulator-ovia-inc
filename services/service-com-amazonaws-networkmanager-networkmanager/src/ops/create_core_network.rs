@@ -277,6 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             live_policy_version: None,
             policy_version_counter: 0,
             topology: topology.unwrap_or_default(),
+            updating_until: None,
+            created_with_policy_document: input.policy_document.is_some(),
             client_token: input.client_token.filter(|token| !token.is_empty()),
             tags: input.tags.unwrap_or_default(),
         };
