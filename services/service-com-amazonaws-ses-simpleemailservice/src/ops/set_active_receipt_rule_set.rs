@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetActiveReceiptRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetActiveReceiptRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetActiveReceiptRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Makes one of the account's receipt rule sets the active one — or, called with
+//! no rule set name, leaves none active, which is how email receiving is
+//! disabled completely. The active set is held in this service's state as a
+//! NAME, so a reader of it reports that set's rules as they stand.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetActiveReceiptRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetActiveReceiptRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetActiveReceiptRuleSet"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let rule_set_name = input.rule_set_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and the only error this
+            // operation models would claim the set does not exist, which is a
+            // different thing to say.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetActiveReceiptRuleSet",
+            ));
+        };
+        let mut state = state.lock();
+
+        let Some(rule_set_name) = rule_set_name else {
+            // "To disable your email-receiving through Amazon SES completely,
+            // you can call this operation with RuleSetName set to null": no set
+            // is active afterwards, and the stored sets themselves are left
+            // where they are.
+            state.active_receipt_rule_set = None;
+            return Ok(SetActiveReceiptRuleSetOutput {});
+        };
+
+        // Only a set the account holds can be made active, and the rule set
+        // store is the one record of which those are. A name outside the
+        // documented form needs no separate refusal: a name the account cannot
+        // hold is a name it does not hold.
+        if !state.receipt_rule_sets.contains_key(&rule_set_name) {
+            return Err(
+                SetActiveReceiptRuleSetErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(rule_set_name.clone()),
+                        message: Some(format!("Rule set does not exist: {rule_set_name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Exactly one set is active, so this REPLACES whichever set was active
+        // before rather than adding to a collection of active sets.
+        state.active_receipt_rule_set = Some(rule_set_name);
+
+        Ok(SetActiveReceiptRuleSetOutput {})
     }
 }

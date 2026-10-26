@@ -522,6 +522,16 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     /// The receipt rule sets, keyed by name. A `BTreeMap` so every listing is in
     /// one stable (lexicographic) order. Bounded at [`MAX_RECEIPT_RULE_SETS`].
     pub receipt_rule_sets: BTreeMap<String, ReceiptRuleSet>,
+    /// The NAME of the receipt rule set email receiving is currently served by,
+    /// and `None` while no set is active — which is where an account starts, and
+    /// what disables email receiving completely.
+    ///
+    /// A name rather than a copy of the set, so the active set's metadata and
+    /// rules are the ones its entry in [`Self::receipt_rule_sets`] holds at the
+    /// moment of the read ([`Self::active_rule_set`]) instead of a second,
+    /// stale copy of them. This is a pointer into that store, so it grows by at
+    /// most one name and needs no ceiling of its own.
+    pub active_receipt_rule_set: Option<String>,
     /// The receipt IP address filters, keyed by name, held as the modelled
     /// [`crate::ops::types::ReceiptFilter`] shape so a filter a caller wrote is
     /// reported back unchanged instead of being projected through a second copy
@@ -921,6 +931,18 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     rules,
                 }),
         )
+    }
+
+    /// The receipt rule set that is currently active, and `None` while no set
+    /// is active — the two cases a reader of the active set reports.
+    ///
+    /// Resolved through [`Self::receipt_rule_sets`] on every call rather than
+    /// stored alongside the name, so a rule added to or removed from the active
+    /// set after it was made active is part of what this hands back.
+    pub fn active_rule_set(&self) -> Option<&ReceiptRuleSet> {
+        self.active_receipt_rule_set
+            .as_deref()
+            .and_then(|name| self.receipt_rule_sets.get(name))
     }
 
     /// Record the receipt IP address filter `filter` under its own name.

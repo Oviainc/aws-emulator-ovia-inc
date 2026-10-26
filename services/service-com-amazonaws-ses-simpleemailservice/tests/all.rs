@@ -21,6 +21,8 @@ mod harness;
 mod identity_notification_topics;
 #[path = "all/ses_account_sending_and_legacy_addresses.rs"]
 mod ses_account_sending_and_legacy_addresses;
+#[path = "all/ses_active_receipt_rule_set.rs"]
+mod ses_active_receipt_rule_set;
 #[path = "all/ses_configuration_set_listing.rs"]
 mod ses_configuration_set_listing;
 #[path = "all/ses_identity_policies.rs"]
