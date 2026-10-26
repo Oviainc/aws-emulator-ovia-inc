@@ -266,10 +266,10 @@ pub(crate) use channel_placement_groups::channel_placement_group_output;
 pub mod alarm_templates;
 
 pub use alarm_templates::{
-    AlarmTemplateRefusal, AlarmTemplateUpdateRefusal, CloudWatchAlarmTemplateChanges,
-    CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate, MAX_ALARM_PERIOD_SECONDS,
-    MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN, MIN_ALARM_DATAPOINTS,
-    MIN_ALARM_PERIOD_SECONDS,
+    alarm_template_summary, template_scope, AlarmTemplateRefusal, AlarmTemplateUpdateRefusal,
+    CloudWatchAlarmTemplateChanges, CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate,
+    MAX_ALARM_PERIOD_SECONDS, MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN,
+    MIN_ALARM_DATAPOINTS, MIN_ALARM_PERIOD_SECONDS,
 };
 
 pub(crate) use alarm_templates::alarm_template_output;

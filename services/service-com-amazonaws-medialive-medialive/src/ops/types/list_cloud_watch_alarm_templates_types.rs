@@ -28,7 +28,18 @@ pub struct ListCloudWatchAlarmTemplatesOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#CloudWatchAlarmTemplateSummary")]
+/// `CloudWatchAlarmTemplateSummary`, with its schema written out instead of derived
+/// because `CreatedAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices, and the `@required` members (`Arn`, `ComparisonOperator`, `CreatedAt`,
+/// `EvaluationPeriods`, `GroupId`, `Id`, `MetricName`, `Name`, `Period`, `Statistic`,
+/// `TargetResourceType`, `Threshold`, `TreatMissingData`) are bare fields refused by name
+/// when absent, exactly as the derive has them.
+///
+/// Like `EventBridgeRuleTemplateSummary` beside it this one DOES carry a deserializer: it
+/// is the element of `ListCloudWatchAlarmTemplatesResponse$CloudWatchAlarmTemplates`, and
+/// the derive on that shape reads each element through `DeserializableStruct`.
 #[derive(Debug, Clone)]
 pub struct CloudWatchAlarmTemplateSummary {
     pub arn: String,
@@ -48,5 +59,281 @@ pub struct CloudWatchAlarmTemplateSummary {
     pub target_resource_type: String,
     pub threshold: f64,
     pub treat_missing_data: String,
+}
+
+impl CloudWatchAlarmTemplateSummary {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("CloudWatchAlarmTemplateSummary", "Arn", "arn", String, 0);
+    // `CloudWatchAlarmTemplateComparisonOperator` is an enum shape, which the generator
+    // writes as `ShapeType::String`; so are `Statistic`, `TargetResourceType` and
+    // `TreatMissingData` below.
+    const M_COMPARISON_OPERATOR: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "ComparisonOperator",
+        "comparisonOperator",
+        String,
+        1
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "CreatedAt",
+        "createdAt",
+        2
+    );
+    const M_DATAPOINTS_TO_ALARM: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "DatapointsToAlarm",
+        "datapointsToAlarm",
+        Integer,
+        3
+    );
+    const M_DESCRIPTION: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "Description",
+        "description",
+        String,
+        4
+    );
+    const M_EVALUATION_PERIODS: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "EvaluationPeriods",
+        "evaluationPeriods",
+        Integer,
+        5
+    );
+    const M_GROUP_ID: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "GroupId",
+        "groupId",
+        String,
+        6
+    );
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("CloudWatchAlarmTemplateSummary", "Id", "id", String, 7);
+    const M_METRIC_NAME: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "MetricName",
+        "metricName",
+        String,
+        8
+    );
+    const M_MODIFIED_AT: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "ModifiedAt",
+        "modifiedAt",
+        9
+    );
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("CloudWatchAlarmTemplateSummary", "Name", "name", String, 10);
+    const M_PERIOD: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "Period",
+        "period",
+        Integer,
+        11
+    );
+    const M_STATISTIC: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "Statistic",
+        "statistic",
+        String,
+        12
+    );
+    const M_TAGS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("CloudWatchAlarmTemplateSummary", "Tags", "tags", Map, 13);
+    const M_TARGET_RESOURCE_TYPE: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "TargetResourceType",
+        "targetResourceType",
+        String,
+        14
+    );
+    const M_THRESHOLD: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "Threshold",
+        "threshold",
+        Double,
+        15
+    );
+    const M_TREAT_MISSING_DATA: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "CloudWatchAlarmTemplateSummary",
+        "TreatMissingData",
+        "treatMissingData",
+        String,
+        16
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#CloudWatchAlarmTemplateSummary",
+            shared_types::NAMESPACE,
+            "CloudWatchAlarmTemplateSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_COMPARISON_OPERATOR,
+            &Self::M_CREATED_AT,
+            &Self::M_DATAPOINTS_TO_ALARM,
+            &Self::M_DESCRIPTION,
+            &Self::M_EVALUATION_PERIODS,
+            &Self::M_GROUP_ID,
+            &Self::M_ID,
+            &Self::M_METRIC_NAME,
+            &Self::M_MODIFIED_AT,
+            &Self::M_NAME,
+            &Self::M_PERIOD,
+            &Self::M_STATISTIC,
+            &Self::M_TAGS,
+            &Self::M_TARGET_RESOURCE_TYPE,
+            &Self::M_THRESHOLD,
+            &Self::M_TREAT_MISSING_DATA,
+        ],
+    );
+}
+
+pub static CLOUD_WATCH_ALARM_TEMPLATE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &CloudWatchAlarmTemplateSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CloudWatchAlarmTemplateSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&Self::M_ARN, self.arn.as_str())?;
+        serializer.write_string(&Self::M_COMPARISON_OPERATOR, self.comparison_operator.as_str())?;
+        serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(value) = self.datapoints_to_alarm {
+            serializer.write_integer(&Self::M_DATAPOINTS_TO_ALARM, value)?;
+        }
+        if let Some(value) = self.description.as_ref() {
+            serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        serializer.write_integer(&Self::M_EVALUATION_PERIODS, self.evaluation_periods)?;
+        serializer.write_string(&Self::M_GROUP_ID, self.group_id.as_str())?;
+        serializer.write_string(&Self::M_ID, self.id.as_str())?;
+        serializer.write_string(&Self::M_METRIC_NAME, self.metric_name.as_str())?;
+        if let Some(value) = self.modified_at.as_ref() {
+            serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+        }
+        serializer.write_string(&Self::M_NAME, self.name.as_str())?;
+        serializer.write_integer(&Self::M_PERIOD, self.period)?;
+        serializer.write_string(&Self::M_STATISTIC, self.statistic.as_str())?;
+        if let Some(value) = self.tags.as_ref() {
+            serializer.write_map(&Self::M_TAGS, &|entries| {
+                for (key, tag) in value.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        serializer.write_string(
+            &Self::M_TARGET_RESOURCE_TYPE,
+            self.target_resource_type.as_str(),
+        )?;
+        serializer.write_double(&Self::M_THRESHOLD, self.threshold)?;
+        serializer.write_string(
+            &Self::M_TREAT_MISSING_DATA,
+            self.treat_missing_data.as_str(),
+        )?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CloudWatchAlarmTemplateSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arn = ::std::option::Option::None;
+        let mut comparison_operator = ::std::option::Option::None;
+        let mut created_at = ::std::option::Option::None;
+        let mut datapoints_to_alarm = ::std::option::Option::None;
+        let mut description = ::std::option::Option::None;
+        let mut evaluation_periods = ::std::option::Option::None;
+        let mut group_id = ::std::option::Option::None;
+        let mut id = ::std::option::Option::None;
+        let mut metric_name = ::std::option::Option::None;
+        let mut modified_at = ::std::option::Option::None;
+        let mut name = ::std::option::Option::None;
+        let mut period = ::std::option::Option::None;
+        let mut statistic = ::std::option::Option::None;
+        let mut tags = ::std::option::Option::None;
+        let mut target_resource_type = ::std::option::Option::None;
+        let mut threshold = ::std::option::Option::None;
+        let mut treat_missing_data = ::std::option::Option::None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => arn = Some(reader.read_string(&Self::M_ARN)?),
+                Some(1) => {
+                    comparison_operator =
+                        Some(reader.read_string(&Self::M_COMPARISON_OPERATOR)?);
+                }
+                Some(2) => created_at = Some(reader.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(3) => {
+                    datapoints_to_alarm =
+                        Some(reader.read_integer(&Self::M_DATAPOINTS_TO_ALARM)?);
+                }
+                Some(4) => description = Some(reader.read_string(&Self::M_DESCRIPTION)?),
+                Some(5) => {
+                    evaluation_periods = Some(reader.read_integer(&Self::M_EVALUATION_PERIODS)?);
+                }
+                Some(6) => group_id = Some(reader.read_string(&Self::M_GROUP_ID)?),
+                Some(7) => id = Some(reader.read_string(&Self::M_ID)?),
+                Some(8) => metric_name = Some(reader.read_string(&Self::M_METRIC_NAME)?),
+                Some(9) => modified_at = Some(reader.read_timestamp(&Self::M_MODIFIED_AT)?),
+                Some(10) => name = Some(reader.read_string(&Self::M_NAME)?),
+                Some(11) => period = Some(reader.read_integer(&Self::M_PERIOD)?),
+                Some(12) => statistic = Some(reader.read_string(&Self::M_STATISTIC)?),
+                Some(13) => {
+                    let mut entries: ::std::collections::HashMap<String, String> =
+                        ::std::collections::HashMap::new();
+                    reader.read_map(&Self::M_TAGS, &mut |key, value| {
+                        entries.insert(key, value.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    tags = Some(entries);
+                }
+                Some(14) => {
+                    target_resource_type =
+                        Some(reader.read_string(&Self::M_TARGET_RESOURCE_TYPE)?);
+                }
+                Some(15) => threshold = Some(reader.read_double(&Self::M_THRESHOLD)?),
+                Some(16) => {
+                    treat_missing_data = Some(reader.read_string(&Self::M_TREAT_MISSING_DATA)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Arn"))?,
+            comparison_operator: comparison_operator
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("ComparisonOperator"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("CreatedAt"))?,
+            datapoints_to_alarm,
+            description,
+            evaluation_periods: evaluation_periods
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("EvaluationPeriods"))?,
+            group_id: group_id
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("GroupId"))?,
+            id: id.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Id"))?,
+            metric_name: metric_name
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("MetricName"))?,
+            modified_at,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Name"))?,
+            period: period.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Period"))?,
+            statistic: statistic
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("Statistic"))?,
+            tags,
+            target_resource_type: target_resource_type
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("TargetResourceType"))?,
+            threshold: threshold
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("Threshold"))?,
+            treat_missing_data: treat_missing_data
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("TreatMissingData"))?,
+        })
+    }
 }
 
