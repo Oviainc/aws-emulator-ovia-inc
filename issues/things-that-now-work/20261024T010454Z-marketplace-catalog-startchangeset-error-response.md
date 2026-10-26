@@ -24,3 +24,28 @@ Tests: `tests/all/change_set_lifecycle.rs` lines 1621-1657 assert the current (4
 1. StartChangeSet to create an AmiProduct entity; wait for SUCCEEDED and note the EntityId
 2. POST /StartChangeSet with Catalog=AWSMarketplace and a ChangeSet containing two changes, both ChangeType=AddRevisions, both Entity={Type:AmiProduct, Identifier:<EntityId>}
 3. Observe 422 ValidationException; AWS answers 423 ResourceInUseException for this request
+
+## Resolution
+
+Closed as not a defect: the 422 `ValidationException` above is what AWS answers for this
+request, and the emulator already answers it with AWS's message.
+
+The project's own wire recording for exactly this call —
+`marketplace-catalog-start-changeset-duplicate-change-type-rejected`, step `task#1` — holds
+status 422 and Message `[Requested changes contain multiple changes for the same change type
+'AddRevisions' on entity '<EntityId>'. Entity - change type pairs should be unique.]`; its
+recorded expectations are quoted in
+`issues/things-that-now-work/20261022T000249Z-marketplace-catalog-change-set-and-assessment-operations-refused.md`
+(cause 5 of 8, and the per-cause expected/actual list under its Evidence section). This
+report carries no recording of its own, so the 423 expectation above rests only on a reading
+of the operation's documentation, which states TWO rules: the within-one-change-set
+uniqueness rule ("Within a single `ChangeSet`, you can't start the same change type against
+the same entity multiple times"), a property of the submitted list, and — "Additionally" —
+the cross-change-set lock, whose breach is the `ResourceInUseException`.
+
+Both rules are now pinned by
+`services/service-com-amazonaws-marketplacecatalog-awsmpseymour/tests/all/change_pair_uniqueness.rs`:
+a repeated (entity, change type) pair inside ONE change set is 422 `ValidationException`
+(across change types, change-set layouts and identifier forms, and before the entity is
+resolved), while a change against an entity a RUNNING change set holds is 423
+`ResourceInUseException` for any change type until that holder completes.
