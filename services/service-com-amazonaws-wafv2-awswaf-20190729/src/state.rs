@@ -2037,17 +2037,26 @@ pub struct ManagedRuleGroupDescriptor {
     /// [`Self::product_title`].
     pub product_description: &'static str,
     /// Whether the vendor offers this group in NAMED versions a web ACL can choose
-    /// between (`ManagedProductDescriptor$IsVersioningSupported`), which is the same
-    /// thing as the guide publishing a version history for it — so this is `true`
-    /// for exactly the entries [`versioned`] builds (see [`BOT_CONTROL_VERSIONS`])
-    /// and `false` for the ones whose vendor keeps a single version on offer
-    /// ([`CURRENT_VERSION_ONLY`]) and retires the one it supersedes.
+    /// between (`ManagedRuleGroupSummary$VersioningSupported` is "whether the
+    /// managed rule group is versioned. If it is, you can retrieve the versions
+    /// list by calling ListAvailableManagedRuleGroupVersions", and
+    /// `ManagedProductDescriptor$IsVersioningSupported` reports the same property).
+    ///
+    /// Reference data the VENDOR publishes per group, carried here and reported as
+    /// stored rather than left at the member's modelled default, which is only the
+    /// wire default for a summary that carries none: a group the guide publishes a
+    /// version history for is offered in named versions and reports `true`, and one
+    /// whose vendor keeps its content continuously up to date instead — the
+    /// IP-address-list groups ([`unversioned`]) — reports `false`. Independent of
+    /// [`Self::is_advanced_managed_rule_set`]: the advanced groups are versioned,
+    /// but so are the ordinary rule-set ones ([`descriptor`]).
     pub is_versioning_supported: bool,
     /// Whether the group provides "an advanced set of protections, such as the
     /// the Amazon Web Services Managed Rules rule groups that are used for WAF
     /// intelligent threat mitigation"
     /// (`ManagedProductDescriptor$IsAdvancedManagedRuleSet`): the
-    /// intelligent-threat-mitigation groups, which are the versioned ones.
+    /// intelligent-threat-mitigation groups ([`advanced`]), a narrower set than the
+    /// versioned ones.
     pub is_advanced_managed_rule_set: bool,
     /// The versions of this group its vendor offers, OLDEST first.
     ///
@@ -2398,7 +2407,8 @@ impl ManagedRuleGroupRelease {
 ///
 /// And it carries what the group is PUBLISHED as — its display title and its
 /// one-sentence description, from the same list as its name and capacity, plus the
-/// two flags that list implies (see [`descriptor`] and [`versioned`]) — because a
+/// two flags that list implies (see [`descriptor`], [`unversioned`] and
+/// [`advanced`]) — because a
 /// managed product is one of these groups as a describe reports it
 /// ([`ManagedRuleGroupDescriptor::product`]), not a separate catalogue.
 pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
@@ -2477,7 +2487,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          vulnerabilities specific to WordPress sites.",
         WORDPRESS_RULES,
     ),
-    descriptor(
+    unversioned(
         "AWSManagedRulesAmazonIpReputationList",
         25,
         "Amazon IP reputation list",
@@ -2485,7 +2495,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          with bots or other threats.",
         IP_REPUTATION_RULES,
     ),
-    descriptor(
+    unversioned(
         "AWSManagedRulesAnonymousIpList",
         50,
         "Anonymous IP list",
@@ -2493,7 +2503,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          identity, such as VPNs, proxies, Tor nodes and hosting providers.",
         ANONYMOUS_IP_RULES,
     ),
-    versioned(
+    advanced(
         "AWSManagedRulesBotControlRuleSet",
         50,
         BOT_CONTROL_VERSIONS,
@@ -2504,7 +2514,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          evasive bots.",
         BOT_CONTROL_RULES,
     ),
-    versioned(
+    advanced(
         "AWSManagedRulesATPRuleSet",
         50,
         ATP_VERSIONS,
@@ -2514,7 +2524,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          attempts against your login pages.",
         ATP_RULES,
     ),
-    versioned(
+    advanced(
         "AWSManagedRulesACFPRuleSet",
         50,
         ACFP_VERSIONS,
@@ -2524,7 +2534,7 @@ pub const MANAGED_RULE_GROUP_CATALOGUE: &[ManagedRuleGroupDescriptor] = &[
          attempts against your account registration pages.",
         ACFP_RULES,
     ),
-    versioned(
+    advanced(
         "AWSManagedRulesAntiDDoSRuleSet",
         50,
         ANTI_DDOS_VERSIONS,
@@ -2611,12 +2621,55 @@ const ACFP_VERSIONS: &[ManagedRuleGroupRelease] = &[
 const ANTI_DDOS_VERSIONS: &[ManagedRuleGroupRelease] =
     &[release("Version_1.0", "2025-05-14T00:00:00Z")];
 
-/// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor, offered with
-/// [`CURRENT_VERSION_ONLY`] and carrying [`RETIRED_INITIAL_VERSION`]: a group the
-/// guide publishes no version history for, so its vendor keeps one version on offer
-/// at a time — it supports no choice of named versions and is not one of the
-/// intelligent-threat-mitigation groups either (see [`versioned`]).
+/// One [`MANAGED_RULE_GROUP_CATALOGUE`] entry, of the AWS vendor: a RULE SET its
+/// vendor publishes in named versions, offered with [`CURRENT_VERSION_ONLY`] and
+/// carrying [`RETIRED_INITIAL_VERSION`].
+///
+/// A rule set is a body of rules its vendor revises and publishes as a version a
+/// web ACL can pin (`ManagedRuleGroupStatement$Version` is "the version of the
+/// managed rule group to use"), so an entry built here reports its versioning as
+/// supported — what tells a caller it can call
+/// `ListAvailableManagedRuleGroupVersions` and pin one of the versions that answers.
+/// It is not one of the intelligent-threat-mitigation groups (see [`advanced`]), and
+/// it is not one of the IP-address lists either (see [`unversioned`]).
 const fn descriptor(
+    name: &'static str,
+    capacity: i64,
+    product_title: &'static str,
+    product_description: &'static str,
+    rules: &'static [PublishedManagedRule],
+) -> ManagedRuleGroupDescriptor {
+    ManagedRuleGroupDescriptor {
+        vendor_name: AWS_MANAGED_RULE_GROUP_VENDOR,
+        name,
+        capacity,
+        product_title,
+        product_description,
+        is_versioning_supported: true,
+        is_advanced_managed_rule_set: false,
+        versions: CURRENT_VERSION_ONLY,
+        expired_versions: RETIRED_INITIAL_VERSION,
+        rules,
+    }
+}
+
+/// [`descriptor`] for a group its vendor does NOT publish in named versions: the
+/// IP-address-list groups, whose content is an address list the vendor keeps
+/// continuously up to date in place rather than a rule set it revises and
+/// republishes, so a caller has no version of one to choose between or to pin.
+///
+/// Those groups are the only ones in this catalogue that report their versioning as
+/// unsupported; they are not advanced managed rule sets either.
+///
+/// They still carry [`CURRENT_VERSION_ONLY`] and [`RETIRED_INITIAL_VERSION`], like
+/// every other entry: the version LISTS are what this catalogue publishes so that
+/// `ManagedRuleGroupStatement$Version` can pin any catalogued group and
+/// `ListAvailableManagedRuleGroupVersions` answers one for every pair
+/// `ListAvailableManagedRuleGroups` lists (see [`CURRENT_VERSION_ONLY`]), while this
+/// flag is the vendor's published property of the group — so the two are set
+/// independently here rather than one derived from the other, and narrowing what
+/// these groups offer is a change to those lists, not to this flag.
+const fn unversioned(
     name: &'static str,
     capacity: i64,
     product_title: &'static str,
@@ -2642,9 +2695,9 @@ const fn descriptor(
 ///
 /// Those are the intelligent-threat-mitigation groups: the guide publishes a
 /// version history for exactly them, and they are the ones it describes as the
-/// advanced protections — so an entry built here both supports versioning and is
-/// an advanced managed rule set.
-const fn versioned(
+/// advanced protections — so an entry built here is an advanced managed rule set,
+/// versioned like every other rule set.
+const fn advanced(
     name: &'static str,
     capacity: i64,
     versions: &'static [ManagedRuleGroupRelease],
