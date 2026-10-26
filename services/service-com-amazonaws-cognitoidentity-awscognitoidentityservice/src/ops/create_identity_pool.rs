@@ -191,12 +191,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused create is recorded with the error code its caller was
+        // answered with, and the pool the served one minted is the resource it names.
+        let request_parameters = recorded_request(&input);
+        let region = crate::state::request_region(ctx.parts());
+        let outcome = self.create(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id: outcome
+                    .as_ref()
+                    .ok()
+                    .map(|output| output.identity_pool_id.clone()),
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::serde_json::json!({
+                        "identityPoolId": output.identity_pool_id,
+                        "identityPoolName": output.identity_pool_name,
+                    })
+                }),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+/// The `requestParameters` this call's audit record carries: the members the request
+/// sent, through the ONE writer the two pool-configuration operations share.
+fn recorded_request(input: &CreateIdentityPoolInput) -> ::serde_json::Value {
+    crate::state::RecordedPoolRequest {
+        // A create names no pool: its id is what the call mints.
+        identity_pool_id: None,
+        identity_pool_name: &input.identity_pool_name,
+        allow_unauthenticated_identities: input.allow_unauthenticated_identities,
+        allow_classic_flow: input.allow_classic_flow,
+        supported_login_providers: input.supported_login_providers.as_ref(),
+        developer_provider_name: input.developer_provider_name.as_deref(),
+        open_id_connect_provider_arns: input.open_id_connect_provider_ar_ns.as_deref(),
+        cognito_identity_providers: input.cognito_identity_providers.as_deref(),
+        saml_provider_arns: input.saml_provider_ar_ns.as_deref(),
+        identity_pool_tags: input.identity_pool_tags.as_ref(),
+    }
+    .recorded()
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateIdentityPool<Eng> {
+    /// The create itself: authorize, mint the pool's id and persist it.
+    async fn create(
+        &self,
+        input: CreateIdentityPoolInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<CreateIdentityPoolOutput, CreateIdentityPoolError> {
         // Authorization comes first: the pool whose id this call mints is not named yet, so
         // the decision is taken against the account's identity pools in the region the
         // request is signed for — and nothing is stored when it refuses.
-        if let Some(denied) =
-            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
-        {
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            None,
+        ) {
             return Err(denied);
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {

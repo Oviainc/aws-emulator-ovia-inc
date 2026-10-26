@@ -190,13 +190,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused update is recorded with the error code its caller was
+        // answered with.
+        let request_parameters = crate::state::RecordedPoolRequest {
+            identity_pool_id: Some(&input.identity_pool_id),
+            identity_pool_name: &input.identity_pool_name,
+            allow_unauthenticated_identities: input.allow_unauthenticated_identities,
+            allow_classic_flow: input.allow_classic_flow,
+            supported_login_providers: input.supported_login_providers.as_ref(),
+            developer_provider_name: input.developer_provider_name.as_deref(),
+            open_id_connect_provider_arns: input.open_id_connect_provider_ar_ns.as_deref(),
+            cognito_identity_providers: input.cognito_identity_providers.as_deref(),
+            saml_provider_arns: input.saml_provider_ar_ns.as_deref(),
+            identity_pool_tags: input.identity_pool_tags.as_ref(),
+        }
+        .recorded();
+        let region = crate::state::request_region(ctx.parts());
+        let identity_pool_id = Some(input.identity_pool_id.clone());
+        let outcome = self.update(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::serde_json::json!({
+                        "identityPoolId": output.identity_pool_id,
+                        "identityPoolName": output.identity_pool_name,
+                    })
+                }),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPool<Eng> {
+    /// The update itself: authorize, then rewrite the stored pool.
+    async fn update(
+        &self,
+        input: UpdateIdentityPoolInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<UpdateIdentityPoolOutput, UpdateIdentityPoolError> {
         // Authorization comes first, before the pool is read or written: this operation is
         // served only to a caller whose identity-based IAM policies allow its own action on
         // the pool the request names.
         if let Some(denied) = crate::state::authorization::denied(
             &*self.engine,
             ctx,
-            Self::NAME,
+            <Self as smithy_server_runtime::Operation>::NAME,
             Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
         ) {
             return Err(denied);

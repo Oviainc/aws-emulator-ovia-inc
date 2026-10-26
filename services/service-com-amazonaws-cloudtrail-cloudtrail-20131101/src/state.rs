@@ -49,10 +49,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
 use service_common::management_events::{
-    AuditedResource, ManagementEventLog, ServedApiCall, PRINCIPAL_TYPE_ASSUMED_ROLE,
-    PRINCIPAL_TYPE_IAM_USER, PRINCIPAL_TYPE_UNKNOWN,
+    recorded_caller, recorded_user_agent, AuditedResource, ManagementEventLog, ServedApiCall,
 };
-use smithy_server_runtime::OperationError;
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventDataStore,
@@ -3704,20 +3702,10 @@ pub const EVENT_SOURCE: &str = "cloudtrail.amazonaws.com";
 /// CloudTrail reports it in an event's `Resources`.
 pub const TRAIL_RESOURCE_TYPE: &str = "AWS::CloudTrail::Trail";
 
-/// The IAM user name a long-term access key speaks for in this emulator.
-///
-/// The emulator publishes ONE long-term credential, and it belongs to the IAM user
-/// `user/emulator` — the identity STS answers `GetCallerIdentity` with for a caller
-/// presenting it. CloudTrail reports that name as an event's `Username`, which is what a
-/// lookup by the `Username` attribute filters on. A request signed with a TEMPORARY
-/// credential speaks for a session whose role name this service cannot resolve, so it is
-/// recorded without a user name rather than with a guessed one.
-pub const AMBIENT_USER_NAME: &str = "emulator";
-
-/// The access-key-id prefix of a temporary (session) credential, from the IAM
-/// "unique identifier prefixes" table: `ASIA` for a temporary access key, `AKIA` for an
-/// IAM user's long-term one.
-const TEMPORARY_ACCESS_KEY_PREFIX: &str = "ASIA";
+/// The IAM user name a long-term access key speaks for in this emulator — the shared
+/// fact, re-exported so this service's own reader of it keeps reaching it through
+/// `crate::state`.
+pub use service_common::management_events::AMBIENT_USER_NAME;
 
 /// What a handler reports about the call it has just served, for the audit record.
 pub struct ServedCall<'a> {
@@ -3740,40 +3728,12 @@ pub struct ServedCall<'a> {
     pub error_message: Option<String>,
 }
 
-/// The `requestParameters` / `responseElements` of an audit record, from the members a
-/// request carried or a response answered with.
-///
-/// A member that was ABSENT is left out rather than recorded as null: CloudTrail records
-/// what the call actually carried, so a lookup reading the event back cannot tell an
-/// absent member from one explicitly set to null if nulls are written. Members are named
-/// as the event document names them — the modelled member name with a lower-case first
-/// letter.
-pub fn recorded_members<const N: usize>(
-    members: [(&str, ::serde_json::Value); N],
-) -> ::serde_json::Value {
-    members
-        .into_iter()
-        .filter(|(_, value)| !value.is_null())
-        .map(|(name, value)| (name.to_string(), value))
-        .collect::<::serde_json::Map<String, ::serde_json::Value>>()
-        .into()
-}
-
-/// The wire error code and message an outcome carries: `(None, None)` for a success.
-///
-/// Read off the operation's own error channel, so the recorded code is exactly the one
-/// the caller was answered with.
-pub fn failure_of<T, E: OperationError + ::std::fmt::Display>(
-    outcome: &Result<T, E>,
-) -> (Option<String>, Option<String>) {
-    match outcome {
-        Ok(_) => (None, None),
-        Err(error) => (
-            Some(error.shape_name().to_string()),
-            Some(error.to_string()),
-        ),
-    }
-}
+/// The `requestParameters` / `responseElements` of an audit record, and the error code
+/// and message a failed call was answered with: the SHARED writers every service that
+/// records a call uses ([`service_common::management_events`]), re-exported so this
+/// service's handlers reach them through `crate::state` beside
+/// [`record_management_event`].
+pub use service_common::management_events::{recorded_failure, recorded_members};
 
 /// The resources an audit record reports for a call that addressed one trail.
 ///
@@ -3817,28 +3777,25 @@ pub fn record_management_event<Eng: Send + Sync + 'static>(
         );
         return;
     };
-    let access_key_id = caller_access_key_id(parts);
-    let principal_type = match access_key_id.as_deref() {
-        None => PRINCIPAL_TYPE_UNKNOWN,
-        Some(key) if key.starts_with(TEMPORARY_ACCESS_KEY_PREFIX) => PRINCIPAL_TYPE_ASSUMED_ROLE,
-        Some(_) => PRINCIPAL_TYPE_IAM_USER,
-    };
-    let user_name = (principal_type == PRINCIPAL_TYPE_IAM_USER).then(|| AMBIENT_USER_NAME.to_string());
+    let caller = recorded_caller(parts);
     log.lock().record(
         ServedApiCall {
             event_name: call.operation.to_string(),
             event_source: EVENT_SOURCE.to_string(),
             aws_region: call.region.to_string(),
             read_only: call.read_only,
-            access_key_id,
-            user_name,
-            principal_type: principal_type.to_string(),
+            access_key_id: caller.access_key_id,
+            user_name: caller.user_name,
+            principal_type: caller.principal_type.to_string(),
+            // The unique id of the IAM entity a long-term key speaks for is IAM's to
+            // mint, and this service does not resolve one, so the record leaves it out
+            // rather than naming a principal nothing resolves.
+            principal_id: None,
+            // A call to this service is signed with an AWS credential, so its caller is
+            // no federated user an external provider authenticated.
+            identity_provider: None,
             account_id: ::engine::emulator_account_id().to_string(),
-            user_agent: parts
-                .headers
-                .get(http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string),
+            user_agent: recorded_user_agent(parts),
             resources: call.resources,
             request_parameters: call.request_parameters,
             response_elements: call.response_elements,
@@ -3849,15 +3806,3 @@ pub fn record_management_event<Eng: Send + Sync + 'static>(
     );
 }
 
-/// The access key id the request was signed with, or `None` for an unsigned request.
-///
-/// `extract_akid` answers the sentinel `"default"` when the request carried no SigV4
-/// credential at all, which names no caller — so it is reported as an absent key rather
-/// than as one with that id.
-pub fn caller_access_key_id(parts: &http::request::Parts) -> Option<String> {
-    let access_key_id = ::engine::extract_akid(&parts.headers);
-    (access_key_id != UNSIGNED_ACCESS_KEY_ID).then_some(access_key_id)
-}
-
-/// What `extract_akid` answers for a request that carried no SigV4 credential.
-const UNSIGNED_ACCESS_KEY_ID: &str = "default";

@@ -13,8 +13,9 @@
 //! Nothing here names a wire shape or a Smithy type: a reader projects a
 //! [`ManagementEvent`] onto the shapes ITS model declares (CloudTrail's `Event` /
 //! `Resource`). What lives here is the record, the JSON form of a CloudTrail event
-//! ([`ManagementEvent::to_cloudtrail_event_json`]) and the bounds that keep the log from
-//! growing without end.
+//! ([`ManagementEvent::to_cloudtrail_event_json`]), the writers every recording service
+//! shares ([`recorded_caller`], [`recorded_members`], [`recorded_failure`]) and the
+//! bounds that keep the log from growing without end.
 //!
 //! The log is BOUNDED twice over, because every call may add to it:
 //!
@@ -74,6 +75,109 @@ pub const PRINCIPAL_TYPE_ASSUMED_ROLE: &str = "AssumedRole";
 /// identity from.
 pub const PRINCIPAL_TYPE_UNKNOWN: &str = "Unknown";
 
+/// The IAM user name a long-term access key speaks for in this emulator.
+///
+/// The emulator publishes ONE long-term credential, and it belongs to the IAM user
+/// `user/emulator` — the identity STS answers `GetCallerIdentity` with for a caller
+/// presenting it. CloudTrail reports that name as an event's `Username`, which is what a
+/// lookup by the `Username` attribute filters on. A request signed with a TEMPORARY
+/// credential speaks for a session whose role name a serving service cannot resolve, so
+/// it is recorded without a user name rather than with a guessed one.
+pub const AMBIENT_USER_NAME: &str = "emulator";
+
+/// The access-key-id prefix of a temporary (session) credential, from the IAM
+/// "unique identifier prefixes" table: `ASIA` for a temporary access key, `AKIA` for an
+/// IAM user's long-term one.
+const TEMPORARY_ACCESS_KEY_PREFIX: &str = "ASIA";
+
+/// What `extract_akid` answers for a request that carried no SigV4 credential.
+const UNSIGNED_ACCESS_KEY_ID: &str = "default";
+
+/// Who made the call, as a record names them: the three `userIdentity` facts a serving
+/// service can read off the request itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedCaller {
+    /// The access key id the request was signed with, when it carried one.
+    pub access_key_id: Option<String>,
+    /// `userIdentity.type` — one of the `PRINCIPAL_TYPE_*` constants.
+    pub principal_type: &'static str,
+    /// The user name the caller speaks for, when the emulator can resolve one.
+    pub user_name: Option<String>,
+}
+
+/// Who made the request, from the credential scope it was signed with.
+///
+/// ONE rule for every service that records a call, so two services recording the same
+/// caller report the same `userIdentity`. An unsigned request names no caller:
+/// `extract_akid` answers the sentinel `"default"` for one, which is reported as an
+/// ABSENT key and the unknown principal type rather than as a key with that id.
+pub fn recorded_caller(parts: &http::request::Parts) -> RecordedCaller {
+    let access_key_id = ::emulator_server::extract_akid(&parts.headers);
+    let access_key_id = (access_key_id != UNSIGNED_ACCESS_KEY_ID).then_some(access_key_id);
+    let principal_type = match access_key_id.as_deref() {
+        None => PRINCIPAL_TYPE_UNKNOWN,
+        Some(key) if key.starts_with(TEMPORARY_ACCESS_KEY_PREFIX) => PRINCIPAL_TYPE_ASSUMED_ROLE,
+        Some(_) => PRINCIPAL_TYPE_IAM_USER,
+    };
+    RecordedCaller {
+        access_key_id,
+        principal_type,
+        user_name: (principal_type == PRINCIPAL_TYPE_IAM_USER)
+            .then(|| AMBIENT_USER_NAME.to_string()),
+    }
+}
+
+/// The request's `User-Agent`, when it sent one — an event's `userAgent`.
+pub fn recorded_user_agent(parts: &http::request::Parts) -> Option<String> {
+    parts
+        .headers
+        .get(http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
+/// The `requestParameters` / `responseElements` of a record, from the members a request
+/// carried or a response answered with.
+///
+/// A member that was ABSENT is left out rather than recorded as null: CloudTrail records
+/// what the call actually carried, so a lookup reading the event back cannot tell an
+/// absent member from one explicitly set to null if nulls are written. Members are named
+/// as the event document names them — the modelled member name with a lower-case first
+/// letter.
+pub fn recorded_members<const N: usize>(
+    members: [(&str, serde_json::Value); N],
+) -> serde_json::Value {
+    members
+        .into_iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(name, value)| (name.to_string(), value))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into()
+}
+
+/// The wire error code and message an outcome carries: `(None, None)` for a success.
+///
+/// Read off the operation's own error channel, so the recorded code is exactly the one
+/// the caller was answered with. The modelled error's `Display` prefixes its shape name,
+/// which the record already carries as its `errorCode`, so the message is recorded
+/// alone.
+pub fn recorded_failure<T, E>(outcome: &Result<T, E>) -> (Option<String>, Option<String>)
+where
+    E: ::smithy_server_runtime::OperationError + std::fmt::Display,
+{
+    match outcome {
+        Ok(_) => (None, None),
+        Err(error) => {
+            let rendered = error.to_string();
+            let message = rendered
+                .strip_prefix(&format!("{}: ", error.shape_name()))
+                .unwrap_or(&rendered)
+                .to_string();
+            (Some(error.shape_name().to_string()), Some(message))
+        }
+    }
+}
+
 /// One resource an event refers to: the pair CloudTrail reports in an event's
 /// `Resources`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +218,15 @@ pub struct ServedApiCall {
     pub user_name: Option<String>,
     /// `userIdentity.type` — one of the `PRINCIPAL_TYPE_*` constants.
     pub principal_type: String,
+    /// The unique identifier of the entity that made the call, as CloudTrail reports it in
+    /// `userIdentity.principalId`. `None` for a caller whose principal this emulator
+    /// cannot identify, which is what leaves the field out of the record.
+    pub principal_id: Option<String>,
+    /// The EXTERNAL identity provider that authenticated the caller, for a call made on
+    /// behalf of a federated user: CloudTrail reports it as `userIdentity.identityProvider`
+    /// ("the principal name of the external identity provider"). `None` for a caller this
+    /// account authenticated itself, which is every call signed with an AWS credential.
+    pub identity_provider: Option<String>,
     /// The account the call was served for.
     pub account_id: String,
     /// The request's `User-Agent`, when it sent one.
@@ -176,6 +289,12 @@ impl ManagementEvent {
             "accountId".to_string(),
             serde_json::Value::String(call.account_id.clone()),
         );
+        if let Some(principal_id) = &call.principal_id {
+            identity.insert(
+                "principalId".to_string(),
+                serde_json::Value::String(principal_id.clone()),
+            );
+        }
         if let Some(access_key_id) = &call.access_key_id {
             identity.insert(
                 "accessKeyId".to_string(),
@@ -186,6 +305,12 @@ impl ManagementEvent {
             identity.insert(
                 "userName".to_string(),
                 serde_json::Value::String(user_name.clone()),
+            );
+        }
+        if let Some(identity_provider) = &call.identity_provider {
+            identity.insert(
+                "identityProvider".to_string(),
+                serde_json::Value::String(identity_provider.clone()),
             );
         }
 
@@ -374,6 +499,8 @@ mod tests {
             access_key_id: Some("AKIDEMULATOR".to_string()),
             user_name: Some("emulator".to_string()),
             principal_type: PRINCIPAL_TYPE_IAM_USER.to_string(),
+            principal_id: None,
+            identity_provider: None,
             account_id: "000000000000".to_string(),
             user_agent: None,
             resources: vec![AuditedResource::new("AWS::CloudTrail::Trail", "demo")],
@@ -513,6 +640,77 @@ mod tests {
             json.pointer("/userIdentity/userName"),
             Some(&serde_json::json!("emulator")),
             "case userIdentity: expected the caller's user name, got {json}"
+        );
+    }
+
+    /// The caller a record names comes from the credential scope the request was signed
+    /// with: a long-term key speaks for the emulator's IAM user, a temporary one for a
+    /// session whose role name nothing here resolves, and an unsigned request for nobody.
+    #[test]
+    fn the_recorded_caller_follows_the_credential_the_request_carried() {
+        // The rows differ along the kind of credential presented, which is what the
+        // access-key-id prefix carries.
+        for (case, authorization, access_key_id, principal_type, user_name) in [
+            (
+                "a long-term key",
+                Some("AKIAEXAMPLEKEY123456"),
+                Some("AKIAEXAMPLEKEY123456"),
+                PRINCIPAL_TYPE_IAM_USER,
+                Some(AMBIENT_USER_NAME),
+            ),
+            (
+                "a session key",
+                Some("ASIAEXAMPLEKEY123456"),
+                Some("ASIAEXAMPLEKEY123456"),
+                PRINCIPAL_TYPE_ASSUMED_ROLE,
+                None,
+            ),
+            ("an unsigned request", None, None, PRINCIPAL_TYPE_UNKNOWN, None),
+        ] {
+            let mut request = http::Request::builder().uri("https://example.amazonaws.com/");
+            if let Some(key) = authorization {
+                request = request.header(
+                    "authorization",
+                    format!(
+                        "AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/s3/aws4_request, \
+                         SignedHeaders=host, Signature=0"
+                    ),
+                );
+            }
+            let (parts, ()) = request.body(()).expect("the request builds").into_parts();
+            let caller = recorded_caller(&parts);
+            assert_eq!(
+                caller.access_key_id.as_deref(),
+                access_key_id,
+                "case {case:?}: expected access key {access_key_id:?}, got {caller:?}"
+            );
+            assert_eq!(
+                caller.principal_type, principal_type,
+                "case {case:?}: expected principal type {principal_type:?}, got {caller:?}"
+            );
+            assert_eq!(
+                caller.user_name.as_deref(),
+                user_name,
+                "case {case:?}: expected user name {user_name:?}, got {caller:?}"
+            );
+        }
+    }
+
+    /// A member the call did not carry is left OUT of the record, so a reader cannot
+    /// mistake an absent member for one that was sent as null.
+    #[test]
+    fn recorded_members_leave_out_what_was_absent() {
+        let members = recorded_members([
+            ("name", serde_json::json!("demo")),
+            ("count", serde_json::json!(0)),
+            ("enabled", serde_json::json!(false)),
+            ("absent", serde_json::Value::Null),
+            ("alsoAbsent", serde_json::json!(None::<String>)),
+        ]);
+        assert_eq!(
+            members,
+            serde_json::json!({"name": "demo", "count": 0, "enabled": false}),
+            "expected only the members that were carried, got {members}"
         );
     }
 }

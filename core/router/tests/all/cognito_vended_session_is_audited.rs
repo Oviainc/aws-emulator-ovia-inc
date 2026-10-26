@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The audit leg of a Cognito-vended session, across four services on one engine.
+//! The audit leg of a Cognito-vended session, across four services on one engine, and the
+//! audit leg of the identity-pool administration that set it up.
 //!
 //! RULE: the credentials an identity pool vends are an `sts:AssumeRoleWithWebIdentity`
 //! session of the pool's resolved role, so the assume is recorded in the account's
@@ -9,6 +10,11 @@
 //! of — and the vend itself is recorded as this service's own `GetCredentialsForIdentity`
 //! event. A vend the role's trust policy does NOT admit assumes nothing, so it records the
 //! refused vend and no assume at all.
+//!
+//! RULE, the control-plane leg: a Cognito Identity control-plane call is a management
+//! event of that service, so `cloudtrail:LookupEvents` reports it under the operation's
+//! own `eventName` with `eventSource` `cognito-identity.amazonaws.com`, the members the
+//! request carried, and the `readOnly` its kind implies.
 //!
 //! Only a cross-service suite can pin this: the role is written by `iam:CreateRole`, the
 //! session is minted by the vend and resolved by `sts:GetCallerIdentity`, and the record is
@@ -328,6 +334,21 @@ fn lookup(
         .collect()
 }
 
+/// `cognito-identity:DescribeIdentityPool`, answering what it reported.
+fn describe_pool(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_id: &str,
+) -> Answer {
+    rpc(
+        router,
+        runtime,
+        Some("cognito-identity"),
+        "AWSCognitoIdentityService.DescribeIdentityPool",
+        &json!({"IdentityPoolId": pool_id}),
+    )
+}
+
 #[test]
 fn a_vended_session_and_its_assume_are_auditable() {
     std::thread::Builder::new()
@@ -447,6 +468,17 @@ fn a_vended_session_and_its_assume_are_auditable() {
                     Some(&json!(REGION)),
                     "case {case:?}: the record is in the pool's Region, got {event}"
                 );
+                assert_eq!(
+                    event.pointer("/userIdentity/type"),
+                    Some(&json!("WebIdentityUser")),
+                    "case {case:?}: the assume was made for a federated user, got {event}"
+                );
+                assert_eq!(
+                    event.pointer("/userIdentity/identityProvider"),
+                    Some(&json!("cognito-identity.amazonaws.com")),
+                    "case {case:?}: the record names the provider that authenticated the \
+                     user, got {event}"
+                );
             }
 
             // Both vends are auditable as this service's own call, and the refused one
@@ -498,4 +530,109 @@ fn a_vended_session_and_its_assume_are_auditable() {
         .expect("spawn the vended-session audit thread")
         .join()
         .expect("a vended session and its assume must be auditable");
+}
+
+/// RULE: a Cognito Identity CONTROL-PLANE call is a management event of this service, so
+/// `cloudtrail:LookupEvents` reports it under the operation's own name with
+/// `eventSource` `cognito-identity.amazonaws.com` and the members the request carried —
+/// which is what lets a client audit identity-pool administration, and what lets a
+/// pipeline use its own write as a liveness barrier before judging a later event's
+/// absence.
+///
+/// Only a cross-service suite can pin this: the record is written by the service that
+/// SERVES the call and read back through CloudTrail, two services over ONE engine.
+#[test]
+fn cognito_control_plane_calls_are_in_event_history() {
+    std::thread::Builder::new()
+        .name("cognito-control-plane-audit".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+            let mut router = build_router(engine);
+            router.set_request_authentication(false);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+
+            let pool_name = "audited-control-plane";
+            let pool_id = create_pool(&router, &runtime, pool_name);
+            let described = describe_pool(&router, &runtime, &pool_id);
+            assert_eq!(
+                described.status,
+                200,
+                "the describe must be served, got {} with {:?}",
+                described.status,
+                described.text()
+            );
+
+            // The rows are the two control-plane calls that were made, each found the way
+            // a client finds it — a lookup by event name — and each checked for the member
+            // of ITS request that the record must carry.
+            for (case, event_name, member, expected) in [
+                (
+                    "the create",
+                    "CreateIdentityPool",
+                    "identityPoolName",
+                    pool_name.to_string(),
+                ),
+                (
+                    "the describe",
+                    "DescribeIdentityPool",
+                    "identityPoolId",
+                    pool_id.clone(),
+                ),
+            ] {
+                let found = lookup(&router, &runtime, "EventName", event_name);
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "case {case:?}: exactly one {event_name} was made, got {found:?}"
+                );
+                let event = &found[0];
+                assert_eq!(
+                    event.get("eventSource"),
+                    Some(&json!("cognito-identity.amazonaws.com")),
+                    "case {case:?}: the record names Cognito Identity as its source, got \
+                     {event}"
+                );
+                assert_eq!(
+                    event.pointer(&format!("/requestParameters/{member}")),
+                    Some(&json!(expected)),
+                    "case {case:?}: requestParameters.{member} must be {expected:?}, got \
+                     {event}"
+                );
+                assert_eq!(
+                    event.get("errorCode"),
+                    None,
+                    "case {case:?}: a served call carries no error code, got {event}"
+                );
+                assert_eq!(
+                    event.get("awsRegion"),
+                    Some(&json!(REGION)),
+                    "case {case:?}: the record is in the Region the call was served in, \
+                     got {event}"
+                );
+            }
+
+            // The create CHANGED the account and the describe only reported it, which is
+            // what `readOnly` tells apart and what a lookup can filter on.
+            for (case, event_name, read_only) in [
+                ("the create", "CreateIdentityPool", false),
+                ("the describe", "DescribeIdentityPool", true),
+            ] {
+                let found = lookup(&router, &runtime, "ReadOnly", &read_only.to_string());
+                let names: Vec<&str> = found
+                    .iter()
+                    .filter_map(|event| event.get("eventName").and_then(Value::as_str))
+                    .collect();
+                assert!(
+                    names.contains(&event_name),
+                    "case {case:?}: a lookup for readOnly={read_only} reports it, got \
+                     {names:?}"
+                );
+            }
+        })
+        .expect("spawn the control-plane audit thread")
+        .join()
+        .expect("Cognito Identity control-plane calls must be in event history");
 }

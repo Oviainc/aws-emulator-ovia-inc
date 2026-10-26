@@ -38,11 +38,22 @@ impl Emulator {
     }
 
     /// Call one operation and return its HTTP status with the parsed JSON body (`Null`
-    /// for an empty body).
+    /// for an empty body), signed for [`DEFAULT_REGION`].
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call_in(DEFAULT_REGION, operation, body).await
+    }
+
+    /// The same call, signed for `region`: the SigV4 credential scope's Region, which is
+    /// the Region the call is served in.
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://cognito-identity.us-east-1.amazonaws.com/")
+            .uri(format!("https://cognito-identity.{region}.amazonaws.com/"))
             .header("content-type", "application/x-amz-json-1.1")
             .header(
                 "x-amz-target",
@@ -53,9 +64,11 @@ impl Emulator {
             // the emulator is started with authentication on.
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=EMULATORTESTKEY12345/20260101/us-east-1/cognito-identity/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential=EMULATORTESTKEY12345/20260101/{region}/cognito-identity/aws4_request, \
+                     SignedHeaders=host;x-amz-target, Signature=0"
+                ),
             )
             .body(bytes::Bytes::from(
                 serde_json::to_vec(body).expect("the request body serializes"),
@@ -75,6 +88,18 @@ impl Emulator {
             })
         };
         (status, parsed)
+    }
+
+    /// Every event recorded in the account's management-event log of the SAME shared
+    /// engine, oldest first, as the JSON document CloudTrail reports in an event's
+    /// `CloudTrailEvent`.
+    pub(crate) fn recorded_events(&self) -> Vec<Value> {
+        self.engine
+            .state::<service_common::management_events::ManagementEventLog>()
+            .lock()
+            .iter()
+            .map(|event| event.to_cloudtrail_event_json())
+            .collect()
     }
 
     /// Call an operation that must succeed, returning its output object.
@@ -267,6 +292,9 @@ pub(crate) fn non_empty(map: &Value) -> bool {
 
 /// A well-formed `IdentityPoolId` that no pool was ever created with.
 pub(crate) const ABSENT_POOL_ID: &str = "us-east-1:00000000-0000-0000-0000-000000000000";
+
+/// The Region every call this harness makes is signed for unless a suite names another.
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 /// A well-formed `IdentityId` that no `GetId` ever minted.
 const ABSENT_IDENTITY_ID: &str = "us-east-1:11111111-1111-1111-1111-111111111111";
 

@@ -163,13 +163,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused call is recorded with the error code its caller was
+        // answered with.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            ("resourceArn", ::serde_json::json!(input.resource_arn)),
+            ("tags", ::serde_json::json!(input.tags)),
+        ]);
+        let region = crate::state::request_region(ctx.parts());
+        // The resource the call addressed is the pool its `ResourceArn` names, and an ARN
+        // that names no pool of this service addressed none.
+        let identity_pool_id = crate::state::identity_pool_id_from_arn(&input.resource_arn)
+            .map(ToString::to_string);
+        let outcome = self.tag(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                response_elements: None,
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> {
+    /// The write itself: authorize, validate the tags and store them on the pool.
+    async fn tag(
+        &self,
+        input: TagResourceInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<TagResourceOutput, TagResourceError> {
         // Authorization comes first, before the pool the `ResourceArn` names is looked up:
         // this operation is served only to a caller whose identity-based IAM policies allow
         // its own action on the resource the request names.
         if let Some(denied) = crate::state::authorization::denied(
             &*self.engine,
             ctx,
-            Self::NAME,
+            <Self as smithy_server_runtime::Operation>::NAME,
             Some(&input.resource_arn),
         ) {
             return Err(denied);

@@ -187,13 +187,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused call is recorded with the error code its caller was
+        // answered with.
+        let request_parameters = recorded_request(&input);
+        let region = crate::state::request_region(ctx.parts());
+        let identity_pool_id = Some(input.identity_pool_id.clone());
+        let outcome = self.set_roles(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                // This operation answers an empty body, so there is nothing to report.
+                response_elements: None,
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+/// The `requestParameters` this call's audit record carries: the role configuration the
+/// request sent, which is the developer's own configuration and carries no secret.
+fn recorded_request(input: &SetIdentityPoolRolesInput) -> ::serde_json::Value {
+    let role_mappings = input.role_mappings.as_ref().map(|role_mappings| {
+        role_mappings
+            .iter()
+            .map(|(provider, mapping)| {
+                let rules = mapping.rules_configuration.as_ref().map(|configuration| {
+                    configuration
+                        .rules
+                        .iter()
+                        .map(|rule| {
+                            ::serde_json::json!({
+                                "claim": rule.claim,
+                                "matchType": rule.match_type,
+                                "value": rule.value,
+                                "roleARN": rule.role_arn,
+                            })
+                        })
+                        .collect::<Vec<::serde_json::Value>>()
+                });
+                (
+                    provider.clone(),
+                    ::service_common::management_events::recorded_members([
+                        ("type", ::serde_json::json!(mapping.r#type)),
+                        (
+                            "ambiguousRoleResolution",
+                            ::serde_json::json!(mapping.ambiguous_role_resolution),
+                        ),
+                        (
+                            "rulesConfiguration",
+                            ::serde_json::json!(rules.map(|rules| {
+                                ::serde_json::json!({"rules": rules})
+                            })),
+                        ),
+                    ]),
+                )
+            })
+            .collect::<::serde_json::Map<String, ::serde_json::Value>>()
+    });
+    ::service_common::management_events::recorded_members([
+        (
+            "identityPoolId",
+            ::serde_json::json!(input.identity_pool_id),
+        ),
+        ("roles", ::serde_json::json!(input.roles)),
+        ("roleMappings", ::serde_json::json!(role_mappings)),
+    ])
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetIdentityPoolRoles<Eng> {
+    /// The write itself: authorize, validate and replace the pool's role configuration.
+    async fn set_roles(
+        &self,
+        input: SetIdentityPoolRolesInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<SetIdentityPoolRolesOutput, SetIdentityPoolRolesError> {
         // Authorization comes first, before the pool's roles are read or written: this
         // operation is served only to a caller whose identity-based IAM policies allow its
         // own action on the pool the request names.
         if let Some(denied) = crate::state::authorization::denied(
             &*self.engine,
             ctx,
-            Self::NAME,
+            <Self as smithy_server_runtime::Operation>::NAME,
             Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
         ) {
             return Err(denied);

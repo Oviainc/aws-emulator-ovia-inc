@@ -625,6 +625,33 @@ async fn a_served_vend_is_audited_as_an_sts_web_identity_assume() {
             Some(&json!(VENDED_ROLE_SESSION_NAME)),
             "case {case:?}: the record names the session, got {event}"
         );
+        // The assume was made for a user a web identity provider authenticated, and the
+        // provider that authenticated them is the identity pool's own service principal.
+        assert_eq!(
+            event.pointer("/userIdentity/type"),
+            Some(&json!("WebIdentityUser")),
+            "case {case:?}: the record names a web-identity caller, got {event}"
+        );
+        assert_eq!(
+            event.pointer("/userIdentity/identityProvider"),
+            Some(&json!(COGNITO_PRINCIPAL)),
+            "case {case:?}: the record names the provider that authenticated the user, \
+             got {event}"
+        );
+        assert_eq!(
+            event.pointer("/userIdentity/principalId"),
+            Some(&json!(format!(
+                "{COGNITO_PRINCIPAL}:{pool_id}:{identity_id}"
+            ))),
+            "case {case:?}: the record names the principal the token identified, got \
+             {event}"
+        );
+        assert_eq!(
+            event.pointer("/userIdentity/userName"),
+            Some(&json!(identity_id)),
+            "case {case:?}: the record names the identity the assume was made for, got \
+             {event}"
+        );
         assert_eq!(
             event.pointer("/responseElements/audience"),
             Some(&json!(pool_id)),

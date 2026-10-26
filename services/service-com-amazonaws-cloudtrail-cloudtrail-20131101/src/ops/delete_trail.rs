@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let outcome = self.delete(input, &region);
 
-        let (error_code, error_message) = crate::state::failure_of(&outcome);
+        let (error_code, error_message) = crate::state::recorded_failure(&outcome);
         crate::state::record_management_event(
             &*self.engine,
             ctx.parts(),

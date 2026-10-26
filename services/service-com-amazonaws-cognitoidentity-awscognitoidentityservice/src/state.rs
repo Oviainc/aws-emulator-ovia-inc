@@ -1402,12 +1402,21 @@ pub fn record_vended_assume<Eng: Send + Sync + 'static>(
             access_key_id: None,
             user_name: Some(assume.identity_id.to_string()),
             principal_type: WEB_IDENTITY_PRINCIPAL_TYPE.to_string(),
+            // What identifies a federated user is the token that was exchanged: the
+            // provider that issued it, the audience it was issued for (the identity pool)
+            // and the subject it names (the identity), which is the principal the
+            // assumed session speaks for.
+            principal_id: Some(format!(
+                "{COGNITO_IDENTITY_PRINCIPAL}:{}:{}",
+                assume.identity_pool_id, assume.identity_id
+            )),
+            // The provider that authenticated the user the assume was made for is the
+            // identity pool's own service principal: the token the assume exchanged is one
+            // Amazon Cognito Identity issued, and `userIdentity.identityProvider` is the
+            // external provider's principal name.
+            identity_provider: Some(COGNITO_IDENTITY_PRINCIPAL.to_string()),
             account_id: ::engine::emulator_account_id().to_string(),
-            user_agent: parts
-                .headers
-                .get(http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string),
+            user_agent: ::service_common::management_events::recorded_user_agent(parts),
             resources: vec![::service_common::management_events::AuditedResource::new(
                 ROLE_RESOURCE_TYPE,
                 assume.role.arn.clone(),
@@ -1469,8 +1478,9 @@ const IDENTITY_POOL_RESOURCE_TYPE_NAME: &str = "AWS::Cognito::IdentityPool";
 /// `responseElements` at all.
 ///
 /// The caller of this operation presents no credential — "This is a public API. You do not
-/// need any credentials to call this API" (this operation's own doc) — so the record names
-/// no access key and no principal this emulator could resolve.
+/// need any credentials to call this API" (this operation's own doc) — so the record of an
+/// unsigned vend names no access key and no principal this emulator could resolve, which
+/// is what [`record_served_call`] reads off the request itself.
 pub fn record_vend<Eng: Send + Sync + 'static, T, E>(
     engine: &Eng,
     parts: &http::request::Parts,
@@ -1479,86 +1489,239 @@ pub fn record_vend<Eng: Send + Sync + 'static, T, E>(
 ) where
     E: ::smithy_server_runtime::OperationError + ::std::fmt::Display,
 {
-    let Some(log) = management_event_log(engine) else {
-        ::tracing::warn!("the engine carries no management-event log: the vend was served unrecorded");
-        return;
-    };
-    let (error_code, error_message) = match outcome {
-        Ok(_) => (None, None),
-        Err(error) => {
-            // The modelled error's `Display` prefixes its shape name, which the record
-            // already carries as its `errorCode`, so the message is recorded alone.
-            let rendered = error.to_string();
-            let message = rendered
-                .strip_prefix(&format!("{}: ", error.shape_name()))
-                .unwrap_or(&rendered)
-                .to_string();
-            (Some(error.shape_name().to_string()), Some(message))
-        }
-    };
-    let mut request_parameters = ::serde_json::Map::new();
-    request_parameters.insert(
-        "identityId".to_string(),
-        ::serde_json::Value::from(vend.identity_id),
-    );
-    if !vend.providers.is_empty() {
-        request_parameters.insert(
-            "logins".to_string(),
-            ::serde_json::Value::from(vend.providers.to_vec()),
-        );
-    }
-    if let Some(custom_role_arn) = vend.custom_role_arn {
-        request_parameters.insert(
-            "customRoleArn".to_string(),
-            ::serde_json::Value::from(custom_role_arn),
-        );
-    }
-    // The resource the call acted on is the pool the identity belongs to, whatever the
-    // call answered. A request naming an identity this service does not hold acted on no
-    // pool at all, so such a record names no resource rather than one built from an id
-    // nothing resolves.
-    let identity_pool_id = service_state(engine).and_then(|state| {
-        state
-            .lock()
-            .identities
-            .get(vend.identity_id)
-            .map(|identity| identity.identity_pool_id.clone())
-    });
-    log.lock().record(
-        ::service_common::management_events::ServedApiCall {
-            event_name: "GetCredentialsForIdentity".to_string(),
-            event_source: EVENT_SOURCE.to_string(),
+    let providers = (!vend.providers.is_empty()).then(|| vend.providers.to_vec());
+    record_served_call(
+        engine,
+        parts,
+        &ServedCall {
+            operation: "GetCredentialsForIdentity",
             // The Region the call was served in is the identity's own, which its
             // `REGION:GUID` id carries: the request names none, being unsigned.
-            aws_region: region_of(vend.identity_id).to_string(),
+            region: region_of(vend.identity_id),
             // A vend mints and stores a session, so it is not a reporting call.
             read_only: false,
-            access_key_id: None,
-            user_name: None,
-            principal_type: ::service_common::management_events::PRINCIPAL_TYPE_UNKNOWN
-                .to_string(),
+            // The resource the call acted on is the pool the identity belongs to,
+            // whatever the call answered.
+            identity_pool_id: identity_pool_of(engine, vend.identity_id),
+            request_parameters: ::service_common::management_events::recorded_members([
+                ("identityId", ::serde_json::json!(vend.identity_id)),
+                ("logins", ::serde_json::json!(providers)),
+                ("customRoleArn", ::serde_json::json!(vend.custom_role_arn)),
+            ]),
+            response_elements: None,
+        },
+        outcome,
+    );
+}
+
+/// What a handler of this service reports about the call it has just served, for that
+/// call's own audit record.
+pub struct ServedCall<'a> {
+    /// The operation's modelled name (`Self::NAME`), as the event's `eventName`.
+    pub operation: &'a str,
+    /// The Region the call was served in.
+    pub region: &'a str,
+    /// Whether the call only REPORTED state. CloudTrail records it as the event's
+    /// `readOnly`, which a lookup can filter on.
+    pub read_only: bool,
+    /// The identity pool the call addressed, when it addressed one: the resource the
+    /// event names. A request naming a pool this service does not hold still addressed
+    /// that pool, but one that names no pool at all records no resource rather than one
+    /// built from an id nothing resolves.
+    pub identity_pool_id: Option<String>,
+    /// The request's parameters, named as the event document names them (see
+    /// [`service_common::management_events::recorded_members`]).
+    pub request_parameters: ::serde_json::Value,
+    /// The values the response carried, for a response whose members are not secrets;
+    /// `None` for a call that answers nothing, or one whose answer is a credential.
+    pub response_elements: Option<::serde_json::Value>,
+}
+
+/// Record a call this service served in the account's management-event log, whatever it
+/// answered, so CloudTrail's `LookupEvents` reports it — with the error code and message
+/// its caller was answered with when it was refused.
+///
+/// EVERY call is recorded, a reporting one included, because the log is the account's
+/// record of the API calls that were MADE and not a projection of this service's
+/// resources: what a reporting call reports is untouched by its own record, and a client
+/// auditing identity-pool administration reads the reads as well as the writes (an
+/// event's `readOnly` is what tells the two apart, and what a lookup filters on).
+///
+/// Recording is best-effort by design, as every other recorder in this tree: an engine
+/// carrying no log (a unit test over a bare engine) still serves the call, because
+/// failing a caller because the audit log is unreachable would be a worse answer than
+/// serving it unrecorded.
+///
+/// No secret is written: a provider token, an OpenID token and a vended session are the
+/// caller's own and are left out of both `requestParameters` and `responseElements` by
+/// the handler that fills them.
+pub fn record_served_call<Eng: Send + Sync + 'static, T, E>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+    call: &ServedCall<'_>,
+    outcome: &Result<T, E>,
+) where
+    E: ::smithy_server_runtime::OperationError + ::std::fmt::Display,
+{
+    let Some(log) = management_event_log(engine) else {
+        // Not silent: an unrecorded call leaves no trace in the log by definition, so it
+        // leaves one here instead.
+        ::tracing::warn!(
+            operation = call.operation,
+            "the engine carries no management-event log: the call was served unrecorded"
+        );
+        return;
+    };
+    let (error_code, error_message) =
+        ::service_common::management_events::recorded_failure(outcome);
+    let caller = ::service_common::management_events::recorded_caller(parts);
+    log.lock().record(
+        ::service_common::management_events::ServedApiCall {
+            event_name: call.operation.to_string(),
+            event_source: EVENT_SOURCE.to_string(),
+            aws_region: call.region.to_string(),
+            read_only: call.read_only,
+            access_key_id: caller.access_key_id,
+            user_name: caller.user_name,
+            principal_type: caller.principal_type.to_string(),
+            // The unique id of the IAM entity a credential speaks for is IAM's to mint,
+            // and this service resolves none, so the record leaves it out rather than
+            // naming a principal nothing resolves.
+            principal_id: None,
+            // Every operation of this service is called either with an AWS credential or
+            // with none at all, so no caller of one is a federated user an external
+            // provider authenticated.
+            identity_provider: None,
             account_id: ::engine::emulator_account_id().to_string(),
-            user_agent: parts
-                .headers
-                .get(http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string),
-            resources: identity_pool_id
+            user_agent: ::service_common::management_events::recorded_user_agent(parts),
+            resources: call
+                .identity_pool_id
+                .as_deref()
                 .map(|identity_pool_id| {
                     ::service_common::management_events::AuditedResource::new(
                         IDENTITY_POOL_RESOURCE_TYPE_NAME,
-                        identity_pool_arn(&identity_pool_id),
+                        identity_pool_arn(identity_pool_id),
                     )
                 })
                 .into_iter()
                 .collect(),
-            request_parameters: request_parameters.into(),
-            response_elements: None,
+            request_parameters: call.request_parameters.clone(),
+            response_elements: call.response_elements.clone(),
             error_code,
             error_message,
         },
         SystemTime::now(),
     );
+}
+
+/// The pool an identity belongs to, for a call that names only the identity. `None` for
+/// an identity this service does not hold.
+pub fn identity_pool_of<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    identity_id: &str,
+) -> Option<String> {
+    service_state(engine).and_then(|state| {
+        state
+            .lock()
+            .identities
+            .get(identity_id)
+            .map(|identity| identity.identity_pool_id.clone())
+    })
+}
+
+/// The `Logins` provider NAMES a request presented, in the order the map holds them —
+/// what a record of a call carrying `Logins` reports as its `logins`, and `None` for a
+/// request that carried none.
+///
+/// The VALUES are left out because the model marks them secret: `LoginsMap`'s value
+/// targets `IdentityProviderToken`, which is `@sensitive`
+/// (`smithy_query(query="shape",shape="LoginsMap")`), so no record carries one.
+pub fn recorded_login_providers(
+    logins: Option<&::std::collections::HashMap<String, String>>,
+) -> Option<Vec<String>> {
+    let mut providers: Vec<String> = logins?.keys().cloned().collect();
+    providers.sort();
+    (!providers.is_empty()).then_some(providers)
+}
+
+/// What a request carrying a whole identity-pool configuration sent, for its audit
+/// record.
+///
+/// `CreateIdentityPool` and `UpdateIdentityPool` carry the SAME members — an update also
+/// names the pool it rewrites — so one writer serves both and the two records cannot
+/// drift apart. `SupportedLoginProviders` maps a provider name to the application id the
+/// DEVELOPER registered with that provider, which is the pool's configuration rather than
+/// a caller's secret, so it is recorded as sent.
+pub struct RecordedPoolRequest<'a> {
+    /// The pool the request rewrites, for an update; `None` for a create, which names
+    /// none.
+    pub identity_pool_id: Option<&'a str>,
+    pub identity_pool_name: &'a str,
+    pub allow_unauthenticated_identities: bool,
+    pub allow_classic_flow: Option<bool>,
+    pub supported_login_providers: Option<&'a ::std::collections::HashMap<String, String>>,
+    pub developer_provider_name: Option<&'a str>,
+    pub open_id_connect_provider_arns: Option<&'a [String]>,
+    pub cognito_identity_providers: Option<&'a [CognitoIdentityProvider]>,
+    pub saml_provider_arns: Option<&'a [String]>,
+    pub identity_pool_tags: Option<&'a ::std::collections::HashMap<String, String>>,
+}
+
+impl RecordedPoolRequest<'_> {
+    /// These members as the event document's `requestParameters`.
+    pub fn recorded(&self) -> ::serde_json::Value {
+        let providers = self.cognito_identity_providers.map(|providers| {
+            providers
+                .iter()
+                .map(|provider| {
+                    ::service_common::management_events::recorded_members([
+                        ("providerName", ::serde_json::json!(provider.provider_name)),
+                        ("clientId", ::serde_json::json!(provider.client_id)),
+                        (
+                            "serverSideTokenCheck",
+                            ::serde_json::json!(provider.server_side_token_check),
+                        ),
+                    ])
+                })
+                .collect::<Vec<::serde_json::Value>>()
+        });
+        ::service_common::management_events::recorded_members([
+            ("identityPoolId", ::serde_json::json!(self.identity_pool_id)),
+            (
+                "identityPoolName",
+                ::serde_json::json!(self.identity_pool_name),
+            ),
+            (
+                "allowUnauthenticatedIdentities",
+                ::serde_json::json!(self.allow_unauthenticated_identities),
+            ),
+            (
+                "allowClassicFlow",
+                ::serde_json::json!(self.allow_classic_flow),
+            ),
+            (
+                "supportedLoginProviders",
+                ::serde_json::json!(self.supported_login_providers),
+            ),
+            (
+                "developerProviderName",
+                ::serde_json::json!(self.developer_provider_name),
+            ),
+            (
+                "openIdConnectProviderARNs",
+                ::serde_json::json!(self.open_id_connect_provider_arns),
+            ),
+            ("cognitoIdentityProviders", ::serde_json::json!(providers)),
+            (
+                "samlProviderARNs",
+                ::serde_json::json!(self.saml_provider_arns),
+            ),
+            (
+                "identityPoolTags",
+                ::serde_json::json!(self.identity_pool_tags),
+            ),
+        ])
+    }
 }
 
 /// The account's management-event (audit) log in the SAME shared engine, the one store

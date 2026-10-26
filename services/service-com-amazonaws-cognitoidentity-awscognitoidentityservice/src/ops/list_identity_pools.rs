@@ -143,12 +143,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused listing is recorded with the error code its caller was
+        // answered with. The listing reports the pools and leaves them as they were.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            ("maxResults", ::serde_json::json!(input.max_results)),
+            ("nextToken", ::serde_json::json!(input.next_token)),
+        ]);
+        let region = crate::state::request_region(ctx.parts());
+        let outcome = self.list(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: true,
+                // A listing of the account's pools names no single pool.
+                identity_pool_id: None,
+                request_parameters,
+                response_elements: None,
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListIdentityPools<Eng> {
+    /// The listing itself: authorize, then report one page of the stored pools.
+    async fn list(
+        &self,
+        input: ListIdentityPoolsInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<ListIdentityPoolsOutput, ListIdentityPoolsError> {
         // Authorization comes first: a listing of the account's pools names no single pool,
         // so it is decided against (and refused about) the account's identity pools in the
         // region the request is signed for.
-        if let Some(denied) =
-            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
-        {
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            None,
+        ) {
             return Err(denied);
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {

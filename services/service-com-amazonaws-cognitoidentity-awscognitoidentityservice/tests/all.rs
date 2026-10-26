@@ -15,6 +15,8 @@
 mod anonymous_credential_exchange;
 #[path = "all/anonymous_credential_vend.rs"]
 mod anonymous_credential_vend;
+#[path = "all/control_plane_audit.rs"]
+mod control_plane_audit;
 #[path = "all/developer_credentials_authorization.rs"]
 mod developer_credentials_authorization;
 #[path = "all/developer_identity_tokens.rs"]

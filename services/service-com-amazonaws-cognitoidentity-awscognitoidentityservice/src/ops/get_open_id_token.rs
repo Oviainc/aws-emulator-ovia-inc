@@ -177,6 +177,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused call is recorded with the error code its caller was
+        // answered with. The token the served call answers is a credential (`OIDCToken` is
+        // `@sensitive`), so the record names the identity and not the token.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            ("identityId", ::serde_json::json!(input.identity_id)),
+            (
+                "logins",
+                ::serde_json::json!(crate::state::recorded_login_providers(
+                    input.logins.as_ref()
+                )),
+            ),
+        ]);
+        // Being unsigned, the request names no Region: the identity's own id carries the
+        // one the call is served in.
+        let region = crate::state::region_of(&input.identity_id).to_string();
+        // The resource the call acted on is the pool the identity belongs to.
+        let identity_pool_id = crate::state::identity_pool_of(&*self.engine, &input.identity_id);
+        let outcome = self.mint(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                // Minting a token stores it, so this is not a reporting call.
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::service_common::management_events::recorded_members([(
+                        "identityId",
+                        ::serde_json::json!(output.identity_id),
+                    )])
+                }),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<Eng> {
+    /// The call itself: resolve the identity and mint its OpenID token.
+    async fn mint(
+        &self,
+        input: GetOpenIdTokenInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<GetOpenIdTokenOutput, GetOpenIdTokenError> {
         // "This is a public API. You do not need any credentials to call this API" (this
         // operation's own doc), so no principal is resolved and no identity-based policy is
         // consulted: `ctx` carries nothing this handler needs.

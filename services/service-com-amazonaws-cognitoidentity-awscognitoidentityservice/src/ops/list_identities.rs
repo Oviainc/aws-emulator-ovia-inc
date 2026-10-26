@@ -149,13 +149,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused listing is recorded with the error code its caller was
+        // answered with. The listing reports the pool's identities and leaves them as they
+        // were.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            (
+                "identityPoolId",
+                ::serde_json::json!(input.identity_pool_id),
+            ),
+            ("maxResults", ::serde_json::json!(input.max_results)),
+            ("nextToken", ::serde_json::json!(input.next_token)),
+            ("hideDisabled", ::serde_json::json!(input.hide_disabled)),
+        ]);
+        let region = crate::state::request_region(ctx.parts());
+        let identity_pool_id = Some(input.identity_pool_id.clone());
+        let outcome = self.list(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: true,
+                identity_pool_id,
+                request_parameters,
+                response_elements: None,
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListIdentities<Eng> {
+    /// The listing itself: authorize, then report one page of the pool's identities.
+    async fn list(
+        &self,
+        input: ListIdentitiesInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<ListIdentitiesOutput, ListIdentitiesError> {
         // Authorization comes first, before the pool is read: this operation is served
         // only to a caller whose identity-based IAM policies allow its own action on the
         // pool the request names.
         if let Some(denied) = crate::state::authorization::denied(
             &*self.engine,
             ctx,
-            Self::NAME,
+            <Self as smithy_server_runtime::Operation>::NAME,
             Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
         ) {
             return Err(denied);

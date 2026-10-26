@@ -215,30 +215,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered with. The assume the served vend makes is STS's own event and is
         // recorded where it happens.
         let outcome = self.vend(&input, ctx).await;
+        let providers = crate::state::recorded_login_providers(input.logins.as_ref());
         crate::state::record_vend(
             &*self.engine,
             ctx.parts(),
             &crate::state::ServedVend {
                 identity_id: &input.identity_id,
-                providers: &login_providers(&input),
+                providers: providers.as_deref().unwrap_or_default(),
                 custom_role_arn: input.custom_role_arn.as_deref(),
             },
             &outcome,
         );
         outcome
     }
-}
-
-/// The `Logins` provider NAMES a request presented, in the order the map holds them: what
-/// the audit record of a vend carries. The token VALUES are the caller's secrets, so none
-/// of them is recorded — the vend itself reads only the one presented under this service's
-/// own provider name, and only to decide whether its window is still open.
-fn login_providers(input: &GetCredentialsForIdentityInput) -> Vec<String> {
-    input
-        .logins
-        .iter()
-        .flat_map(|logins| logins.keys().cloned())
-        .collect()
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsForIdentity<Eng> {

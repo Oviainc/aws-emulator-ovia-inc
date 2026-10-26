@@ -123,6 +123,8 @@ fn served(event_name: &str, region: &str) -> ServedApiCall {
         access_key_id: Some(ACCESS_KEY_ID.to_string()),
         user_name: Some("emulator".to_string()),
         principal_type: PRINCIPAL_TYPE_IAM_USER.to_string(),
+        principal_id: None,
+        identity_provider: None,
         account_id: engine::emulator_account_id().to_string(),
         user_agent: None,
         resources: vec![AuditedResource::new(

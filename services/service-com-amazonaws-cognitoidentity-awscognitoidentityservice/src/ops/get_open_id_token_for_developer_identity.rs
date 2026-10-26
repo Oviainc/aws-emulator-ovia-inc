@@ -200,6 +200,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused call is recorded with the error code its caller was
+        // answered with. The token the served call answers is a credential
+        // (`OIDCToken` is `@sensitive`), so the record names the identity and not the
+        // token.
+        let request_parameters = ::service_common::management_events::recorded_members([
+            (
+                "identityPoolId",
+                ::serde_json::json!(input.identity_pool_id),
+            ),
+            ("identityId", ::serde_json::json!(input.identity_id)),
+            (
+                "logins",
+                ::serde_json::json!(crate::state::recorded_login_providers(Some(&input.logins))),
+            ),
+            ("principalTags", ::serde_json::json!(input.principal_tags)),
+            ("tokenDuration", ::serde_json::json!(input.token_duration)),
+        ]);
+        let region = crate::state::request_region(ctx.parts());
+        let identity_pool_id = Some(input.identity_pool_id.clone());
+        let outcome = self.exchange(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                identity_pool_id,
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::service_common::management_events::recorded_members([(
+                        "identityId",
+                        ::serde_json::json!(output.identity_id),
+                    )])
+                }),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
+    GetOpenIdTokenForDeveloperIdentity<Eng>
+{
+    /// The exchange itself: authorize, resolve or mint the identity, and mint its token.
+    async fn exchange(
+        &self,
+        input: GetOpenIdTokenForDeveloperIdentityInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<
+        GetOpenIdTokenForDeveloperIdentityOutput,
+        GetOpenIdTokenForDeveloperIdentityError,
+    > {
         // Authorization comes first, before any identity is minted: this is a
         // developer-credentials operation ("You must use Amazon Web Services developer
         // credentials to call this operation"), so it is served only to a caller whose
@@ -207,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(denied) = crate::state::authorization::denied(
             &*self.engine,
             ctx,
-            Self::NAME,
+            <Self as smithy_server_runtime::Operation>::NAME,
             Some(&crate::state::identity_pool_arn(&input.identity_pool_id)),
         ) {
             return Err(denied);

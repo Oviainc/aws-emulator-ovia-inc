@@ -373,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let outcome = self.create(input, &region);
 
-        let (error_code, error_message) = crate::state::failure_of(&outcome);
+        let (error_code, error_message) = crate::state::recorded_failure(&outcome);
         let response_elements = outcome.as_ref().ok().map(|created| {
             crate::state::recorded_members([
                 ("name", ::serde_json::json!(created.name)),
