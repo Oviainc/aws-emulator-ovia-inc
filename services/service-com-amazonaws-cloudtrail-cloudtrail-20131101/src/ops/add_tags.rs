@@ -20,7 +20,6 @@
 //!   appear twice, and no request may carry more than the 50-tag limit — so a tag a
 //!   caller cannot ask for is refused whether or not the ARN names anything;
 //! * a resource carries at most 50 tags, counted AFTER the merge;
-//! * a dashboard CloudTrail has not finished loading is not ready to be tagged;
 //! * an event data store awaiting deletion is inactive;
 //! * a trail or event data store that applies to all Regions is tagged only from its
 //!   home Region.
@@ -229,7 +228,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let request_region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
 
         // "Specifies the ARN of the trail, event data store, dashboard, or channel to
         // which one or more tags will be added": the resource is addressed only by
@@ -280,27 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // `ConflictException` is "thrown when the specified resource is not ready for
-        // an operation … before CloudTrail has time to fully load the resource": a
-        // dashboard still `CREATING` cannot be tagged. Settling it first materialises
-        // only the transition the clock already owed.
-        if let crate::state::TaggableArn::Dashboard { region, name } = &arn {
-            if let Some(dashboard) = store.dashboards.get_mut(&(name.clone(), region.clone())) {
-                dashboard.settle(now);
-                if dashboard.status == crate::state::DASHBOARD_STATUS_CREATING {
-                    return Err(AddTagsErrorModeled::ConflictException(ConflictException {
-                        message: Some(format!(
-                            "Dashboard {} is {} and is not ready to be tagged; wait for it \
-                             to be {} and try again",
-                            input.resource_id,
-                            crate::state::DASHBOARD_STATUS_CREATING,
-                            crate::state::DASHBOARD_STATUS_CREATED,
-                        )),
-                    })
-                    .into());
-                }
-            }
-        }
+        // A dashboard is tagged whatever `DashboardStatus` it reports: the dashboard
+        // `CreateDashboard` has returned is ready for the calls that address it, and
+        // the status it reports while CloudTrail finishes loading it refuses nothing.
+        // `ConflictException` is left for a resource another operation is modifying.
 
         // "You can tag a trail or event data store that applies to all Amazon Web
         // Services Regions only from the Region in which the trail or event data store
