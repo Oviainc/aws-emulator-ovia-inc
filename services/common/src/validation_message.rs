@@ -7,7 +7,7 @@
 //! words, because no model records them. [`aws_validation_refusal`] is the wording AWS
 //! itself uses, so a service only has to delegate to it.
 //!
-//! The ONE thing AWS words differently from the framework is how a `@pattern` requirement
+//! One thing AWS words differently from the framework is how a `@pattern` requirement
 //! is quoted, and that rendering is NOT implemented here: it is
 //! [`crate::validation::unanchored`], this crate's staged home for it, which every service
 //! carrying its own inlined copy is to migrate onto. This module only decides WHICH
@@ -29,29 +29,66 @@
 //! maximum is a schema finding about the object's property count rather than a clause
 //! about a member's length. [`property_count_refusal`] states that one, for a service
 //! whose recordings show it, and is asked before the envelope.
+//!
+//! The other difference this module owns is the VALUE half of a clause: a COLLECTION
+//! (list or map) whose `@length` was broken is stated with no value at all —
+//! `Value at '<member path>' failed to satisfy constraint: …` — where a scalar states the
+//! value it submitted. There is no scalar rendering of a list or a map, so none is
+//! invented.
 
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{Refusal, Refused};
 
 use crate::validation::unanchored;
 
-/// How many entries the framework's rendering of a MAP member states, when `stored` is
-/// one: the validating walk renders a map it length-checks as `<n> entries`
-/// (`aws_smithy_schema_server::constraints`'s collection-length check, which renders a
-/// list as `<n> items` and a map as `<n> entries`). `None` for anything else, so a
-/// clause whose echo is a caller's own string is never read as an entry count.
+/// The two suffixes the validating walk renders a COLLECTION's size with when it
+/// length-checks one: a list as `<n> items`, a map as `<n> entries`
+/// (`aws_smithy_schema_server::constraints`'s collection-length check).
+const COLLECTION_SIZE_SUFFIXES: [&str; 2] = [" items", " entries"];
+
+/// The size `stored` states when it is the walk's rendering of a collection ending in
+/// `suffix`, and `None` for anything else — so a clause whose echo is a caller's own
+/// string is never read as a size.
 ///
 /// The rendering is the ONLY signal available here: [`ViolationKind`] carries the
 /// constraint that was broken and not the KIND of shape that broke it
 /// (`vendor/smithy-schema-server/src/constraints.rs`), and the module header above states
 /// why that crate cannot be changed from here. The accepted collision is a STRING member
-/// whose submitted value is literally `<digits> entries` and whose `@length` maximum is
-/// below that string's length: such a refusal is stated as a property-count finding. No
+/// whose submitted value is literally `<digits> items`/`<digits> entries` and whose
+/// `@length` bound that string breaks: such a refusal is stated as a collection's. No
 /// emulated member admits that today (the shortest `@length` maximum is far above the
-/// eleven characters the shortest such string takes), and the alternative — reading the
+/// seven characters the shortest such string takes), and the alternative — reading the
 /// shape kind — needs the frozen crate.
+fn collection_size(stored: &str, suffix: &str) -> Option<usize> {
+    stored.strip_suffix(suffix)?.parse::<usize>().ok()
+}
+
+/// How many entries the framework's rendering of a MAP member states, when `stored` is
+/// one. `None` for a list's rendering and for a caller's own string.
 fn map_entry_count(stored: &str) -> Option<usize> {
-    stored.strip_suffix(" entries")?.parse::<usize>().ok()
+    collection_size(stored, " entries")
+}
+
+/// The clause a COLLECTION member's `@length` violation states — the framework's own,
+/// with the `Value '<…>'` half reduced to `Value` — or `None` when `violation` is not one.
+///
+/// A list or a map has no scalar rendering, so the clause names the member and the
+/// requirement and nothing else; the requirement half, the path and the envelope stay the
+/// framework's, so only the value half can differ.
+fn collection_length_clause(violation: &Violation) -> Option<String> {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return None;
+    }
+    let stored = violation.value.as_deref()?;
+    COLLECTION_SIZE_SUFFIXES
+        .iter()
+        .find_map(|suffix| collection_size(stored, suffix))?;
+    let valued = violation.message();
+    let requirement_half = valued.strip_prefix(&format!("Value '{stored}' "))?;
+    Some(format!("Value {requirement_half}"))
 }
 
 /// The sentence a JSON-schema layer states for an object carrying more properties than
@@ -118,11 +155,18 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// (restJson1 or the awsJson family), where AWS answers a constraint refusal as
 /// `400 ValidationException` with the envelope
 /// `N validation error(s) detected: Value '<value>' at '<member path>' failed to satisfy
-/// constraint: <requirement>` — the envelope the framework already renders, except that
-/// AWS quotes a `@pattern` requirement without the anchors a whole-value pattern wraps it
-/// in ([`crate::validation::unanchored`]). The check itself still uses the model's pattern
-/// as written: only the RENDERING drops them. Every other requirement, and the member
-/// path, are the framework's, so the two cannot drift.
+/// constraint: <requirement>` — the envelope the framework already renders, except for two
+/// renderings:
+///
+/// * AWS quotes a `@pattern` requirement without the anchors a whole-value pattern wraps
+///   it in ([`crate::validation::unanchored`]). The check itself still uses the model's
+///   pattern as written: only the RENDERING drops them.
+/// * a COLLECTION (list or map) that broke its `@length` is stated with no value at all,
+///   `Value at '<member path>' failed to satisfy constraint: <requirement>`, because a
+///   list and a map have no scalar rendering to quote.
+///
+/// Every other requirement, and the member path, are the framework's, so the two cannot
+/// drift.
 ///
 /// `None` for anything that is not a constraint refusal (an unauthenticated caller keeps
 /// the framework's 403 code and wording), and `None` when there is nothing to state.
@@ -161,9 +205,18 @@ pub fn aws_validation_refusal_with(
             _ => violation.clone(),
         })
         .collect();
+    // The envelope and every clause are the framework's; a COLLECTION's length clause
+    // then drops its value half, which the framework has no way to leave out (a clause
+    // carrying no value reads `Value null at …`, which is how an ABSENT member is stated).
+    let mut message = envelope(&restated)?;
+    for violation in &restated {
+        if let Some(valueless) = collection_length_clause(violation) {
+            message = message.replace(&violation.message(), &valueless);
+        }
+    }
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_owned(),
-        message: envelope(&restated)?,
+        message,
     })
 }
 
@@ -204,6 +257,176 @@ mod tests {
             "expected the AWS envelope with the pattern quoted unanchored, got {:?}",
             stated.message
         );
+    }
+
+    /// RULE: a COLLECTION member that broke its `@length` is stated with NO value —
+    /// `Value at '<path>' failed to satisfy constraint: <requirement>` — while a SCALAR
+    /// member keeps the value it submitted.
+    #[test]
+    fn a_collection_length_clause_states_no_value_and_a_scalar_one_does() {
+        // (case, path, the broken bound, the echo the validating walk rendered, the clause
+        // the refusal must state). The echoes are the framework's own: `<n> items` for a
+        // list, `<n> entries` for a map, and the caller's own bytes for a string.
+        let rows: [(&str, &str, ViolationKind, &str, &str); 8] = [
+            (
+                "a list one element over its maximum",
+                "queries",
+                ViolationKind::MaxLength(1),
+                "2 items",
+                "Value at 'queries' failed to satisfy constraint: Member must have length less \
+                 than or equal to 1",
+            ),
+            (
+                "a list far over a much larger maximum",
+                "sources",
+                ViolationKind::MaxLength(1000),
+                "4096 items",
+                "Value at 'sources' failed to satisfy constraint: Member must have length less \
+                 than or equal to 1000",
+            ),
+            (
+                "an empty list under its minimum",
+                "sources",
+                ViolationKind::MinLength(1),
+                "0 items",
+                "Value at 'sources' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+            (
+                "a nested list, reported under its element path",
+                "entries.1.member.values",
+                ViolationKind::MaxLength(5),
+                "6 items",
+                "Value at 'entries.1.member.values' failed to satisfy constraint: Member must \
+                 have length less than or equal to 5",
+            ),
+            (
+                "a map over its maximum",
+                "tags",
+                ViolationKind::MaxLength(200),
+                "201 entries",
+                "Value at 'tags' failed to satisfy constraint: Member must have length less than \
+                 or equal to 200",
+            ),
+            (
+                "an empty map under its minimum",
+                "tags",
+                ViolationKind::MinLength(1),
+                "0 entries",
+                "Value at 'tags' failed to satisfy constraint: Member must have length greater \
+                 than or equal to 1",
+            ),
+            (
+                "a string over its maximum keeps the value it submitted",
+                "name",
+                ViolationKind::MaxLength(3),
+                "abcd",
+                "Value 'abcd' at 'name' failed to satisfy constraint: Member must have length \
+                 less than or equal to 3",
+            ),
+            (
+                "an empty string under its minimum keeps the value it submitted",
+                "nextToken",
+                ViolationKind::MinLength(1),
+                "",
+                "Value '' at 'nextToken' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ];
+
+        for (case, path, kind, stored, clause) in rows {
+            let refusal = Refusal::Invalid(vec![violation(path, kind, stored)]);
+            for (entry_point, stated) in [
+                ("the default rendering", aws_validation_refusal(&refusal)),
+                (
+                    "the grouping rendering",
+                    aws_validation_refusal_with(&refusal, unanchored_grouping_alternation),
+                ),
+            ] {
+                let stated = stated.expect("a constraint refusal is stated");
+                assert_eq!(
+                    stated.code, "ValidationException",
+                    "case {case:?} under {entry_point}: expected the JSON protocols' refusal \
+                     code, got {:?}",
+                    stated.code
+                );
+                let expected = format!("1 validation error detected: {clause}");
+                assert_eq!(
+                    stated.message, expected,
+                    "case {case:?} under {entry_point}: expected {expected:?}, got {:?}",
+                    stated.message
+                );
+            }
+        }
+    }
+
+    /// RULE, over a refusal carrying SEVERAL clauses: each clause is stated by its own
+    /// shape's rule — the collection's without a value, the scalars' with one — inside the
+    /// framework's counting envelope.
+    #[test]
+    fn an_envelope_states_each_clause_by_its_own_shapes_rule() {
+        let refusal = Refusal::Invalid(vec![
+            violation("queries", ViolationKind::MaxLength(1), "2 items"),
+            violation("tags", ViolationKind::MinLength(1), "0 entries"),
+            violation("maxResults", ViolationKind::MinValue("1".to_owned()), "0"),
+        ]);
+        let stated = aws_validation_refusal(&refusal).expect("a constraint refusal is stated");
+        let expected = "3 validation errors detected: Value at 'queries' failed to satisfy \
+                        constraint: Member must have length less than or equal to 1; Value at \
+                        'tags' failed to satisfy constraint: Member must have length greater \
+                        than or equal to 1; Value '0' at 'maxResults' failed to satisfy \
+                        constraint: Member must have value greater than or equal to 1";
+        assert_eq!(
+            stated.message, expected,
+            "expected {expected:?}, got {:?}",
+            stated.message
+        );
+    }
+
+    /// RULE: only a `@length` violation of a collection loses its value — a collection's
+    /// OTHER constraint classes, and a member whose value the walk could not render,
+    /// keep the framework's clause.
+    #[test]
+    fn nothing_but_a_collection_length_clause_loses_its_value() {
+        // (case, the violation, the clause the refusal must state)
+        let rows: [(&str, Violation, &str); 3] = [
+            (
+                "a list with a repeated element",
+                violation("values", ViolationKind::UniqueItems, "duplicate"),
+                "Value 'duplicate' at 'values' failed to satisfy constraint: Member must have \
+                 unique values",
+            ),
+            (
+                "an absent required member",
+                Violation {
+                    path: "queries".to_owned(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                },
+                "Value null at 'queries' failed to satisfy constraint: Member must not be null",
+            ),
+            (
+                "an absent member carrying a length bound",
+                Violation {
+                    path: "sources".to_owned(),
+                    kind: ViolationKind::MinLength(1),
+                    value: None,
+                },
+                "Value null at 'sources' failed to satisfy constraint: Member must have length \
+                 greater than or equal to 1",
+            ),
+        ];
+
+        for (case, violation, clause) in rows {
+            let stated = aws_validation_refusal(&Refusal::Invalid(vec![violation]))
+                .expect("a constraint refusal is stated");
+            let expected = format!("1 validation error detected: {clause}");
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
     }
 
     #[test]
