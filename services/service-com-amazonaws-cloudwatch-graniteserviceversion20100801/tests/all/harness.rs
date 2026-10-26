@@ -427,3 +427,162 @@ pub fn error_code(body: &Value) -> String {
         .map(|name| name.rsplit('#').next().unwrap_or(name).to_string())
         .unwrap_or_default()
 }
+
+/// A role ARN of the form a log alarm's scheduled query names
+/// (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`).
+pub const QUERY_ROLE: &str = "arn:aws:iam::000000000000:role/cwl-scheduled-query";
+
+/// Which kind of alarm a case creates and reads back: the three `AlarmType` values this
+/// service stores (`smithy_query(query="shape",shape="AlarmType")`).
+///
+/// Every suite that asserts a rule holding for an alarm of ANY kind generalises over this,
+/// so the three writers and the one reader live here once rather than per suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmKind {
+    /// An alarm on a metric, written by `PutMetricAlarm`.
+    Metric,
+    /// An alarm on other alarms' states, written by `PutCompositeAlarm`.
+    Composite,
+    /// An alarm on a CloudWatch Logs scheduled query, written by `PutLogAlarm`.
+    Log,
+}
+
+impl AlarmKind {
+    /// The `DescribeAlarms` output member alarms of this kind are reported under.
+    pub fn member(self) -> &'static str {
+        match self {
+            Self::Metric => "MetricAlarms",
+            Self::Composite => "CompositeAlarms",
+            Self::Log => "LogAlarms",
+        }
+    }
+
+    /// The modelled `AlarmType` value a reader asks for this kind of alarm by: "If you omit
+    /// this parameter, only metric alarms are returned" (`DescribeAlarmsInput$AlarmTypes`),
+    /// so a reader of any other kind has to name it.
+    pub fn alarm_type(self) -> &'static str {
+        match self {
+            Self::Metric => "MetricAlarm",
+            Self::Composite => "CompositeAlarm",
+            Self::Log => "LogAlarm",
+        }
+    }
+
+    /// Create an alarm of this kind named `name`, carrying `actions_enabled` when the case
+    /// states one and the documented default otherwise.
+    pub async fn create(
+        self,
+        router: &MultiServiceRouter,
+        name: &str,
+        actions_enabled: Option<bool>,
+    ) {
+        let (operation, mut request) = match self {
+            Self::Metric => ("PutMetricAlarm", metric_alarm_request(name)),
+            Self::Composite => {
+                // A composite alarm's rule references other alarms, so the case's own child
+                // alarm is created first and the rule names that one.
+                let child = format!("{name}-child");
+                ok(router, "PutMetricAlarm", &metric_alarm_request(&child)).await;
+                (
+                    "PutCompositeAlarm",
+                    ::serde_json::json!({
+                        "AlarmName": name,
+                        "AlarmRule": format!("ALARM(\"{child}\")"),
+                    }),
+                )
+            }
+            Self::Log => ("PutLogAlarm", log_alarm_request(name)),
+        };
+        if let (Some(enabled), Value::Object(members)) = (actions_enabled, &mut request) {
+            members.insert(
+                "ActionsEnabled".to_string(),
+                ::serde_json::Value::Bool(enabled),
+            );
+        }
+        ok(router, operation, &request).await;
+    }
+}
+
+/// A static-threshold metric alarm request for `name`.
+pub fn metric_alarm_request(name: &str) -> Value {
+    ::serde_json::json!({
+        "AlarmName": name,
+        "Namespace": "Custom/Alarms",
+        "MetricName": "Latency",
+        "Statistic": "Average",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 10.0,
+        "ComparisonOperator": "GreaterThanThreshold",
+    })
+}
+
+/// A log alarm request for `name`: every member `PutLogAlarm` requires and nothing else.
+pub fn log_alarm_request(name: &str) -> Value {
+    ::serde_json::json!({
+        "AlarmName": name,
+        "QueryResultsToEvaluate": 3,
+        "QueryResultsToAlarm": 2,
+        "Threshold": 10.0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "ScheduledQueryConfiguration": {
+            "QueryString": "fields @message | filter @message like /ERROR/",
+            "ScheduledQueryRoleARN": QUERY_ROLE,
+            "AggregationExpression": "count(*)",
+            "ScheduleConfiguration": {
+                "ScheduleExpression": "rate(5 minutes)",
+                "StartTimeOffset": 360,
+            },
+        },
+    })
+}
+
+/// The one alarm of `kind` that `DescribeAlarms` reports for `name`, or `None` when it
+/// reports none.
+pub async fn described_alarm(
+    router: &MultiServiceRouter,
+    kind: AlarmKind,
+    name: &str,
+) -> Option<Value> {
+    let body = ok(
+        router,
+        "DescribeAlarms",
+        &::serde_json::json!({"AlarmNames": [name], "AlarmTypes": [kind.alarm_type()]}),
+    )
+    .await;
+    body.get(kind.member())
+        .and_then(Value::as_array)
+        .and_then(|alarms| alarms.first().cloned())
+}
+
+/// The history items of type `item_type` recorded for `name`, as `DescribeAlarmHistory`
+/// reports them.
+///
+/// The kind is named: a history reader, like an alarm reader, reports metric alarms unless it
+/// is told otherwise (`DescribeAlarmHistoryInput$AlarmTypes`).
+pub async fn alarm_history_items(
+    router: &MultiServiceRouter,
+    kind: AlarmKind,
+    name: &str,
+    item_type: &str,
+) -> Vec<Value> {
+    let body = ok(
+        router,
+        "DescribeAlarmHistory",
+        &::serde_json::json!({
+            "AlarmName": name,
+            "AlarmTypes": [kind.alarm_type()],
+            "HistoryItemType": item_type,
+        }),
+    )
+    .await;
+    body.get("AlarmHistoryItems")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A timestamp member of a described alarm, as the epoch seconds the awsJson protocols carry.
+pub fn alarm_stamp(alarm: &Value, member: &str) -> Option<f64> {
+    alarm.get(member).and_then(Value::as_f64)
+}

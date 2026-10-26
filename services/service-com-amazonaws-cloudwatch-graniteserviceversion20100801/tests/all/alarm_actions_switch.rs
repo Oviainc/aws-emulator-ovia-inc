@@ -24,145 +24,21 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{
+    alarm_history_items, alarm_stamp as stamp, build_router, call, described_alarm as described,
+    error_code, ok, AlarmKind as Kind,
+};
 
 /// The modelled maximum number of names one call may carry: `AlarmNames` is `@length 0..100`
 /// (`smithy_query(query="operation",operation="EnableAlarmActions")`).
 const MAX_ALARM_NAMES: usize = 100;
 
-/// A role ARN of the form a log alarm's scheduled query names
-/// (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`).
-const QUERY_ROLE: &str = "arn:aws:iam::000000000000:role/cwl-scheduled-query";
-
 /// The alarm name every row of the unknown-name table writes to.
 const KNOWN_ALARM: &str = "known-alarm";
 
-/// Which kind of alarm a row creates: the three `AlarmType` values this service stores
-/// (`smithy_query(query="shape",shape="AlarmType")`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Metric,
-    Composite,
-    Log,
-}
-
-impl Kind {
-    /// The `DescribeAlarms` output member alarms of this kind are reported under.
-    fn member(self) -> &'static str {
-        match self {
-            Self::Metric => "MetricAlarms",
-            Self::Composite => "CompositeAlarms",
-            Self::Log => "LogAlarms",
-        }
-    }
-
-    /// The modelled `AlarmType` value a reader asks for this kind of alarm by: "If you omit
-    /// this parameter, only metric alarms are returned" (`DescribeAlarmsInput$AlarmTypes`), so
-    /// a reader of any other kind has to name it.
-    fn alarm_type(self) -> &'static str {
-        match self {
-            Self::Metric => "MetricAlarm",
-            Self::Composite => "CompositeAlarm",
-            Self::Log => "LogAlarm",
-        }
-    }
-
-    /// Create an alarm of this kind named `name`, carrying `actions_enabled` when the row
-    /// states one and the documented default otherwise.
-    async fn create(self, router: &MultiServiceRouter, name: &str, actions_enabled: Option<bool>) {
-        let (operation, mut request) = match self {
-            Self::Metric => ("PutMetricAlarm", metric_alarm(name)),
-            Self::Composite => {
-                // A composite alarm's rule references other alarms, so the row's own child
-                // alarm is created first and the rule names that one.
-                let child = format!("{name}-child");
-                ok(router, "PutMetricAlarm", &metric_alarm(&child)).await;
-                (
-                    "PutCompositeAlarm",
-                    json!({"AlarmName": name, "AlarmRule": format!("ALARM(\"{child}\")")}),
-                )
-            }
-            Self::Log => ("PutLogAlarm", log_alarm(name)),
-        };
-        if let (Some(enabled), Value::Object(members)) = (actions_enabled, &mut request) {
-            members.insert("ActionsEnabled".to_string(), json!(enabled));
-        }
-        ok(router, operation, &request).await;
-    }
-}
-
-/// A static-threshold metric alarm request for `name`.
-fn metric_alarm(name: &str) -> Value {
-    json!({
-        "AlarmName": name,
-        "Namespace": "Custom/Alarms",
-        "MetricName": "Latency",
-        "Statistic": "Average",
-        "Period": 60,
-        "EvaluationPeriods": 1,
-        "Threshold": 10.0,
-        "ComparisonOperator": "GreaterThanThreshold",
-    })
-}
-
-/// A log alarm request for `name`: every member `PutLogAlarm` requires and nothing else.
-fn log_alarm(name: &str) -> Value {
-    json!({
-        "AlarmName": name,
-        "QueryResultsToEvaluate": 3,
-        "QueryResultsToAlarm": 2,
-        "Threshold": 10.0,
-        "ComparisonOperator": "GreaterThanThreshold",
-        "ScheduledQueryConfiguration": {
-            "QueryString": "fields @message | filter @message like /ERROR/",
-            "ScheduledQueryRoleARN": QUERY_ROLE,
-            "AggregationExpression": "count(*)",
-            "ScheduleConfiguration": {
-                "ScheduleExpression": "rate(5 minutes)",
-                "StartTimeOffset": 360,
-            },
-        },
-    })
-}
-
-/// The one alarm of `kind` that `DescribeAlarms` reports for `name`, or `None` when it reports
-/// none.
-async fn described(router: &MultiServiceRouter, kind: Kind, name: &str) -> Option<Value> {
-    let body = ok(
-        router,
-        "DescribeAlarms",
-        &json!({"AlarmNames": [name], "AlarmTypes": [kind.alarm_type()]}),
-    )
-    .await;
-    body.get(kind.member())
-        .and_then(Value::as_array)
-        .and_then(|alarms| alarms.first().cloned())
-}
-
 /// The configuration-update history items recorded for `name`, oldest first.
-///
-/// The kind is named: a history reader, like an alarm reader, reports metric alarms unless it
-/// is told otherwise (`DescribeAlarmHistoryInput$AlarmTypes`).
 async fn configuration_updates(router: &MultiServiceRouter, kind: Kind, name: &str) -> Vec<Value> {
-    let body = ok(
-        router,
-        "DescribeAlarmHistory",
-        &json!({
-            "AlarmName": name,
-            "AlarmTypes": [kind.alarm_type()],
-            "HistoryItemType": "ConfigurationUpdate",
-        }),
-    )
-    .await;
-    body.get("AlarmHistoryItems")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// A timestamp member of a described alarm, as the epoch seconds the awsJson protocols carry.
-fn stamp(alarm: &Value, member: &str) -> Option<f64> {
-    alarm.get(member).and_then(Value::as_f64)
+    alarm_history_items(router, kind, name, "ConfigurationUpdate").await
 }
 
 /// Turn the named alarms' actions on, requiring a 200.
