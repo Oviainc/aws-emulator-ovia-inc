@@ -452,10 +452,9 @@ async fn a_max_items_the_page_size_cannot_take_is_invalid_argument() {
 
 #[tokio::test]
 async fn the_max_items_refusal_is_in_front_of_every_operation_that_binds_it() {
-    // `ListDistributionsByWebACLId` binds the same `MaxItems` member and is not
-    // implemented in this emulator: a value the parameter cannot take is refused at the
-    // request boundary, as AWS refuses it, while a usable one reaches the operation —
-    // which answers the scaffold's 501 rather than a fabricated page.
+    // `ListDistributionsByWebACLId` binds the same `MaxItems` member: a value the
+    // parameter cannot take is refused at the request boundary, as AWS refuses it, while a
+    // usable one reaches the operation — which answers from the store.
     let router = emulator();
     let answer = call(
         &router,
@@ -493,8 +492,8 @@ async fn the_max_items_refusal_is_in_front_of_every_operation_that_binds_it() {
     )
     .await;
     assert_eq!(
-        served.status, 501,
-        "a usable MaxItems reaches the operation, which is still a stub: {}",
+        served.status, 200,
+        "a usable MaxItems reaches the operation, which answers from the store: {}",
         served.raw
     );
 }

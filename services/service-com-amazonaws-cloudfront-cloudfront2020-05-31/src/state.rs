@@ -5602,6 +5602,31 @@ pub fn references_response_headers_policy(
     .any(|id| id == response_headers_policy_id)
 }
 
+/// The `WebACLId` a listing names to select the distributions that are associated with NO
+/// web ACL: "if you specify "null" for the ID, the request returns a list of the
+/// distributions that aren't associated with a web ACL".
+pub const WEB_ACL_ID_NONE: &str = "null";
+
+/// Whether `config` is associated with the web ACL `web_acl_id` names.
+///
+/// A web ACL is attached to a distribution by the single `DistributionConfig$WebACLId`
+/// member, whose EMPTY value is what "no web ACL" is — that is what a disassociation
+/// leaves behind — so the association is an exact comparison against the one stored
+/// string, and the sentinel [`WEB_ACL_ID_NONE`] selects the distributions that carry no
+/// association at all.
+///
+/// A web ACL lives in WAF, which this store cannot resolve, so an identifier no
+/// distribution carries selects nothing rather than being refused: the value is only ever
+/// compared, never validated.
+pub fn associated_with_web_acl(config: &DistributionConfig, web_acl_id: &str) -> bool {
+    let stored = config.web_acl_id.as_deref().unwrap_or_default();
+    if web_acl_id == WEB_ACL_ID_NONE {
+        stored.is_empty()
+    } else {
+        stored == web_acl_id
+    }
+}
+
 /// What every cache behaviour of `config` attaches through one of its members — the default
 /// behaviour first, then each ordered one — skipping the behaviours that attach nothing.
 ///
