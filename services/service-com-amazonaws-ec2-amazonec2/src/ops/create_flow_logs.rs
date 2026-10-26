@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFlowLogs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFlowLogs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFlowLogs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns on VPC flow logging for every resource the request names: one flow log per entry
+//! of `ResourceIds`, stored in [`crate::state`] where `DescribeFlowLogs` reports them from
+//! and `DeleteFlowLogs` removes them. The whole `ResourceIds` batch is resolved against
+//! the store BEFORE anything is written, so a call naming one resource the account does
+//! not hold stores nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +193,367 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFlowLogs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFlowLogsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+        use std::time::SystemTime;
+
+        // The Region the request was signed for: a CloudWatch Logs destination given by
+        // NAME is reported as an ARN as well, and that ARN names a Region.
+        let region = state::request_region(ctx.parts());
+
+        // "The IDs of the resources to monitor" (`$ResourceIds`) is `@required`, which the
+        // boundary validator enforces as "present" — an EMPTY list is still present, and
+        // there is nothing to monitor in it.
+        if input.resource_ids.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter ResourceIds",
+            ));
+        }
+        // "The type of resource to monitor" (`$ResourceType`), a `FlowLogsResourceType`
+        // member the boundary validator has already held the request to. Two of them
+        // monitor a transit gateway, which changes three rules below.
+        let monitors_transit_gateway = state::FLOW_LOG_TRANSIT_GATEWAY_RESOURCE_TYPES
+            .contains(&input.resource_type.as_str());
+        // "Constraints: Maximum of 25 for transit gateway resource types. Maximum of 300
+        // for the other resource types" (`$ResourceIds`). The model declares no `@length`,
+        // so the handler is the only place the batch size can be bounded.
+        let max_resource_ids = if monitors_transit_gateway {
+            state::MAX_TRANSIT_GATEWAY_FLOW_LOG_RESOURCE_IDS
+        } else {
+            state::MAX_FLOW_LOG_RESOURCE_IDS
+        };
+        if input.resource_ids.len() > max_resource_ids {
+            return Err(state::invalid_parameter_value(format!(
+                "ResourceIds carries {count} ids, above the maximum of {max_resource_ids} \
+                 for the resource type {resource_type}",
+                count = input.resource_ids.len(),
+                resource_type = input.resource_type,
+            )));
+        }
+        // One resource gets one flow log however many times the batch names it.
+        let resource_ids = state::deduplicate_ids(&input.resource_ids);
+
+        // "This parameter is not supported for transit gateway resource types. It is
+        // required for the other resource types" (`$TrafficType`).
+        match (monitors_transit_gateway, input.traffic_type.as_deref()) {
+            (false, None) => {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter TrafficType",
+                ))
+            }
+            (true, Some(_)) => {
+                return Err(state::invalid_parameter_combination(format!(
+                    "TrafficType is not supported for the resource type {resource_type}",
+                    resource_type = input.resource_type,
+                )))
+            }
+            _ => {}
+        }
+
+        // "The type of destination for the flow log data. Default: cloud-watch-logs"
+        // (`$LogDestinationType`).
+        let log_destination_type = input
+            .log_destination_type
+            .clone()
+            .unwrap_or_else(|| state::LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS.to_string());
+        let publishes_to_log_group =
+            log_destination_type == state::LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS;
+
+        // "The name of a new or existing CloudWatch Logs log group where Amazon EC2
+        // publishes your flow logs. This parameter is valid only if the destination type is
+        // cloud-watch-logs" (`$LogGroupName`).
+        if !publishes_to_log_group && input.log_group_name.is_some() {
+            return Err(state::invalid_parameter_combination(format!(
+                "LogGroupName is valid only for the destination type \
+                 {cloud_watch_logs}, not for {log_destination_type}",
+                cloud_watch_logs = state::LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS,
+            )));
+        }
+
+        // Where the records go. For CloudWatch Logs the destination is ONE log group named
+        // either way — "specify the ARN of a CloudWatch Logs log group … Alternatively, use
+        // the LogGroupName parameter" (`$LogDestination`) — so whichever member the request
+        // used, the flow log reports both; for the other destination types only the ARN
+        // exists.
+        let (log_group_name, log_destination) = if publishes_to_log_group {
+            let named = input.log_group_name.clone();
+            let in_arn = input
+                .log_destination
+                .as_deref()
+                .and_then(state::log_group_name_in_arn)
+                .map(str::to_string);
+            let name = match (named, in_arn, input.log_destination.as_deref()) {
+                (Some(name), _, _) | (None, Some(name), _) => name,
+                // A destination WAS given, but it is not the ARN of a log group, so there
+                // is no group for it to name: that is a value this operation cannot accept
+                // rather than a parameter the request left out.
+                (None, None, Some(destination)) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "LogDestination '{destination}' is not the ARN of a CloudWatch Logs \
+                         log group"
+                    )))
+                }
+                (None, None, None) => {
+                    return Err(state::missing_parameter(
+                        "The request must contain the parameter LogGroupName or \
+                         LogDestination",
+                    ))
+                }
+            };
+            let destination = input
+                .log_destination
+                .clone()
+                .unwrap_or_else(|| state::flow_log_group_arn(&region, &name));
+            (Some(name), Some(destination))
+        } else {
+            let Some(destination) = input.log_destination.clone() else {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter LogDestination",
+                ));
+            };
+            (None, Some(destination))
+        };
+
+        // "The ARN of the IAM role that allows Amazon EC2 to publish flow logs to the log
+        // destination. This parameter is required if the destination type is
+        // cloud-watch-logs" (`$DeliverLogsPermissionArn`).
+        if publishes_to_log_group && input.deliver_logs_permission_arn.is_none() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter DeliverLogsPermissionArn",
+            ));
+        }
+
+        // "The possible values are 60 seconds (1 minute) or 600 seconds (10 minutes). This
+        // parameter must be 60 seconds for transit gateway resource types. … Default: 600"
+        // (`$MaxAggregationInterval`) — so a request that names none gets 600, except for
+        // the resource types that admit only 60, where 60 is the only value the default
+        // could be.
+        let max_aggregation_interval =
+            input.max_aggregation_interval.unwrap_or(if monitors_transit_gateway {
+                state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL
+            } else {
+                state::DEFAULT_MAX_AGGREGATION_INTERVAL
+            });
+        if !state::FLOW_LOG_AGGREGATION_INTERVALS.contains(&max_aggregation_interval) {
+            return Err(state::invalid_parameter_value(format!(
+                "MaxAggregationInterval must be one of [{allowed}], not \
+                 {max_aggregation_interval}",
+                allowed = state::FLOW_LOG_AGGREGATION_INTERVALS
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            )));
+        }
+        if monitors_transit_gateway
+            && max_aggregation_interval != state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "MaxAggregationInterval must be {required} for the resource type \
+                 {resource_type}",
+                required = state::TRANSIT_GATEWAY_MAX_AGGREGATION_INTERVAL,
+                resource_type = input.resource_type,
+            )));
+        }
+
+        // "If you specify this parameter, you must include at least one field. … Specify
+        // the fields using the ${field-id} format, separated by spaces" (`$LogFormat`) —
+        // a request that names the member must name a field in it. A request that omits it
+        // gets the default format, which `state::insert_flow_log` applies.
+        if let Some(log_format) = input.log_format.as_deref() {
+            if log_format.chars().count() > state::MAX_FLOW_LOG_FORMAT_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "LogFormat accepts at most {max} characters",
+                    max = state::MAX_FLOW_LOG_FORMAT_CHARS,
+                )));
+            }
+            // "Specify the fields using the ${field-id} format, separated by spaces"
+            // (`$LogFormat`): a field marker is an opening `${` with a closing `}` after
+            // it, so a format that carries no complete marker names no field at all. This
+            // is the documented rule, not a parse of the field ids themselves.
+            if !log_format
+                .split_once("${")
+                .is_some_and(|(_, rest)| rest.contains('}'))
+            {
+                return Err(state::invalid_parameter_value(
+                    "LogFormat must include at least one ${field-id} field",
+                ));
+            }
+        }
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`$ClientToken`). The model puts no `@length` on it and the store
+        // keeps it for the process's lifetime, so the bound this crate holds every client
+        // token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The tags to apply to the flow logs" (`$TagSpecifications`) — the shared reader
+        // refuses a specification naming any other resource type and holds the payload to
+        // the documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC_FLOW_LOG,
+            Self::NAME,
+        )?;
+
+        // "The destination options" (`$DestinationOptions`), as the response shape reports
+        // them, with each member the request left out at the default its own documentation
+        // gives it: "The default is plain-text" (`DestinationOptionsRequest$FileFormat`),
+        // "The default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`).
+        let destination_options = input.destination_options.as_ref().map(|options| {
+            DestinationOptionsResponse {
+                file_format: Some(
+                    options
+                        .file_format
+                        .clone()
+                        .unwrap_or_else(|| state::DEFAULT_FLOW_LOG_FILE_FORMAT.to_string()),
+                ),
+                hive_compatible_partitions: Some(
+                    options.hive_compatible_partitions.unwrap_or(false),
+                ),
+                per_hour_partition: Some(options.per_hour_partition.unwrap_or(false)),
+            }
+        });
+
+        // "The tag configuration associated with the Flow Logs Amazon EC2 Tags feature
+        // fields in your custom log format" (`$TagFieldSpecifications`), carried over to
+        // the member `FlowLog` reports it under. The model's `length 1..3` on the list has
+        // already been enforced, and each tag key is held to the same length every other
+        // tag key of this service is.
+        let tag_field_specifications = match input.tag_field_specifications.as_deref() {
+            None => None,
+            Some(specifications) => {
+                let mut carried: Vec<TagFieldSpecificationResponse> =
+                    Vec::with_capacity(specifications.len());
+                for specification in specifications {
+                    for key in specification.tag_keys.iter().flatten() {
+                        state::validate_tag_key(key)?;
+                    }
+                    carried.push(TagFieldSpecificationResponse {
+                        resource_type: specification.resource_type.clone(),
+                        tag_keys: specification.tag_keys.clone(),
+                    });
+                }
+                Some(carried)
+            }
+        };
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request … If you have the required permissions, the error response is
+        // DryRunOperation" (`$DryRun`). The flag asks whether the CALLER is permitted, which
+        // is not a question about which resources the account holds — so an authorized dry
+        // run is answered here, once the request itself has been read, and the answer does
+        // not depend on whether the resources it names exist. Nothing is stored on this
+        // path.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Idempotency: one token names the flow logs it minted, so a replay reports those
+        // and creates nothing. A replay stores nothing, so it is charged nothing and clears
+        // the ceilings a fresh create has to pass.
+        let replayed: Option<Vec<String>> = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.flow_log_client_tokens.get(token).cloned());
+
+        // The WHOLE batch is resolved before anything is stored: a call that names one
+        // resource this account does not hold is refused outright rather than half-served,
+        // so a client never has to work out which of its resources got a flow log.
+        if replayed.is_none() {
+            if let Some(unknown) = resource_ids
+                .iter()
+                .find(|id| !store.holds_flow_log_resource(&input.resource_type, id))
+            {
+                return Err(state::invalid_flow_log_resource_id(
+                    &input.resource_type,
+                    unknown,
+                ));
+            }
+        }
+
+        // What this call would store: one flow log per monitored resource, every one of them
+        // built the same way, so the batch is charged and stored as a whole.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFlowLogs"))
+        // The creation instant is read ONCE here: every flow log this one call mints was
+        // created by that call, so they carry the same `CreationTime` rather than one per
+        // record.
+        let created_at = SystemTime::now();
+        let specs: Vec<state::FlowLogSpec> = resource_ids
+            .iter()
+            .map(|resource_id| state::FlowLogSpec {
+                resource_id: resource_id.clone(),
+                traffic_type: input.traffic_type.clone(),
+                log_destination_type: log_destination_type.clone(),
+                log_destination: log_destination.clone(),
+                log_group_name: log_group_name.clone(),
+                log_format: input.log_format.clone(),
+                deliver_logs_permission_arn: input.deliver_logs_permission_arn.clone(),
+                deliver_cross_account_role: input.deliver_cross_account_role.clone(),
+                max_aggregation_interval,
+                destination_options: destination_options.clone(),
+                tag_field_specifications: tag_field_specifications.clone(),
+                tags: tags.clone(),
+                client_token: input.client_token.clone(),
+                created_at,
+            })
+            .collect();
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() {
+            if !store.has_flow_log_capacity_for(specs.len()) {
+                return Err(state::flow_logs_limit_exceeded(format!(
+                    "This emulator holds {max} flow logs, which is as many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                )));
+            }
+            let payload_bytes: usize = specs.iter().map(state::flow_log_payload_bytes).sum();
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(state::flow_logs_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                     data, so it cannot store {payload_bytes} more",
+                    held = store.stored_bytes(),
+                    max = state::MAX_STORED_BYTES,
+                )));
+            }
+        }
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateFlowLogsResult$ClientToken`): the token is echoed on the
+        // answer, a replay's included.
+        if let Some(flow_log_ids) = replayed {
+            return Ok(CreateFlowLogsOutput {
+                client_token: input.client_token.clone(),
+                flow_log_ids: Some(flow_log_ids),
+                // Every flow log this token minted was stored, so none of them failed.
+                unsuccessful: Some(Vec::new()),
+            });
+        }
+
+        let flow_log_ids: Vec<String> = specs
+            .into_iter()
+            .map(|spec| store.insert_flow_log(spec))
+            .collect();
+
+        Ok(CreateFlowLogsOutput {
+            client_token: input.client_token.clone(),
+            flow_log_ids: Some(flow_log_ids),
+            // "Information about the flow logs that could not be created successfully"
+            // (`$Unsuccessful`): the whole batch was resolved before anything was stored,
+            // so either every flow log was created or the call was refused.
+            unsuccessful: Some(Vec::new()),
+        })
     }
 }
