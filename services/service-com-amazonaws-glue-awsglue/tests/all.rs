@@ -67,6 +67,8 @@ mod etl_connections;
 mod etl_jobs_and_connections;
 #[path = "all/form_types.rs"]
 mod form_types;
+#[path = "all/get_mapping.rs"]
+mod get_mapping;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
 #[path = "all/glossaries.rs"]

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Proposes the field-by-field mapping from the source table to the target tables, read
+//! out of the Data Catalog: for every column of the source table — its storage-descriptor
+//! columns and then its partition keys, which are columns of its data too — one entry per
+//! target table naming that column as the source field and the target table's like-named
+//! column as the target field. A target table that declares no such column takes the
+//! source field through unchanged, and a request naming no target table proposes the
+//! source onto itself. Nothing is persisted: the proposal is computed from the stored
+//! table definitions on every call, so a later read of either table sees exactly what the
+//! catalog held before.
+//!
+//! An absent source or sink database or table is `EntityNotFoundException`. A request
+//! naming more targets than [`MAX_MAPPING_SINKS`], or one whose proposal would carry more
+//! than [`MAX_MAPPING_ENTRIES`] entries, is refused with `InvalidInputException`: both are
+//! this emulator's own request- and answer-size bounds, because the model bounds neither
+//! the `Sinks` list nor a table's column count.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +115,145 @@ impl From<GetMappingErrorModeled> for GetMappingError {
     }
 }
 
+/// How many target tables one `GetMapping` request may name.
+///
+/// This emulator's own REQUEST-SIZE bound, not a modelled quota: `CatalogEntries` bounds
+/// neither the list's length nor its elements', while the answer carries one entry per
+/// named target per source field. So what one request can make this operation look up and
+/// allocate is bounded here, at the figure this crate's other request-size bound serves
+/// (`batch_get_jobs`' ceiling, which is this service's paginated page ceiling of 100
+/// records). A request past it is refused with this operation's own modelled
+/// `InvalidInputException` rather than served.
+pub const MAX_MAPPING_SINKS: usize = 100;
+
+/// How many entries one proposal may carry: the PRODUCT of the target tables a request
+/// names and the columns of the source table's data, which is what the answer's size and
+/// the work of building it both grow with. The same kind of bound as
+/// [`MAX_MAPPING_SINKS`], on the product rather than on one factor, so neither a long
+/// `Sinks` list nor a wide source table can buy an answer larger than
+/// [`MAX_MAPPING_SINKS`] pages of it.
+pub const MAX_MAPPING_ENTRIES: usize = 10_000;
+
+/// How many entries a proposal of `columns` source fields onto `sinks` target tables
+/// carries. A request naming no target still proposes each source field once, which is why
+/// the count is not simply the product.
+fn proposal_size(columns: usize, sinks: usize) -> usize {
+    columns.saturating_mul(sinks.max(1))
+}
+
+/// The message the request-size refusal carries: the bound the request has to fit in,
+/// built from [`MAX_MAPPING_SINKS`] so the figure a caller reads back is the one enforced.
+fn sinks_limit_message() -> String {
+    format!("Sinks may name at most {MAX_MAPPING_SINKS} tables")
+}
+
+/// The message the answer-size refusal carries: built from [`MAX_MAPPING_ENTRIES`] and
+/// from the two factors of THIS request, so a caller can see which of them to cut.
+fn entries_limit_message(columns: usize, sinks: usize) -> String {
+    format!(
+        "a mapping of {columns} source fields onto {sinks} target tables carries more than \
+         the {MAX_MAPPING_ENTRIES} entries one mapping may carry"
+    )
+}
+
+/// The stored table a [`CatalogEntry`] addresses, or the miss that stands for it.
+///
+/// A catalog entry "specifies a table definition in the Glue Data Catalog" by database and
+/// table name, so it is resolved the way every other read of one table resolves it: in the
+/// catalog of the account this endpoint serves, by the Hive-folded name
+/// ([`crate::state::fold_name`]). The two misses are the two refusals this crate already
+/// words for a table read through its parent database: the per-resource templates
+/// `GetPartition` — the other read that resolves a table it was given the name of —
+/// answers for an absent database and an absent table. `GetTable`'s own constant is NOT
+/// reused: that one is the wording recorded for THAT operation, which addresses its table
+/// by `Name` rather than by a catalog entry, so reusing it here would claim a recording
+/// this operation has none of.
+fn catalog_table<'store>(
+    store: &'store crate::state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    entry: &CatalogEntry,
+) -> Result<&'store crate::state::TableEntry, GetMappingError> {
+    let Some(database) = store.database(catalog_id, &entry.database_name) else {
+        return Err(GetMappingErrorModeled::EntityNotFoundException(
+            EntityNotFoundException {
+                message: Some(crate::state::messages::database_not_found(
+                    &entry.database_name,
+                )),
+                from_federation_source: None,
+            },
+        )
+        .into());
+    };
+    database
+        .tables
+        .get(&crate::state::fold_name(&entry.table_name))
+        .ok_or_else(|| {
+            GetMappingErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(crate::state::messages::table_not_found(&entry.table_name)),
+                from_federation_source: None,
+            })
+            .into()
+        })
+}
+
+/// The columns of a stored table's DATA, in schema order: the columns of its storage
+/// descriptor ("a column in a Table", `StorageDescriptor$Columns`) and then its partition
+/// keys ("a list of columns by which the table is partitioned", `Table$PartitionKeys`),
+/// which a reader of the table sees as columns of every record it reads.
+///
+/// Deliberately a different list from [`crate::state::table_column_names`], which serves
+/// the column-statistics operations: those address a partition key's statistics PER
+/// partition and so leave the keys out, while a field the proposal maps is any column a
+/// reader of the table reads. The whole [`Column`] is borrowed rather than its name,
+/// because an entry carries the type a column declares too.
+fn data_columns(table: &crate::state::TableEntry) -> Vec<&Column> {
+    table
+        .storage_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.columns.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .chain(table.partition_keys.as_deref().unwrap_or_default().iter())
+        .collect()
+}
+
+/// What ONE target table contributes to the proposal, read out of the store: the catalog's
+/// name for it, and the column it declares for each source field name the request's source
+/// table carries.
+///
+/// Only the columns the SOURCE names are kept, keyed by the folded name they are matched
+/// by, so what one target contributes is bounded by the source's field count and not by
+/// how many columns that target happens to declare.
+struct Target {
+    /// The catalog's name for the target table, as a read of it reports it.
+    name: String,
+    /// The target's own column for each source field name that it declares one for.
+    columns: ::std::collections::HashMap<String, Column>,
+}
+
+/// One proposed mapping of `column` of the source table `source_table` names onto
+/// `target`, the like-named column of the target table `target_table` names.
+///
+/// A target column of the same name decides the target field's spelling and type, which is
+/// what makes the proposal a CAST when the two tables declare a column differently; a
+/// target table that declares no such column takes the source field through unchanged.
+/// `target_table` is `None` when the request named no target table at all.
+fn mapping_entry(
+    source_table: &str,
+    column: &Column,
+    target_table: Option<&str>,
+    target: Option<&Column>,
+) -> MappingEntry {
+    MappingEntry {
+        source_table: Some(source_table.to_string()),
+        source_path: Some(column.name.clone()),
+        source_type: column.r#type.clone(),
+        target_table: target_table.map(str::to_string),
+        target_path: Some(target.map_or_else(|| column.name.clone(), |held| held.name.clone())),
+        target_type: target.map_or_else(|| column.r#type.clone(), |held| held.r#type.clone()),
+    }
+}
+
 /// The `GetMapping` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -142,18 +290,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMapping"))
+        // A `CatalogEntry` carries no `CatalogId`, so every table this request names is
+        // read out of the catalog of the account this endpoint serves — the default the
+        // model documents for the member catalog operations do carry. Nothing in `ctx` is
+        // therefore read.
+        let _ = ctx;
+        let sinks = input.sinks.as_deref().unwrap_or_default();
+        // The request-size bound is a property of the REQUEST as a whole, so it is
+        // answered before any table in it is looked up and before the answer allocates
+        // anything: a caller that named too many targets learns that, rather than learning
+        // that one of them is unknown.
+        if sinks.len() > MAX_MAPPING_SINKS {
+            return Err(GetMappingErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(sinks_limit_message()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMappingErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let catalog_id = crate::state::resolve_catalog_id(None);
+
+        // Everything the proposal is computed FROM is read in one critical section, scoped
+        // to the lookups and bounded above by the two bounds below; the guard is dropped
+        // before the answer is built.
+        let (source_table, source_columns, targets) = {
+            let store = state.lock();
+            let source = catalog_table(&store, &catalog_id, &input.source)?;
+            let declared = data_columns(source);
+            // The answer carries one entry per target per source field, so the PRODUCT is
+            // what the request can make this operation allocate; it is bounded before
+            // anything is copied out of the store and before any target is read.
+            if proposal_size(declared.len(), sinks.len()) > MAX_MAPPING_ENTRIES {
+                return Err(GetMappingErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(entries_limit_message(declared.len(), sinks.len())),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            // A column name is matched case-insensitively: a target that spells a column
+            // in another case still declares that column of its schema. The fold is the
+            // ASCII one this catalog already folds a name by
+            // ([`crate::state::fold_name`]), and each source field is kept beside the
+            // folded name it is matched by, folded once here rather than once per entry
+            // the answer carries.
+            let source_columns: Vec<(Column, String)> = declared
+                .into_iter()
+                .map(|column| (column.clone(), crate::state::fold_name(&column.name)))
+                .collect();
+            // The names the SOURCE carries are what a target is searched for, so each
+            // target costs one walk of its own columns rather than one walk per source
+            // field, and contributes at most one column per source field.
+            let wanted: ::std::collections::HashSet<&str> = source_columns
+                .iter()
+                .map(|(_, folded)| folded.as_str())
+                .collect();
+            let mut targets: Vec<Target> = Vec::new();
+            for sink in sinks {
+                let target_table = catalog_table(&store, &catalog_id, sink)?;
+                let mut columns: ::std::collections::HashMap<String, Column> =
+                    ::std::collections::HashMap::new();
+                for held in data_columns(target_table) {
+                    let folded = crate::state::fold_name(&held.name);
+                    if wanted.contains(folded.as_str()) {
+                        // The FIRST column of that name in the target's schema order is
+                        // the one it declares for the field; a later like-named one does
+                        // not replace it.
+                        columns.entry(folded).or_insert_with(|| held.clone());
+                    }
+                }
+                targets.push(Target {
+                    name: target_table.name.clone(),
+                    columns,
+                });
+            }
+            (source.name.clone(), source_columns, targets)
+        };
+
+        // `Location` is "the parameters for the mapping" — where the data a sink has no
+        // catalog table for is written. It names no columns, so it cannot change which
+        // fields the proposal maps: the fields are the two tables' own, read above.
+        let mut mapping: Vec<MappingEntry> = Vec::new();
+        if targets.is_empty() {
+            // No target table named: there is nothing to match the source fields against,
+            // so each one is proposed onto itself and no entry names a target table.
+            for (column, _) in &source_columns {
+                mapping.push(mapping_entry(&source_table, column, None, None));
+            }
+            return Ok(GetMappingOutput { mapping });
+        }
+        // Grouped by target table, in the order the request named the sinks, so a request
+        // with several targets reads as one proposal per target.
+        for target in &targets {
+            for (column, folded) in &source_columns {
+                // The target's own spelling and declared type are what the entry carries.
+                let held = target.columns.get(folded);
+                mapping.push(mapping_entry(
+                    &source_table,
+                    column,
+                    Some(&target.name),
+                    held,
+                ));
+            }
+        }
+        Ok(GetMappingOutput { mapping })
     }
 }
