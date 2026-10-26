@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnrichmentJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnrichmentJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnrichmentJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! Starts one enrichment job in a workspace and answers the job it started. The
+//! call "returns immediately with job details while processing continues in the
+//! background", so what is written is the job's identity, the configuration it was
+//! created from and the instant it was created; the status every later read reports
+//! is DERIVED from that instant by [`crate::state::EnrichmentJobRecord::status`],
+//! never slept on and never stored.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +192,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnrichmentJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnrichmentJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A job analyses the video of ONE workspace, so a request naming a workspace
+        // this account does not hold addresses nothing: the modelled not-found
+        // refusal, in the wording every other operation scoped to a workspace uses
+        // (cf. `StartSearch`), and before any state is written. The documented
+        // prerequisite is that the workspace "is in ACTIVE state (not being
+        // deleted)"; nothing in this emulator deletes a workspace, so a held
+        // workspace is one that is not being deleted.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnrichmentJob"))
+        // Resolved FIRST, before the configuration is checked, so this operation and
+        // `ListEnrichmentJobs` agree on which wrongness a request that is wrong in
+        // both ways reports: the resource the path names.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // The rules the configuration's own shapes state, checked before anything is
+        // written so a refused create starts no job.
+        crate::state::check_enrichment_job_configuration(&input.job_configuration)
+            .map_err(invalid_request)?;
+
+        // "If you submit the same request with the same token within the idempotency
+        // window, you receive the original job details without creating a duplicate":
+        // the retry writes nothing and reports the job the ORIGINAL call started, at
+        // whatever status that job has reached by now.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) =
+                store.enrichment_job_for_client_token(&input.workspace_name, token)
+            {
+                return Ok(created(existing, now));
+            }
+        }
+
+        // "The IoT SiteWise dataset ID containing the video time-series data to
+        // analyze": the configuration names a dataset of this service's own control
+        // plane, so one no dataset holds is the modelled not-found refusal.
+        let dataset_id = crate::state::enrichment_job_target(&input.job_configuration).0;
+        if !store.datasets.contains_key(dataset_id) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_DATASET,
+                dataset_id,
+            )));
+        }
+
+        // "No duplicate job (same workspace, dataset, property, and job type) is
+        // currently running": while such a job has not reached a terminal status, a
+        // second create for the same work is the modelled conflict rather than a
+        // second job.
+        if let Some(existing) =
+            store.active_enrichment_job(&input.workspace_name, &input.job_configuration, now)
+        {
+            let job_id = existing.job_id.clone();
+            let status = existing.status(now);
+            let region = crate::state::request_region(ctx.parts());
+            return Err(conflicting_operation(
+                format!(
+                    "The enrichment job {job_id} is {status} for the same dataset, time \
+                     series and job type in the workspace {}.",
+                    input.workspace_name
+                ),
+                job_id.clone(),
+                crate::state::enrichment_job_arn(&region, &job_id),
+            ));
+        }
+
+        // The store is bounded: a create is the only thing that adds a job and
+        // nothing evicts one, so past either cap the request exceeds what this
+        // emulator holds — the quota refusal this operation's own documentation
+        // names for "Too many concurrent jobs or requests". The total is checked as
+        // well as the per-workspace count, because the store holds up to
+        // `MAX_WORKSPACES` workspaces and each of them its own jobs.
+        if store.enrichment_jobs.len() >= crate::state::MAX_ENRICHMENT_JOBS {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} enrichment jobs.",
+                crate::state::MAX_ENRICHMENT_JOBS
+            )));
+        }
+        if store.enrichment_jobs_in_workspace(&input.workspace_name)
+            >= crate::state::MAX_ENRICHMENT_JOBS_PER_WORKSPACE
+        {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} enrichment jobs per workspace.",
+                crate::state::MAX_ENRICHMENT_JOBS_PER_WORKSPACE
+            )));
+        }
+
+        let job_id = loop {
+            let candidate = crate::state::new_id();
+            let key = crate::state::enrichment_job_key(&input.workspace_name, &candidate);
+            if !store.enrichment_jobs.contains_key(&key) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::EnrichmentJobRecord {
+            job_id,
+            workspace_name: input.workspace_name.clone(),
+            configuration: input.job_configuration.clone(),
+            client_token: input.client_token.clone(),
+            // The job's whole lifecycle is owed from here; the status is derived from
+            // this instant rather than stored, and nothing is slept on.
+            created_at: now,
+        };
+
+        let output = created(&record, now);
+        let key = crate::state::enrichment_job_key(&record.workspace_name, &record.job_id);
+        store.enrichment_jobs.insert(key, record);
+
+        Ok(output)
     }
+}
+
+/// What this operation answers for a stored job, as of `now` — every member read
+/// off the record rather than off the request, so a create and a replay of that
+/// create answer the same job.
+fn created(
+    record: &crate::state::EnrichmentJobRecord,
+    now: ::std::time::SystemTime,
+) -> CreateEnrichmentJobOutput {
+    CreateEnrichmentJobOutput {
+        job_id: record.job_id.clone(),
+        status: record.status(now).to_string(),
+        created_at: crate::state::to_date_time(record.created_at),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateEnrichmentJobError {
+    CreateEnrichmentJobErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> CreateEnrichmentJobError {
+    CreateEnrichmentJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` naming the job this create collides
+/// with — the resource both operations are on, as the error's required members
+/// state it.
+fn conflicting_operation(
+    message: String,
+    resource_id: String,
+    resource_arn: String,
+) -> CreateEnrichmentJobError {
+    CreateEnrichmentJobErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message,
+        resource_id,
+        resource_arn,
+    })
+    .into()
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> CreateEnrichmentJobError {
+    CreateEnrichmentJobErrorModeled::LimitExceededException(LimitExceededException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> CreateEnrichmentJobError {
+    CreateEnrichmentJobErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }
