@@ -41,7 +41,7 @@ use crate::certificate_lifecycle::{
 
 /// `RevokeAcmeExternalAccountBinding`, asserted to succeed and to answer with the empty
 /// body its modelled `Unit` output carries.
-async fn revoke_binding(router: &MultiServiceRouter, case: &str, arn: &str) {
+pub(crate) async fn revoke_binding(router: &MultiServiceRouter, case: &str, arn: &str) {
     let (status, response) = call(
         router,
         "RevokeAcmeExternalAccountBinding",
@@ -66,7 +66,7 @@ fn unix_seconds(at: SystemTime) -> f64 {
 }
 
 /// How many external account bindings the store holds.
-fn held_bindings(engine: &Arc<engine::InMemoryEngine>) -> usize {
+pub(crate) fn held_bindings(engine: &Arc<engine::InMemoryEngine>) -> usize {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let store = store.lock();
     store.acme_external_account_bindings.len()

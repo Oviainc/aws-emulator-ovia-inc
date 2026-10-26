@@ -252,7 +252,7 @@ fn binding_id(arn: &str) -> &str {
 /// alphabets differ only in their last two symbols (RFC 4648 §§4-5), so a key whose every
 /// character is ASCII alphanumeric names neither of them and decodes identically under
 /// both.
-fn assert_mac_key_round_trips(case: &str, mac_key: &str) {
+pub(crate) fn assert_mac_key_round_trips(case: &str, mac_key: &str) {
     assert_eq!(
         mac_key.chars().count(),
         state::ACME_MAC_KEY_LEN,

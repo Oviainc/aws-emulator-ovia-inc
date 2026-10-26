@@ -43,6 +43,12 @@
 //! credentials it carries — the key id an ACME client presents and the MAC key it signs
 //! with ([`mint_acme_external_account_binding_mac_key`]) — are minted when the binding is
 //! created and never rewritten, so every later read reports the same pair.
+//! `GetAcmeExternalAccountBindingCredentials` is the operation that reports that pair —
+//! it is no member of [`acme_external_account_binding_detail`] — and reports it only
+//! while the binding's authority stands, since a revocation
+//! ([`AcmeExternalAccountBindingRecord::is_revoked`]) withdraws the credentials it
+//! records the instant of
+//! ([`acme_external_account_binding_revoked_message`]).
 //!
 //! Every URL those two records carry is minted here, on the Region's ACME enrollment
 //! host ([`ACME_ENROLLMENT_HOST_LABEL`]) with the endpoint's own id as the first path
@@ -1184,6 +1190,14 @@ pub struct AcmeExternalAccountBindingRecord {
     pub updated_at: SystemTime,
 }
 
+impl AcmeExternalAccountBindingRecord {
+    /// Whether a revocation has already withdrawn the authority these credentials
+    /// carried, which is exactly what [`Self::revoked_at`] records the instant of.
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
+    }
+}
+
 /// Written by hand rather than derived, so the MAC key cannot travel into a formatter:
 /// it is the secret an ACME client signs with, and a derived `Debug` would carry it into
 /// anything that renders this record or the store holding it.
@@ -1757,6 +1771,21 @@ pub fn acme_external_account_binding_not_found_message(
 ) -> String {
     format!(
         "Could not find ACME external account binding {acme_external_account_binding_arn}."
+    )
+}
+
+/// The `ValidationException` message for a request that asks for the credentials of an
+/// ACME external account binding whose revocation has already withdrawn them.
+///
+/// `ValidationException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence follows the template every refusal in this
+/// service renders: one complete sentence naming the requested ARN and the state that
+/// refuses it, terminated by a period.
+pub fn acme_external_account_binding_revoked_message(
+    acme_external_account_binding_arn: &str,
+) -> String {
+    format!(
+        "The ACME external account binding {acme_external_account_binding_arn} has been revoked."
     )
 }
 
