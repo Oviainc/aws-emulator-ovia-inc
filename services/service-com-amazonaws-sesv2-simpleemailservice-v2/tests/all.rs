@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account.rs"]
 mod account;
+#[path = "all/account_details.rs"]
+mod account_details;
 #[path = "all/account_sending_attributes.rs"]
 mod account_sending_attributes;
 #[path = "all/account_suppression_attributes.rs"]

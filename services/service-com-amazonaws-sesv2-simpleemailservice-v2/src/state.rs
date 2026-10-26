@@ -64,6 +64,17 @@ pub const SEND_QUOTA_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// identities per account per Region.
 pub const MAX_IDENTITIES: usize = 10_000;
 
+/// How long after an account asks for production access the decision on that
+/// request becomes due.
+///
+/// Real SES decides the request by a review nothing here can observe (a support
+/// case worked by a human), so the span is CHOSEN, not documented: it is the
+/// emulator's convention for a transition the clock owes, long enough that a caller
+/// which reads straight back still sees the request under review and the rules that
+/// go with it. The due instant is stored on the account record; nothing ever sleeps
+/// for it.
+pub const PRODUCTION_ACCESS_REVIEW_SETTLE: Duration = Duration::from_millis(500);
+
 /// Entries the outbound-message log retains, oldest evicted first.
 ///
 /// A CHOSEN bound, not an AWS one: the log is what lets a caller read back what it
@@ -557,6 +568,7 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         // moves past entries that no longer count.
         let charged = self.recipients_in_quota_window(now);
         self.send_counters.sent_last_24h = charged;
+        self.account.settle(now);
     }
 
     /// Every reputation entity reachable by the call `scope` describes, ordered by
@@ -2287,6 +2299,18 @@ impl Default for SendQuotaState {
 /// status of an account whose sending nobody has reviewed or paused.
 pub const ENFORCEMENT_STATUS_HEALTHY: &str = "HEALTHY";
 
+/// `ReviewStatus`'s value for a production-access request still under review, as
+/// the model spells it (see `crate::ops::types::REVIEW_STATUS_VALUES`).
+///
+/// `ReviewDetails$Status` documents it as "PENDING – We have received your appeal
+/// and are in the process of reviewing it".
+pub const REVIEW_STATUS_PENDING: &str = "PENDING";
+
+/// `ReviewStatus`'s value for a production-access request that has been decided in
+/// the account's favour: "GRANTED – Your appeal has been reviewed and your
+/// production access has been granted".
+pub const REVIEW_STATUS_GRANTED: &str = "GRANTED";
+
 /// `FeatureStatus`'s value for a feature that is on, as the model spells it (see
 /// `crate::ops::types::FEATURE_STATUS_VALUES`).
 pub const FEATURE_ENABLED: &str = "ENABLED";
@@ -2334,6 +2358,15 @@ pub struct AccountState {
     pub next_pricing_plan: Option<String>,
     /// `Details`: the account details a request supplied, absent until one does.
     pub details: Option<crate::ops::types::AccountDetails>,
+    /// When the decision on a production-access request that is still under review
+    /// falls due, and `None` when no request is under review. The request is
+    /// reported meanwhile as `Details$ReviewDetails` with the `PENDING` status;
+    /// [`Self::settle`] is what turns it into the decision.
+    pub production_access_review_due_at: Option<SystemTime>,
+    /// Monotonic counter feeding [`Self::next_review_case_id`], so two
+    /// production-access requests made in the same millisecond still get different
+    /// case ids.
+    pub review_case_sequence: u64,
 }
 
 impl Default for AccountState {
@@ -2363,6 +2396,8 @@ impl Default for AccountState {
             pricing_plan: PRICING_PLAN_NONE.to_string(),
             next_pricing_plan: None,
             details: None,
+            production_access_review_due_at: None,
+            review_case_sequence: 0,
         }
     }
 }
@@ -2406,6 +2441,61 @@ impl AccountState {
             current_plan: Some(self.pricing_plan.clone()),
             next_plan: self.next_pricing_plan.clone(),
         }
+    }
+
+    /// Whether a production-access request is still under review at `now`.
+    ///
+    /// A request whose decision is already due is not under review any more, even
+    /// if nothing has read the account since: [`Self::settle`] is what records the
+    /// decision, and it is owed at the same instant either way.
+    pub fn production_access_review_pending(&self, now: SystemTime) -> bool {
+        self.production_access_review_due_at
+            .is_some_and(|due_at| now < due_at)
+    }
+
+    /// Record the decision the clock owes a production-access request at `now`.
+    ///
+    /// The review of a request SES has received ends in a decision, so the request
+    /// is reported as `PENDING` only until its decision falls due; from then on the
+    /// account reports the granted access and the review that granted it, whether or
+    /// not anybody called in between. The case the request opened keeps its id: the
+    /// decision is on that case, not on a new one.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due_at) = self.production_access_review_due_at else {
+            return;
+        };
+        if now < due_at {
+            return;
+        }
+        self.production_access_review_due_at = None;
+        self.production_access_enabled = true;
+        if let Some(review) = self
+            .details
+            .as_mut()
+            .and_then(|details| details.review_details.as_mut())
+        {
+            review.status = Some(REVIEW_STATUS_GRANTED.to_string());
+        }
+    }
+
+    /// Mint the id of the support case a production-access request opens.
+    ///
+    /// `ReviewDetails$CaseId` is documented only as "the associated support center
+    /// case ID (if any)" and carries no modelled format, so the shape mirrors the
+    /// case id AWS Support hands back while the only guarantee this makes is the one
+    /// a client depends on: the id identifies one request and is stable for as long
+    /// as the account reports that request's review (it is minted once, when the
+    /// request is submitted, and read back from the record afterwards). Uniqueness is
+    /// structural — the monotonic sequence number is part of the id — so two requests
+    /// submitted in the same millisecond still differ.
+    pub fn next_review_case_id(&mut self, account_id: &str, now: SystemTime) -> String {
+        self.review_case_sequence += 1;
+        let millis = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let sequence = self.review_case_sequence;
+        format!("case-{account_id}-{millis:012x}-{sequence:08x}")
     }
 }
 

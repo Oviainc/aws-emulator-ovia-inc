@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists the account details of this account in this Region — the mail type, the
+//! website, the contact language, the use-case description and the additional
+//! contacts — and submits a production-access request for review when one is asked
+//! for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutAccountDetails without the shared emulator state",
+            ));
+        };
+
+        // Every modelled constraint on the input — the two enum value sets, the
+        // sized members' lengths and the website's pattern — is refused before this
+        // handler runs, so reaching here means the details are submittable as they
+        // stand.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountDetails"))
+        // The support case a production-access request opens is the caller's own, so
+        // its id carries the account the call is signed for.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of the account reports settled state, so settle here too: this write
+        // lands on the same record a read would have reported, and the decision an
+        // earlier request was already owed is recorded before this one is judged.
+        store.settle(now);
+        let account = &mut store.account;
+
+        // "If there is already an ongoing account details update under review": the
+        // details under review are not replaced while that review is running.
+        if account.production_access_review_pending(now) {
+            return Err(PutAccountDetailsErrorModeled::ConflictException(ConflictException {
+                message: Some(
+                    "There is already an ongoing account details update under review.".to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // `ProductionAccessEnabled` "indicates whether or not your account SHOULD
+        // have production access", so asking for access the account does not have
+        // opens a support case and is reviewed: the account stays in the sandbox,
+        // reporting the request as the review of the details just submitted, until
+        // the decision on that case falls due. Asking for no production access puts
+        // the account in the sandbox at once, with nothing left under review, and a
+        // request that says nothing about production access leaves the account's
+        // access, and the review it last reported, as they are.
+        let review_details = match input.production_access_enabled {
+            Some(true) if !account.production_access_enabled => {
+                let case_id = account.next_review_case_id(scope.account_id, now);
+                account.production_access_review_due_at = Some(
+                    now.checked_add(crate::state::PRODUCTION_ACCESS_REVIEW_SETTLE)
+                        .unwrap_or(now),
+                );
+                Some(ReviewDetails {
+                    status: Some(crate::state::REVIEW_STATUS_PENDING.to_string()),
+                    case_id: Some(case_id),
+                })
+            }
+            Some(false) => {
+                account.production_access_enabled = false;
+                None
+            }
+            Some(true) | None => account
+                .details
+                .as_ref()
+                .and_then(|details| details.review_details.clone()),
+        };
+
+        // The request carries the whole of the account's details, so the stored
+        // details become exactly what was submitted, and every later caller sees
+        // them: `GetAccount` reports them as `Details`. The sending limits are left
+        // alone — SES documents them as varying "based on your specific use case", so
+        // nothing here invents one.
+        account.details = Some(AccountDetails {
+            mail_type: Some(input.mail_type),
+            website_url: Some(input.website_url),
+            contact_language: input.contact_language,
+            use_case_description: input.use_case_description,
+            additional_contact_email_addresses: input.additional_contact_email_addresses,
+            review_details,
+        });
+
+        // `PutAccountDetailsResponse` carries no members: what was persisted is read
+        // back with `GetAccount`.
+        Ok(PutAccountDetailsOutput {})
     }
 }
