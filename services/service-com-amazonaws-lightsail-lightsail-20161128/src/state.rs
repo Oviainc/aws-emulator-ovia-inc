@@ -698,6 +698,8 @@ pub const OPERATION_TYPE_DELETE_DISTRIBUTION: &str = "DeleteDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_RELEASE_STATIC_IP: &str = "ReleaseStaticIp";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
@@ -12450,6 +12452,53 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly allocated static IP.
     pub fn insert_static_ip(&mut self, static_ip: StoredStaticIp) {
         self.static_ips.insert(static_ip.name.clone(), static_ip);
+    }
+
+    /// Remove the static IP `name` names, answering it. `None` when nothing
+    /// matched.
+    ///
+    /// Giving up the reservation gives up the attachment with it, for the reason
+    /// spelled out on [`Self::remove_instance`]: an attachment names "the
+    /// resources to which" a resource "is attached" (the modelled
+    /// `StaticIp$attachedTo`), and an address this account no longer holds is
+    /// not one of them — so the removal and the release are one step and no read
+    /// can observe an instance holding an address the store does not have.
+    ///
+    /// The instance that held it keeps public addressing, drawn afresh from this
+    /// store's one address allocator: an attached static IP is the ONLY thing
+    /// that pins an instance's public IPv4 address ("To use the same IP address
+    /// after stopping and starting an instance, create a static IP address and
+    /// attach it to the instance" — the modelled `StartInstance`
+    /// documentation), so an instance with none holds an ordinary address the
+    /// platform assigned it, and `Instance$isStaticIp` — "a Boolean value
+    /// indicating whether this instance has a static IP assigned to it" — is
+    /// false again. The private address and the IPv6 addresses are left where
+    /// they are: a static IP reserves one public IPv4 address (the modelled
+    /// `StaticIp$ipAddress`), so it pinned neither.
+    pub fn remove_static_ip(&mut self, name: &str) -> Option<StoredStaticIp> {
+        let static_ip = self.static_ips.remove(name)?;
+        if let Some(instance_name) = static_ip.attached_to.clone() {
+            // Which addresses the instance has at all is its own
+            // `ipAddressType`, exactly as it is on a start; an instance the
+            // store no longer holds has none to redraw.
+            let ip_address_type = self
+                .instance(&instance_name)
+                .map(|instance| instance.ip_address_type.clone());
+            if let Some(ip_address_type) = ip_address_type {
+                // ONE draw from the one allocator every address in this store
+                // comes out of, so the address the instance falls back to is one
+                // no resource in this process has held. The private address and
+                // the IPv6 addresses it also yields are dropped — the instance
+                // keeps its own — which spends the offset rather than wasting
+                // it.
+                let (_private, public, _ipv6) = self.fresh_addresses(&ip_address_type);
+                if let Some(instance) = self.instance_mut(&instance_name) {
+                    instance.is_static_ip = false;
+                    instance.public_ip_address = public;
+                }
+            }
+        }
+        Some(static_ip)
     }
 
     /// Store a newly created disk snapshot.
