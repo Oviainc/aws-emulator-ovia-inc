@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLandingZoneOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLandingZoneOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLandingZoneOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the landing zone operation log: the record every call that acts on the
+//! account's landing zone appends, narrowed by `filter`, limited to the window the
+//! operation documents and paginated by `maxResults`/`nextToken`. Modelled `@readonly`:
+//! the only state it writes is the transitions the state's `settle` finds the clock
+//! already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +79,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The filter-matching rule every list operation of this service shares, so a change to
+// it narrows every listing the same way; see `crate::state` for how a sent filter member
+// becomes the set it matches against.
+use crate::state::{filter_set, selected};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -114,6 +116,22 @@ pub type ListLandingZoneOperationsError = crate::scaffolded::Scaffolded<ListLand
 impl From<ListLandingZoneOperationsErrorModeled> for ListLandingZoneOperationsError {
     fn from(modeled: ListLandingZoneOperationsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// How far back a listing reaches.
+///
+/// From this operation's own docs — it "lists all landing zone operations from the past 90
+/// days" — so an older record is not listed, even while `GetLandingZoneOperation` still
+/// resolves it by identifier for as long as the log retains it.
+const LISTED_WINDOW: ::std::time::Duration = ::std::time::Duration::from_secs(90 * 24 * 60 * 60);
+
+/// The summary one log record reports.
+fn summary(record: &crate::state::LandingZoneOperation) -> LandingZoneOperationSummary {
+    LandingZoneOperationSummary {
+        operation_type: Some(record.operation_type.as_wire().to_string()),
+        operation_identifier: Some(record.operation_identifier.clone()),
+        status: Some(record.status.as_wire().to_string()),
     }
 }
 
@@ -153,18 +171,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLandingZoneOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLandingZoneOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLandingZoneOperations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLandingZoneOperationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every member of `filter` narrows the listing; a member the caller omitted
+        // narrows nothing. The sets are built here, BEFORE the state lock below, so the
+        // only work done under the lock is one pass over the log.
+        let filter = input.filter.unwrap_or_default();
+        let types = filter_set(filter.types.as_ref());
+        let statuses = filter_set(filter.statuses.as_ref());
+
+        let now = ::std::time::SystemTime::now();
+        // A record that started before this instant is outside the documented window. A
+        // clock so far back that the window would predate the epoch leaves every record
+        // inside it, which is what `None` means here.
+        let earliest_listed = now.checked_sub(LISTED_WINDOW);
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(now);
+
+        // Most recently started first, as the operation documents, and the identifier
+        // breaks a tie so the order is TOTAL: a `nextToken` then resumes exactly where the
+        // previous page stopped whatever order the map iterates in. The records are
+        // BORROWED, not cloned: only the page this call returns is materialised.
+        let mut records: Vec<&crate::state::LandingZoneOperation> = store
+            .landing_zone_operations
+            .values()
+            .filter(|record| {
+                selected(&types, record.operation_type.as_wire())
+                    && selected(&statuses, record.status.as_wire())
+                    && earliest_listed.is_none_or(|earliest| record.start_time >= earliest)
+            })
+            .collect();
+        records.sort_by(|left, right| {
+            right
+                .start_time
+                .cmp(&left.start_time)
+                .then_with(|| left.operation_identifier.cmp(&right.operation_identifier))
+        });
+
+        // The token this operation hands out is the index of the next unreturned record,
+        // so it is only meaningful against a call carrying the same filter, which is what
+        // `nextToken` is documented to require.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= records.len() => index,
+                _ => {
+                    return Err(ListLandingZoneOperationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListLandingZoneOperations call with these parameters"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the front door has already refused
+        // anything outside it; absent, every remaining record is returned.
+        let limit = input
+            .max_results
+            .map_or(records.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(records.len());
+
+        Ok(ListLandingZoneOperationsOutput {
+            landing_zone_operations: records[start..end]
+                .iter()
+                .map(|record| summary(record))
+                .collect(),
+            next_token: (end < records.len()).then(|| end.to_string()),
+        })
     }
 }

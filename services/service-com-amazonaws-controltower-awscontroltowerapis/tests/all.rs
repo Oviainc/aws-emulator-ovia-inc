@@ -53,6 +53,8 @@ mod landing_zone_decommission;
 mod landing_zone_identifier;
 #[path = "all/landing_zone_lifecycle.rs"]
 mod landing_zone_lifecycle;
+#[path = "all/landing_zone_operations.rs"]
+mod landing_zone_operations;
 #[path = "all/landing_zone_reset.rs"]
 mod landing_zone_reset;
 #[path = "all/landing_zone_update.rs"]
