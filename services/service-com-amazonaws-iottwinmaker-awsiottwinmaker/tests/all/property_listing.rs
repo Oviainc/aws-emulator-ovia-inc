@@ -434,7 +434,10 @@ async fn a_row_agrees_with_the_other_readers_of_the_property() {
     let rows = summaries(&listed);
 
     // The definition of an INHERITED property is the component type's own —
-    // whichever type on the chain declared it.
+    // whichever type on the chain declared it — except for `isInherited`, which
+    // describes the READER's relationship to the definition: a component that
+    // never declared the property reports it inherited, while the component type
+    // that declared it reports its own definition.
     let definitions: Vec<(&str, &str)> = vec![("Tag", BASE), ("Serial", BASE), ("Pressure", DERIVED)];
     for (property_name, component_type_id) in definitions {
         let read = emulator
@@ -448,8 +451,21 @@ async fn a_row_agrees_with_the_other_readers_of_the_property() {
             .iter()
             .find(|row| row["propertyName"] == property_name)
             .unwrap_or_else(|| panic!("case {property_name:?}: expected the row, got {listed:?}"));
+        let mut listed_definition = row["definition"].clone();
+        let mut declared_definition = read.member("propertyDefinitions")[property_name].clone();
         assert_eq!(
-            row["definition"], read.member("propertyDefinitions")[property_name],
+            (
+                listed_definition["isInherited"].as_bool(),
+                declared_definition["isInherited"].as_bool(),
+            ),
+            (Some(true), Some(false)),
+            "case {property_name:?}: the component inherits this definition and the component \
+             type declares it, got {row:?} and {declared_definition:?}"
+        );
+        listed_definition["isInherited"] = Value::Null;
+        declared_definition["isInherited"] = Value::Null;
+        assert_eq!(
+            listed_definition, declared_definition,
             "case {property_name:?}: expected one definition to be reported alike by \
              ListProperties and GetComponentType, got {row:?}"
         );

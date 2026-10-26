@@ -235,9 +235,73 @@ fn create_bucket(router: &MultiServiceRouter, runtime: &tokio::runtime::Runtime,
     );
 }
 
+/// The trust policy of the role an identity pool vends sessions of, written the way the
+/// Amazon Cognito Developer Guide writes one: the `Federated` Cognito Identity principal,
+/// the web-identity assume, and the `:aud` condition that restricts the assume to the users
+/// of that one pool.
+///
+/// Compact and carrying none of the characters that are significant in an
+/// `application/x-www-form-urlencoded` body (`&`, `=`, `+`, `%`, space), so it needs no
+/// encoding.
+fn pool_trust_policy(pool_id: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"Federated\":\"cognito-identity.amazonaws.com\"}},\
+         \"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{{\"StringEquals\":\
+         {{\"cognito-identity.amazonaws.com:aud\":\"{pool_id}\"}}}}}}]}}"
+    )
+}
+
+/// `iam:CreateRole` for the role the pool `pool_id` vends sessions of, answering its ARN.
+fn create_pool_role(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    pool_name: &str,
+    pool_id: &str,
+) -> String {
+    let role_name = format!("{pool_name}-unauth");
+    let created = dispatch(
+        router,
+        runtime,
+        as_setup("iam"),
+        "POST",
+        "/",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        bytes::Bytes::from(format!(
+            "Action=CreateRole&Version=2010-05-08&RoleName={role_name}\
+             &AssumeRolePolicyDocument={}",
+            pool_trust_policy(pool_id)
+        )),
+    );
+    assert_eq!(
+        created.status,
+        200,
+        "setup: CreateRole({role_name:?}) must succeed, got {} with {:?}",
+        created.status,
+        created.text()
+    );
+    let body = created.text();
+    let open = "<Arn>";
+    let close = "</Arn>";
+    let start = body
+        .find(open)
+        .unwrap_or_else(|| panic!("setup: no <Arn> in {body}"))
+        + open.len();
+    let end = body[start..]
+        .find(close)
+        .unwrap_or_else(|| panic!("setup: no </Arn> in {body}"))
+        + start;
+    body[start..end].to_string()
+}
+
 /// The access key id of a session vended to a fresh identity of a fresh identity pool,
 /// reached the way a client reaches it: `GetId` and `GetCredentialsForIdentity` sent with
 /// NO credential scope.
+///
+/// A vend is a session of the pool's role, so the pool is first given one: the role is
+/// created by `iam:CreateRole` and attached by `cognito-identity:SetIdentityPoolRoles`,
+/// both over the wire, so the trust policy the vend's assume is decided against is the
+/// document IAM's own handler stored.
 fn vended_access_key_id(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
@@ -261,6 +325,25 @@ fn vended_access_key_id(
         .as_str()
         .expect("CreateIdentityPool reports an IdentityPoolId")
         .to_string();
+
+    let role_arn = create_pool_role(router, runtime, pool_name, &pool_id);
+    let configured = rpc(
+        router,
+        runtime,
+        as_setup("cognito-identity"),
+        "AWSCognitoIdentityService.SetIdentityPoolRoles",
+        &json!({
+            "IdentityPoolId": &pool_id,
+            "Roles": { "unauthenticated": &role_arn },
+        }),
+    );
+    assert_eq!(
+        configured.status,
+        200,
+        "setup: SetIdentityPoolRoles must succeed, got {} with {:?}",
+        configured.status,
+        configured.text()
+    );
 
     let identity = rpc(
         router,

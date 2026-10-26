@@ -52,6 +52,14 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambd
 /// This is the 22-byte empty-archive zip, base64-encoded.
 pub(crate) const ZIP_FILE: &str = "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==";
 
+/// The name of the MicroVM image the tagging rows address, and so the last segment of
+/// the `microvm-image` ARN they put in the shared tagging path.
+const MICROVM_IMAGE_NAME: &str = "img-1";
+
+/// The AWS-managed base image every MicroVM image is built on, in the ARN form an
+/// AWS-owned resource of that service carries (`aws` in the account field).
+const MANAGED_BASE_IMAGE_ARN: &str = "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1";
+
 /// How a row names the service that must claim it. `MANY` and `NONE` are the two routing
 /// failures: `MANY` is the `500 AmbiguousService` this issue is about, `NONE` the router's
 /// `404 UnknownService`.
@@ -614,20 +622,41 @@ async fn every_lambda_signed_request_is_dispatched_instead_of_refused_as_ambiguo
             "",
         ),
         (
-            // The shared tagging path, MicroVMs side. This row is what distinguishes the
+            // The MicroVMs side of the shared tagging path tags a resource only the
+            // MicroVMs service mints, so this row creates it first — the same
+            // create-then-tag pair as the control-plane rows above.
+            "microvms CreateMicrovmImage",
+            "POST",
+            "/2025-09-09/microvm-images".to_string(),
+            json!({
+                "name": MICROVM_IMAGE_NAME,
+                "baseImageArn": MANAGED_BASE_IMAGE_ARN,
+                "buildRoleArn": ROLE,
+                "codeArtifact": {"uri": "s3://routing-artifacts/app.zip"},
+            }),
+            201,
+            "",
+        ),
+        (
             // two: the control plane's own `TaggableResource` pattern does NOT accept a
             // `microvm-image` ARN, so had the request landed there the framework would
             // have refused it before any handler ran — only the MicroVMs service can
-            // answer its scaffold's 501 here.
+            // answer its own modelled 204 here. This change implements the MicroVMs
+            // service's `TagResource` (see
+            // `services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/src/ops/tag_resource.rs`),
+            // so it now answers that 204 for the image the row above created, rather than
+            // the scaffold's 501.
             "tags: TagResource on a MicroVM image",
             "POST",
             format!(
                 "/2017-03-31/tags/{}",
-                label("arn:aws:lambda:us-east-1:000000000000:microvm-image:img-1")
+                label(&format!(
+                    "arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image:{MICROVM_IMAGE_NAME}"
+                ))
             ),
             json!({"Tags": {"team": "routing"}}),
-            501,
-            "NotImplemented",
+            204,
+            "",
         ),
     ];
 

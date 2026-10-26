@@ -191,9 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The pool's identities are gone, so the sessions issued to them are no longer
-        // credentials this emulator accepts.
+        // credentials this emulator accepts — in the credential store, and in the session
+        // registry that would otherwise still resolve them to a role.
         for access_key_id in revoked {
-            let _ = ctx.credential_store().delete(&access_key_id);
+            crate::state::discard_vended_role_session(
+                &*self.engine,
+                ctx.credential_store(),
+                &access_key_id,
+            );
         }
         Ok(DeleteIdentityPoolOutput)
     }

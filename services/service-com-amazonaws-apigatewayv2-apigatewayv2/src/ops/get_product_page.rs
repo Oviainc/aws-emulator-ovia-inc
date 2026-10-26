@@ -181,11 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(page) = stored else {
             return Err(GetProductPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid ProductPage identifier specified {}:{}:{}",
-                        ::engine::emulator_account_id(),
-                        input.portal_product_id,
-                        input.product_page_id
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::PRODUCT_PAGE_RESOURCE,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

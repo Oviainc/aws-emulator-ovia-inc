@@ -43,6 +43,12 @@ mod instance_attribute_reset;
 // its lines, and this fix lost three serialized squash merges to exactly that.
 #[path = "all/replace_root_volume_tasks.rs"]
 mod replace_root_volume_tasks;
+// What `ReportInstanceStatus` collects, which instances it accepts feedback about, and what
+// it refuses. Declared beside the suites above rather than in sorted position, for the reason
+// this file's header note gives: the sorted neighbourhood is where every new ec2 suite
+// inserts its two lines, and that is where a serialized squash merge is lost.
+#[path = "all/report_instance_status.rs"]
+mod report_instance_status;
 // Declared here rather than in sorted position, for the reason above: the sorted
 // neighbourhood of this suite is the contended region of this file.
 #[path = "all/local_gateway_routes.rs"]

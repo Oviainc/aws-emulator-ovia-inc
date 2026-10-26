@@ -27,6 +27,8 @@ mod domain_name_conflict_and_not_found;
 mod domain_project_lifecycle;
 #[path = "all/domain_unit_hierarchy.rs"]
 mod domain_unit_hierarchy;
+#[path = "all/domain_unit_name_uniqueness.rs"]
+mod domain_unit_name_uniqueness;
 #[path = "all/domain_units_for_parent.rs"]
 mod domain_units_for_parent;
 #[path = "all/entity_owners.rs"]

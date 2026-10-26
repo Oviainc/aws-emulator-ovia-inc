@@ -169,8 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutPortalProductSharingPolicyErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::invalid_identifier_message(
-                        "PortalProduct",
-                        &input.portal_product_id,
+                        crate::state::PORTAL_PRODUCT_RESOURCE,
                     )),
                     resource_type: ::std::option::Option::None,
                 })

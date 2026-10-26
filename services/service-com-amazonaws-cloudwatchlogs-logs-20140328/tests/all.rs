@@ -99,6 +99,8 @@ mod lookup_table_removal;
 mod lookup_table_updates;
 #[path = "all/lookup_tables.rs"]
 mod lookup_tables;
+#[path = "all/metric_filter_enumeration.rs"]
+mod metric_filter_enumeration;
 #[path = "all/metric_filters.rs"]
 mod metric_filters;
 #[path = "all/metric_transformation_exclusion_wording.rs"]

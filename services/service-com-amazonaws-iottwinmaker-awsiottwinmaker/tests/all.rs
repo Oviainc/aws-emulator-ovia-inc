@@ -14,6 +14,9 @@
 #[path = "all/abstract_component_types.rs"]
 mod abstract_component_types;
 
+#[path = "all/component_inherited_schema.rs"]
+mod component_inherited_schema;
+
 #[path = "all/component_listing.rs"]
 mod component_listing;
 

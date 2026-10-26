@@ -39,8 +39,12 @@ mod event_topics;
 mod harness;
 #[path = "all/ip_route_removal.rs"]
 mod ip_route_removal;
+#[path = "all/log_subscriptions.rs"]
+mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
+#[path = "all/request_id_header.rs"]
+mod request_id_header;
 #[path = "all/shared_directories.rs"]
 mod shared_directories;
 #[path = "all/snapshots.rs"]

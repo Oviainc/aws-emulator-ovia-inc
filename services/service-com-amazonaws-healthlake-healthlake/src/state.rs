@@ -20,6 +20,9 @@
 //! `ListDataTransformationProfileVersions` reports those same versions — the
 //! DRAFT and every published snapshot — newest first and paged, so a published
 //! version is observable identically through either of them.
+//! `ListDataTransformationProfiles` reports the SAME records once each instead,
+//! at their latest version, filtered by source format and paged, so a created,
+//! updated or published profile is observable through it too.
 //!
 //! The FHIR export job is the third: a job record belongs to the data store it
 //! exports, `StartFHIRExportJob` MINTS one here, and `DescribeFHIRExportJob` /
@@ -52,7 +55,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
-    DataTransformationProfileVersionSummary, ErrorCause, ExportJobProperties,
+    DataTransformationProfileSummary, DataTransformationProfileVersionSummary, ErrorCause,
+    ExportJobProperties,
     IdentityProviderConfiguration, ImportJobProperties, InputDataConfig, JobProgressReport,
     KmsEncryptionConfig, NlpConfiguration, OutputDataConfig, PreloadDataConfig,
     ProfileConfiguration, SseConfiguration, Tag, TransformationInputDataConfig,
@@ -1420,6 +1424,52 @@ impl DataTransformationProfile {
             profile_name: Some(self.name.clone()),
             change_description: version.change_description.clone(),
             last_updated_at: Some(version.last_updated_at),
+        }
+    }
+
+    /// The LATEST version of this profile: the highest version it holds, which is
+    /// the highest published one, or its DRAFT while nothing has been published
+    /// from it. A published version is numbered above the DRAFT's
+    /// [`DRAFT_PROFILE_VERSION`], so "highest" and "latest" are the same version.
+    pub fn latest_version(&self) -> &ProfileVersionRecord {
+        self.latest_published().unwrap_or(&self.draft)
+    }
+
+    /// When this PROFILE last changed: the most recent instant any version of it
+    /// was last updated, across its DRAFT and every version published from it.
+    ///
+    /// Measured over the versions rather than read off the latest one, so a DRAFT
+    /// rewritten after the last publish still moves it — a write to any version is
+    /// a write to the profile. The walk is bounded: at most
+    /// `1 + MAX_PROFILE_VERSION` versions.
+    pub fn last_updated_at(&self) -> ::aws_smithy_types::DateTime {
+        ::std::iter::once(&self.draft)
+            .chain(self.published.values())
+            .map(|version| version.last_updated_at)
+            .max_by_key(epoch_nanos)
+            // A profile always holds its DRAFT, so the iterator is never empty;
+            // the create instant is the floor if that ever stops being true.
+            .unwrap_or(self.created_at)
+    }
+
+    /// This profile as the modelled `DataTransformationProfileSummary`, the shape
+    /// `ListDataTransformationProfiles` reports a profile through — one entry per
+    /// profile, carrying its latest version number and the instant the profile was
+    /// last updated.
+    ///
+    /// The metadata comes from the profile itself, so a summary and the
+    /// `GetDataTransformationProfile` of the same version can never disagree. The
+    /// content is NOT summarised: the model sends a caller to
+    /// `GetDataTransformationProfile` for it.
+    pub fn summary(&self) -> DataTransformationProfileSummary {
+        DataTransformationProfileSummary {
+            profile_id: self.id.clone(),
+            version: self.latest_version().version,
+            source_format: self.source_format.clone(),
+            target_format: self.target_format.clone(),
+            profile_name: Some(self.name.clone()),
+            profile_description: self.description.clone(),
+            last_updated_at: Some(self.last_updated_at()),
         }
     }
 

@@ -90,17 +90,25 @@ pub const KEY_SCHEMA_MISMATCH_MESSAGE: &str =
 /// AWS's FIXED sentence for that case, again naming no attribute.
 pub const MISSING_KEY_VALUE_MESSAGE: &str = "One of the required keys was not given a value";
 
+/// How an `ExclusiveStartKey` that is not a key of the schema being paged is
+/// refused. A resume token is not an item selector: a caller gets it from the
+/// previous page's `LastEvaluatedKey`, so AWS states the token INVALID rather
+/// than reporting the key-schema mismatch it words for a `Key` member.
+pub const START_KEY_INVALID_MESSAGE: &str = "The provided starting key is invalid";
+
 /// Which request member a primary key is being read out of.
 ///
-/// The walk over the key schema is the same for both; only the WORDING of a
+/// The walk over the key schema is the same for all three; only the WORDING of a
 /// missing or wrongly-typed element differs, which is what this carries. A
 /// `Key` IS the primary key, so any way it differs from the schema is the one
 /// mismatch; an `Item` is the whole item, so a key attribute it does not carry
-/// is reported as the value it did not give.
+/// is reported as the value it did not give; an `ExclusiveStartKey` is a resume
+/// token, so any way it differs from the schema makes it an invalid token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySource {
     Item,
     Key,
+    StartKey,
 }
 
 impl KeySource {
@@ -109,14 +117,19 @@ impl KeySource {
     fn absent(self) -> RequestError {
         match self {
             Self::Item => RequestError::Validation(MISSING_KEY_VALUE_MESSAGE.to_string()),
-            Self::Key => self.mismatch(),
+            Self::Key | Self::StartKey => self.mismatch(),
         }
     }
 
     /// The one sentence a key that is not this table's primary key is refused
-    /// with.
+    /// with, in the terms the member it was read out of is stated in.
     fn mismatch(self) -> RequestError {
-        RequestError::Validation(KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
+        match self {
+            Self::StartKey => RequestError::Validation(START_KEY_INVALID_MESSAGE.to_string()),
+            Self::Item | Self::Key => {
+                RequestError::Validation(KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
+            }
+        }
     }
 }
 
@@ -1837,9 +1850,40 @@ impl PointInTimeRecovery {
     }
 
     /// Whether point-in-time recovery is on, which is what a restore from a point in
-    /// time is served against.
+    /// time is served against ([`Self::restorable_window`] derives the window such a
+    /// restore is held to, and answers `None` for exactly the tables this answers
+    /// `false` for).
     pub fn enabled(&self) -> bool {
         self.enabled_at.is_some()
+    }
+
+    /// The restorable window at `now` — `(earliest, latest)` — while recovery is on,
+    /// and `None` while it is off, because a table with recovery off has no point in
+    /// time to restore to.
+    ///
+    /// DERIVED at every read rather than stored, because it moves with the clock: the
+    /// newest point is one [`RESTORE_WINDOW_LAG`] behind now ("LatestRestorableDateTime
+    /// is typically 5 minutes before the current time") and the oldest the configured
+    /// period behind now, each held at or after the instant recovery started — before
+    /// which there is nothing to restore from. The bounds are ordered by construction,
+    /// so the window is never empty.
+    pub fn restorable_window(&self, now: SystemTime) -> Option<(SystemTime, SystemTime)> {
+        let enabled_at = self.enabled_at?;
+        let latest = now
+            .checked_sub(RESTORE_WINDOW_LAG)
+            .unwrap_or(now)
+            .max(enabled_at);
+        let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
+        let earliest = now
+            .checked_sub(DAY * period)
+            .unwrap_or(now)
+            .clamp(enabled_at, latest);
+        // Reported at the precision a timestamp carries on the wire, so each bound a
+        // client reads back is exactly the instant it can send in again.
+        Some((
+            at_timestamp_precision(earliest),
+            at_timestamp_precision(latest),
+        ))
     }
 
     /// The continuous-backups settings as the two continuous-backups operations report
@@ -1847,35 +1891,13 @@ impl PointInTimeRecovery {
     /// description — the window only while recovery is on, since a table with recovery
     /// off has no point in time to restore to.
     pub fn describe(&self, now: SystemTime) -> ContinuousBackupsDescription {
-        let recovery = match self.enabled_at {
-            Some(enabled_at) => {
-                // The newest restorable point, never earlier than the instant recovery
-                // started: a table whose recovery is younger than the lag can be
-                // restored to when it started and no further back.
-                let latest = now
-                    .checked_sub(RESTORE_WINDOW_LAG)
-                    .unwrap_or(now)
-                    .max(enabled_at);
-                let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
-                // The oldest restorable point: the configured period behind now, held
-                // inside the window the recovery itself has been running for. The bounds
-                // are ordered by construction — `latest` is at least `enabled_at` — so
-                // this cannot be an empty range.
-                let earliest = now
-                    .checked_sub(DAY * period)
-                    .unwrap_or(now)
-                    .clamp(enabled_at, latest);
-                PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: Some(
-                        POINT_IN_TIME_RECOVERY_ENABLED.to_string(),
-                    ),
-                    recovery_period_in_days: Some(self.recovery_period_in_days),
-                    earliest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(
-                        earliest,
-                    )),
-                    latest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(latest)),
-                }
-            }
+        let recovery = match self.restorable_window(now) {
+            Some((earliest, latest)) => PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_ENABLED.to_string()),
+                recovery_period_in_days: Some(self.recovery_period_in_days),
+                earliest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(earliest)),
+                latest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(latest)),
+            },
             None => PointInTimeRecoveryDescription {
                 point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_DISABLED.to_string()),
                 ..PointInTimeRecoveryDescription::default()
@@ -2131,8 +2153,28 @@ pub fn at_timestamp_precision(instant: SystemTime) -> SystemTime {
     }
 }
 
-/// One stored instant as the figure a comparison orders by: whole milliseconds since the
-/// epoch, negative before it.
+/// `instant` at the NEAREST reported timestamp, for an instant a client ECHOED BACK.
+///
+/// [`at_timestamp_precision`] truncates, which is right for an instant this service is
+/// MINTING. A value that has travelled out through the wire's decimal form and back can
+/// land a fraction either side of the instant it names, so one being read is rounded
+/// instead: a client that sends back a timestamp this service reported then names exactly
+/// that instant rather than the millisecond below it.
+pub fn at_nearest_timestamp_precision(instant: SystemTime) -> SystemTime {
+    match instant.duration_since(UNIX_EPOCH) {
+        Ok(since) => {
+            let millis = since.as_nanos().saturating_add(500_000) / 1_000_000;
+            // An instant so far ahead that rounding it cannot be represented is left as
+            // it is rather than wrapped: the value arrives from a request, so no caller
+            // can steer this into an overflow.
+            UNIX_EPOCH
+                .checked_add(Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX)))
+                .unwrap_or(instant)
+        }
+        Err(_) => instant,
+    }
+}
+
 fn epoch_millis(instant: SystemTime) -> i128 {
     match instant.duration_since(UNIX_EPOCH) {
         Ok(since) => i128::try_from(since.as_millis()).unwrap_or(i128::MAX),
@@ -2744,12 +2786,25 @@ impl Table {
     /// attribute it omits, a key attribute of another type — is the one mismatch
     /// AWS states with [`KEY_SCHEMA_MISMATCH_MESSAGE`].
     pub fn key_of_key_map(&self, key: &Item) -> Result<ItemKey, RequestError> {
+        self.key_of_map(key, KeySource::Key)
+    }
+
+    /// The primary key a paging member (`ExclusiveStartKey`) resumes from: read
+    /// through the same key schema as a `Key`, and refused as the INVALID RESUME
+    /// TOKEN it is when it is not a key of that schema ([`START_KEY_INVALID_MESSAGE`]).
+    pub fn key_of_start_key(&self, key: &Item) -> Result<ItemKey, RequestError> {
+        self.key_of_map(key, KeySource::StartKey)
+    }
+
+    /// The one walk a `Key`-shaped map is read through, whichever member carried it:
+    /// exactly the key attributes the schema declares, with their declared types.
+    fn key_of_map(&self, key: &Item, source: KeySource) -> Result<ItemKey, RequestError> {
         for name in key.keys() {
             if name != self.partition_key_name() && Some(name.as_str()) != self.sort_key_name() {
-                return Err(KeySource::Key.mismatch());
+                return Err(source.mismatch());
             }
         }
-        self.key_from(key, KeySource::Key)
+        self.key_from(key, source)
     }
 
     /// The one walk over the key schema both `Key` and `Item` are read through:
@@ -2764,7 +2819,7 @@ impl Table {
             // Read out of a `Key`, an element of the wrong type does not name
             // this key either, so it is the same mismatch rather than a report
             // of the declared and the supplied type.
-            if matches!(source, KeySource::Key)
+            if !matches!(source, KeySource::Item)
                 && self
                     .declared_type(name)
                     .is_some_and(|declared| declared != attribute_value_type(value))
@@ -2779,7 +2834,7 @@ impl Table {
             }
         }
         Ok(ItemKey {
-            partition: partition.ok_or_else(|| KeySource::Key.mismatch())?,
+            partition: partition.ok_or_else(|| source.mismatch())?,
             sort,
         })
     }
@@ -4025,6 +4080,22 @@ pub fn duplicate_tag_key(key: &str) -> RequestError {
 /// status) leaks through the data-plane refusal.
 fn item_resource_not_found() -> RequestError {
     RequestError::NotFound("Requested resource not found".to_string())
+}
+
+/// The `ValidationException` message for a request that names an index the addressed
+/// table does not declare as the SOURCE IT READS.
+///
+/// An index named in a statement's source — or in an `IndexName` member — is part of the
+/// request's own shape rather than a resource the caller addressed: the table was found,
+/// and what is wrong is that it has no such index, which AWS states with this fixed
+/// sentence, naming no index. (A caller that addresses an index AS THE RESOURCE, by table
+/// and index name, is answered by [`index_not_found`] instead: there the index is what it
+/// asked for.)
+pub const UNKNOWN_INDEX_MESSAGE: &str = "The table does not have the specified index";
+
+/// That message as the refusal it is.
+pub fn unknown_index() -> RequestError {
+    RequestError::Validation(UNKNOWN_INDEX_MESSAGE.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

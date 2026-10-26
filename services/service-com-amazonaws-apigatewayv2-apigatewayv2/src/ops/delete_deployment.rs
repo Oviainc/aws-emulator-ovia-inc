@@ -174,12 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // A deployment is a CHILD of an api: it is addressed through the api that owns
-        // it, so an api that does not exist holds no deployment to remove.
+        // A deployment is addressed WITHIN the api that owns it (`DELETE
+        // /v2/apis/{ApiId}/deployments/{DeploymentId}`), so the pair is one lookup: an
+        // api the store does not hold carries no such deployment, and the refusal names
+        // the deployment this call addressed rather than the api it is scoped by.
         let Some(api) = store.apis.get_mut(&input.api_id) else {
             return Err(not_found(crate::state::invalid_identifier_message(
-                "API",
-                &input.api_id,
+                crate::state::DEPLOYMENT_RESOURCE,
             )));
         };
 
@@ -188,8 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addressing `GetDeployment` reports on.
         if !api.deployments.contains_key(&input.deployment_id) {
             return Err(not_found(crate::state::invalid_identifier_message(
-                "Deployment",
-                &input.deployment_id,
+                crate::state::DEPLOYMENT_RESOURCE,
             )));
         }
 

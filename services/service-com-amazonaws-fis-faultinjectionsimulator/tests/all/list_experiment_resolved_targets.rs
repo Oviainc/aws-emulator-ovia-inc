@@ -150,10 +150,13 @@ struct Row {
     case: &'static str,
     /// The target's name — the `targetName` every entry resolved from it carries.
     name: &'static str,
-    /// `resourceType`. Modelled as a free `TargetResourceTypeId` string that this
-    /// service validates against no catalog, so the rows vary it to show an entry reports
-    /// the type of the target it came from rather than one value for all of them.
+    /// `resourceType`: one of the target resource types the service publishes, so the rows
+    /// vary it to show an entry reports the type of the target it came from rather than one
+    /// value for all of them.
     resource_type: &'static str,
+    /// The target's `parameters`, for a resource type whose published contract requires
+    /// some (an ECS task is identified through its cluster and service).
+    parameters: Option<Value>,
     /// The target's `selectionMode`, in one of the three forms FIS documents.
     selection_mode: &'static str,
     /// The ARNs the target NAMES (`resourceArns`) — the resources it identifies, in the
@@ -190,6 +193,7 @@ fn rows() -> Vec<Row> {
             case: "all-of-three-instances",
             name: "allInstances",
             resource_type: "aws:ec2:instance",
+            parameters: None,
             selection_mode: "ALL",
             named: (1..=3).map(|n| resource_arn("ec2", "instance", n)).collect(),
             resource_tags: None,
@@ -199,6 +203,7 @@ fn rows() -> Vec<Row> {
             case: "count-one-of-five",
             name: "countOneInstance",
             resource_type: "aws:ec2:instance",
+            parameters: None,
             selection_mode: "COUNT(1)",
             named: (11..=15)
                 .map(|n| resource_arn("ec2", "instance", n))
@@ -210,6 +215,9 @@ fn rows() -> Vec<Row> {
             case: "count-three-of-five",
             name: "countThreeTasks",
             resource_type: "aws:ecs:task",
+            // `aws:ecs:task` publishes `cluster` and `service` as required parameters, so a
+            // target of that type carries them.
+            parameters: Some(json!({ "cluster": "fis-resolved", "service": "fis-service" })),
             selection_mode: "COUNT(3)",
             named: (21..=25).map(|n| resource_arn("ecs", "task", n)).collect(),
             resource_tags: None,
@@ -219,6 +227,7 @@ fn rows() -> Vec<Row> {
             case: "count-past-what-the-target-identified",
             name: "countNineClusters",
             resource_type: "aws:eks:nodegroup",
+            parameters: None,
             selection_mode: "COUNT(9)",
             named: (31..=32)
                 .map(|n| resource_arn("eks", "nodegroup", n))
@@ -230,6 +239,7 @@ fn rows() -> Vec<Row> {
             case: "percent-100-of-four",
             name: "percentAllFunctions",
             resource_type: "aws:lambda:function",
+            parameters: None,
             selection_mode: "PERCENT(100)",
             named: (41..=44)
                 .map(|n| resource_arn("lambda", "function", n))
@@ -241,6 +251,7 @@ fn rows() -> Vec<Row> {
             case: "percent-50-of-four",
             name: "percentHalfFunctions",
             resource_type: "aws:lambda:function",
+            parameters: None,
             selection_mode: "PERCENT(50)",
             named: (51..=54)
                 .map(|n| resource_arn("lambda", "function", n))
@@ -252,6 +263,7 @@ fn rows() -> Vec<Row> {
             case: "percent-25-of-two-does-not-reach-a-whole-resource",
             name: "percentQuarterOfTwo",
             resource_type: "aws:rds:db",
+            parameters: None,
             selection_mode: "PERCENT(25)",
             named: (61..=62).map(|n| resource_arn("rds", "db", n)).collect(),
             resource_tags: None,
@@ -261,6 +273,7 @@ fn rows() -> Vec<Row> {
             case: "a-resource-named-twice-resolves-once",
             name: "repeatedInstance",
             resource_type: "aws:ec2:instance",
+            parameters: None,
             selection_mode: "ALL",
             named: vec![
                 resource_arn("ec2", "instance", 71),
@@ -274,6 +287,7 @@ fn rows() -> Vec<Row> {
             case: "identified-by-tag-not-by-arn",
             name: "taggedInstances",
             resource_type: "aws:ec2:instance",
+            parameters: None,
             selection_mode: "ALL",
             named: Vec::new(),
             resource_tags: Some(json!({ "Stage": "test", "Team": "chaos" })),
@@ -283,6 +297,7 @@ fn rows() -> Vec<Row> {
             case: "count-one-of-one",
             name: "theOneBucket",
             resource_type: "aws:s3:bucket",
+            parameters: None,
             selection_mode: "COUNT(1)",
             named: vec![format!("arn:aws:s3:::fis-resolved-targets-{ACCOUNT_ID}")],
             resource_tags: None,
@@ -298,6 +313,9 @@ fn template_body(label: &str, rows: &[Row]) -> Value {
         let mut target = Map::new();
         target.insert("resourceType".to_string(), json!(row.resource_type));
         target.insert("selectionMode".to_string(), json!(row.selection_mode));
+        if let Some(parameters) = &row.parameters {
+            target.insert("parameters".to_string(), parameters.clone());
+        }
         if !row.named.is_empty() {
             target.insert("resourceArns".to_string(), json!(row.named));
         }
@@ -854,6 +872,7 @@ async fn a_target_on_the_published_resource_bound_resolves_and_one_past_it_is_re
             case: "bounded",
             name: "manyInstances",
             resource_type: "aws:ec2:instance",
+            parameters: None,
             selection_mode: "ALL",
             named: (1..=named)
                 .map(|n| resource_arn("ec2", "instance", n))

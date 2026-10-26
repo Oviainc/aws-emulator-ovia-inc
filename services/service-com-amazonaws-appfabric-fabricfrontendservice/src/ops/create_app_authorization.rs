@@ -223,7 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx);
+        // The Region this call was SIGNED for. It scopes the idempotency token
+        // below (each Region is its own endpoint, so a token spent elsewhere is
+        // not a retry of this request) but it is NOT what the created
+        // authorization's ARN carries: see `owning_region`.
+        let signed_region = crate::state::request_region(ctx);
 
         // ONE lock for the whole decision: the uniqueness check below and the
         // insert that follows it are taken without releasing it, so two
@@ -236,10 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(app_bundle_arn) = store
+        // The parent's ARN and the Region it lives in, read TOGETHER out of the
+        // stored bundle: an ARN names where its resource lives, and a resource
+        // nested under another lives wherever that parent does, so both halves
+        // of the response's resource chain come from the same record.
+        let Some((app_bundle_arn, owning_region)) = store
             .app_bundles
             .get(&bundle_key)
-            .map(|bundle| bundle.arn.clone())
+            .map(|bundle| (bundle.arn.clone(), bundle.region.clone()))
         else {
             return Err(CreateAppAuthorizationErrorModeled::ResourceNotFoundException(
                 crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
@@ -273,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region is its own endpoint with its own resources, so a token spent in
         // another Region is not a retry of this request.
         if let Some(token) = input.client_token.as_deref() {
-            let key = crate::state::client_token_key(&region, Self::NAME, token);
+            let key = crate::state::client_token_key(&signed_region, Self::NAME, token);
             if let Some(spent) = store.client_tokens.get(&key).cloned() {
                 if spent.fingerprint != fingerprint {
                     return Err(CreateAppAuthorizationErrorModeled::ConflictException(
@@ -317,9 +325,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = ::std::time::SystemTime::now();
         let id = crate::state::new_uuid();
         // An authorization's ARN nests under the bundle that owns it, the way
-        // AppFabric's own resource chain nests them.
+        // AppFabric's own resource chain nests them — and it therefore carries
+        // the Region that bundle lives in, not the Region this create call
+        // happened to be signed for: an ARN nested under a parent ARN names a
+        // resource of that parent, so the two can never disagree about where
+        // the resource lives.
         let arn = crate::state::appfabric_arn(
-            &region,
+            &owning_region,
             &format!("appbundle/{bundle_key}/appauthorization/{id}"),
         );
         let Some(bundle) = store.app_bundles.get_mut(&bundle_key) else {
@@ -349,7 +361,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             app_bundle_arn: app_bundle_arn.clone(),
             app_bundle_id: bundle_key.clone(),
-            region: region.clone(),
+            // Where this authorization LIVES: the Region of the bundle that
+            // owns it, which is the Region its own ARN carries and the one
+            // whose service endpoint its URLs name.
+            region: owning_region,
             app: input.app,
             tenant_identifier: input.tenant.tenant_identifier,
             tenant_display_name: input.tenant.tenant_display_name,
@@ -373,7 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token.as_deref() {
             store.remember_client_token(
-                crate::state::client_token_key(&region, Self::NAME, token),
+                crate::state::client_token_key(&signed_region, Self::NAME, token),
                 arn,
                 fingerprint,
             );

@@ -19,6 +19,8 @@ mod aliases;
 mod aws_managed_keys;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/custom_key_store_connection.rs"]
+mod custom_key_store_connection;
 #[path = "all/custom_key_stores.rs"]
 mod custom_key_stores;
 #[path = "all/data_key_pair_without_plaintext.rs"]

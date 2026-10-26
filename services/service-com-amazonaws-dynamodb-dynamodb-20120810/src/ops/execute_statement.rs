@@ -362,11 +362,12 @@ fn select_items(
         .transpose()
         .map_err(lift)?;
     let table = store.active_table(region, name, now).map_err(lift)?;
+    // A statement whose source qualifier names an index this table does not declare is
+    // a bad STATEMENT rather than a resource that could not be found: the table was
+    // resolved, and nothing it carries answers to that name.
     if let Some(index) = select.index.as_deref() {
         if !crate::state::declares_index(table, index) {
-            return Err(lift(crate::state::RequestError::NotFound(
-                "Requested resource not found".to_string(),
-            )));
+            return Err(lift(crate::state::unknown_index()));
         }
     }
     // One partition's items are contiguous in the store, so a statement that pins the

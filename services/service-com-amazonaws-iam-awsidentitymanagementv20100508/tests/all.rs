@@ -27,6 +27,8 @@ mod aws_managed_policy_catalog;
 mod custom_policy_context_keys;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
+#[path = "all/group_creation.rs"]
+mod group_creation;
 #[path = "all/group_deletion.rs"]
 mod group_deletion;
 #[path = "all/group_inline_policies.rs"]
@@ -99,6 +101,8 @@ mod role_policy_listing;
 mod role_policy_removal;
 #[path = "all/role_settings.rs"]
 mod role_settings;
+#[path = "all/role_tag_listing.rs"]
+mod role_tag_listing;
 #[path = "all/role_tag_removal.rs"]
 mod role_tag_removal;
 #[path = "all/role_tags.rs"]

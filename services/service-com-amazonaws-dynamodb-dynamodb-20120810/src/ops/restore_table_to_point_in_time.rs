@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreTableToPointInTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreTableToPointInTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a new table from the SOURCE table's current settings and data —
+//! "Global secondary indexes (GSIs) Local secondary indexes (LSIs) Provisioned read and
+//! write capacity ... All these settings come from the current settings of the source
+//! table at the time of restore" (the doc below) — under the name the request names, and
+//! reports it back as the `TableDescription` of the stored table, carrying the
+//! `RestoreSummary` that records which table it came from and the point in time asked
+//! for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreTableToPointInTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The restored table is reported `CREATING` and becomes `ACTIVE` once
+//! [`crate::state::STATUS_TRANSITION`] has elapsed, exactly as a created one, so
+//! `RestoreSummary.RestoreInProgress` is true for that span and a caller that reads
+//! straight after the call still sees the restore in flight.
+//!
+//! The restore is served against the SOURCE table's continuous-backups settings: a table
+//! whose point-in-time recovery is off has no point in time to restore to
+//! (`PointInTimeRecoveryUnavailableException`), and a request outside the window those
+//! settings derive ([`crate::state::PointInTimeRecovery::restorable_window`]) is the
+//! `InvalidRestoreTimeException` the model declares. The restored data is the source
+//! table's own items: this store keeps a table's current contents rather than a history
+//! of them, so the state it can restore is the one at the newest restorable point.
+//!
+//! What a restore does NOT carry over is what AWS says a caller must set up again:
+//! "Auto scaling policies IAM policies Amazon CloudWatch metrics and alarms Tags Stream
+//! settings Time to Live (TTL) settings Point in time recovery settings" (the doc below).
+//! So the restored table carries no tags, no stream and no resource policy, and its own
+//! point-in-time recovery is off.
+//!
+//! `BillingModeOverride`, `ProvisionedThroughputOverride` and the two secondary-index
+//! overrides are applied to the restored table; `SSESpecificationOverride`,
+//! `VectorIndexOverride` and `OnDemandThroughputOverride` are members no table this
+//! service stores carries yet (`CreateTable` and `RestoreTableFromBackup` refuse the same
+//! three), so they answer the scaffold's 501 and are filed as their own gap issues —
+//! after the request's own contradictions, so an on-demand ceiling named for a table
+//! restored `PROVISIONED` is the `ValidationException` the two capacity models make it.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +230,652 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreTableToPointInTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreTableToPointInTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreTableToPointInTime"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // The source table is addressed by NAME or by ARN, and the target is named; both
+        // are held to the form every table name takes.
+        let source_name = resolved_source(&input).map_err(bad_request)?;
+        let target = crate::state::resolve_table_name(&input.target_table_name)
+            .map_err(bad_request)?;
+        // Every caller-sized list this request carries is clamped BEFORE anything walks
+        // it, so the work below is bounded by constants rather than by the request body.
+        clamped_overrides(&input).map_err(bad_request)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        let source = store
+            .table(&region, &source_name)
+            .map_err(|error| lift(&source_name, error))?;
+        // "Point in time recovery has not yet been enabled for this source table"
+        // (`PointInTimeRecoveryUnavailableException`): a table whose recovery is off has
+        // no restorable window at all, so there is no point in time to restore to.
+        let Some((earliest, latest)) = source.point_in_time_recovery.restorable_window(now)
+        else {
+            return Err(recovery_unavailable(&source_name));
+        };
+        // The point in time this restore reads the source table at: the one the request
+        // names, or the newest restorable one where it asks for the latest.
+        let point = restore_point(&input, earliest, latest)?;
+
+        let (billing_mode, provisioned_throughput) =
+            restored_capacity(&input, source).map_err(bad_request)?;
+        // An on-demand capacity ceiling cannot hold on a table whose capacity mode is the
+        // provisioned one ([`crate::state::check_on_demand_ceilings`]). That
+        // contradiction is in the REQUEST, so it is refused ahead of the scaffold refusal
+        // below.
+        crate::state::check_on_demand_ceilings(
+            &billing_mode,
+            input.on_demand_throughput_override.as_ref(),
+        )
+        .map_err(bad_request)?;
+        // A member no stored table carries yet is refused as "not written yet" rather
+        // than accepted and silently dropped.
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "RestoreTableToPointInTime with {member}"
+            )));
+        }
+
+        let global_secondary_indexes = restored_indexes(
+            &input,
+            source,
+            &billing_mode,
+            provisioned_throughput.as_ref(),
+            &region,
+            &target,
+            now,
+        )
+        .map_err(bad_request)?;
+        let local_secondary_indexes =
+            restored_local_indexes(&input, source, &region, &target, now).map_err(bad_request)?;
+        let key_schema = source.key_schema.clone();
+        let attribute_definitions = source.attribute_definitions.clone();
+        let table_class = source.table_class.clone();
+        let source_arn = source.arn.clone();
+        let items = source.items.clone();
+        let item_bytes = source.stored_bytes;
+
+        // The target name must be free. A table that is still being created, or already
+        // being deleted, is "a target table with the specified name [that] is either
+        // being created or deleted" (`TableInUseException`); a settled table under that
+        // name simply "already exists" (`TableAlreadyExistsException`).
+        if let Ok(existing) = store.table(&region, &target) {
+            return Err(if matches!(
+                existing.status(now),
+                crate::state::TableStatus::Creating | crate::state::TableStatus::Deleting
+            ) {
+                RestoreTableToPointInTimeErrorModeled::TableInUseException(TableInUseException {
+                    message: Some(format!("Table is being created or deleted: {target}")),
+                })
+                .into()
+            } else {
+                RestoreTableToPointInTimeErrorModeled::TableAlreadyExistsException(
+                    TableAlreadyExistsException {
+                        message: Some(format!("Table already exists: {target}")),
+                    },
+                )
+                .into()
+            });
+        }
+
+        // A restore CREATES a table, so it is held to the same quotas a create is, plus
+        // the one restores have of their own.
+        if store.table_count_in(&region) >= crate::state::MAX_TABLES {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this account already holds the maximum of {} \
+                 tables in {region}",
+                crate::state::MAX_TABLES
+            )));
+        }
+        if store.region_bucket_exhausted(&region) {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this emulator holds tables for at most {} \
+                 regions, and {region} is not one of them",
+                crate::state::MAX_REGIONS
+            )));
+        }
+        if store.restores_in_progress(&region, now) >= crate::state::MAX_CONCURRENT_RESTORES {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: at most {} restores may run at a time",
+                crate::state::MAX_CONCURRENT_RESTORES
+            )));
+        }
+        // The restored table holds a second copy of the source table's data, so the
+        // restore is a growth site of the store like an item write, and it is measured
+        // against the same budget BEFORE the items are copied.
+        if store.stored_bytes().saturating_add(item_bytes) > crate::state::MAX_STORE_SIZE_BYTES {
+            return Err(limit_exceeded(format!(
+                "Subscriber limit exceeded: this emulator holds at most {} bytes of item \
+                 data",
+                crate::state::MAX_STORE_SIZE_BYTES
+            )));
+        }
+
+        let active_at = now + crate::state::STATUS_TRANSITION;
+        let mut table = crate::state::Table {
+            arn: crate::state::table_arn(&region, &target),
+            name: target.clone(),
+            // A restored table is a NEW table, so it is minted its own `TableId` rather
+            // than carrying the source table's: "A unique identifier for the table, in
+            // UUID format, generated by DynamoDB when the table is created"
+            // (`TableDescription$TableId`).
+            id: crate::state::new_table_id(),
+            region: region.clone(),
+            // The primary key and the attributes it is declared over are the source
+            // table's: a restore cannot change them, and no override names them.
+            key_schema,
+            attribute_definitions,
+            billing_mode: billing_mode.clone(),
+            provisioned_throughput: provisioned_throughput.clone(),
+            warm_throughput: crate::state::WarmThroughputSettings::tracking(
+                provisioned_throughput.as_ref(),
+                now,
+            ),
+            // A new table has no past capacity changes, whichever pair it starts life
+            // with.
+            throughput_history: crate::state::ThroughputHistory::default(),
+            global_secondary_indexes,
+            local_secondary_indexes,
+            // The table class is one of the source table's current settings, and nothing
+            // in the list a caller must set up again names it.
+            table_class,
+            deletion_protection_enabled: false,
+            // "You must manually set up the following on the restored table: ... Point in
+            // time recovery settings" (the doc above), so the restored table starts with
+            // recovery off however the source table's was set.
+            point_in_time_recovery: crate::state::PointInTimeRecovery::default(),
+            // "... Tags Stream settings Time to Live (TTL) settings" — none of them
+            // carries over from the source table either.
+            tags: crate::state::ResourceTags::default(),
+            stream: None,
+            resource_policy: None,
+            creation_date_time: now,
+            active_at,
+            updated_at: None,
+            // A table restored on-demand has `PAY_PER_REQUEST` set as its capacity mode
+            // by this call, and the mode takes effect when the table does.
+            pay_per_request_at: (billing_mode == "PAY_PER_REQUEST").then_some(active_at),
+            removed_at: None,
+            items,
+            // Metered below, once the items are in place: this table holds the restored
+            // data from its first instant.
+            reported_counters: crate::state::MeteredCounters::new(now),
+            stored_bytes: item_bytes,
+            // A new table has consumed none of the capacity it is provisioned for.
+            write_budget: crate::state::CapacityBudget::new(now),
+            contributor_insights: crate::state::ContributorInsights::default(),
+            restore: Some(crate::state::TableRestore {
+                // A restore to a point in time came from no backup, so the summary
+                // reports only the table it was taken of.
+                source_backup_arn: None,
+                source_table_arn: Some(source_arn),
+                // "Point in time or source backup time"
+                // (`RestoreSummary$RestoreDateTime`): for this restore it is the point in
+                // time the table was restored to.
+                restore_date_time: point,
+            }),
+        };
+        // The figures `ItemCount`/`TableSizeBytes` report are metered when a table is
+        // created, and this one was created holding the restored items.
+        table.meter_counters(now);
+        let description = table.describe(now);
+        store.insert_table(table);
+
+        // The audit record for a state-changing call: who asked, what was created and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %target,
+            source_table_name = %source_name,
+            items = description.item_count.unwrap_or_default(),
+            outcome = "restored",
+            "table restored to a point in time"
+        );
+
+        Ok(RestoreTableToPointInTimeOutput {
+            table_description: Some(description),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> RestoreTableToPointInTimeError {
+    RestoreTableToPointInTimeErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled limit error for a restore past one of the quotas it is held to: "For most
+/// purposes, up to 500 simultaneous table operations are allowed per account. These
+/// operations include CreateTable, UpdateTable, DeleteTable,UpdateTimeToLive,
+/// RestoreTableFromBackup, and RestoreTableToPointInTime" (`LimitExceededException`).
+fn limit_exceeded(message: String) -> RestoreTableToPointInTimeError {
+    RestoreTableToPointInTimeErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal of a restore from a table that has nothing to restore from:
+/// "Point in time recovery has not yet been enabled for this source table"
+/// (`PointInTimeRecoveryUnavailableException`). The message is built from the request: the
+/// source table it asked for.
+fn recovery_unavailable(source: &str) -> RestoreTableToPointInTimeError {
+    RestoreTableToPointInTimeErrorModeled::PointInTimeRecoveryUnavailableException(
+        PointInTimeRecoveryUnavailableException {
+            message: Some(format!(
+                "Point in time recovery has not yet been enabled for this source table: {source}"
+            )),
+        },
+    )
+    .into()
+}
+
+/// A bad member of this request, which this operation models no error for: the
+/// `ValidationException` such an input is.
+fn bad_request(error: crate::state::RequestError) -> RestoreTableToPointInTimeError {
+    crate::scaffolded::Scaffolded::validation(error.message())
+}
+
+/// Lift a store refusal about the SOURCE table into this operation's error channel.
+///
+/// A table this operation cannot find is reported as `TableNotFoundException` — "A source
+/// table with the name TableName does not currently exist within the subscriber's account
+/// or the subscriber is operating in the wrong Amazon Web Services Region" — which is the
+/// miss this operation models, rather than the control plane's `ResourceNotFoundException`,
+/// which it does not.
+fn lift(source: &str, error: crate::state::RequestError) -> RestoreTableToPointInTimeError {
+    match error {
+        crate::state::RequestError::NotFound(_) => {
+            RestoreTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
+                message: Some(format!("Table not found: {source}")),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The source table this restore reads, from the two members that can name it: "The
+/// DynamoDB table that will be restored. This value is an Amazon Resource Name (ARN)"
+/// (`$SourceTableArn`) and "Name of the source table that is being restored"
+/// (`$SourceTableName`).
+///
+/// Either member names the table, so one of them must be present and two that disagree
+/// name no single table to restore.
+fn resolved_source(
+    input: &RestoreTableToPointInTimeInput,
+) -> Result<String, crate::state::RequestError> {
+    match (
+        input.source_table_name.as_deref(),
+        input.source_table_arn.as_deref(),
+    ) {
+        (Some(name), None) | (None, Some(name)) => crate::state::resolve_table_name(name),
+        (Some(name), Some(arn)) => {
+            let named = crate::state::resolve_table_name(name)?;
+            let addressed = crate::state::resolve_table_name(arn)?;
+            if named == addressed {
+                Ok(named)
+            } else {
+                Err(crate::state::RequestError::Validation(format!(
+                    "One or more parameter values were invalid: SourceTableName {named} and \
+                     SourceTableArn {addressed} name different tables"
+                )))
+            }
+        }
+        (None, None) => Err(crate::state::RequestError::Validation(
+            "One or more parameter values were invalid: either SourceTableName or \
+             SourceTableArn must be specified"
+                .to_string(),
+        )),
+    }
+}
+
+/// The point in time this restore reads the source table at.
+///
+/// A request either names one — "Time in the past to restore the table to"
+/// (`$RestoreDateTime`) — or asks for the newest restorable one: "Restore the table to
+/// the latest possible time" (`$UseLatestRestorableTime`). The two selectors name
+/// different instants, so a request that sets both names no single point, and one that
+/// sets neither names none at all. A named instant must lie inside the restorable window,
+/// which is what `InvalidRestoreTimeException` states: "RestoreDateTime must be between
+/// EarliestRestorableDateTime and LatestRestorableDateTime".
+fn restore_point(
+    input: &RestoreTableToPointInTimeInput,
+    earliest: ::std::time::SystemTime,
+    latest: ::std::time::SystemTime,
+) -> Result<::std::time::SystemTime, RestoreTableToPointInTimeError> {
+    let use_latest = input.use_latest_restorable_time.unwrap_or(false);
+    match (use_latest, input.restore_date_time.as_ref()) {
+        (true, None) => Ok(latest),
+        (false, Some(requested)) => {
+            let point = ::std::time::SystemTime::try_from(*requested)
+                .map_err(|_| invalid_restore_time())?;
+            // The window's bounds are reported at the precision a timestamp carries on
+            // the wire, and the point is read back at that same precision
+            // ([`crate::state::at_nearest_timestamp_precision`]), so a client that sends
+            // back a bound this service reported names exactly that bound rather than
+            // landing a fraction outside it.
+            let point = crate::state::at_nearest_timestamp_precision(point);
+            if point < earliest || point > latest {
+                return Err(invalid_restore_time());
+            }
+            Ok(point)
+        }
+        (true, Some(_)) => Err(crate::scaffolded::Scaffolded::validation(
+            "One or more parameter values were invalid: RestoreDateTime cannot be specified \
+             when UseLatestRestorableTime is true",
+        )),
+        (false, None) => Err(crate::scaffolded::Scaffolded::validation(
+            "One or more parameter values were invalid: either RestoreDateTime or \
+             UseLatestRestorableTime must be specified",
+        )),
+    }
+}
+
+/// The modelled refusal of a point in time outside the source table's restorable window,
+/// worded as the model states the error: "An invalid restore time was specified.
+/// RestoreDateTime must be between EarliestRestorableDateTime and
+/// LatestRestorableDateTime" (`InvalidRestoreTimeException`).
+///
+/// The window's own bounds are NOT echoed: they move with the clock, and
+/// `DescribeContinuousBackups` is where a caller reads them.
+fn invalid_restore_time() -> RestoreTableToPointInTimeError {
+    RestoreTableToPointInTimeErrorModeled::InvalidRestoreTimeException(
+        InvalidRestoreTimeException {
+            message: Some(
+                "An invalid restore time was specified. RestoreDateTime must be between \
+                 EarliestRestorableDateTime and LatestRestorableDateTime"
+                    .to_string(),
+            ),
+        },
+    )
+    .into()
+}
+
+/// The first input member present that no stored table carries yet, if any.
+///
+/// The same three members `CreateTable` and `RestoreTableFromBackup` report as
+/// unimplemented, under the names this operation declares them: a restore cannot store
+/// what a create cannot.
+fn unsupported_member(input: &RestoreTableToPointInTimeInput) -> Option<&'static str> {
+    if input
+        .vector_index_override
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return Some("VectorIndexOverride");
+    }
+    if input
+        .sse_specification_override
+        .as_ref()
+        .is_some_and(|specification| specification.enabled.unwrap_or(false))
+    {
+        return Some("SSESpecificationOverride");
+    }
+    if input.on_demand_throughput_override.is_some() {
+        return Some("OnDemandThroughputOverride");
+    }
+    for index in input.global_secondary_index_override.iter().flatten() {
+        if index.on_demand_throughput.is_some() {
+            return Some("GlobalSecondaryIndexOverride carrying OnDemandThroughput");
+        }
+    }
+    None
+}
+
+/// Clamp every caller-sized list this operation walks, before anything walks it, and
+/// refuse the one member this operation documents as unsupported.
+///
+/// An override is matched against the source table's indexes, so the work would otherwise
+/// be the product of a request-chosen count and a stored one. Both bounds are ones the
+/// contract already implies — a table carries at most
+/// [`crate::state::MAX_GLOBAL_SECONDARY_INDEXES`] global and
+/// [`crate::state::MAX_LOCAL_SECONDARY_INDEXES`] local secondary indexes, so an override
+/// past either names more indexes than any table has.
+///
+/// "The WarmThroughput setting is not supported on global secondary indexes when you use
+/// RestoreTableToPointInTime ... including it in a GlobalSecondaryIndexOverride entry
+/// causes the request to fail with a validation error"
+/// (`$GlobalSecondaryIndexOverride`) — so that member is a bad request here rather than a
+/// gap to report, which is why it is refused beside the bounds.
+fn clamped_overrides(
+    input: &RestoreTableToPointInTimeInput,
+) -> Result<(), crate::state::RequestError> {
+    let indexes = input
+        .global_secondary_index_override
+        .as_ref()
+        .map_or(0, Vec::len);
+    if indexes > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid GlobalSecondaryIndexOverride: a table may carry at most {} global \
+             secondary indexes, got {indexes}",
+            crate::state::MAX_GLOBAL_SECONDARY_INDEXES
+        )));
+    }
+    let local_indexes = input
+        .local_secondary_index_override
+        .as_ref()
+        .map_or(0, Vec::len);
+    if local_indexes > crate::state::MAX_LOCAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid LocalSecondaryIndexOverride: a table may carry at most {} local \
+             secondary indexes, got {local_indexes}",
+            crate::state::MAX_LOCAL_SECONDARY_INDEXES
+        )));
+    }
+    for index in input.global_secondary_index_override.iter().flatten() {
+        if index.warm_throughput.is_some() {
+            return Err(crate::state::RequestError::Validation(format!(
+                "One or more parameter values were invalid: WarmThroughput is not supported \
+                 on global secondary index {} when restoring a table to a point in time",
+                index.index_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The capacity mode and provisioned throughput the restored table starts life with.
+///
+/// "Provisioned read and write capacity ... come from the current settings of the source
+/// table at the time of restore" (the doc above), and the request may override either:
+/// "The billing mode of the restored table" (`$BillingModeOverride`) and "Provisioned
+/// throughput settings for the restored table" (`$ProvisionedThroughputOverride`). What
+/// holds the two together is the rule both capacity models state — "If you set BillingMode
+/// as PROVISIONED, you must specify this property. If you set BillingMode as
+/// PAY_PER_REQUEST, you cannot specify this property"
+/// (`CreateTable$ProvisionedThroughput`) — measured against the mode IN FORCE for the
+/// restored table, which is the override where the request names one and the source
+/// table's mode otherwise. An on-demand source table carries no provisioned pair at all,
+/// so restoring one `PROVISIONED` must name the override.
+fn restored_capacity(
+    input: &RestoreTableToPointInTimeInput,
+    source: &crate::state::Table,
+) -> Result<(String, Option<ProvisionedThroughput>), crate::state::RequestError> {
+    let billing_mode = input
+        .billing_mode_override
+        .clone()
+        .unwrap_or_else(|| source.billing_mode.clone());
+    match (
+        billing_mode.as_str(),
+        input.provisioned_throughput_override.clone(),
+    ) {
+        ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
+        ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
+            "ProvisionedThroughputOverride cannot be specified when BillingModeOverride is \
+             PAY_PER_REQUEST"
+                .to_string(),
+        )),
+        ("PROVISIONED", requested) => {
+            match requested.or_else(|| source.provisioned_throughput.clone()) {
+                Some(throughput) => {
+                    if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
+                        return Err(crate::state::RequestError::Validation(format!(
+                            "Invalid ProvisionedThroughput: ReadCapacityUnits and \
+                             WriteCapacityUnits must be at least 1, got {} and {}",
+                            throughput.read_capacity_units, throughput.write_capacity_units
+                        )));
+                    }
+                    Ok((billing_mode, Some(throughput)))
+                }
+                None => Err(crate::state::RequestError::Validation(
+                    "ProvisionedThroughputOverride must be specified when the restored table's \
+                     BillingMode is PROVISIONED and the source table carries no provisioned \
+                     capacity"
+                        .to_string(),
+                )),
+            }
+        }
+        (other, _) => Err(crate::state::RequestError::Validation(format!(
+            "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"
+        ))),
+    }
+}
+
+/// The global secondary indexes the restored table carries.
+///
+/// A restore carries over the source table's indexes, and the override SELECTS which of
+/// them: "The indexes provided should match existing secondary indexes. You can choose to
+/// exclude some or all of the indexes at the time of restore"
+/// (`$GlobalSecondaryIndexOverride`). So an entry names one of the source table's indexes
+/// — the restored index's key schema and projection are the source's, because an index's
+/// key schema is not something a restore can change — and may restate its provisioned
+/// throughput; an entry naming an index the source table does not carry is refused, since
+/// there is nothing to restore under that name. A request that names no override restores
+/// every index.
+///
+/// An index's capacity mode is the TABLE's ("you must use either OnDemandThroughput or
+/// ProvisionedThroughput based on your table's capacity mode" —
+/// `GlobalSecondaryIndex$ProvisionedThroughput`), so the pair each index keeps is held to
+/// the restored table's mode by the same check `CreateTable` applies, over the pair the
+/// request restated, else the source index's own, else the table's.
+fn restored_indexes(
+    input: &RestoreTableToPointInTimeInput,
+    source: &crate::state::Table,
+    billing_mode: &str,
+    table_throughput: Option<&ProvisionedThroughput>,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
+    let selected: Vec<(String, Option<ProvisionedThroughput>)> =
+        match input.global_secondary_index_override.as_ref() {
+            Some(overrides) => overrides
+                .iter()
+                .map(|index| (index.index_name.clone(), index.provisioned_throughput.clone()))
+                .collect(),
+            None => source
+                .global_secondary_indexes
+                .iter()
+                .map(|index| (index.name.clone(), index.provisioned_throughput.clone()))
+                .collect(),
+        };
+    let mut indexes: Vec<crate::state::GlobalSecondaryIndex> = Vec::new();
+    for (name, restated) in selected {
+        if indexes.iter().any(|stored| stored.name == name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexOverride: duplicate index name {name}"
+            )));
+        }
+        let Some(existing) = source
+            .global_secondary_indexes
+            .iter()
+            .find(|index| index.name == name)
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexOverride: the source table carries no global \
+                 secondary index named {name}"
+            )));
+        };
+        // An on-demand table's index carries no provisioned throughput at all, so a pair
+        // the source table's index carries is not carried into an on-demand restore; one
+        // the request restates there is the contradiction the check below refuses.
+        let requested = if billing_mode == "PAY_PER_REQUEST" {
+            restated
+        } else {
+            restated
+                .or_else(|| existing.provisioned_throughput.clone())
+                .or_else(|| table_throughput.cloned())
+        };
+        let throughput =
+            super::create_table::validated_index_throughput(&name, billing_mode, requested)?;
+        indexes.push(crate::state::GlobalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &name),
+            name,
+            key_schema: existing.key_schema.clone(),
+            projection: existing.projection.clone(),
+            provisioned_throughput: throughput.clone(),
+            // An index restored with the table is `CREATING` and becomes `ACTIVE` on the
+            // same clock-owed transition as the table, exactly as one created with it.
+            transient_status: crate::state::IndexStatus::Creating,
+            active_at: now + crate::state::STATUS_TRANSITION,
+            throughput_history: crate::state::ThroughputHistory::default(),
+            warm_throughput: crate::state::WarmThroughputSettings::tracking(
+                throughput.as_ref(),
+                now,
+            ),
+            reported_counters: crate::state::MeteredCounters::new(now),
+            contributor_insights: crate::state::ContributorInsights::default(),
+        });
+    }
+    Ok(indexes)
+}
+
+/// The local secondary indexes the restored table carries, by the same selection rule
+/// over the source table's ([`restored_indexes`]) — "The indexes provided should match
+/// existing secondary indexes. You can choose to exclude some or all of the indexes at the
+/// time of restore" (`$LocalSecondaryIndexOverride`). A local index carries no throughput
+/// and no status of its own, so the name is the whole selector.
+fn restored_local_indexes(
+    input: &RestoreTableToPointInTimeInput,
+    source: &crate::state::Table,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::LocalSecondaryIndex>, crate::state::RequestError> {
+    let selected: Vec<String> = match input.local_secondary_index_override.as_ref() {
+        Some(overrides) => overrides
+            .iter()
+            .map(|index| index.index_name.clone())
+            .collect(),
+        None => source
+            .local_secondary_indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect(),
+    };
+    let mut indexes: Vec<crate::state::LocalSecondaryIndex> = Vec::new();
+    for name in selected {
+        if indexes.iter().any(|stored| stored.name == name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid LocalSecondaryIndexOverride: duplicate index name {name}"
+            )));
+        }
+        let Some(existing) = source
+            .local_secondary_indexes
+            .iter()
+            .find(|index| index.name == name)
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid LocalSecondaryIndexOverride: the source table carries no local \
+                 secondary index named {name}"
+            )));
+        };
+        indexes.push(crate::state::LocalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &name),
+            name,
+            key_schema: existing.key_schema.clone(),
+            projection: existing.projection.clone(),
+            reported_counters: crate::state::MeteredCounters::new(now),
+        });
+    }
+    Ok(indexes)
 }

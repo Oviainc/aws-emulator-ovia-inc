@@ -7531,7 +7531,10 @@ pub fn validate_setup_domain_names(domain_names: &[String]) -> Result<(), String
 /// `ContainerServiceState` values this slice uses, from the modelled enum and the
 /// `ContainerService$state` documentation: `PENDING` while the service is being
 /// created, `READY` once it runs without an active deployment, `DEPLOYING` while
-/// it launches one, and `RUNNING` once a deployment is active.
+/// it launches one, `RUNNING` once a deployment is active, `UPDATING` while "the
+/// container service capacity or its custom domains are being updated", and
+/// `DISABLED` for one that "is disabled, and its active deployment and
+/// containers, if any, are shut down".
 pub const CONTAINER_SERVICE_PENDING: &str = "PENDING";
 /// See [`CONTAINER_SERVICE_PENDING`].
 pub const CONTAINER_SERVICE_READY: &str = "READY";
@@ -7539,6 +7542,10 @@ pub const CONTAINER_SERVICE_READY: &str = "READY";
 pub const CONTAINER_SERVICE_DEPLOYING: &str = "DEPLOYING";
 /// See [`CONTAINER_SERVICE_PENDING`].
 pub const CONTAINER_SERVICE_RUNNING: &str = "RUNNING";
+/// See [`CONTAINER_SERVICE_PENDING`].
+pub const CONTAINER_SERVICE_UPDATING: &str = "UPDATING";
+/// See [`CONTAINER_SERVICE_PENDING`].
+pub const CONTAINER_SERVICE_DISABLED: &str = "DISABLED";
 
 /// `ContainerServiceDeploymentState` values this slice uses, from the modelled
 /// enum and the `ContainerServiceDeployment$state` documentation: `ACTIVATING`

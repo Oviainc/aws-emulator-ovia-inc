@@ -648,8 +648,9 @@ async fn one_name_names_one_alarm_whatever_kind_it_is() {
         );
     }
 
-    // And a log alarm cannot take a name another kind holds: that conflicts with the current
-    // state of the alarm already there, which is the modelled `ResourceConflict`.
+    // And a log alarm cannot take a name another kind holds either: a name already in use
+    // is a parameter this request cannot carry, which CloudWatch refuses as a
+    // `ValidationError`.
     ok(&router, "PutMetricAlarm", &metric_alarm("taken-by-a-metric-alarm")).await;
     ok(
         &router,
@@ -664,8 +665,8 @@ async fn one_name_names_one_alarm_whatever_kind_it_is() {
         let (status, body) = call(&router, "PutLogAlarm", &minimal(name)).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (409, "ResourceConflict"),
-            "case {case:?}: expected HTTP 409 ResourceConflict, got {status} with {body}"
+            (400, "ValidationError"),
+            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
         );
     }
 }
@@ -806,12 +807,7 @@ async fn delete_alarms_removes_a_log_alarm_but_never_in_a_batch() {
         "DescribeAlarms: expected both log alarms to be gone, got {alarms:?}"
     );
 
-    // A name nothing holds any more is reported as missing rather than silently accepted.
-    let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": ["deleted"]})).await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (404, "ResourceNotFound"),
-        "expected HTTP 404 ResourceNotFound for an alarm already deleted, got {status} with \
-         {body}"
-    );
+    // A name nothing holds any more deletes nothing and succeeds: the request asks for a
+    // state the store is already in.
+    ok(&router, "DeleteAlarms", &json!({"AlarmNames": ["deleted"]})).await;
 }

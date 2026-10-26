@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLogSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLogSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLogSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the subscription that forwards a directory's domain controller security logs
+//! to a CloudWatch log group. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLogSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLogSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLogSubscription"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The subscription forwards ONE directory's logs, so an id naming no stored
+        // directory is refused with the modelled "specified entity could not be found"
+        // and stores nothing.
+        let Some(directory) = store.directories.get_mut(&input.directory_id) else {
+            return Err(CreateLogSubscriptionErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+            .into());
+        };
+
+        // A directory forwards its logs to at most one log group: `DeleteLogSubscription`
+        // identifies the subscription to remove by `DirectoryId` alone, and
+        // `ListLogSubscriptions$DirectoryId` narrows the listing to "the log subscription
+        // associated with that directory". So a create for a directory that already has
+        // one is the entity that already exists — whichever log group it names — and the
+        // stored subscription, with its `SubscriptionCreatedDateTime`, is left as it was.
+        if directory.log_subscription.is_some() {
+            return Err(
+                CreateLogSubscriptionErrorModeled::EntityAlreadyExistsException(
+                    crate::state::refusal(crate::state::log_subscription_exists(
+                        &input.directory_id,
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        directory.log_subscription = Some(crate::state::LogSubscriptionRecord {
+            log_group_name: input.log_group_name,
+            created_at: now,
+        });
+
+        // The operation models no output members: `ListLogSubscriptions` is what reports
+        // the subscription back.
+        Ok(CreateLogSubscriptionOutput {})
     }
 }

@@ -16,7 +16,9 @@
 
 use serde_json::{json, Value};
 
-use crate::identity_pool_flow::{error_code, member, non_empty, Emulator, ABSENT_POOL_ID};
+use crate::identity_pool_flow::{
+    cognito_trust_policy, error_code, member, non_empty, Emulator, ABSENT_POOL_ID,
+};
 
 /// An IAM role ARN: `arn:<partition>:iam::<12-digit-account-id>:role/<path and name>`,
 /// the form `RolesMap`'s value and `MappingRule$RoleARN` (both documented "the Role ARN",
@@ -504,6 +506,18 @@ async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
     let emulator = Emulator::new();
     let pool_id = emulator.pool("roles-custom", true).await;
     let identity_id = emulator.identity(&pool_id, None).await;
+
+    // A vend is a session of the role it resolves, so every role the rows below name is
+    // seeded in the IAM store of the same engine, trusting this pool's users.
+    for role in [
+        "Cognito_poolAuth_Role",
+        "Cognito_poolUnauth_Role",
+        "mapped-0",
+        "mapped-1",
+        "mapped-2",
+    ] {
+        emulator.seed_role(&role_arn(role), cognito_trust_policy(&pool_id));
+    }
 
     emulator
         .ok(
