@@ -2435,7 +2435,8 @@ impl Domain {
     /// goes `UpgradingEngineVersion` and its `EngineVersion` option reports
     /// `Processing` until the clock makes the run due, and only THEN does the domain
     /// report the version it was upgraded to ([`Self::settle`]). A check performs no
-    /// upgrade, so it starts no change and moves nothing about the domain.
+    /// upgrade, so it starts no change and moves nothing about the domain — including
+    /// its history: see [`Self::eligibility_check`].
     pub fn begin_upgrade(
         &mut self,
         target_version: &str,
@@ -2443,6 +2444,14 @@ impl Domain {
         advanced_options: BTreeMap<String, String>,
         now: SystemTime,
     ) -> UpgradeRun {
+        // An eligibility check performs nothing, so performing it again records
+        // nothing: the check the domain already holds for the version it runs IS the
+        // check, whatever target a later call names.
+        if perform_check_only {
+            if let Some(existing) = self.eligibility_check() {
+                return existing.clone();
+            }
+        }
         let run = UpgradeRun {
             upgrade_id: new_upgrade_id(),
             source_version: self.engine_version.clone(),
@@ -2477,6 +2486,21 @@ impl Domain {
             self.upgrades.pop_front();
         }
         run
+    }
+
+    /// The upgrade eligibility check this domain already holds for the engine version
+    /// it runs now, if any.
+    ///
+    /// A check "does not actually perform the upgrade", so it is a statement about the
+    /// version the domain is ON rather than a run of its own: a domain holds at most
+    /// one such record per engine version, and a later check from that same version
+    /// reports it rather than recording a second. The oldest matching record is the
+    /// one, so the record a repeat check reports keeps the identity, name and start
+    /// instant the first check gave it.
+    pub fn eligibility_check(&self) -> Option<&UpgradeRun> {
+        self.upgrades
+            .iter()
+            .find(|run| run.perform_check_only && run.source_version == self.engine_version)
     }
 
     /// Whether an engine version upgrade is being performed on this domain right now
