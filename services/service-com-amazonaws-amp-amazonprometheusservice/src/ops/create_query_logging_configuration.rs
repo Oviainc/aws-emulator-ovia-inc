@@ -185,6 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(existing) = store.query_logging.get(&input.workspace_id) {
+            // A record whose removal the clock already owes is NOT the record the create
+            // that made it left: `crate::state::materialize_due` drops it once its due
+            // instant has passed, so answering a create from it would accept the call
+            // (202) and leave the workspace holding no configuration at all. It is still
+            // held until then, so the create is refused rather than replayed — the same
+            // request-level `ValidationException` (400) a second configuration gets,
+            // naming this configuration's own deletion as what stands in the way.
+            if existing.status_code == crate::state::QUERY_LOGGING_STATUS_DELETING {
+                return Err(
+                    CreateQueryLoggingConfigurationErrorModeled::ValidationException(
+                        crate::state::request_validation_failed(
+                            crate::state::QUERY_LOGGING_CONFIGURATION_DELETING_MESSAGE,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+
             // `clientToken` carries `@idempotencyToken`: replaying the very call that
             // created this configuration is that same call, so it answers from the
             // stored record instead of creating or refusing anything — however many
