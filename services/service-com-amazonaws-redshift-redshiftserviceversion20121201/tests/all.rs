@@ -73,6 +73,8 @@ mod snapshot_access;
 mod snapshot_access_revoke;
 #[path = "all/snapshot_copy_configuration.rs"]
 mod snapshot_copy_configuration;
+#[path = "all/snapshot_copy_grant_kms_keys.rs"]
+mod snapshot_copy_grant_kms_keys;
 #[path = "all/snapshot_copy_grants.rs"]
 mod snapshot_copy_grants;
 #[path = "all/snapshot_restore.rs"]

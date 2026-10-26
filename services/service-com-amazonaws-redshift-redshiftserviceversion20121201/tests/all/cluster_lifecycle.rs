@@ -19,9 +19,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite signs for, so the derived endpoint
 /// hostnames and ARNs are predictable.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` so a sibling suite that builds an ARN for the same endpoint reads
+/// the region from here rather than repeating the literal.
+pub(crate) const REGION: &str = "us-west-2";
 
-/// One emulator: a single shared engine behind a router mounting only Redshift.
+/// One emulator: a single shared engine behind a router mounting Redshift, and
+/// optionally the KMS service a handler resolves a key through.
 ///
 /// `pub(crate)` so a sibling suite under `tests/all/` drives requests through the
 /// same harness instead of writing a second copy of it.
@@ -52,13 +56,67 @@ impl Answer {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// An emulator with KMS mounted beside Redshift on the SAME engine, exactly as
+    /// the assembled emulator mounts them.
+    ///
+    /// `CreateSnapshotCopyGrant` resolves the `KmsKeyId` it is given by calling KMS
+    /// in process, so a suite that is about that resolution needs a KMS to reach;
+    /// [`Emulator::new`] deliberately leaves it unmounted, which is the "KMS said
+    /// nothing" case.
+    pub(crate) fn with_kms() -> Self {
+        Self::build(true)
+    }
+
+    fn build(with_kms: bool) -> Self {
         // The one shared engine, exactly as `router/src/lib.rs` builds it: every
         // request in this suite observes the same store.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if with_kms {
+            router.register_service(
+                service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+            );
+        }
         Self { router, engine }
+    }
+
+    /// Mint a KMS key in `region` through the mounted KMS service and answer its
+    /// ARN, so a `KmsKeyId` a case means to be REAL is one KMS can resolve.
+    ///
+    /// Panics unless [`Emulator::with_kms`] built this emulator — there is no KMS to
+    /// create a key in otherwise.
+    pub(crate) async fn create_kms_key(&self, region: &str) -> String {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://kms.{region}.amazonaws.com/"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", "TrentService.CreateKey")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/kms/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from_static(b"{}"))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let body = String::from_utf8_lossy(response.body()).into_owned();
+        assert_eq!(
+            status, 200,
+            "case \"mint a real KMS key\": expected status 200, got {status} with body {body}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("CreateKey answers a JSON body");
+        parsed["KeyMetadata"]["Arn"]
+            .as_str()
+            .expect("CreateKey reports the new key's ARN")
+            .to_string()
     }
 
     /// Seed a snapshot Redshift took on its OWN schedule.

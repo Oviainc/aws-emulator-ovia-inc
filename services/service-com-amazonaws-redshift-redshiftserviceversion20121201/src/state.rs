@@ -1664,6 +1664,16 @@ pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
 /// `DeleteSnapshotCopyGrant`.
 pub const SNAPSHOT_COPY_GRANT_QUOTA: usize = 10_000;
 
+/// Why a request naming no snapshot copy grant is refused, naming the grant it
+/// could not find.
+///
+/// The wording Amazon Redshift answers a missing snapshot copy grant with, shared
+/// by every operation that looks one up so a client sees one message for one
+/// condition.
+pub fn snapshot_copy_grant_not_found_message(name: &str) -> String {
+    format!("Snapshot copy grant '{name}' not found.")
+}
+
 /// How many event notification subscriptions the store holds before
 /// `CreateEventSubscription` refuses with the modelled
 /// `EventSubscriptionQuotaExceededFault`.

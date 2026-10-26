@@ -181,16 +181,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is resolved exactly as the create stored it and as the read
         // resolves it, so the two can never disagree on which names identify a
-        // grant. One that identifies none is a refusal, worded as this service
-        // words this fault: the resource, then the name the request carried.
+        // grant. One that identifies none is a refusal, worded through the one
+        // function that words this fault for the whole service.
         let Some(position) = store.snapshot_copy_grant_position(&input.snapshot_copy_grant_name)
         else {
             return Err(
                 DeleteSnapshotCopyGrantErrorModeled::SnapshotCopyGrantNotFoundFault(
                     SnapshotCopyGrantNotFoundFault {
-                        message: Some(format!(
-                            "Snapshot copy grant not found: {}",
-                            input.snapshot_copy_grant_name
+                        message: Some(st::snapshot_copy_grant_not_found_message(
+                            &input.snapshot_copy_grant_name,
                         )),
                     },
                 )

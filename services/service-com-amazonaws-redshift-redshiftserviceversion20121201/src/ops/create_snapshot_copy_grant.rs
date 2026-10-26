@@ -8,6 +8,12 @@
 //! and the tags the request carried. A second create under the same name is
 //! refused with `SnapshotCopyGrantAlreadyExistsFault` and overwrites nothing.
 //!
+//! A `KmsKeyId` the request NAMES is resolved against Key Management Service
+//! before anything is written: the grant's whole purpose is to let Amazon
+//! Redshift use that key, so a value KMS reports it cannot read names no key
+//! this grant could ever permit, and the request is refused with
+//! `InvalidParameterValue` (HTTP 400) with nothing stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -149,6 +155,157 @@ impl<Eng> CreateSnapshotCopyGrant<Eng> {
     }
 }
 
+/// What Key Management Service answered about the `KmsKeyId` this request named.
+#[derive(Debug)]
+enum KeyLookup {
+    /// KMS reported the key: it exists and this caller can read it.
+    Resolved,
+    /// KMS reported that the value names no key it can resolve — the key does not
+    /// exist, the value is not a key identifier KMS can read at all, or this caller
+    /// may not read it. The reason it gave travels for the operator-visible log.
+    Unresolvable(String),
+    /// KMS gave no answer about this key (it was not reachable, or it failed for a
+    /// reason that says nothing about the key itself). Not a negative, so not a
+    /// refusal.
+    Indeterminate(String),
+}
+
+/// A KMS client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes IN PROCESS to this emulator's own inbound listener, so no
+/// network client is configured here and this crate names no other service's crate.
+/// `region` is the request's own signing region, so the key is resolved where the
+/// grant this call would create lives.
+fn kms_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_kms::Client {
+    let config = ::aws_sdk_kms::Config::builder()
+        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
+        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_kms::Client::from_conf(config)
+}
+
+/// Ask Key Management Service about `kms_key_id`.
+///
+/// `DescribeKey` is the read that answers the only question this operation has about
+/// the value: whether it names a key KMS can resolve for this caller, whatever form
+/// the request gave it in — a key id, a key ARN, an alias name or an alias ARN are
+/// all identifiers `DescribeKey` accepts, so nothing here inspects the string itself.
+///
+/// The answer is a definite negative only when KMS names one of
+/// [`KEY_NEGATIVE_KMS_ERROR_CODES`] with a client status: those codes say the key
+/// cannot be read at all. Anything else is [`KeyLookup::Indeterminate`] and the
+/// create proceeds rather than refusing a key nothing said was bad — a server fault,
+/// a throttle or another key-agnostic condition, a reply carrying no KMS error code
+/// at all (a routing failure rather than a KMS answer, as when KMS is not mounted
+/// beside this service), or a lookup that never reached KMS.
+async fn describe_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: &str,
+) -> KeyLookup {
+    let err = match kms_client(ctx, region)
+        .describe_key()
+        .key_id(kms_key_id)
+        .send()
+        .await
+    {
+        Ok(_) => return KeyLookup::Resolved,
+        Err(err) => err,
+    };
+    let reason = ::aws_smithy_types::error::display::DisplayErrorContext(&err).to_string();
+    // The status KMS answered with, when it answered at all: a 5xx is about KMS, not
+    // about the key, whatever code travels with it.
+    let client_error = err
+        .raw_response()
+        .is_some_and(|response| response.status().is_client_error());
+    let code = ::aws_sdk_kms::error::ProvideErrorMetadata::code(&err).unwrap_or_default();
+    let about_the_key = KEY_NEGATIVE_KMS_ERROR_CODES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(code));
+    if client_error && about_the_key {
+        return KeyLookup::Unresolvable(reason);
+    }
+    KeyLookup::Indeterminate(reason)
+}
+
+/// The KMS error codes that say the identifier the lookup named cannot be read at
+/// all, rather than something about the call, about KMS, or about the key's current
+/// state: the two codes `DescribeKey` models for an identifier it cannot resolve
+/// (`NotFoundException` for an identifier naming no key, `InvalidArnException` for a
+/// value that is not a usable ARN) and the authorization refusal for a key this
+/// caller may not read.
+///
+/// Deliberately NOT the state codes (`DisabledException`, `KMSInvalidStateException`):
+/// those describe a key that DOES resolve, and a grant may name such a key — the key
+/// is only used later, when a snapshot is actually copied. A code outside this list,
+/// or no code at all, leaves the lookup indeterminate, so a condition nobody
+/// attributed to the key's existence never refuses a create.
+const KEY_NEGATIVE_KMS_ERROR_CODES: &[&str] = &[
+    "AccessDeniedException",
+    "InvalidArnException",
+    "NotFoundException",
+];
+
+/// The refusal the STORE dictates for a create under `name`, or `None` when the
+/// create may proceed.
+///
+/// One function so the check made before the awaited KMS lookup and the check made
+/// again under the write lock cannot disagree.
+fn refusal_from_state(
+    store: &crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State,
+    name: &str,
+) -> Option<CreateSnapshotCopyGrantError> {
+    use crate::state as st;
+
+    // Identity before capacity: a request that would create nothing keeps the more
+    // specific fault even when the store is at its bound. The NAME is what an
+    // account's grants are unique on, so a second create under one name is refused
+    // and overwrites nothing.
+    if store.snapshot_copy_grant(name).is_some() {
+        return Some(
+            CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantAlreadyExistsFault(
+                SnapshotCopyGrantAlreadyExistsFault {
+                    message: Some(format!(
+                        "Cannot create the snapshot copy grant because a grant with the name {name} already exists."
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    if store.snapshot_copy_grants.len() >= st::SNAPSHOT_COPY_GRANT_QUOTA {
+        return Some(
+            CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantQuotaExceededFault(
+                SnapshotCopyGrantQuotaExceededFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of snapshot copy grants ({}).",
+                        st::SNAPSHOT_COPY_GRANT_QUOTA
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    None
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateSnapshotCopyGrant<Eng>
 {
@@ -164,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -212,40 +369,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-
-        // Identity before capacity: a request that would create nothing keeps
-        // the more specific fault even when the store is at its bound. The NAME
-        // is what an account's grants are unique on, so a second create under
-        // one name is refused and overwrites nothing.
-        if store
-            .snapshot_copy_grant(&input.snapshot_copy_grant_name)
-            .is_some()
-        {
-            return Err(
-                CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantAlreadyExistsFault(
-                    SnapshotCopyGrantAlreadyExistsFault {
-                        message: Some(format!(
-                            "Cannot create the snapshot copy grant because a grant with the name {} already exists.",
-                            input.snapshot_copy_grant_name
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // The refusals the STORE dictates, decided under a lock that is released
+        // before the awaited KMS lookup below — a store guard is never held across
+        // an await. Each is made AGAIN after it, under the write lock, because the
+        // store can have moved while this request was asking KMS about the key.
+        if let Some(refusal) = {
+            let store = state.lock();
+            refusal_from_state(&store, &input.snapshot_copy_grant_name)
+        } {
+            return Err(refusal);
         }
-        if store.snapshot_copy_grants.len() >= st::SNAPSHOT_COPY_GRANT_QUOTA {
-            return Err(
-                CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantQuotaExceededFault(
-                    SnapshotCopyGrantQuotaExceededFault {
-                        message: Some(format!(
-                            "The request would exceed the allowed number of snapshot copy grants ({}).",
-                            st::SNAPSHOT_COPY_GRANT_QUOTA
-                        )),
-                    },
-                )
-                .into(),
-            );
+
+        // The key the grant would permit Amazon Redshift to use, resolved against
+        // Key Management Service before anything is written: a value KMS cannot
+        // read for this caller names no key a copied snapshot could ever be
+        // encrypted under, so the grant is refused and nothing is stored. A request
+        // that names NO key has no value to resolve — it gets the account's default
+        // key below.
+        if let Some(kms_key_id) = input.kms_key_id.as_deref() {
+            let region = st::request_region(ctx);
+            match describe_kms_key(ctx, &region, kms_key_id).await {
+                KeyLookup::Resolved => {}
+                KeyLookup::Unresolvable(reason) => {
+                    ::tracing::debug!(
+                        kms_key_id,
+                        error = %reason,
+                        "KMS reports this KmsKeyId names no readable key; refusing the grant"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        format!(
+                            "Unable to create snapshot copy grant. The KMS key '{kms_key_id}' does not exist or is inaccessible."
+                        ),
+                    ));
+                }
+                // Visible to an operator: an indeterminate lookup is accepted, so
+                // without this line it would be indistinguishable from a key KMS
+                // resolved.
+                KeyLookup::Indeterminate(reason) => ::tracing::warn!(
+                    kms_key_id,
+                    error = %reason,
+                    "KMS gave no answer about this KmsKeyId; accepting it"
+                ),
+            }
+        }
+
+        let mut store = state.lock();
+        if let Some(refusal) = refusal_from_state(&store, &input.snapshot_copy_grant_name) {
+            return Err(refusal);
         }
 
         // The record every later `DescribeSnapshotCopyGrants` reports verbatim:
