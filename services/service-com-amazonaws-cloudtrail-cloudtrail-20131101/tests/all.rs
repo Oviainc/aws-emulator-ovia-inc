@@ -163,3 +163,7 @@ mod channel_destination_identifier;
 // names are answered with, across the operations each rule reaches.
 #[path = "all/page_size_and_query_id_refusals.rs"]
 mod page_size_and_query_id_refusals;
+// `event_data_store_restore` pins `RestoreEventDataStore`: which status it applies to,
+// what the clock owes the store it brings back, and how it refuses an identifier.
+#[path = "all/event_data_store_restore.rs"]
+mod event_data_store_restore;

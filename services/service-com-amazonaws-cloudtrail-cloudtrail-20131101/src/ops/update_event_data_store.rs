@@ -331,13 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if changes_nothing {
             return Err(UpdateEventDataStoreErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(
-                        "At least one optional parameter must be specified besides \
-                         EventDataStore: Name, AdvancedEventSelectors, MultiRegionEnabled, \
-                         OrganizationEnabled, RetentionPeriod, TerminationProtectionEnabled, \
-                         KmsKeyId or BillingMode"
-                            .to_string(),
-                    ),
+                    message: Some(NO_UPDATABLE_MEMBER_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -618,6 +612,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The refusal text a call that supplies no updatable member is answered with.
+///
+/// The message is FIXED: nothing in it comes from the request or from the registry, so
+/// every such call reads the same — including the enumeration of the members that
+/// count as a change, in the order CloudTrail states them (and spelled as the model
+/// spells the input members). A caller or wrapper matching on this wording, and a
+/// human reading it to learn which members are updatable, both get CloudTrail's text.
+const NO_UPDATABLE_MEMBER_MESSAGE: &str = "At least one of the following must be provided: \
+     AdvancedEventSelectors, Name, RetentionPeriod, MultiRegionEnabled, \
+     TerminationProtectionEnabled, OrganizationEnabled, KmsKeyId";
 
 /// The HTTP status this service answers a not-found refusal with.
 ///

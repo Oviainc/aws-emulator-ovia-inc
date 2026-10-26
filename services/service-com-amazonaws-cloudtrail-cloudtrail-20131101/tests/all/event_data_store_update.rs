@@ -16,7 +16,8 @@
 //! * an update applies exactly the members the request carries, leaves every other
 //!   member as it was, and is reported identically by the next read;
 //! * "Other parameters are optional, but at least one optional parameter must be
-//!   specified, or CloudTrail throws an error";
+//!   specified, or CloudTrail throws an error" — refused with the one fixed text that
+//!   refusal carries, before the identifier is resolved;
 //! * the retention period a store may carry is the band its `BillingMode` documents
 //!   (`EXTENDABLE_RETENTION_PRICING` 7..3653 days, `FIXED_RETENTION_PRICING`
 //!   7..2557), read against the billing mode the SAME call leaves the store in;
@@ -266,19 +267,109 @@ async fn an_update_applies_only_the_members_it_carries() {
     }
 }
 
+/// The members CloudTrail's "no updatable member" refusal enumerates, in the order it
+/// states them. Each is spelled as the input member is spelled
+/// (`smithy_query(query="operation", operation="UpdateEventDataStore")`: the optional
+/// members are Name, AdvancedEventSelectors, MultiRegionEnabled, OrganizationEnabled,
+/// RetentionPeriod, TerminationProtectionEnabled, KmsKeyId and BillingMode).
+const MEMBERS_THE_REFUSAL_NAMES: [&str; 7] = [
+    "AdvancedEventSelectors",
+    "Name",
+    "RetentionPeriod",
+    "MultiRegionEnabled",
+    "TerminationProtectionEnabled",
+    "OrganizationEnabled",
+    "KmsKeyId",
+];
+
+/// The whole refusal text, which is FIXED: no part of it is derived from the request
+/// or from the registry.
+fn no_updatable_member_message() -> String {
+    format!(
+        "At least one of the following must be provided: {}",
+        MEMBERS_THE_REFUSAL_NAMES.join(", ")
+    )
+}
+
 /// RULE: "at least one optional parameter must be specified, or CloudTrail throws an
-/// error", and the refused call changes nothing.
+/// error" — the refusal is `InvalidParameterException` carrying that one fixed text,
+/// whatever store the identifier addresses and whether it addresses one at all (the
+/// precondition is read before the store is resolved), and the refused call changes
+/// nothing.
+///
+/// The rows differ along the identifier the call carries — the two accepted forms, a
+/// store that exists and ARNs and ids that name none, in the caller's Region and in
+/// another — because none of that may reach the message.
 #[tokio::test]
 async fn an_update_naming_no_optional_member_is_refused() {
     let emulator = Emulator::new();
+    let account = engine::emulator_account_id();
+    let absent = "11111111-1111-1111-1111-111111111111";
     let created = create(&emulator, "untouched", &json!({"RetentionPeriod": 30})).await;
     let id = store_id(&created);
+    let arn = created
+        .get("EventDataStoreArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
-    let case = "UpdateEventDataStore with no optional member";
-    update(&emulator, &id, &json!({}))
-        .await
-        .expect_error(case, 400, "InvalidParameterException");
+    let expected = no_updatable_member_message();
+    // (case, the identifier the call carries)
+    let rows: Vec<(&str, String)> = vec![
+        ("an existing store, by its id suffix", id.clone()),
+        ("an existing store, by its ARN", arn.clone()),
+        ("an id that names no store", absent.to_string()),
+        (
+            "an ARN that names no store in the caller's Region",
+            format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:eventdatastore/{absent}"),
+        ),
+        (
+            "an ARN that names no store in another Region",
+            format!("arn:aws:cloudtrail:us-west-2:{account}:eventdatastore/{absent}"),
+        ),
+        (
+            // A value that is not even a readable identifier: the precondition is
+            // still what answers, because it is read first.
+            "a value no identifier form accepts",
+            "not-an-arn".to_string(),
+        ),
+    ];
 
+    for (case, identifier) in &rows {
+        let reply = update(&emulator, identifier, &json!({})).await;
+        reply.expect_error(case, 400, "InvalidParameterException");
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case}: expected the fixed refusal text {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+
+    // Every member the refusal names counts as a change: supplying just that one gets
+    // the call PAST this precondition, so the message's list is the list the handler
+    // reads. The store is one that does not exist, so what proves the precondition
+    // passed is the next refusal — the store lookup's.
+    let unknown = format!("arn:aws:cloudtrail:{HOME_REGION}:{account}:eventdatastore/{absent}");
+    for member in MEMBERS_THE_REFUSAL_NAMES {
+        let value = match member {
+            "AdvancedEventSelectors" => json!([{
+                "Name": "management events",
+                "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}],
+            }]),
+            "Name" => json!("a-new-name"),
+            "RetentionPeriod" => json!(90),
+            "KmsKeyId" => json!("alias/lake-key"),
+            // The three remaining members are booleans; `false` is as much a supplied
+            // member as `true`, so the rows carry the value that is NOT the default.
+            _ => json!(false),
+        };
+        let reply = update(&emulator, &unknown, &json!({member: value})).await;
+        reply.expect_error(member, NOT_FOUND_STATUS, "EventDataStoreNotFoundException");
+    }
+
+    // The refused calls left the store exactly as it was.
+    let case = "the store the refusals addressed";
     let read = get(&emulator, &id).await;
     let read = read.expect_ok(case).clone();
     assert_members(case, &created, &read, &json!({}));

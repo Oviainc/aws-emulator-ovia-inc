@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreEventDataStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreEventDataStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreEventDataStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restores a store awaiting deletion in the shared registry (`crate::state`), within
+//! the seven-day wait `DeleteEventDataStore` started.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +209,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreEventDataStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreEventDataStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreEventDataStore"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RestoreEventDataStoreErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "RestoreEventDataStore needs the CloudTrail event data store \
+                         registry, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // Materialise what the CLOCK already owed the registry before reading it: a
+        // store whose seven-day wait has elapsed is gone — which is exactly the store
+        // this operation can no longer restore — and one still provisioning or moving
+        // between ingestion statuses has taken the status it was heading for.
+        store.settle_event_data_stores(now);
+
+        // `EventDataStore` is either a store ARN or the id suffix of one; a value that
+        // can be read as neither names no store in any account. The identifier is read
+        // here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+            RestoreEventDataStoreErrorModeled::EventDataStoreARNInvalidException(
+                EventDataStoreARNInvalidException {
+                    message: Some(rejection.message(&region)),
+                },
+            )
+        })?;
+
+        let Some(record) = store.addressed_event_data_store_mut(&identifier, &region, now) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                RestoreEventDataStoreErrorModeled::EventDataStoreNotFoundException(
+                    EventDataStoreNotFoundException {
+                        message: Some(crate::state::event_data_store_not_found_message(
+                            &identifier.arn(&region),
+                        )),
+                    },
+                ),
+                NOT_FOUND_STATUS,
+            ));
+        };
+
+        // "Restores a DELETED event data store": only a store awaiting deletion has
+        // anything to restore, so every other status is refused with the one error
+        // this operation models for a status that does not support it, and the store
+        // is left exactly as it was.
+        if record.status != crate::state::EventDataStoreState::PendingDeletion {
+            return Err(
+                RestoreEventDataStoreErrorModeled::InvalidEventDataStoreStatusException(
+                    InvalidEventDataStoreStatusException {
+                        message: Some(format!(
+                            "The event data store {} is in status {}: only an event data store \
+                             whose status is {} can be restored.",
+                            record.arn(),
+                            record.status.as_wire(),
+                            crate::state::EventDataStoreState::PendingDeletion.as_wire(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Restoring is asynchronous ("Restoring an event data store can take several
+        // minutes"), so the store takes the transient status the model carries for a
+        // store being provisioned and the CLOCK — not another call — moves it to the
+        // status it is heading for: a restored store ingests again, which is the
+        // status `DeleteEventDataStore` took it out of. The wait period it was under
+        // is over, so nothing is left to remove it later.
+        record.status = crate::state::EventDataStoreState::Created;
+        record.pending_status = Some((
+            now + crate::state::EVENT_DATA_STORE_PROVISIONING,
+            crate::state::EventDataStoreState::Enabled,
+        ));
+        record.ingestion_settles_at = None;
+        record.deleted_at = None;
+        record.updated_at = Some(now);
+
+        // Report the stored record, so this response and every later read of the store
+        // are the same values.
+        Ok(RestoreEventDataStoreOutput {
+            event_data_store_arn: Some(record.arn()),
+            name: Some(record.name.clone()),
+            status: Some(record.status.as_wire().to_string()),
+            advanced_event_selectors: (!record.advanced_event_selectors.is_empty())
+                .then(|| record.advanced_event_selectors.clone()),
+            multi_region_enabled: Some(record.multi_region_enabled),
+            organization_enabled: Some(record.organization_enabled),
+            retention_period: record.retention_period,
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+            created_timestamp: record.created_at.map(::aws_smithy_types::DateTime::from),
+            updated_timestamp: record
+                .updated_at
+                .or(record.created_at)
+                .map(::aws_smithy_types::DateTime::from),
+            kms_key_id: record.kms_key_id.clone(),
+            billing_mode: Some(record.billing_mode.as_wire().to_string()),
+        })
     }
 }
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response to this very
+/// operation naming a store that does not exist is `HTTP 400` with `__type`
+/// `EventDataStoreNotFoundException` and a `Message` naming the store's ARN. The
+/// error CODE is the model's; only the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
+/// `delete_event_data_store` states it.
+const NOT_FOUND_STATUS: u16 = 400;
