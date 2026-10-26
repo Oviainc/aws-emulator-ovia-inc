@@ -97,6 +97,8 @@ mod disk_snapshot_delete;
 mod disk_snapshot_listing;
 #[path = "all/distribution_cache_reset.rs"]
 mod distribution_cache_reset;
+#[path = "all/distribution_cache_reset_clock.rs"]
+mod distribution_cache_reset_clock;
 #[path = "all/distribution_cdn.rs"]
 mod distribution_cdn;
 #[path = "all/distribution_certificate_attachment.rs"]

@@ -59,26 +59,41 @@ const ORIGIN_ZONE: &str = "us-east-1a";
 /// The `operationType` the log entry of a reset carries, from the modelled
 /// `OperationType` enum (`smithy_query(query="shape",shape="OperationType")`,
 /// which lists `ResetDistributionCache`).
-const OPERATION_TYPE: &str = "ResetDistributionCache";
+///
+/// `pub(crate)` so a sibling suite about these operations names the same
+/// modelled value rather than re-declaring it.
+pub(crate) const OPERATION_TYPE: &str = "ResetDistributionCache";
 
 /// The `ResourceType` a distribution reports, from the modelled enum.
-const RESOURCE_TYPE_DISTRIBUTION: &str = "Distribution";
+///
+/// `pub(crate)` so a sibling suite about these operations names the same
+/// modelled value rather than re-declaring it.
+pub(crate) const RESOURCE_TYPE_DISTRIBUTION: &str = "Distribution";
 
 /// The `status` of a cache reset while the invalidation is still being applied,
 /// and the one it settles into — CloudFront's own `Invalidation$Status` values,
 /// which a Lightsail distribution's cache reset carries
 /// (`crate::state::CACHE_RESET_STATUS_IN_PROGRESS`).
-const IN_PROGRESS: &str = "InProgress";
+///
+/// `pub(crate)` so a sibling suite about these operations names the same
+/// modelled value rather than re-declaring it.
+pub(crate) const IN_PROGRESS: &str = "InProgress";
 /// See [`IN_PROGRESS`].
-const COMPLETED: &str = "Completed";
+pub(crate) const COMPLETED: &str = "Completed";
 
 /// The `status` a distribution reports once its configuration has rolled out
 /// (`crate::state::DISTRIBUTION_STATUS_DEPLOYED`).
-const DEPLOYED: &str = "Deployed";
+///
+/// `pub(crate)` so a sibling suite about these operations names the same
+/// modelled value rather than re-declaring it.
+pub(crate) const DEPLOYED: &str = "Deployed";
 
 /// The `status` a non-terminal operation-log entry carries
 /// (`crate::state::OPERATION_STATUS_STARTED`).
-const STARTED: &str = "Started";
+///
+/// `pub(crate)` so a sibling suite about these operations names the same
+/// modelled value rather than re-declaring it.
+pub(crate) const STARTED: &str = "Started";
 
 /// The wire error code (awsJson `__type`) of a refusal of a request the model
 /// admits but the service does not serve.
@@ -141,14 +156,19 @@ fn other_regions() -> Vec<&'static str> {
 /// What kind of Lightsail resource a distribution's origin is, from the modelled
 /// `Origin` documentation: "An origin can be a Lightsail instance, bucket,
 /// container service, or load balancer."
+///
+/// `pub(crate)` so a sibling suite that stands up a distribution of this
+/// service drives the same creates rather than carrying a second copy of them.
 #[derive(Clone, Copy, Debug)]
-enum OriginKind {
+pub(crate) enum OriginKind {
     Instance,
     Bucket,
 }
 
 /// Stand up the origin resource `name` of this kind in the distribution Region.
-async fn create_origin(emulator: &Emulator, kind: OriginKind, name: &str) {
+///
+/// `pub(crate)` for the same reason as [`OriginKind`].
+pub(crate) async fn create_origin(emulator: &Emulator, kind: OriginKind, name: &str) {
     match kind {
         OriginKind::Instance => create_running_instance(emulator, name, ORIGIN_ZONE).await,
         OriginKind::Bucket => {
@@ -163,12 +183,12 @@ async fn create_origin(emulator: &Emulator, kind: OriginKind, name: &str) {
 }
 
 /// Create the distribution `name` on `bundle_id`, pulling from the origin
-/// resource `origin_name`, and wait until it reports [`DEPLOYED`].
+/// resource `origin_name`, WITHOUT waiting for the deployment the create owes
+/// it.
 ///
-/// The wait is what makes a later assertion about the distribution's own status
-/// meaningful: a reset of its cached content must leave the deployed
-/// configuration exactly as it was.
-async fn create_deployed_distribution(
+/// `pub(crate)` so the ONE `CreateDistribution` request shape of this test
+/// target serves every suite that needs a distribution of the account.
+pub(crate) async fn create_distribution(
     emulator: &Emulator,
     name: &str,
     bundle_id: &str,
@@ -189,6 +209,21 @@ async fn create_deployed_distribution(
             }),
         )
         .await;
+}
+
+/// Create the distribution `name` on `bundle_id`, pulling from the origin
+/// resource `origin_name`, and wait until it reports [`DEPLOYED`].
+///
+/// The wait is what makes a later assertion about the distribution's own status
+/// meaningful: a reset of its cached content must leave the deployed
+/// configuration exactly as it was.
+async fn create_deployed_distribution(
+    emulator: &Emulator,
+    name: &str,
+    bundle_id: &str,
+    origin_name: &str,
+) {
+    create_distribution(emulator, name, bundle_id, origin_name).await;
     wait_for_distribution_status(emulator, name, DEPLOYED).await;
 }
 
@@ -201,7 +236,9 @@ async fn reset_cache(emulator: &Emulator, name: &str) -> Value {
 /// The last cache reset `GetDistributionLatestCacheReset` reports: of the
 /// distribution `name` names, or of every distribution of the account when it
 /// names none.
-async fn latest_reset(emulator: &Emulator, name: Option<&str>) -> Value {
+///
+/// `pub(crate)` for the same reason as [`OriginKind`].
+pub(crate) async fn latest_reset(emulator: &Emulator, name: Option<&str>) -> Value {
     let body = match name {
         Some(name) => json!({"distributionName": name}),
         None => json!({}),
@@ -259,7 +296,10 @@ async fn reset_log_entries(emulator: &Emulator, case: &str, name: &str) -> usize
 
 /// Assert `answered` is the answer of a reset just made on `name`: the log entry
 /// it carries is about that distribution and is not finished yet.
-fn assert_reset_answer(case: &str, name: &str, answered: &Value) {
+///
+/// `pub(crate)` so a sibling suite about this operation holds these expectations
+/// to the same single copy of them.
+pub(crate) fn assert_reset_answer(case: &str, name: &str, answered: &Value) {
     assert_eq!(
         answered["status"].as_str(),
         Some(IN_PROGRESS),
