@@ -25,8 +25,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::{Document, Number};
+use ::sha2::{Digest, Sha256};
 
-use crate::ops::types::{Contact, FileDetail, FileInput, Tag};
+use crate::ops::types::{Amendment, Contact, FileDetail, FileInput, Tag};
 
 /// This service's ARN namespace, from
 /// `smithy_query(query="service_info")` -> `arnNamespace: partnercentral`.
@@ -374,6 +375,26 @@ pub const MAX_AMENDMENT_REASON_LEN: usize = 1000;
 /// keeps the token, so this bounds the bytes one record holds for it.
 pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
 
+/// The bytes a stored request fingerprint occupies: a SHA-256 digest in hex.
+///
+/// A spent `ClientToken` is kept with the fingerprint of the request that spent it (see
+/// [`request_fingerprint`]), so what the store holds for one token is this fixed size
+/// however large that request was.
+pub const REQUEST_FINGERPRINT_LEN: usize = 64;
+
+/// What a request spending a `ClientToken` another, DIFFERENT request already spent is
+/// refused with.
+///
+/// The token is the identity of one request, so a second request carrying it is not a
+/// retry: it conflicts with the request the store already holds under that token, and is
+/// refused with the modelled `ConflictException` (HTTP 409) rather than reported as a
+/// success for a write it never made. The sentence is AWS's wording for this error class
+/// — the same two-part guidance every AWS API gives a caller that reuses an idempotency
+/// token with different parameters — and names no value of either request.
+pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "The request uses the same client token as a \
+     previous, but non-identical request. Do not reuse a client token with different requests, \
+     unless the requests are identical.";
+
 /// The most writes one benefit application keeps a record of.
 ///
 /// Every operation that changes an application and carries a `ClientToken` is idempotent
@@ -385,10 +406,11 @@ pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
 /// again.
 ///
 /// With [`MAX_AMENDMENTS_PER_REQUEST`], [`MAX_FIELD_PATH_LEN`],
-/// [`MAX_AMENDMENT_REASON_LEN`] and [`MAX_CLIENT_TOKEN_LEN`] — each enforced before the
-/// record is written — one application's write record holds at most 20 x (64-byte token
-/// + 1000-byte reason + 20 x 256-byte path) of caller text: bounded, like every other
-/// part of this store.
+/// [`MAX_AMENDMENT_REASON_LEN`], [`MAX_CLIENT_TOKEN_LEN`] and
+/// [`REQUEST_FINGERPRINT_LEN`] — each enforced, or fixed, before the record is written —
+/// one application's write record holds at most 20 x (64-byte token + 64-byte
+/// fingerprint + 1000-byte reason + 20 x 256-byte path) of caller text: bounded, like
+/// every other part of this store.
 pub const MAX_APPLIED_WRITE_HISTORY: usize = 20;
 
 /// The most members a stored `BenefitApplicationDetails` document may hold, counted over
@@ -962,6 +984,12 @@ pub struct AppliedWrite {
     pub operation: &'static str,
     /// The request's `ClientToken`.
     pub client_token: String,
+    /// The fingerprint of the request the token was spent on ([`request_fingerprint`]),
+    /// which is what tells a RETRY of that request from a different request carrying the
+    /// same token: the first is answered with what this write reported, the second is
+    /// refused — see [`replayed_write`]. [`REQUEST_FINGERPRINT_LEN`] bytes, so the
+    /// record keeps no copy of the request itself.
+    pub request_fingerprint: String,
     /// Why the write was made, where the request carried a reason of its own (an
     /// `AmendmentReason`) that the record does not already hold elsewhere.
     pub reason: Option<String>,
@@ -974,6 +1002,19 @@ pub struct AppliedWrite {
     pub applied_at_millis: i64,
     /// The revision the write produced — the `Revision` a replay of the token reports.
     pub revision: u64,
+}
+
+/// One `ClientToken` a write spent, with the fingerprint of the request that spent it.
+///
+/// The pair is what an operation whose idempotency window is the resource's own state —
+/// rather than the applied-write record — judges a repeated token against: the token says
+/// WHICH request, the fingerprint says whether this is that same request.
+#[derive(Debug, Clone)]
+pub struct SpentToken {
+    /// The request's `ClientToken`, at most [`MAX_CLIENT_TOKEN_LEN`] bytes.
+    pub client_token: String,
+    /// The fingerprint of the request it was spent on ([`request_fingerprint`]).
+    pub request_fingerprint: String,
 }
 
 /// One stored benefit application: the single source of truth for every application
@@ -1014,14 +1055,17 @@ pub struct BenefitApplication {
     /// has been updated since.
     pub created_revision: u64,
     /// The `ClientToken` of the recall that put this application back into
-    /// `PENDING_SUBMISSION`, if one did and it is still in draft.
+    /// `PENDING_SUBMISSION`, if one did and it is still in draft, with the fingerprint of
+    /// the request that recall carried.
     ///
     /// `RecallBenefitApplication` documents its `ClientToken` as what makes the recall
     /// idempotent, so a retry carrying the token of the recall still in effect answers
-    /// success and changes nothing. One token per application, so it is bounded by the
-    /// application count; a fresh submission makes the application recallable again, at
-    /// which point the token no longer matches a recall in effect.
-    pub recall_client_token: Option<String>,
+    /// success and changes nothing, while a DIFFERENT request carrying that token is
+    /// refused rather than answered success — see [`BenefitApplication::recall_retry`].
+    /// One token per application, so it is bounded by the application count; a fresh
+    /// submission makes the application recallable again, at which point the token no
+    /// longer matches a recall in effect.
+    pub recall_client_token: Option<SpentToken>,
     pub associated_resources: Vec<String>,
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
@@ -1095,14 +1139,29 @@ impl BenefitApplication {
     }
 
     /// Whether `client_token` is the token of the recall that is still in effect on this
-    /// application — i.e. a retry of that same recall, which must change nothing.
+    /// application — i.e. a retry of that same recall, which must change nothing — or the
+    /// refusal that token was spent on a DIFFERENT recall request.
     ///
     /// Takes the token itself, never an `Option`, so a request that carries none cannot
     /// be read as a retry of a recall that never happened: the caller passes a token only
-    /// when the request has one.
-    pub fn is_recall_retry(&self, client_token: &str) -> bool {
-        self.status == STATUS_PENDING_SUBMISSION
-            && self.recall_client_token.as_deref() == Some(client_token)
+    /// when the request has one. `request_fingerprint` is the fingerprint of the request
+    /// carrying it, judged exactly as [`replayed_write`] judges one against an applied
+    /// write.
+    pub fn recall_retry(
+        &self,
+        client_token: &str,
+        request_fingerprint: &str,
+    ) -> Result<bool, crate::ops::types::ConflictException> {
+        let Some(spent) = self.recall_client_token.as_ref() else {
+            return Ok(false);
+        };
+        if self.status != STATUS_PENDING_SUBMISSION || spent.client_token != client_token {
+            return Ok(false);
+        }
+        if spent.request_fingerprint != request_fingerprint {
+            return Err(idempotency_conflict());
+        }
+        Ok(true)
     }
 
     /// Record a change to the stored application: bump the revision and advance
@@ -1180,6 +1239,22 @@ impl BenefitApplication {
     }
 }
 
+/// What one spent `CreateBenefitApplication` `ClientToken` holds: the application that
+/// create minted, and the fingerprint of the request it was spent on.
+///
+/// The fingerprint is what tells a RETRY of that create from a different create carrying
+/// the same token: the first is answered with the minted id, ARN and revision, the second
+/// is refused with [`idempotency_conflict`] rather than reported as a success for an
+/// application it never created. [`REQUEST_FINGERPRINT_LEN`] bytes, so the index keeps no
+/// copy of the request.
+#[derive(Debug, Clone)]
+pub struct ClientTokenRecord {
+    /// The `benappl-...` id of the application the create minted.
+    pub application_id: String,
+    /// The fingerprint of the create request ([`request_fingerprint`]).
+    pub request_fingerprint: String,
+}
+
 /// One benefit catalog: its seeded benefits and allocations, the applications created in
 /// it, and the `ClientToken`s those creates were made with.
 #[derive(Debug, Clone, Default)]
@@ -1192,8 +1267,8 @@ pub struct Catalog {
     /// Allocations by `benalloc-...` id, in one stable order so
     /// `ListBenefitAllocations` can page.
     pub allocations: BTreeMap<String, BenefitAllocation>,
-    /// `ClientToken` -> the application id the create it completed minted.
-    pub client_tokens: BTreeMap<String, String>,
+    /// `ClientToken` -> what the create it completed minted, and the request it carried.
+    pub client_tokens: BTreeMap<String, ClientTokenRecord>,
 }
 
 impl Catalog {
@@ -1522,16 +1597,29 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
 
     /// Store a newly created application and index it by ARN and by `ClientToken`.
     ///
+    /// The token is indexed with the fingerprint of the create request it came on
+    /// ([`request_fingerprint`]), so the create can tell a retry of that request from a
+    /// different request carrying the same token.
+    ///
     /// `None` when the catalog does not exist, which a handler has already refused.
-    pub fn insert_application(&mut self, client_token: String, application: BenefitApplication) {
+    pub fn insert_application(
+        &mut self,
+        client_token: String,
+        request_fingerprint: String,
+        application: BenefitApplication,
+    ) {
         self.arns.insert(
             application.arn.clone(),
             (application.catalog.clone(), application.id.clone()),
         );
         if let Some(catalog) = self.catalogs.get_mut(&application.catalog) {
-            catalog
-                .client_tokens
-                .insert(client_token, application.id.clone());
+            catalog.client_tokens.insert(
+                client_token,
+                ClientTokenRecord {
+                    application_id: application.id.clone(),
+                    request_fingerprint,
+                },
+            );
             catalog
                 .applications
                 .insert(application.id.clone(), application);
@@ -1810,6 +1898,148 @@ fn document_json(value: &Document, budget: usize) -> String {
             rendered.sort();
             format!("{{{}}}", rendered.join(","))
         }
+    }
+}
+
+/// A request member's value as the [`Document`] a request fingerprint covers.
+///
+/// One implementation per member type a `ClientToken`-carrying input of this service
+/// carries, so a fingerprint covers every member a request supplied whatever that
+/// member's shape is: a string, a document, or a list of either or of a modelled
+/// structure.
+pub trait FingerprintValue {
+    /// This value as the document [`request_fingerprint`] renders.
+    fn fingerprint_document(&self) -> Document;
+}
+
+impl FingerprintValue for String {
+    fn fingerprint_document(&self) -> Document {
+        Document::String(self.clone())
+    }
+}
+
+impl FingerprintValue for Document {
+    fn fingerprint_document(&self) -> Document {
+        self.clone()
+    }
+}
+
+impl FingerprintValue for Tag {
+    fn fingerprint_document(&self) -> Document {
+        fingerprint_object([("Key", Some(self.key.clone())), ("Value", Some(self.value.clone()))])
+    }
+}
+
+impl FingerprintValue for Contact {
+    fn fingerprint_document(&self) -> Document {
+        fingerprint_object([
+            ("Email", self.email.clone()),
+            ("FirstName", self.first_name.clone()),
+            ("LastName", self.last_name.clone()),
+            ("BusinessTitle", self.business_title.clone()),
+            ("Phone", self.phone.clone()),
+        ])
+    }
+}
+
+impl FingerprintValue for FileInput {
+    fn fingerprint_document(&self) -> Document {
+        fingerprint_object([
+            ("FileURI", Some(self.file_uri.clone())),
+            ("BusinessUseCase", self.business_use_case.clone()),
+        ])
+    }
+}
+
+impl FingerprintValue for Amendment {
+    fn fingerprint_document(&self) -> Document {
+        fingerprint_object([
+            ("FieldPath", Some(self.field_path.clone())),
+            ("NewValue", Some(self.new_value.clone())),
+        ])
+    }
+}
+
+impl<T: FingerprintValue> FingerprintValue for Vec<T> {
+    /// A list in REQUEST ORDER: the order is part of what the caller sent (an
+    /// amendment list is applied in it), so two requests differing only in it are
+    /// different requests.
+    fn fingerprint_document(&self) -> Document {
+        Document::Array(
+            self.iter()
+                .map(FingerprintValue::fingerprint_document)
+                .collect(),
+        )
+    }
+}
+
+/// The members of one modelled structure a request carried, as a document: a member the
+/// structure did not carry is left out, exactly as [`request_fingerprint`] leaves out an
+/// absent input member.
+fn fingerprint_object<const N: usize>(members: [(&str, Option<String>); N]) -> Document {
+    Document::Object(
+        members
+            .into_iter()
+            .filter_map(|(name, value)| value.map(|value| (name.to_string(), Document::String(value))))
+            .collect(),
+    )
+}
+
+/// `value` as the document a request fingerprint covers — the one call a handler makes
+/// per supplied member (`input.tags.as_ref().map(fingerprint_value)`).
+pub fn fingerprint_value<T: FingerprintValue>(value: &T) -> Document {
+    value.fingerprint_document()
+}
+
+/// The fingerprint of one request's parameters: the identity a repeated `ClientToken` is
+/// judged against, so a token already spent replays its first answer only for the SAME
+/// request.
+///
+/// `members` are the input members the operation carries other than the token itself,
+/// each as the document the request supplied for it ([`fingerprint_value`]) or `None`
+/// when the request omitted it. An omitted member is left out of the digest, so omitting
+/// a member and supplying one never fingerprint alike, and the rendering is canonical
+/// ([`document_json`] sorts an object's members), so two spellings of one request agree.
+///
+/// The digest is hex SHA-256: a fixed [`REQUEST_FINGERPRINT_LEN`] bytes however large
+/// the request was, which is what lets a spent token be remembered without holding a
+/// copy of the request.
+pub fn request_fingerprint(members: Vec<(&str, Option<Document>)>) -> String {
+    let supplied: HashMap<String, Document> = members
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| (name.to_string(), value)))
+        .collect();
+    // One level deeper than a stored document may nest, so the wrapper object below
+    // cannot cost the deepest member of a document the handlers already accepted.
+    let canonical = document_json(&Document::Object(supplied), MAX_DETAILS_DEPTH + 1);
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// The refusal a request that spends another request's `ClientToken` is answered with —
+/// see [`IDEMPOTENT_PARAMETER_MISMATCH`]. One construction, so every operation that
+/// takes a token refuses the reuse in the same words.
+pub fn idempotency_conflict() -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: IDEMPOTENT_PARAMETER_MISMATCH.to_string(),
+    }
+}
+
+/// The write a request is a replay of, or the refusal its `ClientToken` was spent on a
+/// different request.
+///
+/// `applied` is what the store holds for this operation under the request's token.
+/// `Ok(Some(..))` is a true retry — same operation, same token, same parameters — which
+/// the caller answers with what that write reported, applying nothing a second time.
+/// `Ok(None)` is a token no write of this operation holds, so the request is a new one.
+/// `Err` is the mismatch: the token identifies a request this one is not.
+pub fn replayed_write<'a>(
+    applied: Option<&'a AppliedWrite>,
+    request_fingerprint: &str,
+) -> Result<Option<&'a AppliedWrite>, crate::ops::types::ConflictException> {
+    match applied {
+        Some(applied) if applied.request_fingerprint == request_fingerprint => Ok(Some(applied)),
+        Some(_) => Err(idempotency_conflict()),
+        None => Ok(None),
     }
 }
 

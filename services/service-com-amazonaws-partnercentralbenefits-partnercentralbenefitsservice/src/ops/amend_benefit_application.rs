@@ -11,7 +11,9 @@
 //!    refused with `AccessDeniedException` (see [`crate::state::ENTITLEMENT_REQUIRED`]),
 //!    so it never learns whether the application it named exists;
 //! 3. the `ClientToken` replay check — a retry of an amendment already applied changes
-//!    nothing and answers success;
+//!    nothing and answers success, while the same token on a request naming different
+//!    amendments, reason or revision is refused with `ConflictException` (see
+//!    [`crate::state::replayed_write`]);
 //! 4. the application's status — AWS has finished with a terminal application
 //!    ([`crate::state::TERMINAL_STATUSES`]), so amending one is `ConflictException`;
 //! 5. optimistic concurrency — the request's `Revision` must be the application's
@@ -478,6 +480,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now_millis();
+
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "Identifier",
+                Some(crate::state::fingerprint_value(&input.identifier)),
+            ),
+            (
+                "Revision",
+                Some(crate::state::fingerprint_value(&input.revision)),
+            ),
+            (
+                "AmendmentReason",
+                Some(crate::state::fingerprint_value(&input.amendment_reason)),
+            ),
+            (
+                "Amendments",
+                Some(crate::state::fingerprint_value(&input.amendments)),
+            ),
+        ]);
+
         let mut store = state.lock();
 
         // The catalog the request names is resolved FIRST: an application lives inside a
@@ -509,14 +537,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // A retry of an amendment that already succeeded applies nothing a second time.
-        // It is checked BEFORE the revision, because the first call moved the revision
-        // the retry still carries.
-        if application
-            .applied_write(Self::NAME, &input.client_token)
-            .is_some()
-        {
-            return Ok(AmendBenefitApplicationOutput {});
+        // A retry of an amendment that already succeeded applies nothing a second time,
+        // while a request carrying that token with a different reason, revision or
+        // amendment list is a DIFFERENT request and is refused rather than answered
+        // success. It is checked BEFORE the revision, because the first call moved the
+        // revision the retry still carries.
+        match crate::state::replayed_write(
+            application.applied_write(Self::NAME, &input.client_token),
+            &fingerprint,
+        ) {
+            Err(conflict) => {
+                return Err(AmendBenefitApplicationErrorModeled::ConflictException(conflict).into())
+            }
+            Ok(Some(_)) => return Ok(AmendBenefitApplicationOutput {}),
+            Ok(None) => {}
         }
 
         // AWS has finished with a terminal application (`APPROVED`, `REJECTED`,
@@ -596,6 +630,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         amended.record_write(crate::state::AppliedWrite {
             operation: Self::NAME,
             client_token: input.client_token.clone(),
+            request_fingerprint: fingerprint,
             reason: Some(input.amendment_reason.clone()),
             fields: input
                 .amendments

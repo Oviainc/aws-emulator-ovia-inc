@@ -41,6 +41,8 @@ mod entitlement_denial;
 mod get_benefit;
 #[path = "all/get_benefit_allocation.rs"]
 mod get_benefit_allocation;
+#[path = "all/idempotent_parameter_mismatch.rs"]
+mod idempotent_parameter_mismatch;
 #[path = "all/pagination_cursor_issuance.rs"]
 mod pagination_cursor_issuance;
 #[path = "all/recall_benefit_application.rs"]

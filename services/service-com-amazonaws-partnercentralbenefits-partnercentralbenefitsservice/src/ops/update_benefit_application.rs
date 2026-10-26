@@ -23,10 +23,12 @@
 //!
 //! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of an
 //! update that already applied changes nothing a second time and answers with the
-//! `Id`/`Arn`/`Revision` that update reported (see
-//! [`crate::state::BenefitApplication::applied_write`]). It is checked BEFORE the status
-//! and the revision, because the first call's own write is what moved the revision the
-//! retry still carries.
+//! `Id`/`Arn`/`Revision` that update reported, while an update carrying that token with
+//! any different member is a different request and is refused with the modelled
+//! `ConflictException` (HTTP 409) — see [`crate::state::replayed_write`] and
+//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The token is checked BEFORE the
+//! status and the revision, because the first call's own write is what moved the revision
+//! the retry still carries.
 //!
 //! ## Shape of an operation
 //!
@@ -233,6 +235,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let principal = crate::state::caller_principal(ctx);
         let now = crate::state::now_millis();
 
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "Identifier",
+                Some(crate::state::fingerprint_value(&input.identifier)),
+            ),
+            (
+                "Revision",
+                Some(crate::state::fingerprint_value(&input.revision)),
+            ),
+            (
+                MEMBER_NAME,
+                input.name.as_ref().map(crate::state::fingerprint_value),
+            ),
+            (
+                MEMBER_DESCRIPTION,
+                input
+                    .description
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                MEMBER_DETAILS,
+                input
+                    .benefit_application_details
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                MEMBER_PARTNER_CONTACTS,
+                input
+                    .partner_contacts
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                MEMBER_FILE_DETAILS,
+                input
+                    .file_details
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+        ]);
+
         let mut store = state.lock();
 
         // The catalog the request names is resolved FIRST: an application lives inside a
@@ -269,17 +320,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A retry of an update that already applied applies nothing a second time and
         // answers with what that call reported: the `ClientToken` is the identity of the
         // REQUEST, so a request repeating one is the same request rather than a new
-        // write. It is checked BEFORE the status and the revision, because the first
-        // call's own write moved the revision the retry still carries (and the
-        // application may since have been submitted, which the status gate below refuses
-        // an update of) — so without this a lost response turns into a refusal of a write
-        // that already succeeded.
-        if let Some(applied) = application.applied_write(Self::NAME, &input.client_token) {
-            return Ok(UpdateBenefitApplicationOutput {
-                id: Some(application.id.clone()),
-                arn: Some(application.arn.clone()),
-                revision: Some(applied.revision.to_string()),
-            });
+        // write — and a request repeating one with different members is a DIFFERENT
+        // request, refused rather than answered with that write's result. It is checked
+        // BEFORE the status and the revision, because the first call's own write moved
+        // the revision the retry still carries (and the application may since have been
+        // submitted, which the status gate below refuses an update of) — so without this
+        // a lost response turns into a refusal of a write that already succeeded.
+        match crate::state::replayed_write(
+            application.applied_write(Self::NAME, &input.client_token),
+            &fingerprint,
+        ) {
+            Err(conflict) => {
+                return Err(UpdateBenefitApplicationErrorModeled::ConflictException(conflict).into())
+            }
+            Ok(Some(applied)) => {
+                return Ok(UpdateBenefitApplicationOutput {
+                    id: Some(application.id.clone()),
+                    arn: Some(application.arn.clone()),
+                    revision: Some(applied.revision.to_string()),
+                })
+            }
+            Ok(None) => {}
         }
 
         // A document this update would store has to satisfy the benefit's request schema,
@@ -362,6 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         application.record_write(crate::state::AppliedWrite {
             operation: Self::NAME,
             client_token: input.client_token,
+            request_fingerprint: fingerprint,
             // This operation carries no reason member, so the record states none.
             reason: None,
             fields: applied_members,

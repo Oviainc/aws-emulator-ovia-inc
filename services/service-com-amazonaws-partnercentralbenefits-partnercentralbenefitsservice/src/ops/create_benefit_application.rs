@@ -6,8 +6,12 @@
 //! minted.
 //!
 //! `@idempotent`: the `ClientToken` of a create that succeeded is remembered with the
-//! application it created, so a retry of the same request answers with that first call's
-//! id, ARN and revision instead of creating a second application.
+//! application it created AND with the fingerprint of the request it came on, so a retry
+//! of the SAME request answers with that first call's id, ARN and revision instead of
+//! creating a second application, while a create carrying that token with any different
+//! member is a different request and is refused with the modelled `ConflictException`
+//! (HTTP 409) — see [`crate::state::request_fingerprint`] and
+//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`].
 //!
 //! The benefit the request names is READ from the catalog, not merely resolved: a benefit
 //! whose `BenefitStatus` is not `ACTIVE` is no longer offered, so an application for it is
@@ -255,6 +259,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let principal = crate::state::caller_principal(ctx);
         let now = crate::state::now_millis();
 
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "BenefitIdentifier",
+                Some(crate::state::fingerprint_value(&input.benefit_identifier)),
+            ),
+            (
+                "Name",
+                input.name.as_ref().map(crate::state::fingerprint_value),
+            ),
+            (
+                "Description",
+                input
+                    .description
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                "FulfillmentTypes",
+                input
+                    .fulfillment_types
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                crate::state::DETAILS_MEMBER,
+                input
+                    .benefit_application_details
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                "Tags",
+                input.tags.as_ref().map(crate::state::fingerprint_value),
+            ),
+            (
+                "AssociatedResources",
+                input
+                    .associated_resources
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                "PartnerContacts",
+                input
+                    .partner_contacts
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+            (
+                "FileDetails",
+                input
+                    .file_details
+                    .as_ref()
+                    .map(crate::state::fingerprint_value),
+            ),
+        ]);
+
         let mut store = state.lock();
 
         // Everything this create reads from the catalog is resolved here, inside one
@@ -274,20 +341,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
 
-            // A retry of a create that already succeeded: answer with what that call
-            // minted, and create nothing. The stored `created_revision` is what the first
-            // call reported, so the retry sees the same response even if the application
-            // has been updated since.
-            if let Some(existing) = catalog
-                .client_tokens
-                .get(&input.client_token)
-                .and_then(|id| catalog.applications.get(id))
-            {
-                return Ok(CreateBenefitApplicationOutput {
-                    id: Some(existing.id.clone()),
-                    arn: Some(existing.arn.clone()),
-                    revision: Some(existing.created_revision_text()),
-                });
+            // A `ClientToken` this catalog has already seen: it identifies the create
+            // request it came on, so what happens next depends on whether THIS request is
+            // that one.
+            if let Some(spent) = catalog.client_tokens.get(&input.client_token) {
+                // A different request carrying a spent token is not a retry of anything:
+                // it is refused, rather than answered with a success for an application
+                // it did not create and whose members would be silently dropped.
+                if spent.request_fingerprint != fingerprint {
+                    return Err(CreateBenefitApplicationErrorModeled::ConflictException(
+                        crate::state::idempotency_conflict(),
+                    )
+                    .into());
+                }
+                // A retry of the create that already succeeded: answer with what that
+                // call minted, and create nothing. The stored `created_revision` is what
+                // the first call reported, so the retry sees the same response even if
+                // the application has been updated since.
+                if let Some(existing) = catalog.applications.get(&spent.application_id) {
+                    return Ok(CreateBenefitApplicationOutput {
+                        id: Some(existing.id.clone()),
+                        arn: Some(existing.arn.clone()),
+                        revision: Some(existing.created_revision_text()),
+                    });
+                }
             }
 
             // The application requests ONE benefit of this catalog, named either by its
@@ -393,7 +470,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             applied_writes: Vec::new(),
         };
         let revision = application.created_revision_text();
-        store.insert_application(input.client_token, application);
+        store.insert_application(input.client_token, fingerprint, application);
 
         Ok(CreateBenefitApplicationOutput {
             id: Some(id),

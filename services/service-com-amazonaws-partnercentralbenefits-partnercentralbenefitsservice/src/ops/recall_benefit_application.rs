@@ -12,7 +12,11 @@
 //!
 //! `ClientToken` is this request's idempotency token, so a retry carrying the token of
 //! the recall that is still in effect answers success and changes nothing rather than
-//! conflicting with its own first attempt.
+//! conflicting with its own first attempt — while a recall carrying that token with a
+//! different `Reason` or naming another application is a different request and is refused
+//! with the modelled `ConflictException` (see
+//! [`crate::state::BenefitApplication::recall_retry`] and
+//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]).
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +179,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now_millis();
+
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "Identifier",
+                Some(crate::state::fingerprint_value(&input.identifier)),
+            ),
+            (
+                "Reason",
+                Some(crate::state::fingerprint_value(&input.reason)),
+            ),
+        ]);
+
         let mut store = state.lock();
         // The catalog the request names is resolved FIRST: an application lives inside a
         // catalog, so a catalog that does not exist is the missing resource and is what
@@ -201,13 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A retry of the recall already in effect: answer success and leave the record —
         // its status, its `StatusReason`, its revision and its `UpdatedAt` — exactly as
-        // that recall left it. A request carrying no `ClientToken` is not a retry.
-        if input
-            .client_token
-            .as_deref()
-            .is_some_and(|token| application.is_recall_retry(token))
-        {
-            return Ok(RecallBenefitApplicationOutput {});
+        // that recall left it. A request carrying no `ClientToken` is not a retry, and a
+        // request carrying that token with a different `Reason` is a DIFFERENT request,
+        // refused rather than answered success.
+        if let Some(token) = input.client_token.as_deref() {
+            match application.recall_retry(token, &fingerprint) {
+                Err(conflict) => {
+                    return Err(
+                        RecallBenefitApplicationErrorModeled::ConflictException(conflict).into(),
+                    )
+                }
+                Ok(true) => return Ok(RecallBenefitApplicationOutput {}),
+                Ok(false) => {}
+            }
         }
 
         if !application.is_recallable() {
@@ -233,8 +261,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         application.revise(now);
         // Recorded AFTER the revision, which clears the previous recall's token: this
         // recall's idempotency window opens here and closes at the next change to the
-        // record.
-        application.recall_client_token = input.client_token;
+        // record. The request's fingerprint goes with the token, so only THIS request
+        // replays it.
+        application.recall_client_token = input.client_token.map(|client_token| {
+            crate::state::SpentToken {
+                client_token,
+                request_fingerprint: fingerprint,
+            }
+        });
 
         Ok(RecallBenefitApplicationOutput {})
     }
