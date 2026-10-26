@@ -34,10 +34,8 @@
 //! Amazon S3, not in this service's state, so a destination inside the rules above is
 //! accepted and the delivery it owes is recorded like any other.
 
-use super::{clip_for_message, VALIDATION_REASON_FIELD_FAILED};
-use crate::ops::types::{
-    DestinationConfigurations, ValidationException, ValidationExceptionField,
-};
+use super::{clip_for_message, field_validation_failed};
+use crate::ops::types::{DestinationConfigurations, ValidationException};
 
 /// The input member a refused output encoding names: the compression is the member whose
 /// value does not go with the format the same request states.
@@ -109,15 +107,11 @@ pub fn validate_destination_configurations(
 /// message member's own modelled bound — because that value is the only part of the
 /// request the caller has to change.
 fn unknown_destination_region(region: &str) -> ValidationException {
-    ValidationException {
-        message: format!("S3Region {} is invalid", clip_for_message(region)),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: S3_REGION_FIELD.to_string(),
-            message: "Must name the Amazon Web Services Region the S3 bucket is in."
-                .to_string(),
-        }]),
-    }
+    field_validation_failed(
+        S3_REGION_FIELD,
+        format!("S3Region {} is invalid", clip_for_message(region)),
+        "Must name the Amazon Web Services Region the S3 bucket is in.".to_string(),
+    )
 }
 
 /// The modelled 400 for a `Format`/`Compression` pair this service does not write,
@@ -139,18 +133,15 @@ fn unsupported_output_encoding(format: &str, compression: &str) -> ValidationExc
                 .join(", ")
         ),
     };
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        COMPRESSION_FIELD,
+        format!(
             "Compression {} is invalid for Format {}",
             clip_for_message(compression),
             clip_for_message(format)
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: COMPRESSION_FIELD.to_string(),
-            message: requirement,
-        }]),
-    }
+        requirement,
+    )
 }
 
 #[cfg(test)]

@@ -270,17 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries an id no other export shares, so the refusal is a lookup by region and
         // name and never by the ARN this call just minted.
         if store.export_named(&region, &export.name).is_some() {
-            return Err(CreateExportErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "An export named {} already exists; export names must be unique.",
-                    export.name
+            return Err(CreateExportErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "Export.Name",
+                    format!(
+                        "An export named {} already exists; export names must be unique.",
+                        crate::state::clip_for_message(&export.name)
+                    ),
+                    "An export with this name already exists.".to_string(),
                 ),
-                reason: Some("fieldValidationFailed".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "Export.Name".to_string(),
-                    message: "An export with this name already exists.".to_string(),
-                }]),
-            })
+            )
             .into());
         }
         if store.exports.len() >= crate::state::MAX_EXPORTS {

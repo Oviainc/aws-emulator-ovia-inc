@@ -101,10 +101,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use super::{clip_for_message, table_spec, VALIDATION_REASON_FIELD_FAILED};
-use crate::ops::types::{
-    DataQuery, InternalServerException, ValidationException, ValidationExceptionField,
-};
+use super::{clip_for_message, field_validation_failed, table_spec};
+use crate::ops::types::{DataQuery, InternalServerException, ValidationException};
 
 /// Why a submitted `DataQuery` was refused: because of the REQUEST, or because this
 /// process could not read it.
@@ -577,14 +575,11 @@ pub fn effective_table_configurations(
 /// the caller has to change. RECORDED AWS wording for the same class of refusal, from the
 /// unpublished-table rule next door: `Table name <name> is invalid`.
 fn invalid_query_statement(statement: &str, requirement: &str) -> ValidationException {
-    ValidationException {
-        message: format!("QueryStatement {} is invalid", clip_for_message(statement)),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: requirement.to_string(),
-        }]),
-    }
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!("QueryStatement {} is invalid", clip_for_message(statement)),
+        requirement.to_string(),
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` that is not readable SQL.
@@ -616,47 +611,34 @@ fn reads_no_table(statement: &str) -> ValidationException {
 
 /// The modelled 400 for a `QueryStatement` nested deeper than this service reads.
 fn too_deeply_nested() -> ValidationException {
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!(
             "QueryStatement must not be nested more than {MAX_QUERY_NESTING_DEPTH} levels deep"
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: format!(
-                "Must not nest more than {MAX_QUERY_NESTING_DEPTH} levels of brackets."
-            ),
-        }]),
-    }
+        format!("Must not nest more than {MAX_QUERY_NESTING_DEPTH} levels of brackets."),
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` carrying more tokens than this service reads.
 fn too_many_tokens() -> ValidationException {
-    ValidationException {
-        message: format!("QueryStatement must not carry more than {MAX_QUERY_TOKENS} tokens"),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: format!("Must not carry more than {MAX_QUERY_TOKENS} tokens."),
-        }]),
-    }
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!("QueryStatement must not carry more than {MAX_QUERY_TOKENS} tokens"),
+        format!("Must not carry more than {MAX_QUERY_TOKENS} tokens."),
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` naming more distinct relations than this
 /// service resolves.
 fn too_many_relations() -> ValidationException {
-    ValidationException {
-        message: format!(
-            "QueryStatement must not name more than {MAX_QUERY_RELATIONS} tables"
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!("QueryStatement must not name more than {MAX_QUERY_RELATIONS} tables"),
+        format!(
+            "Must name at most {MAX_QUERY_RELATIONS} tables of the data exports catalog."
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: format!(
-                "Must name at most {MAX_QUERY_RELATIONS} tables of the data exports catalog."
-            ),
-        }]),
-    }
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` naming a table outside the catalog.
@@ -666,15 +648,11 @@ fn too_many_relations() -> ValidationException {
 /// `ListTables` reports. RECORDED AWS wording for that rule: `Table name <name> is
 /// invalid`.
 fn invalid_query_table(table: &str) -> ValidationException {
-    ValidationException {
-        message: format!("Table name {} is invalid", clip_for_message(table)),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: "Must name a table data exports publishes; call ListTables for them."
-                .to_string(),
-        }]),
-    }
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!("Table name {} is invalid", clip_for_message(table)),
+        "Must name a table data exports publishes; call ListTables for them.".to_string(),
+    )
 }
 
 /// The modelled 400 for a `QueryStatement` naming a column no table it reads publishes
@@ -686,31 +664,23 @@ fn invalid_query_table(table: &str) -> ValidationException {
 /// worded as the unpublished-table refusal beside it, whose recorded AWS form is `Table
 /// name <name> is invalid`.
 fn invalid_query_column(column: &str) -> ValidationException {
-    ValidationException {
-        message: format!("Column name {} is invalid", clip_for_message(column)),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: QUERY_STATEMENT_FIELD.to_string(),
-            message: "Must name a column the queried table publishes under the table \
-                      properties the request states; call GetTable for them."
-                .to_string(),
-        }]),
-    }
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!("Column name {} is invalid", clip_for_message(column)),
+        "Must name a column the queried table publishes under the table properties the \
+         request states; call GetTable for them."
+            .to_string(),
+    )
 }
 
 /// The modelled 400 for an update whose query names `table` without restating that
 /// table's `TableConfigurations`.
 fn missing_table_configurations(table: &str) -> ValidationException {
-    ValidationException {
-        message: format!(
-            "'TableConfigurations' must be provided when updating a {table} export"
+    field_validation_failed(
+        TABLE_CONFIGURATIONS_FIELD,
+        format!("'TableConfigurations' must be provided when updating a {table} export"),
+        format!(
+            "Must carry the {table} entry: an update overwrites every export parameter."
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: TABLE_CONFIGURATIONS_FIELD.to_string(),
-            message: format!(
-                "Must carry the {table} entry: an update overwrites every export parameter."
-            ),
-        }]),
-    }
+    )
 }

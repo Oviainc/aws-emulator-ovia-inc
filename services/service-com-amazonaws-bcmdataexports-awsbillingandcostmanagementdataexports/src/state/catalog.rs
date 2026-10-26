@@ -51,8 +51,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::clip_for_message;
-use crate::ops::types::{Column, ValidationException, ValidationExceptionField};
+use super::{clip_for_message, field_validation_failed};
+use crate::ops::types::{Column, ValidationException};
 
 /// A column's `Type` for text the dictionary does not further constrain.
 const STRING: &str = "String";
@@ -437,14 +437,11 @@ pub fn table_spec(name: &str) -> Option<&'static TableSpec> {
 /// the requirement is the request-derived form, not that one string.) The tables that ARE
 /// published are what `ListTables` reports, so the message does not restate them.
 pub fn unknown_table(name: &str) -> ValidationException {
-    ValidationException {
-        message: format!("Table {} not found", clip_for_message(name)),
-        reason: Some(super::VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "TableName".to_string(),
-            message: "This table is not available in data exports.".to_string(),
-        }]),
-    }
+    field_validation_failed(
+        "TableName",
+        format!("Table {} not found", clip_for_message(name)),
+        "This table is not available in data exports.".to_string(),
+    )
 }
 
 /// The modelled 400 for a `TableProperties` key `table` does not publish.
@@ -455,18 +452,15 @@ fn unknown_table_property(table: &TableSpec, property: &str) -> ValidationExcept
         .map(|property| property.name)
         .collect::<Vec<_>>()
         .join(", ");
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        "TableProperties",
+        format!(
             "Table property {} is not supported for table {}. Supported table properties: [{supported}].",
             clip_for_message(property),
             table.name
         ),
-        reason: Some(super::VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "TableProperties".to_string(),
-            message: format!("This table supports the table properties [{supported}]."),
-        }]),
-    }
+        format!("This table supports the table properties [{supported}]."),
+    )
 }
 
 /// The modelled 400 for a `TableProperties` value outside the property's valid values.
@@ -476,18 +470,15 @@ fn invalid_table_property_value(
     value: &str,
 ) -> ValidationException {
     let valid = property.valid_values.join(", ");
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        "TableProperties",
+        format!(
             "Value {} is not supported for table property {}. Valid values: [{valid}].",
             clip_for_message(value),
             property.name
         ),
-        reason: Some(super::VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "TableProperties".to_string(),
-            message: format!("{} accepts the values [{valid}].", property.name),
-        }]),
-    }
+        format!("{} accepts the values [{valid}].", property.name),
+    )
 }
 
 // ---------------------------------------------------------------------------

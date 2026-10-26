@@ -25,6 +25,8 @@ mod data_query;
 mod delivery_executions;
 #[path = "all/destination_configuration.rs"]
 mod destination_configuration;
+#[path = "all/error_member_bounds.rs"]
+mod error_member_bounds;
 #[path = "all/execution_listing.rs"]
 mod execution_listing;
 #[path = "all/execution_lookup.rs"]
@@ -53,6 +55,8 @@ mod query_statement_subset;
 mod quota_service_code;
 #[path = "all/refusal_message_bound.rs"]
 mod refusal_message_bound;
+#[path = "all/refusal_message_bounds.rs"]
+mod refusal_message_bounds;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]

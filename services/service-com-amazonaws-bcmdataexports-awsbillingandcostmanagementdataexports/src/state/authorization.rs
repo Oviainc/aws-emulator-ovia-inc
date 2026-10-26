@@ -121,10 +121,27 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     } else {
         format!("because no policy allows the {action} action")
     };
+    // `AccessDeniedException$Message` is the same `GenericString` every refusal of this
+    // service is worded into, while the modelled `Arn` the sentence echoes admits twice
+    // its characters — so the ECHOED RESOURCE takes the room the clause around it leaves,
+    // rather than the assembled sentence being cut: the reason clause is what tells the
+    // caller which action to grant, so it has to survive an outsized ARN.
+    let opening = format!(
+        "User: {} is not authorized to perform: {action} on resource: ",
+        caller.arn
+    );
+    let room = crate::state::MESSAGE_LENGTH_LIMIT
+        .saturating_sub(opening.len() + reason.len() + " ".len());
     Err(AccessDeniedException {
-        message: format!(
-            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
-            caller.arn
+        // The last guard, for a sentence whose own clause leaves the echo no room at all:
+        // what the clause states is this service's, but its length is not entirely
+        // (the principal's ARN comes from the credential the request presented).
+        message: crate::state::clip_to_budget(
+            &format!(
+                "{opening}{} {reason}",
+                crate::state::clip_to_budget(resource, room)
+            ),
+            crate::state::MESSAGE_LENGTH_LIMIT,
         ),
     })
 }

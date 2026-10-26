@@ -191,18 +191,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if input.export.name != stored_name {
-            return Err(UpdateExportErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Export.Name is {}, but the export {} is named {}; an export name cannot be changed.",
-                    input.export.name, input.export_arn, stored_name
+            // The echoed values are stated whole rather than clipped: both names are
+            // `Export$Name`, bounded at 128 characters, and the ARN is one this service
+            // minted for the export the lookup above resolved — so the sentence cannot
+            // reach the bound `field_validation_failed` holds it inside, while clipping
+            // the ARN would shorten an ordinary one.
+            return Err(UpdateExportErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "Export.Name",
+                    format!(
+                        "Export.Name is {}, but the export {} is named {}; an export name cannot be changed.",
+                        input.export.name, input.export_arn, stored_name
+                    ),
+                    "Must match the name of the export the ExportArn identifies.".to_string(),
                 ),
-                reason: Some("fieldValidationFailed".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "Export.Name".to_string(),
-                    message: "Must match the name of the export the ExportArn identifies."
-                        .to_string(),
-                }]),
-            })
+            )
             .into());
         }
 

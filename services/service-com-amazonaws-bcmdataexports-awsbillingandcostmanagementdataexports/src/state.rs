@@ -686,6 +686,9 @@ pub const EXECUTION_NOT_FOUND_MESSAGE: &str = "Execution not found";
 pub fn resource_not_found(arn: &str, message: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: message.to_string(),
+        // `ResourceId` reports the identifier WHOLE rather than shortened: it is the
+        // identity of what was not found, not prose about it, and a client reads it to
+        // know which of its own requests failed (`tests/all/not_found_message.rs`).
         resource_id: arn.to_string(),
         resource_type: EXPORT_RESOURCE_TYPE.to_string(),
     }
@@ -777,14 +780,11 @@ pub const RESOURCE_NOT_TAGGABLE_MESSAGE: &str = "Resource doesn't support taggin
 
 /// The modelled 400 a tagging operation refuses an unusable `ResourceArn` with.
 fn not_taggable() -> ValidationException {
-    ValidationException {
-        message: RESOURCE_NOT_TAGGABLE_MESSAGE.to_string(),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "ResourceArn".to_string(),
-            message: "Must name a resource of this account.".to_string(),
-        }]),
-    }
+    field_validation_failed(
+        "ResourceArn",
+        RESOURCE_NOT_TAGGABLE_MESSAGE.to_string(),
+        "Must name a resource of this account.".to_string(),
+    )
 }
 
 /// Refuse `arn` unless it names a resource of THIS account.
@@ -964,14 +964,11 @@ pub fn page_or_token_refusal<T: Clone, E>(
 /// The modelled 400 a listing answers a `NextToken` it never issued with, carrying
 /// `token_requirement` as what the listing's own token must be.
 fn unissued_page_token(token_requirement: &str) -> ValidationException {
-    ValidationException {
-        message: UNISSUED_PAGE_TOKEN_MESSAGE.to_string(),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: PAGE_TOKEN_MEMBER.to_string(),
-            message: token_requirement.to_string(),
-        }]),
-    }
+    field_validation_failed(
+        PAGE_TOKEN_MEMBER,
+        UNISSUED_PAGE_TOKEN_MESSAGE.to_string(),
+        token_requirement.to_string(),
+    )
 }
 
 /// One page of `items` (ordered by their keys): at most `max_results` values starting at
@@ -1051,7 +1048,8 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// text does not depend on iteration order, each is clipped the way every other refusal of
 /// this service quotes a caller-supplied value, and the LIST of them is budgeted by
 /// [`clip_list_for_message`] — a tagging request names up to 200 keys, so quoting all of
-/// them would carry the message past its own modelled bound.
+/// them would carry the message past its own modelled bound. The refusal itself is built
+/// through [`field_validation_failed`], like every other this service words.
 pub fn check_tag_keys_not_reserved<'a>(
     member: &str,
     keys: impl IntoIterator<Item = &'a str>,
@@ -1079,17 +1077,14 @@ pub fn check_tag_keys_not_reserved<'a>(
         ", ",
         MESSAGE_LENGTH_LIMIT.saturating_sub(sentence.len() + ".".len()),
     );
-    Err(ValidationException {
-        message: format!("{sentence}{offenders}."),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: format!(
-                "A tag key must not begin with {RESERVED_TAG_KEY_PREFIX}; that prefix is \
-                 reserved for the tags Amazon Web Services generates."
-            ),
-        }]),
-    })
+    Err(field_validation_failed(
+        member,
+        format!("{sentence}{offenders}."),
+        format!(
+            "A tag key must not begin with {RESERVED_TAG_KEY_PREFIX}; that prefix is \
+             reserved for the tags Amazon Web Services generates."
+        ),
+    ))
 }
 
 /// A submitted `ResourceTagList` collapsed into the keyed map the store holds, or the
@@ -1125,32 +1120,26 @@ pub const TAG_KEY_LIST_MEMBER: &str = "ResourceTagKeys";
 
 /// The modelled 400 for a `ResourceTags` list that carries `key` more than once.
 pub fn duplicate_tag_key(key: &str) -> ValidationException {
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        TAG_LIST_MEMBER,
+        format!(
             "ResourceTags carries the key {} more than once; each tag key must be unique for the resource.",
             clip_for_message(key)
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "ResourceTags".to_string(),
-            message: "Each tag key must be unique for the resource.".to_string(),
-        }]),
-    }
+        "Each tag key must be unique for the resource.".to_string(),
+    )
 }
 
 /// The modelled 400 for a request that would leave an export holding `total` tags, past
 /// [`MAX_RESOURCE_TAGS`].
 pub fn too_many_tags(total: usize) -> ValidationException {
-    ValidationException {
-        message: format!(
+    field_validation_failed(
+        TAG_LIST_MEMBER,
+        format!(
             "The request would leave the resource with {total} tags; a resource holds at most {MAX_RESOURCE_TAGS}."
         ),
-        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: "ResourceTags".to_string(),
-            message: format!("A resource holds at most {MAX_RESOURCE_TAGS} tags."),
-        }]),
-    }
+        format!("A resource holds at most {MAX_RESOURCE_TAGS} tags."),
+    )
 }
 
 /// The tags of an export as the modelled list, ordered by key.
@@ -1171,10 +1160,16 @@ pub const VALIDATION_REASON_FIELD_FAILED: &str = "fieldValidationFailed";
 /// The most characters of a caller-supplied value a refusal message echoes.
 ///
 /// `TableName` admits 1024 characters and a table property value 16384 (smithy_query
-/// shapes `TableName`, `TableProperties`), while `ValidationException$Message` admits
-/// only 1024 — so an echoed value is clipped to keep a refusal built from an outsized
-/// one inside the message's own modelled bound.
+/// shapes `TableName`, `TableProperties`), while a refusal message admits only
+/// [`MESSAGE_LENGTH_LIMIT`] — so an echoed value is clipped to leave room for the sentence
+/// around it. Clipping each value is not by itself the message's bound: how many values a
+/// sentence states is the caller's to choose too, which is what [`clip_list_for_message`]
+/// holds, and what the assembled sentence runs to is what [`field_validation_failed`]
+/// holds.
 const MESSAGE_VALUE_CLIP: usize = 128;
+
+/// What a clipped value ends with, standing for the characters that were dropped.
+const ELLIPSIS: &str = "...";
 
 /// `value` as a refusal message quotes it: itself when short, else its first
 /// [`MESSAGE_VALUE_CLIP`] characters and an ellipsis.
@@ -1183,7 +1178,53 @@ pub(crate) fn clip_for_message(value: &str) -> String {
         return value.to_string();
     }
     let head: String = value.chars().take(MESSAGE_VALUE_CLIP).collect();
-    format!("{head}...")
+    format!("{head}{ELLIPSIS}")
+}
+
+/// `value` in at most `budget` bytes: itself when it fits, else as much of it as the
+/// budget admits — cut on a character boundary, never mid-UTF-8 — and an ellipsis.
+///
+/// Takes the budget rather than reading one, so a sentence can hand a caller-supplied
+/// value the room that is LEFT once the clause around it is accounted for: a value an
+/// echoing sentence cannot fit is the caller's, while the clause around it is what tells
+/// the caller what to do, so it is the value that gives way.
+pub(crate) fn clip_to_budget(value: &str, budget: usize) -> String {
+    if value.len() <= budget {
+        return value.to_string();
+    }
+    let mut end = budget.saturating_sub(ELLIPSIS.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    match value.get(..end) {
+        Some(head) if !head.is_empty() => format!("{head}{ELLIPSIS}"),
+        _ => String::new(),
+    }
+}
+
+/// The modelled 400 that reports ONE named input member at fault: `message` as the
+/// refusal's own sentence and `requirement` as what that member must carry.
+///
+/// Every refusal this service words itself is built here, so the modelled
+/// `GenericString` members it fills — `Message`, and the `Name` and `Message` of the one
+/// `ValidationExceptionField` it names — are held inside [`MESSAGE_LENGTH_LIMIT`] in ONE
+/// place rather than at each sentence, and the reason it reports is
+/// [`VALIDATION_REASON_FIELD_FAILED`] for all of them. A sentence that budgeted its own
+/// echoes ([`clip_for_message`], [`clip_list_for_message`]) is already inside the bound
+/// and passes through unchanged; this is what holds the bound for every other.
+pub fn field_validation_failed(
+    member: &str,
+    message: String,
+    requirement: String,
+) -> ValidationException {
+    ValidationException {
+        message: clip_to_budget(&message, MESSAGE_LENGTH_LIMIT),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: clip_to_budget(member, MESSAGE_LENGTH_LIMIT),
+            message: clip_to_budget(&requirement, MESSAGE_LENGTH_LIMIT),
+        }]),
+    }
 }
 
 /// The most a refusal message may run to, in bytes.
@@ -1241,25 +1282,20 @@ pub(crate) fn clip_list_for_message(items: &[&str], separator: &str, budget: usi
     }
     if taken == 0 {
         // Not even the first value fits whole. As much of it as the budget admits is
-        // quoted, cut on a character boundary — never mid-UTF-8 — and the count then
-        // covers EVERY value, this one included, so nothing is reported as quoted that
-        // was not quoted whole. A budget with room for neither quotes nothing: the
-        // sentence still states the member and the rule.
+        // quoted — clipped by [`clip_to_budget`], so the one clipping rule of this crate
+        // decides where the cut falls — and the count then covers EVERY value, this one
+        // included, so nothing is reported as quoted that was not quoted whole. A budget
+        // with room for neither quotes nothing: the sentence still states the member and
+        // the rule.
         let Some(first) = items.first() else {
             return String::new();
         };
-        let head = budget
-            .saturating_sub(tail(items.len()).len())
-            .saturating_sub("...".len());
-        let mut end = head.min(first.len());
-        while end > 0 && !first.is_char_boundary(end) {
-            end -= 1;
-        }
-        return match first.get(..end) {
-            Some(fragment) if !fragment.is_empty() => {
-                format!("{fragment}...{}", tail(items.len()))
-            }
-            _ => String::new(),
+        let counted = tail(items.len());
+        let fragment = clip_to_budget(first, budget.saturating_sub(counted.len()));
+        return if fragment.is_empty() {
+            String::new()
+        } else {
+            format!("{fragment}{counted}")
         };
     }
     format!("{quoted}{}", tail(items.len() - taken))
