@@ -221,7 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
-        let requested_page_size = page_size(input.max_results)?;
+        // The page size rule is this service's one shared rule, so this listing
+        // bounds a page exactly as every other listing of the service does.
+        let requested_page_size =
+            crate::state::page_size(input.max_results).map_err(bad_request)?;
 
         // A task belongs to the region of the group it syncs, and only that region's
         // callers see it, so this listing enumerates the tasks of the region the
@@ -300,13 +303,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// resumes THIS listing and no other.
 const LISTING: &str = "tag-sync-tasks";
 
-/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
-/// page size used when the caller asks for none: the model documents `MaxResults`
-/// as "the maximum number of results to be included in the response" and names no
-/// default, and answering at the modelled maximum bounds the response and keeps
-/// the `NextToken` loop working the same way whether or not `MaxResults` was sent.
-const MAX_RESULTS: usize = 50;
-
 /// The most `Filters` entries this operation applies to one call.
 ///
 /// NOT an AWS quota: the modelled `ListTagSyncTasksFilterList` declares no length.
@@ -351,25 +347,6 @@ fn names_group(
         Named::Name => task.group_name.as_str(),
     };
     identifier == stored || resolved == Some(task.group_name.as_str())
-}
-
-/// How many tasks one page carries, from the caller's `MaxResults`.
-///
-/// The framework refuses a value outside the modelled range before this handler
-/// runs; checking it again here keeps the conversion lossless rather than letting
-/// a negative value wrap into "every task".
-fn page_size(max_results: Option<i32>) -> Result<usize, ListTagSyncTasksError> {
-    match max_results {
-        None => Ok(MAX_RESULTS),
-        Some(max) => usize::try_from(max)
-            .ok()
-            .filter(|size| (1..=MAX_RESULTS).contains(size))
-            .ok_or_else(|| {
-                bad_request(format!(
-                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
-                ))
-            }),
-    }
 }
 
 /// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose

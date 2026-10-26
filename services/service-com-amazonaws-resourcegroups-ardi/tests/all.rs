@@ -41,6 +41,8 @@ mod list_group_resources_filter_validation;
 mod list_groups_filters;
 #[path = "all/list_tag_sync_tasks.rs"]
 mod list_tag_sync_tasks;
+#[path = "all/page_size_rule.rs"]
+mod page_size_rule;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_group_lifecycle.rs"]

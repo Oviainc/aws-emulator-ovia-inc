@@ -1543,6 +1543,40 @@ pub fn owning_account_id() -> String {
     emulator_server::emulator_account_id().to_string()
 }
 
+/// The largest page any listing of this service answers, and the page size it
+/// answers when the caller asks for none.
+///
+/// Every listing's `MaxResults` targets the one modelled `MaxResults` shape
+/// (`range 1..50`), and the model documents the absent case as "defaults to a
+/// value that is specific to the operation", so answering at the modelled maximum
+/// bounds the response and keeps the `NextToken` loop working the same way whether
+/// or not `MaxResults` was sent.
+pub const MAX_PAGE_SIZE: usize = 50;
+
+/// How many items one page of a listing carries, from the caller's `MaxResults`,
+/// else the message the refusal reports.
+///
+/// The ONE place this service decides a page size, so every listing — of groups,
+/// of one group's memberships, of its grouping statuses and of the account's
+/// tag-sync tasks — defaults an absent `MaxResults` to [`MAX_PAGE_SIZE`] and
+/// refuses a value outside `1..=MAX_PAGE_SIZE` with the same sentence, and the
+/// bound and that sentence cannot drift apart between them.
+///
+/// The framework refuses a value outside the modelled range before a handler runs;
+/// checking it again here keeps the conversion lossless rather than letting a
+/// negative value wrap into "every item".
+pub fn page_size(max_results: Option<i32>) -> Result<usize, String> {
+    match max_results {
+        None => Ok(MAX_PAGE_SIZE),
+        Some(max) => usize::try_from(max)
+            .ok()
+            .filter(|size| (1..=MAX_PAGE_SIZE).contains(size))
+            .ok_or_else(|| {
+                format!("MaxResults {max} is not valid: it must be between 1 and {MAX_PAGE_SIZE}")
+            }),
+    }
+}
+
 /// The marker every pagination token this service mints carries, before its
 /// listing name and resume key. It is what makes a token verifiable: a string
 /// that merely happens to be base64 is not a resume point, and a token issued by

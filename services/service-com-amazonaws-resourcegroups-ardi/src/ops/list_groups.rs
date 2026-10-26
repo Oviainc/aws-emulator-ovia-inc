@@ -256,7 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(resume) = resume_after.as_deref() {
             remaining.retain(|group| group.name.as_str() > resume);
         }
-        let page_size = page_size(input.max_results)?.min(remaining.len());
+        // The page size rule is this service's one shared rule, so this listing
+        // bounds a page exactly as every other listing of the service does.
+        let page_size = crate::state::page_size(input.max_results)
+            .map_err(bad_request)?
+            .min(remaining.len());
         let page = &remaining[..page_size];
         let next_token = (page.len() < remaining.len())
             .then(|| page.last().map(|group| crate::state::encode_page_token(LISTING, &group.name)))
@@ -276,13 +280,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// resumes THIS listing and no other.
 const LISTING: &str = "groups";
 
-/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
-/// page size used when the caller asks for none: the model documents the absent
-/// case as "defaults to a value that is specific to the operation", and answering
-/// at the modelled maximum bounds the response and keeps the `NextToken` loop
-/// working the same way whether or not `MaxResults` was sent.
-const MAX_RESULTS: usize = 50;
-
 /// The most `Filters` entries this operation applies to one call.
 ///
 /// NOT an AWS quota: the modelled `GroupFilterList` declares no length, and each
@@ -298,25 +295,6 @@ const MAX_FILTERS: usize = 10;
 /// stored resource query — the one a listing reads per group rather than per
 /// filter.
 const RESOURCE_TYPE_FILTER: &str = "resource-type";
-
-/// How many identifiers one page carries, from the caller's `MaxResults`.
-///
-/// The framework refuses a value outside the modelled range before this handler
-/// runs; checking it again here keeps the conversion lossless rather than letting
-/// a negative value wrap into "every group".
-fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupsError> {
-    match max_results {
-        None => Ok(MAX_RESULTS),
-        Some(max) => usize::try_from(max)
-            .ok()
-            .filter(|size| (1..=MAX_RESULTS).contains(size))
-            .ok_or_else(|| {
-                bad_request(format!(
-                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
-                ))
-            }),
-    }
-}
 
 /// Whether `group` satisfies one `GroupFilter`: the group attribute the filter
 /// names carries one of the filter's values.

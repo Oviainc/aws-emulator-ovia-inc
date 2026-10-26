@@ -266,7 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(resume) = resume_after.as_deref() {
             remaining.retain(|(resource_arn, _)| resource_arn.as_str() > resume);
         }
-        let page_size = page_size(input.max_results)?.min(remaining.len());
+        // The page size rule is this service's one shared rule, so this listing
+        // bounds a page exactly as every other listing of the service does.
+        let page_size = crate::state::page_size(input.max_results)
+            .map_err(bad_request)?
+            .min(remaining.len());
         let page = &remaining[..page_size];
         let next_token = (page.len() < remaining.len())
             .then(|| {
@@ -309,32 +313,6 @@ const FILTER_RESOURCE_ARN: &str = "resource-arn";
 
 /// Every filter name the modelled `ListGroupingStatusesFilterName` declares.
 const FILTER_NAME_VALUES: [&str; 2] = [FILTER_STATUS, FILTER_RESOURCE_ARN];
-
-/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
-/// page size used when the caller asks for none: the model documents `MaxResults`
-/// as "the maximum number of resources and their statuses returned in the
-/// response", and answering at the modelled maximum bounds the response and keeps
-/// the `NextToken` loop working the same way whether or not `MaxResults` was sent.
-const MAX_RESULTS: usize = 50;
-
-/// How many records one page carries, from the caller's `MaxResults`.
-///
-/// The framework refuses a value outside the modelled range before this handler
-/// runs; checking it again here keeps the conversion lossless rather than letting a
-/// negative value wrap into "every record".
-fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupingStatusesError> {
-    match max_results {
-        None => Ok(MAX_RESULTS),
-        Some(max) => usize::try_from(max)
-            .ok()
-            .filter(|size| (1..=MAX_RESULTS).contains(size))
-            .ok_or_else(|| {
-                bad_request(format!(
-                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
-                ))
-            }),
-    }
-}
 
 /// Whether the record of `resource_arn` satisfies one `ListGroupingStatusesFilter`:
 /// a filter selects a record when ANY of its values matches the member the filter
