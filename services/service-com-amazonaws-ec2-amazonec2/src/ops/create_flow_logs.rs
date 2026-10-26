@@ -5,7 +5,8 @@
 //! Turns on VPC flow logging for every resource the request names: one flow log per entry
 //! of `ResourceIds`, stored in [`crate::state`] where `DescribeFlowLogs` reports them from
 //! and `DeleteFlowLogs` removes them. The whole `ResourceIds` batch is resolved against
-//! the store BEFORE anything is written, so a call naming one resource the account does
+//! the store BEFORE anything is written — and before the delivery role the destination
+//! requires is asked for — so a call naming one resource the account does
 //! not hold stores nothing at all.
 //!
 //! ## Shape of an operation
@@ -315,12 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ARN of the IAM role that allows Amazon EC2 to publish flow logs to the log
         // destination. This parameter is required if the destination type is
-        // cloud-watch-logs" (`$DeliverLogsPermissionArn`).
-        if publishes_to_log_group && input.deliver_logs_permission_arn.is_none() {
-            return Err(state::missing_parameter(
-                "The request must contain the parameter DeliverLogsPermissionArn",
-            ));
-        }
+        // cloud-watch-logs" (`$DeliverLogsPermissionArn`) — asked BELOW, once the resources
+        // to monitor have been resolved: the delivery role is a requirement of the
+        // destination this request asks for, and a request that names a resource the
+        // account does not hold is refused for THAT, whichever delivery members it carries.
 
         // "The possible values are 60 seconds (1 minute) or 600 seconds (10 minutes). This
         // parameter must be 60 seconds for transit gateway resource types. … Default: 600"
@@ -481,6 +480,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     unknown,
                 ));
             }
+        }
+
+        // The role the destination requires, asked of a request whose monitored resources
+        // all resolve: "This parameter is required if the destination type is
+        // cloud-watch-logs" (`$DeliverLogsPermissionArn`). The destination TYPE is what
+        // makes the member mandatory, so it is the member the refusal names, however the
+        // log group itself was named.
+        if publishes_to_log_group && input.deliver_logs_permission_arn.is_none() {
+            return Err(state::flow_log_delivery_role_required(
+                &log_destination_type,
+            ));
         }
 
         // What this call would store: one flow log per monitored resource, every one of them

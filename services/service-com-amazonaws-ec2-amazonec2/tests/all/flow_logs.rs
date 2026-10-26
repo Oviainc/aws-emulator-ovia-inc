@@ -22,6 +22,13 @@
 //!   one unknown id refuses the whole call, naming only the unknown ids, and the flow logs
 //!   it named that do exist survive. The rows differ in how many ids are unknown and where
 //!   in the batch they sit.
+//! * A `CreateFlowLogs` resolves the resources it monitors BEFORE the delivery
+//!   requirements of the destination it asks for: an unresolvable `ResourceIds` entry is
+//!   refused with that resource kind's own not-found code whether or not the request
+//!   carries the delivery role, and a request whose resources all resolve and whose
+//!   CloudWatch Logs destination has no role is refused as a request whose members cannot
+//!   be honoured together. The rows differ in the resource kind and in how the destination
+//!   was named.
 //! * An authorized `DryRun` is answered with `DryRunOperation` and performs nothing,
 //!   whether or not the resources the request names exist — the rule
 //!   `dry_run_and_unknown_ids` asserts over the rest of this service's surface.
@@ -966,6 +973,234 @@ async fn a_create_naming_an_absent_resource_is_refused_and_stores_nothing() {
     }
 }
 
+/// One row of the resolution table: the `FlowLogsResourceType` member, an id of that kind
+/// the account holds no resource for, and the error code the flow-log surface refuses it
+/// with.
+struct AbsentResourceCase {
+    /// The `ResourceType` the request names.
+    resource_type: &'static str,
+    /// The `ResourceIds` entry — an id of that kind this account holds nothing for.
+    resource_id: &'static str,
+    /// The code the refusal carries, which is the flow-log family's own for that kind.
+    expected_code: &'static str,
+}
+
+/// The monitored resources a request names are RESOLVED BEFORE the delivery requirements of
+/// the destination it asks for: a `ResourceIds` entry the account holds no resource for is
+/// refused with that resource kind's own not-found code, naming the id, whether or not the
+/// request carries the role a CloudWatch Logs destination needs.
+///
+/// The rows are every member of `FlowLogsResourceType`
+/// (`smithy_query(query="shape",shape="FlowLogsResourceType")`), each crossed with the
+/// request carrying the delivery role and omitting it — so neither the resource kind nor
+/// the presence of the role can change the answer.
+#[tokio::test]
+async fn an_absent_monitored_resource_is_refused_before_the_destination_requirements() {
+    let (router, engine) = super::ec2_query::emulator();
+
+    let cases: Vec<AbsentResourceCase> = vec![
+        AbsentResourceCase {
+            resource_type: "VPC",
+            resource_id: "vpc-0ffffffffffffffff",
+            expected_code: "InvalidVpcId.NotFound",
+        },
+        AbsentResourceCase {
+            resource_type: "Subnet",
+            resource_id: "subnet-0ffffffffffffffff",
+            expected_code: "InvalidSubnetId.NotFound",
+        },
+        AbsentResourceCase {
+            resource_type: "NetworkInterface",
+            resource_id: "eni-0ffffffffffffffff",
+            expected_code: "InvalidNetworkInterfaceId.NotFound",
+        },
+        AbsentResourceCase {
+            resource_type: "TransitGateway",
+            resource_id: "tgw-0ffffffffffffffff",
+            expected_code: "InvalidTransitGatewayId.NotFound",
+        },
+        AbsentResourceCase {
+            resource_type: "TransitGatewayAttachment",
+            resource_id: "tgw-attach-0ffffffffffffffff",
+            expected_code: "InvalidTransitGatewayAttachmentId.NotFound",
+        },
+        AbsentResourceCase {
+            resource_type: "RegionalNatGateway",
+            resource_id: "nat-0ffffffffffffffff",
+            expected_code: "NatGatewayNotFound",
+        },
+    ];
+
+    for row in &cases {
+        for with_role in [true, false] {
+            let case = format!(
+                "{resource_type} with{maybe} the delivery role",
+                resource_type = row.resource_type,
+                maybe = if with_role { "" } else { "out" },
+            );
+            let mut params = vec![
+                param("ResourceType", row.resource_type),
+                param("ResourceId.1", row.resource_id),
+                param("LogGroupName", "resolve-the-resource-first"),
+            ];
+            // "This parameter is not supported for transit gateway resource types. It is
+            // required for the other resource types" (`CreateFlowLogsRequest$TrafficType`).
+            if !row.resource_type.starts_with("TransitGateway") {
+                params.push(param("TrafficType", "ALL"));
+            }
+            if with_role {
+                params.push(param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN));
+            }
+
+            let (status, body) = create_flow_logs(&router, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                row.expected_code,
+                "case {case:?}: expected {expected_code}, got {body}",
+                expected_code = row.expected_code,
+            );
+            assert_eq!(
+                error_message(&body),
+                format!("Unknown resource {resource_id}", resource_id = row.resource_id),
+                "case {case:?}: unexpected message in {body}"
+            );
+            assert!(
+                engine.state::<Ec2State>().lock().flow_logs.is_empty(),
+                "case {case:?}: a refused create must store nothing"
+            );
+        }
+    }
+}
+
+/// One row of the delivery-role table: the case, the form fields that name the CloudWatch
+/// Logs destination, and the resource the flow log would monitor.
+struct DeliveryRoleCase {
+    /// The case name every assertion of this row reports.
+    name: &'static str,
+    /// The fields that name the destination — the only thing that differs between rows.
+    destination: Vec<(String, String)>,
+    /// The `ResourceType` the request names.
+    resource_type: &'static str,
+    /// The id of a resource of that kind this account really holds.
+    resource_id: String,
+}
+
+/// A create whose monitored resources all resolve and whose CloudWatch Logs destination
+/// carries no delivery role is refused as a request whose own members cannot be honoured
+/// together — `InvalidParameter`, naming the `LogDestinationType` that made the role
+/// mandatory — and the same request with the role is served.
+///
+/// The rows differ in how the log group was named (by `LogGroupName`, by a log-group ARN in
+/// `LogDestination`, and with the destination type left to its documented default) and in
+/// the resource kind monitored, so the rule covers every way a CloudWatch Logs destination
+/// is asked for: the refusal does not vary with the member that named the destination.
+#[tokio::test]
+async fn a_cloud_watch_logs_destination_without_a_delivery_role_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let vpc_id = create_vpc(&router, "10.224.0.0/16").await;
+    let subnet_id = create_subnet(&router, &vpc_id, "10.224.1.0/24").await;
+    let interface_id = create_network_interface(&router, &subnet_id).await;
+    let log_group = "needs-a-delivery-role";
+    // The log group named as an ARN instead: "specify the ARN of a CloudWatch Logs log
+    // group. For example: arn:aws:logs:region:account_id:log-group:my_group"
+    // (`CreateFlowLogsRequest$LogDestination`).
+    let log_group_arn = format!("arn:aws:logs:{REGION}:000000000000:log-group:{log_group}");
+    // The one message every one of these refusals carries: it names the destination type
+    // that requires the role, not the member the request named the group with.
+    let expected_message = format!(
+        "DeliverLogsPermissionArn can't be empty if LogDestinationType is \
+         {LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS}."
+    );
+
+    let cases: Vec<DeliveryRoleCase> = vec![
+        DeliveryRoleCase {
+            name: "a log group named by LogGroupName",
+            destination: vec![
+                param("LogDestinationType", LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+                param("LogGroupName", log_group),
+            ],
+            resource_type: "VPC",
+            resource_id: vpc_id.clone(),
+        },
+        DeliveryRoleCase {
+            name: "a log group named by LogDestination",
+            destination: vec![
+                param("LogDestinationType", LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+                param("LogDestination", &log_group_arn),
+            ],
+            resource_type: "Subnet",
+            resource_id: subnet_id.clone(),
+        },
+        DeliveryRoleCase {
+            name: "the default destination type",
+            destination: vec![param("LogGroupName", log_group)],
+            resource_type: "NetworkInterface",
+            resource_id: interface_id.clone(),
+        },
+    ];
+
+    for DeliveryRoleCase {
+        name: case,
+        destination,
+        resource_type,
+        resource_id,
+    } in &cases
+    {
+        let mut params = vec![
+            param("ResourceType", resource_type),
+            param("ResourceId.1", resource_id),
+            param("TrafficType", "ALL"),
+        ];
+        params.extend(destination.iter().cloned());
+
+        let (status, body) = create_flow_logs(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameter",
+            "case {case:?}: expected InvalidParameter, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected_message,
+            "case {case:?}: unexpected message in {body}"
+        );
+        assert!(
+            engine.state::<Ec2State>().lock().flow_logs.is_empty(),
+            "case {case:?}: a refused create must store nothing"
+        );
+
+        // The very same request WITH the role is served, so the refusal above is the
+        // missing role and nothing else.
+        params.push(param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN));
+        let (status, body) = create_flow_logs(&router, &params).await;
+        let flow_log_id = created_id(case, status, &body);
+        let described = describe_one(&router, case, &flow_log_id).await;
+        assert!(
+            reports(&described, "resourceId", resource_id),
+            "case {case:?}: expected the flow log to monitor {resource_id}, got {described}"
+        );
+        assert!(
+            reports(&described, "deliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
+            "case {case:?}: expected the delivery role to round-trip, got {described}"
+        );
+
+        delete_flow_logs(&router, &indexed("FlowLogId", &[&flow_log_id])).await;
+    }
+
+    assert!(
+        engine.state::<Ec2State>().lock().flow_logs.is_empty(),
+        "every flow log this test created was deleted again"
+    );
+}
+
 /// The members a destination type requires, and the ones it forbids: each row is a request
 /// that is well formed against the model and still cannot be served, with the code the
 /// service refuses it with.
@@ -1000,7 +1235,7 @@ async fn a_create_is_held_to_the_members_its_resource_and_destination_require() 
                 param("TrafficType", "ALL"),
                 param("LogGroupName", "needs-a-role"),
             ],
-            "MissingParameter",
+            "InvalidParameter",
         ),
         refusal(
             "no destination at all for a CloudWatch Logs destination",

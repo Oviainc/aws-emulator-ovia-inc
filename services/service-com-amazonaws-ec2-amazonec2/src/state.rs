@@ -16958,6 +16958,29 @@ pub fn carrier_gateway_limit_exceeded<E>(message: impl Into<String>) -> Scaffold
     Scaffolded::service_error(CARRIER_GATEWAY_LIMIT_EXCEEDED, 400, message)
 }
 
+/// `InvalidVpcId.Malformed` (HTTP 400): the carrier gateway surface's refusal of a `VpcId`
+/// it cannot resolve.
+///
+/// The code is spelled `Id` rather than `ID` and says `Malformed` rather than `NotFound`,
+/// which is a DIVERGENCE from [`INVALID_VPC_ID_NOT_FOUND`], the code the rest of this
+/// crate answers for a VPC id the account holds no VPC for. It is what a recorded
+/// `CreateCarrierGateway` refusal carries: that surface asks one question of the member —
+/// does it name a VPC this account has a carrier gateway to attach to — and answers the
+/// one code whatever the value's shape, so a well-formed id with no VPC behind it is
+/// refused exactly as a value that is no id at all is.
+pub const INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED: &str = "InvalidVpcId.Malformed";
+
+/// Refuse a `CreateCarrierGateway` whose `VpcId` names no VPC of the account: HTTP 400
+/// [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`], worded the way this surface words it —
+/// `The vpc ID '<id>' is malformed`, built from the id the request sent.
+pub fn carrier_gateway_vpc_id_malformed<E>(vpc_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+        400,
+        format!("The vpc ID '{vpc_id}' is malformed"),
+    )
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another carrier gateway fits inside the store's ceiling
     /// ([`MAX_CARRIER_GATEWAYS`]).
@@ -33531,32 +33554,47 @@ pub fn flow_logs_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> 
 /// [`INVALID_FLOW_LOG_VPC_ID_NOT_FOUND`] for the spelling and why it differs from the code
 /// the operations of those resources answer). `resource_type` is a `FlowLogsResourceType`
 /// member (`smithy_query(query="shape",shape="FlowLogsResourceType")`).
+///
+/// The MESSAGE is the flow-log family's own too, and does not vary with the resource kind:
+/// the monitored resource is named by its id alone (`Unknown resource <id>`, the wording a
+/// recorded refusal of an unresolvable `ResourceIds` entry carries), where
+/// [`id_not_found`] spells out the kind it was read as. One message for every member of
+/// the enum, because the operation resolves all of them through the one lookup
+/// ([`ComAmazonawsEc2Amazonec2State::holds_flow_log_resource`]).
 pub fn invalid_flow_log_resource_id<E>(resource_type: &str, resource_id: &str) -> Scaffolded<E> {
-    match resource_type {
-        "VPC" => id_not_found(INVALID_FLOW_LOG_VPC_ID_NOT_FOUND, "vpc ID", resource_id),
-        "Subnet" => id_not_found(
-            INVALID_FLOW_LOG_SUBNET_ID_NOT_FOUND,
-            "subnet ID",
-            resource_id,
+    let code = match resource_type {
+        "VPC" => INVALID_FLOW_LOG_VPC_ID_NOT_FOUND,
+        "Subnet" => INVALID_FLOW_LOG_SUBNET_ID_NOT_FOUND,
+        "NetworkInterface" => INVALID_FLOW_LOG_NETWORK_INTERFACE_ID_NOT_FOUND,
+        "TransitGateway" => INVALID_FLOW_LOG_TRANSIT_GATEWAY_ID_NOT_FOUND,
+        "TransitGatewayAttachment" => INVALID_FLOW_LOG_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+        // The one remaining `FlowLogsResourceType` member, `RegionalNatGateway`, which has
+        // no `Invalid…Id.NotFound` code of its own.
+        _ => NAT_GATEWAY_NOT_FOUND,
+    };
+    Scaffolded::service_error(code, 400, format!("Unknown resource {resource_id}"))
+}
+
+/// Refuse a `CreateFlowLogs` that asks for a destination whose delivery needs an IAM role
+/// the request did not carry: HTTP 400 [`INVALID_PARAMETER`].
+///
+/// "The ARN of the IAM role that allows Amazon EC2 to publish flow logs to the log
+/// destination. This parameter is required if the destination type is cloud-watch-logs"
+/// (`CreateFlowLogsRequest$DeliverLogsPermissionArn`) — so the member is not absent from a
+/// request that needed nothing of it, it is absent from one whose `LogDestinationType`
+/// makes it mandatory. That is [`INVALID_PARAMETER`] rather than [`MISSING_PARAMETER`],
+/// and the message is the service's wording for a member another member makes mandatory:
+/// it names `LogDestinationType` and the value `log_destination_type` that required the
+/// role, whichever member the request named the destination itself with.
+pub fn flow_log_delivery_role_required<E>(log_destination_type: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "DeliverLogsPermissionArn can't be empty if LogDestinationType is \
+             {log_destination_type}."
         ),
-        "NetworkInterface" => id_not_found(
-            INVALID_FLOW_LOG_NETWORK_INTERFACE_ID_NOT_FOUND,
-            "networkInterface ID",
-            resource_id,
-        ),
-        "TransitGateway" => id_not_found(
-            INVALID_FLOW_LOG_TRANSIT_GATEWAY_ID_NOT_FOUND,
-            "transitGateway ID",
-            resource_id,
-        ),
-        "TransitGatewayAttachment" => id_not_found(
-            INVALID_FLOW_LOG_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-            "transitGatewayAttachment ID",
-            resource_id,
-        ),
-        // The one remaining `FlowLogsResourceType` member, `RegionalNatGateway`.
-        _ => nat_gateway_not_found(resource_id),
-    }
+    )
 }
 
 /// The ARN of the CloudWatch Logs log group a flow log publishes to:

@@ -7,7 +7,7 @@
 //! the `ec2` signing name in the request's SigV4 credential scope, so every call here
 //! carries one.
 //!
-//! Two rules are under test:
+//! Three rules are under test:
 //!
 //! * `DescribeCarrierGateways` REPORTS THE STORE: the set it answers with is the account's
 //!   carrier gateways narrowed by the `CarrierGatewayIds` and `Filters` the request names
@@ -18,19 +18,23 @@
 //!   the `pending` state the model publishes, and the clock owes it `available` one
 //!   [`ec2::state::TRANSITION_DELAY`] later. The rows differ in the VPC, the number of tags
 //!   and the client token.
+//! * A `VpcId` this surface CANNOT RESOLVE is refused with one code and one message
+//!   whatever the value's shape, and the create stores nothing. The rows differ in the
+//!   shape of the unresolvable value.
 
 use std::time::Duration;
 
 use ec2::ops::types::Tag;
 use ec2::state::{
     CARRIER_GATEWAY_ID_PREFIX, CARRIER_GATEWAY_STATE_AVAILABLE, CARRIER_GATEWAY_STATE_PENDING,
-    CarrierGatewaySpec, ComAmazonawsEc2Amazonec2State as Ec2State, IDEMPOTENT_PARAMETER_MISMATCH,
+    CarrierGatewaySpec, ComAmazonawsEc2Amazonec2State as Ec2State,
+    IDEMPOTENT_PARAMETER_MISMATCH, INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
     MAX_CLIENT_TOKEN_CHARS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, filters, indexed, unescaped};
+use super::ec2_query::{element, elements, error_code, error_message, filters, indexed, unescaped};
 
 /// The Region every call here is signed for. The carrier gateway store holds the account's
 /// gateways rather than one Region's, and the seeded default VPC is the one of the
@@ -649,12 +653,12 @@ async fn a_create_that_cannot_be_honoured_is_refused_and_stores_nothing() {
         (
             "a VPC the account does not have",
             vec![param("VpcId", "vpc-0ffffffffffffffff")],
-            "InvalidVpcID.NotFound",
+            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
         ),
         (
             "a malformed VPC id",
             vec![param("VpcId", "not-a-vpc")],
-            "InvalidVpcID.NotFound",
+            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
         ),
         (
             "a tag specification for another resource type",
@@ -711,6 +715,64 @@ async fn a_create_that_cannot_be_honoured_is_refused_and_stores_nothing() {
             .carrier_gateways
             .is_empty(),
         "a refused create must store nothing"
+    );
+}
+
+/// Every `VpcId` this surface cannot resolve gets the SAME refusal, whatever the value's
+/// shape: `InvalidVpcId.Malformed`, naming the value the request sent. The rows differ in
+/// the shape of the unresolvable value — the 17-digit form the mint issues, the 8-digit
+/// short form, a prefix with no digits, another resource's id, and a value that is no id at
+/// all — so the rule cannot be read as a check on the id's syntax.
+#[tokio::test]
+async fn a_vpc_id_this_surface_cannot_resolve_is_refused_as_malformed() {
+    let (router, engine) = super::ec2_query::emulator();
+    // One VPC the account DOES hold, so the table's refusals are about the id each row
+    // sends rather than about an account with no VPC at all.
+    let held = create_vpc(&router, "10.9.0.0/16").await;
+
+    let cases: Vec<(&str, String)> = vec![
+        ("the long form", "vpc-0ffffffffffffffff".to_string()),
+        ("the short form", "vpc-0fffffff".to_string()),
+        ("a prefix with no digits", "vpc-".to_string()),
+        ("another resource's id", "subnet-0ffffffffffffffff".to_string()),
+        ("no id at all", "not-a-vpc".to_string()),
+        // The held VPC's id with one digit changed: the account holds a VPC, just not this
+        // one.
+        ("a near miss of a held id", format!("{held}0")),
+    ];
+
+    for (case, vpc_id) in &cases {
+        let (status, body) = create(&router, &[param("VpcId", vpc_id)]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED,
+            "case {case:?}: expected {INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED}, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("The vpc ID '{vpc_id}' is malformed"),
+            "case {case:?}: unexpected message in {body}"
+        );
+        assert!(
+            engine
+                .state::<Ec2State>()
+                .lock()
+                .carrier_gateways
+                .is_empty(),
+            "case {case:?}: a refused create must store nothing"
+        );
+    }
+
+    // The same request with the VPC the account DOES hold is served, so the refusals above
+    // are the id's doing and nothing else.
+    let (status, body) = create(&router, &[param("VpcId", &held)]).await;
+    assert_eq!(
+        status, 200,
+        "a held VPC: expected HTTP 200, got {status} with body {body}"
     );
 }
 
