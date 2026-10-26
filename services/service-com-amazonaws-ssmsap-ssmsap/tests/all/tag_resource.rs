@@ -54,7 +54,7 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The `tags` body member of a `TagResource` request: the model names the member
 /// `tags` and declares no `jsonName` for it.
-fn tags_body(tags: &[(String, String)]) -> Value {
+pub(crate) fn tags_body(tags: &[(String, String)]) -> Value {
     let mut map = Map::new();
     for (key, value) in tags {
         map.insert(key.clone(), json!(value));
@@ -64,7 +64,11 @@ fn tags_body(tags: &[(String, String)]) -> Value {
 
 /// `TagResource` for `resource_arn` at `region`'s endpoint: the modelled
 /// `POST /tags/{resourceArn}`.
-async fn tag_in_region(
+///
+/// `pub(crate)` because the suites of this target share one harness: the
+/// `UntagResource` suite (`tests/all/untag_resource.rs`) attaches the tags it then
+/// deletes through this same route.
+pub(crate) async fn tag_in_region(
     emulator: &Emulator,
     region: &str,
     resource_arn: &str,
@@ -81,7 +85,11 @@ async fn tag_in_region(
 }
 
 /// `TagResource` for `resource_arn` at [`REGION`]'s endpoint.
-async fn tag(emulator: &Emulator, resource_arn: &str, tags: &[(String, String)]) -> Reply {
+pub(crate) async fn tag(
+    emulator: &Emulator,
+    resource_arn: &str,
+    tags: &[(String, String)],
+) -> Reply {
     tag_in_region(emulator, REGION, resource_arn, tags).await
 }
 
@@ -112,7 +120,7 @@ async fn tags_held(emulator: &Emulator, case: &str, resource_arn: &str) -> BTree
 }
 
 /// A `(key, value)` list from borrowed pairs, so a row can be written literally.
-fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
     rows.iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()

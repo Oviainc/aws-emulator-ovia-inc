@@ -2482,6 +2482,32 @@ impl RegionState {
         Ok(())
     }
 
+    /// Remove the tags `tag_keys` names from the set held for the resource `arn` names,
+    /// in the one place this service keeps tags ([`Self::tags_by_arn`]), so every later
+    /// read reports the set without them.
+    ///
+    /// Only the keys NAMED are removed: a key the resource holds and this call does not
+    /// name keeps its value. A key the resource does not hold removes nothing, so the
+    /// call is idempotent — removing the same keys twice leaves the same set — and
+    /// naming no key at all leaves the set exactly as it was.
+    ///
+    /// Once nothing is left held for `arn`, its entry goes too, which is what an
+    /// untagged resource is stored as (so an emptied resource counts no differently
+    /// from one nothing ever tagged, see [`Self::is_empty`]).
+    pub fn remove_tags(&mut self, arn: &str, tag_keys: &[String]) {
+        let Some(held) = self.tags_by_arn.get_mut(arn) else {
+            // Nothing is held for the resource, so there is nothing any key could
+            // remove — and no empty entry is minted for it.
+            return;
+        };
+        for key in tag_keys {
+            held.remove(key);
+        }
+        if held.is_empty() {
+            self.tags_by_arn.remove(arn);
+        }
+    }
+
     /// Whether `arn` names a resource THIS Region holds.
     ///
     /// The resources AWS Systems Manager for SAP holds are the registered SAP

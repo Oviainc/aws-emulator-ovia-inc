@@ -73,5 +73,7 @@ mod sub_check_result_cursor;
 mod sub_check_results;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
