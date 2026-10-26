@@ -1387,6 +1387,45 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             None => self.event_apis.get_mut(api_id).map(|api| &mut api.api_keys),
         }
     }
+
+    /// The tags the resource `resource_arn` names holds, or `None` when this account
+    /// holds no such resource.
+    ///
+    /// `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), and an API of
+    /// EITHER resource family is published under exactly that shape, so the ARN is
+    /// resolved against both stores here — the single lookup every tag operation uses,
+    /// so a tag read and a tag write can never disagree about which resources are
+    /// taggable. The whole ARN is compared, so a resource is addressed only in the
+    /// account and Region it was created in.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.graphql_apis
+            .values()
+            .find(|api| api.arn == resource_arn)
+            .map(|api| &api.tags)
+            .or_else(|| {
+                self.event_apis
+                    .values()
+                    .find(|api| api.api_arn == resource_arn)
+                    .map(|api| &api.tags)
+            })
+    }
+
+    /// The tags the resource `resource_arn` names holds, for a call that writes them.
+    ///
+    /// Resolves `resource_arn` exactly as [`Self::tags_of`] does.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(api) = self
+            .graphql_apis
+            .values_mut()
+            .find(|api| api.arn == resource_arn)
+        {
+            return Some(&mut api.tags);
+        }
+        self.event_apis
+            .values_mut()
+            .find(|api| api.api_arn == resource_arn)
+            .map(|api| &mut api.tags)
+    }
     /// Mint a fresh opaque id: 26 lowercase base-32 characters, the shape an AppSync
     /// `apiId` takes.
     ///
@@ -1654,6 +1693,61 @@ pub fn invalid_environment_variable_key_message(key: &str) -> String {
          {ENVIRONMENT_VARIABLE_KEY_MIN_LEN} and {ENVIRONMENT_VARIABLE_KEY_MAX_LEN} characters \
          long, must begin with a letter, and can only contain letters, numbers, and the \
          underscore character (_)."
+    )
+}
+
+/// The minimum length of a `TagKey`. Modelled: `TagKey` carries `@length` 1..128.
+pub const TAG_KEY_MIN_LEN: usize = 1;
+
+/// The maximum length of a `TagKey` ([`TAG_KEY_MIN_LEN`]).
+pub const TAG_KEY_MAX_LEN: usize = 128;
+
+/// The key prefix AWS reserves for itself, which `TagKey`'s modelled pattern
+/// (`^(?!aws:)[ a-zA-Z+-=._:/]+$`) rules out: a caller cannot set a tag under it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The number of tags one resource holds at most.
+///
+/// AppSync's per-resource tag quota, and the same number the modelled `TagMap` and
+/// `TagKeyList` bound one call to (`@length` 1..50): a resource cannot carry more tags
+/// than a caller can submit, so the per-call bound is also the per-resource ceiling.
+pub const TAGS_PER_RESOURCE: usize = 50;
+
+/// Whether `candidate` is a well-formed `TagKey`: between [`TAG_KEY_MIN_LEN`] and
+/// [`TAG_KEY_MAX_LEN`] characters drawn from the alphabet `TagKey`'s modelled pattern
+/// admits (`[ a-zA-Z+-=._:/]`, whose `+-=` range also admits the digits and `,;<`),
+/// and not under the reserved prefix ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// A map KEY is not checked by the request boundary (only map values and the entry
+/// count are), so the service enforces the key's own rule — the same split
+/// [`is_environment_variable_key`] is there for.
+pub fn is_tag_key(candidate: &str) -> bool {
+    let length = candidate.chars().count();
+    (TAG_KEY_MIN_LEN..=TAG_KEY_MAX_LEN).contains(&length)
+        && !candidate.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && candidate
+            .chars()
+            .all(|character| matches!(character, ' ' | '_' | 'a'..='z' | 'A'..='Z' | '+'..='='))
+}
+
+/// AppSync's refusal text for a tag key that is not a `TagKey` ([`is_tag_key`]): the
+/// rejected key and the constraint it broke, so the caller can fix the request from the
+/// message alone.
+pub fn invalid_tag_key_message(key: &str) -> String {
+    format!(
+        "Invalid tag key {key}: a key must be between {TAG_KEY_MIN_LEN} and {TAG_KEY_MAX_LEN} \
+         characters long, cannot begin with {RESERVED_TAG_KEY_PREFIX}, and can only contain \
+         letters, numbers, spaces and the characters + - = . _ : /"
+    )
+}
+
+/// AppSync's refusal text for a tag write that would leave the resource holding more
+/// than [`TAGS_PER_RESOURCE`] tags: the quota, and the number the resource would end up
+/// with, so the caller can see how far past it the request went.
+pub fn tag_limit_exceeded_message(requested: usize) -> String {
+    format!(
+        "A resource can have a maximum of {TAGS_PER_RESOURCE} tags, and this request would \
+         leave it with {requested}."
     )
 }
 

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the submitted tags onto the resource the request names, into this service's
+//! store: a key the resource already carries takes the submitted value, a key it does
+//! not carry is added, and a key the request does not name is left exactly as it was,
+//! so this call MERGES rather than replaces and `ListTagsForResource` (and the
+//! resource's own `tags` member) answers the merged map afterwards.
+//!
+//! `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), under which an
+//! API of either resource family is published, so the resource is resolved from the
+//! whole ARN through the store's `tags_of_mut` — the same lookup the tag listing reads
+//! through. An ARN this account holds no resource for is a 404 `NotFoundException`, a
+//! key outside `TagKey`'s rule a 400 `BadRequestException`, and a write that would push
+//! the resource past the per-resource tag quota a 429 `LimitExceededException`. Every
+//! refusal is decided before anything is written, so a refused call leaves the stored
+//! map exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +154,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Which resource is tagged, and with what, comes from the request body and the
+        // ARN alone, so nothing here reads the request's metadata.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The entry COUNT and every VALUE are refused by the request boundary against
+        // the modelled bounds before this handler runs; a map KEY is not covered there,
+        // so a key's own bounds, alphabet and reserved prefix are enforced here. Checked
+        // before anything is written, so a refused call leaves the stored tags as they
+        // were.
+        for key in input.tags.keys() {
+            if !crate::state::is_tag_key(key) {
+                return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::invalid_tag_key_message(key)),
+                    ..Default::default()
+                })
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+
+        let Some(tags) = guard.tags_of_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A key the resource already holds is overwritten rather than added, so only
+        // the keys this request introduces grow the map: the quota is checked against
+        // what the merge would really leave behind.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(*key))
+            .count();
+        let merged = tags.len().saturating_add(added);
+        if merged > crate::state::TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::tag_limit_exceeded_message(merged)),
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        // `TagResourceResponse` models no members: the stored map is what the tag
+        // listing answers with, and this call reports only that the write happened.
+        Ok(TagResourceOutput {})
     }
 }

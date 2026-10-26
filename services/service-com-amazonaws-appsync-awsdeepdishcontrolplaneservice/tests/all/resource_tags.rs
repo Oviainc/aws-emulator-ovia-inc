@@ -32,23 +32,23 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::graphql_api_lifecycle::{call, create_api, router, REGION};
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The modelled maximum number of entries a `TagMap` holds. Source:
 /// `smithy_query(query="shape", shape="TagMap")` — `@length` min 1, max 50.
-const TAG_COUNT_MAX: usize = 50;
+pub(crate) const TAG_COUNT_MAX: usize = 50;
 
 /// `TagKey`'s modelled maximum length. Source: `smithy_query(query="shape",
 /// shape="TagKey")` — `@length` min 1, max 128.
-const TAG_KEY_MAX_LEN: usize = 128;
+pub(crate) const TAG_KEY_MAX_LEN: usize = 128;
 
 /// `TagValue`'s modelled maximum length. Source: `smithy_query(query="shape",
 /// shape="TagValue")` — `@length` min 0, max 256, so the empty string is a value.
-const TAG_VALUE_MAX_LEN: usize = 256;
+pub(crate) const TAG_VALUE_MAX_LEN: usize = 256;
 
 /// An `apiId`-shaped id (`[0-9A-Za-z_-]{26}`) that no create ever mints here, used to
 /// build the ARN of a resource that does not exist.
-const ABSENT_API_ID: &str = "abcdefghijklmnopqrstuvwxyz";
+pub(crate) const ABSENT_API_ID: &str = "abcdefghijklmnopqrstuvwxyz";
 
 /// One answer from the emulator: the parts a client branches on.
 #[derive(Debug)]
@@ -102,7 +102,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
 /// `value` percent-encoded the way an AWS SDK encodes a non-greedy `@httpLabel`:
 /// every character outside the unreserved set (`A-Za-z0-9-._~`) becomes `%XX`, so an
 /// ARN's `:` and `/` stay inside the one path segment the label binds.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

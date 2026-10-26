@@ -7,9 +7,11 @@
 //! call, so it is exactly what the create (and any later tag write) persisted. A
 //! pure read — nothing about the resource changes because its tags were listed.
 //!
-//! `ResourceArn` admits exactly one resource kind (`^arn:aws:appsync:…:apis/…$`), so
-//! the resource named is a GraphQL API, resolved by its own stored ARN; an ARN this
-//! account holds no API for is a 404 `NotFoundException`.
+//! `ResourceArn` admits exactly one ARN shape (`^arn:aws:appsync:…:apis/…$`), under
+//! which an API of either resource family is published, so the resource is resolved
+//! from its whole stored ARN through the store's `tags_of` — the same lookup
+//! `TagResource` writes through; an ARN this account holds no API for is a 404
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,12 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
 
-        // `ResourceArn` is constrained to the ARN of ONE resource kind — an AppSync
-        // GraphQL API — and that constraint is enforced before this handler runs, so
-        // the value here is a well-formed API ARN and the only question left is
-        // whether this account holds the API it names.
-        let Some(record) = crate::state::api_by_identifier(&guard.graphql_apis, &input.resource_arn)
-        else {
+        // `ResourceArn` is constrained to ONE ARN shape — an AppSync API's — and that
+        // constraint is enforced before this handler runs, so the value here is a
+        // well-formed API ARN and the only question left is whether this account holds
+        // the API it names. Resolved through the store's `tags_of`, the single lookup a
+        // tag read and a tag write share, so an API of either resource family lists the
+        // tags its create persisted.
+        let Some(tags) = guard.tags_of(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
@@ -185,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same choice is made by the `GraphqlApi` projection in `crate::state`,
         // where a recording pinned it.
         Ok(ListTagsForResourceOutput {
-            tags: Some(crate::state::map_out(&record.tags)),
+            tags: Some(crate::state::map_out(tags)),
         })
     }
 }

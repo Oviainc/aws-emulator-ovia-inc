@@ -67,5 +67,7 @@ mod source_graphql_api_association;
 mod start_schema_merge;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/flush_api_cache.rs"]
 mod flush_api_cache;
