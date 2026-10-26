@@ -88,7 +88,10 @@ async fn list_endpoints(emulator: &Emulator, token: Option<&str>) -> Answer {
 }
 
 /// `DeleteVpcEndpoint`: `DELETE /2021-01-01/opensearch/vpcEndpoints/{VpcEndpointId}`.
-async fn delete_endpoint(emulator: &Emulator, id: &str) -> Answer {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`]: it is this crate's one
+/// release of an endpoint.
+pub(crate) async fn delete_endpoint(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "DELETE",

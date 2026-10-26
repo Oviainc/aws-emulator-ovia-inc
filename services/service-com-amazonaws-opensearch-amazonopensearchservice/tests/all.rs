@@ -113,3 +113,5 @@ mod vpc_endpoint_updates;
 mod vpc_endpoints;
 #[path = "all/vpc_endpoints_for_domain.rs"]
 mod vpc_endpoints_for_domain;
+#[path = "all/vpc_endpoints_for_domain_status.rs"]
+mod vpc_endpoints_for_domain_status;

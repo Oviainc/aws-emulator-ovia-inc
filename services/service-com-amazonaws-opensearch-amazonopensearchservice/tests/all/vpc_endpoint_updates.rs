@@ -44,7 +44,10 @@ fn conflict_message(change_in_flight: &str) -> String {
 }
 
 /// `UpdateVpcEndpoint`: `POST /2021-01-01/opensearch/vpcEndpoints/update`.
-async fn update_endpoint(emulator: &Emulator, id: &str, vpc_options: &Value) -> Answer {
+///
+/// `pub(crate)` because the sibling suite for what status the per-domain listing reports
+/// drives a modification through THIS wrapper rather than growing a second copy of it.
+pub(crate) async fn update_endpoint(emulator: &Emulator, id: &str, vpc_options: &Value) -> Answer {
     emulator
         .call(
             "POST",

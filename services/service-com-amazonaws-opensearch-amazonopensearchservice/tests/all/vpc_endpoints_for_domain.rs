@@ -32,7 +32,14 @@ use super::vpc_endpoints::{create_endpoint, member, minted, vpc_domain};
 
 /// `ListVpcEndpointsForDomain`: `GET /2021-01-01/opensearch/domain/{DomainName}/vpcEndpoints`,
 /// optionally resumed from a page token.
-async fn list_for_domain(emulator: &Emulator, domain: &str, token: Option<&str>) -> Answer {
+///
+/// `pub(crate)` because the sibling suite for what status this listing reports calls THIS
+/// wrapper rather than growing a second copy of it.
+pub(crate) async fn list_for_domain(
+    emulator: &Emulator,
+    domain: &str,
+    token: Option<&str>,
+) -> Answer {
     let uri = match token {
         None => format!("{PREFIX}/opensearch/domain/{domain}/vpcEndpoints"),
         Some(token) => {
@@ -43,7 +50,9 @@ async fn list_for_domain(emulator: &Emulator, domain: &str, token: Option<&str>)
 }
 
 /// One endpoint on the domain `arn` names, answering with its id.
-async fn endpoint_on(emulator: &Emulator, arn: &str, subnet: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`list_for_domain`].
+pub(crate) async fn endpoint_on(emulator: &Emulator, arn: &str, subnet: &str) -> String {
     let case = "an endpoint of the domain being listed";
     let answer = create_endpoint(
         emulator,
@@ -57,7 +66,9 @@ async fn endpoint_on(emulator: &Emulator, arn: &str, subnet: &str) -> String {
 }
 
 /// The ids the listing of `domain` reports, in the order it reports them.
-async fn listed_ids(emulator: &Emulator, domain: &str, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason as [`list_for_domain`].
+pub(crate) async fn listed_ids(emulator: &Emulator, domain: &str, case: &str) -> Vec<String> {
     let answer = list_for_domain(emulator, domain, None).await;
     assert_eq!(
         answer.status, 200,
