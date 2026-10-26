@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBotLocale
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBotLocale`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBotLocale::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one locale of one bot version in [`crate::state`] and answers from the stored
+//! record, so `DescribeBotLocale` reports back what was stored. The locale starts in
+//! `Creating`; the `NotBuilt` transition the clock owes is due
+//! [`crate::state::CREATION_SETTLES_AFTER`] later and is materialised by the next read,
+//! so a caller reading straight back still observes `Creating`.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +219,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBotLocale` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBotLocaleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBotLocale"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBotLocaleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `localeId` is a plain string in the model, unlike the enum-valued members the
+        // boundary validator checks before this handler runs, so the set of locales the
+        // service supports is checked here; the name reported back comes from the same
+        // table.
+        let Some(locale_name) = crate::state::locale_name(&input.locale_id) else {
+            return Err(CreateBotLocaleErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "localeId must be one of [{}]; received {}",
+                    crate::state::supported_locale_ids().join(", "),
+                    input.locale_id
+                )),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // "You must add a locale to a bot before you can add intents and slot types to
+        // the bot" — so the bot the locale is added to has to exist first.
+        if !store.bots.contains_key(&input.bot_id) {
+            return Err(CreateBotLocaleErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(format!(
+                        "Bot {} does not exist; check the botId and try again",
+                        input.bot_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A bot version holds at most one locale per locale id, so a second create for
+        // one already defined conflicts with the locale that is there.
+        if store.bot_locale_exists(&input.bot_id, &input.bot_version, &input.locale_id) {
+            return Err(CreateBotLocaleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A locale with the localeId {} already exists for bot {} version {}; update it instead",
+                    input.locale_id, input.bot_id, input.bot_version
+                )),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut locale = crate::state::BotLocale {
+            bot_id: input.bot_id.clone(),
+            bot_version: input.bot_version.clone(),
+            locale_id: input.locale_id.clone(),
+            locale_name: locale_name.to_string(),
+            description: input.description,
+            nlu_intent_confidence_threshold: input.nlu_intent_confidence_threshold,
+            voice_settings: input.voice_settings,
+            unified_speech_settings: input.unified_speech_settings,
+            audio_filler_settings: input.audio_filler_settings,
+            speech_recognition_settings: input.speech_recognition_settings,
+            generative_ai_settings: input.generative_ai_settings,
+            speech_detection_sensitivity: input.speech_detection_sensitivity,
+            speaker_diarization_settings: input.speaker_diarization_settings,
+            bot_locale_status: crate::state::BOT_LOCALE_STATUS_CREATING.to_string(),
+            creation_date_time: now,
+            last_updated_date_time: now,
+            last_build_submitted_date_time: None,
+            pending_status: None,
+        };
+        // "If the bot was saved but not built, the status is NotBuilt": nothing has been
+        // built for a locale that was just created, so that is where it settles.
+        locale.schedule_status(
+            crate::state::BOT_LOCALE_STATUS_NOT_BUILT,
+            crate::state::CREATION_SETTLES_AFTER,
+        );
+
+        // The response is read back off the record that was just stored, so what this
+        // call reports is what a later read reports.
+        let key =
+            crate::state::bot_locale_key(&input.bot_id, &input.bot_version, &input.locale_id);
+        let stored = store.bot_locales.entry(key).or_insert(locale);
+        Ok(CreateBotLocaleOutput {
+            bot_id: Some(stored.bot_id.clone()),
+            bot_version: Some(stored.bot_version.clone()),
+            locale_id: Some(stored.locale_id.clone()),
+            locale_name: Some(stored.locale_name.clone()),
+            description: stored.description.clone(),
+            nlu_intent_confidence_threshold: Some(stored.nlu_intent_confidence_threshold),
+            voice_settings: stored.voice_settings.clone(),
+            unified_speech_settings: stored.unified_speech_settings.clone(),
+            audio_filler_settings: stored.audio_filler_settings.clone(),
+            speech_recognition_settings: stored.speech_recognition_settings.clone(),
+            bot_locale_status: Some(stored.bot_locale_status.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            generative_ai_settings: stored.generative_ai_settings.clone(),
+            speech_detection_sensitivity: stored.speech_detection_sensitivity.clone(),
+            speaker_diarization_settings: stored.speaker_diarization_settings.clone(),
+        })
     }
 }

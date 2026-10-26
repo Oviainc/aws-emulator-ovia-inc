@@ -6,11 +6,18 @@
 //! `DeleteBot`) is served entirely out of the `bots` map below: every response those
 //! handlers build is read back from a record stored here, and the ids they hand out are
 //! minted here and kept.
+//!
+//! The locale slice (`CreateBotLocale`, `DescribeBotLocale`) is served the same way out
+//! of `bot_locales`, keyed by the bot, bot version and locale the request names.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ops::types::{BotMember, BotSummary, DataPrivacy, ErrorLogSettings};
+use crate::ops::types::{
+    AudioFillerSettings, BotMember, BotSummary, DataPrivacy, ErrorLogSettings,
+    GenerativeAISettings, SpeakerDiarizationSettings, SpeechRecognitionSettings,
+    UnifiedSpeechSettings, VoiceSettings,
+};
 
 /// `BotStatus` members this crate names. The full modelled set is
 /// `smithy_query(query="shape",shape="BotStatus")`:
@@ -20,6 +27,68 @@ pub const BOT_STATUS_CREATING: &str = "Creating";
 pub const BOT_STATUS_AVAILABLE: &str = "Available";
 /// See [`BOT_STATUS_CREATING`].
 pub const BOT_STATUS_DELETING: &str = "Deleting";
+
+/// `BotLocaleStatus` members this crate names. The full modelled set is
+/// `smithy_query(query="shape",shape="BotLocaleStatus")`:
+/// Creating | Building | Built | ReadyExpressTesting | Failed | Deleting | NotBuilt |
+/// Importing | Processing.
+pub const BOT_LOCALE_STATUS_CREATING: &str = "Creating";
+/// See [`BOT_LOCALE_STATUS_CREATING`]. AWS documents this as the status of a locale
+/// that "was saved but not built", which is where a freshly created locale lands.
+pub const BOT_LOCALE_STATUS_NOT_BUILT: &str = "NotBuilt";
+
+/// Every language and locale Amazon Lex V2 accepts, each with the locale name the API
+/// reports for it.
+///
+/// The modelled `LocaleId` is a plain string
+/// (`smithy_query(query="shape",shape="LocaleId")`) whose doc says only "The string
+/// must match one of the supported locales", so the accepted set and both columns here
+/// come from the published Amazon Lex V2 supported languages and locales table — the
+/// same source that table's `localeName` column has.
+pub const SUPPORTED_LOCALES: [(&str, &str); 27] = [
+    ("ar_AE", "Arabic (Gulf)"),
+    ("ca_ES", "Catalan (Spain)"),
+    ("de_AT", "German (Austria)"),
+    ("de_DE", "German (Germany)"),
+    ("en_AU", "English (Australia)"),
+    ("en_GB", "English (UK)"),
+    ("en_IN", "English (India)"),
+    ("en_NZ", "English (New Zealand)"),
+    ("en_US", "English (US)"),
+    ("en_ZA", "English (South Africa)"),
+    ("es_419", "Spanish (Latin America)"),
+    ("es_ES", "Spanish (Spain)"),
+    ("es_US", "Spanish (US)"),
+    ("fi_FI", "Finnish (Finland)"),
+    ("fr_CA", "French (Canada)"),
+    ("fr_FR", "French (France)"),
+    ("hi_IN", "Hindi (India)"),
+    ("it_IT", "Italian (Italy)"),
+    ("ja_JP", "Japanese (Japan)"),
+    ("ko_KR", "Korean (Korea)"),
+    ("nb_NO", "Norwegian (Norway)"),
+    ("nl_NL", "Dutch (Netherlands)"),
+    ("pl_PL", "Polish (Poland)"),
+    ("pt_BR", "Portuguese (Brazil)"),
+    ("pt_PT", "Portuguese (Portugal)"),
+    ("sv_SE", "Swedish (Sweden)"),
+    ("zh_CN", "Chinese (Simplified)"),
+];
+
+/// The locale name Amazon Lex reports for `locale_id`, or `None` when the service
+/// supports no such locale.
+pub fn locale_name(locale_id: &str) -> Option<&'static str> {
+    SUPPORTED_LOCALES
+        .iter()
+        .find(|(id, _)| *id == locale_id)
+        .map(|(_, name)| *name)
+}
+
+/// Every supported locale id, in the order [`SUPPORTED_LOCALES`] lists them: what a
+/// refusal tells a caller it may send instead.
+pub fn supported_locale_ids() -> Vec<&'static str> {
+    SUPPORTED_LOCALES.iter().map(|(id, _)| *id).collect()
+}
 
 /// Every member of the modelled `BotType` enum
 /// (`smithy_query(query="shape",shape="BotType")`).
@@ -41,7 +110,8 @@ pub const BOT_FILTER_NAMES: [&str; 2] = ["BotName", "BotType"];
 /// (`smithy_query(query="shape",shape="BotFilterOperator")`).
 pub const BOT_FILTER_OPERATORS: [&str; 3] = ["CO", "EQ", "NE"];
 
-/// How long after `CreateBot` the `Creating` -> `Available` transition falls due.
+/// How long after a create the `Creating` -> settled transition falls due: `Available`
+/// for a bot, `NotBuilt` for a bot locale.
 ///
 /// AWS documents the transition but not its duration ("The bot is first in the
 /// `Creating` status. Once the bot is ready for use, it changes to the `Available`
@@ -96,14 +166,7 @@ impl Bot {
     /// A read calls this before answering: the change was owed at that instant whether
     /// or not anybody called, so materialising it is not a mutation a reader invented.
     pub fn settle(&mut self) {
-        let now = Instant::now();
-        if let Some((next, due)) = self.pending_status.take() {
-            if now >= due {
-                self.bot_status = next;
-            } else {
-                self.pending_status = Some((next, due));
-            }
-        }
+        settle_status(&mut self.bot_status, &mut self.pending_status);
     }
 
     /// Schedule `status` to become this bot's status once `after` has elapsed.
@@ -144,11 +207,84 @@ impl Bot {
     }
 }
 
+/// Move `status` on to the transition the clock has already made due, if any.
+///
+/// Shared by every record that carries a scheduled status, so one rule decides when a
+/// pending transition is owed.
+fn settle_status(status: &mut String, pending: &mut Option<(String, Instant)>) {
+    let now = Instant::now();
+    if let Some((next, due)) = pending.take() {
+        if now >= due {
+            *status = next;
+        } else {
+            *pending = Some((next, due));
+        }
+    }
+}
+
+/// A bot locale, as `CreateBotLocale` stored it and `DescribeBotLocale` reads it back.
+#[derive(Debug, Clone)]
+pub struct BotLocale {
+    pub bot_id: String,
+    pub bot_version: String,
+    pub locale_id: String,
+    pub locale_name: String,
+    pub description: Option<String>,
+    pub nlu_intent_confidence_threshold: f64,
+    pub voice_settings: Option<VoiceSettings>,
+    pub unified_speech_settings: Option<UnifiedSpeechSettings>,
+    pub audio_filler_settings: Option<AudioFillerSettings>,
+    pub speech_recognition_settings: Option<SpeechRecognitionSettings>,
+    pub generative_ai_settings: Option<GenerativeAISettings>,
+    pub speech_detection_sensitivity: Option<String>,
+    pub speaker_diarization_settings: Option<SpeakerDiarizationSettings>,
+    pub bot_locale_status: String,
+    pub creation_date_time: SystemTime,
+    pub last_updated_date_time: SystemTime,
+    /// When the locale was last submitted for building; `None` until a build is asked
+    /// for.
+    pub last_build_submitted_date_time: Option<SystemTime>,
+    /// The status the clock owes this locale, and the instant it falls due. Set it
+    /// through [`BotLocale::schedule_status`] rather than by hand.
+    pub pending_status: Option<(String, Instant)>,
+}
+
+impl BotLocale {
+    /// Apply the status transition the clock has already made due, if any — the same
+    /// contract as [`Bot::settle`].
+    pub fn settle(&mut self) {
+        settle_status(&mut self.bot_locale_status, &mut self.pending_status);
+    }
+
+    /// Schedule `status` to become this locale's status once `after` has elapsed.
+    pub fn schedule_status(&mut self, status: &str, after: Duration) {
+        self.pending_status = Some((status.to_string(), Instant::now() + after));
+    }
+}
+
+/// How a bot locale is keyed: the bot, the bot version and the locale id, which is the
+/// same triple every locale operation's URI carries.
+pub type BotLocaleKey = (String, String, String);
+
+/// The [`BotLocaleKey`] for one locale of one bot version.
+pub fn bot_locale_key(bot_id: &str, bot_version: &str, locale_id: &str) -> BotLocaleKey {
+    (
+        bot_id.to_string(),
+        bot_version.to_string(),
+        locale_id.to_string(),
+    )
+}
+
 /// Per-service state for com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// Every bot this emulator holds, keyed by the `botId` it minted.
     pub bots: HashMap<String, Bot>,
+    /// Every bot locale this emulator holds, keyed by [`bot_locale_key`]. A locale
+    /// belongs to one version of one bot, so this map is bounded by the bots the store
+    /// may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the locale ids a bot version can
+    /// carry ([`SUPPORTED_LOCALES`]): a caller cannot grow it past that.
+    pub bot_locales: HashMap<BotLocaleKey, BotLocale>,
     /// The monotonic source the minted ids are derived from.
     bot_id_seq: u64,
 }
@@ -195,6 +331,36 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         for bot in self.bots.values_mut() {
             bot.settle();
         }
+    }
+
+    /// Is this locale already defined for that bot version? `CreateBotLocale` refuses a
+    /// second locale with the same id on the same bot version.
+    pub fn bot_locale_exists(&self, bot_id: &str, bot_version: &str, locale_id: &str) -> bool {
+        self.bot_locales
+            .contains_key(&bot_locale_key(bot_id, bot_version, locale_id))
+    }
+
+    /// The stored locale the triple names, with any due status transition applied
+    /// first.
+    pub fn settled_bot_locale(
+        &mut self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+    ) -> Option<&BotLocale> {
+        let locale = self
+            .bot_locales
+            .get_mut(&bot_locale_key(bot_id, bot_version, locale_id))?;
+        locale.settle();
+        Some(locale)
+    }
+
+    /// Drop every locale of `bot_id`, whatever version holds it, and answer how many
+    /// went: a locale cannot outlive the bot it is defined in.
+    pub fn remove_bot_locales(&mut self, bot_id: &str) -> usize {
+        let before = self.bot_locales.len();
+        self.bot_locales.retain(|(bot, _, _), _| bot != bot_id);
+        before - self.bot_locales.len()
     }
 }
 

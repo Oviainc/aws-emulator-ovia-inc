@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBotLocale
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBotLocale`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBotLocale::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored bot locale out of [`crate::state`], applying the status
+//! transition the clock has already made due before answering. It writes nothing else:
+//! a describe never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +187,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBotLocale` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBotLocaleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBotLocale"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBotLocaleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // `settled_bot_locale` applies a status transition the clock already made due
+        // before reporting; it never invents one.
+        let Some(locale) =
+            store.settled_bot_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+        else {
+            return Err(DescribeBotLocaleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Locale {} does not exist for bot {} version {}; check the botId, botVersion and localeId and try again",
+                        input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeBotLocaleOutput {
+            bot_id: Some(locale.bot_id.clone()),
+            bot_version: Some(locale.bot_version.clone()),
+            locale_id: Some(locale.locale_id.clone()),
+            locale_name: Some(locale.locale_name.clone()),
+            description: locale.description.clone(),
+            nlu_intent_confidence_threshold: Some(locale.nlu_intent_confidence_threshold),
+            voice_settings: locale.voice_settings.clone(),
+            unified_speech_settings: locale.unified_speech_settings.clone(),
+            audio_filler_settings: locale.audio_filler_settings.clone(),
+            speech_recognition_settings: locale.speech_recognition_settings.clone(),
+            // No operation in this slice stores intents or slot types yet — `CreateIntent`
+            // and `CreateSlotType` are still scaffolds — so there is no collection to
+            // count and reporting a number would assert one that nothing holds.
+            intents_count: None,
+            slot_types_count: None,
+            bot_locale_status: Some(locale.bot_locale_status.clone()),
+            // Only a locale in `Failed` carries failure reasons and the recommended
+            // actions that resolve them, and nothing in this slice puts a locale there.
+            failure_reasons: None,
+            recommended_actions: None,
+            creation_date_time: Some(crate::state::to_date_time(locale.creation_date_time)),
+            last_updated_date_time: Some(crate::state::to_date_time(
+                locale.last_updated_date_time,
+            )),
+            last_build_submitted_date_time: locale
+                .last_build_submitted_date_time
+                .map(crate::state::to_date_time),
+            // History events are recorded when a locale is used in an alias; no
+            // operation in this slice records one.
+            bot_locale_history_events: None,
+            generative_ai_settings: locale.generative_ai_settings.clone(),
+            speech_detection_sensitivity: locale.speech_detection_sensitivity.clone(),
+            speaker_diarization_settings: locale.speaker_diarization_settings.clone(),
+        })
     }
 }

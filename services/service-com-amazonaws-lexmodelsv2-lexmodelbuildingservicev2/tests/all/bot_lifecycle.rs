@@ -54,7 +54,7 @@ const ECHOED_BY_DESCRIBE: [&str; 8] = [
 ];
 
 /// One emulator holding one Lex Models V2 service on the single shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -63,7 +63,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Dispatch one request and return its status and parsed JSON body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -92,29 +92,29 @@ async fn call(
 }
 
 /// The wire error code restJson1 puts in the error envelope's `__type`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
 /// A member of a JSON object, or `Null` when it is absent — an absent member and an
 /// explicit null compare equal, which is what "the response omits what was not set"
 /// means on the wire.
-fn member(body: &Value, name: &str) -> Value {
+pub(crate) fn member(body: &Value, name: &str) -> Value {
     body.get(name).cloned().unwrap_or(Value::Null)
 }
 
 /// A response member as a string.
-fn text(body: &Value, name: &str) -> String {
+pub(crate) fn text(body: &Value, name: &str) -> String {
     member(body, name).as_str().unwrap_or_default().to_string()
 }
 
 /// A timestamp member, which restJson1 renders as epoch seconds.
-fn seconds(body: &Value, name: &str) -> f64 {
+pub(crate) fn seconds(body: &Value, name: &str) -> f64 {
     member(body, name).as_f64().unwrap_or(f64::NAN)
 }
 
 /// A `CreateBot` request body.
-fn create_body(name: &str, ttl: i64, extra: Value) -> Value {
+pub(crate) fn create_body(name: &str, ttl: i64, extra: Value) -> Value {
     let mut body = json!({
         "botName": name,
         "roleArn": ROLE_ARN,
@@ -129,7 +129,7 @@ fn create_body(name: &str, ttl: i64, extra: Value) -> Value {
 }
 
 /// Create a bot and return its minted id, failing the test on any other answer.
-async fn create_bot(router: &MultiServiceRouter, body: &Value) -> String {
+pub(crate) async fn create_bot(router: &MultiServiceRouter, body: &Value) -> String {
     let (status, response) = call(router, "PUT", "/bots", Some(body.clone())).await;
     assert_eq!(
         status, 202,
