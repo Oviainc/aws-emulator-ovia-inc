@@ -1574,6 +1574,15 @@ pub const DASHBOARDS_PAGE_SIZE: usize = 1_000;
 /// reached; replacing a dashboard that already exists adds none, so it is unaffected.
 pub const MAX_DASHBOARDS: usize = 10_000;
 
+/// The largest dashboard document this in-memory store holds, in bytes.
+///
+/// A capacity bound, not an AWS quota, for the same reason as [`MAX_DASHBOARDS`]: a document
+/// lives in this process's memory, so its size has to be finite, and a body above this is
+/// refused with `LimitExceededException` ("The operation exceeded one or more limits.") before
+/// it is parsed, checked or stored. Orders of magnitude above the dashboards AWS's own console
+/// writes, so no document a caller authors meets it.
+pub const MAX_DASHBOARD_BODY_BYTES: usize = 1_048_576;
+
 /// The identifier of the one dataset this service has: "Only the default dataset is
 /// supported." (`GetDataset`), and `GetDatasetOutput$DatasetId` is modelled `^default$`.
 pub const DEFAULT_DATASET_ID: &str = "default";

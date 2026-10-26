@@ -197,6 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = crate::state::tag_count_error("dashboard", input.tags.as_deref()) {
             return Err(invalid_parameter_value(message));
         }
+        // The document is held in this process's memory, so its size is bounded before it is
+        // parsed, walked or stored ([`crate::state::MAX_DASHBOARD_BODY_BYTES`]).
+        if input.dashboard_body.len() > crate::state::MAX_DASHBOARD_BODY_BYTES {
+            return Err(PutDashboardErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds a dashboard document of at most {} bytes",
+                        crate::state::MAX_DASHBOARD_BODY_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
         validate_body(&input.dashboard_body)?;
 
         let now = crate::state::now_secs();
@@ -253,25 +266,255 @@ fn invalid_parameter_value(message: String) -> PutDashboardError {
     .into()
 }
 
-/// Refuse a `DashboardBody` that is not a dashboard document at all.
+/// Refuse a `DashboardBody` that is not a dashboard document.
 ///
 /// "The detailed information about the dashboard in JSON format, including the widgets to
-/// include and their location on the dashboard." (`PutDashboardInput$DashboardBody`) — the
-/// model constrains the member only as a string, so a body that is not a JSON object is
-/// refused here with the modelled `DashboardInvalidInputError` (HTTP 400, `awsQueryError`
-/// code `InvalidParameterInput`): "Some part of the dashboard data is invalid."
+/// include and their location on the dashboard. … For more information about the syntax, see
+/// Dashboard Body Structure and Syntax." (`PutDashboardInput$DashboardBody`) — the model
+/// constrains the member only as a string, so BOTH halves of that sentence are checked here
+/// and a body failing either is refused with the modelled `DashboardInvalidInputError`
+/// (HTTP 400, `awsQueryError` code `InvalidParameterInput`): "Some part of the dashboard data
+/// is invalid."
 ///
-/// What each WIDGET of an otherwise well-formed document must carry is diagnosed per
-/// `dataPath` into `DashboardValidationMessages` and is not checked here.
+/// A document that is not a JSON object at all is refused for the field itself, before any
+/// widget is looked at. A document that IS one is checked against the widget schema
+/// ([`widget_problems`]), and the problems that schema finds are enumerated — each located by
+/// a JSON pointer to the offending node — so a caller is told what to repair rather than
+/// handed a dashboard that cannot render.
 fn validate_body(body: &str) -> Result<(), PutDashboardError> {
-    if ::serde_json::from_str::<::serde_json::Value>(body).is_ok_and(|parsed| parsed.is_object()) {
+    let document = ::serde_json::from_str::<::serde_json::Value>(body)
+        .ok()
+        .filter(::serde_json::Value::is_object)
+        .ok_or_else(|| {
+            PutDashboardErrorModeled::DashboardInvalidInputError(DashboardInvalidInputError {
+                message: Some("The field DashboardBody must be a valid JSON object".into()),
+                dashboard_validation_messages: None,
+            })
+        })?;
+    let problems = widget_problems(&document);
+    if problems.is_empty() {
         return Ok(());
     }
-    Err(
-        PutDashboardErrorModeled::DashboardInvalidInputError(DashboardInvalidInputError {
-            message: Some("The field DashboardBody must be a valid JSON object".into()),
-            dashboard_validation_messages: None,
-        })
-        .into(),
-    )
+    Err(invalid_dashboard(problems))
+}
+
+/// How many problems one refusal enumerates at most.
+///
+/// The number of widgets a document declares is the caller's, so the diagnosis — and the
+/// refusal body carrying it — is capped here instead of growing with the request: the walk
+/// stops once this many problems are collected, and a document with more is diagnosed down to
+/// the first of them. Far more than a dashboard a person authors can hold, so a real document
+/// is reported whole.
+pub const MAX_VALIDATION_PROBLEMS: usize = 100;
+
+/// One problem the widget schema found: where in the submitted document it is, and what is
+/// wrong there — the pair `DashboardValidationMessage` spells as `DataPath` and `Message`.
+#[derive(Debug)]
+struct Problem {
+    /// "The data path related to the message." (`DashboardValidationMessage$DataPath`) — a
+    /// JSON pointer into the submitted document, so the caller can find the node.
+    data_path: String,
+    /// "A message describing the error or warning." (`DashboardValidationMessage$Message`).
+    message: String,
+}
+
+impl Problem {
+    /// A problem at `data_path` reading `message`.
+    fn new(data_path: String, message: String) -> Self {
+        Self { data_path, message }
+    }
+}
+
+/// The JSON pointer to the widget at `index`, or — with `member` naming one — to that member
+/// of it.
+///
+/// Built only where a problem is recorded, so walking a document the schema accepts allocates
+/// no path at all.
+fn widget_path(index: usize, member: &str) -> String {
+    format!("/widgets/{index}{member}")
+}
+
+/// The schema's words for a node that is missing a member it requires.
+fn missing(member: &str) -> String {
+    format!("Should have required property '{member}'")
+}
+
+/// The schema's words for a node whose JSON type is not the one it defines.
+fn should_be(json_type: &str) -> String {
+    format!("Should be {json_type}")
+}
+
+/// The member each widget type's `properties` must carry, from the dashboard body structure
+/// AWS documents for that type (the "Dashboard Body Structure and Syntax" reference
+/// `PutDashboardInput$DashboardBody` points at): a text widget renders `markdown`, an alarm
+/// widget names the `alarms` it watches, a log widget runs a `query`, and a custom widget
+/// calls an `endpoint`.
+///
+/// A metric widget's requirement is a CHOICE rather than a single member, so it lives in
+/// [`metric_property_problems`] instead. A widget type this list does not name has nothing
+/// required of its properties here, so a document using a widget kind this emulator does not
+/// model is stored rather than refused for a rule it was never checked against.
+const DEFINING_PROPERTY: &[(&str, &str)] = &[
+    ("text", "markdown"),
+    ("alarm", "alarms"),
+    ("log", "query"),
+    ("custom", "endpoint"),
+];
+
+/// The widget type whose properties name a data source rather than one required member.
+const METRIC_WIDGET: &str = "metric";
+
+/// Every problem the widget schema finds in a dashboard document, in document order.
+///
+/// `widgets` is the member that carries them ("including the widgets to include and their
+/// location on the dashboard", `PutDashboardInput$DashboardBody`); a document declaring none
+/// declares no widget to check, which is why an empty document is a dashboard.
+fn widget_problems(document: &::serde_json::Value) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let Some(widgets) = document.get("widgets") else {
+        return problems;
+    };
+    let Some(widgets) = widgets.as_array() else {
+        problems.push(Problem::new(
+            "/widgets".to_string(),
+            should_be("array"),
+        ));
+        return problems;
+    };
+    for (index, widget) in widgets.iter().enumerate() {
+        // The diagnosis is capped ([`MAX_VALIDATION_PROBLEMS`]), so the walk a caller's widget
+        // count drives stops rather than collecting one problem per widget without end.
+        if problems.len() >= MAX_VALIDATION_PROBLEMS {
+            break;
+        }
+        widget_problems_at(index, widget, &mut problems);
+    }
+    problems.truncate(MAX_VALIDATION_PROBLEMS);
+    problems
+}
+
+/// Every problem of the one widget at `at`, appended to `problems`.
+///
+/// A widget declares the kind of widget it is (`type`) and the configuration of that kind
+/// (`properties`), and what `properties` must carry follows from the `type`
+/// ([`DEFINING_PROPERTY`], [`metric_property_problems`]). A widget whose type is missing is
+/// reported for that, and its properties are then checked against no type's rule — there is
+/// none to apply.
+fn widget_problems_at(index: usize, widget: &::serde_json::Value, problems: &mut Vec<Problem>) {
+    let Some(members) = widget.as_object() else {
+        problems.push(Problem::new(widget_path(index, ""), should_be("object")));
+        return;
+    };
+    let kind = match members.get("type") {
+        None => {
+            problems.push(Problem::new(widget_path(index, ""), missing("type")));
+            None
+        }
+        Some(::serde_json::Value::String(kind)) => Some(kind.as_str()),
+        Some(_) => {
+            problems.push(Problem::new(
+                widget_path(index, "/type"),
+                should_be("string"),
+            ));
+            None
+        }
+    };
+    let Some(properties) = members.get("properties") else {
+        problems.push(Problem::new(widget_path(index, ""), missing("properties")));
+        return;
+    };
+    let Some(properties) = properties.as_object() else {
+        problems.push(Problem::new(
+            widget_path(index, "/properties"),
+            should_be("object"),
+        ));
+        return;
+    };
+    match kind {
+        Some(METRIC_WIDGET) => metric_property_problems(index, properties, problems),
+        Some(kind) => {
+            let absent = DEFINING_PROPERTY
+                .iter()
+                .find(|(named, _)| *named == kind)
+                .map(|(_, member)| *member)
+                .filter(|member| !properties.contains_key(*member));
+            if let Some(member) = absent {
+                problems.push(Problem::new(
+                    widget_path(index, "/properties"),
+                    missing(member),
+                ));
+            }
+        }
+        None => {}
+    }
+}
+
+/// Every problem of a METRIC widget's `properties`, appended to `problems`.
+///
+/// A metric widget draws either a series — the `metrics` it graphs, in the `region` they are
+/// published in — or the annotation of an alarm (`annotations`), so its properties satisfy the
+/// schema when they carry one of the two. Properties carrying neither are reported for the
+/// data source they do not name and for each of the two alternatives they are missing, so the
+/// caller is told both ways of repairing them.
+fn metric_property_problems(
+    index: usize,
+    properties: &::serde_json::Map<String, ::serde_json::Value>,
+    problems: &mut Vec<Problem>,
+) {
+    let graphs_metrics = properties.contains_key("metrics") && properties.contains_key("region");
+    if graphs_metrics || properties.contains_key("annotations") {
+        return;
+    }
+    let at = widget_path(index, "/properties");
+    if !properties.contains_key("metrics") {
+        problems.push(Problem::new(at.clone(), missing("metrics")));
+    }
+    problems.push(Problem::new(
+        at.clone(),
+        "The metric widget should have specified a region and a data source or an alarm \
+         annotation"
+            .to_string(),
+    ));
+    problems.push(Problem::new(at, missing("annotations")));
+}
+
+/// Refuse the request with `DashboardInvalidInputError` (HTTP 400, `awsQueryError` code
+/// `InvalidParameterInput`), enumerating every problem the widget schema found.
+///
+/// The message counts the problems and then renders them as the JSON array of
+/// `{"dataPath", "message"}` objects the schema produced, indented two spaces — the same
+/// problems the modelled `DashboardValidationMessages` member of the error carries, so a
+/// caller reading either field reads the same diagnosis. `problems` is rendered and then
+/// MOVED into that member, so neither the list nor any problem of it is copied, and its
+/// length is already capped ([`MAX_VALIDATION_PROBLEMS`]).
+fn invalid_dashboard(problems: Vec<Problem>) -> PutDashboardError {
+    let rendered = ::serde_json::Value::Array(
+        problems
+            .iter()
+            .map(|problem| {
+                ::serde_json::json!({
+                    "dataPath": problem.data_path,
+                    "message": problem.message,
+                })
+            })
+            .collect(),
+    );
+    let rendered = ::serde_json::to_string_pretty(&rendered)
+        .expect("an array of JSON strings serializes");
+    PutDashboardErrorModeled::DashboardInvalidInputError(DashboardInvalidInputError {
+        message: Some(format!(
+            "The dashboard body is invalid, there are {} validation errors:\n{rendered}",
+            problems.len()
+        )),
+        dashboard_validation_messages: Some(
+            problems
+                .into_iter()
+                .map(|problem| DashboardValidationMessage {
+                    data_path: Some(problem.data_path),
+                    message: Some(problem.message),
+                })
+                .collect(),
+        ),
+    })
+    .into()
 }

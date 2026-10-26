@@ -35,6 +35,8 @@ mod alarm_reason_datapoints;
 mod anomaly_detectors;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
+#[path = "all/dashboard_body_validation.rs"]
+mod dashboard_body_validation;
 #[path = "all/dashboards.rs"]
 mod dashboards;
 #[path = "all/datasets.rs"]
