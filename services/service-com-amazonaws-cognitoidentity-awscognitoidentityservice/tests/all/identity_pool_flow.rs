@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedService;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator holding this service, reached exactly as the production router reaches
@@ -23,14 +24,17 @@ use smithy_server_runtime::MultiServiceRouter;
 /// copy of it.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine the service is mounted on, so a suite can seed the records ANOTHER
+    /// service in that same engine holds — the IAM roles a vend assumes.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     /// Call one operation and return its HTTP status with the parsed JSON body (`Null`
@@ -113,6 +117,105 @@ impl Emulator {
             .expect("GetId returns an IdentityId")
             .to_string()
     }
+
+    /// Seed `role_arn` into the IAM store of the SAME shared engine — the record
+    /// `iam:CreateRole` writes — carrying `trust_policy` as its
+    /// `AssumeRolePolicyDocument`, and answer the ARN the role is stored under.
+    ///
+    /// A vend assumes the pool's role, so a suite that vends credentials needs the role to
+    /// exist where the vend reads it from.
+    pub(crate) fn seed_role(&self, role_arn: &str, trust_policy: Value) -> String {
+        seed_role(&self.engine, role_arn, trust_policy)
+    }
+
+    /// A pool whose two roles are configured and seeded: the shape a pool has to be in for
+    /// it to be able to vend credentials at all. Answers its `IdentityPoolId`.
+    pub(crate) async fn pool_with_roles(&self, name: &str, allow_unauthenticated: bool) -> String {
+        let pool_id = self.pool(name, allow_unauthenticated).await;
+        let authenticated =
+            self.seed_role(&seeded_role_arn(name, "auth"), cognito_trust_policy(&pool_id));
+        let unauthenticated = self.seed_role(
+            &seeded_role_arn(name, "unauth"),
+            cognito_trust_policy(&pool_id),
+        );
+        self.ok(
+            "SetIdentityPoolRoles",
+            &json!({
+                "IdentityPoolId": &pool_id,
+                "Roles": {
+                    "authenticated": authenticated,
+                    "unauthenticated": unauthenticated,
+                },
+            }),
+        )
+        .await;
+        pool_id
+    }
+}
+
+/// The ARN of a role seeded for the pool `pool_name`, in the emulator's own account (the
+/// account every role this emulator holds lives in).
+pub(crate) fn seeded_role_arn(pool_name: &str, role_type: &str) -> String {
+    iam::state::role_arn(
+        iam::state::DEFAULT_PATH,
+        &format!("{pool_name}-{role_type}"),
+    )
+}
+
+/// Seed `role_arn` into `engine`'s IAM store, as `iam:CreateRole` records a role, carrying
+/// `trust_policy` as its `AssumeRolePolicyDocument`; answer the ARN it is stored under.
+///
+/// A free function so a suite holding its own engine (rather than this harness) seeds a
+/// role the same way instead of keeping a second copy of this.
+pub(crate) fn seed_role(
+    engine: &engine::InMemoryEngine,
+    role_arn: &str,
+    trust_policy: Value,
+) -> String {
+    let role_name = role_arn
+        .rsplit('/')
+        .next()
+        .expect("a role ARN names a role")
+        .to_string();
+    let role = iam::ops::types::Role {
+        path: iam::state::DEFAULT_PATH.to_string(),
+        role_name: role_name.clone(),
+        // Its own value, not one derived from the ARN, so an assertion that a session's
+        // `AssumedRoleId` is built from the id IAM issued cannot pass against a handler
+        // that derives an id of its own.
+        role_id: format!("AROASEEDED{:0>11}", role_name.len()),
+        arn: role_arn.to_string(),
+        create_date: aws_smithy_types::DateTime::from_secs(1_767_225_600),
+        assume_role_policy_document: Some(trust_policy.to_string()),
+        description: None,
+        max_session_duration: Some(43_200),
+        permissions_boundary: None,
+        tags: None,
+        role_last_used: None,
+        source_role_template: None,
+    };
+    engine
+        .state::<iam::ComAmazonawsIamAwsidentitymanagementv20100508State>()
+        .lock()
+        .roles
+        .insert(iam::state::name_key(&role_name), role);
+    role_arn.to_string()
+}
+
+/// A role trust policy that admits an identity pool's users, written the way the Amazon
+/// Cognito Developer Guide writes one: the `Federated` Cognito Identity principal, the
+/// web-identity assume, and the `:aud` condition restricting the assume to `audience`'s
+/// own users.
+pub(crate) fn cognito_trust_policy(audience: &str) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Federated": "cognito-identity.amazonaws.com"},
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {"StringEquals": {"cognito-identity.amazonaws.com:aud": audience}},
+        }],
+    })
 }
 
 /// `IdentityPoolId` / `IdentityId` are modelled `len 1..55, pattern ^[\w-]+:[0-9a-f-]+$`
@@ -483,7 +586,9 @@ async fn get_id_refuses_an_unauthenticated_call_when_the_pool_forbids_it() {
 #[tokio::test]
 async fn credentials_are_per_identity_and_stable_while_valid() {
     let emulator = Emulator::new();
-    let pool_id = emulator.pool("credentials", true).await;
+    // A vend is a session of the pool's role, so the pool is configured with the roles it
+    // vends; what the session STANDS FOR is `super::vended_role_session`'s own rule.
+    let pool_id = emulator.pool_with_roles("credentials", true).await;
 
     // One row per way of reaching an identity: unauthenticated, and federated with one
     // and with several providers.
@@ -846,8 +951,9 @@ async fn logins_presented_together_are_linked_to_one_identity() {
 }
 
 /// RULE: a request this slice cannot answer faithfully is refused with the modelled
-/// error, never with a session that ignores the member — `CustomRoleArn` needs the pool's
-/// role mappings, which no operation can configure yet.
+/// error, never with a session that ignores the member — a `CustomRoleArn` the pool does
+/// not name, and a pool that names no role at all, leave the vend no role it could be a
+/// session of.
 #[tokio::test]
 async fn a_custom_role_arn_is_refused_while_the_pool_has_no_roles() {
     let emulator = Emulator::new();
@@ -880,17 +986,28 @@ async fn a_custom_role_arn_is_refused_while_the_pool_has_no_roles() {
         );
     }
 
-    // Without one, the same identity is still served.
-    let issued = emulator
-        .ok(
+    // Without one, the pool still has no role for the request — "the identity pool has no
+    // unauthenticated role configured" (`InvalidIdentityPoolConfigurationException`, this
+    // service's model) — so there is no session to vend either.
+    let (status, body) = emulator
+        .call(
             "GetCredentialsForIdentity",
             &json!({"IdentityId": &identity_id}),
         )
         .await;
     assert_eq!(
-        issued["IdentityId"].as_str(),
-        Some(identity_id.as_str()),
-        "a call without a CustomRoleArn must still vend credentials, got {issued}"
+        status, 400,
+        "a vend from a pool with no role expected HTTP 400, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidIdentityPoolConfigurationException"),
+        "a vend from a pool with no role expected \
+         InvalidIdentityPoolConfigurationException, got {body}"
+    );
+    assert_eq!(
+        member(&body, "Credentials"),
+        None,
+        "a refused vend carries no Credentials, got {body}"
     );
 }
 

@@ -386,7 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resumed = input
             .exclusive_start_key
             .as_ref()
-            .map(|start| table.key_of_key_map(start))
+            .map(|start| table.key_of_start_key(start))
             .transpose()
             .map_err(lift)?;
 

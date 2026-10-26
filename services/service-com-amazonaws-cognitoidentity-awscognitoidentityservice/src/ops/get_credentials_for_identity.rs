@@ -1,25 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCredentialsForIdentity
-//! Issues session credentials for a stored identity, from the emulator's own credential
-//! store, and holds them for the identity until they expire.
+//! Issues the credentials of an `sts:AssumeRoleWithWebIdentity` session of the pool's
+//! resolved role, and holds them for the identity until they expire.
 //!
 //! ## Which role the session stands for
 //!
-//! The credentials a real identity pool vends are the pool's authenticated or
-//! unauthenticated ROLE, chosen through `SetIdentityPoolRoles` and its role mappings,
-//! and `CustomRoleArn` picks one of those mapped roles. This emulator calls no STS and
-//! vends no role-scoped session: the session it issues is the identity's own and does
-//! not stand for one role rather than another. What it does enforce is the pool's stored
-//! configuration — a `CustomRoleArn` the pool names, as one of its two roles or as a role
-//! a mapping rule resolves to, is accepted, and one the pool does not name is answered
-//! with the modelled `InvalidIdentityPoolConfigurationException` (HTTP 400), the error
-//! the real service raises when it has no role for the request, rather than with a
-//! session that ignores the member.
+//! The credentials a real identity pool vends are a session of the pool's authenticated or
+//! unauthenticated ROLE, chosen through `SetIdentityPoolRoles`, and `CustomRoleArn` picks
+//! one of the roles the pool names instead. This handler resolves that role and assumes
+//! it: the session it mints is recorded in the STS session registry in the same engine, so
+//! `sts:GetCallerIdentity` under the vended credential answers
+//! `arn:<partition>:sts::<account>:assumed-role/<role>/CognitoIdentityCredentials`, and the
+//! assume itself is recorded in the account's management-event log as STS's own
+//! `AssumeRoleWithWebIdentity` event.
 //!
-//! `Logins` selects WHICH provider token is exchanged for the session. This emulator
-//! verifies no provider token (it issues none), so the session it vends is the
-//! identity's own and does not vary with `Logins`.
+//! The assume happens only where the role admits it. A pool that names no role for the
+//! request, a role the account does not hold, and a role whose trust policy does not admit
+//! an assume by THIS pool's users — the `cognito-identity.amazonaws.com:aud` condition
+//! that keeps one identity pool out of another pool's role — are each answered with the
+//! modelled `InvalidIdentityPoolConfigurationException` (HTTP 400), the error the real
+//! service raises when it has no role it can assume for the request, rather than with a
+//! session that stands for nothing.
+//!
+//! `Logins` selects WHICH flow the exchange is: a request that presents a login is an
+//! authenticated one, and the pool's `authenticated` role is the one assumed, which is
+//! also the `amr` the trust-policy decision is made with.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +199,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused vend is recorded with the error code its caller was
+        // answered with. The assume the served vend makes is STS's own event and is
+        // recorded where it happens.
+        let outcome = self.vend(&input, ctx).await;
+        crate::state::record_vend(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedVend {
+                identity_id: &input.identity_id,
+                providers: &login_providers(&input),
+                custom_role_arn: input.custom_role_arn.as_deref(),
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+/// The `Logins` provider NAMES a request presented, in the order the map holds them. The
+/// tokens themselves are the caller's secrets and are never read out of the map here.
+fn login_providers(input: &GetCredentialsForIdentityInput) -> Vec<String> {
+    input
+        .logins
+        .iter()
+        .flat_map(|logins| logins.keys().cloned())
+        .collect()
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsForIdentity<Eng> {
+    /// The vend itself: resolve the pool's role, assume it, and answer the session.
+    async fn vend(
+        &self,
+        input: &GetCredentialsForIdentityInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<GetCredentialsForIdentityOutput, GetCredentialsForIdentityError> {
+        use crate::state::{
+            IssuedCredentials, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE,
+            UNSUPPORTED_LOGIN_PROVIDER_MESSAGE,
+        };
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -203,115 +250,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        // The pool's own configuration is read FIRST, and only the facts this vend needs
+        // are copied out, so the identity-pool store is not held while the IAM and STS
+        // stores in the same engine are read.
+        let resolved = {
+            let mut store = state.lock();
 
-        let Some(identity) = store.identities.get(&input.identity_id) else {
-            return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
-                },
-            )
-            .into());
-        };
-        let identity_pool_id = identity.identity_pool_id.clone();
-
-        // "Any provided logins will be validated against supported login providers"
-        // (this operation's own doc): a `Logins` entry that names an Amazon Cognito user
-        // pool carries its issuer in the provider name, so the stored configuration of
-        // the identity's OWN pool decides it — a token minted by a user pool that is
-        // none of that pool's `CognitoIdentityProviders` authorizes nobody here.
-        let logins = input.logins.clone().unwrap_or_default();
-        if !logins.is_empty() {
-            let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+            let Some(identity) = store.identities.get(&input.identity_id) else {
                 return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                        message: Some(format!("Identity '{}' not found.", input.identity_id)),
                     },
                 )
                 .into());
             };
-            if logins
-                .keys()
-                .any(|provider| !pool.accepts_login_provider(provider))
-            {
-                return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
-                    NotAuthorizedException {
-                        message: Some(
-                            crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-        }
+            let identity_pool_id = identity.identity_pool_id.clone();
 
-        // A custom role can only be honoured against the roles the pool has stored, so a
-        // role the pool does not name is refused with the error the real service raises
-        // for a pool that has no role for the request, rather than answered with a session
-        // that ignores the member.
-        if let Some(custom_role_arn) = &input.custom_role_arn {
-            let names_the_role = store
-                .identity_pool_roles
-                .get(&identity_pool_id)
-                .is_some_and(|configured| configured.names_role_arn(custom_role_arn));
-            if !names_the_role {
-                return Err(
-                    GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
-                        InvalidIdentityPoolConfigurationException {
-                            message: Some(format!(
-                                "The CustomRoleArn '{custom_role_arn}' is not a role of identity \
-                                 pool '{identity_pool_id}'."
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-
-        // Every session whose window the clock has closed is forgotten here — by this
-        // service and by the emulator's credential store, so a request still presenting
-        // one is refused and neither store holds an expired session for the life of the
-        // process.
-        for access_key_id in store.purge_expired_credentials(now) {
-            let _ = ctx.credential_store().delete(&access_key_id);
-        }
-
-        // What survives the sweep is still valid, so a caller that asks twice inside the
-        // window gets one session.
-        let issued = match store.credentials.get(&input.identity_id).cloned() {
-            Some(issued) => issued,
-            None => {
-                // The emulator's credential store mints every id and secret: this
-                // operation chooses neither.
-                let minted = ctx
-                    .credential_store()
-                    .create(&::emulator_server::aws_credentials::AWS_SESSION);
-                let secrets = (
-                    minted.secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY),
-                    minted.secret(::emulator_server::aws_credentials::SESSION_TOKEN),
-                );
-                // A session without both secrets is unusable, so it is a server error
-                // rather than a 200 carrying an empty secret.
-                let (Some(secret_key), Some(session_token)) = secrets else {
-                    let _ = ctx.credential_store().delete(&minted.id);
-                    return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
-                        InternalErrorException {
-                            message: Some(
-                                "the credential store minted a session without its secrets"
-                                    .to_string(),
-                            ),
+            // "Any provided logins will be validated against supported login providers"
+            // (this operation's own doc): a `Logins` entry that names an Amazon Cognito user
+            // pool carries its issuer in the provider name, so the stored configuration of
+            // the identity's OWN pool decides it — a token minted by a user pool that is
+            // none of that pool's `CognitoIdentityProviders` authorizes nobody here.
+            let logins = input.logins.clone().unwrap_or_default();
+            if !logins.is_empty() {
+                let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+                    return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
                         },
                     )
                     .into());
                 };
-                let issued = crate::state::IssuedCredentials {
-                    access_key_id: minted.id.clone(),
-                    secret_key: secret_key.to_string(),
-                    session_token: session_token.to_string(),
-                    expiration: now + CREDENTIAL_VALIDITY,
+                if logins
+                    .keys()
+                    .any(|provider| !pool.accepts_login_provider(provider))
+                {
+                    return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+            let providers: Vec<String> = logins.keys().cloned().collect();
+
+            // Which role this vend assumes: the `CustomRoleArn` the request names, which
+            // can only be honoured against the roles the pool has stored, or — for a
+            // request that names none — the pool's role for the flow the request is in.
+            let configured = store.identity_pool_roles.get(&identity_pool_id);
+            let role_arn = match &input.custom_role_arn {
+                Some(custom_role_arn) => configured
+                    .filter(|configured| configured.names_role_arn(custom_role_arn))
+                    .map(|_| custom_role_arn.clone()),
+                None => configured
+                    .and_then(|configured| configured.role_for(!providers.is_empty()))
+                    .map(ToString::to_string),
+            };
+            let Some(role_arn) = role_arn else {
+                return Err(
+                    GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
+                        InvalidIdentityPoolConfigurationException {
+                            message: Some(INVALID_POOL_CONFIGURATION_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // Every session whose window the clock has closed is forgotten here — by this
+            // service, by the emulator's credential store and by the session registry — so
+            // a request still presenting one is refused and no store holds an expired
+            // session for the life of the process.
+            let expired = store.purge_expired_credentials(now);
+
+            ResolvedVend {
+                identity_pool_id,
+                providers,
+                role_arn,
+                expired,
+                held: store.credentials.get(&input.identity_id).cloned(),
+            }
+        };
+
+        for access_key_id in &resolved.expired {
+            crate::state::discard_vended_role_session(
+                &*self.engine,
+                ctx.credential_store(),
+                access_key_id,
+            );
+        }
+
+        // Nothing is assumed that the account does not hold and no trust policy admits:
+        // the role the pool names, and its trust policy's grant to the Cognito Identity
+        // principal for THIS pool, are both read before a credential exists.
+        let refused = || -> GetCredentialsForIdentityError {
+            GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
+                InvalidIdentityPoolConfigurationException {
+                    message: Some(INVALID_POOL_CONFIGURATION_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        };
+        let Some(role) = crate::state::resolve_role(&*self.engine, &resolved.role_arn) else {
+            return Err(refused());
+        };
+        let context = crate::state::web_identity_condition_context(
+            &resolved.identity_pool_id,
+            &input.identity_id,
+            &resolved.providers,
+        );
+        if !crate::state::role_admits_web_identity(&role, &context) {
+            return Err(refused());
+        }
+
+        // What survived the sweep is still valid and stands for the role THIS call
+        // resolved, so a caller that asks twice inside the window gets one session.
+        let issued = match resolved
+            .held
+            .filter(|held| held.role_arn == resolved.role_arn)
+        {
+            Some(issued) => issued,
+            None => {
+                let vended = crate::state::mint_vended_role_session(
+                    &*self.engine,
+                    ctx.credential_store(),
+                    &role,
+                    now,
+                    CREDENTIAL_VALIDITY,
+                );
+                // A vend that could not be recorded is refused rather than answered with a
+                // credential no later call can resolve.
+                let vended = match vended {
+                    Ok(vended) => vended,
+                    Err(why) => {
+                        return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
+                            InternalErrorException { message: Some(why) },
+                        )
+                        .into())
+                    }
                 };
-                store
+                let duration_seconds = i32::try_from(CREDENTIAL_VALIDITY.as_secs())
+                    .unwrap_or(i32::MAX)
+                    .min(role.max_session_duration);
+                crate::state::record_vended_assume(
+                    &*self.engine,
+                    ctx.parts(),
+                    &VendedAssume {
+                        role: &role,
+                        session: &vended,
+                        identity_pool_id: &resolved.identity_pool_id,
+                        identity_id: &input.identity_id,
+                        // The Region the vend was served in is the POOL's own, which its
+                        // `REGION:GUID` id carries: `GetCredentialsForIdentity` is modelled
+                        // `@optionalAuth` and a client calls it with no credential scope at
+                        // all, so the request itself names no Region.
+                        region: crate::state::region_of(&resolved.identity_pool_id),
+                        duration_seconds,
+                    },
+                );
+                let issued = IssuedCredentials {
+                    access_key_id: vended.access_key_id,
+                    secret_key: vended.secret_key,
+                    session_token: vended.session_token,
+                    expiration: vended.expiration,
+                    role_arn: resolved.role_arn.clone(),
+                };
+                state
+                    .lock()
                     .credentials
                     .insert(input.identity_id.clone(), issued.clone());
                 issued
@@ -319,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetCredentialsForIdentityOutput {
-            identity_id: Some(input.identity_id),
+            identity_id: Some(input.identity_id.clone()),
             credentials: Some(Credentials {
                 access_key_id: Some(issued.access_key_id),
                 secret_key: Some(issued.secret_key),
@@ -328,4 +434,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         })
     }
+}
+
+/// What the pool's stored configuration decides about one vend, read out of the
+/// identity-pool store before the role it names is resolved against IAM.
+struct ResolvedVend {
+    /// The pool the identity belongs to, which is the `aud` the assume is made for.
+    identity_pool_id: String,
+    /// The `Logins` provider names the request presented, in the order the map holds them.
+    providers: Vec<String>,
+    /// The ARN of the role this vend assumes.
+    role_arn: String,
+    /// The access key ids of the sessions the clock has expired, to be forgotten.
+    expired: Vec<String>,
+    /// The session this identity already holds, if any.
+    held: Option<crate::state::IssuedCredentials>,
 }

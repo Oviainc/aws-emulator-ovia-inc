@@ -620,14 +620,14 @@ async fn a_scan_request_the_service_refuses() {
             json!({"TableName": &table.name, "ExclusiveStartKey": {"Nope": {"S": "x"}}}),
             400,
             "ValidationException",
-            "does not match the schema",
+            "The provided starting key is invalid",
         ),
         (
             "an ExclusiveStartKey whose key attribute has the wrong type",
             json!({"TableName": &table.name, "ExclusiveStartKey": {"Artist": {"N": "1"}}}),
             400,
             "ValidationException",
-            "does not match the schema",
+            "The provided starting key is invalid",
         ),
         (
             "a table that was never created",
