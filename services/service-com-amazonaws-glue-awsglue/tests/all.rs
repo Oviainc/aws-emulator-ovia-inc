@@ -29,6 +29,8 @@ mod catalog_mutations;
 mod catalog_projections;
 #[path = "all/column_statistics_task_runs.rs"]
 mod column_statistics_task_runs;
+#[path = "all/column_statistics_task_settings.rs"]
+mod column_statistics_task_settings;
 #[path = "all/connection_deletion.rs"]
 mod connection_deletion;
 #[path = "all/connection_listing.rs"]

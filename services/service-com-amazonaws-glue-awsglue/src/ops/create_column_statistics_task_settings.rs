@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateColumnStatisticsTaskSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateColumnStatisticsTaskSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateColumnStatisticsTaskSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the column statistics task settings of ONE stored table — the configuration a
+//! scheduled statistics run of it uses — into [`crate::state`], where
+//! `GetColumnStatisticsTaskSettings` reads them back.
+//!
+//! The settings hang on the table they were created for
+//! ([`crate::state::TableEntry::column_statistics_task_settings`]), so a create for a
+//! table the addressed catalog does not hold is the operation's modelled
+//! `EntityNotFoundException`, and a second create for a table that already carries
+//! settings is its `AlreadyExistsException` rather than an overwrite — the update path is
+//! `UpdateColumnStatisticsTaskSettings`'s. A `Schedule` is stored only when it is the
+//! cron expression the service documents; anything else is refused as invalid input, the
+//! same way every other operation that writes a schedule refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +168,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateColumnStatisticsTaskSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateColumnStatisticsTaskSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateColumnStatisticsTaskSettings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                CreateColumnStatisticsTaskSettingsErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided FIRST, before the
+        // request's own contents and before the entity lookup: a `CatalogId` of another
+        // account is reachable only through that catalog's own resource policy (see
+        // `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(
+                CreateColumnStatisticsTaskSettingsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A `Schedule` is "a schedule for running the column statistics, specified in CRON
+        // syntax", whose documented form is `cron(<six fields>)`. Anything else is not a
+        // schedule this service can run, so it is refused rather than stored and reported
+        // back — the same decision every other operation that writes a schedule makes.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(invalid_input(
+                    crate::state::messages::schedule_not_a_cron_expression(schedule),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        // `DatabaseName`, `TableName` and `Role` are `@required` with `length 1..255`, and
+        // `SampleSize`'s `range 0..100` is refused at the boundary — so reaching here, the
+        // only questions are whether the catalog holds that table and whether it already
+        // carries settings.
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(not_found(crate::state::messages::database_not_found(
+                &input.database_name,
+            )));
+        };
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(not_found(crate::state::messages::table_not_found(
+                &input.table_name,
+            )));
+        };
+        // One settings record per table: a second create for the same table is a
+        // duplicate, not an overwrite, so what is stored stays exactly as the first create
+        // left it.
+        if table.column_statistics_task_settings.is_some() {
+            return Err(
+                CreateColumnStatisticsTaskSettingsErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(
+                            crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        table.column_statistics_task_settings = Some(
+            crate::state::ColumnStatisticsTaskSettingsEntry::from_create_input(&input),
+        );
+        ::tracing::info!(
+            operation = "CreateColumnStatisticsTaskSettings",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %input.table_name,
+            "created the column statistics task settings of a Data Catalog table"
+        );
+
+        Ok(CreateColumnStatisticsTaskSettingsOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> CreateColumnStatisticsTaskSettingsError {
+    CreateColumnStatisticsTaskSettingsErrorModeled::EntityNotFoundException(
+        EntityNotFoundException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
+}
+
+/// This operation's modelled refusal of a request it cannot store: "The input provided was
+/// not valid."
+fn invalid_input(message: String) -> CreateColumnStatisticsTaskSettingsError {
+    CreateColumnStatisticsTaskSettingsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

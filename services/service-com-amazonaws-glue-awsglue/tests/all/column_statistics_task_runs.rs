@@ -141,7 +141,11 @@ fn stored_runs(engine: &Arc<engine::InMemoryEngine>) -> Vec<ColumnStatisticsTask
 
 /// Move the due instant of every unsettled run to `at`, so a test can hold the transient
 /// window open or make the owed transition due without sleeping.
-fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, at: SystemTime) {
+///
+/// Shared with the settings suite ([`crate::column_statistics_task_settings`]), which reads
+/// the attempt a settings record reports through the same run lifecycle, so both suites
+/// move the clock through ONE helper.
+pub(crate) fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, at: SystemTime) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     for run in &mut store.column_statistics_task_runs {
@@ -152,12 +156,12 @@ fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, at: SystemTime) {
 }
 
 /// An instant far enough out that no owed transition falls due during a test.
-fn far_future() -> SystemTime {
+pub(crate) fn far_future() -> SystemTime {
     SystemTime::now() + Duration::from_secs(3600)
 }
 
 /// An instant already past, so the next call settles what the clock owed.
-fn already_past() -> SystemTime {
+pub(crate) fn already_past() -> SystemTime {
     SystemTime::now() - Duration::from_secs(1)
 }
 

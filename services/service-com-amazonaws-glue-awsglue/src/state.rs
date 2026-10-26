@@ -36,6 +36,12 @@
 //! the id the start mints (`GetColumnStatisticsTaskRun` takes that id and nothing else),
 //! so the table a run covers is recorded on the run rather than the run on the table.
 //!
+//! The SETTINGS those runs are scheduled by (`CreateColumnStatisticsTaskSettings`) sit the
+//! other way round — ON the table, like its partitions
+//! ([`TableEntry::column_statistics_task_settings`]) — because every operation that
+//! addresses one settings record names its catalog, its database and then its table and
+//! nothing else, so there is at most one of them per table.
+//!
 //! The SCHEMA REGISTRY is the store's second resource tree and is independent of the
 //! catalog: a registry (keyed by name, per account) holds schema sets, and a schema set
 //! holds the versions registered against it. It is keyed by name rather than by
@@ -152,8 +158,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AssetTypeFormReference,
-    CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
-    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
+    CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
+    Connection, ConnectionInput,
+    ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets,
+    CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
     CreateMLTransformInput,
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
@@ -161,7 +169,7 @@ use crate::ops::types::{
     DataQualityRuleRecommendationRunAdditionalRunOptions,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
-    ExecutionProperty, FederatedDatabase,
+    ExecutionAttempt, ExecutionProperty, FederatedDatabase,
     FederatedTable, GlueTable, Job, MLTransform,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
@@ -843,6 +851,30 @@ impl ComAmazonawsGlueAwsglueState {
                 && run.catalog_id == catalog_id
                 && run.database_name == fold_name(database_name)
                 && run.table_name == fold_name(table_name)
+        })
+    }
+
+    /// The LAST column statistics task run started for this table, or `None` when none
+    /// has been.
+    ///
+    /// [`Self::column_statistics_task_runs`] is kept in start order, so the last match is
+    /// the most recent attempt — which is what a settings read reports as its
+    /// `LastExecutionAttempt`. Call
+    /// [`Self::settle_due_column_statistics_task_runs`] first, or the attempt is reported
+    /// in a status the clock has already moved it out of. `database_name` and `table_name`
+    /// are matched folded, the way the catalog stores them.
+    pub fn last_column_statistics_task_run(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&ColumnStatisticsTaskRunEntry> {
+        let database = fold_name(database_name);
+        let table = fold_name(table_name);
+        self.column_statistics_task_runs.iter().rev().find(|run| {
+            run.catalog_id == catalog_id
+                && run.database_name == database
+                && run.table_name == table
         })
     }
 
@@ -2079,6 +2111,18 @@ pub struct TableEntry {
     /// passed in ("ordered in the same order as the partition keys",
     /// `PartitionInput$Values`) groups a table's partitions by their first key.
     pub partitions: BTreeMap<Vec<String>, PartitionEntry>,
+    /// The COLUMN STATISTICS TASK SETTINGS of this table — "the settings for a column
+    /// statistics task" (`ColumnStatisticsTaskSettings`) — or `None` while no create has
+    /// written them.
+    ///
+    /// On the table rather than beside the catalog tree, exactly as a partition is:
+    /// every operation that addresses one settings record names its catalog, its database
+    /// and then its table (`GetColumnStatisticsTaskSettings$TableName`) and nothing else,
+    /// so the record is addressed only WITHIN one table and there is at most one of it per
+    /// table. That is also why a second create under the same table is the duplicate
+    /// [`messages::COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST`] reports rather than an
+    /// overwrite, and why dropping the table drops its settings with it.
+    pub column_statistics_task_settings: Option<ColumnStatisticsTaskSettingsEntry>,
 }
 
 /// Why a partition could not be created on a table.
@@ -2264,6 +2308,9 @@ impl TableEntry {
             // KEYS of a table, never a slice of its data, so the first partition arrives
             // through a partition create.
             partitions: BTreeMap::new(),
+            // `TableInput` carries no column statistics task settings either: they arrive
+            // through `CreateColumnStatisticsTaskSettings`.
+            column_statistics_task_settings: None,
         }
     }
 
@@ -5727,6 +5774,28 @@ pub mod messages {
         format!("Column statistics task run with id {run_id} does not exist")
     }
 
+    /// A column statistics task settings read (`GetColumnStatisticsTaskSettings`) for a
+    /// table no create has written settings for. NOT recorded: what is pinned is the
+    /// behaviour — 400 with the operation's modelled `EntityNotFoundException` — and the
+    /// sentence names the table the request addressed, the way
+    /// [`column_statistics_task_already_running`] names its table.
+    pub fn column_statistics_task_settings_not_found(
+        database_name: &str,
+        table_name: &str,
+    ) -> String {
+        format!(
+            "Column statistics task settings for table {database_name}.{table_name} do not \
+             exist"
+        )
+    }
+
+    /// `CreateColumnStatisticsTaskSettings` for a table whose settings a create already
+    /// wrote. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the addressed table.
+    pub const COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST: &str =
+        "Column statistics task settings already exist.";
+
     /// `StartColumnStatisticsTaskRun` for a table that already has a run in flight. NOT
     /// recorded: what is pinned is the behaviour — 400 with the operation's modelled
     /// `ColumnStatisticsTaskRunningException`, "thrown when you try to start another job
@@ -6460,6 +6529,28 @@ impl ColumnStatisticsTaskRunEntry {
         self.last_updated = due;
     }
 
+    /// This run as the `ExecutionAttempt` a settings read reports: "a run attempt for a
+    /// column statistics task run."
+    ///
+    /// Every member is this run's own — its id, the status it stands in, the instant it
+    /// started and the reason it failed, if it did.
+    pub fn to_execution_attempt(&self) -> ExecutionAttempt {
+        ExecutionAttempt {
+            status: Some(
+                if self.status == COLUMN_STATISTICS_TASK_RUN_STATE_FAILED {
+                    COLUMN_STATISTICS_EXECUTION_STATUS_FAILED.to_string()
+                } else {
+                    COLUMN_STATISTICS_EXECUTION_STATUS_STARTED.to_string()
+                },
+            ),
+            column_statistics_task_run_id: Some(self.id.clone()),
+            // "A timestamp when the last column statistics task run occurred": the
+            // instant the attempt started.
+            execution_timestamp: Some(to_date_time(self.start_time)),
+            error_message: self.error_message.clone(),
+        }
+    }
+
     /// Rebuild the modelled `ColumnStatisticsTaskRun` output shape from what is stored.
     pub fn to_column_statistics_task_run(&self) -> ColumnStatisticsTaskRun {
         ColumnStatisticsTaskRun {
@@ -6516,6 +6607,119 @@ pub fn table_column_names(table: &TableEntry) -> Vec<String> {
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default()
+}
+
+/// `ColumnStatisticsTaskSettings$ScheduleType` of settings created with a `Schedule`: of
+/// the modelled `ScheduleType` (`CRON | AUTO`), the cron one, because the schedule those
+/// settings carry IS a cron expression ("A schedule for running the column statistics,
+/// specified in CRON syntax" — `CreateColumnStatisticsTaskSettingsRequest$Schedule`).
+/// Settings created without a schedule carry no schedule type at all: nothing stated one.
+pub const COLUMN_STATISTICS_SCHEDULE_TYPE_CRON: &str = "CRON";
+
+/// `ColumnStatisticsTaskSettings$SettingSource` of settings a create wrote for one table:
+/// of the modelled `SettingSource` (`CATALOG | TABLE`), the table one, because the create
+/// addresses a single table (`DatabaseName` plus `TableName`, both `@required`) rather
+/// than the catalog those settings would otherwise be inherited from.
+pub const COLUMN_STATISTICS_SETTING_SOURCE_TABLE: &str = "TABLE";
+
+/// `ExecutionAttempt$Status` of an attempt that ended in a column statistics task run's
+/// failure state: of the modelled `ExecutionStatus` (`FAILED | STARTED`), the failed one.
+pub const COLUMN_STATISTICS_EXECUTION_STATUS_FAILED: &str = "FAILED";
+
+/// `ExecutionAttempt$Status` of any other attempt. The modelled `ExecutionStatus` carries
+/// only the two values quoted on [`COLUMN_STATISTICS_EXECUTION_STATUS_FAILED`], so an
+/// attempt that has not failed is reported as the run it started.
+pub const COLUMN_STATISTICS_EXECUTION_STATUS_STARTED: &str = "STARTED";
+
+/// The column statistics task settings of ONE table, as
+/// `CreateColumnStatisticsTaskSettings` recorded them.
+///
+/// Only what the client STATED is held here. The members that address the settings —
+/// their catalog, database and table — are the stored table's own and are read off it
+/// when a read projects the modelled shape ([`Self::to_column_statistics_task_settings`]),
+/// so one record cannot disagree with the table it hangs on.
+#[derive(Debug, Clone)]
+pub struct ColumnStatisticsTaskSettingsEntry {
+    /// `ColumnStatisticsTaskSettings$Role`: "The role used for running the column
+    /// statistics."
+    pub role: String,
+    /// `ColumnStatisticsTaskSettings$SampleSize`: "The percentage of data to sample", the
+    /// request's value, whose own default is 0.
+    pub sample_size: f64,
+    /// The cron expression of `Schedule`, or `None` when the create stated no schedule.
+    pub schedule_expression: Option<String>,
+    /// `ColumnNameList`: "A list of column names for which to run statistics", or `None`
+    /// when the create listed none — the settings record what was configured, and the
+    /// default of a run that names no column is resolved by the run
+    /// ([`table_column_names`]).
+    pub column_name_list: Option<Vec<String>>,
+    /// `SecurityConfiguration`: "Name of the security configuration that is used to
+    /// encrypt CloudWatch logs."
+    pub security_configuration: Option<String>,
+    /// `CreateColumnStatisticsTaskSettingsRequest$Tags`: "A map of tags." Stored rather
+    /// than served, for the reason [`CustomEntityTypeEntry::tags`] gives: no `ResourceArn`
+    /// this service tags ([`ComAmazonawsGlueAwsglueState::resource_tags`]) addresses a
+    /// settings record, so nothing reads them back yet — and dropping them would lose what
+    /// the create was told.
+    pub tags: HashMap<String, String>,
+}
+
+impl ColumnStatisticsTaskSettingsEntry {
+    /// Record the settings a `CreateColumnStatisticsTaskSettings` request states.
+    pub fn from_create_input(input: &CreateColumnStatisticsTaskSettingsInput) -> Self {
+        Self {
+            role: input.role.clone(),
+            sample_size: input.sample_size,
+            schedule_expression: input.schedule.clone(),
+            // An empty list states no column either, so it is recorded as none rather
+            // than as settings that cover nothing.
+            column_name_list: input
+                .column_name_list
+                .clone()
+                .filter(|names| !names.is_empty()),
+            security_configuration: input.security_configuration.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `ColumnStatisticsTaskSettings` shape from what is stored.
+    ///
+    /// `table` is the stored table these settings hang on, which is where their catalog,
+    /// database and table names come from, and `last_attempt` the last column statistics
+    /// task run started for that table, if one has been: "the last `ExecutionAttempt` for
+    /// the column statistics task run" is that run, so it is read off the stored runs
+    /// rather than held here.
+    pub fn to_column_statistics_task_settings(
+        &self,
+        table: &TableEntry,
+        last_attempt: Option<&ColumnStatisticsTaskRunEntry>,
+    ) -> ColumnStatisticsTaskSettings {
+        ColumnStatisticsTaskSettings {
+            database_name: Some(table.database_name.clone()),
+            table_name: Some(table.name.clone()),
+            catalog_id: Some(table.catalog_id.clone()),
+            // A stated schedule is a schedule the service runs, so it is reported in the
+            // scheduled state, exactly as a crawler's is ([`CrawlerEntry::to_crawler`]).
+            schedule: self
+                .schedule_expression
+                .as_ref()
+                .map(|expression| Schedule {
+                    schedule_expression: Some(expression.clone()),
+                    state: Some(SCHEDULE_STATE_SCHEDULED.to_string()),
+                }),
+            schedule_type: self
+                .schedule_expression
+                .as_ref()
+                .map(|_| COLUMN_STATISTICS_SCHEDULE_TYPE_CRON.to_string()),
+            setting_source: Some(COLUMN_STATISTICS_SETTING_SOURCE_TABLE.to_string()),
+            column_name_list: self.column_name_list.clone(),
+            role: Some(self.role.clone()),
+            sample_size: self.sample_size,
+            security_configuration: self.security_configuration.clone(),
+            last_execution_attempt: last_attempt
+                .map(ColumnStatisticsTaskRunEntry::to_execution_attempt),
+        }
+    }
 }
 
 /// A stored workflow: the container for the dependent jobs and crawlers

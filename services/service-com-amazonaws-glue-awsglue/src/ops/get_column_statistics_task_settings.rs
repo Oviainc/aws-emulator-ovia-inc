@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetColumnStatisticsTaskSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetColumnStatisticsTaskSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetColumnStatisticsTaskSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the column statistics task settings of ONE stored table, as
+//! `CreateColumnStatisticsTaskSettings` wrote them
+//! ([`crate::state::TableEntry::column_statistics_task_settings`]) — so the settings a
+//! create recorded are the settings this read answers with, and a table no create has
+//! written settings for is the operation's modelled `EntityNotFoundException`.
+//!
+//! `LastExecutionAttempt` is not held on the settings: "the last `ExecutionAttempt` for
+//! the column statistics task run" is the most recent run started for that table, so it
+//! is read off the stored runs
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::last_column_statistics_task_run`]) —
+//! absent until one has been started. The one write this read makes is materialising the
+//! run statuses the clock had already made due, exactly as
+//! `GetColumnStatisticsTaskRun` does.
+//!
+//! This operation models no access error, so a `CatalogID` of another account is simply a
+//! catalog this emulator holds nothing in: the read reports the modelled miss rather than
+//! an exception the model does not declare for it.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +156,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetColumnStatisticsTaskSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetColumnStatisticsTaskSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetColumnStatisticsTaskSettings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                GetColumnStatisticsTaskSettingsErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the run statuses the clock had already made due, so
+        // the attempt reported below is the one the clock had already reached.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // `DatabaseName` and `TableName` are `@required` with `length 1..255`, so reaching
+        // here the only question is what the catalog holds under them. Resolved BEFORE the
+        // attempt is looked up, so a read that is about to be refused walks no runs.
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(not_found(crate::state::messages::database_not_found(
+                &input.database_name,
+            )));
+        };
+        let Some(table) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(not_found(crate::state::messages::table_not_found(
+                &input.table_name,
+            )));
+        };
+        let Some(settings) = table.column_statistics_task_settings.as_ref() else {
+            return Err(not_found(
+                crate::state::messages::column_statistics_task_settings_not_found(
+                    &table.database_name,
+                    &table.name,
+                ),
+            ));
+        };
+        let last_attempt = store.last_column_statistics_task_run(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        );
+
+        Ok(GetColumnStatisticsTaskSettingsOutput {
+            column_statistics_task_settings: Some(
+                settings.to_column_statistics_task_settings(table, last_attempt),
+            ),
+        })
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> GetColumnStatisticsTaskSettingsError {
+    GetColumnStatisticsTaskSettingsErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }
