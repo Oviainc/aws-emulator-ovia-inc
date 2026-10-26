@@ -27,3 +27,5 @@ mod state_roundtrip;
 // and the XML readers, defined once.
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/vpc_zone_identifier_zones.rs"]
+mod vpc_zone_identifier_zones;

@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # `service::query_error_envelope`), the same v4 UUID form the framework's query
 # renderer puts in a successful response's `ResponseMetadata/RequestId`.
 uuid = { version = "1", features = ["v4"] }
+# The EC2 store holds the account's subnets, and a subnet's Availability Zone is a fact
+# about that subnet: a group that names only `VPCZoneIdentifier` has its zones resolved
+# from EC2's own state (`state::ec2_subnets`) rather than asked of the caller.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

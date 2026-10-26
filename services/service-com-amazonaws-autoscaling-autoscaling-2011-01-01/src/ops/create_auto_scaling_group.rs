@@ -7,6 +7,11 @@
 //! initial `DesiredCapacity` instances, each reported `Pending` until the
 //! lifecycle transition the clock owes comes due.
 //!
+//! A group that names only `VPCZoneIdentifier` carries zones too: the zones of the
+//! subnets it names, resolved against the account's own Amazon EC2 subnets
+//! ([`crate::state::ec2_subnets`]), because the zone a subnet is in is a fact about
+//! that subnet rather than a value this caller supplies.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -473,29 +478,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let availability_zones = input.availability_zones.clone().unwrap_or_default();
-        if availability_zones.is_empty() && input.vpc_zone_identifier.is_none() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "At least one Availability Zone or VPC Subnet is required: specify \
-                 AvailabilityZones or VPCZoneIdentifier",
-            ));
-        }
-        // An instance is reported in the Availability Zone it runs in. Resolving
-        // that zone from a subnet id alone needs the subnet's own state, which
-        // lives in EC2, so a group that has to launch instances and names only
-        // subnets is something this emulator cannot answer faithfully.
-        if availability_zones.is_empty() && desired_capacity > 0 {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "launching instances for a group that names only VPCZoneIdentifier \
-                              needs each subnet's Availability Zone, which this emulator does not \
-                              hold: pass AvailabilityZones as well"
-                        .to_string(),
-                },
-            ));
+        let region = crate::state::request_region(ctx.parts());
+        // The zones the group places instances in. `VPCZoneIdentifier` is "a
+        // comma-separated list of subnet IDs for a virtual private cloud (VPC) where
+        // instances in the Auto Scaling group can be created", and a subnet is in
+        // exactly one Availability Zone, so a group that names only subnets still has
+        // zones: the zones of those subnets, which the account's Amazon EC2 store holds
+        // and this service reads rather than asks the caller for. Resolved BEFORE this
+        // service's own store is locked, so only one store is ever held at a time.
+        let mut availability_zones = input.availability_zones.clone().unwrap_or_default();
+        if availability_zones.is_empty() {
+            let subnets = input.vpc_zone_identifier.as_deref().unwrap_or_default();
+            match crate::state::ec2_subnets::zones_of(&*self.engine, &region, subnets) {
+                crate::state::ec2_subnets::ZoneResolution::Zones(zones) if !zones.is_empty() => {
+                    availability_zones = zones;
+                }
+                // Neither member named anything to place an instance in.
+                crate::state::ec2_subnets::ZoneResolution::Zones(_) => {
+                    return Err(crate::state::ec2_subnets::no_placement_error());
+                }
+                // A subnet the account cannot launch into has no zone to derive.
+                crate::state::ec2_subnets::ZoneResolution::UnknownSubnet(subnet_id) => {
+                    return Err(crate::state::ec2_subnets::unknown_subnet_error(&subnet_id));
+                }
+            }
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(now);

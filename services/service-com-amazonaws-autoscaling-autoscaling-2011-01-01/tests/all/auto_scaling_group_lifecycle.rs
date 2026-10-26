@@ -1222,70 +1222,31 @@ async fn deletion_protection_refuses_the_deletes_it_names() {
 /// parameters.
 type RefusalCase = (&'static str, &'static str, Vec<(&'static str, &'static str)>);
 
-/// Capacity this emulator cannot place, and configuration it cannot read, are
-/// refused outright — never reported as a group short of its desired capacity, or
-/// as a resource with invented attributes.
+/// Configuration this emulator cannot read is refused outright — never reported as
+/// a resource with invented attributes.
+///
+/// A group that names only subnets is NOT such a case: its zones are the zones of
+/// those subnets, which the account's own Amazon EC2 store holds, so it is created
+/// and its capacity placed (`vpc_zone_identifier_zones.rs`).
 #[tokio::test]
 async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
     let engine = new_engine();
     let router = router_with(engine.clone());
 
-    // A group that names only subnets can be created while it asks for no
-    // capacity: there is nothing to place yet.
-    let (status, body) = query(
-        &router,
+    // (case, action, params) — the configuration asked for lives on a resource of
+    // another service that this request does not name, so it answers 501 rather
+    // than inventing it, and creates nothing.
+    let refused: Vec<RefusalCase> = vec![(
+        "a group built from a running EC2 instance",
         "CreateAutoScalingGroup",
-        &[
-            ("AutoScalingGroupName", "subnets-only"),
-            LAUNCH_SOURCE,
-            ("MinSize", "0"),
-            ("MaxSize", "4"),
-            ("VPCZoneIdentifier", "subnet-1"),
+        vec![
+            ("AutoScalingGroupName", "from-instance"),
+            ("InstanceId", "i-0123456789abcdef0"),
+            ("MinSize", "1"),
+            ("MaxSize", "1"),
+            ("AvailabilityZones.member.1", "us-west-2a"),
         ],
-    )
-    .await;
-    assert_eq!(status, 200, "a group with no capacity to place: got {status}: {body}");
-
-    // (case, action, params) — each needs an Availability Zone this emulator
-    // cannot resolve from a subnet id, so each answers 501 rather than inventing
-    // one, and none of them changes the group.
-    let refused: Vec<RefusalCase> = vec![
-        (
-            "a create that must place instances in a subnet's zone",
-            "CreateAutoScalingGroup",
-            vec![
-                ("AutoScalingGroupName", "subnets-only-2"),
-                LAUNCH_SOURCE,
-                ("MinSize", "2"),
-                ("MaxSize", "4"),
-                ("VPCZoneIdentifier", "subnet-1"),
-            ],
-        ),
-        (
-            "a capacity change on a group that names only subnets",
-            "SetDesiredCapacity",
-            vec![
-                ("AutoScalingGroupName", "subnets-only"),
-                ("DesiredCapacity", "1"),
-            ],
-        ),
-        (
-            "an update that raises the minimum of a group that names only subnets",
-            "UpdateAutoScalingGroup",
-            vec![("AutoScalingGroupName", "subnets-only"), ("MinSize", "1")],
-        ),
-        (
-            "a group built from a running EC2 instance",
-            "CreateAutoScalingGroup",
-            vec![
-                ("AutoScalingGroupName", "from-instance"),
-                ("InstanceId", "i-0123456789abcdef0"),
-                ("MinSize", "1"),
-                ("MaxSize", "1"),
-                ("AvailabilityZones.member.1", "us-west-2a"),
-            ],
-        ),
-    ];
+    )];
 
     for (case, action, params) in refused {
         let (status, body) = query(&router, action, &params).await;
@@ -1299,25 +1260,10 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
         );
     }
 
-    let (_, body) = query(
-        &router,
-        "DescribeAutoScalingGroups",
-        &[("AutoScalingGroupNames.member.1", "subnets-only")],
-    )
-    .await;
-    assert_eq!(
-        tag_value(&body, "DesiredCapacity"),
-        "0",
-        "a refused capacity change must leave the group alone, got {body}"
-    );
-    assert_eq!(
-        tag_value(&body, "MinSize"),
-        "0",
-        "a refused update must leave the group alone, got {body}"
-    );
+    let (_, body) = query(&router, "DescribeAutoScalingGroups", &[]).await;
     assert!(
-        tag_values(&body, "InstanceId").is_empty(),
-        "the group must hold no instances, got {body}"
+        tag_values(&body, "AutoScalingGroupName").is_empty(),
+        "a refused create must leave no group behind, got {body}"
     );
 }
 

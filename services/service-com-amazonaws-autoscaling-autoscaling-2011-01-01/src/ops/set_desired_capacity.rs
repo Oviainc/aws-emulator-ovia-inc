@@ -212,20 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_GROUP_CAPACITY
             )));
         }
-        // An instance is reported in the Availability Zone it runs in, and
-        // resolving that zone from a subnet id needs EC2's own state (see
-        // `CreateAutoScalingGroup`), so capacity this service cannot place is
-        // refused rather than reported short.
-        if group.availability_zones.is_empty() && desired_capacity > 0 {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "launching instances for a group that names only VPCZoneIdentifier \
-                              needs each subnet's Availability Zone, which this emulator does not \
-                              hold: pass AvailabilityZones as well"
-                        .to_string(),
-                },
-            ));
-        }
+        // Every stored group has at least one Availability Zone to place an instance in:
+        // `CreateAutoScalingGroup` derives them from `VPCZoneIdentifier` when the request
+        // names only subnets, and `UpdateAutoScalingGroup` keeps that invariant, so there
+        // is no zoneless group for this capacity change to refuse.
         // Instances from an earlier change are stored until they finish
         // terminating, and they occupy the group's ceiling while they do. A change
         // whose launches would not fit beside them cannot be started yet.

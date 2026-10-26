@@ -6,6 +6,10 @@
 //! member leaves that part of the group unchanged — then brings the group's
 //! capacity within the bounds the update leaves it with, as the model documents.
 //!
+//! A request that names new subnets and no `AvailabilityZones` moves the group to the
+//! zones those subnets are in, resolved against the account's own Amazon EC2 subnets
+//! ([`crate::state::ec2_subnets`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -326,6 +330,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  request",
             ));
         }
+        // A group always has somewhere to place an instance, so an update cannot leave it
+        // with an EMPTY zone list: that names no zone at all, which is the same refusal a
+        // create naming neither member answers.
+        if input
+            .availability_zones
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(crate::state::ec2_subnets::no_placement_error());
+        }
+        // A request that names new subnets and no zones moves the group to the zones of
+        // those subnets: the zone a subnet is in is a fact about that subnet, resolved
+        // against the account's own Amazon EC2 subnets of the signed Region, exactly as
+        // `CreateAutoScalingGroup` resolves it. Asked BEFORE this service's store is
+        // locked, so only one store is ever held at a time. `VPCZoneIdentifier` naming no
+        // subnet at all leaves the group's zones as they are.
+        let mut zones_from_subnets: Option<Vec<String>> = None;
+        if input.availability_zones.is_none() {
+            if let Some(subnets) = input.vpc_zone_identifier.as_deref() {
+                let region = crate::state::request_region(ctx.parts());
+                match crate::state::ec2_subnets::zones_of(&*self.engine, &region, subnets) {
+                    crate::state::ec2_subnets::ZoneResolution::Zones(zones) => {
+                        if !zones.is_empty() {
+                            zones_from_subnets = Some(zones);
+                        }
+                    }
+                    // A subnet the account cannot launch into has no zone to derive.
+                    crate::state::ec2_subnets::ZoneResolution::UnknownSubnet(subnet_id) => {
+                        return Err(crate::state::ec2_subnets::unknown_subnet_error(&subnet_id));
+                    }
+                }
+            }
+        }
         if let Some(lifetime) = input.max_instance_lifetime {
             if !crate::state::is_valid_max_instance_lifetime(lifetime) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(format!(
@@ -433,23 +470,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(current_capacity)
             .clamp(min_size, max_size);
         let launches_needed = group.launches_needed(desired_capacity);
-        // An instance is reported in the Availability Zone it runs in, and
-        // resolving that zone from a subnet id needs EC2's own state (see
-        // `CreateAutoScalingGroup`), so a group left with capacity to launch and no
-        // zone to launch into is refused rather than reported short.
+        // The zones the group places instances in after this update: the ones the request
+        // named, else those its new subnets resolve to, else the ones it already has. A
+        // group always has at least one — `CreateAutoScalingGroup` derives them from
+        // `VPCZoneIdentifier` for a request that names only subnets — so this is the
+        // floor under that invariant rather than a refusal any well-formed request meets.
         let zones_after_update = input
             .availability_zones
             .clone()
+            .or_else(|| zones_from_subnets.clone())
             .unwrap_or_else(|| group.availability_zones.clone());
         if zones_after_update.is_empty() && desired_capacity > 0 {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "launching instances for a group that names only VPCZoneIdentifier \
-                              needs each subnet's Availability Zone, which this emulator does not \
-                              hold: pass AvailabilityZones as well"
-                        .to_string(),
-                },
-            ));
+            return Err(crate::state::ec2_subnets::no_placement_error());
         }
         // Instances from an earlier change are stored until they finish
         // terminating, and they occupy the group's ceiling while they do. A change
@@ -496,6 +528,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(value) = input.availability_zones {
             group.availability_zones = value;
+        }
+        // New subnets and no zones: the group moves to the zones those subnets are in.
+        if let Some(zones) = zones_from_subnets {
+            group.availability_zones = zones;
         }
         if let Some(value) = input.availability_zone_ids {
             group.availability_zone_ids = Some(value);

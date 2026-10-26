@@ -31,6 +31,10 @@ use crate::ops::types::{
     TrafficSourceIdentifier,
 };
 
+/// The Availability Zones of the subnets a request's `VPCZoneIdentifier` names, read
+/// from the account's own Amazon EC2 store.
+pub mod ec2_subnets;
+
 /// How long a lifecycle transition this service owes takes to come due.
 ///
 /// Amazon EC2 Auto Scaling reports a freshly launched instance as `Pending` and an

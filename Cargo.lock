@@ -5966,6 +5966,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-ec2-amazonec2",
  "sha2 0.10.9",
  "tokio",
  "tracing",
