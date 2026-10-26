@@ -14,7 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile, Policy,
-    PolicyVersion, Role, SAMLPrivateKey, ServiceSpecificCredentialMetadata, Tag, User,
+    PolicyVersion, Role, SAMLPrivateKey, ServerCertificateMetadata,
+    ServiceSpecificCredentialMetadata, Tag, User,
 };
 
 pub mod authorization;
@@ -312,6 +313,13 @@ pub const ANY_OPEN_ID_CONNECT_PROVIDER: &str = "*";
 /// growing without end.
 pub const MAX_SAML_PROVIDERS_PER_ACCOUNT: usize = 100;
 
+/// How many server certificates one account may hold. AWS's "IAM and STS quotas" page
+/// gives the quota "Server certificates stored in IAM per account: 20", and an upload
+/// past it is refused with `LimitExceededException`, whose documentation says "the error
+/// message describes the limit exceeded". It is also what stops the server-certificate
+/// map growing without end.
+pub const MAX_SERVER_CERTIFICATES_PER_ACCOUNT: usize = 20;
+
 /// The XML namespace a SAML 2.0 metadata document's descriptors are declared in
 /// (`urn:oasis:names:tc:SAML:2.0:metadata`, OASIS "Metadata for the OASIS Security
 /// Assertion Markup Language (SAML) V2.0"). A document whose root descriptor is not in
@@ -348,6 +356,13 @@ const SAML_PROVIDER_UUID_PREFIX: &str = "SAMLP";
 /// `privateKeyIdType` as [`SAML_PROVIDER_UUID_PREFIX`] and is built the same way, from
 /// its own prefix so a key id is never a provider uuid.
 const SAML_PRIVATE_KEY_ID_PREFIX: &str = "SAMLK";
+
+/// The prefix AWS gives a server certificate's unique id — the `ASCA` prefix the "IAM
+/// identifiers" page of the IAM User Guide lists for a certificate under "unique ID
+/// prefixes". `ServerCertificateMetadata$ServerCertificateId` is modelled as `idType`
+/// (len 16..128, pattern `^[\w]+$`), which this prefix plus [`UNIQUE_ID_SUFFIX_LEN`]
+/// base32 characters satisfies.
+const SERVER_CERTIFICATE_ID_PREFIX: &str = "ASCA";
 
 /// The tag-key prefix AWS reserves. "Tagging IAM resources" (IAM User Guide):
 /// "You cannot create tag keys that begin with `aws:` because this prefix is
@@ -827,6 +842,37 @@ pub struct LoginProfileRecord {
     pub password_reset_required: bool,
 }
 
+/// One persisted server certificate: the metadata every operation reports about it,
+/// beside the PEM material a read may hand back.
+///
+/// The uploaded PRIVATE KEY is deliberately not a field. `ServerCertificate` — the only
+/// shape any operation reports a server certificate through — carries just the metadata,
+/// the certificate body and the chain
+/// (`smithy_query(query="shape", shape="ServerCertificate")`), and the model marks
+/// `UploadServerCertificate$PrivateKey` sensitive, so nothing can ever read the key back:
+/// holding it would be keeping a secret no caller may be given. It is read once, by the
+/// upload, to check that it belongs to the certificate's public key.
+#[derive(Debug, Clone)]
+pub struct ServerCertificateRecord {
+    /// "The meta information of the uploaded server certificate without its certificate
+    /// body, certificate chain, and private key"
+    /// (`UploadServerCertificate$ServerCertificateMetadata`): the path, the name, the
+    /// minted id, the ARN, the instant it was uploaded and the instant the certificate
+    /// itself expires. Stored whole, so the upload response and every later read report
+    /// one record.
+    pub metadata: ServerCertificateMetadata,
+    /// "The contents of the public key certificate" (`ServerCertificate$CertificateBody`),
+    /// verbatim as the upload carried it.
+    pub certificate_body: String,
+    /// "The contents of the public key certificate chain"
+    /// (`ServerCertificate$CertificateChain`), when the upload carried one.
+    pub certificate_chain: Option<String>,
+    /// The tags attached to the certificate, sorted by tag key, because "the returned list
+    /// of tags is sorted by tag key" (`UploadServerCertificate$Tags`). `None` when the
+    /// upload attached none.
+    pub tags: Option<Vec<Tag>>,
+}
+
 /// Per-service state for com-amazonaws-iam-awsidentitymanagementv20100508. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap` so enumeration order is total and stable, which is
@@ -957,6 +1003,15 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// and makes the name the provider's identity, which is what refuses a second
     /// create for one the account already holds.
     pub saml_providers: BTreeMap<String, SamlProviderRecord>,
+    /// The persisted server certificates, keyed by [`name_key`] of the server certificate
+    /// name — the handle every operation on one takes
+    /// (`GetServerCertificate$ServerCertificateName`) — and case-folded for the same
+    /// reason user and role names are: IAM entity names are unique within the account and
+    /// "are not distinguished by case", while
+    /// `ServerCertificateMetadata::server_certificate_name` keeps the case the uploader
+    /// chose. `UploadServerCertificate` is what fills this map and `GetServerCertificate`
+    /// reads it.
+    pub server_certificates: BTreeMap<String, ServerCertificateRecord>,
     /// The account's alias, when one has been created. An `Option` rather than a
     /// collection because an account holds AT MOST ONE: "Lists the account alias
     /// associated with the Amazon Web Services account (Note: you can have only
@@ -1010,6 +1065,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Monotonic counter feeding
     /// [`next_instance_profile_id`](Self::next_instance_profile_id).
     pub instance_profile_id_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_server_certificate_id`](Self::next_server_certificate_id).
+    pub server_certificate_id_seq: u64,
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -1062,6 +1120,21 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_saml_private_key_id(&mut self) -> String {
         self.saml_private_key_id_seq += 1;
         unique_id(SAML_PRIVATE_KEY_ID_PREFIX, self.saml_private_key_id_seq)
+    }
+
+    /// Mint the next server certificate's `ServerCertificateId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
+    /// counter is bijectively mixed into the suffix, and the id is minted once and then
+    /// stored with the certificate, so "the stable and unique string identifying the
+    /// server certificate" (`ServerCertificateMetadata$ServerCertificateId`) is what every
+    /// later read reports.
+    pub fn next_server_certificate_id(&mut self) -> String {
+        self.server_certificate_id_seq += 1;
+        unique_id(
+            SERVER_CERTIFICATE_ID_PREFIX,
+            self.server_certificate_id_seq,
+        )
     }
 
     /// How many access keys the user keyed by `user_key` holds.
@@ -1566,6 +1639,20 @@ pub fn instance_profile_arn(path: &str, instance_profile_name: &str) -> String {
         "iam",
         "",
         &format!("instance-profile{path}{instance_profile_name}"),
+    )
+}
+
+/// The ARN of an IAM server certificate:
+/// `arn:aws:iam::<account>:server-certificate<path><name>`.
+///
+/// Built the same way [`user_arn`] is, from the `server-certificate` resource type:
+/// `path` already begins and ends with `/` (the model's `pathType` pattern), and IAM is a
+/// global service, so the region segment is empty.
+pub fn server_certificate_arn(path: &str, server_certificate_name: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("server-certificate{path}{server_certificate_name}"),
     )
 }
 

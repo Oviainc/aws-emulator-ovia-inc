@@ -9591,12 +9591,17 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "pkcs1",
+ "pkcs8 0.10.2",
+ "rcgen",
  "roxmltree",
+ "sec1 0.7.3",
  "serde_json",
  "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

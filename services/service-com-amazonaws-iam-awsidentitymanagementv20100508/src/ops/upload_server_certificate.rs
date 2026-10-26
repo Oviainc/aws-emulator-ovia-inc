@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadServerCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadServerCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadServerCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a server certificate under the account: the certificate is named by its
+//! `ServerCertificateName`, its ARN is derived from that name and its path, the PEM body
+//! it carries is what its expiration is read from, and the record this writes is what
+//! `GetServerCertificate` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +141,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::pkcs8::der::Decode;
+use ::x509_cert::der::DecodePem;
+use ::x509_cert::spki::{ObjectIdentifier, SubjectPublicKeyInfoOwned};
+// The modelled `ServerCertificate*` shapes come in through the glob above, so the X.509
+// object is named apart from them.
+use ::x509_cert::Certificate as X509Certificate;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -219,18 +222,288 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadServerCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadServerCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadServerCertificate"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global,
+        // so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UploadServerCertificateErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The contents of the public key certificate in PEM-encoded format"
+        // (`$CertificateBody`): a body that is not one is "malformed", and the expiration
+        // the metadata reports is read out of the certificate itself rather than chosen
+        // here. Nothing refuses a certificate whose validity window has already lapsed —
+        // that window is REPORTED, through `Expiration`, which is what a client reads to
+        // see it has.
+        let certificate =
+            X509Certificate::from_pem(input.certificate_body.as_bytes()).map_err(|_| {
+                malformed(
+                    "CertificateBody",
+                    "the value must be one PEM-encoded X.509 certificate",
+                )
+            })?;
+        // "Typically a concatenation of the PEM-encoded public key certificates of the
+        // chain" (`$CertificateChain`), so a chain is one or more certificates in the same
+        // encoding.
+        if let Some(chain) = input.certificate_chain.as_deref() {
+            let chain = X509Certificate::load_pem_chain(chain.as_bytes()).map_err(|_| {
+                malformed(
+                    "CertificateChain",
+                    "the value must be PEM-encoded X.509 certificates",
+                )
+            })?;
+            if chain.is_empty() {
+                return Err(malformed(
+                    "CertificateChain",
+                    "the value must carry at least one PEM-encoded X.509 certificate",
+                )
+                .into());
+            }
+        }
+        // "The contents of the private key in PEM-encoded format" (`$PrivateKey`), which
+        // has to be the private key of the certificate's own public key: a key that is not
+        // is the modelled `KeyPairMismatchException`. The key is read here and never
+        // stored — see [`crate::state::ServerCertificateRecord`].
+        check_key_pair(
+            &input.private_key,
+            &certificate.tbs_certificate.subject_public_key_info,
+        )?;
+        // "The date on which the certificate is set to expire"
+        // (`ServerCertificateMetadata$Expiration`) is the certificate's own `notAfter`
+        // (RFC 5280 section 4.1.2.5), which X.509 states in whole seconds. The decoder
+        // admits no instant before the Unix epoch, so a certificate whose `notAfter` is
+        // earlier never reaches this line: it is refused as malformed above.
+        let expiration = ::aws_smithy_types::DateTime::from_secs(
+            certificate
+                .tbs_certificate
+                .validity
+                .not_after
+                .to_unix_duration()
+                .as_secs() as i64,
+        );
+
+        // "This parameter is optional. If it is not included, it defaults to a slash (/)"
+        // (`$Path`) — the default every IAM entity's path takes.
+        let path = input
+            .path
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter" — and "if any one of the tags is
+        // invalid or if you exceed the allowed maximum number of tags, then the entire
+        // request fails and the resource is not created" (`$Tags`), which is why this is
+        // checked before anything is written.
+        let supplied_tags = input.tags.unwrap_or_default();
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(UploadServerCertificateErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+        // A key repeated inside one request settles on its LAST value, the rule every tag
+        // call in this service follows, and the certificate's tags are held sorted by key
+        // because "the returned list of tags is sorted by tag key" (`$Tags`).
+        let Some(mut tags) = crate::state::merge_tags(None, supplied_tags) else {
+            return Err(UploadServerCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for TagsPerResource: {}",
+                        crate::state::MAX_TAGS_PER_ENTITY
+                    )),
+                },
+            )
+            .into());
+        };
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+        let tags = (!tags.is_empty()).then_some(tags);
+
+        let mut store = state.lock();
+
+        // The certificate is named by its `ServerCertificateName`, which is unique within
+        // the account and not distinguished by case, so a second upload under a held name
+        // "attempted to create a resource that already exists"
+        // (`EntityAlreadyExistsException`) and is refused, leaving the held certificate as
+        // it stands.
+        let certificate_key = crate::state::name_key(&input.server_certificate_name);
+        if store.server_certificates.contains_key(&certificate_key) {
+            return Err(
+                UploadServerCertificateErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "The Server Certificate with name {} already exists.",
+                            input.server_certificate_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // An account holds a bounded number of server certificates, so a caller cannot
+        // grow the account without limit; past the quota IAM refuses the upload.
+        if store.server_certificates.len() >= crate::state::MAX_SERVER_CERTIFICATES_PER_ACCOUNT {
+            return Err(UploadServerCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for ServerCertificatesPerAccount: {}",
+                        crate::state::MAX_SERVER_CERTIFICATES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let metadata = ServerCertificateMetadata {
+            arn: crate::state::server_certificate_arn(&path, &input.server_certificate_name),
+            path,
+            server_certificate_name: input.server_certificate_name,
+            // "The stable and unique string identifying the server certificate"
+            // (`ServerCertificateMetadata$ServerCertificateId`): minted once, here, and
+            // reported unchanged by every later read.
+            server_certificate_id: store.next_server_certificate_id(),
+            // "The date when the server certificate was uploaded" (`$UploadDate`).
+            upload_date: Some(crate::state::now()),
+            expiration: Some(expiration),
+        };
+        store.server_certificates.insert(
+            certificate_key,
+            crate::state::ServerCertificateRecord {
+                metadata: metadata.clone(),
+                certificate_body: input.certificate_body,
+                certificate_chain: input.certificate_chain,
+                tags: tags.clone(),
+            },
+        );
+
+        // The response reports the stored record, so a caller sees exactly what a later
+        // `GetServerCertificate` reports.
+        Ok(UploadServerCertificateOutput {
+            server_certificate_metadata: Some(metadata),
+            tags,
+        })
     }
+}
+
+/// The modelled refusal of material that is not what its member says it is: "the
+/// certificate was malformed … the error message describes the specific error"
+/// (`MalformedCertificateException`), worded as this service words the refusal of an input
+/// member's value — `Invalid <member>: <what the value has to be>`, the form
+/// `CreateOpenIDConnectProvider`'s `InvalidInputException` uses.
+fn malformed(member: &str, reason: &str) -> UploadServerCertificateErrorModeled {
+    UploadServerCertificateErrorModeled::MalformedCertificateException(
+        MalformedCertificateException {
+            message: Some(format!("Invalid {member}: {reason}")),
+        },
+    )
+}
+
+/// Refuse a `PrivateKey` that is not an unencrypted PEM-encoded private key of the
+/// certificate's own public key.
+///
+/// The key is read as the PKCS#8 `PrivateKeyInfo`, PKCS#1 `RSAPrivateKey` or SEC1
+/// `ECPrivateKey` its PEM label frames (RFC 7468 sections 10, 11 and 13), and the public
+/// key it belongs to is compared with the certificate's `SubjectPublicKeyInfo`: a key of
+/// another algorithm, or of another key pair of the same algorithm, is the modelled
+/// `KeyPairMismatchException` ("the public key certificate and the private key do not
+/// match"). An encrypted key carries a PEM label of its own ("ENCRYPTED PRIVATE KEY") and
+/// is malformed for this purpose, because its structure cannot be read.
+///
+/// Nothing here derives a public key from a secret scalar — no key material leaves this
+/// function, and none is stored — so a key whose structure carries no public key at all
+/// (a version-1 PKCS#8 document, or an `ECPrivateKey` omitting the optional field of SEC1
+/// appendix C.4, for an algorithm beyond RSA) is checked on its algorithm alone.
+fn check_key_pair(
+    private_key: &str,
+    spki: &SubjectPublicKeyInfoOwned,
+) -> Result<(), UploadServerCertificateError> {
+    let unreadable = || {
+        malformed(
+            "PrivateKey",
+            "the value must be one unencrypted PEM-encoded private key",
+        )
+    };
+    let mismatched = || {
+        UploadServerCertificateErrorModeled::KeyPairMismatchException(KeyPairMismatchException {
+            message: Some(
+                "The public key certificate and the private key do not match.".to_string(),
+            ),
+        })
+    };
+
+    let (label, document) =
+        ::pkcs8::SecretDocument::from_pem(private_key).map_err(|_| unreadable())?;
+    // The public key the document itself carries, when it carries one: RFC 5958 section 2
+    // lets a version-2 `OneAsymmetricKey` state the public key of the pair beside the
+    // private one, for ANY algorithm.
+    let (algorithm, key, carried_public) = match label {
+        "PRIVATE KEY" => {
+            let info =
+                ::pkcs8::PrivateKeyInfo::try_from(document.as_bytes()).map_err(|_| unreadable())?;
+            (info.algorithm.oid, info.private_key, info.public_key)
+        }
+        "RSA PRIVATE KEY" => (oid::RSA_ENCRYPTION, document.as_bytes(), None),
+        "EC PRIVATE KEY" => (oid::EC_PUBLIC_KEY, document.as_bytes(), None),
+        _ => return Err(unreadable().into()),
+    };
+
+    if algorithm != spki.algorithm.oid {
+        return Err(mismatched().into());
+    }
+    let Some(public) = spki.subject_public_key.as_bytes() else {
+        return Err(malformed(
+            "CertificateBody",
+            "the certificate must carry a whole number of public key bytes",
+        )
+        .into());
+    };
+    // A document that states its own public key is compared directly, so a key of another
+    // pair is refused whatever algorithm the pair is of.
+    if carried_public.is_some_and(|carried| carried != public) {
+        return Err(mismatched().into());
+    }
+    if algorithm == oid::RSA_ENCRYPTION {
+        // RFC 8017 appendix A.1: an `RSAPrivateKey` repeats the modulus and the public
+        // exponent of the `RSAPublicKey` it belongs to, verbatim.
+        let public = ::pkcs1::RsaPublicKey::from_der(public).map_err(|_| {
+            malformed(
+                "CertificateBody",
+                "the certificate must carry an RSA public key for its RSA algorithm",
+            )
+        })?;
+        let private = ::pkcs1::RsaPrivateKey::from_der(key).map_err(|_| unreadable())?;
+        if private.modulus.as_bytes() != public.modulus.as_bytes()
+            || private.public_exponent.as_bytes() != public.public_exponent.as_bytes()
+        {
+            return Err(mismatched().into());
+        }
+    } else if algorithm == oid::EC_PUBLIC_KEY {
+        // SEC1 appendix C.4: an `ECPrivateKey` MAY carry the public point it belongs to.
+        let private = ::sec1::EcPrivateKey::from_der(key).map_err(|_| unreadable())?;
+        if private.public_key.is_some_and(|carried| carried != public) {
+            return Err(mismatched().into());
+        }
+    }
+    Ok(())
+}
+
+/// The object identifiers this operation names in the certificate and the private key it
+/// reads: RSA keys from RFC 8017 appendix C (`1.2.840.113549.1.1.1`) and elliptic-curve
+/// keys from RFC 5480 section 2.1.1 (`1.2.840.10045.2.1`).
+mod oid {
+    use super::ObjectIdentifier;
+
+    pub const RSA_ENCRYPTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    pub const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 }

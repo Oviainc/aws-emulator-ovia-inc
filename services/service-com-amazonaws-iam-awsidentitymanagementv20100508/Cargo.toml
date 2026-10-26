@@ -26,6 +26,17 @@ roxmltree = "0.20"
 # timestamp declares, which the metadata document's `validUntil` is read through.
 service-common = { path = "../common" }
 tracing = { workspace = true }
+# Reads the X.509 certificate an `UploadServerCertificate` request carries: the instant it
+# expires, and whether the body is a certificate at all.
+x509-cert = "0.2"
+# Reads the PEM framing and PKCS#8 structure of the private key that upload carries, so an
+# encrypted or foreign key is refused rather than stored.
+pkcs8 = { version = "0.10", features = ["pem", "std"] }
+# The PKCS#1 RSA key structures, for matching an uploaded private key with the public key
+# in its certificate.
+pkcs1 = "0.7"
+# The SEC1 elliptic-curve private key structure, for that same match on an EC key pair.
+sec1 = "0.7"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +44,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Generates the real certificates and key pairs the server-certificate tests feed the
+# service, independently of the DER this crate reads.
+rcgen = "0.13"
 
 [lints]
 workspace = true
