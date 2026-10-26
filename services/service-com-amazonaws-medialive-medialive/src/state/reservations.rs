@@ -16,6 +16,12 @@
 //! itself holds is what the purchase CHOSE: how many resources, the name, when
 //! the lease starts, the renewal settings and the tags.
 //!
+//! Two of those the account can change afterwards — the name and the renewal
+//! settings, which are the only two settings `UpdateReservation` ("Update
+//! reservation") carries beside the id — through
+//! [`ComAmazonawsMedialiveMedialiveState::update_reservation`]. Nothing else
+//! moves: a reservation reserves what it was bought to reserve.
+//!
 //! ## What the clock owns
 //!
 //! A reservation's `State` is DERIVED on every read rather than stored. The lease
@@ -196,6 +202,23 @@ pub struct NewReservation {
     pub start: SystemTime,
     pub renewal_settings: Option<RenewalSettings>,
     pub tags: HashMap<String, String>,
+}
+
+/// What one `UpdateReservation` request asks to change about a reservation the
+/// account already holds: the two settings its input carries beside the id.
+///
+/// One struct rather than a row of positional arguments on
+/// [`ComAmazonawsMedialiveMedialiveState::update_reservation`], so a caller
+/// cannot pass one setting where the other belongs, and so adding a settable
+/// member later changes one type rather than every call site.
+#[derive(Debug, Clone, Default)]
+pub struct ReservationUpdate {
+    /// `Name`, "Name of the reservation": `Some` replaces the stored name,
+    /// `None` leaves it as it was.
+    pub name: Option<String>,
+    /// `RenewalSettings`, "Renewal settings for the reservation": `Some`
+    /// replaces the stored settings, `None` leaves them as they were.
+    pub renewal_settings: Option<RenewalSettings>,
 }
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_reservation`] stored
@@ -385,5 +408,35 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// none with that id.
     pub fn reservation_description(&self, id: &str, now: SystemTime) -> Option<Reservation> {
         Some(self.reservations.get(id)?.reservation(now))
+    }
+
+    /// Apply `update` to the reservation `id` names and answer it as of `now`,
+    /// or `None` when the account holds none with that id — in which case
+    /// nothing is written.
+    ///
+    /// A setting the update CARRIES replaces the stored one; a setting it omits
+    /// leaves that one exactly as it was, so an update changes only what the
+    /// request named. Only the settings a purchase chose are reachable this way:
+    /// everything a reservation reports about the thing it reserves stays read
+    /// from the catalog entry it was bought from, and its lease and `State` stay
+    /// the clock's.
+    ///
+    /// The renewal settings go through the SAME normalisation a purchase's do,
+    /// so a reservation reports an automatic-renewal status however it was last
+    /// written.
+    pub fn update_reservation(
+        &mut self,
+        id: &str,
+        update: ReservationUpdate,
+        now: SystemTime,
+    ) -> Option<Reservation> {
+        let record = self.reservations.get_mut(id)?;
+        if let Some(name) = update.name {
+            record.name = Some(name);
+        }
+        if let Some(settings) = update.renewal_settings {
+            record.renewal_settings = renewal_settings(Some(settings));
+        }
+        Some(record.reservation(now))
     }
 }
