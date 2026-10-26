@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectStackResourceDrift
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectStackResourceDrift`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectStackResourceDrift::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: checks ONE resource of a stack for drift, there and then. The resource the
+//! request names is read from the service that OWNS it and compared with the configuration
+//! the stack's template declared for it (see [`crate::state::drift`]) — the same comparison
+//! `DetectStackDrift` runs across a whole stack, over one resource — and what that check
+//! found is recorded on the resource, so `DescribeStackResourceDrifts` and the resource
+//! reads report it afterwards, and answered directly as this operation's
+//! `StackResourceDrift`. A `StackName` that resolves to no stack of the Region, and a
+//! `LogicalResourceId` the stack has not deployed, are refused with `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +144,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectStackResourceDrift` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectStackResourceDriftErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectStackResourceDrift"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack whose resource could be
+            // checked, so this answers 501 rather than a drift record nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DetectStackResourceDrift",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // The store lock is taken for the resolution and RELEASED at the end of this block:
+        // the read that asks the owning service what the resource IS now runs after it, and
+        // that read reaches another service's own handler.
+        let (stack_id, stack_region, resource) = {
+            let mut store = state.lock();
+            store.settle(now);
+
+            let region = crate::state::request_region(ctx.parts());
+            let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(&input.stack_name),
+                )
+            })?;
+            // "The logical name of the resource for which to return drift information": one
+            // resource of that stack, named by the logical id its template declared it
+            // under. A logical id the stack has not deployed names no resource, so the
+            // request is refused rather than answered with a record about nothing — the same
+            // refusal every other read of one resource of a stack answers for it.
+            let deployed = stack
+                .resources
+                .iter()
+                .find(|deployed| deployed.resource.logical_id == input.logical_resource_id)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::resource_does_not_exist(
+                            &input.logical_resource_id,
+                            &input.stack_name,
+                        ),
+                    )
+                })?;
+            (
+                stack.stack_id.clone(),
+                stack.region.clone(),
+                deployed.resource.clone(),
+            )
+        };
+
+        // The comparison itself: one read from the service that owns the resource, in the
+        // stack's own Region — where its resources live.
+        let detected =
+            crate::state::drift::detect(ctx, &stack_region, ::std::slice::from_ref(&resource))
+                .await;
+
+        let mut store = state.lock();
+        // What the check FOUND goes onto the resource it was carried out over, so every
+        // later read of that resource reports this check.
+        for result in &detected.results {
+            store.apply_resource_drift_result(&stack_id, now, result);
+        }
+
+        // Answered from what was just persisted, so this record and the one
+        // `DescribeStackResourceDrifts` reports for the resource are the same record.
+        let region = crate::state::request_region(ctx.parts());
+        let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        })?;
+        let deployed = stack
+            .resources
+            .iter()
+            .find(|deployed| deployed.resource.logical_id == input.logical_resource_id)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::resource_does_not_exist(
+                        &input.logical_resource_id,
+                        &input.stack_name,
+                    ),
+                )
+            })?;
+
+        Ok(DetectStackResourceDriftOutput {
+            stack_resource_drift: crate::state::resource_drift_record(&stack.stack_id, deployed, now),
+        })
     }
 }

@@ -35,6 +35,8 @@ mod cognito_resource_types;
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]
 mod cross_stack_imports;
+#[path = "all/detect_resource_drift.rs"]
+mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
 #[path = "all/dynamic_references.rs"]

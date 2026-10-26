@@ -3581,27 +3581,56 @@ impl ComAmazonawsCloudformationCloudformationState {
         stack_drift_status: &str,
         results: &[drift::ResourceDrift],
     ) {
+        {
+            let Some(stack) = self
+                .stacks
+                .iter_mut()
+                .find(|stack| stack.stack_id == stack_id)
+            else {
+                // The stack was deleted while its detection was running: there is nothing
+                // left to report the result on, and the detection record keeps it.
+                return;
+            };
+            stack.drift_status = stack_drift_status.to_string();
+            stack.drift_last_check = Some(checked_at);
+        }
+        for result in results {
+            self.apply_resource_drift_result(stack_id, checked_at, result);
+        }
+    }
+
+    /// Record what a drift check found on ONE resource, on that resource.
+    ///
+    /// This is the per-resource half of [`Self::apply_drift_result`] on its own, and the
+    /// whole of what a check of a SINGLE resource may conclude: `Stack$DriftInformation` is
+    /// "the status of the stack's actual configuration compared to its expected template
+    /// configuration", a statement about every resource of the stack, so a check that looked
+    /// at one resource leaves it as the last check over the whole stack left it rather than
+    /// re-deciding it from the one resource it read.
+    ///
+    /// A `stack_id` or a logical id the store no longer holds records nothing: the resource
+    /// was deleted while the check was running, and there is nothing left to report on.
+    pub fn apply_resource_drift_result(
+        &mut self,
+        stack_id: &str,
+        checked_at: SystemTime,
+        result: &drift::ResourceDrift,
+    ) {
         let Some(stack) = self
             .stacks
             .iter_mut()
             .find(|stack| stack.stack_id == stack_id)
         else {
-            // The stack was deleted while its detection was running: there is nothing left
-            // to report the result on, and the detection record keeps it.
             return;
         };
-        stack.drift_status = stack_drift_status.to_string();
-        stack.drift_last_check = Some(checked_at);
-        for result in results {
-            if let Some(deployed) = stack
-                .resources
-                .iter_mut()
-                .find(|deployed| deployed.resource.logical_id == result.logical_id)
-            {
-                deployed.drift_status = result.status.clone();
-                deployed.drift_checked_at = Some(checked_at);
-                deployed.drift_detail = result.detail.clone();
-            }
+        if let Some(deployed) = stack
+            .resources
+            .iter_mut()
+            .find(|deployed| deployed.resource.logical_id == result.logical_id)
+        {
+            deployed.drift_status = result.status.clone();
+            deployed.drift_checked_at = Some(checked_at);
+            deployed.drift_detail = result.detail.clone();
         }
     }
 
@@ -5280,33 +5309,52 @@ pub fn stack_resource_drift_view(
     stack_id: &str,
     deployed: &DeployedResource,
 ) -> Option<crate::ops::types::StackResourceDrift> {
-    let detail = deployed.drift_detail.as_ref()?;
+    deployed.drift_detail.as_ref()?;
     let checked_at = deployed.drift_checked_at?;
-    Some(crate::ops::types::StackResourceDrift {
+    Some(resource_drift_record(stack_id, deployed, checked_at))
+}
+
+/// The same record for a resource a check was just carried out over, WHATEVER that check
+/// found — including a resource of a type no configuration is read for here, which carries
+/// the `NOT_CHECKED` status and so neither property structure and no differences
+/// ([`resource_drift_status::NOT_CHECKED`]: "any resources that do not currently support
+/// drift detection have a status of NOT_CHECKED").
+///
+/// It is the same construction [`stack_resource_drift_view`] reports, held in one place so
+/// the operation that checks ONE resource and the read that lists a stack's checked
+/// resources cannot report the same comparison differently. `checked_at` is the instant of
+/// the check being reported.
+pub fn resource_drift_record(
+    stack_id: &str,
+    deployed: &DeployedResource,
+    checked_at: SystemTime,
+) -> crate::ops::types::StackResourceDrift {
+    let detail = deployed.drift_detail.clone().unwrap_or_default();
+    crate::ops::types::StackResourceDrift {
         stack_id: stack_id.to_string(),
         logical_resource_id: deployed.resource.logical_id.clone(),
         physical_resource_id: physical_resource_id(&deployed.resource),
         physical_resource_id_context: None,
         resource_type: deployed.resource.resource_type.clone(),
-        expected_properties: detail.expected_properties.clone(),
-        actual_properties: detail.actual_properties.clone(),
+        expected_properties: detail.expected_properties,
+        actual_properties: detail.actual_properties,
         property_differences: non_empty(
             detail
                 .differences
-                .iter()
+                .into_iter()
                 .map(|difference| crate::ops::types::PropertyDifference {
-                    property_path: difference.property_path.clone(),
-                    expected_value: difference.expected_value.clone(),
-                    actual_value: difference.actual_value.clone(),
-                    difference_type: difference.difference_type.clone(),
+                    property_path: difference.property_path,
+                    expected_value: difference.expected_value,
+                    actual_value: difference.actual_value,
+                    difference_type: difference.difference_type,
                 })
                 .collect(),
         ),
         stack_resource_drift_status: deployed.drift_status.clone(),
         timestamp: timestamp(checked_at),
         module_info: None,
-        drift_status_reason: detail.reason.clone(),
-    })
+        drift_status_reason: detail.reason,
+    }
 }
 
 /// One JSON scalar as the single text an API member takes it as, or `None` for a
