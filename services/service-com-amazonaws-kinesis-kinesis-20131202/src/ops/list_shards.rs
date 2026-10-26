@@ -428,6 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (
                 store
                     .resolve_stream(
+                        now,
                         &region,
                         input.stream_name.as_deref(),
                         input.stream_arn.as_deref(),
@@ -479,7 +480,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 }
                 let stream = store
-                    .stream_by_arn(&region, &resume.stream_arn)
+                    .stream_by_arn(now, &region, &resume.stream_arn)
                     .filter(|stream| resume.names(stream))
                     .ok_or_else(|| not_found(&resume.stream_arn))?;
                 (stream, Some(resume.next_shard_id))

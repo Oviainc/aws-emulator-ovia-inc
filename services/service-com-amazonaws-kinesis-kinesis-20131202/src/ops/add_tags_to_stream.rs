@@ -227,6 +227,7 @@ fn assign_tags(
     // carries one and a request naming only that member names no stream.
     let stream = store
         .resolve_stream_mut(
+            now,
             region,
             input.stream_name.as_deref(),
             input.stream_arn.as_deref(),
