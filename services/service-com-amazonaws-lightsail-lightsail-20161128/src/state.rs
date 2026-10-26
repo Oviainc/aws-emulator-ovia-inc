@@ -11471,6 +11471,29 @@ impl DistributionBundleSpec {
     }
 }
 
+/// The bundles a `GetDistributionBundles` call reports out of `specs`: EVERY
+/// plan the catalog holds, retired ones included.
+///
+/// The request carries no member to select a slice with — unlike the bucket and
+/// database catalogs, which have an `includeInactive` flag — and
+/// `DistributionBundle$isActive` is what tells a caller which of the reported
+/// plans a new or existing distribution may be put on, so leaving a retired plan
+/// out would hide the flag's only subject.
+///
+/// The order is `specs`' own, so two reads answer identically. Taking the catalog
+/// as an argument is what lets the rule be exercised against a catalog that holds
+/// a retired plan, which the published one does not yet.
+pub fn distribution_bundles_from(specs: &[DistributionBundleSpec]) -> Vec<DistributionBundle> {
+    specs.iter().map(DistributionBundleSpec::view).collect()
+}
+
+/// The distribution bundles a `GetDistributionBundles` call reports:
+/// [`distribution_bundles_from`] over this service's published catalog,
+/// [`DISTRIBUTION_BUNDLE_SPECS`].
+pub fn distribution_bundles() -> Vec<DistributionBundle> {
+    distribution_bundles_from(DISTRIBUTION_BUNDLE_SPECS)
+}
+
 /// The distribution bundle `bundle_id` names — active or not, since a
 /// distribution already running on a retired plan still has to resolve — or
 /// `None` when this service publishes no such plan.

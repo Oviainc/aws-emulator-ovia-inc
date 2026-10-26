@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDistributionBundles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDistributionBundles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this service's published CDN price list: every distribution bundle
+//! [`crate::state::DISTRIBUTION_BUNDLE_SPECS`] holds, each carrying the monthly network
+//! transfer quota and monthly price that plan charges, and `isActive` saying whether a
+//! new or existing distribution may be put on it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDistributionBundles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A distribution bundle is service-wide published data, not a per-caller record: it is
+//! the same for every caller, and no operation in this service creates, changes or
+//! retires one. So the catalog lives beside this service's other published tables
+//! (instance bundles, bucket bundles, blueprint families, regions) in [`crate::state`],
+//! and this operation reads no stored resource and writes nothing: reporting it cannot
+//! change what a later caller sees.
+//!
+//! The request has no member to select a slice of the catalog with, so every plan is
+//! reported and `isActive` is what distinguishes them; `CreateDistribution` and
+//! `UpdateDistributionBundle` are what refuse a plan that is not active.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDistributionBundles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDistributionBundlesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDistributionBundles"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE: the modelled `InvalidInputException` documentation covers "Domain
+        // and distribution APIs" together and says to set the Region to us-east-1
+        // "to create, VIEW, or edit these resources", so reporting what a
+        // distribution can be put on is as restricted as creating one. Checked
+        // through the crate's one owner of that rule.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `GetDistributionBundlesRequest` is an empty structure and the catalog is
+        // service-wide published data (see this module's docs), so neither the store
+        // nor anything else about the request takes part in the answer.
+        let _ = (&input, &self.engine);
+
+        Ok(GetDistributionBundlesOutput {
+            bundles: Some(crate::state::distribution_bundles()),
+        })
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service does
+/// not: the modelled `InvalidInputException`, whose message states the rule the
+/// request broke.
+fn invalid(message: String) -> GetDistributionBundlesError {
+    GetDistributionBundlesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
