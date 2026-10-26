@@ -202,7 +202,9 @@
 //! generation rides a clock of its own — answered in flight and concluded
 //! [`generated_template::GENERATION_DELAY`] later — which is also what makes the modelled
 //! cap on CONCURRENT generations transient: it counts the records still in a pending or
-//! in-progress status, so it lifts as those conclude.
+//! in-progress status, so it lifts as those conclude. `DeleteGeneratedTemplate` removes a
+//! record outright — nothing in that feature reports a generated template that was deleted,
+//! so no read keeps one addressable the way a deleted stack's summary is kept.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};

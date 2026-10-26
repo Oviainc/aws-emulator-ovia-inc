@@ -50,6 +50,15 @@
 //! template of its last COMPLETE generation in [`StoredGeneratedTemplate::completed`], which
 //! [`StoredGeneratedTemplate::settle`] snapshots as it materialises that completion, and a
 //! record that has never completed renders the empty template.
+//!
+//! ## Deleting one
+//!
+//! `DeleteGeneratedTemplate` removes the record it addresses from the store, so the name and
+//! the quotas it held are free again and no read answers for it afterwards: nothing in this
+//! feature reports a generated template that was deleted, unlike a deleted stack, whose
+//! summary and template stay addressable for a retention window. A record whose generation
+//! is still in flight ([`StoredGeneratedTemplate::is_in_flight`]) is refused instead, which
+//! is the other case the modelled `ConcurrentResourcesLimitExceededException` documents.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -110,8 +119,8 @@ pub const MAX_CONCURRENT_GENERATIONS: usize = 5;
 /// A caller chooses how many it creates, so the store bounds them by count. Chosen, like
 /// every count in [`crate::state`] that no published quota fixes; it sits far above any
 /// client workflow. What frees a record is the caller deleting it, the way a stack's
-/// quota is freed by deleting the stack — `DeleteGeneratedTemplate` is still a scaffold
-/// stub with its own issue, so nothing reclaims a record yet.
+/// quota is freed by deleting the stack: `DeleteGeneratedTemplate` removes the record it
+/// addresses, so the name and this quota it held are free again.
 pub const MAX_GENERATED_TEMPLATES: usize = 100;
 
 /// The most generated templates this store holds across EVERY Region together.

@@ -55,6 +55,8 @@ mod generated_physical_names;
 mod generated_template_body;
 #[path = "all/generated_template_coverage.rs"]
 mod generated_template_coverage;
+#[path = "all/generated_template_deletion.rs"]
+mod generated_template_deletion;
 #[path = "all/generated_template_reads.rs"]
 mod generated_template_reads;
 #[path = "all/generated_templates.rs"]

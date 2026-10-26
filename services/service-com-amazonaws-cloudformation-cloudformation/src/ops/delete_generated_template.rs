@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGeneratedTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGeneratedTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the generated-template record its `GeneratedTemplateName` addresses in the
+//! account and Region the request is signed for, so nothing addresses that generated
+//! template afterwards: `DescribeGeneratedTemplate`, `GetGeneratedTemplate` and
+//! `ListGeneratedTemplates` all stop answering for it, its name is free to be created under
+//! again and the quotas its record counted against are freed with it
+//! ([`crate::state::generated_template`] holds the record and those quotas).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGeneratedTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A generation that is still in flight is not the caller's to discard — that is the case
+//! the modelled `ConcurrentResourcesLimitExceededException` documents beside its quota — and
+//! an address no record of the request's Region holds is refused
+//! `GeneratedTemplateNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGeneratedTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGeneratedTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGeneratedTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no generated template to delete, and
+            // nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteGeneratedTemplate",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Settled FIRST, so the in-flight refusal below is about the generations really
+        // still running at this instant rather than ones the clock has already concluded.
+        store.settle(::std::time::SystemTime::now());
+
+        // "The name or Amazon Resource Name (ARN) of a generated template": either address
+        // resolves the record, and only within the Region the request is signed for.
+        let template = store
+            .resolve_generated_template(&region, &input.generated_template_name)
+            .ok_or_else(|| {
+                DeleteGeneratedTemplateErrorModeled::GeneratedTemplateNotFoundException(
+                    GeneratedTemplateNotFoundException {
+                        message: Some(crate::state::generated_template::does_not_exist(
+                            &input.generated_template_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // "This error is also returned if a generated template that is in an InProgress or
+        // Pending status is attempted to be updated or deleted": a generation still in
+        // flight is refused, and because the refusal keys on a status the clock retires, it
+        // lifts on its own once that generation concludes. The message opens with the
+        // documented sentence of this error class — the same one `create_generated_template`
+        // answers for the quota itself — and then names the record this request addressed
+        // and the status the store holds it in.
+        if template.is_in_flight() {
+            return Err(
+                DeleteGeneratedTemplateErrorModeled::ConcurrentResourcesLimitExceededException(
+                    ConcurrentResourcesLimitExceededException {
+                        message: Some(format!(
+                            "No more than {} generated templates can be in an InProgress or \
+                             Pending status at one time. Generated template {} is in {} \
+                             status",
+                            crate::state::generated_template::MAX_CONCURRENT_GENERATIONS,
+                            template.generated_template_name,
+                            template.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record IS the generated template, so the deletion removes it: unlike a deleted
+        // stack — whose summary, template and resources CloudFormation documents keeping for
+        // a retention window — nothing in this feature reports a generated template that was
+        // deleted, so no read keeps one addressable and the name and the quota its record
+        // held are free again.
+        let generated_template_id = template.generated_template_id.clone();
+        store
+            .generated_templates
+            .retain(|candidate| candidate.generated_template_id != generated_template_id);
+
+        Ok(DeleteGeneratedTemplateOutput)
     }
 }
