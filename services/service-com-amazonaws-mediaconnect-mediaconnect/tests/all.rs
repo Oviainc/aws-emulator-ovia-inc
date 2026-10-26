@@ -167,3 +167,5 @@ mod router_network_interface_listing;
 mod router_input_listing;
 #[path = "all/create_router_output_request_bounds.rs"]
 mod create_router_output_request_bounds;
+#[path = "all/get_router_output.rs"]
+mod get_router_output;
