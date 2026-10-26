@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports every order of the region the request is addressed to,
+//! narrowed by the Outpost filter the caller sent, in creation order, cut into pages
+//! of at most `MaxResults` with the modelled `NextToken` the next page resumes from.
+//! A read: the only thing it writes is the order progress the clock has already made
+//! due, which every report of an order materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOrders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrdersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrders"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOrdersErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // This service is regional, so "the Outpost orders for your Amazon Web
+        // Services account" are the orders of the region the request is addressed to:
+        // an order belongs to the region it was placed in and to no other, so a region
+        // nothing was ordered in lists nothing. Every order this emulator holds was
+        // placed by this account, so that inventory is exactly the account's orders.
+        let region = crate::state::request_region(ctx.parts());
+        // The Outpost the caller narrowed to, if any. The filter is modelled as an
+        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN and
+        // both name the same stored Outpost.
+        let outpost_filter = match input
+            .outpost_identifier_filter
+            .as_deref()
+            .filter(|identifier| !identifier.is_empty())
+        {
+            Some(identifier) => Some(crate::state::resolve_outpost_id(identifier).ok_or_else(
+                || {
+                    ListOrdersErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::outpost_identifier_filter_pattern_report()),
+                    })
+                },
+            )?),
+            None => None,
+        };
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page — the rule every
+        // other list in this service applies to theirs.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::ORDER_PAGE, token).ok_or_else(
+                    || {
+                        ListOrdersErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report(Self::NAME)),
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // Report the status each order holds NOW: an order submitted a moment ago is
+        // still being prepared, and the move past that falls due on the clock, so
+        // every transition already owed is materialised before the records are read —
+        // exactly as `GetOrder` does, so a list and a read never disagree about one
+        // order's status.
+        store.settle_orders();
+        let (orders, next_token) = crate::state::page(
+            crate::state::ORDER_PAGE,
+            store
+                .orders_in(&region)
+                .filter(|record| matches_outpost(record, outpost_filter.as_deref()))
+                .map(|record| (record.sequence, order_summary(&record.order))),
+            after,
+            size,
+        );
+
+        Ok(ListOrdersOutput {
+            // The orders of this region that match the filter, which may be none at
+            // all.
+            orders: Some(orders),
+            next_token,
+        })
     }
+}
+
+/// Whether a stored order satisfies the Outpost filter the caller sent.
+///
+/// The filter selects on the order's own `OutpostId` — the Outpost the order was
+/// placed against — and a filter the caller did not send narrows nothing. It is a
+/// filter and not an identifier the request is addressed to: it narrows the list the
+/// caller is reported, so one naming an Outpost that holds no order — including one
+/// this region does not hold at all — reports no order rather than failing, the rule
+/// every filtered list of this service selects by.
+fn matches_outpost(record: &crate::state::OrderRecord, outpost_filter: Option<&str>) -> bool {
+    outpost_filter.is_none_or(|outpost_id| record.order.outpost_id.as_deref() == Some(outpost_id))
+}
+
+/// The `OrderSummary` a stored order is reported as.
+///
+/// The modelled `OrderSummary` carries six of the eleven members the order's own read
+/// reports, each documented identically on both shapes — so a summary is the stored
+/// order's own value member for member, and a list can never say something about an
+/// order that a read of it denies. In place of the `LineItems` a read reports, a
+/// summary carries its seventh member, `LineItemCountsByStatus`, computed from exactly
+/// those stored line items ([`line_item_counts_by_status`]); the four remaining members
+/// a read carries (`QuoteIdentifier`, `QuoteOptionIdentifier`, `PaymentOption`,
+/// `PaymentTerm`) are the order's own purchase detail, which the model keeps on the
+/// read alone.
+fn order_summary(order: &Order) -> OrderSummary {
+    OrderSummary {
+        outpost_id: order.outpost_id.clone(),
+        order_id: order.order_id.clone(),
+        order_type: order.order_type.clone(),
+        status: order.status.clone(),
+        line_item_counts_by_status: order
+            .line_items
+            .as_deref()
+            .map(line_item_counts_by_status),
+        order_submission_date: order.order_submission_date,
+        order_fulfilled_date: order.order_fulfilled_date,
+    }
+}
+
+/// How many of an order's line items stand in each status: "the status of all line
+/// items in the order", as the modelled `OrderSummary$LineItemCountsByStatus`
+/// documents it.
+///
+/// The map is keyed by the modelled `LineItemStatus` an item holds and its value is
+/// the NUMBER OF LINE ITEMS holding it, so the counts sum to the order's line-item
+/// count however the statuses are spread. A status no item of the order holds is no
+/// key of the map — the modelled value type is `range(min: 1)`, so a count of zero is
+/// not a value this map can carry — and an item recorded with no status at all counts
+/// towards none.
+fn line_item_counts_by_status(items: &[LineItem]) -> std::collections::HashMap<String, i32> {
+    let mut counts: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for status in items.iter().filter_map(|item| item.status.as_deref()) {
+        *counts.entry(status.to_string()).or_insert(0) += 1;
+    }
+    counts
 }

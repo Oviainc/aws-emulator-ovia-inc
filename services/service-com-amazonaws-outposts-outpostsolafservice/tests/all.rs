@@ -51,6 +51,8 @@ mod get_site_address_reporting;
 mod order_cancellation;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
+#[path = "all/order_listing.rs"]
+mod order_listing;
 #[path = "all/orderable_instance_types.rs"]
 mod orderable_instance_types;
 #[path = "all/outpost_assets.rs"]

@@ -2503,6 +2503,13 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region_mut(&mut self.orders, region, order_id)
     }
 
+    /// Every order of `region`, in the store's creation order — what `ListOrders`
+    /// pages through. See [`RegionalRecord`], and [`Self::quotes_in`], which is the
+    /// same question asked of the other resource a region's inventory holds.
+    pub fn orders_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a OrderRecord> + 'a {
+        all_in_region(&self.orders, region)
+    }
+
     /// The hardware configuration this service publishes under the `SkuCode`
     /// `catalog_item_id`, or `None` for a code of that form it publishes nothing
     /// under — which this service holds no published hardware facts for.
@@ -4660,6 +4667,14 @@ pub const SITE_PAGE: &str = "sites";
 
 /// The stamp a `ListQuotes` page token carries. See [`OUTPOST_PAGE`].
 pub const QUOTE_PAGE: &str = "quotes";
+
+/// The stamp a `ListOrders` page token carries.
+///
+/// What it pages through is every order of one region, narrowed by its own Outpost
+/// filter, and an order carries a creation sequence of its own — so the boundary
+/// such a token names is a position in the store's creation order. See
+/// [`OUTPOST_PAGE`].
+pub const ORDER_PAGE: &str = "orders";
 
 /// The stamp a `ListOrderableInstanceTypes` page token carries. See [`OUTPOST_PAGE`].
 pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";
