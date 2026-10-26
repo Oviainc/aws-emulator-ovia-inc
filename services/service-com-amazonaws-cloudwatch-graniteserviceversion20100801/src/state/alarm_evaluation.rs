@@ -11,8 +11,11 @@
 //!
 //! The rule, as `PutMetricAlarm` and the CloudWatch alarm documentation state it:
 //!
-//! * the metric is aggregated into windows of `Period` seconds each, the newest ending at
-//!   the instant of the evaluation;
+//! * the metric is aggregated into periods of `Period` seconds each, ANCHORED at multiples of
+//!   the period — "CloudWatch aggregates all data points with time stamps that fall within
+//!   each one-hour period" — so which period a datapoint belongs to is decided by its own time
+//!   stamp and not by the instant the evaluation runs, the newest period being the one that
+//!   instant falls in;
 //! * each window yields one datapoint — the alarm's `Statistic` or `ExtendedStatistic` over
 //!   the datapoints in it — or no datapoint at all when the window holds none;
 //! * the evaluation looks over a RANGE of windows wider than `EvaluationPeriods`, and
@@ -98,7 +101,7 @@ pub const EVALUATION_DELAY_SECS: f64 = 0.5;
 /// evaluate.
 const MAX_EVALUATED_PERIODS: usize = 1_440;
 
-/// How much wider than the look-back the EVALUATION RANGE is: the span of windows an
+/// How much wider than the look-back the EVALUATION RANGE is: the span of periods an
 /// evaluation searches for the datapoints it evaluates.
 ///
 /// CloudWatch "attempts to retrieve a higher number of data points than the number specified
@@ -108,8 +111,13 @@ const MAX_EVALUATED_PERIODS: usize = 1_440;
 /// wider the range is depends on the period and the resolution and is not published as a
 /// number, so this factor is the emulator's own bounded choice: wide enough that a sparse
 /// series is evaluated on what it really published, and a fixed multiple of the look-back so
-/// the windows one evaluation folds stay bounded by it.
-const EVALUATION_RANGE_FACTOR: usize = 2;
+/// the periods one evaluation folds stay bounded by it.
+///
+/// The periods are anchored at multiples of the period, so the newest of them is the PARTIAL
+/// one the evaluation instant falls in: the range reaches one whole period further back than a
+/// span measured from that instant would, which is why this factor leaves room for one period
+/// more than the look-back plus the sparse-series margin.
+const EVALUATION_RANGE_FACTOR: usize = 3;
 
 /// The most action notifications the store holds waiting for delivery.
 ///
@@ -391,7 +399,7 @@ impl State {
             return None;
         }
         let threshold = alarm.threshold?;
-        let breaches = breach_test(alarm.comparison_operator.as_deref()?)?;
+        let comparison = comparison_of(alarm.comparison_operator.as_deref()?)?;
         let statistic = AlarmStatistic::of(alarm)?;
         let period = f64::from(alarm.period.filter(|period| *period >= 1)?);
         let evaluation_periods = usize::try_from(alarm.evaluation_periods?)
@@ -405,11 +413,14 @@ impl State {
         };
 
         // One pass over the series fills every window of the EVALUATION RANGE: window 0 is
-        // the `Period` seconds ending at the evaluation instant, window i the one before it,
-        // and the range reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
+        // the period the evaluation instant falls in, window i the period before it, and the
+        // range reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
         let range_periods = evaluation_periods.saturating_mul(EVALUATION_RANGE_FACTOR);
         let mut windows: Vec<Vec<&StoredDatum>> = vec![Vec::new(); range_periods];
         let series = self.metrics.get(&key);
+        // The period the evaluation instant falls in, as a count of whole periods since the
+        // epoch: the anchor every datapoint's window is measured against.
+        let current_period = (now_secs / period).floor();
         // The datapoints this fold is about to visit, charged before it visits them: this is
         // the factor that multiplies with the number of alarms one request evaluates.
         budget.charge_datapoints(series.map_or(0, Vec::len));
@@ -424,13 +435,18 @@ impl State {
             {
                 continue;
             }
+            // A datapoint belongs to the period its OWN time stamp falls in, so which window
+            // it is aggregated into is decided by the datapoint and not by the instant the
+            // evaluation runs — the same fold this store's readers make over a series
+            // ([`super::windows_of`]).
+            //
             // A datapoint may be stamped up to two hours ahead of now ("as much as 2 hours
             // after the current day and time", `PutMetricData`); it belongs to the newest
             // window, the one the evaluation instant falls in.
-            let age = (now_secs - datum.timestamp_secs).max(0.0);
-            let index = (age / period).floor();
+            let periods_back =
+                (current_period - (datum.timestamp_secs / period).floor()).max(0.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let index = index as usize;
+            let index = periods_back as usize;
             if let Some(window) = windows.get_mut(index) {
                 window.push(datum);
             }
@@ -452,7 +468,7 @@ impl State {
             evaluated.push(Evaluated {
                 window: Some(index),
                 value: Some(value),
-                datapoint: if breaches(value, threshold) {
+                datapoint: if (comparison.breaches)(value, threshold) {
                     Datapoint::Breaching
                 } else {
                     Datapoint::NotBreaching
@@ -521,6 +537,16 @@ impl State {
         } else {
             ALARM_STATE_OK
         };
+        // An evaluation that computes the state the alarm already reports changes nothing, so
+        // there is no transition to explain: the alarm keeps the reason it has rather than
+        // being given one that names a state as the state it moved from and to.
+        let old_state = alarm
+            .state_value
+            .as_deref()
+            .unwrap_or(ALARM_STATE_INSUFFICIENT_DATA);
+        if alarm.state_value.as_deref() == Some(state) {
+            return None;
+        }
         let counts = EvaluationCounts {
             breaching,
             present,
@@ -532,9 +558,12 @@ impl State {
             state,
             reason: state_reason(
                 state,
+                // The state the alarm reports now is the state this evaluation moves it FROM,
+                // which the sentence names beside the state it moves to.
+                old_state,
                 counts,
                 missing_data_arm(treat_missing),
-                alarm.comparison_operator.as_deref().unwrap_or_default(),
+                comparison.phrase,
                 threshold,
                 &cited_datapoints(&evaluated, now_secs, period),
             ),
@@ -572,17 +601,43 @@ impl State {
     }
 }
 
+/// What one `ComparisonOperator` means to an evaluation: the test it makes between a datapoint
+/// and the threshold, and the words an explanation states that test in.
+///
+/// The two live together so a reason can never word a comparison the evaluation did not make.
+#[derive(Debug, Clone, Copy)]
+struct Comparison {
+    /// Whether a datapoint BREACHES the threshold under this operator.
+    breaches: fn(f64, f64) -> bool,
+    /// How a `StateReason` reads the comparison: "… was <phrase> the threshold (<threshold>)",
+    /// and negated ("was not <phrase> …") for the state in which it did not hold.
+    phrase: &'static str,
+}
+
 /// The comparison one `ComparisonOperator` makes between a datapoint and the threshold, or
 /// `None` for the anomaly-detection band operators, which compare against a model this
 /// engine does not compute rather than against a static threshold.
-fn breach_test(comparison: &str) -> Option<fn(f64, f64) -> bool> {
+fn comparison_of(comparison: &str) -> Option<Comparison> {
     // The static-threshold members of the modelled `ComparisonOperator` enum
-    // (`smithy_query(query="shape",shape="ComparisonOperator")`).
+    // (`smithy_query(query="shape",shape="ComparisonOperator")`), each with the reading
+    // CloudWatch's own alarm explanations give it.
     match comparison {
-        "GreaterThanOrEqualToThreshold" => Some(|value, threshold| value >= threshold),
-        "GreaterThanThreshold" => Some(|value, threshold| value > threshold),
-        "LessThanThreshold" => Some(|value, threshold| value < threshold),
-        "LessThanOrEqualToThreshold" => Some(|value, threshold| value <= threshold),
+        "GreaterThanOrEqualToThreshold" => Some(Comparison {
+            breaches: |value, threshold| value >= threshold,
+            phrase: "greater than or equal to",
+        }),
+        "GreaterThanThreshold" => Some(Comparison {
+            breaches: |value, threshold| value > threshold,
+            phrase: "greater than",
+        }),
+        "LessThanThreshold" => Some(Comparison {
+            breaches: |value, threshold| value < threshold,
+            phrase: "less than",
+        }),
+        "LessThanOrEqualToThreshold" => Some(Comparison {
+            breaches: |value, threshold| value <= threshold,
+            phrase: "less than or equal to",
+        }),
         // "LessThanLowerOrGreaterThanUpperThreshold", "LessThanLowerThreshold" and
         // "GreaterThanUpperThreshold" compare against an anomaly detection band.
         _ => None,
@@ -683,9 +738,18 @@ fn plural(count: usize) -> (&'static str, &'static str) {
     }
 }
 
-/// The `StateReason` an evaluated state reports: the DATAPOINTS the evaluation graded, what it
-/// counted over them against what it needed — and, where a window held no datapoint of the
-/// metric at all, that the window was EMPTY and which missing-data arm was applied to it.
+/// The `StateReason` an evaluated state reports: the DATAPOINTS the evaluation graded, how many
+/// of them read the way the state says against the threshold, the minimum the transition needed
+/// and the transition itself — and, where a window held no datapoint of the metric at all, that
+/// the window was EMPTY and which missing-data arm was applied to it.
+///
+/// The sentence is the one CloudWatch publishes for an evaluated alarm:
+/// `Threshold Crossed: <n> out of the last <m> datapoints [<value> (<instant>), …] was|were
+/// [not] <comparison> the threshold (<threshold>) (minimum <k> datapoint(s) for <from> -> <to>
+/// transition).` for a graded state, and `Insufficient Data: <m> datapoint(s) was|were unknown.`
+/// for a state decided with nothing to grade. The state the alarm moved to decides whether the
+/// comparison is stated as it holds or negated, and the count is of the datapoints that read
+/// that way.
 ///
 /// The datapoints are NAMED, not just counted ([`cited_datapoints`]): the explanation of a
 /// state says which values decided it and when each was measured, so a reader can tell the
@@ -700,10 +764,11 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// Built from the evaluation rather than from any request: the text states the datapoints, the
 /// counts, the comparison and the threshold the alarm is configured with. Inside the modelled
 /// `@length 0..1023` of `StateReason` for every alarm, because the only variable parts are
-/// four counts, an operator name of at most 41 characters, one number, and a datapoint list
-/// bounded by [`MAX_CITED_DATAPOINT_CHARS`].
+/// four counts, two state names, a comparison reading of at most 24 characters, one number, and
+/// a datapoint list bounded by [`MAX_CITED_DATAPOINT_CHARS`].
 fn state_reason(
     state: &str,
+    old_state: &str,
     counts: EvaluationCounts,
     arm: Option<&str>,
     comparison: &str,
@@ -749,18 +814,31 @@ fn state_reason(
         None => String::new(),
     };
     if state == ALARM_STATE_ALARM {
+        // The comparison HELD often enough, so the sentence states it as it reads and counts
+        // the datapoints it held for.
         return format!(
             "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} \
-             satisfied {comparison} with the threshold ({threshold}); {required} datapoints \
-             must for the alarm to be in ALARM state.{substituted_clause}"
+             {} {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
+            plural(breaching).1,
+            transition_minimum(required, old_state, state)
         );
     }
-    // The alarm is in OK, so the comparison did not hold often enough.
+    // The alarm is in OK, so the comparison did not hold: the sentence states its NEGATION and
+    // counts the datapoints that read that way.
+    let cleared = present.saturating_sub(breaching);
     format!(
-        "Threshold Crossed: {breaching} out of the last {present} datapoints{cited} satisfied \
-         {comparison} with the threshold ({threshold}), fewer than the {required} datapoints \
-         required for the alarm to be in ALARM state.{substituted_clause}"
+        "Threshold Crossed: {cleared} out of the last {present} datapoints{cited} {} not \
+         {comparison} the threshold ({threshold}) ({}).{substituted_clause}",
+        plural(cleared).1,
+        transition_minimum(required, old_state, state)
     )
+}
+
+/// The clause a graded reason closes with: how many breaching datapoints the transition needed
+/// and which transition it was — `minimum 1 datapoint for OK -> ALARM transition`.
+fn transition_minimum(required: usize, old_state: &str, state: &str) -> String {
+    let (datapoints_suffix, _) = plural(required);
+    format!("minimum {required} datapoint{datapoints_suffix} for {old_state} -> {state} transition")
 }
 
 /// The most characters the datapoint list a `StateReason` cites may take.
@@ -774,7 +852,7 @@ fn state_reason(
 const MAX_CITED_DATAPOINT_CHARS: usize = 700;
 
 /// The datapoints an evaluation GRADED, newest first, each as the value the statistic took over
-/// its window and the instant that window ends: ` [137.0 (2026-10-25T02:02:00Z), …]`.
+/// its window and the instant that window ends: ` [137.0 (25/10/26 02:02:00), …]`.
 ///
 /// Empty when the evaluation graded no real datapoint at all — a slot the missing-data
 /// treatment substituted stands for a window that held nothing, so there is no measured value
@@ -786,7 +864,7 @@ fn cited_datapoints(evaluated: &[Evaluated], now_secs: f64, period: f64) -> Stri
         let (Some(index), Some(value)) = (slot.window, slot.value) else {
             continue;
         };
-        let entry = match super::rfc3339(window_end(now_secs, index, period)) {
+        let entry = match reason_instant(window_start(now_secs, index, period)) {
             Some(at) => format!("{} ({at})", decimal_text(value)),
             None => decimal_text(value),
         };
@@ -804,12 +882,42 @@ fn cited_datapoints(evaluated: &[Evaluated], now_secs: f64, period: f64) -> Stri
     format!(" [{cited}]")
 }
 
-/// The instant the `index`th window back from the evaluation instant ENDS: window 0 ends at
-/// the evaluation instant itself, and each window before it a `period` earlier.
-fn window_end(now_secs: f64, index: usize, period: f64) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
-    let windows_back = index as f64;
-    now_secs - windows_back * period
+/// The instant the `index`th period back from the one the evaluation instant falls in BEGINS,
+/// which is the time stamp a datapoint aggregated out of that period carries.
+///
+/// The periods are the ones this store's readers fold a series into, so the start of one is
+/// the shared [`super::window_start`] measured from the period the evaluation instant falls in:
+/// one definition of a period's start serves the alarm evaluator and the metric readers.
+fn window_start(now_secs: f64, index: usize, period: f64) -> f64 {
+    let current_period_start = (now_secs / period).floor() * period;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let periods_back = index as i64;
+    super::window_start(current_period_start, -periods_back, period)
+}
+
+/// The instant a graded datapoint is named by, in the form an alarm explanation writes one:
+/// the day, the month and the last two digits of the year, then the time of day in UTC to the
+/// second (`25/10/26 17:40:25`).
+///
+/// The calendar fields come from the modelled timestamp type's own rendering
+/// ([`super::rfc3339`]) and are only re-ordered here, so no second date implementation lives
+/// in this crate and an instant a sentence names is the instant a document reports. `None` for
+/// an instant that type cannot render.
+fn reason_instant(secs: f64) -> Option<String> {
+    /// How many digits of the year the form writes.
+    const YEAR_DIGITS: usize = 2;
+
+    let rendered = super::rfc3339(secs)?;
+    let (date, time) = rendered.split_once('T')?;
+    let mut fields = date.split('-');
+    let year = fields.next()?;
+    let month = fields.next()?;
+    let day = fields.next()?;
+    // Whole seconds: neither the fraction a timestamp may carry nor the zone suffix is part of
+    // the form.
+    let time = time.split('.').next()?.trim_end_matches('Z');
+    let year = year.get(year.len().saturating_sub(YEAR_DIGITS)..)?;
+    Some(format!("{day}/{month}/{year} {time}"))
 }
 
 /// One measured quantity as an explanation names it: a decimal that always carries a fraction,
@@ -822,8 +930,8 @@ fn decimal_text(value: f64) -> String {
 }
 
 /// The `StateReasonData` an evaluated state reports: the query the evaluation made and the
-/// datapoints it evaluated, newest first, each with the end of the window it came from — and
-/// no window at all for a slot the missing-data treatment filled.
+/// datapoints it evaluated, newest first, each with the start of the period it came from — and
+/// no period at all for a slot the missing-data treatment filled.
 ///
 /// "An explanation for the alarm state, in JSON format." (`MetricAlarm$StateReasonData`),
 /// bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be
@@ -864,8 +972,8 @@ fn state_reason_data(
             let mut window = Map::new();
             if let Some(index) = slot.window {
                 window.insert(
-                    "windowEndSeconds".to_string(),
-                    Value::from(window_end(now_secs, index, period)),
+                    "windowStartSeconds".to_string(),
+                    Value::from(window_start(now_secs, index, period)),
                 );
             }
             if let Some(value) = slot.value {

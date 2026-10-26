@@ -55,6 +55,27 @@ const METRIC: &str = "SearchableDocuments";
 /// shortest span an alarm can be configured for.
 const SHORTEST_PERIOD_SECS: i32 = 10;
 
+/// How many periods per evaluation period an alarm's EVALUATION RANGE covers in this emulator
+/// (`crate::state::alarm_evaluation::EVALUATION_RANGE_FACTOR`): CloudWatch "attempts to
+/// retrieve a higher number of data points than the number specified as Evaluation Periods"
+/// and publishes no number for how many, so the rows that drive a datapoint OUT of the range
+/// are written against the emulator's own factor.
+const EVALUATION_RANGE_PERIODS: i32 = 3;
+
+/// Block until the clock is just past a `period`-second boundary.
+///
+/// A metric is aggregated into periods anchored at multiples of the period, so a row that
+/// needs its datapoint to stay in one period across a reading — or to leave one after a known
+/// wait — has to know where in the period it is publishing.
+fn wait_for_period_start(period: f64) {
+    /// How far into a period is close enough to its start for a reading to follow inside it.
+    const CLOSE_ENOUGH_SECS: f64 = 2.0;
+
+    while now_secs().rem_euclid(period) > CLOSE_ENOUGH_SECS {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The alarm every row of the evaluation table starts from: one 60-second period, one
 /// evaluation period, a static threshold of 10 and a `GreaterThanThreshold` comparison.
 ///
@@ -195,31 +216,31 @@ async fn an_alarms_state_is_evaluated_from_the_datapoints_it_watches() {
         (
             "the Average of two datapoints of one period crosses",
             json!({}),
-            vec![datum(2.0, 0.0), datum(30.0, 1.0)],
+            vec![datum(2.0, 0.0), datum(30.0, 0.0)],
             "ALARM",
         ),
         (
             "the Minimum of the same two datapoints does not",
             json!({"Statistic": "Minimum"}),
-            vec![datum(2.0, 0.0), datum(30.0, 1.0)],
+            vec![datum(2.0, 0.0), datum(30.0, 0.0)],
             "OK",
         ),
         (
             "the Maximum of the same two datapoints does",
             json!({"Statistic": "Maximum"}),
-            vec![datum(2.0, 0.0), datum(30.0, 1.0)],
+            vec![datum(2.0, 0.0), datum(30.0, 0.0)],
             "ALARM",
         ),
         (
             "the Sum of the same two datapoints does",
             json!({"Statistic": "Sum"}),
-            vec![datum(2.0, 0.0), datum(30.0, 1.0)],
+            vec![datum(2.0, 0.0), datum(30.0, 0.0)],
             "ALARM",
         ),
         (
             "the SampleCount of two datapoints is under a threshold of 10",
             json!({"Statistic": "SampleCount"}),
-            vec![datum(2.0, 0.0), datum(30.0, 1.0)],
+            vec![datum(2.0, 0.0), datum(30.0, 0.0)],
             "OK",
         ),
         (
@@ -494,7 +515,7 @@ async fn an_evaluated_state_reason_reports_an_empty_window_as_a_hole_and_names_t
             vec![datum(1.0, 0.0)],
             "OK",
             vec![
-                "0 out of the last 2 datapoints",
+                "2 out of the last 2 datapoints",
                 "1 missing datapoint was treated as [NonBreaching]",
             ],
             vec!["no datapoints were received"],
@@ -523,7 +544,10 @@ async fn an_evaluated_state_reason_reports_an_empty_window_as_a_hole_and_names_t
             json!({}),
             vec![datum(1.0, 0.0)],
             "OK",
-            vec!["Threshold Crossed: 0 out of the last 1 datapoints"],
+            vec![
+                "Threshold Crossed: 1 out of the last 1 datapoints",
+                "was not greater than the threshold (10.0)",
+            ],
             vec![
                 "Threshold not Crossed",
                 "missing datapoint",
@@ -617,6 +641,11 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
 
     let router = build_router();
     let mut names: Vec<String> = Vec::with_capacity(rows.len());
+    // A period is anchored at a multiple of the period, so the boundary that carries a
+    // datapoint out of the range falls at a known instant: publishing just after one boundary
+    // leaves each row's datapoint inside its range for the reading below, and the wait that
+    // follows crosses exactly one more boundary.
+    wait_for_period_start(f64::from(SHORTEST_PERIOD_SECS));
     for (index, (_, periods, _)) in rows.iter().enumerate() {
         let name = format!("aged-out-{index}");
         let alarm = patched(
@@ -624,9 +653,10 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
             &json!({"Period": SHORTEST_PERIOD_SECS, "EvaluationPeriods": periods}),
         );
         ok(&router, "PutMetricAlarm", &alarm).await;
-        // The evaluation range reaches twice the look-back back, so a datapoint three
-        // seconds short of it is still evaluated now and out of the range a few seconds on.
-        let age = f64::from(SHORTEST_PERIOD_SECS * 2 * periods) - 3.0;
+        // The oldest period the alarm's evaluation range still searches, mid-period: the
+        // range covers `EVALUATION_RANGE_PERIODS` periods per evaluation period.
+        let age = (f64::from(EVALUATION_RANGE_PERIODS * periods) - 1.5)
+            * f64::from(SHORTEST_PERIOD_SECS);
         publish(&router, &name, &[datum(42.0, age)]).await;
         names.push(name);
     }
@@ -644,9 +674,14 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
         );
     }
 
-    // Past the end of every one of these alarms' evaluation ranges, every window they search
-    // is empty: each row's datapoint was published three seconds short of its range.
-    std::thread::sleep(Duration::from_millis(4_600));
+    // One period boundary on, every row's datapoint is a period older than the oldest period
+    // its alarm searches, so every period the evaluation looks at is empty. The wait is derived
+    // from the period the rows use — one and a half of them, which carries the clock past the
+    // boundary the publish was placed just after whatever that boundary was — so it follows
+    // that constant rather than restating it.
+    std::thread::sleep(Duration::from_secs_f64(
+        f64::from(SHORTEST_PERIOD_SECS) * 1.5,
+    ));
     for ((case, _, expected), name) in rows.iter().zip(&names) {
         let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
         let reported = &described["MetricAlarms"][0];

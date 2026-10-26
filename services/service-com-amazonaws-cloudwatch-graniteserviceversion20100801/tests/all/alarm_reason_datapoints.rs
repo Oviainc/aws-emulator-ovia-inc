@@ -14,10 +14,11 @@
 //! `StateReason` length (`@length 0..1023`,
 //! `smithy_query(query="shape",shape="StateReason")`) can hold the datapoints of.
 //!
-//! What the suite does NOT pin is the prose around the list or the layout of the instant: the
-//! rule is that each graded value is named with the instant it was measured over, so each entry
-//! is checked to be a decimal value followed by a calendar instant — in whichever form the
-//! renderer writes one — rather than compared against one rendering.
+//! What the suite does NOT pin is the layout of the instant: the rule is that each graded value
+//! is named with the instant it was measured over, so each entry is checked to be a decimal
+//! value followed by a calendar instant — in whichever form the renderer writes one — rather
+//! than compared against one rendering. The sentence AROUND the list is CloudWatch's own, and
+//! the fragments of it each row names are checked (`alarm_period_windows` states it whole).
 
 use serde_json::{json, Value};
 
@@ -144,7 +145,8 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             Vec::new(),
             vec![
                 "Threshold Crossed: 1 out of the last 1 datapoints [137.0 (",
-                "with the threshold (10.0)",
+                "was greater than the threshold (10.0)",
+                "(minimum 1 datapoint for INSUFFICIENT_DATA -> ALARM transition).",
             ],
         ),
         row(
@@ -156,8 +158,7 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             Vec::new(),
             vec![
                 "Threshold Crossed: 1 out of the last 1 datapoints [0.5 (",
-                "GreaterThanOrEqualToThreshold",
-                "with the threshold (0.5)",
+                "was greater than or equal to the threshold (0.5)",
             ],
         ),
         row(
@@ -169,7 +170,7 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             Vec::new(),
             vec![
                 "Threshold Crossed: 1 out of the last 1 datapoints [-7.25 (",
-                "with the threshold (-2.5)",
+                "was less than the threshold (-2.5)",
             ],
         ),
         row(
@@ -193,8 +194,9 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
             vec!["1.0"],
             Vec::new(),
             vec![
-                "Threshold Crossed: 0 out of the last 1 datapoints [1.0 (",
-                "with the threshold (10.0)",
+                "Threshold Crossed: 1 out of the last 1 datapoints [1.0 (",
+                "was not greater than the threshold (10.0)",
+                "(minimum 1 datapoint for INSUFFICIENT_DATA -> OK transition).",
             ],
         ),
         row(
