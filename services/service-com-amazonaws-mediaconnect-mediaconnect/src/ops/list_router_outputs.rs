@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRouterOutputs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRouterOutputs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRouterOutputs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the router outputs this service's store HOLDS, a page at a time in the store's
+//! own order, each one projected into the modelled `ListedRouterOutput` summary and
+//! narrowed by the `Filters` the request carries. The write side is CreateRouterOutput and
+//! the full read side is GetRouterOutput / BatchGetRouterOutput.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +76,109 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::StoredRouterOutput;
+
+/// The largest page ListRouterOutputs returns: the maximum of the modelled `MaxResults`
+/// range (`smithy_query(query="operation",operation="ListRouterOutputs")`: 1..100).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The page size ListRouterOutputs uses when the request names none.
+///
+/// `ListRouterOutputsRequest$MaxResults` is "the maximum number of router outputs to return
+/// in the response" and the model documents no smaller default for it, so a request that
+/// names no page size is answered with as many router outputs as the modelled range allows
+/// at once — [`MAX_PAGE_SIZE`]. This is deliberately NOT the ten the sibling listings of
+/// this crate default to (`list_bridges.rs`, `list_gateways.rs`,
+/// `list_gateway_instances.rs`): each of those quotes its own `MaxResults` documentation
+/// stating that default, and this operation's states none.
+const DEFAULT_PAGE_SIZE: i32 = MAX_PAGE_SIZE;
+
+/// How many `Filters` entries one request may carry.
+///
+/// `RouterOutputFilterList` is a plain list and its members are plain lists of values, so
+/// the model bounds neither how many criteria a request states nor how many values any one
+/// of them names. Every stored router output is tested against every filter and every
+/// filter value, so these two ceilings are what bound that work: the comparisons are at
+/// most `MAX_FILTERS` x [`MAX_VALUES_PER_FILTER`] x [`crate::state::MAX_ROUTER_OUTPUTS`],
+/// whatever a request asks for. A filter beyond them is a request this operation refuses
+/// rather than one it spends the store's lock on.
+///
+/// Both ceilings, and the wording of the refusal they produce, are this emulator's own:
+/// AWS publishes no limit on either count for this operation, so a request past them is
+/// refused here with the client-input error the model does declare
+/// (`BadRequestException`, "thrown if the request contains a semantic error") rather than
+/// with an error the model does not. They are set far above any listing a client writes by
+/// hand, so a request a MediaConnect client would send is answered, not refused.
+const MAX_FILTERS: usize = 10;
+
+/// How many values one `Filters` entry may name. See [`MAX_FILTERS`].
+const MAX_VALUES_PER_FILTER: usize = 100;
+
+/// The values `filter` names — the list the union member carries, whichever member it is.
+fn filter_values(filter: &RouterOutputFilter) -> &[String] {
+    match filter {
+        RouterOutputFilter::RegionNames(values)
+        | RouterOutputFilter::NetworkInterfaceArns(values)
+        | RouterOutputFilter::RoutingScopes(values)
+        | RouterOutputFilter::OutputTypes(values)
+        | RouterOutputFilter::RoutedInputArns(values)
+        | RouterOutputFilter::NameContains(values) => values,
+    }
+}
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> ListRouterOutputsError {
+    ListRouterOutputsErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Whether `router_output` satisfies ONE filter of the request.
+///
+/// A `RouterOutputFilter` is a union whose member names the ATTRIBUTE of a router output to
+/// select on and whose value is the list of values accepted for it, so an output satisfies
+/// the filter exactly when its own value for that attribute is one the list names — and an
+/// attribute the output does not carry (no interface for a configuration that egresses into
+/// another AWS resource, no routed input while nothing is routed) is not among them. The
+/// `NameContains` member selects on CONTAINMENT instead of equality, so there it is enough
+/// that the output's name contains one of the fragments.
+fn satisfies_filter(router_output: &StoredRouterOutput, filter: &RouterOutputFilter) -> bool {
+    match filter {
+        RouterOutputFilter::RegionNames(region_names) => region_names
+            .iter()
+            .any(|region| region.as_str() == router_output.region_name),
+        RouterOutputFilter::NetworkInterfaceArns(interface_arns) => {
+            crate::state::router_output_network_interface_arn(&router_output.configuration)
+                .is_some_and(|interface_arn| {
+                    interface_arns
+                        .iter()
+                        .any(|candidate| candidate.as_str() == interface_arn)
+                })
+        }
+        RouterOutputFilter::RoutingScopes(routing_scopes) => routing_scopes
+            .iter()
+            .any(|scope| scope.as_str() == router_output.routing_scope),
+        RouterOutputFilter::OutputTypes(output_types) => output_types
+            .iter()
+            .any(|output_type| output_type.as_str() == router_output.output_type()),
+        RouterOutputFilter::RoutedInputArns(routed_input_arns) => router_output
+            .routed_input_arn
+            .as_deref()
+            .is_some_and(|routed_input_arn| {
+                routed_input_arns
+                    .iter()
+                    .any(|candidate| candidate.as_str() == routed_input_arn)
+            }),
+        RouterOutputFilter::NameContains(fragments) => fragments
+            .iter()
+            .any(|fragment| router_output.name.contains(fragment.as_str())),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +252,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRouterOutputs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRouterOutputsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // "The filters to apply when retrieving the list of router outputs": each element of
+        // `Filters` states one criterion an output must satisfy ([`satisfies_filter`]), so a
+        // request carrying several is narrowed by all of them and one carrying none lists
+        // every router output of the account.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRouterOutputs"))
+        // The two size checks run BEFORE the store is reached, so the comparisons the scan
+        // below performs are bounded by `MAX_FILTERS` x `MAX_VALUES_PER_FILTER` x
+        // `crate::state::MAX_ROUTER_OUTPUTS` and a request past either ceiling is refused
+        // without taking the store's guard.
+        let filters = input.filters.unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(bad_request(format!(
+                "A list router outputs request may apply at most {MAX_FILTERS} Filters \
+                 entries; this one has {}.",
+                filters.len()
+            )));
+        }
+        for filter in &filters {
+            let values = filter_values(filter);
+            if values.len() > MAX_VALUES_PER_FILTER {
+                return Err(bad_request(format!(
+                    "A Filters entry may name at most {MAX_VALUES_PER_FILTER} values; this one \
+                     names {}.",
+                    values.len()
+                )));
+            }
+        }
+
+        // `NextToken` is the router output ARN this listing resumes at, so a token the
+        // service never minted is a semantic error, not a key to page from — the same rule
+        // the other listings of this service apply to their own tokens. The output it names
+        // may have been deleted in between; paging survives that, which is why the check is
+        // on the token's FORM and not on the store — and, like the filter ceilings above, it
+        // refuses before the store's guard is taken.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_mintable_router_output_arn(token) {
+                return Err(bad_request(format!(
+                    "Invalid NextToken {token:?}. A pagination token must be one this service \
+                     issued."
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRouterOutputsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect router output store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: a router output state change and a
+        // delete the clock already made due (see `crate::state::TRANSITION_SPAN`) were owed
+        // at their own instants whether or not anybody called, so the listing reports the
+        // outputs the store holds NOW and the state each of them is in now.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // Defence in depth: the modelled `MaxResults` range (1..100) is already enforced at
+        // the boundary, so an out-of-range value is refused with a 400 before this handler
+        // runs and the clamp below never fires on a real request.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // The token is the ARN of the first router output of the NEXT page, so paging resumes
+        // at that key even if outputs were created or deleted in between. With no token the
+        // walk starts before every minted ARN, which is what the empty key is.
+        let resume_at = input.next_token.unwrap_or_default();
+        let mut router_outputs: Vec<ListedRouterOutput> = Vec::new();
+        let mut next_token: Option<String> = None;
+        for (arn, router_output) in store.router_outputs.range(resume_at..) {
+            if !filters
+                .iter()
+                .all(|filter| satisfies_filter(router_output, filter))
+            {
+                continue;
+            }
+            if router_outputs.len() == page_size {
+                next_token = Some(arn.clone());
+                break;
+            }
+            router_outputs.push(router_output.to_listed_router_output());
+        }
+
+        Ok(ListRouterOutputsOutput {
+            router_outputs,
+            next_token,
+        })
     }
 }
