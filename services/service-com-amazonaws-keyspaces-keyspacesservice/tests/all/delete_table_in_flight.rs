@@ -248,11 +248,13 @@ async fn delete_table_answers_one_outcome_per_observed_table_status() {
             .await,
     );
 
-    // The statuses this emulator can put a table in, each with the outcome the
-    // documentation names. `DELETED`, `RESTORING` and
-    // `INACCESSIBLE_ENCRYPTION_CREDENTIALS` are in the model's `TableStatus` set but are
-    // unreachable here (no operation produces them — `RestoreTable` is still a stub), so
-    // they are covered by the completeness assertion below rather than by a row.
+    // The statuses this emulator can put a table in from a `CreateTable`, an
+    // `UpdateTable` or a `DeleteTable`, each with the outcome the documentation names.
+    // `RESTORING` is reachable too — `RestoreTable` puts the table it builds in it — and
+    // its own suite (`restore_table_restoring_status`) covers the delete of a table in
+    // that status. `DELETED` and `INACCESSIBLE_ENCRYPTION_CREDENTIALS` are in the model's
+    // `TableStatus` set but no operation here produces them, so they are covered by the
+    // completeness assertion below rather than by a row.
     let rows: [(&str, &str, Outcome); 4] = [
         (
             "creating_tbl",

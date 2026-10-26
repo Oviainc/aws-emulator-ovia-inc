@@ -15,6 +15,8 @@
 mod entities_detection_v2;
 #[path = "all/icd10_cm_inference.rs"]
 mod icd10_cm_inference;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/rx_norm_inference.rs"]
 mod rx_norm_inference;
 #[path = "all/snomedct_inference.rs"]

@@ -439,9 +439,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         // HTTP 200, not 202: the association is complete when the call answers, so the
         // feed reports the settled ACTIVE status straight away and owes the clock
-        // nothing.
-        feed.status = crate::state::FeedStatus::Active;
-        feed.transition_due_at = None;
+        // nothing — this claim is what decides where the feed goes, so nothing a
+        // transition still in flight was going to settle it into survives it
+        // (`crate::state::Feed::settle_into`).
+        feed.settle_into(crate::state::FeedStatus::Active);
         Ok(output)
     }
 }

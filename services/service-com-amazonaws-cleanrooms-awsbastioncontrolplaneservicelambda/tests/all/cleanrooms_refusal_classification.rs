@@ -8,13 +8,16 @@
 //!
 //! 1. `CreateMembership` by an account that already holds a membership in the
 //!    collaboration is an input-validation refusal — `ValidationException` (400) —
-//!    naming the account the membership would have been created for. It is terminal,
-//!    not the retryable resource conflict a 409 announces.
+//!    naming the account the membership would have been created for and the INVITED
+//!    state a member has to be in for one to be creatable. It is terminal, not the
+//!    retryable resource conflict a 409 announces.
 //! 2. A `collaborationIdentifier` the caller is not authorized to is an authorization
 //!    refusal — `AccessDeniedException` (403) — on every operation that takes one, and
 //!    the three indistinguishable cases (never created, deleted, caller not part of it)
 //!    get the same answer: authorization to a collaboration lives in the collaboration
 //!    and disappears with it, and `GetCollaboration` models no not-found error at all.
+//!    Its message is the authorization-failure form: the calling principal, the action
+//!    and the resource.
 //! 3. A membership lookup that finds nothing reports a message composed from the
 //!    requested `membershipIdentifier` AND the resolved caller account, because
 //!    membership ids are account-scoped.
@@ -25,8 +28,8 @@
 use serde_json::{json, Value};
 
 use super::cleanrooms_collaboration_lifecycle::{
-    account_id, error_code, error_message, minimal_collaboration, Emulator, ALL_LOG_STATUSES,
-    ALL_MEMBER_ABILITIES,
+    account_id, collaboration_owned_elsewhere, error_code, error_message, minimal_collaboration,
+    Emulator, ALL_LOG_STATUSES, ALL_MEMBER_ABILITIES, REGION,
 };
 
 /// An account id that is not the caller's, used to make a stored collaboration one the
@@ -139,12 +142,17 @@ async fn a_repeat_join_is_refused_as_input_validation_naming_the_account() {
                 case.label
             );
             // Composed from the caller account the membership would be created for and
-            // the collaboration identifier the request carried.
+            // the state that account must be in for a membership to be creatable.
             let message = error_message(&refusal);
-            assert!(
-                message.contains(account_id()) && message.contains(&collaboration_id),
+            assert_eq!(
+                message,
+                format!(
+                    "Cannot create membership for account: {}. Memberships can only be created \
+                     for members in INVITED state",
+                    account_id()
+                ),
                 "case {:?} attempt {attempt}: the message must name the account and the \
-                 collaboration, got {message:?}",
+                 INVITED-state precondition, got {message:?}",
                 case.label
             );
             // And the refusal is terminal: nothing was created, nothing was replaced.
@@ -223,6 +231,8 @@ async fn a_collaboration_the_caller_cannot_reach_is_refused_as_access_denied() {
         let membership_id = joined["membership"]["id"].as_str().unwrap().to_string();
         for pass in 1..=deletes {
             let (status, body) = emulator.delete_collaboration(&id).await;
+            // `@idempotent` with no 404 declared: with nothing stored under the id there
+            // is no owner to refuse on behalf of, so a repeat delete answers the same 204.
             assert_eq!(
                 status, 204,
                 "case {label:?} delete {pass}: expected 204, got {status} with {body}"
@@ -276,10 +286,16 @@ async fn a_collaboration_the_caller_cannot_reach_is_refused_as_access_denied() {
             "case GetCollaboration {label:?}: expected AccessDeniedException, got {body}"
         );
         let message = error_message(&body);
-        assert!(
-            message.contains(account_id()) && message.contains(&collaboration_id),
-            "case GetCollaboration {label:?}: the message must name the account and the \
-             collaboration, got {message:?}"
+        assert_eq!(
+            message,
+            format!(
+                "User: arn:aws:iam::{account}:user/emulator is not authorized to perform: \
+                 cleanrooms:GetCollaboration on resource: \
+                 arn:aws:cleanrooms:{REGION}:{account}:collaboration/{collaboration_id}",
+                account = account_id()
+            ),
+            "case GetCollaboration {label:?}: the message must name the principal, the action \
+             and the collaboration ARN, got {message:?}"
         );
 
         // CreateMembership resolves the same identifier through the same gate.
@@ -326,10 +342,15 @@ async fn a_membership_lookup_refusal_names_the_id_and_the_caller_account() {
         .map(|id| (format!("never minted {id}"), id.to_string()))
         .collect();
     {
-        let (_, created) = emulator
-            .create_collaboration(minimal_collaboration("deleted-membership"))
-            .await;
-        let collaboration_id = created["collaboration"]["id"].as_str().unwrap().to_string();
+        // A collaboration this account participates in rather than created, so its own
+        // membership is one it may leave (the creator's is removed only with the
+        // collaboration).
+        let collaboration_id = collaboration_owned_elsewhere(
+            &emulator,
+            "deleted-membership",
+            Some(&[ALL_MEMBER_ABILITIES[0]]),
+        )
+        .await;
         let (_, joined) = emulator
             .create_membership(json!({
                 "collaborationIdentifier": collaboration_id,

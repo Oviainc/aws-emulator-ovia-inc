@@ -3,7 +3,9 @@
 //! @op ListTagsForResource
 //!
 //! Reports the tags stored on the connector or challenge `ResourceArn` names, read straight
-//! off that record. A reporting operation: the one write it makes is materialising the
+//! off that record. `ResourceArn` is parsed first: a value that is not a resource ARN this
+//! service could hold a record under is an input validation failure, not a missing resource.
+//! A reporting operation: the one write it makes is materialising the
 //! transition the clock already owes the connectors, so a resource whose teardown has come
 //! due is reported as gone rather than as tagged.
 //!
@@ -157,6 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region the request was signed for is part of resolving that ARN.
         let region = crate::state::request_region(ctx);
 
+        // `ResourceArn` is parsed BEFORE anything is looked up — before the store is even
+        // reached — so a value that names no resource at all is refused as the input error it
+        // is, rather than reported as a resource this service does not hold.
+        if let Some(why) = crate::state::resource_arn_rejection(&input.resource_arn) {
+            return Err(validation(why));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         // The only write a report may make: the transition the clock already owes.
@@ -183,12 +192,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `ResourceNotFoundException`, whose own doc covers both the resource that is gone and the
 /// one "incorrectly specified". A listing after the resource (or its owning connector) was
 /// deleted lands here.
+///
+/// Reserved for an ARN that could name one of this service's resources: a value that is not
+/// such an ARN is refused by [`validation`] before any lookup, so no 404 ever invents a
+/// `ResourceType` for a string that named nothing.
 fn not_found(resource_arn: &str) -> ListTagsForResourceError {
     let resource_type = crate::state::resource_type_of(resource_arn);
     ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("{resource_type} {resource_arn} could not be found"),
         resource_id: resource_arn.to_string(),
         resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// Refuse a request this operation cannot act on — HTTP 400 `ValidationException`, whose own
+/// doc names exactly this class ("An input validation error occurred"). The modelled shape is
+/// used rather than the scaffold's synthetic one, so the caller also gets the `Reason` member.
+fn validation(message: String) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        // "The service doesn't return a reason for every validation exception" (`Reason`'s
+        // own doc), and `ValidationExceptionReason` carries no value for a member whose
+        // value is malformed.
+        reason: None,
     })
     .into()
 }

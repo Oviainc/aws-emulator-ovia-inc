@@ -797,7 +797,7 @@ fn selected_properties(
                  addresses"
             )));
         }
-        if !crate::state::property_is_time_series(definition) {
+        if !crate::state::property_is_time_series(definition.as_ref()) {
             return Err(invalid(crate::state::property_not_time_series_message(
                 property_name,
             )));
@@ -810,18 +810,24 @@ fn selected_properties(
 /// scope: the one the named component TYPE's own chain declares for a
 /// cross-entity query, else the effective definition of the first addressed
 /// component that has one.
-fn definition_in_scope<'a>(
-    workspace: &'a crate::state::Workspace,
-    components: &[Scoped<'a>],
+///
+/// Either way the definition is RESOLVED over every declaration that reaches the
+/// property, nearest first ([`crate::state::refined_property_definition`]), so a
+/// component type that refines an inherited definition — restating only the
+/// members it changes — is read with the inherited values of the rest.
+fn definition_in_scope(
+    workspace: &crate::state::Workspace,
+    components: &[Scoped<'_>],
     input: &GetPropertyValueHistoryInput,
     property_name: &str,
-) -> Option<&'a crate::ops::types::PropertyDefinitionRequest> {
+) -> Option<crate::ops::types::PropertyDefinitionRequest> {
     if let Some(component_type_id) = input.component_type_id.as_deref() {
-        if let Some(definition) = workspace
-            .component_type_chain(component_type_id)
-            .into_iter()
-            .find_map(|component_type| component_type.property_definitions.get(property_name))
-        {
+        let chain = workspace.component_type_chain(component_type_id);
+        if let Some(definition) = crate::state::refined_property_definition(
+            chain
+                .iter()
+                .filter_map(|component_type| component_type.property_definitions.get(property_name)),
+        ) {
             return Some(definition);
         }
     }

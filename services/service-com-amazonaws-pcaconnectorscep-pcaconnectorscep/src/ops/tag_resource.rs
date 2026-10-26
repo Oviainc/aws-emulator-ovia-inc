@@ -175,6 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region the request was signed for is part of resolving that ARN.
         let region = crate::state::request_region(ctx);
 
+        // `ResourceArn` is parsed BEFORE anything is looked up — before the store is even
+        // reached — so a value that names no resource at all is refused as the input error it
+        // is, rather than reported as a resource this service does not hold.
+        if let Some(why) = crate::state::resource_arn_rejection(&input.resource_arn) {
+            return Err(validation(why));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         // The transition the clock already owes, materialised before the lookup, so a
@@ -231,16 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse a request this service's tagging rules do not allow — HTTP 400
-/// `ValidationException`, whose own doc names exactly this case ("invalid characters in a name
-/// tag"). The modelled shape is used rather than the scaffold's synthetic one, so the caller
-/// also gets the `Reason` member.
+/// Refuse a request this operation cannot act on — HTTP 400 `ValidationException`, whose own
+/// doc names this class and this case ("An input validation error occurred. For example,
+/// invalid characters in a name tag"). The modelled shape is used rather than the scaffold's
+/// synthetic one, so the caller also gets the `Reason` member.
 fn validation(message: String) -> TagResourceError {
     TagResourceErrorModeled::ValidationException(ValidationException {
         message,
         // "The service doesn't return a reason for every validation exception" (`Reason`'s
-        // own doc), and `ValidationExceptionReason` carries no value for a tag a caller may
-        // not set.
+        // own doc), and `ValidationExceptionReason` carries no value for a malformed member
+        // or for a tag a caller may not set.
         reason: None,
     })
     .into()
@@ -250,6 +257,9 @@ fn validation(message: String) -> TagResourceError {
 /// `ResourceNotFoundException`, whose own doc covers both the resource that is gone and the
 /// one "incorrectly specified". A call naming a deleted resource, or one whose owning
 /// connector's teardown has completed, lands here.
+///
+/// Reserved for an ARN that could name one of this service's resources: a value that is not
+/// such an ARN is refused by [`validation`] before any lookup.
 fn not_found(resource_arn: &str) -> TagResourceError {
     let resource_type = crate::state::resource_type_of(resource_arn);
     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

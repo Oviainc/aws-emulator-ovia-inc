@@ -50,12 +50,21 @@ enum Expect {
     /// The output is reported, and carries no `OutputValue`: the expression names
     /// something this emulator does not hold.
     NoValue,
+    /// An identifier the OWNING service assigns, of the published form `<prefix>-` plus
+    /// [`SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters: a resource of an Amazon
+    /// EC2 VPC-network type reports one of those rather than a name, because EC2 takes no
+    /// name on its create. No request fixes the hexadecimal part, so the rule is the FORM.
+    ServiceAssigned { prefix: &'static str },
     /// The output is not reported at all, because its `Condition` evaluates false.
     Absent,
 }
 
 /// How many hexadecimal characters the unique segment of a generated physical id carries.
 const GENERATED_ID_HEX_DIGITS: usize = 12;
+
+/// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
+/// current (long) id form is 17 (`vpc-0123456789abcdef0`).
+const SERVICE_ID_HEX_DIGITS: usize = 17;
 
 /// One row: a template, the parameters the create supplies, and what each output must
 /// report.
@@ -392,22 +401,10 @@ Outputs:
                 // An attribute that is the property the template declared for it.
                 value("AsgDesired", "2"),
                 value("LaunchTemplateName", "probe-lt"),
-                // The VPC the template does not name takes the generated physical id,
-                // and the subnet's `VpcId` attribute is that same id.
-                (
-                    "VpcId",
-                    Expect::Generated {
-                        prefix: String::new(),
-                        logical_id: "Vpc",
-                    },
-                ),
-                (
-                    "SubnetVpc",
-                    Expect::Generated {
-                        prefix: String::new(),
-                        logical_id: "Vpc",
-                    },
-                ),
+                // The VPC the template does not name reports the `vpc-` identifier its
+                // type's `Ref` returns, and the subnet's `VpcId` attribute is that same id.
+                ("VpcId", Expect::ServiceAssigned { prefix: "vpc" }),
+                ("SubnetVpc", Expect::ServiceAssigned { prefix: "vpc" }),
                 value("VpcCidrBlock", "10.20.0.0/16"),
                 value("SubnetZones", format!("{REGION}a,{REGION}b")),
                 value("SubnetCidrs", "10.20.0.0/24,10.20.1.0/24"),
@@ -432,6 +429,19 @@ fn is_generated(value: &str, prefix: &str, stack_name: &str, logical_id: &str) -
         .is_some_and(|unique| {
             unique.len() == GENERATED_ID_HEX_DIGITS
                 && unique.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
+/// Whether `value` is a service-assigned identifier of the published Amazon EC2 form:
+/// `<prefix>-` plus [`SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters.
+fn is_service_assigned(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(&format!("{prefix}-"))
+        .is_some_and(|digits| {
+            digits.len() == SERVICE_ID_HEX_DIGITS
+                && digits
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         })
 }
 
@@ -495,6 +505,16 @@ async fn every_declared_output_of_a_deployed_stack_carries_its_resolved_value() 
                             && is_generated(actual, prefix, case.stack_name, logical_id),
                         "case {:?}: output {key:?} must carry \
                          {prefix}<stack>-{logical_id}-<unique id>, got {:?}",
+                        case.case,
+                        output.value
+                    );
+                }
+                Expect::ServiceAssigned { prefix } => {
+                    let actual = output.value.as_deref().unwrap_or_default();
+                    assert!(
+                        is_service_assigned(actual, prefix),
+                        "case {:?}: output {key:?} must carry {prefix}-<17 hexadecimal \
+                         characters>, got {:?}",
                         case.case,
                         output.value
                     );

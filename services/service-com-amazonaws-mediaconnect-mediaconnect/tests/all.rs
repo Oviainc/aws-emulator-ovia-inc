@@ -75,6 +75,8 @@ mod get_router_input;
 mod global_resource_tag_listing;
 #[path = "all/global_resource_tags.rs"]
 mod global_resource_tags;
+#[path = "all/global_resource_untagging.rs"]
+mod global_resource_untagging;
 #[path = "all/lifecycle_preconditions.rs"]
 mod lifecycle_preconditions;
 #[path = "all/offering_listing.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation applies a write to the global endpoint
+//! `CreateEndpoint` stored ([`crate::state::EndpointRecord`]) and reports the
+//! merged record back. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEndpointErrorModeled::InternalException(InternalException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        // `ReplicationConfig$State` is a modelled enum, which the boundary
+        // validator does not narrow to its values — so a state the enum does not
+        // have is refused here rather than stored and reported back as one AWS
+        // accepted. The same check `CreateEndpoint` makes, so both writers of an
+        // endpoint's replication admit exactly the same values.
+        let named_state = input
+            .replication_config
+            .as_ref()
+            .and_then(|config| config.state.as_deref());
+        if let Some(named) = named_state.filter(|named| !REPLICATION_STATE_VALUES.contains(named)) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::validation_envelope(&[crate::state::constraint_clause(
+                    "replicationConfig.state",
+                    Some(named),
+                    &format!(
+                        "Member must satisfy enum value set: [{}]",
+                        REPLICATION_STATE_VALUES.join(", ")
+                    ),
+                )]),
+            ));
+        }
+
+        // A pair of buses this write names has to be ONE bus name in TWO
+        // Regions, which the model cannot express and the boundary validator
+        // therefore passes. A write naming no pair leaves the stored pair alone,
+        // so there is nothing to check.
+        if let Some(reason) = input
+            .event_buses
+            .as_deref()
+            .and_then(crate::state::endpoint_event_bus_violation)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        let region = crate::state::endpoint_region(None, ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An endpoint whose clock has already moved it on is settled first, so
+        // the write is applied to, and answered from, one state.
+        store.settle_endpoints(now);
+
+        // An update changes an endpoint that EXISTS; it never brings one into
+        // being. One lookup serves both the merge decision and the write.
+        let Some(endpoint) = store.endpoint_mut(&input.name) else {
+            return Err(UpdateEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_endpoint(&input.name, &region)),
+                },
+            )
+            .into());
+        };
+
+        // What the write would leave in force: a member it carries, and
+        // otherwise the one the stored record already holds.
+        let replication_state = named_state
+            .unwrap_or(&endpoint.replication_state)
+            .to_string();
+        let role_arn = input.role_arn.or_else(|| endpoint.role_arn.clone());
+
+        // "The default state is ENABLED which means you must supply a RoleArn.
+        // If you don't have a RoleArn or you don't want event replication
+        // enabled, set the state to DISABLED"
+        // (`CreateEndpoint$ReplicationConfig`): replication runs AS that role, so
+        // a write that would leave the endpoint replicating with no role to
+        // replicate as is refused rather than stored as one nothing could
+        // replicate for.
+        if replication_state == crate::state::REPLICATION_STATE_ENABLED && role_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::parameter_violation(
+                    "RoleArn",
+                    &format!(
+                        "RoleArn is required when event replication is {}.",
+                        crate::state::REPLICATION_STATE_ENABLED
+                    ),
+                ),
+            ));
+        }
+
+        // Each member the request carries is written; one it does not carry
+        // changes nothing. The endpoint's identity — its name, its ARN, the
+        // subdomain minted with it and the URL built from that subdomain — is not
+        // a member of this request, so a write never moves it.
+        if input.description.is_some() {
+            endpoint.description = input.description;
+        }
+        if let Some(routing_config) = input.routing_config {
+            endpoint.routing_config = routing_config;
+        }
+        if let Some(event_buses) = input.event_buses {
+            endpoint.event_buses = event_buses;
+        }
+        endpoint.replication_state = replication_state;
+        endpoint.role_arn = role_arn;
+        // The written configuration has to reach the Regions the endpoint spans
+        // before it is serving it, so the write leaves the endpoint in its
+        // non-terminal state and the clock owes it `ACTIVE` — stored as a due
+        // instant, never waited for, so a caller reading straight after this
+        // write still observes `UPDATING`.
+        endpoint.state = crate::state::ENDPOINT_STATE_UPDATING.to_string();
+        endpoint.last_modified = now;
+        endpoint.active_due = Some(now + crate::state::ENDPOINT_TRANSITION);
+
+        // Reported from the STORED record rather than from the request, so this
+        // response and `DescribeEndpoint`'s cannot disagree.
+        Ok(endpoint.to_update_output())
     }
 }

@@ -27,8 +27,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cleanrooms_awsbastioncontrolplaneservicelambda::state as cleanrooms_state;
 
 use super::cleanrooms_collaboration_lifecycle::{
-    account_id, error_code, is_model_uuid, minimal_collaboration, Emulator, ALL_MEMBER_ABILITIES,
-    REGION,
+    account_id, collaboration_owned_elsewhere, error_code, is_model_uuid, minimal_collaboration,
+    Emulator, ALL_MEMBER_ABILITIES, REGION,
 };
 
 /// A well-formed `MembershipIdentifier`/`ProtectedQueryIdentifier` (model shape `UUID`:
@@ -468,8 +468,29 @@ async fn start_protected_query_refuses_a_membership_the_store_does_not_hold() {
 
     // A membership that was never created, and one that was created and deleted: in
     // both cases the store holds no such membership, which is what decides the answer.
-    let deleted = simple_membership(&emulator, "deleted-membership").await;
-    let deleted_id = deleted["id"].as_str().expect("membership id").to_string();
+    // The deleted one is a membership of a collaboration this account only PARTICIPATES
+    // in, because a participant may leave while the creator's own membership is removed
+    // only by deleting the collaboration.
+    let collaboration_id = collaboration_owned_elsewhere(
+        &emulator,
+        "deleted-membership",
+        Some(&["CAN_QUERY"]),
+    )
+    .await;
+    let (status, joined) = emulator
+        .create_membership(json!({
+            "collaborationIdentifier": collaboration_id,
+            "queryLogStatus": "ENABLED",
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateMembership must succeed to set up the case, got {status} with {joined}"
+    );
+    let deleted_id = joined["membership"]["id"]
+        .as_str()
+        .expect("membership id")
+        .to_string();
     let (status, body) = emulator
         .call("DELETE", &format!("/memberships/{deleted_id}"), None)
         .await;

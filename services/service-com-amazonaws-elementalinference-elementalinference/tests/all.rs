@@ -61,6 +61,8 @@ mod output_provenance;
 mod put_feed_policy_scope;
 #[path = "all/refusals_from_state.rs"]
 mod refusals_from_state;
+#[path = "all/release_after_reconfiguration.rs"]
+mod release_after_reconfiguration;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/reserved_tag_namespace.rs"]

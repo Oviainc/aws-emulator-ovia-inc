@@ -250,6 +250,236 @@ pub fn export_columns(requested: Option<&[String]>, modelled: &[&str]) -> Vec<St
     columns
 }
 
+// ---------------------------------------------------------------------------
+// Admitting one export call and creating its job
+//
+// Every `Export*Recommendations` operation of this service admits a request by the SAME
+// rules — the mutually exclusive `accountIds`/`includeMemberAccounts` pair, the account ids
+// themselves, the surface's own filter vocabulary, a destination bucket that is named and
+// that the object store holds, the enrollment gate, the one-job-in-progress-per-Region limit
+// and how many jobs this store may hold — and then records the same job against the same
+// derived keys. So that whole rule lives HERE once, and each export operation supplies only
+// what its own surface settles: the resource type it exports, its filter vocabulary, its
+// `Exportable*Field` set and the sentence it documents the one-job limit with.
+// ---------------------------------------------------------------------------
+
+/// What one `Export*Recommendations` request asks for, in the terms the shared admission rule
+/// needs: the members every export surface declares, plus the few things that differ between
+/// surfaces.
+pub struct ExportRequest<'a, F: ExportFilter> {
+    /// The `ResourceType` whose recommendations this surface exports, which the job carries
+    /// and which the one-job-in-progress limit is counted per.
+    pub resource_type: &'a str,
+    /// The request's `accountIds` and whether it asked for the organization's member accounts
+    /// — "The parameters are mutually exclusive." They select WHOSE recommendations go into
+    /// the file, not where it is written.
+    pub account_ids: Option<Vec<String>>,
+    /// See [`ExportRequest::account_ids`].
+    pub include_member_accounts: bool,
+    /// The request's filters, in this surface's own filter shape: "an array of objects to
+    /// specify a filter that exports a more specific set of ... recommendations".
+    pub filters: Option<Vec<F>>,
+    /// This surface's filter vocabulary check — the one its recommendation READER applies, so
+    /// an export and a read never admit different filter sets.
+    pub filter_rejection: fn(&[F]) -> Option<String>,
+    /// The `s3DestinationConfig` the request named: the destination bucket and the key prefix
+    /// the two object keys are derived from.
+    pub destination: &'a crate::ops::types::S3DestinationConfig,
+    /// "The recommendations data to include in the export file", with this surface's
+    /// `Exportable*Field` value set to resolve it against ([`export_columns`]).
+    pub fields_to_export: Option<&'a [String]>,
+    /// See [`ExportRequest::fields_to_export`].
+    pub exportable_fields: &'a [&'a str],
+    /// The `fileFormat` the request asked for, or `None` for the one format the model
+    /// declares ([`FILE_FORMAT_CSV`]).
+    pub file_format: Option<String>,
+    /// The one-job-in-progress sentence this operation documents, which the refusal of a
+    /// second in-progress export of this resource type opens with.
+    pub one_job_in_progress: &'a str,
+}
+
+/// Why one export call cannot create its job, as the modelled error the calling operation
+/// answers it with: the shared rule names the refusal and each operation lifts it into its own
+/// error channel.
+#[derive(Debug, Clone)]
+pub enum ExportRefusal {
+    /// This service's store is not reachable from the engine — an `InternalServerException`.
+    StoreUnavailable,
+    /// The request is not one the service accepts — an `InvalidParameterValueException`.
+    InvalidParameter(String),
+    /// The account is not enrolled — an `OptInRequiredException`.
+    OptInRequired,
+    /// The call would exceed a limit of the service — a `LimitExceededException`.
+    LimitExceeded(String),
+}
+
+impl ExportRefusal {
+    /// The message the refusal carries, stated here so no two export operations word one
+    /// refusal differently.
+    pub fn message(&self) -> String {
+        match self {
+            Self::StoreUnavailable => {
+                "The Compute Optimizer recommendation store is unavailable.".to_string()
+            }
+            Self::OptInRequired => {
+                "The account is not opted in to Compute Optimizer.".to_string()
+            }
+            Self::InvalidParameter(message) | Self::LimitExceeded(message) => message.clone(),
+        }
+    }
+}
+
+/// What an admitted export call answers: the job's id, and the destination the job itself
+/// holds — so the call's answer, the job's reported destination and the objects that appear
+/// cannot name different places.
+#[derive(Debug, Clone)]
+pub struct CreatedExport {
+    /// The `JobId` minted for the created job.
+    pub job_id: String,
+    /// The `S3Destination` of the created job.
+    pub s3_destination: crate::ops::types::S3Destination,
+}
+
+/// Admit one `Export*Recommendations` request and create its job: the whole rule every export
+/// operation of this service applies.
+///
+/// A malformed request is refused BEFORE the store is read, so an invalid parameter takes
+/// precedence over the enrollment gate, as it does in every other operation of this service.
+/// Creating a job is a write, so this is also where the jobs the seven-day reporting window
+/// has dropped are let go of — a reader never writes. The export job belongs to the Region
+/// whose endpoint created it, and so does the one-job-in-progress limit each export operation
+/// documents: "You can have only one ... export job in progress per Amazon Web Services
+/// Region", which a job that has reached its terminal status no longer holds, and which a job
+/// of another resource type never holds against this one.
+pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
+    engine: &Arc<Eng>,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    request: ExportRequest<'_, F>,
+) -> Result<CreatedExport, ExportRefusal> {
+    let Some(state) = super::service_state(&**engine) else {
+        return Err(ExportRefusal::StoreUnavailable);
+    };
+
+    // `accountIds`: "You can specify multiple account IDs per request", each an Amazon Web
+    // Services account ID. "This parameter cannot be specified together with the include
+    // member accounts parameter. The parameters are mutually exclusive."
+    let account_ids = request.account_ids.unwrap_or_default();
+    if !account_ids.is_empty() && request.include_member_accounts {
+        return Err(ExportRefusal::InvalidParameter(
+            "The value supplied for parameter accountIds is not valid: accountIds and \
+             includeMemberAccounts are mutually exclusive."
+                .to_string(),
+        ));
+    }
+    if let Some(value) = account_ids
+        .iter()
+        .find(|value| !super::is_account_id(value))
+    {
+        return Err(ExportRefusal::InvalidParameter(format!(
+            "The value supplied for parameter accountIds is not valid: {value} is not a \
+             12-digit Amazon Web Services account ID."
+        )));
+    }
+
+    // The filters are the ones the surface's recommendation reader selects with, so a name or
+    // value outside that vocabulary is refused here too rather than silently exporting a
+    // different set.
+    let filters = request.filters.unwrap_or_default();
+    if let Some(reason) = (request.filter_rejection)(&filters) {
+        return Err(ExportRefusal::InvalidParameter(reason));
+    }
+
+    // "You must create the destination Amazon S3 bucket for your recommendations export
+    // before you create the export job. Compute Optimizer does not create the S3 bucket for
+    // you." There is no export without a bucket to write it to, so a request that names none
+    // is refused — and so is one naming a bucket this emulator's object store does not hold,
+    // rather than queueing a job whose export file could never appear.
+    let bucket = request
+        .destination
+        .bucket
+        .as_deref()
+        .map(str::trim)
+        .filter(|bucket| !bucket.is_empty());
+    let Some(bucket) = bucket else {
+        return Err(ExportRefusal::InvalidParameter(
+            "The value supplied for parameter s3DestinationConfig is not valid: a \
+             destination bucket must be supplied."
+                .to_string(),
+        ));
+    };
+    if let Some(reason) = destination_bucket_rejection(&**engine, bucket) {
+        return Err(ExportRefusal::InvalidParameter(reason));
+    }
+
+    let region = super::request_region(ctx);
+    let now = super::now_secs();
+
+    let mut guard = state.lock();
+    if !guard.enrollment.is_opted_in() {
+        return Err(ExportRefusal::OptInRequired);
+    }
+
+    guard.export_jobs.prune_expired(now);
+
+    if let Some(running) = guard
+        .export_jobs
+        .in_progress_in(&region, request.resource_type, now)
+    {
+        let running = running.job_id.clone();
+        let documented = request.one_job_in_progress;
+        return Err(ExportRefusal::LimitExceeded(format!(
+            "{documented} Export job {running} is still in progress."
+        )));
+    }
+    if !guard.export_jobs.can_hold() {
+        return Err(ExportRefusal::LimitExceeded(format!(
+            "The request exceeds a limit of the service: this emulator holds at most {} \
+             recommendation export jobs.",
+            super::MAX_EXPORT_JOBS
+        )));
+    }
+
+    let job_id = guard.export_jobs.mint_job_id();
+    let (key, metadata_key) = super::export_destination_keys(
+        request.destination.key_prefix.as_deref(),
+        ::engine::emulator_account_id(),
+        request.resource_type,
+        &job_id,
+    );
+    let plan = ExportPlan {
+        job_id: job_id.clone(),
+        region,
+        resource_type: request.resource_type.to_string(),
+        bucket: bucket.to_string(),
+        key,
+        metadata_key,
+        // "The recommendations data to include in the export file", or every field the model
+        // declares for this resource type when the request selects none.
+        columns: export_columns(request.fields_to_export, request.exportable_fields),
+        file_format: request
+            .file_format
+            .unwrap_or_else(|| FILE_FORMAT_CSV.to_string()),
+        account_ids,
+        include_member_accounts: request.include_member_accounts,
+        filters: filter_pairs(&filters),
+    };
+    // The destination this call answers is the job's own, so it names exactly the objects
+    // `DescribeRecommendationExportJobs` reports for the job and exactly the objects the
+    // completed job writes.
+    let s3_destination = guard.record_export_job(&plan, now).s3_destination();
+    drop(guard);
+
+    // An export this call did not create may have come due meanwhile, and this one comes due
+    // two lifecycle steps from now — the task is what makes the objects appear for a client
+    // that makes no further call to this service.
+    deliver_and_schedule(engine, now);
+
+    Ok(CreatedExport {
+        job_id,
+        s3_destination,
+    })
+}
+
 /// The export file: the column header row, then one row per recommendation.
 ///
 /// Comma-separated values as the `csv` crate writes them — quoting a cell that needs it, with

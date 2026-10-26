@@ -249,17 +249,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "Each collaboration can have only one privacy budget template. If you need to
-        // change the privacy budget template, use the UpdatePrivacyBudgetTemplate
-        // operation."
-        if let Some(existing) =
-            store.privacy_budget_template_of_collaboration(&membership.collaboration_id)
-        {
+        // A privacy budget template configures the budget of ONE `privacyBudgetType`, so
+        // the record a create collides with is the template of the SAME type: a
+        // collaboration holds at most one per type, and a template of another type
+        // configures another budget rather than restating this one.
+        if let Some(existing) = store.privacy_budget_template_of_type(
+            &membership.collaboration_id,
+            &input.privacy_budget_type,
+        ) {
             return Err(CreatePrivacyBudgetTemplateErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "collaboration {} already has privacy budget template {}; each collaboration can have only one privacy budget template",
-                        membership.collaboration_id, existing.id
+                    message: Some(st::privacy_budget_template_exists_message(
+                        &input.privacy_budget_type,
+                        &membership.collaboration_id,
                     )),
                     resource_id: Some(existing.id.clone()),
                     // The model's `ResourceType` catalog (COLLABORATION | MEMBERSHIP |
@@ -297,6 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = st::new_uuid();
         let arn = st::privacy_budget_template_arn(&region, &id);
         let created_at = st::now();
+        let privacy_budget_type = input.privacy_budget_type;
         let template = PrivacyBudgetTemplate {
             id: id.clone(),
             arn: arn.clone(),
@@ -306,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             collaboration_arn: membership.collaboration_arn.clone(),
             create_time: created_at,
             update_time: created_at,
-            privacy_budget_type: input.privacy_budget_type,
+            privacy_budget_type: privacy_budget_type.clone(),
             auto_refresh: st::effective_template_auto_refresh(input.auto_refresh),
             parameters: st::privacy_budget_template_parameters_output(&input.parameters),
         };
@@ -316,9 +319,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.privacy_budget_templates.insert(id.clone(), template);
         store.privacy_budget_template_order.push(id.clone());
-        store
-            .privacy_budget_template_by_collaboration
-            .insert(membership.collaboration_id.clone(), id.clone());
+        store.privacy_budget_template_by_collaboration.insert(
+            (
+                membership.collaboration_id.clone(),
+                privacy_budget_type.clone(),
+            ),
+            id.clone(),
+        );
 
         let Some(privacy_budget_template) = store.privacy_budget_templates.get(&id).cloned() else {
             return Err(CreatePrivacyBudgetTemplateErrorModeled::InternalServerException(

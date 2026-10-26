@@ -1226,6 +1226,10 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             // And no annotation: one is attached to a stored object afterwards, by S3's own
             // `PutObjectAnnotation`.
             annotations: BTreeMap::new(),
+            // And no ACL: a delivered object carries the ACL every object starts with, the
+            // owner's `FULL_CONTROL`, which a reader derives; S3's own `PutObjectAcl` is
+            // what sets one on it.
+            acl: None,
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(

@@ -328,8 +328,9 @@ async fn a_deployments_events_are_the_timeline_of_its_walk_over_the_dependency_g
 /// therefore never reaches.
 ///
 /// `AWS::EC2::VPC` and `AWS::EC2::Subnet` are types this emulator provisions nowhere, so the
-/// stack records them from the template alone; the `AWS::RDS::DBSubnetGroup` is really
-/// created in Amazon RDS, which refuses a group over subnets it cannot resolve.
+/// stack records them from the template alone, each under the `vpc-`/`subnet-` identifier
+/// its type's `Ref` returns; the `AWS::RDS::DBSubnetGroup` is really created in Amazon RDS,
+/// which refuses the name AWS reserves for the DB subnet group of the account's default VPC.
 const REFUSED_CHAIN: &str = r#"{"Resources":{
     "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
     "SubnetA":{"Type":"AWS::EC2::Subnet","Properties":{
@@ -337,6 +338,7 @@ const REFUSED_CHAIN: &str = r#"{"Resources":{
     "SubnetB":{"Type":"AWS::EC2::Subnet","Properties":{
       "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.0.2.0/24"}},
     "SubnetGroup":{"Type":"AWS::RDS::DBSubnetGroup","Properties":{
+      "DBSubnetGroupName":"default",
       "DBSubnetGroupDescription":"the timeline suite's subnets",
       "SubnetIds":[{"Ref":"SubnetA"},{"Ref":"SubnetB"}]}},
     "Topic":{"Type":"AWS::SNS::Topic","DependsOn":"SubnetGroup",

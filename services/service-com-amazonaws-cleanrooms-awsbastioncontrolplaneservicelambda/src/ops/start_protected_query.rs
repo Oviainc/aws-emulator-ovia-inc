@@ -226,9 +226,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !can_query {
             return Err(StartProtectedQueryErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(format!(
-                        "account {caller} does not hold the {} ability in collaboration {}",
-                        st::ABILITY_CAN_QUERY, record.id
+                    // Worded as every authorization failure of this service is worded
+                    // (`st::authorization_denied_message`): the principal, the action and
+                    // the resource. This operation binds the membership identifier as its
+                    // URI label, so the membership is the resource the decision was taken
+                    // on.
+                    message: Some(st::authorization_denied_message(
+                        Self::NAME,
+                        &membership.arn,
                     )),
                     reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
                 },

@@ -14,7 +14,8 @@ use crate::ops::types::{
     AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
     AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
     AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
-    KnowledgeBaseAssociationData, KnowledgeBaseData, OrchestratorConfigurationEntry,
+    KnowledgeBaseAssociationData, KnowledgeBaseData, KnowledgeBaseSummary,
+    OrchestratorConfigurationEntry,
     RenderingConfiguration, RecommendationData, RecommendationTrigger,
     ServerSideEncryptionConfiguration, SessionData, SessionIntegrationConfiguration,
     SourceConfiguration, TagFilter, VectorIngestionConfiguration,
@@ -233,6 +234,34 @@ pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
 /// of any other modelled type is refused instead of being handed a URL that could not
 /// be used.
 pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `KnowledgeBaseType` values whose content comes from a source OUTSIDE this service
+/// (`smithy_query(query="shape",shape="KnowledgeBaseType")` declares `EXTERNAL`, `CUSTOM`,
+/// `QUICK_RESPONSES`, `MESSAGE_TEMPLATES` and `MANAGED`).
+///
+/// The model states which ones those are on the member that carries the source:
+/// `sourceConfiguration` is "The source of the knowledge base content. Only set this
+/// argument for EXTERNAL or Managed knowledge bases"
+/// (`smithy_query(query="doc",shape="CreateKnowledgeBaseRequest",member="sourceConfiguration")`),
+/// so a knowledge base of one of these types IS its source — created without one it would
+/// describe no content at all. See [`message_source_configuration_required`].
+pub const SOURCED_KNOWLEDGE_BASE_TYPES: [&str; 2] = ["EXTERNAL", "MANAGED"];
+
+/// Whether a knowledge base of this `knowledgeBaseType` cannot exist without a
+/// `sourceConfiguration` — see [`SOURCED_KNOWLEDGE_BASE_TYPES`].
+pub fn requires_source_configuration(knowledge_base_type: &str) -> bool {
+    SOURCED_KNOWLEDGE_BASE_TYPES.contains(&knowledge_base_type)
+}
+
+/// The sentence a create of a knowledge base whose type requires a source, carrying none,
+/// is refused with — stating the type the request named, as the recorded wire answer of
+/// this endpoint for that class does.
+pub fn message_source_configuration_required(knowledge_base_type: &str) -> String {
+    format!(
+        "KnowledgeBase of type {knowledge_base_type} must have at least one \
+         SourceConfiguration."
+    )
+}
 
 /// How long an upload URL stays valid when the caller names no
 /// `presignedUrlTimeToLive`.
@@ -455,6 +484,40 @@ pub fn resolve_id(label: &str) -> &str {
     } else {
         label
     }
+}
+
+/// Whether `value` has the form the model's `Uuid` shape declares
+/// (`smithy_query(query="shape",shape="Uuid")`:
+/// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`) — five lowercase-hex
+/// groups of 8, 4, 4, 4 and 12 digits. The id-FORM question alone, so the decision that
+/// reads it states only what it decides.
+fn is_uuid_shaped(value: &str) -> bool {
+    /// The group lengths of the modelled `Uuid` form, in order.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = value.split('-');
+    GROUPS.iter().all(|expected| {
+        groups.next().is_some_and(|group| {
+            group.len() == *expected
+                && group
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    }) && groups.next().is_none()
+}
+
+/// Whether `label` names a resource IDENTITY in this account at all: the id it resolves
+/// to ([`resolve_id`]) has the form the model gives this service's ids
+/// ([`is_uuid_shaped`]).
+///
+/// This is a question about the LABEL, not about the store: a well-formed id that names
+/// nothing is still an identity of this account, and gets the operation's not-found
+/// answer once it is resolved. A label that is not one — a bare string that is no id, or
+/// an ARN of another partition, account or service, which [`resolve_id`] hands back
+/// unchanged — names no resource any permission of this account could cover, which is
+/// what an operation that decides authorization before it resolves anything keys on.
+pub fn names_an_account_resource(label: &str) -> bool {
+    is_uuid_shaped(resolve_id(label))
 }
 
 /// A non-tag map field rendered as the modelled map shape, or `None` when it is empty:
@@ -830,6 +893,29 @@ impl KnowledgeBase {
             // invented one.
             ingestion_status: None,
             ingestion_failure_reasons: None,
+        }
+    }
+
+    /// The `KnowledgeBaseSummary` a listing of this knowledge base reports: the same
+    /// stored fields [`Self::to_knowledge_base_data`] answers with, reduced to the
+    /// members the summary shape declares
+    /// (`smithy_query(query="shape",shape="KnowledgeBaseSummary")`), so a list page and a
+    /// read of the same record cannot disagree.
+    pub fn to_summary(&self) -> KnowledgeBaseSummary {
+        KnowledgeBaseSummary {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            name: self.name.clone(),
+            knowledge_base_type: self.knowledge_base_type.clone(),
+            status: self.status.clone(),
+            source_configuration: self.source_configuration.clone(),
+            vector_ingestion_configuration: self.vector_ingestion_configuration.clone(),
+            rendering_configuration: self.rendering_configuration.clone(),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            description: self.description.clone(),
+            tags: tags_out(&self.tags),
         }
     }
 }
@@ -1493,6 +1579,16 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// answers with instead of cloning every record (and its sessions).
     pub fn assistant_ids_in_order(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.assistants.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Every stored knowledge base's id, in `knowledgeBaseId` order — the stable order
+    /// `ListKnowledgeBases` pages over, as [`Self::assistant_ids_in_order`] is for
+    /// assistants: a page boundary only holds if the order does not depend on map
+    /// iteration.
+    pub fn knowledge_base_ids_in_order(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.knowledge_bases.keys().cloned().collect();
         ids.sort();
         ids
     }

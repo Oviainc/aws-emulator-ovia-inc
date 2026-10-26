@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountOverview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountOverview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports THIS account's overview for a day-granular time range: how many of its
+//! insights are OPEN, by `InsightType`, among the insights CREATED inside that range,
+//! and the mean time the CLOSED ones of that same set took to recover. A pure read: it
+//! never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountOverview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The three numbers are one insight tally ([`crate::state::InsightTally`]) over the
+//! store's `insights` map — the SAME map, walked the same way, that
+//! [`crate::ops::describe_account_health`] tallies without a window and
+//! [`crate::ops::list_insights`] lists — restricted to the insights whose own start
+//! instant the requested window holds. An emulator over which no analysis has run
+//! therefore answers zeros because the set tallied is empty, not because the numbers are
+//! constants, and this read cannot contradict the other reads of one store.
+//!
+//! `MeanTimeToRecoverInMilliseconds` is documented "the MTTR for all closed insights that
+//! were created during the time range passed in", so it averages over the CLOSED insights
+//! of the window of EITHER `InsightType` — each contributing its `InsightTimeRange` end
+//! minus its start — and is zero while the window holds no closed insight, there being no
+//! recovery time accrued to average.
+//!
+//! The range is a range of whole UTC DAYS ([`crate::state::DayRange`]): both `FromTime`
+//! and `ToTime` are documented "The start time granularity is at the day level. The floor
+//! of the start time is used", so each bound names a day and both of those days count in
+//! full, with an absent `ToTime` meaning the current day, exactly as in
+//! [`crate::ops::describe_organization_overview`].
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +173,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountOverview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountOverviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountOverview"))
+        // This overview is computed from the store and the deserialized input alone, so
+        // no request metadata takes part and the context is unused.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountOverviewError::Modeled(
+                DescribeAccountOverviewErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru insight store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // The window: the whole of each UTC day the two bounds name. A bound that is not
+        // an instant this service can keep is the modelled 400 `ValidationException`.
+        let window = crate::state::DayRange::requested(&input.from_time, input.to_time.as_ref())
+            .map_err(|rejection| -> DescribeAccountOverviewError {
+                DescribeAccountOverviewErrorModeled::ValidationException(
+                    rejection.validation_exception(),
+                )
+                .into()
+            })?;
+
+        // One tally over the insights the store holds, restricted to those CREATED inside
+        // the window: the open counts by type and the mean recovery time over the closed
+        // ones, computed the way every other health read of this store computes them.
+        let guard = state.lock();
+        let tally = crate::state::InsightTally::over(guard.insights.values(), |insight| {
+            window.holds(insight.start_time_millis)
+        });
+
+        Ok(DescribeAccountOverviewOutput {
+            proactive_insights: tally.open_proactive,
+            reactive_insights: tally.open_reactive,
+            mean_time_to_recover_in_milliseconds: tally.mean_time_to_recover_millis,
+        })
     }
 }

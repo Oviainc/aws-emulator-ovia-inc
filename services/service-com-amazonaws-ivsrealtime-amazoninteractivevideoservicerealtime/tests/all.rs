@@ -81,5 +81,7 @@ mod state_roundtrip;
 mod storage_configurations;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/update_ingest_configuration.rs"]
+mod update_ingest_configuration;
 #[path = "all/wire_probe.rs"]
 mod wire_probe;

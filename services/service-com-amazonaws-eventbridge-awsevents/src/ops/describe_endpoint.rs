@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeEndpointErrorModeled::InternalException(
@@ -180,9 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) =
             store.endpoint_in_home_region(&input.name, input.home_region.as_deref())
         else {
+            // The Region the read searched is part of what it reports: the
+            // `HomeRegion` the request named, or the Region it was addressed to.
+            let region =
+                crate::state::endpoint_region(input.home_region.as_deref(), ctx.parts());
             return Err(DescribeEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_endpoint(&input.name)),
+                    message: Some(crate::state::no_such_endpoint(&input.name, &region)),
                 },
             )
             .into());

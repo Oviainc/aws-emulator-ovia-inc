@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataQualityRuleRecommendationRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataQualityRuleRecommendationRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataQualityRuleRecommendationRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data quality rule recommendation run
+//! `StartDataQualityRuleRecommendationRun` recorded under this `RunId`: the data source it
+//! covers, the configuration it was started with, its `TaskStatusType` and, once it has
+//! finished, the ruleset it recommended or the reason it could not.
+//!
+//! The one write this read performs is the status the CLOCK had already made due
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_data_quality_rule_recommendation_runs`]):
+//! a run's terminal status was owed at its due instant whether or not anybody called, so
+//! two reads of the same run report the same run.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +174,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataQualityRuleRecommendationRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataQualityRuleRecommendationRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataQualityRuleRecommendationRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no store fault of its own, so an unreachable store is
+            // reported as its timeout error, the way the catalog's other reads report it.
+            return Err(
+                GetDataQualityRuleRecommendationRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the statuses the clock had already made due.
+        store.settle_due_data_quality_rule_recommendation_runs(now);
+
+        // `RunId` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this
+        // account holds a run under that id.
+        let Some(run) = store.data_quality_rule_recommendation_run(&input.run_id) else {
+            return Err(
+                GetDataQualityRuleRecommendationRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::data_quality_rule_recommendation_run_not_found(
+                                &input.run_id,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetDataQualityRuleRecommendationRunOutput {
+            run_id: Some(run.id.clone()),
+            data_source: Some(run.data_source.clone()),
+            role: Some(run.role.clone()),
+            number_of_workers: Some(run.number_of_workers),
+            timeout: Some(run.timeout),
+            status: Some(run.status.clone()),
+            error_string: run.error_string.clone(),
+            started_on: Some(crate::state::to_date_time(run.started_on)),
+            last_modified_on: Some(crate::state::to_date_time(run.last_modified_on)),
+            completed_on: run.completed_on.map(crate::state::to_date_time),
+            execution_time: run.execution_time_seconds(),
+            recommended_ruleset: run.recommended_ruleset.clone(),
+            created_ruleset_name: run.created_ruleset_name.clone(),
+            data_quality_security_configuration: run.data_quality_security_configuration.clone(),
+            additional_run_options: run.additional_run_options.clone(),
+            recommendation_mode: Some(run.recommendation_mode.clone()),
+        })
     }
 }
