@@ -92,6 +92,13 @@ pub const ORIGIN_EXTERNAL: &str = "EXTERNAL";
 /// AWS managed key, from `smithy_query(shape="KeyManagerType")`.
 pub const KEY_MANAGER_CUSTOMER: &str = "CUSTOMER";
 
+/// The `KeyManagerType` of a key Amazon Web Services manages on a service's behalf:
+/// "KMS keys in your Amazon Web Services account are either customer managed or
+/// Amazon Web Services managed"
+/// (`smithy_query(query="doc",shape="KeyMetadata",member="KeyManager")`), and this is
+/// the value that tells the second kind apart. See [`KEY_MANAGER_CUSTOMER`].
+pub const KEY_MANAGER_AWS: &str = "AWS";
+
 /// The only `EncryptionAlgorithmSpec` a symmetric encryption key supports:
 /// "The default value, SYMMETRIC_DEFAULT, is the algorithm used for symmetric
 /// encryption KMS keys"
@@ -441,6 +448,61 @@ impl ComAmazonawsKmsTrentserviceState {
         self.keys.get(key_id).filter(|key| key.region == region)
     }
 
+    /// The Amazon Web Services managed key the predefined alias `alias_name`
+    /// resolves to at `region`'s endpoint, associating the alias with a freshly
+    /// created key the first time one is asked for.
+    ///
+    /// A predefined Amazon Web Services alias is a name that exists in every account
+    /// and Region while carrying no target key — "the response might also include
+    /// aliases that have no `TargetKeyId` field. These are predefined aliases that
+    /// Amazon Web Services has created but has not yet associated with a KMS key"
+    /// (`smithy_query(query="doc",shape="ListAliases")`) — and the call that asks for
+    /// one is what gives it a key: "if you specify a predefined Amazon Web Services
+    /// alias (an Amazon Web Services alias with no key ID), KMS associates the alias
+    /// with an Amazon Web Services managed key and returns its KeyId and Arn in the
+    /// response"
+    /// (`smithy_query(query="doc",shape="DescribeKeyRequest",member="KeyId")`). So the
+    /// association happens once and every later call resolves the alias to the same
+    /// key, in that Region.
+    ///
+    /// `None` when `alias_name` is not a predefined Amazon Web Services alias
+    /// ([`is_predefined_aws_alias`]), when the platform refused to produce key
+    /// material, and when the store is already at its bound ([`MAX_KEYS`],
+    /// [`MAX_ALIASES`]) — so a caller naming ever more predefined aliases cannot grow
+    /// the store without end.
+    pub fn associate_predefined_aws_alias(
+        &mut self,
+        region: &str,
+        alias_name: &str,
+    ) -> Option<&Cmk> {
+        if !is_predefined_aws_alias(alias_name) {
+            return None;
+        }
+        // Already associated: the alias names its key, and nothing is created.
+        if let Some(key_id) = self
+            .alias(region, alias_name)
+            .map(|alias| alias.target_key_id.clone())
+        {
+            return self.key_in(region, &key_id);
+        }
+        if !self.has_room_for_another_key() || !self.has_room_for_another_alias() {
+            return None;
+        }
+        // An Amazon Web Services managed key is a symmetric encryption key whose
+        // material KMS generated, so its material is the material that key spec
+        // calls for rather than a kind named here.
+        let material = mint_material(key_spec_profile(KEY_SPEC_SYMMETRIC_DEFAULT)?.material)?;
+        let key = Cmk::aws_managed(mint_key_id(false), region.to_string(), material);
+        let key_id = key.key_id.clone();
+        self.insert_key(key);
+        self.insert_alias(Alias::new(
+            region.to_string(),
+            alias_name.to_string(),
+            key_id.clone(),
+        ));
+        self.key_in(region, &key_id)
+    }
+
     /// The key ids `region`'s endpoint serves, in creation order.
     pub fn key_ids_in(&self, region: &str) -> Vec<&str> {
         self.key_order
@@ -682,6 +744,52 @@ pub fn names_an_alias(identifier: &str) -> bool {
         parse_key_identifier(identifier),
         Ok(KeyIdentifier::Alias { .. })
     )
+}
+
+/// The alias name (`alias/<name>`) a `KeyId`-shaped identifier names at `region`'s
+/// endpoint, in either form KMS accepts for an alias: bare `alias/<name>`, or an
+/// alias ARN.
+///
+/// `None` when the identifier names a key rather than an alias, when it is an ARN
+/// that is no KMS key or alias ARN, and when it is an alias ARN whose Region or
+/// account segment names another endpoint's alias — an ARN addresses one alias in
+/// one Region of one account, exactly as it does one key.
+pub fn alias_named_by(region: &str, identifier: &str) -> Option<String> {
+    let Ok(KeyIdentifier::Alias { alias, scope }) = parse_key_identifier(identifier) else {
+        return None;
+    };
+    match scope {
+        Some((arn_region, account))
+            if arn_region != region || account != ::engine::emulator_account_id() =>
+        {
+            None
+        }
+        _ => Some(alias),
+    }
+}
+
+/// Whether `alias_name` is a PREDEFINED Amazon Web Services alias: a name Amazon Web
+/// Services itself holds in every account and Region for the Amazon Web Services
+/// managed key of one service, rather than a name a caller created.
+///
+/// "You can recognize Amazon Web Services aliases because their names have the format
+/// `aws/<service-name>`, such as `aws/dynamodb`"
+/// (`smithy_query(query="doc",shape="ListAliases")`), so the NAMESPACE is the rule:
+/// [`ALIAS_PREFIX_AWS_MANAGED`] followed by one non-empty service-name segment. No
+/// catalogue of service names is written here — the model documents the form, and a
+/// list of the services that have such a key is not in it, so a list would be
+/// invented rather than read.
+///
+/// It is the exact complement of what [`validate_alias_name`] refuses a caller: a
+/// name under this prefix is never one a `CreateAlias` created.
+pub fn is_predefined_aws_alias(alias_name: &str) -> bool {
+    let Some(service_name) = alias_name.strip_prefix(ALIAS_PREFIX_AWS_MANAGED) else {
+        return false;
+    };
+    !service_name.is_empty()
+        && service_name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 /// Whether `alias_name` is a name a caller may create, and why not when it is not.
@@ -1171,6 +1279,40 @@ impl Cmk {
             // one (`smithy_query(query="doc",shape="EnableKeyRotation")`).
             rotation_schedule: None,
         }
+    }
+
+    /// The Amazon Web Services managed key behind a predefined
+    /// `alias/aws/<service-name>` alias, in `region`.
+    ///
+    /// An Amazon Web Services managed key is the symmetric encryption key one
+    /// service encrypts a customer's resources with: KMS generates its material and
+    /// manages it, and its `KeyManager` ([`KEY_MANAGER_AWS`]) is what distinguishes
+    /// it from a key the customer created
+    /// (`smithy_query(query="doc",shape="KeyMetadata",member="KeyManager")`).
+    ///
+    /// Two things follow from that manager and are set here rather than left to a
+    /// caller: KMS "always rotates the key material of Amazon Web Services managed
+    /// keys every year" (`smithy_query(query="doc",shape="EnableKeyRotation")`), so
+    /// the key carries that rotation schedule from the instant it exists — and the
+    /// same sentence is why [`check_rotation_configurable`] refuses to let a caller
+    /// enable or disable it. No description is invented: the per-service wording KMS
+    /// gives these keys is not in the model.
+    pub fn aws_managed(key_id: String, region: String, material: KeyMaterial) -> Self {
+        let mut key = Self::new(
+            key_id,
+            region,
+            String::new(),
+            KEY_USAGE_ENCRYPT_DECRYPT.to_string(),
+            KEY_SPEC_SYMMETRIC_DEFAULT.to_string(),
+            ORIGIN_AWS_KMS.to_string(),
+            false,
+            default_key_policy(),
+            BTreeMap::new(),
+            material,
+        );
+        key.key_manager = KEY_MANAGER_AWS.to_string();
+        key.schedule_rotation(Some(DEFAULT_ROTATION_PERIOD_IN_DAYS));
+        key
     }
 
     /// Make `material` this key's current key material, retaining the version it

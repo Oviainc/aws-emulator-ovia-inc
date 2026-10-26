@@ -256,27 +256,31 @@ async fn a_key_may_have_many_aliases_but_a_name_names_one_key() {
 /// The rows are the two rules the model cannot express
 /// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`): the
 /// value "must begin with alias/ followed by a name", and "the alias name cannot
-/// begin with alias/aws/".
+/// begin with alias/aws/". Each row also says whether the refused name is a
+/// PREDEFINED Amazon Web Services alias (`aws/<service-name>`), which `DescribeKey`
+/// associates with an Amazon Web Services managed key of its own — never with the
+/// caller's target key.
 #[tokio::test]
 async fn an_alias_name_outside_the_documented_rules_is_refused() {
     let router = router();
     let metadata = create_key(&router, &json!({"Description": "target"})).await;
     let key_id = text("setup", &metadata, "KeyId");
 
-    let names: Vec<(&str, String)> = vec![
-        ("no prefix at all", "plain-name".to_string()),
-        ("prefix in the middle", "my/alias/name".to_string()),
-        ("prefix without its slash", "alias".to_string()),
-        ("prefix with nothing after it", "alias/".to_string()),
-        ("prefix in the wrong case", "ALIAS/name".to_string()),
-        ("reserved AWS-managed prefix", "alias/aws/elasticache".to_string()),
-        ("reserved prefix with nothing after it", "alias/aws/".to_string()),
+    let names: Vec<(&str, String, bool)> = vec![
+        ("no prefix at all", "plain-name".to_string(), false),
+        ("prefix in the middle", "my/alias/name".to_string(), false),
+        ("prefix without its slash", "alias".to_string(), false),
+        ("prefix with nothing after it", "alias/".to_string(), false),
+        ("prefix in the wrong case", "ALIAS/name".to_string(), false),
+        ("reserved AWS-managed prefix", "alias/aws/elasticache".to_string(), true),
+        ("reserved prefix with nothing after it", "alias/aws/".to_string(), false),
         (
             "reserved prefix, deeper name",
             "alias/aws/team/project".to_string(),
+            false,
         ),
     ];
-    for (case, alias) in names {
+    for (case, alias, predefined) in names {
         let (status, code) = failure(
             &router,
             "CreateAlias",
@@ -292,10 +296,30 @@ async fn an_alias_name_outside_the_documented_rules_is_refused() {
             "case {case}: expected InvalidAliasNameException, got {code}"
         );
         let (status, payload) = call(&router, REGION, "DescribeKey", &json!({"KeyId": alias})).await;
-        assert_ne!(
-            status, 200,
-            "case {case}: a refused name must resolve to nothing, got {payload}"
-        );
+        if predefined {
+            assert_eq!(
+                status, 200,
+                "case {case}: a predefined Amazon Web Services alias resolves, got {payload}"
+            );
+            let described = payload["KeyMetadata"].clone();
+            assert_eq!(
+                described["KeyManager"],
+                json!("AWS"),
+                "case {case}: a predefined alias names an Amazon Web Services managed \
+                 key, got {described}"
+            );
+            assert_ne!(
+                text(case, &described, "KeyId"),
+                key_id,
+                "case {case}: the refused create must not have pointed the name at the \
+                 target key, got {described}"
+            );
+        } else {
+            assert_ne!(
+                status, 200,
+                "case {case}: a refused name must resolve to nothing, got {payload}"
+            );
+        }
     }
 
     // One character past the modelled `len 1..256` the request never reaches the

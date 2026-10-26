@@ -161,7 +161,9 @@ service's own state, where a test seeds them directly.
 
 An `s3RecordingConfig`'s recording bucket needs NO setting: Ground Station resolves the
 bucket the `bucketArn` names against the emulator's own S3 (`HeadBucket` over the
-in-process callback), so a bucket created through the emulator's S3 is accepted and only
-a `bucketArn` naming no bucket is refused with `InvalidParameterException` ("Unable to
-create new S3 endpoint config - bucket does not exist."). With no S3 mounted to ask,
+in-process callback), so a bucket created through the emulator's S3 is accepted and a
+`bucketArn` the service cannot resolve to a bucket is refused with
+`InvalidParameterException` — one fixed text for every way the resolution fails ("Unable
+to create new S3 endpoint config - unable to get location of bucket. Ensure that Ground
+Station has s3:GetBucketLocation permissions on the bucket."). With no S3 mounted to ask,
 nothing is known about the bucket and the config is created.

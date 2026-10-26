@@ -15,6 +15,8 @@
 mod alias_lifecycle;
 #[path = "all/aliases.rs"]
 mod aliases;
+#[path = "all/aws_managed_keys.rs"]
+mod aws_managed_keys;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
 #[path = "all/custom_key_stores.rs"]

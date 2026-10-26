@@ -253,6 +253,46 @@ pub(crate) async fn deploy(router: &MultiServiceRouter, name: &str, template: &s
     );
 }
 
+/// The fixed form of `CapabilitiesReason`: "the list of resources that generated the values
+/// in the Capabilities response element".
+///
+/// Shared by every suite that reads a template-reporting response (`validate_template.rs`
+/// and `template_summary.rs` both report the capabilities a template requires), so the two
+/// cannot drift about the form of that one sentence.
+pub(crate) const CAPABILITIES_REASON_PREFIX: &str =
+    "The following resource(s) require capabilities: [";
+
+/// The resource types a `CapabilitiesReason` names, sorted — the set matters, the order the
+/// service happened to walk the `Resources` section in does not.
+pub(crate) fn reason_resource_types(reason: &str) -> Vec<String> {
+    let inner = reason
+        .strip_prefix(CAPABILITIES_REASON_PREFIX)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_default();
+    let mut types: Vec<String> = inner
+        .split(", ")
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    types.sort();
+    types
+}
+
+/// The response with its `Parameters` block removed, so reading a TOP-LEVEL element does not
+/// pick up a parameter's own `Description` (the envelope carries `Parameters` first).
+///
+/// Shared for the same reason [`CAPABILITIES_REASON_PREFIX`] is: every response that reports
+/// what a template declares carries both a top-level `Description` and one per parameter.
+pub(crate) fn outside_parameters(xml: &str) -> String {
+    let close = "</Parameters>";
+    match (xml.find("<Parameters>"), xml.find(close)) {
+        (Some(start), Some(end)) => {
+            format!("{}{}", &xml[..start], &xml[end + close.len()..])
+        }
+        _ => xml.to_string(),
+    }
+}
+
 /// The top-level `<member>` elements of the first `tag` list in `xml`, each as the XML it
 /// holds, in wire order.
 ///

@@ -208,9 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(resource_rejection)?;
 
         // "This exception is thrown when the specified resource is not ready for an
-        // operation … before CloudTrail has time to fully load the resource, or
-        // because another operation is modifying the resource. If this exception
-        // occurs, wait a few minutes, and then try the operation again."
+        // operation … because another operation is modifying the resource. If this
+        // exception occurs, wait a few minutes, and then try the operation again."
+        // A resource whose create has returned is ready; only one on its way out is
+        // refused.
         if !resource.ready {
             return Err(PutResourcePolicyErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::policy_resource_not_ready_message(
@@ -221,14 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The policy document's own validity: JSON policy syntax, and a principal
-        // the policy can grant to.
-        crate::state::validate_resource_policy(&input.resource_policy).map_err(|message| {
-            PutResourcePolicyErrorModeled::ResourcePolicyNotValidException(
-                ResourcePolicyNotValidException {
-                    message: Some(message),
-                },
-            )
-        })?;
+        // the policy can grant to. The refusal states the one fixed sentence the
+        // service answers a document that is not a policy with.
+        if !crate::state::is_valid_resource_policy(&input.resource_policy) {
+            return Err(
+                PutResourcePolicyErrorModeled::ResourcePolicyNotValidException(
+                    ResourcePolicyNotValidException {
+                        message: Some(
+                            crate::state::RESOURCE_POLICY_NOT_VALID_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // Store the document as submitted — the policy a later read reports is the
         // one this call attached — keyed by the resource it is attached to, so a

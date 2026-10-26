@@ -226,9 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        // The content of the lenses this workload reviews, resolved from the whole lens
+        // catalog: a lens review's risk roll-up counts the questions THAT lens asks, which
+        // for a custom lens are the ones its imported document defines.
+        let content = store.reviewed_lens_content(&workload.lenses);
         let lens_review_summaries: Vec<LensReviewSummary> = page
             .iter()
-            .map(|(_, lens)| lens_review_summary(&store, workload, lens, &region))
+            .map(|(_, lens)| lens_review_summary(&store, workload, lens, &region, &content))
             .collect();
 
         Ok(ListLensReviewsOutput {
@@ -250,12 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// a summary moves when an answer does and cannot disagree with what `GetLensReview`
 /// reports about the same review — the lens's identity and currency and the roll-up come
 /// from the same two places (`crate::state::reviewed_lens_at` and
-/// `WorkloadRecord::lens_risk_counts`) that read builds its answer from.
+/// `WorkloadRecord::lens_risk_counts`) that read builds its answer from. `content` is the
+/// content of the lenses the workload reviews, resolved from the WHOLE catalog — the
+/// AWS-official lenses this emulator publishes and the stored custom lenses' published
+/// documents — so the roll-up counts whatever the reviewed lens itself asks.
 fn lens_review_summary(
     store: &crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
     workload: &crate::state::WorkloadRecord,
     lens: &str,
     region: &str,
+    content: &crate::state::ReviewedLensContent,
 ) -> LensReviewSummary {
     let reviewed = store.reviewed_lens_at(lens, workload.lens_review_version(lens), region);
     LensReviewSummary {
@@ -281,7 +289,7 @@ fn lens_review_summary(
         // The roll-up over THIS lens's questions alone, derived from the stored answers on
         // every read: it moves when an answer does.
         risk_counts: Some(crate::state::risk_counts_to_map(
-            &workload.lens_risk_counts(lens),
+            &workload.lens_risk_counts(lens, content),
         )),
         // "The profiles associated with the workload" — the same list the workload itself
         // and a read of this review report, projected from the one place

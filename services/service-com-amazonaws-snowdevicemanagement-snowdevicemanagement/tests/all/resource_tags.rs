@@ -13,8 +13,8 @@
 //!    `managed-device/<id>` or `task/<id>` is refused HTTP 400 `BadRequestException`; an
 //!    ARN whose account is not the one this emulator serves is refused 403
 //!    `AccessDeniedException` whatever it names, so a tag read cannot be used to learn
-//!    what another account holds; and an ARN of this account addressing no stored record
-//!    is refused 404 `NotFoundException`.
+//!    what another account holds; and an ARN of this account addressing no record of the
+//!    Region the request is signed for is refused 404 `NotFoundException`.
 //! 3. A read changes nothing a later caller sees, and neither does a refusal.
 //!
 //! Rows differ along what the rules generalise over: the resource kind, the number and
@@ -314,14 +314,16 @@ async fn a_fully_percent_encoded_label_names_the_same_arn() {
 }
 
 #[tokio::test]
-async fn an_arn_naming_another_region_of_this_account_addresses_the_same_record() {
-    // The ARN's region is not part of the key: the inventory and the task store are
-    // per-account, so an ARN of this account naming another region addresses the same
-    // record — the same resolution `UntagResource` performs.
+async fn an_arn_naming_another_region_of_this_account_addresses_no_record() {
+    // The ARN's Region is part of what it addresses: a record of this service belongs
+    // to one Region and is invisible in every other, so an ARN naming a Region other
+    // than the one the request is signed for names nothing this endpoint serves — even
+    // when the id it carries is one this account really holds. The whole rule, over
+    // both writes as well, is `tagging_region_scope.rs`.
     let router = emulator();
-    let tags = json!({ "scope": "per-account" });
-    let (task_id, _) = tagged_task(&router, "another region", &tags).await;
-    let (device_id, _) = a_seeded_device(&router, "another region").await;
+    let tags = json!({ "scope": "per-region" });
+    let (task_id, task_arn) = tagged_task(&router, "another region", &tags).await;
+    let (device_id, device_arn) = a_seeded_device(&router, "another region").await;
 
     let rows: &[(&str, String)] = &[
         (
@@ -338,14 +340,22 @@ async fn an_arn_naming_another_region_of_this_account_addresses_the_same_record(
             ),
         ),
     ];
-    let expected = [tags.clone(), json!({})];
-    for ((case, resource_arn), want) in rows.iter().zip(expected) {
-        assert_eq!(
-            tags_of(&list_tags(&router, resource_arn).await, case),
-            want,
-            "case {case:?}: an ARN of this account must address the same per-account record"
-        );
+    for (case, resource_arn) in rows {
+        assert_not_found(&list_tags(&router, resource_arn).await, case, resource_arn);
     }
+
+    // The positive control: the SAME records are served through the ARNs the emulator
+    // issued for them, so the refusals above are about the Region the ARN named.
+    assert_eq!(
+        tags_of(&list_tags(&router, &task_arn).await, "the task's own ARN"),
+        tags,
+        "the task must still be served through the ARN its create returned"
+    );
+    assert_eq!(
+        tags_of(&list_tags(&router, &device_arn).await, "the device's own ARN"),
+        json!({}),
+        "the device must still be served through the ARN the inventory reports"
+    );
 }
 
 /// Rule 2, the denied half, and the no-leak invariant it exists for.

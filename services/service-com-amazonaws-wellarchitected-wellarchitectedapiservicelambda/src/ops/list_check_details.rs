@@ -194,9 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this read resolves are the workload and its lens review above — so a value the
         // lens's content does not define is refused as a field validation, the same rule
         // every operation that takes a pillar or a question of a lens review applies.
+        //
+        // The content comes from the whole lens catalog, so a pillar and a question of a
+        // CUSTOM lens are judged against the document that lens imported exactly as an
+        // official lens's are against its catalog row.
+        let content = store.lens_content(&input.lens_arn);
         if let Some(exception) = crate::state::undefined_pillar_refusal(
             crate::state::PILLAR_ID_MEMBER,
             &input.lens_arn,
+            &content,
             std::iter::once(input.pillar_id.as_str()),
         ) {
             return Err(ListCheckDetailsErrorModeled::ValidationException(exception).into());
@@ -205,6 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::QUESTION_ID_MEMBER,
             &input.lens_arn,
             &input.pillar_id,
+            &content,
             std::iter::once(input.question_id.as_str()),
         ) {
             return Err(ListCheckDetailsErrorModeled::ValidationException(exception).into());

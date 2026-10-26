@@ -12,8 +12,8 @@
 //! `managed-device/<id>` or `task/<id>` never addressed a resource here and is refused
 //! with HTTP 400 `BadRequestException`; a well-formed ARN for another account is refused
 //! with the modelled `AccessDeniedException` (403), which discloses nothing about what
-//! that account holds; a well-formed ARN of this account naming no stored record is
-//! refused with HTTP 404 `NotFoundException`.
+//! that account holds; a well-formed ARN of this account naming no record of the Region
+//! the request was signed for is refused with HTTP 404 `NotFoundException`.
 //!
 //! Every key the request names is checked before anything is removed, and one AWS does
 //! not let a request name is refused with the modelled `ValidationException` (400): AWS reserves the `aws:` tag-key
@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
@@ -201,6 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The Region of the endpoint this request reached: a record of this service
+        // lives in one Region and is invisible in every other, so it is what the
+        // addressed ARN has to agree with.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Settling is owed here too, because a tag read of a task has to see the
         // state the clock gave it.
@@ -229,11 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn` resolves to is the state's own rule (its `tags_of_mut`), shared
         // with `TagResource` and the mutable counterpart of the `tags_of` a tag read
         // goes through.
-        let Some(tags) = store.tags_of_mut(&resource) else {
+        let Some(tags) = store.tags_of_mut(&region, &resource) else {
             // The recorded answer of the tagging APIs for a `resourceArn` that parses
-            // but names no device and no task is HTTP 404 `NotFoundException` — not the
-            // model's `ResourceNotFoundException`, which is what the device and task
-            // operations answer with — so it too comes from the error channel.
+            // but names no device and no task of this endpoint's Region is HTTP 404
+            // `NotFoundException` — not the model's `ResourceNotFoundException`, which is
+            // what the device and task operations answer with — so it too comes from the
+            // error channel.
             return Err(crate::scaffolded::Scaffolded::not_found(
                 crate::state::TAGGING_NOT_FOUND_MESSAGE,
             ));

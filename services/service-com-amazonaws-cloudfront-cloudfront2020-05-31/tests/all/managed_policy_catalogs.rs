@@ -40,7 +40,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     MANAGED_ORIGIN_REQUEST_POLICIES, MANAGED_RESPONSE_HEADERS_POLICIES, MAX_ITEMS,
     NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE, NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
     ORIGIN_REQUEST_POLICY_TYPE_CUSTOM, ORIGIN_REQUEST_POLICY_TYPE_MANAGED,
-    RESPONSE_HEADERS_POLICY_TYPE_CUSTOM, RESPONSE_HEADERS_POLICY_TYPE_MANAGED,
+    RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE, RESPONSE_HEADERS_POLICY_TYPE_CUSTOM,
+    RESPONSE_HEADERS_POLICY_TYPE_MANAGED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -101,8 +102,12 @@ struct Family {
     custom: &'static str,
     /// The wire code a read of an id neither source holds answers with.
     missing_code: &'static str,
-    /// The message that refusal carries.
+    /// The message that refusal carries for a WELL-FORMED id of this family that names no
+    /// policy.
     missing_message: &'static str,
+    /// The message that refusal carries for an identifier that is not of this family's id
+    /// shape at all.
+    malformed_message: &'static str,
     /// `(Id, Name)` for every entry of the published catalogue, as the crate serves it.
     catalogue: Vec<(String, String)>,
 }
@@ -119,6 +124,9 @@ fn origin_request_family() -> Family {
         custom: ORIGIN_REQUEST_POLICY_TYPE_CUSTOM,
         missing_code: "NoSuchOriginRequestPolicy",
         missing_message: NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
+        // This family answers one sentence for both conditions: nothing recorded shows it
+        // telling an unusable identifier apart from a well-formed one that names no policy.
+        malformed_message: NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
         catalogue: MANAGED_ORIGIN_REQUEST_POLICIES
             .iter()
             .map(|managed| (managed.id.to_string(), managed.name.to_string()))
@@ -138,6 +146,7 @@ fn response_headers_family() -> Family {
         custom: RESPONSE_HEADERS_POLICY_TYPE_CUSTOM,
         missing_code: "NoSuchResponseHeadersPolicy",
         missing_message: NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
+        malformed_message: RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
         catalogue: MANAGED_RESPONSE_HEADERS_POLICIES
             .iter()
             .map(|managed| (managed.id.to_string(), managed.name.to_string()))
@@ -665,18 +674,23 @@ async fn the_published_and_account_partitions_stay_disjoint() {
 }
 
 /// An id outside BOTH sources — the published catalogue and the account's own records —
-/// names no policy at all, so both readers answer the modelled 404 with the modelled
-/// sentence. The ids are shaped like the catalogue's (a UUID) and unlike it.
+/// names no policy at all, so both readers answer the modelled 404. The ids are shaped like
+/// the catalogue's (a UUID) and unlike it, and the MESSAGE follows the shape: a well-formed
+/// id names no policy, while an identifier outside the shape is unusable.
 #[tokio::test]
 async fn an_id_in_neither_source_does_not_exist() {
     let router = emulator();
 
     for family in [origin_request_family(), response_headers_family()] {
         let case = family.case;
-        for (shape, id) in [
-            ("uuid-shaped", "11111111-2222-3333-4444-555555555555"),
-            ("not-an-id-at-all", "nope"),
-            ("a version token", "E1AAAAAAAAAAAA"),
+        for (shape, id, expected) in [
+            (
+                "uuid-shaped",
+                "11111111-2222-3333-4444-555555555555",
+                family.missing_message,
+            ),
+            ("not-an-id-at-all", "nope", family.malformed_message),
+            ("a version token", "E1AAAAAAAAAAAA", family.malformed_message),
         ] {
             for path in [format!("/{}/{id}", family.path), format!("/{}/{id}/config", family.path)]
             {
@@ -695,8 +709,8 @@ async fn an_id_in_neither_source_does_not_exist() {
                 );
                 assert_eq!(
                     answer.root().find_text("Message").unwrap_or_default(),
-                    family.missing_message,
-                    "case {case} ({shape}, {path}): expected the modelled sentence, got {}",
+                    expected,
+                    "case {case} ({shape}, {path}): expected {expected:?}, got {}",
                     answer.raw
                 );
             }

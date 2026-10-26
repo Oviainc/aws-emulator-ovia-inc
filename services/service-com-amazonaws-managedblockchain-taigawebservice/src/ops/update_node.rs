@@ -3,7 +3,8 @@
 //! @op UpdateNode
 //!
 //! `UpdateNode` applies the node configuration parameters a request names to the stored
-//! node record; `GetNode` reads the result back.
+//! node record and starts the change the node reports as `UPDATING` until the clock owes
+//! it `AVAILABLE` again; `GetNode` reads both back.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
-        guard.settle(::std::time::SystemTime::now());
+        guard.settle(now);
 
         // `PATCH /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the network,
         // so the path labels resolve left to right: a `NetworkId` this service does not
@@ -205,6 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested) = input.log_publishing_configuration {
             let merged = merge_node_logs(node.log_publishing_configuration.take(), requested);
             node.log_publishing_configuration = Some(merged);
+            // The update STARTS the change rather than completing it: "`UPDATING` - The
+            // node is in the process of being updated" (`Node$Status`), which `GetNode`
+            // reports and the `ListNodes` `Status` filter selects on, until the clock owes
+            // the node `AVAILABLE` again. A request that named no configuration changed
+            // nothing, so it starts nothing.
+            node.begin_update(now);
         }
 
         // `UpdateNodeOutput` models no members: the updated record is read back through

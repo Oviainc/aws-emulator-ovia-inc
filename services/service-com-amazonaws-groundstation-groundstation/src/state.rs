@@ -447,28 +447,39 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What `s3RecordingConfig`'s bucket resolution answers when the `bucketArn` names no
-/// bucket: the service's fixed refusal text for this condition, as recorded against AWS.
-/// As with every other refusal here the status (431) and the error code
+/// What `s3RecordingConfig`'s bucket resolution answers when the bucket cannot be
+/// resolved: the service's SINGLE fixed refusal text for that condition, whatever made
+/// the resolution fail — a `bucketArn` that names no bucket and a bucket the account does
+/// not hold are the same answer, because both are the bucket's location failing to
+/// resolve. Entirely fixed text: it interpolates no bucket, ARN, account or region. As
+/// with every other refusal here the status (431) and the error code
 /// (`InvalidParameterException`) are the contract, and this is the wording that goes
 /// with them.
-pub const RECORDING_BUCKET_DOES_NOT_EXIST: &str =
-    "Unable to create new S3 endpoint config - bucket does not exist.";
+pub const UNRESOLVABLE_RECORDING_BUCKET: &str =
+    "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
+     that Ground Station has s3:GetBucketLocation permissions on the bucket.";
 
-/// Refuse a `configData` whose recording bucket does not exist — and only then.
+/// Refuse a `configData` whose recording bucket cannot be resolved — and only then.
 ///
 /// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station
-/// resolves that bucket before it will store the config: a bucket S3 reports this account
-/// does not hold, and a `bucketArn` that names no bucket at all, are refused with the
-/// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
-/// never holds a recording config that cannot record. A bucket that EXISTS is accepted.
+/// resolves that bucket — it has to know where the bucket is before it can record to it —
+/// before it will store the config: a bucket S3 reports this account does not hold, and a
+/// `bucketArn` that names no bucket at all, are refused with the modelled
+/// `InvalidParameterException` (HTTP 431) instead of being stored, so a caller never holds
+/// a recording config that cannot record. Both failures are ONE refusal, carrying
+/// [`UNRESOLVABLE_RECORDING_BUCKET`]: what the caller is told is that the bucket's
+/// location could not be obtained, not which way the lookup came back empty. A bucket that
+/// RESOLVES is accepted.
 ///
 /// S3 is reached the way the framework documents a handler reaching another emulated
 /// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
 /// over the in-process callback's HTTP client and credentials, so this crate names no
 /// other service crate and the bucket is resolved against the emulator's OWN S3 state.
-/// The question is put with `HeadBucket`, the operation S3 documents for it ("You can use
-/// this operation to determine if a bucket exists").
+/// The question is put with `HeadBucket`, the operation S3 documents both for existence
+/// ("You can use this operation to determine if a bucket exists") and for a bucket's
+/// location ("calls to the HeadBucket operation always return the bucket's location
+/// through an HTTP response header […] we recommend using the HeadBucket operation for
+/// bucket Region discovery"), so one call answers the resolution this refusal is about.
 ///
 /// `None` means the create or update may proceed. That INCLUDES every answer that is not
 /// S3 reporting the bucket absent — a router with no S3 mounted, or any other failure to
@@ -487,7 +498,7 @@ pub async fn unresolvable_recording_bucket(
     let refusal = || {
         invalid_parameter(
             "configData.s3RecordingConfig.bucketArn",
-            RECORDING_BUCKET_DOES_NOT_EXIST.to_string(),
+            UNRESOLVABLE_RECORDING_BUCKET.to_string(),
         )
     };
     // A value that is not an S3 bucket ARN names no bucket, and that is settled without
@@ -504,7 +515,8 @@ pub async fn unresolvable_recording_bucket(
     match answer {
         // S3 holds the bucket, so the config can record to it.
         Ok(_) => None,
-        // S3 says this account holds no such bucket: the refusal is grounded.
+        // S3 says this account holds no such bucket, so its location cannot be obtained
+        // either: the refusal is grounded.
         Err(error) if bucket_reported_absent(&error) => Some(refusal()),
         Err(error) => {
             ::tracing::warn!(

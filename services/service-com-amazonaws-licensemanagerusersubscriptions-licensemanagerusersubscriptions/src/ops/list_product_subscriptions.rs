@@ -168,13 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not a registration this call resolves.
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
         let provider_arns: Vec<String> = match input.product.as_deref() {
-            Some(product) => state
-                .identity_provider_index
-                .get(&(key.clone(), product.to_string()))
-                .filter(|arn| state.live_identity_provider(arn).is_some())
-                .cloned()
-                .into_iter()
-                .collect(),
+            // A `(IdentityProvider, Product)` pair addresses ONE registration, and what it
+            // resolves to is the state layer's single answer — the same one every operation
+            // that acts on a registration asks for — so this list can never report through
+            // a registration they would refuse.
+            Some(product) => vec![
+                state
+                    .resolve_identity_provider(None, Some(&input.identity_provider), Some(product))
+                    .map_err(into_error)?
+                    .arn
+                    .clone(),
+            ],
             None => {
                 let registered: std::collections::HashSet<&str> = state
                     .identity_provider_index
@@ -192,10 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         if provider_arns.is_empty() {
-            // The identifier names no registration of this account: an invalid parameter,
-            // reported exactly as `DeregisterIdentityProvider` reports it. Listing a
-            // provider's subscriptions is a call about the REGISTRATION, so it says so
-            // rather than failing closed the way the user-plane calls do.
+            // Reached from the `Product`-omitted branch above, whose scan has no resolution
+            // of its own to refuse through: the identifier names no registration of this
+            // account, an invalid parameter reported exactly as the resolution reports it.
+            // Listing a provider's subscriptions is a call about the REGISTRATION, so it
+            // says so rather than failing closed the way the user-plane calls do.
             return Err(into_error(crate::state::StateError::ProviderNotRegistered));
         }
 

@@ -6,11 +6,11 @@
 //! The resource is addressed by ARN, so this handler answers in the order the service
 //! does: a `resourceArn` this operation cannot parse as one of this service's ARNs is a
 //! bad request, one naming another account is denied, one that parses but names no
-//! device and no task is not found, and only once the ARN has resolved does the
-//! request's `tags` get looked at. That ordering is observable — a call carrying BOTH an
-//! unresolvable ARN and an unacceptable tag is answered about the ARN, never with the
-//! tag refusal. `UntagResource` answers the same classes the same way, through the same
-//! `crate::state::parse_tagged_resource_arn`.
+//! device and no task OF THE SIGNED REGION is not found, and only once the ARN has
+//! resolved does the request's `tags` get looked at. That ordering is observable — a
+//! call carrying BOTH an unresolvable ARN and an unacceptable tag is answered about the
+//! ARN, never with the tag refusal. `UntagResource` answers the same classes the same
+//! way, through the same `crate::state::parse_tagged_resource_arn`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
@@ -186,6 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // The Region of the endpoint this request reached: a record of this service
+        // lives in one Region and is invisible in every other, so it is what the
+        // addressed ARN has to agree with.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Settling is owed here too, because tagging a task has to see the state
         // the clock gave it.
@@ -214,15 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The tags of the addressed record, or the tagging APIs' recorded 404 for a
-        // `resourceArn` that parses but names no device and no task — not the model's
-        // `ResourceNotFoundException`, which is what the device and task operations
-        // answer with. The ARN is resolved BEFORE the request's `tags` is looked at, so
-        // a call carrying both an unresolvable ARN and an unacceptable tag is answered
-        // with this. The resolution itself belongs to the state
-        // (the state's `tags_of_mut`), the mutable counterpart of the `tags_of` a tag
-        // read goes through, so this handler, `UntagResource` and the read path cannot
-        // resolve the same `resourceArn` to different records.
-        let Some(existing) = store.tags_of_mut(&resource) else {
+        // `resourceArn` that parses but names no device and no task of this endpoint's
+        // Region — not the model's `ResourceNotFoundException`, which is what the device
+        // and task operations answer with. An ARN whose Region field is another Region
+        // addresses no record here, whatever id it carries, the same way every
+        // id-addressed operation of this service resolves only within the signed Region.
+        // The ARN is resolved BEFORE the request's `tags` is looked at, so a call
+        // carrying both an unresolvable ARN and an unacceptable tag is answered with
+        // this. The resolution itself belongs to the state (the state's `tags_of_mut`),
+        // the mutable counterpart of the `tags_of` a tag read goes through, so this
+        // handler, `UntagResource` and the read path cannot resolve the same
+        // `resourceArn` to different records.
+        let Some(existing) = store.tags_of_mut(&region, &resource) else {
             return Err(crate::scaffolded::Scaffolded::not_found(
                 crate::state::TAGGING_NOT_FOUND_MESSAGE,
             ));

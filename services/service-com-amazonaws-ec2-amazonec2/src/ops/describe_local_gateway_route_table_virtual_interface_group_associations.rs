@@ -5,8 +5,11 @@
 //! Reports the associations between local gateway route tables and virtual interface
 //! groups out of [`crate::state`]: the whole store by default, or the subset the
 //! request's `LocalGatewayRouteTableVirtualInterfaceGroupAssociationIds` and `Filters`
-//! select, one `MaxResults`-sized page at a time. A reporting operation — it writes
-//! nothing at all, a stored association carrying no clock-owed transition.
+//! select, one `MaxResults`-sized page at a time. A reporting operation — the only thing it
+//! writes is the `associating` -> `associated` move the clock already owed a stored
+//! association
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), which was
+//! due at this instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -246,7 +249,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // Every clock-owed move that has come due, applied before the store is read: an
+        // association `CreateLocalGatewayRouteTableVirtualInterfaceGroupAssociation`
+        // answered `associating` owes `associated` at its due instant whether or not anybody
+        // asks, so materialising it changes nothing a later caller would otherwise have
+        // seen.
+        store.materialize_due_transitions();
 
         // The default is to describe every association the account holds; the ids narrow
         // the store to those named, and every filter must then hold ("If you specify
@@ -265,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for association in store
             .local_gateway_route_table_virtual_interface_group_associations
             .values()
+            .map(|record| &record.view)
         {
             if budget.exhausted() {
                 break;

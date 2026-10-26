@@ -23,8 +23,8 @@
 //!   `DashboardName` rules, or an `arn:` value that is not a dashboard ARN — is one of
 //!   those misses;
 //! * "You cannot delete a dashboard that has termination protection enabled": the delete
-//!   is refused with the `ConflictException` this operation models and the dashboard is
-//!   left exactly as it was, until `UpdateDashboard` turns termination protection off;
+//!   is refused with `ValidationException` and the dashboard is left exactly as it was,
+//!   until `UpdateDashboard` turns termination protection off;
 //! * a resource-based policy belongs to the resource it is attached to, so the policy
 //!   attached to a dashboard goes with the dashboard and one later created with the same
 //!   name in the same Region inherits nothing.
@@ -57,10 +57,12 @@ const NOT_FOUND_STATUS: u16 = 400;
 /// under test could not catch that code wording its own refusal.
 const NOT_FOUND_MESSAGE: &str = "No matching dashboard found.";
 
-/// The status this service answers its dashboard `ConflictException` with: 400 on the
-/// wire, not the 409 the shape's `@httpError` trait annotates (see
-/// `state::DASHBOARD_CONFLICT_HTTP_STATUS`, which cites the recorded conflict).
-const CONFLICT_STATUS: u16 = 400;
+/// The status and code CloudTrail refuses a request its target's own configuration
+/// forbids with: the recorded delete of a dashboard that has termination protection
+/// enabled answers HTTP 400 `ValidationException`.
+const PROTECTED_STATUS: u16 = 400;
+/// See [`PROTECTED_STATUS`].
+const PROTECTED_CODE: &str = "ValidationException";
 
 /// A margin on top of [`state::DASHBOARD_SETTLE_AFTER`], so a case that has to wait for
 /// the clock does not race the instant a handler reads.
@@ -101,11 +103,17 @@ fn tags(count: usize) -> Value {
 
 /// Create a dashboard called `name` in `region` with `extra` merged into the request.
 ///
+/// `TerminationProtectionEnabled` is set to false unless `extra` states it: CloudTrail
+/// protects a new dashboard unless the caller opts out
+/// (`state::DASHBOARD_TERMINATION_PROTECTION_DEFAULT`), and every row here is about what
+/// a delete releases rather than about that protection, so each one opts out the way a
+/// client that means to delete its dashboard does.
+///
 /// A free function rather than an inherent method on the shared [`Emulator`]: the other
 /// dashboard suites already extend that type, and two inherent methods of one name on one
 /// type cannot both be reached.
 async fn create(emulator: &Emulator, region: &str, name: &str, extra: &Value) -> Reply {
-    let mut request = json!({"Name": name});
+    let mut request = json!({"Name": name, "TerminationProtectionEnabled": false});
     if let Some(members) = extra.as_object() {
         for (key, value) in members {
             request[key] = value.clone();
@@ -420,9 +428,9 @@ async fn an_identifier_naming_no_dashboard_is_not_found() {
 }
 
 /// RULE: a dashboard with termination protection enabled cannot be deleted — the delete
-/// is refused with the modelled `ConflictException` and the dashboard is left exactly as
-/// it was — and turning termination protection off through `UpdateDashboard` makes it
-/// deletable again.
+/// is refused with `ValidationException` and the dashboard is left exactly as it was —
+/// and turning termination protection off through `UpdateDashboard` makes it deletable
+/// again.
 ///
 /// The rows differ in HOW termination protection came to be on (set by the create, or
 /// turned on later by an update), in the Region the dashboard lives in, in the form of
@@ -483,7 +491,7 @@ async fn termination_protection_refuses_the_delete() {
         let refused = delete(&emulator, region, &identifier).await;
         assert_eq!(
             (refused.status, refused.error_code()),
-            (CONFLICT_STATUS, "ConflictException"),
+            (PROTECTED_STATUS, PROTECTED_CODE),
             "case {case:?}: a protected dashboard cannot be deleted, got {refused:?}"
         );
         // AWS publishes no wording for this refusal, so what is asserted is that the

@@ -27,8 +27,10 @@
 //!   service announces" below), and a `DELETE /tags/{ResourceArn}` that binds no
 //!   `tagKeys` value — the empty key list `UntagResource` models — is served by
 //!   `UntagResource`, which the framework's required-query-binding rule leaves unmatched
-//!   (see [`UNTAG_RESOURCE_ROUTE`]). Which operation serves a request is still the
-//!   model's routing table's answer in every other case.
+//!   (see [`UNTAG_RESOURCE_ROUTE`]), as is a `DELETE /rummetrics/{AppMonitorName}/metrics`
+//!   that binds no `metricDefinitionIds` value (see
+//!   [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]). Which operation serves a request is still
+//!   the model's routing table's answer in every other case.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -157,11 +159,30 @@ fn is_resource_arn_syntax_violation(violations: &[Violation]) -> bool {
 /// "unknown operation" (HTTP 501 `NotImplemented`, a status and code the operation does
 /// not model) instead of being served.
 ///
-/// It is the only such route in this service: every other operation here either binds no
-/// `@required` member to the query string at all, or (`ListTagsForResource`,
-/// `TagResource`) binds none to it, so no other method+path pair can fail to resolve this
-/// way.
+/// It is one of the two such routes in this service: every operation other than it and
+/// [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`] either binds no `@required` member to the
+/// query string at all, or binds only members a request always carries a value for, so no
+/// other method+path pair can fail to resolve this way.
 const UNTAG_RESOURCE_ROUTE: (&str, &str, &str) = ("DELETE", "tags", "UntagResource");
+
+/// The other route of this service the same rule leaves unmatched, as
+/// `(method, collection segment, sub-resource segment, operation)`.
+///
+/// `BatchDeleteRumMetricDefinitions` is `DELETE /rummetrics/{AppMonitorName}/metrics` with
+/// `MetricDefinitionIds` `@required` and bound to the `metricDefinitionIds` query parameter
+/// (`smithy_query(query="operation", operation="BatchDeleteRumMetricDefinitions")`). A call
+/// that binds no `metricDefinitionIds` value — which is how a query-bound list spells the
+/// empty list, the value a list with no `@length` admits — matches no route for exactly the
+/// reason above, and is answered "unknown operation" instead of being served. This method
+/// and path name that one operation (the same template is `POST` for the batch create and
+/// `GET` for the batch read), so resolving it here takes nothing away from the model's own
+/// routing table.
+const BATCH_DELETE_METRIC_DEFINITIONS_ROUTE: (&str, &str, &str, &str) = (
+    "DELETE",
+    "rummetrics",
+    "metrics",
+    "BatchDeleteRumMetricDefinitions",
+);
 
 /// Whether `req` is a request to [`UNTAG_RESOURCE_ROUTE`]: the method, and a path whose
 /// segments are `tags` followed by ONE non-empty segment — the single `{ResourceArn}`
@@ -183,6 +204,30 @@ fn is_untag_resource_route(req: &aws_smithy_runtime_api::http::Request) -> bool 
     service_common::nth_path_segment(path, 0) == Some(collection)
         && service_common::nth_path_segment(path, 1).is_some_and(|label| !label.is_empty())
         && service_common::nth_path_segment(path, 2).is_none()
+}
+
+/// Whether `req` is a request to [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]: the method, and
+/// a path whose segments are `rummetrics`, ONE non-empty `{AppMonitorName}` label and
+/// `metrics`, and nothing after it. Segments are read through the same shared reader
+/// [`is_untag_resource_route`] uses, so the two cannot disagree with the framework's own
+/// matcher about which requests the generated table already resolves.
+fn is_batch_delete_metric_definitions_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    let (method, collection, sub_resource, _) = BATCH_DELETE_METRIC_DEFINITIONS_ROUTE;
+    if req.method() != method {
+        return false;
+    }
+    let path = service_common::uri_path(req.uri());
+    let path = path.trim_end_matches('/');
+    service_common::nth_path_segment(path, 0) == Some(collection)
+        && service_common::nth_path_segment(path, 1).is_some_and(|label| !label.is_empty())
+        && service_common::nth_path_segment(path, 2) == Some(sub_resource)
+        && service_common::nth_path_segment(path, 3).is_none()
+}
+
+/// Whether `req` is a request to one of the two routes the protocol's routing key cannot
+/// name.
+fn is_query_unmatched_route(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    is_untag_resource_route(req) || is_batch_delete_metric_definitions_route(req)
 }
 
 /// The `com-amazonaws-rum-rum` emulated service: the generated [`ServiceDefinition`] plus
@@ -215,9 +260,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///
 /// It owns no behaviour of its own: the operation that serves the request is the one the
 /// model's routing table names, reached through its own `run`, so that operation stays
-/// the single owner of the request — its telemetry included. The one exception is
-/// [`UNTAG_RESOURCE_ROUTE`], the route the protocol's routing key cannot name, which the
-/// gate serves from the `UntagResource` it holds.
+/// the single owner of the request — its telemetry included. The exceptions are the two
+/// routes the protocol's routing key cannot name ([`UNTAG_RESOURCE_ROUTE`] and
+/// [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]), which the gate serves from the operations it
+/// holds.
 struct AnnouncedMediaType<Eng> {
     /// `UntagResource`, built from the SAME shared engine the generated entry threads
     /// into every operation, so this gate and the rest of the service read one store.
@@ -225,12 +271,21 @@ struct AnnouncedMediaType<Eng> {
     /// without a request in hand, and the schemes this gate reports for the route the
     /// routing key cannot name must be that operation's MODELLED ones.
     untag_resource: crate::ops::untag_resource::UntagResource<Eng>,
+    /// `BatchDeleteRumMetricDefinitions`, held from that same shared engine for the other
+    /// route the routing key cannot name
+    /// ([`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]).
+    batch_delete_rum_metric_definitions:
+        crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
     fn new(engine: Arc<Eng>) -> Self {
         Self {
-            untag_resource: crate::ops::untag_resource::UntagResource::new(engine),
+            untag_resource: crate::ops::untag_resource::UntagResource::new(Arc::clone(&engine)),
+            batch_delete_rum_metric_definitions:
+                crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions::new(
+                    engine,
+                ),
         }
     }
 }
@@ -250,13 +305,19 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
             // `override_operation`, which would route straight back to this gate.
             let response = match modeled_operation(svc, req) {
                 Some(op) => op.run(svc, req, ctx).await,
-                // The one route the protocol's routing key cannot name, served by the
-                // operation the model binds to it (see [`UNTAG_RESOURCE_ROUTE`]).
+                // The routes the protocol's routing key cannot name, each served by the
+                // operation the model binds to it (see [`UNTAG_RESOURCE_ROUTE`] and
+                // [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]).
                 None if is_untag_resource_route(req) => {
                     self.untag_resource.run(svc, req, ctx).await
                 }
+                None if is_batch_delete_metric_definitions_route(req) => {
+                    self.batch_delete_rum_metric_definitions
+                        .run(svc, req, ctx)
+                        .await
+                }
                 // Unreachable: this gate is served only for a request that is one of the
-                // two cases above.
+                // cases above.
                 None => svc.definition().routing_error_response(req),
             };
             announced(req, response)
@@ -264,11 +325,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // Consulted only when the modelled routing key names NO operation — the untag
-        // route above — because the router prefers the modelled operation's schemes for
-        // every request whose key it can resolve. So the schemes reported here are that
+        // Consulted only when the modelled routing key names NO operation — the two
+        // routes above — because the router prefers the modelled operation's schemes for
+        // every request whose key it can resolve. So the schemes reported here are an
         // operation's own modelled ones, read off it rather than written out: a gate
-        // must not be able to weaken what the model requires.
+        // must not be able to weaken what the model requires. Neither of those two
+        // operations overrides the service's authentication, so the schemes are the same
+        // for both and either one reports them.
         self.untag_resource.auth_schemes()
     }
 }
@@ -351,7 +414,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     /// service in its own protocol-correct envelope.
     fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         let gate = &self.announced_media_type as &dyn ErasedOperation;
-        if modeled_operation(self, req).is_some() || is_untag_resource_route(req) {
+        if modeled_operation(self, req).is_some() || is_query_unmatched_route(req) {
             return Some(gate);
         }
         None

@@ -382,8 +382,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.updated_at = std::time::SystemTime::now();
         }
 
+        // The record as it now stands, read back through the store so the risk roll-up can
+        // be counted over the content of the lenses it reviews, resolved from the whole lens
+        // catalog beside it: the write above held the record MUTABLY, which a resolution
+        // that also reads the lenses of the store cannot share. This operation writes no
+        // lens, so the list it reviews is the one it carried above, and the miss arm is
+        // unreachable — the record was just written in place — but it is the same 404 this
+        // operation already answers rather than an unwrap.
+        let Some(record) = store.workloads.get(&input.workload_id) else {
+            return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        };
+
         Ok(UpdateWorkloadOutput {
-            workload: Some(record.to_workload()),
+            workload: Some(record.to_workload(&store.reviewed_lens_content(&record.lenses))),
         })
     }
 }
