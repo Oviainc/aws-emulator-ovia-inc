@@ -1358,6 +1358,35 @@ impl SuppressedDestinationRecord {
             tenant_name: self.tenant_name.clone(),
         }
     }
+
+    /// The modelled `SuppressedDestinationSummary` view of this record.
+    ///
+    /// The summary is the listing's projection of the same stored entry
+    /// [`Self::detail`] reports, so a listed address and the read after it cannot
+    /// disagree. `SuppressedDestinationSummary` models only the address, the reason
+    /// and the last-update instant — the list the entry belongs to is the one the
+    /// request selected, so it is not repeated per summary.
+    pub fn summary(&self) -> crate::ops::types::SuppressedDestinationSummary {
+        crate::ops::types::SuppressedDestinationSummary {
+            email_address: self.email_address.clone(),
+            reason: self.reason.clone(),
+            last_update_time: ::aws_smithy_types::DateTime::from(self.last_update_time),
+        }
+    }
+
+    /// Whether this entry's `LastUpdateTime` lies in the window `start`..`end`, each
+    /// bound given as epoch seconds and each absent bound leaving that side open.
+    ///
+    /// The bounds come from `ListSuppressedDestinationsRequest$StartDate` ("only
+    /// includes addresses that were added to the list before a specific date" for
+    /// `$EndDate`, "after a specific date" for `$StartDate`). Neither the model nor
+    /// that wording settles an entry stamped exactly ON a bound, so the reading is
+    /// CHOSEN: the window is CLOSED, since a bound names an instant the caller asked
+    /// about and an entry stamped there is one the caller asked for.
+    pub fn updated_within(&self, start: Option<f64>, end: Option<f64>) -> bool {
+        let at = ::aws_smithy_types::DateTime::from(self.last_update_time).as_secs_f64();
+        start.is_none_or(|from| at >= from) && end.is_none_or(|to| at <= to)
+    }
 }
 
 /// The key a suppression-list entry is stored under: the list it belongs to — a
@@ -1371,10 +1400,21 @@ impl SuppressedDestinationRecord {
 /// addr-spec can contain, so one list's entries can never collide with another's.
 pub fn suppression_key(tenant_name: Option<&str>, email_address: &str) -> String {
     format!(
-        "{}\u{1f}{}",
-        tenant_name.unwrap_or_default(),
+        "{}{}",
+        suppression_list_prefix(tenant_name),
         identity_key(email_address)
     )
+}
+
+/// The key prefix every entry of ONE suppression list shares: the tenant whose list
+/// it is (the empty name for the account-level list) and the separator from
+/// [`suppression_key`].
+///
+/// A position in one list therefore starts with that list's prefix and no other's,
+/// which is what lets a listing tell its own page token from one minted for a
+/// different list.
+pub fn suppression_list_prefix(tenant_name: Option<&str>) -> String {
+    format!("{}\u{1f}", tenant_name.unwrap_or_default())
 }
 
 /// How this service words `NotFoundException` for an address that is not on the
@@ -1385,6 +1425,16 @@ pub fn suppression_key(tenant_name: Option<&str>, email_address: &str) -> String
 /// not suppressed.
 pub fn suppressed_destination_not_found(email_address: &str) -> String {
     format!("Email address {email_address} does not exist on your suppression list.")
+}
+
+/// How this service words `InvalidNextTokenException` for a `NextToken` that is not
+/// a position in the listing being read.
+///
+/// The sentence carries no part of the request: a token is refused for being
+/// something this listing never handed out, and there is nothing else to say about
+/// it. One wording for every listing that models the error.
+pub fn invalid_next_token() -> String {
+    "Token is invalid.".to_string()
 }
 
 /// One accepted outbound message.
@@ -1668,6 +1718,9 @@ pub const CONTACT_LISTS_PAGE_TOKEN_TAG: &str = "sesv2:contact-lists:";
 
 /// The tag `ListContacts`'s own tokens carry.
 pub const CONTACTS_PAGE_TOKEN_TAG: &str = "sesv2:contacts:";
+
+/// The tag `ListSuppressedDestinations`'s own tokens carry.
+pub const SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG: &str = "sesv2:suppressed-destinations:";
 
 /// The tag `ListMultiRegionEndpoints`'s own tokens carry.
 pub const MULTI_REGION_ENDPOINTS_PAGE_TOKEN_TAG: &str = "sesv2:multi-region-endpoints:";
