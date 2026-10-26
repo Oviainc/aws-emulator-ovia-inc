@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_eks_awswesleyfrontend::ops::types::UpdateParam;
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ComAmazonawsEksAwswesleyfrontendState, UpdateRecord, CANCELLATION_STATUS_SUCCESSFUL,
+    ComAmazonawsEksAwswesleyfrontendState, UpdateRecord, UpdateScope, CANCELLATION_STATUS_SUCCESSFUL,
     STATUS_ACTIVE, STATUS_UPDATING, UPDATE_CANCELLED, UPDATE_COMPLETION_DELAY, UPDATE_FAILED,
     UPDATE_IN_PROGRESS, UPDATE_SUCCESSFUL, UPDATE_TYPE_VERSION_ROLLBACK,
     VERSION_ROLLBACK_NODE_PHASE,
@@ -206,6 +206,8 @@ fn seed_update(
         pending_config: None,
         cancellation: None,
         cancellation_request_token: None,
+        // Every update this suite seeds is an update of the cluster itself.
+        scope: UpdateScope::Cluster,
     };
     let store = engine.state::<ComAmazonawsEksAwswesleyfrontendState>();
     let mut guard = store.lock();
