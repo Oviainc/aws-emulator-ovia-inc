@@ -1299,6 +1299,68 @@ impl BillingGroupVersion {
     }
 }
 
+/// A billing group that was DELETED, with the instant the delete was made at: the
+/// record of the billing periods that group billed in, which the delete does not
+/// erase.
+///
+/// A billing group bills a consolidated family FOR A BILLING PERIOD, so a period it
+/// billed in keeps a record of it after it is gone — which is what the model's
+/// `BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD` refusal is decided from
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`): a name a group
+/// occupied in a billing period stays occupied for that period. The whole record is
+/// kept rather than just its name, because the name a period reports is the one the
+/// generation in force THEN carried ([`Self::name_in`]).
+#[derive(Debug, Clone)]
+pub struct DeletedBillingGroupRecord {
+    /// The group as it stood when the delete took it, with every generation of it the
+    /// store still held.
+    pub record: BillingGroupRecord,
+    /// The instant the delete was made at; the billing period it falls in is the LAST
+    /// one this group existed in ([`Self::deletion_billing_period`]).
+    pub deletion_time_millis: i64,
+}
+
+impl DeletedBillingGroupRecord {
+    /// The billing period the delete was made in — the last period this group billed
+    /// in, since a group deleted part-way through a month billed its family for that
+    /// month.
+    pub fn deletion_billing_period(&self) -> String {
+        billing_period_at(self.deletion_time_millis)
+    }
+
+    /// Did this group exist in `billing_period`? From the period it was created in
+    /// through the one it was deleted in, both inclusive; a value that is not a billing
+    /// period at all names no period at all.
+    pub fn existed_in(&self, billing_period: &str) -> bool {
+        match (
+            billing_period_key(billing_period),
+            billing_period_key(&self.record.creation_billing_period()),
+            billing_period_key(&self.deletion_billing_period()),
+        ) {
+            (Some(wanted), Some(created), Some(deleted)) => {
+                (created..=deleted).contains(&wanted)
+            }
+            _ => false,
+        }
+    }
+
+    /// The name this group carried in `billing_period` — the name it OCCUPIED there —
+    /// or `None` when it did not exist in that period.
+    ///
+    /// A rename takes effect in the period it is made in, so the name a period holds is
+    /// the one the generation in force then carried
+    /// ([`BillingGroupRecord::effective_in`]), not whichever name the group happened to
+    /// end with.
+    pub fn name_in(&self, billing_period: &str) -> Option<String> {
+        if !self.existed_in(billing_period) {
+            return None;
+        }
+        self.record
+            .effective_in(billing_period)
+            .map(|version| version.name)
+    }
+}
+
 /// One resource associated to a percentage custom line item, as
 /// `BatchAssociateResourcesToCustomLineItem` (or the `AssociatedValues` of the
 /// charge details the item was created with) persisted it. The billing period range
@@ -1955,6 +2017,10 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   return before any insert), and
 ///   [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group)
 ///   reclaims a deleted group's share of all of them.
+/// * `deleted_billing_groups` keeps the record of the groups a delete removed, so the
+///   billing periods they billed in still hold them; at most
+///   [`MAX_DELETED_BILLING_GROUPS`], oldest deletion forgotten first, which reads back
+///   as a period that never held that group.
 /// * `custom_line_items` holds one entry per custom line item, at most
 ///   [`MAX_CUSTOM_LINE_ITEMS`], and each item at most
 ///   [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources — the maximum the
@@ -2007,6 +2073,19 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     pub pricing_plan_names: BTreeMap<String, String>,
     /// Billing groups by full ARN.
     pub billing_groups: BTreeMap<String, BillingGroupRecord>,
+    /// The billing groups a delete removed, oldest deletion first, at most
+    /// [`MAX_DELETED_BILLING_GROUPS`] of them.
+    ///
+    /// A billing group bills for a BILLING PERIOD, so deleting it does not erase the
+    /// periods it billed in: the record of each deleted group is kept here, which is
+    /// what makes a billing period's occupancy of a group's name decidable after the
+    /// group is gone (see
+    /// [`deleted_billing_group_occupying_name`](ComAmazonawsBillingconductorAwsbillingconductorState::deleted_billing_group_occupying_name)).
+    /// Written only by
+    /// [`remove_billing_group`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_billing_group),
+    /// which is where the cap is enforced; the oldest deletion is forgotten first,
+    /// which reads back as a period that never held that group.
+    pub deleted_billing_groups: VecDeque<DeletedBillingGroupRecord>,
     /// Custom line items by full ARN, at most [`MAX_CUSTOM_LINE_ITEMS`]; each one
     /// holds at most [`MAX_RESOURCES_PER_CUSTOM_LINE_ITEM`] associated resources.
     /// A custom line item applies to a billing group, so
@@ -2391,9 +2470,15 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// billing period, so those accounts become `UNMONITORED` from now on while the
     /// periods they were members in still report the group) and the idempotency
     /// entries that named it. `None` when no such group is stored.
+    ///
+    /// What the delete does NOT erase is the group's own record of the billing periods
+    /// it billed in: the removed record is kept as a
+    /// [`DeletedBillingGroupRecord`](crate::state::DeletedBillingGroupRecord), so the
+    /// name it occupied in those periods stays occupied for them.
     pub fn remove_billing_group(&mut self, group_arn: &str) -> Option<BillingGroupRecord> {
         let removed = self.billing_groups.remove(group_arn)?;
         self.billing_group_names.remove(&removed.name);
+        self.record_deleted_billing_group(removed.clone(), now_millis());
 
         // A custom line item "applies to" one billing group, so it cannot outlive
         // it; and an association names a resource that exists, so every association
@@ -2437,6 +2522,56 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .retain(|key| remaining.contains_key(key));
 
         Some(removed)
+    }
+
+    /// Keep the record of a deleted billing group, so the billing periods it billed in
+    /// still hold it. The only writer of `deleted_billing_groups`, so the cap below
+    /// holds wherever a group is deleted.
+    ///
+    /// Past [`MAX_DELETED_BILLING_GROUPS`] the OLDEST deletion is forgotten, which
+    /// reads back the way that period read before the group ever existed; a forgotten
+    /// record frees the name it occupied, which is the one thing about this store a
+    /// caller cannot see in a response, so it is logged — only the group's ARN, never a
+    /// `@sensitive` member such as its name.
+    fn record_deleted_billing_group(
+        &mut self,
+        record: BillingGroupRecord,
+        deletion_time_millis: i64,
+    ) {
+        self.deleted_billing_groups.push_back(DeletedBillingGroupRecord {
+            record,
+            deletion_time_millis,
+        });
+        while self.deleted_billing_groups.len() > MAX_DELETED_BILLING_GROUPS {
+            let Some(forgotten) = self.deleted_billing_groups.pop_front() else {
+                break;
+            };
+            ::tracing::warn!(
+                billing_group_arn = %forgotten.record.arn,
+                cap = MAX_DELETED_BILLING_GROUPS,
+                "the oldest deleted billing group was forgotten at the store's cap"
+            );
+        }
+    }
+
+    /// The billing group that was DELETED but still occupied `name` in
+    /// `billing_period`, if any — the newest such deletion.
+    ///
+    /// A billing group bills for a billing period, so a period it billed in keeps the
+    /// record of it: the name it carried there stays that period's, and only from the
+    /// period after the delete is the name free again. The name a period holds is the
+    /// one the generation in force then carried
+    /// ([`DeletedBillingGroupRecord::name_in`]), so a group renamed before it was
+    /// deleted occupies each of its names in the periods it carried them.
+    pub fn deleted_billing_group_occupying_name(
+        &self,
+        name: &str,
+        billing_period: &str,
+    ) -> Option<&DeletedBillingGroupRecord> {
+        self.deleted_billing_groups
+            .iter()
+            .rev()
+            .find(|deleted| deleted.name_in(billing_period).as_deref() == Some(name))
     }
 
     /// Delete a custom line item and everything that only existed because of it: the
@@ -3179,6 +3314,16 @@ pub const MAX_PRICING_PLANS: usize = 1000;
 /// see [`MAX_PRICING_PLANS`] for why it exists and how it is enforced.
 pub const MAX_BILLING_GROUPS: usize = 1000;
 
+/// How many DELETED billing groups this emulator keeps the record of, so a billing
+/// period a deleted group billed in still holds it.
+///
+/// A CHOSEN bound, not an AWS limit: a caller decides how many groups to create and
+/// delete, and each delete is one more record to answer a past period from. The
+/// OLDEST deletion is forgotten first, which reads back the way that period read
+/// before the group existed, and of the same order as [`MAX_BILLING_GROUPS`], since
+/// that is how many groups can be deleted at once.
+pub const MAX_DELETED_BILLING_GROUPS: usize = 1000;
+
 /// How many of a consolidated billing family's billing groups may have automatic
 /// account association enabled at once.
 ///
@@ -3611,6 +3756,37 @@ pub fn accounts_already_associated(
         field,
         format!(
             "account {account_id} is already associated with billing group {owner_group_arn}"
+        ),
+    )
+}
+
+/// The modelled refusal a request earns when the billing group name it claims is
+/// already occupied in the CURRENT billing period by a group that was deleted during
+/// it.
+///
+/// A billing group bills a consolidated family for a billing period, so the period it
+/// billed in keeps the record of it and of the name it carried there: until the next
+/// billing period that name names that group. `ValidationExceptionReason` enumerates
+/// `BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD` for exactly this
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), so the answer is
+/// the 400 `ValidationException` with that reason — built here so every operation that
+/// claims a billing group name answers it the same way; `field` names the input member
+/// that carried the name.
+///
+/// The message states the rule and the period, never the NAME: a billing group's name
+/// is `@sensitive` (`smithy_query(query="shape",shape="BillingGroupName")`), so its
+/// value belongs in no message and no log — the member named in `Fields` is what tells
+/// the caller which value of its own request was at fault.
+pub fn billing_group_already_exists_in_current_billing_period(
+    field: &str,
+    billing_period: &str,
+) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD",
+        field,
+        format!(
+            "a billing group with this name already exists in the current billing period \
+             ({billing_period})"
         ),
     )
 }

@@ -217,6 +217,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+
+            // A name the current billing period already holds is that period's, even
+            // when the group that held it has been deleted since: a billing group bills
+            // for a billing period, so the period keeps the record of it. The same
+            // refusal `CreateBillingGroup` answers a claim on such a name with, through
+            // the same state query, so one rule decides every claim on a billing group
+            // name.
+            let current_period = crate::state::current_billing_period();
+            if state
+                .deleted_billing_group_occupying_name(name, &current_period)
+                .is_some()
+            {
+                return Err(UpdateBillingGroupErrorModeled::ValidationException(
+                    crate::state::billing_group_already_exists_in_current_billing_period(
+                        "Name",
+                        &current_period,
+                    ),
+                )
+                .into());
+            }
         }
 
         // The computation preference must name a pricing plan that exists — the same

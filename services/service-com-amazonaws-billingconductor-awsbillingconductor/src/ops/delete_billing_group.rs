@@ -4,6 +4,15 @@
 //! Removes a stored billing group and the account associations it owned, so the
 //! next read no longer reports either.
 //!
+//! What the delete does NOT erase is the billing periods the group BILLED in: a
+//! billing group bills a consolidated family for a billing period, so the record of
+//! the deleted group is kept ([`crate::state::DeletedBillingGroupRecord`]) and the
+//! name it carried in those periods stays theirs — a `CreateBillingGroup` or
+//! `UpdateBillingGroup` claiming that name in the CURRENT billing period is refused
+//! with the reason the model enumerates for it
+//! ([`crate::state::billing_group_already_exists_in_current_billing_period`]), and
+//! only from the next billing period on is the name free.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

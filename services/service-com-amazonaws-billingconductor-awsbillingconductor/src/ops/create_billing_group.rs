@@ -11,6 +11,14 @@
 //! documented contract it does state — a retry completes without performing any
 //! further actions — is honoured either way.
 //!
+//! A billing group name is unique, and it is unique PER BILLING PERIOD: a group that
+//! billed in a period keeps that period's claim on its name even after a
+//! `DeleteBillingGroup` took it, so a create re-using such a name in the CURRENT
+//! billing period is refused with the modelled 400 `ValidationException` carrying the
+//! `BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD` reason and nothing is
+//! minted; from the next billing period on the name is free. A name a LIVE group
+//! holds is the 409 `ConflictException` below.
+//!
 //! A `Tags` key in the reserved `aws:` namespace is refused with the modelled 400
 //! `ValidationException` and nothing is minted (see
 //! [`crate::state::check_tag_keys_not_reserved`]).
@@ -228,6 +236,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_type: "billinggroup".to_string(),
                 reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
             })
+            .into());
+        }
+
+        // A billing group bills a consolidated family FOR A BILLING PERIOD, so the
+        // period it billed in keeps the record of it and of the name it carried there
+        // even after a `DeleteBillingGroup` took it: the name is that period's until
+        // the next one begins. `ValidationExceptionReason` enumerates
+        // `BILLING_GROUP_ALREADY_EXIST_IN_CURRENT_BILLING_PERIOD` for exactly a name a
+        // group already occupies in the current billing period, so a create claiming
+        // one is refused with the modelled 400 `ValidationException` carrying that
+        // reason and nothing is minted.
+        let current_period = crate::state::current_billing_period();
+        if state
+            .deleted_billing_group_occupying_name(&input.name, &current_period)
+            .is_some()
+        {
+            return Err(CreateBillingGroupErrorModeled::ValidationException(
+                crate::state::billing_group_already_exists_in_current_billing_period(
+                    "Name",
+                    &current_period,
+                ),
+            )
             .into());
         }
 

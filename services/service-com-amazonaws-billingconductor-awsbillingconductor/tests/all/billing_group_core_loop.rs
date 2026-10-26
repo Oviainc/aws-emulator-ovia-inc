@@ -1396,8 +1396,19 @@ async fn a_deleted_group_releases_its_client_token() {
         "setup DeleteBillingGroup: expected 200, got {status} with {body:?}"
     );
 
+    // The replay carries the same `ClientToken` and asks for a DIFFERENT name: the
+    // name the deleted group held is still the current billing period's, which
+    // `tests/all/billing_group_period_occupancy.rs` owns, so a name of its own is what
+    // leaves this row about the token alone. A token that still replayed would answer
+    // with the deleted ARN whatever the rest of the request says.
+    let mut replayed_input = input.clone();
+    replayed_input["Name"] = json!("TokenLifetimeGroupAgain");
     let (status, replay) = em
-        .post_with_token("/create-billing-group", &input, Some("token-lifetime"))
+        .post_with_token(
+            "/create-billing-group",
+            &replayed_input,
+            Some("token-lifetime"),
+        )
         .await;
     assert_eq!(
         status, 200,
