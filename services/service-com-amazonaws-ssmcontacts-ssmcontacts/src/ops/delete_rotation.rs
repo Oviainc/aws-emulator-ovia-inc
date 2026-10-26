@@ -9,8 +9,8 @@
 //!
 //! The account-level Incident Manager precondition is evaluated FIRST, before `RotationId`
 //! is resolved, exactly as `GetRotation` evaluates it: a rotation lives in the Regions of
-//! the account's replication set, so without an ACTIVE one the ARN resolves to nothing and
-//! the call is refused HTTP 400 `ValidationException` rather than serviced. An admitted call
+//! the account's replication set, so without an ACTIVE one the call is refused HTTP 400
+//! `ValidationException` about the ACCOUNT rather than serviced. An admitted call
 //! naming a rotation this store does not hold answers HTTP 404
 //! `ResourceNotFoundException`, so a repeated delete is refused rather than reported as a
 //! fresh success.
@@ -164,11 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST: it is evaluated before `RotationId` is resolved and
         // before anything is removed, so a non-onboarded account is refused identically
-        // whether or not the rotation it named exists. This operation's whole subject is one
-        // resource ARN, so the refusal is the ARN-shaped one the crate reserves for that
-        // case — the same one `GetRotation` answers for the same `RotationId`.
+        // whether or not the rotation it named exists. The refusal is the account-level one
+        // `GetRotation` answers for the same `RotationId`: what is missing is the account's
+        // own registry entry, not anything the request named.
         state
-            .require_active_replication_set_for(&input.rotation_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         if state.rotations.remove(&input.rotation_id).is_none() {

@@ -16,7 +16,10 @@
 //! * the **prompt-text extraction** rule used to count tokens in an
 //!   `InvokeModel` body;
 //! * the **async-invoke** records, their idempotency index and the clock-owed
-//!   transition that moves a submitted invocation out of `InProgress`.
+//!   transition that moves a submitted invocation out of `InProgress`;
+//! * the **metric publication** ([`invocation_metrics`]) that turns a served
+//!   inference's token accounting into `AWS/Bedrock` metric data, so the counts
+//!   a response reports inline are the ones CloudWatch surfaces for it.
 //!
 //! No language model runs inside this emulator, so nothing here invents model
 //! output and presents it as inference: a synchronous completion carries, in the
@@ -35,6 +38,10 @@ use crate::ops::types::{
     ReasoningContentBlock, SearchResultBlock, SystemContentBlock, Tag, TokenUsage, Tool,
     ToolChoice, ToolConfiguration, ToolInputSchema, ToolReference, ToolResultContentBlock,
 };
+
+/// The `AWS/Bedrock` metric data a served inference publishes, beside the
+/// `usage` it reports inline.
+pub mod invocation_metrics;
 
 /// The most async-invoke records this emulator retains.
 ///

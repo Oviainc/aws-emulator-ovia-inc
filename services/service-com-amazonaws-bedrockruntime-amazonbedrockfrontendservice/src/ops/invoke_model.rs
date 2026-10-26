@@ -309,15 +309,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        state
-            .lock()
-            .log_invocation(crate::state::InvocationLogEntry {
-                model_id: model.model_id.clone(),
-                kind: crate::state::InvokeKind::Sync,
-                input_tokens,
-                output_tokens,
-                at_millis: crate::state::now_millis(),
-            });
+        let logged = crate::state::InvocationLogEntry {
+            model_id: model.model_id.clone(),
+            kind: crate::state::InvokeKind::Sync,
+            input_tokens,
+            output_tokens,
+            at_millis: crate::state::now_millis(),
+        };
+        state.lock().log_invocation(logged.clone());
+        // The token volume this call reports in the model family's own response
+        // envelope is also its contribution to the `AWS/Bedrock` series
+        // dimensioned on the invoked model, published with no state guard of
+        // this service held.
+        crate::state::invocation_metrics::publish_token_usage(&*self.engine, &logged);
 
         Ok(InvokeModelOutput {
             body,

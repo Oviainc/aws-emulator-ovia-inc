@@ -53,6 +53,8 @@ mod metric_math;
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]
 mod metrics_and_alarms;
+#[path = "all/otel_enrichment.rs"]
+mod otel_enrichment;
 #[path = "all/query_form_metrics.rs"]
 mod query_form_metrics;
 #[path = "all/replay_probe.rs"]
