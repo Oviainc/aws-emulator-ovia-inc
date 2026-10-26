@@ -99,15 +99,16 @@ impl Write {
     }
 
     /// The status this write answers once the registry it names is one the caller owns
-    /// and holds what the write needs — the modelled success status of the operation.
+    /// and holds what the write needs — the success status of the operation.
     fn served_status(self) -> u16 {
         match self {
             Self::CreateSchema => 201,
-            Self::UpdateSchema | Self::UpdateRegistry | Self::PutResourcePolicy => 200,
-            Self::DeleteSchema
-            | Self::DeleteSchemaVersion
-            | Self::DeleteRegistry
-            | Self::DeleteResourcePolicy => 204,
+            Self::UpdateSchema
+            | Self::UpdateRegistry
+            | Self::PutResourcePolicy
+            // Every method on the policy endpoint answers 200, this removal included.
+            | Self::DeleteResourcePolicy => 200,
+            Self::DeleteSchema | Self::DeleteSchemaVersion | Self::DeleteRegistry => 204,
         }
     }
 

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateMergedGraphqlApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateMergedGraphqlApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: schedules the deletion of the source-API association the path addresses
+//! from the SOURCE API's side, and reports the `SourceApiAssociationStatus` the
+//! association is left in; `GetSourceApiAssociation` projects the same record until the
+//! clock performs that deletion.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateMergedGraphqlApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One association links two APIs and AppSync lets it be addressed from either of them,
+//! so the rule itself lives in [`crate::state::delete_source_api_association`], which
+//! `DisassociateSourceGraphqlApi` (the same delete addressed by the Merged API) reaches
+//! with the same request; this handler only names the side the path carries and lifts
+//! the shared refusals into this operation's modelled errors.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateMergedGraphqlApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateMergedGraphqlApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateMergedGraphqlApi"))
+        // The engine is reachable from `&self` (constructor-injected); nothing in the
+        // answer depends on this request's metadata, so `ctx` is unused here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateMergedGraphqlApiErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "the appsync store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request this delete makes, in the form both disassociates share: this
+        // operation addresses the association by its SOURCE API, the other one by its
+        // Merged API, and that is the only way the two differ.
+        let request = crate::state::SourceApiDisassociationRequest {
+            side: crate::state::AssociationSide::SourceApi,
+            api_identifier: input.source_api_identifier,
+            association_id: input.association_id,
+        };
+
+        let deleted = crate::state::delete_source_api_association(
+            &mut state.lock(),
+            request,
+            std::time::SystemTime::now(),
+        );
+
+        match deleted {
+            Ok(source_api_association_status) => Ok(DisassociateMergedGraphqlApiOutput {
+                source_api_association_status: Some(source_api_association_status),
+            }),
+            Err(refusal) => Err(refuse(refusal)),
+        }
     }
+}
+
+/// This operation's modelled error for a refusal the shared association rule states.
+///
+/// Each variant keeps the status the model gives its shape, and carries the rule's own
+/// text: a malformed request names the value that was refused, while a not-found names
+/// no identifier, so which side was missing is not reported.
+fn refuse(refusal: crate::state::AssociationRefusal) -> DisassociateMergedGraphqlApiError {
+    match refusal {
+        crate::state::AssociationRefusal::BadRequest(message) => {
+            DisassociateMergedGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationRefusal::NotFound(message) => {
+            DisassociateMergedGraphqlApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        crate::state::AssociationRefusal::ConcurrentModification(message) => {
+            DisassociateMergedGraphqlApiErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }

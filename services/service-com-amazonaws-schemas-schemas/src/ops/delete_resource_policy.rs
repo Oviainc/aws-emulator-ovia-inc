@@ -6,6 +6,11 @@
 //! resource this operation deletes: a registry that holds none has nothing to delete,
 //! and once the policy is gone `GetResourcePolicy` reports that it does not exist.
 //!
+//! A success answers HTTP 200 with no body, not the 204 the model's `@http` trait
+//! declares: every method served on the policy endpoint answers 200 — the read and the
+//! write do so by the model's own default, and the service answers the removal the same
+//! way, which is what a client's HTTP stack observes. The one constant below states it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -68,12 +73,26 @@ use super::types::*;
 // `DeleteResourcePolicyError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
 
+/// The status a successful removal answers, and the one place it is stated.
+///
+/// The policy endpoint answers 200 for every method it serves: the read and the write
+/// take it from the protocol's default (neither declares an `@http` code), and the
+/// removal answers it too, so a caller that distinguishes a 200 carrying a stated
+/// length from a bodiless 204 takes the same path on all three. The model's `@http`
+/// trait for this one operation declares 204, and the recorded wire behaviour of the
+/// service contradicts it: what a client's HTTP stack sees is 200, so that is what this
+/// operation serves and this constant must not be reset from the model. The body is
+/// still empty — a Unit output has no members to serialize — and `crate::service`
+/// frames it with the `content-length: 0` an answer with no body states.
+const SUCCESS_STATUS_ON_THE_WIRE: u16 = 200;
+
 #[derive(Debug, Clone, Default)]
 pub struct DeleteResourcePolicyOutput;
 
 impl DeleteResourcePolicyOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's method and URI; the status the response
+    // takes is `Operation::SUCCESS_STATUS` below, read at serialize time, and both
+    // name the one constant above so they cannot drift apart.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -82,7 +101,7 @@ impl DeleteResourcePolicyOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
         "/v1/policy",
-        Some(204u16),
+        Some(SUCCESS_STATUS_ON_THE_WIRE),
     ));
 }
 
@@ -152,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteResourcePolicy";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_RESOURCE_POLICY_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_RESOURCE_POLICY_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    const SUCCESS_STATUS: u16 = SUCCESS_STATUS_ON_THE_WIRE;
 
     async fn handle(
         &self,
@@ -230,7 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Modelled 204 with an empty body: the status is the only thing a caller gets.
+        // The removal happened, so the answer is this operation's success status with
+        // an empty body: the status and its framing are all a caller gets.
         Ok(DeleteResourcePolicyOutput)
     }
 }

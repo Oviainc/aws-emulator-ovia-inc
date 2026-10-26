@@ -413,7 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `web_identity_condition_context`.
         let principals = crate::state::web_identity_principals(&identity.issuer);
         let context = crate::state::web_identity_condition_context(&identity);
-        let published = crate::state::web_identity_published_condition_keys(&identity.issuer);
+        let published = crate::state::web_identity_published_condition_keys(&identity);
         let published: Vec<&str> = published.iter().map(String::as_str).collect();
         let admitted = role.as_ref().is_some_and(|role| {
             role.trust_policy_admits(
