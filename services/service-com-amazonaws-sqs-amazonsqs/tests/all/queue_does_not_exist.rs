@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{account, call, create_ok, emulator, error_code, HOST};
+use super::support::{account, call, create_ok, emulator, error_code, HOST, OTHER_ACCOUNT};
 
 /// The `message` member of a refusal, as awsJson renders it.
 fn message_of(body: &Value) -> String {
@@ -42,6 +42,15 @@ fn url_requests(url: &str) -> Vec<(&'static str, Value)> {
         (
             "SetQueueAttributes",
             json!({"QueueUrl": url, "Attributes": {"VisibilityTimeout": "10"}}),
+        ),
+        (
+            "AddPermission",
+            json!({"QueueUrl": url, "Label": "shared",
+                   "AWSAccountIds": [OTHER_ACCOUNT], "Actions": ["SendMessage"]}),
+        ),
+        (
+            "RemovePermission",
+            json!({"QueueUrl": url, "Label": "shared"}),
         ),
         ("SendMessage", json!({"QueueUrl": url, "MessageBody": "hello"})),
         ("ReceiveMessage", json!({"QueueUrl": url})),

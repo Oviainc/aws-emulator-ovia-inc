@@ -200,6 +200,17 @@
 //!   and the group name ([`codedeploy_application_of`]), so its delete and its drift read
 //!   carry both.
 //!
+//! * `AWS::EKS::AccessEntry`'s properties are `CreateAccessEntry`'s own members with a
+//!   lower-case initial (`KubernetesGroups`, `PrincipalArn`, `Type`, `Username`), with the
+//!   cluster carried in the URI that create binds it to and `Tags` sent as that call's tag
+//!   MAP. `AccessPolicies` is no member of that create at all: each entry of it is an
+//!   `AssociateAccessPolicy` of its own on the entry just created — the same second call a
+//!   client makes — so a policy the declaration lists is associated to the entry rather
+//!   than dropped. The entry is keyed by the PAIR of the cluster and the principal ARN
+//!   ([`access_entry_identity`]), so its delete and its drift read carry both; an
+//!   association Amazon EKS refuses leaves no half-configured entry behind, because the
+//!   entry this arm just created is removed before the refusal is reported.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -282,6 +293,12 @@ const RDS_DB_PARAMETER_GROUP: &str = "AWS::RDS::DBParameterGroup";
 /// `DBClusterParameterGroupName` names.
 const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup";
 
+/// `AWS::EKS::AccessEntry`: the access entry that lets one IAM principal reach an Amazon
+/// EKS cluster. Amazon EKS keys one by the PAIR its two create-only properties name — the
+/// cluster and the principal ARN, the two `@httpLabel`s of every operation on it — so each
+/// call of this type's arm carries both, read off the resource's own declaration.
+const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
+
 /// The code a refusal carries where the change a deployment asks for is one this emulator
 /// has not written the owning API call for. It is the same code the scaffold's own 501
 /// answers under (`smithy.framework#NotImplemented`), and not a code any AWS service
@@ -334,6 +351,7 @@ pub(super) enum Provisioner {
     CodeDeployApplication,
     CodeDeployDeploymentGroup,
     CodeDeployDeploymentConfig,
+    EksAccessEntry,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -385,6 +403,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEDEPLOY_APPLICATION => Some(Provisioner::CodeDeployApplication),
         CODEDEPLOY_DEPLOYMENT_GROUP => Some(Provisioner::CodeDeployDeploymentGroup),
         CODEDEPLOY_DEPLOYMENT_CONFIG => Some(Provisioner::CodeDeployDeploymentConfig),
+        EKS_ACCESS_ENTRY => Some(Provisioner::EksAccessEntry),
         _ => None,
     }
 }
@@ -552,6 +571,7 @@ impl Provisioner {
             Self::CodeDeployDeploymentConfig => {
                 create_codedeploy_deployment_config(ctx, region, resource).await
             }
+            Self::EksAccessEntry => create_access_entry(ctx, region, resource, propagated).await,
         }
     }
 
@@ -864,6 +884,9 @@ impl Provisioner {
             Self::CodeDeployDeploymentConfig => {
                 delete_codedeploy_deployment_config(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the entry by the PAIR Amazon EKS keys one by, both
+            // halves of which are on the resource's own declaration.
+            Self::EksAccessEntry => delete_access_entry(ctx, region, resource).await,
         }
     }
 
@@ -1007,6 +1030,8 @@ impl Provisioner {
             Self::CodeDeployDeploymentConfig => {
                 describe_codedeploy_deployment_config(ctx, region, physical_resource_id).await
             }
+            // Read back by the same cluster-and-principal pair the delete uses.
+            Self::EksAccessEntry => describe_access_entry(ctx, region, resource).await,
         }
     }
 }
@@ -8639,8 +8664,10 @@ fn resolver_creator_request_id(resource: &StoredResource) -> String {
     resource.physical_resource_id.clone()
 }
 
-/// One required property of a Route 53 Resolver resource, or the refusal a declaration
-/// missing it gets — the create could not identify what to make without it.
+/// One required property of a declared resource, or the refusal a declaration missing it
+/// gets — the create could not identify what to make without it. Read by the arms whose
+/// create needs a property the TYPE requires (the Route 53 Resolver ones, and the Amazon
+/// EKS access entry's cluster and principal).
 fn required_property(resource: &StoredResource, name: &str) -> Result<String, Refusal> {
     property(resource, name).ok_or_else(|| Refusal {
         code: MISSING_PROPERTY_CODE.to_string(),
@@ -10229,6 +10256,252 @@ async fn call_transfer(
         request,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EKS: AWS::EKS::AccessEntry
+// ---------------------------------------------------------------------------
+
+/// Amazon EKS's signing name, from its model (`sigv4Name: eks`). That service speaks
+/// `restJson1`, so its operations are bound to a METHOD and a URI rather than to an
+/// `X-Amz-Target` header: `CreateAccessEntry` is
+/// `POST /clusters/{clusterName}/access-entries`, `AssociateAccessPolicy` is
+/// `POST /clusters/{clusterName}/access-entries/{principalArn}/access-policies`,
+/// `DescribeAccessEntry` is `GET /clusters/{clusterName}/access-entries/{principalArn}`
+/// and `DeleteAccessEntry` is the `DELETE` of that same URI
+/// (`smithy_query(query="operation", operation="CreateAccessEntry,AssociateAccessPolicy,\
+/// DescribeAccessEntry,DeleteAccessEntry")` on that service's model).
+const EKS_SIGNING_NAME: &str = "eks";
+
+/// The URI prefix every operation on a cluster's access entries hangs off.
+const EKS_CLUSTERS_URI: &str = "/clusters";
+
+/// The error code Amazon EKS answers for a cluster or an access entry it does not hold
+/// (`ResourceNotFoundException`, the modelled 404 of `DescribeAccessEntry` and
+/// `DeleteAccessEntry`).
+const EKS_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `AWS::EKS::AccessEntry` properties `CreateAccessEntry` takes under its own member
+/// name, as (property, member) pairs.
+///
+/// Source: AWS's CloudFormation resource reference for the type against the
+/// `CreateAccessEntryRequest` shape. The Amazon EKS model spells its members in lower
+/// camel case and renames none of these, so the only difference is the first character's
+/// case. `ClusterName` is not here because that create binds it to its URI, `Tags` is not
+/// because the call takes a tag MAP while the type publishes a tag LIST, and
+/// `AccessPolicies` is not because it is no member of that create at all.
+const EKS_ACCESS_ENTRY_MEMBERS: &[(&str, &str)] = &[
+    ("KubernetesGroups", "kubernetesGroups"),
+    ("PrincipalArn", "principalArn"),
+    ("Type", "type"),
+    ("Username", "username"),
+];
+
+/// The members of one `AccessScope` an `AccessPolicies` entry declares, as
+/// `AssociateAccessPolicy`'s `accessScope` takes them (`AccessScope`'s own members are
+/// `type` and `namespaces`).
+const EKS_ACCESS_SCOPE_MEMBERS: &[(&str, &str)] = &[("Type", "type"), ("Namespaces", "namespaces")];
+
+/// The members `DescribeAccessEntry` reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// `AccessPolicies` is not among them: the policies associated to an entry are answered by
+/// `ListAssociatedAccessPolicies`, a read of its own, and a property the read does not
+/// report is not evidence of anything ([`super::drift`]). `Tags` is left out for the same
+/// reason as everywhere else here — the tags a resource carries change independently of its
+/// declaration.
+const EKS_ACCESS_ENTRY_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("ClusterName", "clusterName"),
+    ("KubernetesGroups", "kubernetesGroups"),
+    ("PrincipalArn", "principalArn"),
+    ("Type", "type"),
+    ("Username", "username"),
+];
+
+/// Create the access entry an `AWS::EKS::AccessEntry` declares, and associate every access
+/// policy its `AccessPolicies` lists to it — so a client that deployed the stack and then
+/// calls `eks describe-access-entry` for the declared principal reads the entry back, and
+/// `eks list-associated-access-policies` lists the declared policies, rather than a
+/// `ResourceNotFoundException` for an entry nothing created.
+///
+/// The entry's own properties are that create's members ([`EKS_ACCESS_ENTRY_MEMBERS`]),
+/// with the cluster in the URI and the declared tags beside the ones CloudFormation gives
+/// the resource ([`tags_of`]) as the tag MAP `CreateAccessEntry` takes. Each
+/// `AccessPolicies` entry is then one `AssociateAccessPolicy` on the entry just created:
+/// that is a call of its own, exactly as it is for a client.
+///
+/// An association Amazon EKS refuses leaves NO entry behind: the entry this arm created is
+/// deleted before the refusal is reported, so the resource fails — and with it the stack —
+/// with nothing half-configured in Amazon EKS for a resource the stack does not record.
+///
+/// The ARN Amazon EKS minted for the entry is reported back as the `AccessEntryArn`
+/// attribute the type publishes, so `Fn::GetAtt` reads the handle that service really
+/// created.
+async fn create_access_entry(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let (cluster_name, principal_arn) = access_entry_identity(resource)?;
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    copy_members(&properties, EKS_ACCESS_ENTRY_MEMBERS, &mut request);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_rest_json(
+        ctx,
+        EKS_SIGNING_NAME,
+        region,
+        "POST",
+        &format!(
+            "{EKS_CLUSTERS_URI}/{}/access-entries",
+            percent_encoded(&cluster_name)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let arn = answered
+        .get("accessEntry")
+        .and_then(|entry| entry.get("accessEntryArn"))
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "Amazon EKS answered CreateAccessEntry without an accessEntryArn"
+                .to_string(),
+        })?
+        .to_string();
+    for declared in declared_list(&resource.properties, "AccessPolicies") {
+        let associated = match access_policy_request(resource, declared) {
+            Ok(request) => {
+                call_rest_json(
+                    ctx,
+                    EKS_SIGNING_NAME,
+                    region,
+                    "POST",
+                    &format!(
+                        "{}/access-policies",
+                        access_entry_uri(&cluster_name, &principal_arn)
+                    ),
+                    Some(&request),
+                )
+                .await
+                .map(|_| ())
+            }
+            Err(refusal) => Err(refusal),
+        };
+        if let Err(refusal) = associated {
+            // The entry exists but not with the access it was declared with, and the stack
+            // will record no resource for it, so it is removed before the failure is
+            // reported — a refused delete changes nothing about the refusal that caused it.
+            let _ = delete_access_entry(ctx, region, resource).await;
+            return Err(refusal);
+        }
+    }
+    let mut attributes = BTreeMap::new();
+    attributes.insert("AccessEntryArn".to_string(), arn);
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the access entry a stack created, addressed by the cluster-and-principal pair
+/// Amazon EKS keys one by.
+///
+/// An entry that service no longer holds — and a cluster it no longer holds, which took
+/// the entry with it — answers `ResourceNotFoundException`, judged on the CODE and never on
+/// a message, and is already in the state the delete asks for. Deleting the entry takes its
+/// associated access policies with it, so nothing disassociates them first.
+async fn delete_access_entry(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let (cluster_name, principal_arn) = access_entry_identity(resource)?;
+    let uri = access_entry_uri(&cluster_name, &principal_arn);
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The access entry's configuration as Amazon EKS reports it, for drift detection:
+/// `DescribeAccessEntry`'s own record, read by the same pair the delete uses. One that
+/// service no longer holds (`ResourceNotFoundException`) was deleted.
+async fn describe_access_entry(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let (cluster_name, principal_arn) = access_entry_identity(resource)?;
+    let uri = access_entry_uri(&cluster_name, &principal_arn);
+    match call_rest_json(ctx, EKS_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            answer.get("accessEntry").unwrap_or(&Value::Null),
+            EKS_ACCESS_ENTRY_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == EKS_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The pair that identifies one access entry: the cluster holding it and the IAM principal
+/// it is for, both of them required properties of the type and both read off the resource's
+/// own declaration. A declaration missing either names no entry that could be created or
+/// addressed, so it is refused here rather than with a request Amazon EKS would reject.
+fn access_entry_identity(resource: &StoredResource) -> Result<(String, String), Refusal> {
+    Ok((
+        required_property(resource, "ClusterName")?,
+        required_property(resource, "PrincipalArn")?,
+    ))
+}
+
+/// The URI that addresses ONE access entry: the two `@httpLabel`s of every operation on it,
+/// each percent-encoded, as a non-greedy label is sent — a principal ARN carries both `:`
+/// and `/`, so it reaches that service as one value rather than as extra URI structure.
+fn access_entry_uri(cluster_name: &str, principal_arn: &str) -> String {
+    format!(
+        "{EKS_CLUSTERS_URI}/{}/access-entries/{}",
+        percent_encoded(cluster_name),
+        percent_encoded(principal_arn)
+    )
+}
+
+/// One entry of the type's `AccessPolicies` property as `AssociateAccessPolicy` takes it:
+/// the policy ARN it names and the scope that policy is associated under.
+///
+/// Both are required members of that call and of the type's own `AccessPolicy` property, so
+/// an entry carrying neither describes no association that could be made and is refused
+/// here.
+fn access_policy_request(resource: &StoredResource, declared: &Value) -> Result<Value, Refusal> {
+    let missing = |property: &str| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "{} declares an AccessPolicies entry with no {property}",
+            resource.resource_type
+        ),
+    };
+    let policy_arn = declared
+        .get("PolicyArn")
+        .and_then(scalar_text)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| missing("PolicyArn"))?;
+    let scope = declared
+        .get("AccessScope")
+        .ok_or_else(|| missing("AccessScope"))?;
+    let mut request = Map::new();
+    request.insert("policyArn".to_string(), Value::String(policy_arn));
+    request.insert(
+        "accessScope".to_string(),
+        mapped_members(scope, EKS_ACCESS_SCOPE_MEMBERS),
+    );
+    Ok(Value::Object(request))
 }
 
 #[cfg(test)]

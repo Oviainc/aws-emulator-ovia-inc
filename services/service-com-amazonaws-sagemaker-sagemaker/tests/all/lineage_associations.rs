@@ -25,6 +25,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The one `message` reader this crate's suites share, so the recorded refusal sentence is
+/// extracted the same way here as everywhere else.
+use crate::inference_deployment_lifecycle::message;
+
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
@@ -503,6 +507,21 @@ async fn an_end_that_names_no_stored_lineage_entity_is_refused_with_resource_not
             error_code(&parsed),
             "ResourceNotFound",
             "case {case:?}: expected ResourceNotFound, got {parsed:?}"
+        );
+        // The refusal is the lineage family's recorded sentence, naming the ARN of the
+        // FIRST end the request could not resolve — the source unless it is the stored
+        // one — in single quotes, and naming the end generically because an
+        // `AssociationEntityArn` admits five entity kinds and an unresolvable one names
+        // no kind to report.
+        let unresolved = if source == present {
+            &destination
+        } else {
+            &source
+        };
+        assert_eq!(
+            message(&parsed),
+            format!("Resource '{unresolved}' does not exist."),
+            "case {case:?}: refusal message, got {parsed:?}"
         );
         // The refusal stored nothing.
         assert_no_association(&emulator, "us-east-1", &source, &destination, &case).await;

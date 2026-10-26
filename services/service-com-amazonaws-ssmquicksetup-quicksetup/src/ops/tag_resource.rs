@@ -221,9 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(manager) = store.managers.get_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no configuration manager with ARN {} exists",
-                        input.resource_arn
+                    message: Some(crate::state::manager_not_found_message(
+                        &input.resource_arn,
                     )),
                 },
             )

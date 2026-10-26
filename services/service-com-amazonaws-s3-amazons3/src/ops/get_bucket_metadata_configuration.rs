@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketMetadataConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketMetadataConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the S3 Metadata configuration a general purpose bucket carries —
+//! the destination its tables live in, the journal table with the record expiration
+//! settings the configuration names, and the inventory and annotation table
+//! configurations when the create named them. Each table's `TableStatus` is COMPUTED from
+//! the instant it falls due to be in service, so a read straight after the create reports
+//! `CREATING` and a later one `ACTIVE`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketMetadataConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket carrying no metadata configuration answers
+//! [`crate::state::NO_SUCH_CONFIGURATION_CODE`] (HTTP 404), one this emulator does not
+//! hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner` that is not this
+//! account's HTTP 403 `AccessDenied`. Reads only: nothing about the bucket changes.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +93,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `GetBucketMetadataConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketMetadataConfiguration")]
+// Widened by `NoSuchBucket`: the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketMetadataConfiguration")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketMetadataConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketMetadataConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +160,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketMetadataConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketMetadataConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketMetadataConfiguration"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The expected owner of the general purpose bucket that you want to retrieve the
+        // metadata table configuration for"
+        // (`GetBucketMetadataConfigurationRequest$ExpectedBucketOwner`): this emulator
+        // serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and the
+            // widened-in error would not be a true statement about it. The scaffold's 501
+            // says what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBucketMetadataConfiguration",
+            ));
+        };
+
+        // Read-only: the guard is taken, the configuration is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw. The table statuses are
+        // COMPUTED from the instant each table falls due
+        // ([`crate::state::MetadataTable::status_at`]) rather than stored on read, which is
+        // what lets a reporting operation observe the transition the clock owes without
+        // touching the store.
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+        let Some(configuration) = bucket.metadata_configuration() else {
+            // A bucket is created carrying no metadata configuration, and nothing is
+            // derived for one that carries none: the read reports that the configuration it
+            // names does not exist, the way every other bucket-subresource read in this
+            // crate reports a subresource the bucket does not carry.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CONFIGURATION_CODE,
+                crate::state::NO_SUCH_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+            ));
+        };
+        // The tables live in the Region the general purpose bucket lives in, so the ARNs
+        // reported for them are scoped to it rather than to anything the request carried.
+        let region = bucket.region.clone();
+        // One renderer for the three tables, so what is reported about the inventory and
+        // annotation tables cannot drift from what is reported about the journal one.
+        let table_arn = |table: &crate::state::MetadataTable| {
+            crate::state::metadata_table_arn(&region, &table.name)
+        };
+
+        Ok(GetBucketMetadataConfigurationOutput {
+            get_bucket_metadata_configuration_result: Some(GetBucketMetadataConfigurationResult {
+                metadata_configuration_result: MetadataConfigurationResult {
+                    // "The destination information for the S3 Metadata configuration": the
+                    // managed table bucket a V2 configuration's tables live in, and the
+                    // namespace inside it.
+                    destination_result: DestinationResult {
+                        table_bucket_type: Some(
+                            crate::state::METADATA_TABLE_BUCKET_TYPE.to_string(),
+                        ),
+                        table_bucket_arn: Some(crate::state::metadata_table_bucket_arn(&region)),
+                        table_namespace: Some(
+                            crate::state::METADATA_TABLE_NAMESPACE.to_string(),
+                        ),
+                    },
+                    // Every configuration has a journal table, because
+                    // `MetadataConfiguration$JournalTableConfiguration` is required on the
+                    // create — so this container is always reported.
+                    journal_table_configuration_result: Some(JournalTableConfigurationResult {
+                        table_status: configuration.journal.status_at(now).to_string(),
+                        // `ErrorDetails` reports "If the `CREATING` status is `FAILED`, the
+                        // reason that the journal table couldn't be created": no table here
+                        // fails to be created, so there is no error to report.
+                        error: None,
+                        table_name: configuration.journal.name.clone(),
+                        table_arn: Some(table_arn(&configuration.journal)),
+                        record_expiration: configuration.journal_record_expiration.clone(),
+                    }),
+                    inventory_table_configuration_result: configuration
+                        .inventory
+                        .as_ref()
+                        .map(|inventory| InventoryTableConfigurationResult {
+                            configuration_state: inventory.configuration_state.clone(),
+                            // A table exists exactly while the configuration state asks for
+                            // one, which is why these three members are optional where
+                            // `ConfigurationState` is required: a disabled inventory
+                            // configuration has no table to report a status, a name or an
+                            // ARN for.
+                            table_status: inventory
+                                .table
+                                .as_ref()
+                                .map(|table| table.status_at(now).to_string()),
+                            error: None,
+                            table_name: inventory
+                                .table
+                                .as_ref()
+                                .map(|table| table.name.clone()),
+                            table_arn: inventory.table.as_ref().map(table_arn),
+                        }),
+                    annotation_table_configuration_result: configuration
+                        .annotation
+                        .as_ref()
+                        .map(|annotation| AnnotationTableConfigurationResult {
+                            configuration_state: annotation.configuration_state.clone(),
+                            table_status: annotation
+                                .table
+                                .as_ref()
+                                .map(|table| table.status_at(now).to_string()),
+                            error: None,
+                            table_name: annotation
+                                .table
+                                .as_ref()
+                                .map(|table| table.name.clone()),
+                            table_arn: annotation.table.as_ref().map(table_arn),
+                            // "The ARN of the IAM role used to manage the annotation table"
+                            // — reported exactly when the configuration names one.
+                            role: annotation.role.clone(),
+                        }),
+                },
+            }),
+        })
     }
 }
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the owner of
+/// the bucket it names, the way every other bucket-scoped read in this crate answers it.
+/// Not a shape in this model, so it goes out through the unmodelled channel.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`] — the status an owner mismatch is answered with: "403
+/// Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";

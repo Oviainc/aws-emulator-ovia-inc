@@ -336,26 +336,26 @@ pub fn authorize_master_key<Eng: Send + Sync + 'static>(
         let mut store = kms.lock();
         let resolved = match store.resolve(region, master_key_id) {
             kms_store::KeyRef::Found(key) => Some(KeySnapshot::of(key)),
-            // An identifier whose account segment names no account is one KMS refuses
-            // for want of permission BEFORE it looks any key up, so the queue's key
-            // cannot be used for this call at all — and the refusal names the principal,
-            // the action and the identifier the queue carries, as every other
-            // authorization failure here does.
-            kms_store::KeyRef::UnauthorizedAccount => {
-                return Err(KeyRefusal::AccessDenied(relayed(
-                    &format!(
-                        "User: {} is not authorized to perform: {action} on resource: \
-                         {master_key_id} because no resource-based policy allows the \
-                         {action} action",
-                        kms_store::caller_identity_arn()
-                    ),
-                    "AccessDeniedException",
-                )))
-            }
             // An identifier KMS cannot parse names no key either, and this service
             // models no "invalid ARN" refusal, so it is reported as not found — the
             // reading KMS's own `Encrypt`/`Decrypt` take of such an identifier.
             kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => None,
+            // An identifier whose account segment names no account is one KMS refuses
+            // for want of permission BEFORE it looks any key up, so the queue's key
+            // cannot be used for this call at all. The refusal is KMS's own sentence,
+            // taken from the function that words it for every KMS operation, and relayed
+            // like every other refusal in this module. That wording prefixes the IAM
+            // action with the KMS namespace itself, so the action goes in without this
+            // service's own `kms:` prefix.
+            kms_store::KeyRef::UnauthorizedAccount => {
+                return Err(KeyRefusal::AccessDenied(relayed(
+                    &kms_store::unauthorized_account_message(
+                        action.strip_prefix("kms:").unwrap_or(action),
+                        master_key_id,
+                    ),
+                    "AccessDeniedException",
+                )))
+            }
         };
         match resolved {
             Some(key) => key,

@@ -138,3 +138,5 @@ mod select_aggregate_resource_config;
 mod recorded_refusal_wording;
 #[path = "all/put_remediation_exceptions.rs"]
 mod put_remediation_exceptions;
+#[path = "all/describe_conformance_packs.rs"]
+mod describe_conformance_packs;

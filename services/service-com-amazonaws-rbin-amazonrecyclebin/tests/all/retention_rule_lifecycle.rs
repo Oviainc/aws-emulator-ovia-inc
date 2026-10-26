@@ -49,11 +49,11 @@ pub(crate) fn router() -> MultiServiceRouter {
     router
 }
 
-/// A SigV4 `Authorization` header whose credential scope names `rbin` in [`REGION`] —
+/// A SigV4 `Authorization` header whose credential scope names `rbin` in `region` —
 /// the signal both the router's `can_handle` and the ARN's region segment read.
-fn authorization() -> String {
+fn authorization(region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDRBINTEST/20260101/{REGION}/rbin/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential=AKIDRBINTEST/20260101/{region}/rbin/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
     )
 }
@@ -66,14 +66,26 @@ pub(crate) async fn call(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
+    call_signed_for(router, REGION, method, path, body).await
+}
+
+/// Dispatch one request signed for `region`, so a suite can drive the same service
+/// through two Regions' endpoints; [`call`] is this with [`REGION`].
+pub(crate) async fn call_signed_for(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
     let payload = match &body {
         Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serializable body")),
         None => bytes::Bytes::new(),
     };
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://rbin.{REGION}.amazonaws.com{path}"))
-        .header("authorization", authorization())
+        .uri(format!("https://rbin.{region}.amazonaws.com{path}"))
+        .header("authorization", authorization(region))
         .header("content-type", "application/json")
         .body(payload)
         .expect("a well-formed test request");

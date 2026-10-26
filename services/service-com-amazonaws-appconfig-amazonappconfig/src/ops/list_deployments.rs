@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the deployments of one environment, newest first, brought up to
+//! the progress the clock already owes each of them.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +107,16 @@ impl From<ListDeploymentsErrorModeled> for ListDeploymentsError {
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource that could not be
+/// resolved.
+fn not_found(message: String, resource_name: String) -> ListDeploymentsError {
+    ListDeploymentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
 /// The `ListDeployments` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,20 +151,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeployments"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDeploymentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A deployment only exists under an environment, which only exists under an
+        // application, so an unresolvable level of the path is not an empty listing: it is
+        // the 404 this operation models, worded exactly as `GetDeployment` words it.
+        let Some(application) = store.application_mut(&input.application_id) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_id),
+                input.application_id,
+            ));
+        };
+        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+            return Err(not_found(
+                crate::state::environment_not_found(&input.application_id, &input.environment_id),
+                input.environment_id,
+            ));
+        };
+
+        // Reporting a deployment materialises only what the CLOCK already made due — the
+        // growth steps, the bake period and the completion the strategy's own durations
+        // schedule. Nothing here depends on this call happening, and `GetDeployment`
+        // materialises the same records the same way.
+        environment.materialize(now);
+
+        // "Lists the deployments for an environment in descending deployment number
+        // order" — so the newest deployment heads the listing. Deployment numbers are
+        // unique within an environment, so the key is a TOTAL order, which is what a
+        // pagination cursor needs to resume exactly once; the complement key shared with
+        // every listing this service orders newest first turns that descending order into
+        // the ascending key order `paginate` walks.
+        let mut ordered: Vec<(String, DeploymentSummary)> = environment
+            .deployments
+            .values()
+            .map(|deployment| {
+                (
+                    crate::state::descending_number_key(deployment.deployment_number),
+                    summary_of(deployment),
+                )
+            })
+            .collect();
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_DEPLOYMENTS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListDeploymentsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::next_token_not_issued()),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListDeploymentsOutput {
+            // Reported even when empty: "the elements from this collection" is an answer
+            // about an environment nothing was ever deployed into, not a missing member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The summary this operation reports for one stored deployment.
+///
+/// Every member is read off the stored record, and each one `GetDeployment` answers for
+/// that same deployment answers alike here — the summary is the deployment document
+/// without the members `DeploymentSummary` does not model (the ids of its application,
+/// environment and strategy, its description and location URI, its event log, its applied
+/// extensions and its KMS members).
+fn summary_of(deployment: &crate::state::Deployment) -> DeploymentSummary {
+    DeploymentSummary {
+        deployment_number: deployment.deployment_number,
+        configuration_profile_id: Some(deployment.configuration_profile_id.clone()),
+        configuration_name: Some(deployment.configuration_name.clone()),
+        configuration_version: Some(deployment.configuration_version.clone()),
+        deployment_duration_in_minutes: deployment.deployment_duration_in_minutes,
+        growth_type: Some(deployment.growth_type.clone()),
+        growth_factor: Some(deployment.growth_factor),
+        final_bake_time_in_minutes: deployment.final_bake_time_in_minutes,
+        state: Some(deployment.state.clone()),
+        percentage_complete: Some(deployment.percentage_complete),
+        started_at: Some(crate::state::to_date_time(deployment.started_at)),
+        completed_at: deployment.completed_at.map(crate::state::to_date_time),
+        version_label: deployment.version_label.clone(),
+        r#type: Some(deployment.deployment_type.clone()),
     }
 }

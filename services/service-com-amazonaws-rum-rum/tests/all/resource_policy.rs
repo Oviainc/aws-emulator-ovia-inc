@@ -17,10 +17,13 @@
 //! canonical text, while whitespace inside a string value is content and survives); and
 //! the revision tests assert the conditional-request invariant (a put or delete that
 //! names a revision id succeeds only on the current one, and a refused one leaves the
-//! stored policy untouched), and the revision-counter rule (the id a write reports is the
-//! policy revision's number, 1 for the first revision an app monitor stores and one more
-//! for every later write) over rows that differ in how many writes they make and in how
-//! each one is made.
+//! stored policy untouched), the stickiness of an ASSIGNED revision id (once a write has
+//! assigned one, a put that does not provide the correct current id is refused, whether
+//! it names a stale id, a foreign one or none at all, while the delete's weaker rule
+//! stays conditional only on the id it provides), and the revision-counter rule (the id a
+//! write reports is the policy revision's number, 1 for the first revision an app monitor
+//! stores and one more for every later write) over rows that differ in how many writes
+//! they make and in how each one is made.
 
 use std::sync::Arc;
 
@@ -59,6 +62,20 @@ const POLICY_REVISION_ID_BOUNDS: (usize, usize) = (1, 255);
 /// returns `2`, i.e. the revision id is the revision's number, which is what makes an
 /// optimistic-concurrency round trip orderable.
 const FIRST_POLICY_REVISION_ID: &str = "1";
+
+/// The message RUM answers `InvalidPolicyRevisionIdException` with when the request
+/// provided no `PolicyRevisionId` at all and one had been assigned.
+/// Source: the error's own documented sentence
+/// (`smithy_query(query="shape", shape="InvalidPolicyRevisionIdException")` — "The policy
+/// revision ID that you provided … match the latest policy revision ID"), carrying no id
+/// because the request named none, in the same "does not match" voice as the refusal of a
+/// stale id. No recording of this case is available, so the assertion pins the wording the
+/// service answers with rather than one taken from a recorded run.
+const POLICY_REVISION_NOT_PROVIDED_MESSAGE: &str =
+    "The policy revision ID that you provided does not match the latest policy revision ID.";
+
+/// A syntactically valid `PolicyRevisionId` that no revision of any policy here carries.
+const FOREIGN_POLICY_REVISION_ID: &str = "00000000-0000-4000-8000-000000000000";
 
 /// The message RUM answers `PolicyNotFoundException` with.
 /// Source: recorded RUM behaviour — a 404 for a missing resource policy carries this
@@ -877,7 +894,8 @@ async fn a_conditional_put_succeeds_only_on_the_current_revision() {
         create_app_monitor(&router, case, &name).await;
 
         // A revision id named before any policy exists can never be the current one.
-        let premature = put_policy(&router, &name, first, Some("00000000-0000-4000-8000-000000000000")).await;
+        let premature =
+            put_policy(&router, &name, first, Some(FOREIGN_POLICY_REVISION_ID)).await;
         assert_refused(&premature, case, 400, "InvalidPolicyRevisionIdException");
         assert_refused(&get_policy(&router, &name).await, case, 404, "PolicyNotFoundException");
 
@@ -914,12 +932,36 @@ async fn a_conditional_put_succeeds_only_on_the_current_revision() {
             "case {case:?}: a refused conditional put must leave the revision unchanged"
         );
 
-        // A put naming no revision is unconditional: it replaces whatever is there.
-        let third_put = put_policy(&router, &name, first, None).await;
+        // A revision id has now been assigned to this policy, so a put that provides
+        // none does not provide the correct current one either: it is refused and the
+        // stored policy is left alone.
+        let unconditional = put_policy(&router, &name, first, None).await;
+        assert_refused(
+            &unconditional,
+            case,
+            400,
+            "InvalidPolicyRevisionIdException",
+        );
+        let after_unconditional = get_policy(&router, &name).await;
+        assert_stored_document(
+            case,
+            second,
+            &after_unconditional.member(case, "PolicyDocument"),
+        );
+        assert_eq!(
+            after_unconditional.member(case, "PolicyRevisionId"),
+            second_revision,
+            "case {case:?}: a put refused for not providing the current revision must \
+             leave the revision unchanged"
+        );
+
+        // The read-revision-then-write loop still goes through: a put naming the
+        // revision now in force is accepted and mints the next one.
+        let third_put = put_policy(&router, &name, first, Some(&second_revision)).await;
         let third_revision = third_put.member(case, "PolicyRevisionId");
         assert_ne!(
             third_revision, second_revision,
-            "case {case:?}: an unconditional put must still mint a new revision"
+            "case {case:?}: an accepted put must mint a new revision"
         );
         assert_stored_document(
             case,
@@ -956,8 +998,7 @@ async fn delete_is_conditional_on_the_revision_and_then_reports_no_policy() {
                 .member(case, "PolicyRevisionId");
 
             // A stale revision id refuses the delete and the policy stays readable.
-            let stale = delete_policy(&router, &name, Some("00000000-0000-4000-8000-000000000000"))
-                .await;
+            let stale = delete_policy(&router, &name, Some(FOREIGN_POLICY_REVISION_ID)).await;
             assert_refused(&stale, case, 400, "InvalidPolicyRevisionIdException");
             assert_stored_document(
                 case,
@@ -1016,7 +1057,9 @@ async fn delete_is_conditional_on_the_revision_and_then_reports_no_policy() {
 /// How one write of a revision-counter row reaches the service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Write {
-    /// A put naming no `PolicyRevisionId`: unconditional, it replaces whatever is there.
+    /// A put naming no `PolicyRevisionId`. Accepted only while no revision id has been
+    /// assigned to the policy: on the monitor's first policy, and on one written after a
+    /// delete took the previous policy — with its assigned id — away.
     Unconditional,
     /// A put naming the revision the previous write reported — the documented
     /// read-revision-then-write loop.
@@ -1055,14 +1098,12 @@ async fn revision_ids_count_the_writes_to_each_app_monitors_policy() {
             ],
         ),
         (
-            "twelve alternating writes",
+            "twelve writes cycling through all three ways of writing",
             (0..12)
-                .map(|step| {
-                    if step % 2 == 0 {
-                        Write::Unconditional
-                    } else {
-                        Write::Conditional
-                    }
+                .map(|step| match step % 3 {
+                    0 => Write::Unconditional,
+                    1 => Write::Conditional,
+                    _ => Write::DeleteThenPut,
                 })
                 .collect(),
         ),
@@ -1260,6 +1301,234 @@ async fn each_app_monitor_carries_its_own_policy() {
             &case,
             document,
             &get_policy(&router, name).await.member(&case, "PolicyDocument"),
+        );
+    }
+}
+
+/// What a request names as its `PolicyRevisionId`, as a class of value rather than a
+/// literal: the follow-up requests below differ along this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    /// The member is absent from the request.
+    Nothing,
+    /// The revision now in force — the only value that IS the correct current one.
+    Current,
+    /// A revision this policy carried before the write now in force.
+    Stale,
+    /// A well-formed id no revision of this policy ever carried.
+    Foreign,
+}
+
+impl Named {
+    /// The value this class names, given the revision in force and an earlier one.
+    fn value(self, in_force: &str, stale: &str) -> Option<String> {
+        match self {
+            Named::Nothing => None,
+            Named::Current => Some(in_force.to_string()),
+            Named::Stale => Some(stale.to_string()),
+            Named::Foreign => Some(FOREIGN_POLICY_REVISION_ID.to_string()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_put_is_refused_unless_it_provides_the_assigned_revision() {
+    let router = emulator();
+    let documents = well_formed_documents();
+
+    // Every row first writes a policy and then ASSIGNS a revision id to it by writing it
+    // again with its `PolicyRevisionId`. The rows then differ in what the next put names
+    // — nothing, the current id, a stale one, a foreign one — and in how many assigning
+    // writes came before it, because the assignment is a property of the policy and not
+    // of the one write that made it. Only naming the current revision is accepted.
+    let rows = [
+        ("no revision id at all", Named::Nothing, 1, false),
+        ("a stale revision id", Named::Stale, 1, false),
+        ("a foreign revision id", Named::Foreign, 1, false),
+        ("the current revision id", Named::Current, 1, true),
+        ("no revision id, three writes later", Named::Nothing, 3, false),
+        ("a stale revision id, three writes later", Named::Stale, 3, false),
+        (
+            "the current revision id, three writes later",
+            Named::Current,
+            3,
+            true,
+        ),
+    ];
+
+    for (row, (case, named, assigning_writes, accepted)) in rows.into_iter().enumerate() {
+        let name = format!("policy-assigned-revision-{row}");
+        create_app_monitor(&router, case, &name).await;
+
+        // The monitor's first policy: no revision id has been assigned yet, so a put that
+        // provides none is accepted.
+        let mut held = documents[row % documents.len()].1.clone();
+        let first = put_policy(&router, &name, &held, None).await;
+        assert_eq!(
+            first.status,
+            200,
+            "case {case:?}: the first policy of a monitor must be storable without a \
+             revision id, got {} {:?}",
+            first.status,
+            String::from_utf8_lossy(&first.body)
+        );
+        let mut in_force = first.member(case, "PolicyRevisionId");
+        let mut stale = in_force.clone();
+
+        // Each of these writes provides the revision in force, which is what assigns a
+        // revision id to the policy.
+        for step in 0..assigning_writes {
+            let document = documents[(row + step + 1) % documents.len()].1.clone();
+            let assigning = put_policy(&router, &name, &document, Some(&in_force)).await;
+            assert_eq!(
+                assigning.status,
+                200,
+                "case {case:?}: write {step} naming the current revision must succeed, \
+                 got {} {:?}",
+                assigning.status,
+                String::from_utf8_lossy(&assigning.body)
+            );
+            stale = in_force;
+            in_force = assigning.member(case, "PolicyRevisionId");
+            held = document;
+        }
+
+        // A document that differs from the one in force, so a put that is wrongly
+        // accepted shows up in what the reader reports.
+        let replacement = documents[(row + assigning_writes + 1) % documents.len()]
+            .1
+            .clone();
+        assert_ne!(
+            canonical_form(&replacement),
+            canonical_form(&held),
+            "case {case:?}: the follow-up put must submit a different document"
+        );
+
+        let follow_up =
+            put_policy(&router, &name, &replacement, named.value(&in_force, &stale).as_deref())
+                .await;
+        let read = get_policy(&router, &name).await;
+        if accepted {
+            assert_eq!(
+                follow_up.status,
+                200,
+                "case {case:?}: a put providing the current revision must succeed, \
+                 got {} {:?}",
+                follow_up.status,
+                String::from_utf8_lossy(&follow_up.body)
+            );
+            let minted = follow_up.member(case, "PolicyRevisionId");
+            assert_modelled_revision_id(case, &minted);
+            assert_ne!(
+                minted, in_force,
+                "case {case:?}: an accepted put must mint a new revision id"
+            );
+            assert_stored_document(case, &replacement, &read.member(case, "PolicyDocument"));
+            assert_eq!(
+                read.member(case, "PolicyRevisionId"),
+                minted,
+                "case {case:?}: the reader must report the revision the put minted"
+            );
+        } else {
+            assert_refused(&follow_up, case, 400, "InvalidPolicyRevisionIdException");
+            if named == Named::Nothing {
+                let message = follow_up.member(case, "message");
+                assert_eq!(
+                    message, POLICY_REVISION_NOT_PROVIDED_MESSAGE,
+                    "case {case:?}: expected the message \
+                     {POLICY_REVISION_NOT_PROVIDED_MESSAGE:?}, got {message:?}"
+                );
+            }
+            // Nothing was written: the policy and the revision in force are untouched.
+            assert_stored_document(case, &held, &read.member(case, "PolicyDocument"));
+            assert_eq!(
+                read.member(case, "PolicyRevisionId"),
+                in_force,
+                "case {case:?}: a refused put must leave the revision in force, expected \
+                 {in_force:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delete_stays_conditional_only_on_the_revision_it_provides() {
+    let router = emulator();
+    let documents = well_formed_documents();
+
+    // The delete's member conditions the refusal on the id "that you provide", so an
+    // assigned revision id does not make a delete that provides none refusable. Rows
+    // differ in what the delete names; after each accepted delete the monitor carries no
+    // policy, so a put that provides no revision id is storable again.
+    let rows = [
+        ("delete naming no revision", Named::Nothing, true),
+        ("delete naming the current revision", Named::Current, true),
+        ("delete naming a stale revision", Named::Stale, false),
+        ("delete naming a foreign revision", Named::Foreign, false),
+    ];
+
+    for (row, (case, named, accepted)) in rows.into_iter().enumerate() {
+        let name = format!("policy-assigned-revision-delete-{row}");
+        create_app_monitor(&router, case, &name).await;
+
+        let document = documents[row % documents.len()].1.clone();
+        let stale = put_policy(&router, &name, &document, None)
+            .await
+            .member(case, "PolicyRevisionId");
+        // Assign a revision id to the policy.
+        let in_force = put_policy(&router, &name, &document, Some(&stale))
+            .await
+            .member(case, "PolicyRevisionId");
+
+        let deleted = delete_policy(&router, &name, named.value(&in_force, &stale).as_deref()).await;
+        if !accepted {
+            assert_refused(&deleted, case, 400, "InvalidPolicyRevisionIdException");
+            assert_stored_document(
+                case,
+                &document,
+                &get_policy(&router, &name)
+                    .await
+                    .member(case, "PolicyDocument"),
+            );
+            continue;
+        }
+        assert_eq!(
+            deleted.status,
+            200,
+            "case {case:?}: expected DeleteResourcePolicy to answer 200, got {} {:?}",
+            deleted.status,
+            String::from_utf8_lossy(&deleted.body)
+        );
+        assert_eq!(
+            deleted.member(case, "PolicyRevisionId"),
+            in_force,
+            "case {case:?}: delete must report the revision it removed"
+        );
+        assert_refused(
+            &get_policy(&router, &name).await,
+            case,
+            404,
+            "PolicyNotFoundException",
+        );
+
+        // The assigned revision id went away with the policy it belonged to, so the
+        // monitor's next policy is storable without providing one.
+        let replacement = documents[(row + 1) % documents.len()].1.clone();
+        let again = put_policy(&router, &name, &replacement, None).await;
+        assert_eq!(
+            again.status,
+            200,
+            "case {case:?}: a policy stored after the previous one was deleted must not \
+             require a revision id, got {} {:?}",
+            again.status,
+            String::from_utf8_lossy(&again.body)
+        );
+        assert_stored_document(
+            case,
+            &replacement,
+            &get_policy(&router, &name)
+                .await
+                .member(case, "PolicyDocument"),
         );
     }
 }

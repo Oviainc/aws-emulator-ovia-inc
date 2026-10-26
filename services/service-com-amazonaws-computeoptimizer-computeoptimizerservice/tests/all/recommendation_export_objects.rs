@@ -37,7 +37,8 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, create_bucket, delete_bucket, emulator, error_code, get_object, opt_in, ACCOUNT,
+    call, cell, create_bucket, csv_rows, delete_bucket, emulator, error_code, export_destination,
+    get_object, opt_in, ACCOUNT,
 };
 
 /// The destination bucket these fixtures export to.
@@ -133,43 +134,8 @@ async fn reported_job(router: &MultiServiceRouter, case: &str, job_id: &str) -> 
         .unwrap_or_else(|| panic!("case {case:?}: no job reported for {job_id}, got {body}"))
 }
 
-/// The `s3Destination` members an accepted export answered: (bucket, key, metadataKey).
-fn destination(case: &str, body: &Value) -> (String, String, String) {
-    let destination = &body["s3Destination"];
-    let member = |name: &str| {
-        destination[name]
-            .as_str()
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: an accepted export answers s3Destination.{name}, got {body}")
-            })
-            .to_string()
-    };
-    (member("bucket"), member("key"), member("metadataKey"))
-}
-
-/// One export file as rows of cells, read with the same `csv` codec it is written with.
-fn csv_rows(document: &str) -> Vec<Vec<String>> {
-    ::csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(document.as_bytes())
-        .records()
-        .map(|record| {
-            let record = record.unwrap_or_else(|error| {
-                panic!("the export file is comma-separated values: {error}")
-            });
-            record.iter().map(ToString::to_string).collect()
-        })
-        .collect()
-}
-
-/// The cell of `row` under `column`, by the header the document carries.
-fn cell<'a>(header: &[String], row: &'a [String], column: &str) -> &'a str {
-    header
-        .iter()
-        .position(|held| held == column)
-        .and_then(|at| row.get(at))
-        .map_or("", String::as_str)
-}
+// The destination reader, the CSV reader and the cell lookup live in `harness.rs`, shared
+// with the per-surface export suites so no two of them read an export file differently.
 
 /// "You must create the destination Amazon S3 bucket for your recommendations export before
 /// you create the export job. Compute Optimizer does not create the S3 bucket for you": every
@@ -262,7 +228,7 @@ async fn a_completed_export_writes_the_file_and_its_metadata_to_the_destination(
         )
         .await;
         let job_id = body["jobId"].as_str().unwrap_or_default().to_string();
-        let (bucket, key, metadata_key) = destination(operation, &body);
+        let (bucket, key, metadata_key) = export_destination(operation, &body);
         assert_eq!(
             bucket, BUCKET,
             "case {operation:?}: the export answers the destination it was given, got {body}"
@@ -495,7 +461,7 @@ async fn the_export_file_holds_the_recommendations_the_reader_reports() {
             request["fieldsToExport"] = json!(fields);
         }
         let body = export_ok(&router, "ExportAutoScalingGroupRecommendations", request).await;
-        let (bucket, key, _) = destination(case, &body);
+        let (bucket, key, _) = export_destination(case, &body);
 
         tokio::time::sleep(2 * EXPORT_JOB_STEP + SLACK).await;
         let (status, exported) = get_object(&router, &bucket, &key).await;
@@ -819,7 +785,7 @@ async fn the_requests_filters_select_what_the_reader_selects() {
             json!({"s3DestinationConfig": {"bucket": BUCKET}, "filters": filters.clone()}),
         )
         .await;
-        let (bucket, key, _) = destination(case, &body);
+        let (bucket, key, _) = export_destination(case, &body);
         tokio::time::sleep(2 * EXPORT_JOB_STEP + SLACK).await;
         let (status, exported) = get_object(&router, &bucket, &key).await;
         assert_eq!(

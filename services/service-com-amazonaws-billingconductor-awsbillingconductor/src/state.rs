@@ -637,8 +637,10 @@ pub struct PricingPlanRecord {
     pub arn: String,
     pub name: String,
     pub description: Option<String>,
-    /// The rules this plan associates, each with the billing period its association
-    /// started in — see [`PricingRuleAssociationRecord`].
+    /// The rules this plan associates, each with the billing periods its association
+    /// is in force over — including the ones that have ENDED, which a read scoped to a
+    /// period they were in force in still reports; see
+    /// [`PricingRuleAssociationRecord`].
     pub pricing_rule_associations: Vec<PricingRuleAssociationRecord>,
     pub tags: BTreeMap<String, String>,
     pub creation_time_millis: i64,
@@ -671,6 +673,52 @@ impl PricingPlanRecord {
     /// reports it for, since a resource does not exist in a period that precedes it.
     pub fn creation_billing_period(&self) -> String {
         billing_period_at(self.creation_time_millis)
+    }
+
+    /// End this plan's association with each rule of `rule_arns` AT `billing_period`,
+    /// the period the disassociating call is made in: the association is in force in
+    /// every period up to that one and in none from it on.
+    ///
+    /// `rule_arns` are FULL rule ARNs ([`normalize_pricing_rule_arn`]), and only the
+    /// associations that still stand are ended, so a rule named twice over two calls in
+    /// one period does not reopen an association that has already ended.
+    ///
+    /// An association ended in the very period it started in was in force in no period
+    /// at all ([`PricingRuleAssociationRecord::covers`]), so its record is DROPPED
+    /// rather than kept as a span covering nothing — which is also what keeps a caller
+    /// cycling one rule inside one billing period from growing the record. The ended
+    /// associations that a read of a closed period still has to report are kept, at most
+    /// [`MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN`] of them with the oldest
+    /// dropped first, so the kept history is bounded like every other store here and the
+    /// associations in force are never the ones evicted.
+    pub fn end_rule_associations(&mut self, rule_arns: &[String], billing_period: &str) {
+        for association in &mut self.pricing_rule_associations {
+            if association.is_live() && rule_arns.contains(&association.arn) {
+                association.exclusive_end_billing_period = Some(billing_period.to_string());
+            }
+        }
+        self.pricing_rule_associations
+            .retain(PricingRuleAssociationRecord::covers_any_period);
+        let cap = MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN;
+        while self.ended_rule_association_count() > cap {
+            let Some(oldest) = self
+                .pricing_rule_associations
+                .iter()
+                .position(|association| !association.is_live())
+            else {
+                break;
+            };
+            self.pricing_rule_associations.remove(oldest);
+        }
+    }
+
+    /// How many of this plan's associations have ENDED — the history the cap
+    /// [`MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN`] bounds.
+    fn ended_rule_association_count(&self) -> usize {
+        self.pricing_rule_associations
+            .iter()
+            .filter(|association| !association.is_live())
+            .count()
     }
 
     /// The billing period this plan's CURRENT generation is in effect FROM.
@@ -775,16 +823,19 @@ impl PricingPlanVersion {
     }
 }
 
-/// One pricing rule association on a pricing plan, with the billing period it
-/// started in.
+/// One pricing rule association on a pricing plan, with the billing periods it is in
+/// force over.
 ///
 /// A Billing Conductor association is scoped to a billing period — every read of one
 /// names the period it is asking about (`BillingPeriod`: "the billing period for which
-/// the pricing rule associations are to be listed") — so the record keeps the period
-/// from which the association is in force rather than only the rule. The period an
-/// association starts in is the one the associating call was made in, the same
-/// `InclusiveStartBillingPeriod` sense a custom line item's billing period range
-/// carries (see [`billing_period_range_covers`]).
+/// the pricing rule associations are to be listed") — so the record keeps the periods
+/// the association is in force over rather than only the rule. The span is half-open,
+/// exactly as every other billing-period range here is (see
+/// [`billing_period_range_covers`]): the association holds from
+/// `inclusive_start_billing_period`, the period the associating call was made in, and
+/// `exclusive_end_billing_period` is the first period it no longer holds — absent while
+/// it still stands, the same shape a billing group membership
+/// ([`AccountAssociationRecord`]) carries.
 /// `Default` is deliberately NOT derived: an empty start period is not a billing
 /// period, and a record that carried one would be read as unbounded. Every
 /// association is built through [`Self::started_now`].
@@ -794,6 +845,8 @@ pub struct PricingRuleAssociationRecord {
     pub arn: String,
     /// The first billing period this association is in force for.
     pub inclusive_start_billing_period: String,
+    /// The first billing period it is no longer in force for, absent while it stands.
+    pub exclusive_end_billing_period: Option<String>,
 }
 
 impl PricingRuleAssociationRecord {
@@ -802,15 +855,35 @@ impl PricingRuleAssociationRecord {
         Self {
             arn: normalize_pricing_rule_arn(rule_arn),
             inclusive_start_billing_period: current_billing_period(),
+            exclusive_end_billing_period: None,
         }
     }
 
-    /// Is this association in force in `billing_period`? An association has no end
-    /// while it stands, so every period from the one it started in onward is covered.
+    /// Does this association still stand — has nothing ended it?
+    pub fn is_live(&self) -> bool {
+        self.exclusive_end_billing_period.is_none()
+    }
+
+    /// Is this association in force in ANY billing period at all? One that still
+    /// stands always is; an ended one only when it ended in a LATER period than the one
+    /// it started in, since the span is half-open.
+    pub fn covers_any_period(&self) -> bool {
+        billing_period_precedes(
+            billing_period_key(&self.inclusive_start_billing_period),
+            self.exclusive_end_billing_period
+                .as_deref()
+                .and_then(billing_period_key),
+        )
+    }
+
+    /// Is this association in force in `billing_period`? Half-open, as
+    /// [`billing_period_range_covers`] reads it: every period from the one it started
+    /// in up to, but not including, the one it ended at — so an association that began
+    /// and ended in the SAME period is in force in no period at all.
     pub fn covers(&self, billing_period: &str) -> bool {
         billing_period_range_covers(
             Some(&self.inclusive_start_billing_period),
-            None,
+            self.exclusive_end_billing_period.as_deref(),
             billing_period,
         )
     }
@@ -1868,7 +1941,9 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   [`MAX_PRICING_PLANS`], one plan also carrying the generations of it that later
 ///   writes superseded, at most [`MAX_PRICING_PLAN_VERSIONS`], oldest dropped first; a
 ///   plan's own association set at most
-///   [`MAX_PRICING_RULES_PER_PRICING_PLAN`]; `billing_groups` / `billing_group_names` one per group,
+///   [`MAX_PRICING_RULES_PER_PRICING_PLAN`], beside at most
+///   [`MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN`] associations of it that
+///   have ENDED, oldest dropped first; `billing_groups` / `billing_group_names` one per group,
 ///   at most [`MAX_BILLING_GROUPS`], one group also carrying the generations of it that
 ///   later writes superseded, at most [`MAX_BILLING_GROUP_VERSIONS`], oldest dropped
 ///   first; a group's membership and its share of
@@ -3214,6 +3289,19 @@ pub const MAX_PRICING_RULES: usize = 1000;
 /// `ServiceLimitExceededException` — the one operation of the associate/disassociate
 /// pair that declares it — rather than displacing a stored association.
 pub const MAX_PRICING_RULES_PER_PRICING_PLAN: usize = 30;
+
+/// How many ENDED pricing rule associations one pricing plan keeps, so that a read
+/// scoped to a closed billing period can still report the rules the plan associated
+/// then ([`PricingPlanRecord::end_rule_associations`]).
+///
+/// A CHOSEN bound, not an AWS limit, of the same order as [`MAX_PRICING_PLAN_VERSIONS`]
+/// and for the same reason: a caller decides how often it associates and disassociates
+/// a rule, and each cycle that spans a new billing period leaves one more ended
+/// association to report an earlier period from. The OLDEST ended association is
+/// dropped first, which reads back the way that period read before anybody recorded it;
+/// an association in force is never evicted, so what a read of the current period
+/// reports is untouched.
+pub const MAX_ENDED_PRICING_RULE_ASSOCIATIONS_PER_PRICING_PLAN: usize = 100;
 
 /// `ModifierPercentage` as the service stores it: "Your entry will be rounded to
 /// the nearest 2 decimal places." (the member's own documentation), so the value
