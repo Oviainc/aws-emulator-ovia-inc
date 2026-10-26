@@ -714,11 +714,18 @@ pub enum Visibility {
 /// so the wire code is the one that operation declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibilityRefusal {
-    /// The queue holds no message under that receipt handle.
-    UnknownHandle,
+    /// The value is not formed as a receipt handle at all, so no receive can have minted
+    /// it and it names no message of any queue.
+    MalformedHandle,
+    /// It IS a receipt handle, but this queue holds no message under it: the message was
+    /// deleted, purged or expired, or a later receive superseded the handle.
+    NoSuchMessage,
     /// The message the handle names is not in flight, so it has no visibility timeout to
     /// change.
     NotInFlight,
+    /// The span asked for reaches past what ONE receive may hide the message for, counted
+    /// from that receive.
+    BeyondLimit,
 }
 
 /// One message a queue holds.
@@ -759,6 +766,11 @@ pub struct StoredMessage {
     pub receive_count: u32,
     /// When it was first handed to a consumer.
     pub first_received_at: Option<SystemTime>,
+    /// When it was LAST handed to a consumer, which is the instant the receipt handle
+    /// that receive minted was minted at. The visibility a caller may still ask for is
+    /// counted from here, so a change of this message's visibility timeout cannot keep
+    /// it hidden for longer than the span one receive may hide it for.
+    pub last_received_at: Option<SystemTime>,
     /// The handle of the message movement task that still owes this message's delivery
     /// into the queue holding it: set while the task has not reached its
     /// [`available_at`](Self::available_at) slot, and cleared by
@@ -1223,6 +1235,40 @@ impl Queue {
         self.handles.insert(receipt_handle, message_id.to_string());
     }
 
+    /// The id of the message `receipt_handle` names, or why it names none.
+    ///
+    /// Only a handle this queue holds TODAY names a message: a handle a later receive
+    /// superseded, and one whose message has been deleted, purged or expired, name
+    /// nothing, and a value that is not formed as a handle at all names nothing either —
+    /// which is the distinction a caller recovers from differently.
+    pub fn message_id_for_handle(
+        &self,
+        receipt_handle: &str,
+    ) -> Result<String, ReceiptHandleRefusal> {
+        if let Some(message_id) = self.handles.get(receipt_handle) {
+            return Ok(message_id.clone());
+        }
+        Err(if is_receipt_handle(receipt_handle) {
+            ReceiptHandleRefusal::NoSuchMessage
+        } else {
+            ReceiptHandleRefusal::Malformed
+        })
+    }
+
+    /// The message `receipt_handle` names, to be changed in place, or why it names none.
+    pub fn message_for_handle_mut(
+        &mut self,
+        receipt_handle: &str,
+    ) -> Result<&mut StoredMessage, ReceiptHandleRefusal> {
+        let message_id = self.message_id_for_handle(receipt_handle)?;
+        self.messages
+            .iter_mut()
+            .find(|message| message.message_id == message_id)
+            // A handle is dropped with its message, so a handle this queue holds always
+            // names a message it holds; this arm is the same answer either way.
+            .ok_or(ReceiptHandleRefusal::NoSuchMessage)
+    }
+
     /// Discard everything this queue holds, and remember that it was purged at `at`.
     ///
     /// `PurgeQueue` "deletes available messages in a queue (including in-flight
@@ -1299,9 +1345,15 @@ impl Queue {
     /// ChangeMessageVisibility call."
     ///
     /// `Err` is why the change was refused, which each handler renders as its own modelled
-    /// error (or, in a batch, as that entry's own result): a handle this queue does not hold
-    /// names no message, and a message that is not IN FLIGHT has no visibility timeout to
-    /// change — "the specified message isn't in flight". The caller materialises what the
+    /// error (or, in a batch, as that entry's own result). The handle decides the first two:
+    /// a value that is not a receipt handle at all is a different fault from one that is,
+    /// but names no message this queue still holds — see
+    /// [`message_for_handle_mut`](Self::message_for_handle_mut). Past it, a message that is
+    /// not IN FLIGHT has no visibility timeout to change — "the specified message isn't in
+    /// flight" — and the span is bounded by what ONE receive may hide a message for, since
+    /// "if you attempt to set the VisibilityTimeout to a value greater than the maximum time
+    /// left, Amazon SQS returns an error. Amazon SQS doesn't automatically recalculate and
+    /// increase the timeout to the maximum remaining time." The caller materialises what the
     /// clock already owed first, so a message whose timeout has lapsed is not in flight here.
     pub fn change_visibility(
         &mut self,
@@ -1309,18 +1361,28 @@ impl Queue {
         timeout: i64,
         now: SystemTime,
     ) -> Result<(), VisibilityRefusal> {
-        let message_id = self
-            .handles
-            .get(receipt_handle)
-            .cloned()
-            .ok_or(VisibilityRefusal::UnknownHandle)?;
         let message = self
-            .messages
-            .iter_mut()
-            .find(|message| message.message_id == message_id)
-            .ok_or(VisibilityRefusal::UnknownHandle)?;
+            .message_for_handle_mut(receipt_handle)
+            .map_err(|refusal| match refusal {
+                ReceiptHandleRefusal::Malformed => VisibilityRefusal::MalformedHandle,
+                ReceiptHandleRefusal::NoSuchMessage => VisibilityRefusal::NoSuchMessage,
+            })?;
         if message.visibility(now) != Visibility::InFlight {
             return Err(VisibilityRefusal::NotInFlight);
+        }
+        // The ceiling of the span one receive may hide a message for is the ceiling of the
+        // range the timeout itself takes, and it is counted from the receipt handle's own
+        // receive — the LAST one, since that is the receive whose handle this call carries
+        // and an earlier handle names no message any more, so counting from the first
+        // receive would charge this consumer for a delivery it does not hold. Counted in
+        // whole seconds, the unit the timeout is in.
+        let (_, limit) = integer_bounds(VISIBILITY_TIMEOUT);
+        let held = message.last_received_at.map_or(0, |received_at| {
+            now.duration_since(received_at)
+                .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        });
+        if held.saturating_add(timeout) > limit {
+            return Err(VisibilityRefusal::BeyondLimit);
         }
         // A timeout of zero makes the message visible at once, which is how a consumer hands
         // one back; anything else holds it for that long from now.
@@ -2298,12 +2360,15 @@ fn principals_refusal(account_numbers: &[String]) -> Option<PermissionRefusal> {
 fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
     for action in actions {
         if action != ANY_ACTION && !ACTION_NAMES.contains(&action.as_str()) {
-            let reason = format!("Valid values: the name of any action or {ANY_ACTION}.");
+            // The action is named back QUALIFIED with the service it was looked up in,
+            // the way the statement a grant would have added names it, because that is
+            // the name no action of this service answers to.
+            let qualified = format!("{POLICY_ACTION_PREFIX}{action}");
             return Some(PermissionRefusal::Parameter(
                 if action.chars().count() > MAX_ACTION_NAME_LENGTH {
-                    invalid_parameter_message_without_value(ACTION_PARAMETER, &reason)
+                    invalid_parameter_message_without_value(ACTION_PARAMETER, UNKNOWN_ACTION_REASON)
                 } else {
-                    invalid_parameter_message(action, ACTION_PARAMETER, &reason)
+                    invalid_parameter_message(&qualified, ACTION_PARAMETER, UNKNOWN_ACTION_REASON)
                 },
             ));
         }
@@ -2319,6 +2384,12 @@ fn actions_refusal(actions: &[String]) -> Option<PermissionRefusal> {
         ))
     })
 }
+
+/// The reason a grant is refused for an action name this service has no action for: the
+/// caller is pointed at the service's own interface description, which is where the names
+/// a grant may allow are published.
+const UNKNOWN_ACTION_REASON: &str =
+    "Please refer to the appropriate WSDL for a list of valid actions.";
 
 /// The longest action name a refusal echoes back: the longest name this service has, so
 /// a value no longer than any action name is reported and anything longer is not.
@@ -2625,6 +2696,73 @@ pub fn receipt_handle_is_invalid(origin: ReceiptHandleOrigin<'_>) -> ReceiptHand
             }
         }),
     }
+}
+
+/// The parameter a receipt handle is supplied for, as every operation that takes one
+/// names it.
+pub const RECEIPT_HANDLE_PARAMETER: &str = "ReceiptHandle";
+
+/// Why a receipt handle a request carries names no message of the queue it was sent to.
+///
+/// The two are told apart because a caller recovers from them differently: a string that
+/// is not a receipt handle at all is a request no retry can fix, while a handle this
+/// queue no longer holds a message under means the message is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptHandleRefusal {
+    /// The value is not formed as a receipt handle, so no receive can have minted it.
+    Malformed,
+    /// It is formed as one, but names no message this queue still holds: the message was
+    /// deleted, purged or expired, or a later receive superseded the handle.
+    NoSuchMessage,
+}
+
+/// Whether `receipt_handle` is formed as a receipt handle at all — a handle is an opaque
+/// token a receive handed a consumer, so what can be judged of a value is its FORM.
+///
+/// A handle this emulator minted is one [`new_identifier`] produced, and another queue
+/// service's is a longer opaque token of the same alphabet, so both are handles here: a
+/// consumer replaying one is told its MESSAGE is gone rather than that what it holds is
+/// not a handle. A value shorter than a minted one, one holding a character no opaque
+/// token does, or one longer than any handle a consumer can have been handed is not one.
+pub fn is_receipt_handle(receipt_handle: &str) -> bool {
+    let length = receipt_handle.chars().count();
+    (MINTED_RECEIPT_HANDLE_LENGTH..=MAX_RECEIPT_HANDLE_LENGTH).contains(&length)
+        && receipt_handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='))
+}
+
+/// The length of a receipt handle this service mints: [`new_identifier`] produces the
+/// hyphenated 36-character form, and nothing shorter is a handle.
+const MINTED_RECEIPT_HANDLE_LENGTH: usize = 36;
+
+/// The longest value this service treats as a receipt handle. A handle is held by a
+/// consumer and handed back, so this bounds what one refusal can be made to echo; it is
+/// this emulator's bound, as the other `MAX_*` bounds here are.
+const MAX_RECEIPT_HANDLE_LENGTH: usize = 1_024;
+
+/// How a refusal states that the handle names no message whose visibility there is to
+/// change. The value is echoed only because it is already known to be a handle, and so
+/// bounded by the form one has.
+pub fn no_message_for_receipt_handle_message(receipt_handle: &str) -> String {
+    invalid_parameter_message(
+        receipt_handle,
+        RECEIPT_HANDLE_PARAMETER,
+        "Message does not exist or is not available for visibility timeout change.",
+    )
+}
+
+/// How a refusal states that the visibility asked for reaches past what the message has
+/// left: "if you attempt to set the VisibilityTimeout to a value greater than the maximum
+/// time left, Amazon SQS returns an error. Amazon SQS doesn't automatically recalculate
+/// and increase the timeout to the maximum remaining time." The limit is the span one
+/// receive may hide a message for, counted from that receive.
+pub fn visibility_beyond_limit_message(requested: i64, limit: i64) -> String {
+    invalid_parameter_message(
+        &requested.to_string(),
+        VISIBILITY_TIMEOUT,
+        &format!("Total VisibilityTimeout for the message is beyond the limit [{limit} seconds]."),
+    )
 }
 
 /// How many entries one batch request may carry.

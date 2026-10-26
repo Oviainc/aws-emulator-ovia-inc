@@ -65,3 +65,5 @@ mod state_roundtrip;
 mod support;
 #[path = "all/time_driven_queue_semantics.rs"]
 mod time_driven_queue_semantics;
+#[path = "all/visibility_change.rs"]
+mod visibility_change;

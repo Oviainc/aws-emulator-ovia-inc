@@ -301,7 +301,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(()) => successful.push(ChangeMessageVisibilityBatchResultEntry {
                     id: entry.id.clone(),
                 }),
-                Err(sqs::VisibilityRefusal::UnknownHandle) => {
+                Err(sqs::VisibilityRefusal::MalformedHandle)
+                | Err(sqs::VisibilityRefusal::NoSuchMessage) => {
                     failed.push(BatchResultErrorEntry {
                         id: entry.id.clone(),
                         // The caller supplied the handle, so the fault is the sender's.
@@ -316,6 +317,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         sender_fault: true,
                         code: MESSAGE_NOT_INFLIGHT.to_string(),
                         message: Some(MESSAGE_NOT_INFLIGHT_MESSAGE.to_string()),
+                    })
+                }
+                Err(sqs::VisibilityRefusal::BeyondLimit) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        sender_fault: true,
+                        code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
+                        message: Some(sqs::visibility_beyond_limit_message(requested, max)),
                     })
                 }
             }

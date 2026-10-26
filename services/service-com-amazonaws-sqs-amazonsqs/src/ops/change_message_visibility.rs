@@ -1,18 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangeMessageVisibility
-//! IMPLEMENTED: this operation gives the message a receipt handle names a new visibility
-//! timeout, counted from the instant of the call — "the 10 seconds begin to count from the
-//! time that you make the ChangeMessageVisibility call" — through
-//! [`crate::state::Queue::change_visibility`], which is the one place that change lives
-//! (`ChangeMessageVisibilityBatch` applies it per entry). It is the ONLY file to touch for
-//! `ChangeMessageVisibility`.
+//! Moves the instant one message of a queue becomes visible again, resolving the message
+//! through the receipt handle a receive handed the caller. The change itself lives in
+//! [`crate::state::Queue::change_visibility`], the one place it is applied
+//! (`ChangeMessageVisibilityBatch` applies it per entry). This is the ONLY file to touch
+//! for `ChangeMessageVisibility`.
 //!
-//! A message that is not in flight has no timeout to change, which is what the modelled
-//! `MessageNotInflight` reports; the change is applied to the message rather than to the
-//! queue, so the queue's own `VisibilityTimeout` attribute is untouched and "the visibility
-//! timeout for the message reverts to the original timeout value" the next time it is
-//! received.
+//! The refusals come from resolving that handle against what the queue holds NOW: a value
+//! that is not formed as a receipt handle at all is refused with `ReceiptHandleIsInvalid`,
+//! while a handle this queue holds no message under — its message deleted, purged or
+//! expired, or the handle superseded by a later receive — is refused as a `ReceiptHandle`
+//! value the call cannot act on, because the message whose visibility there is to change
+//! is gone. A message that is not in flight has no timeout to change, which is what the
+//! modelled `MessageNotInflight` reports, and the span asked for is held to the range the
+//! parameter documents and to what one receive may hide a message for.
+//!
+//! Past those the message is hidden from the instant of THIS call — "the timeout value is
+//! applied immediately" — and a span of zero hides it for nothing, which is what makes a
+//! message a consumer is done waiting on available again at once. The change is applied to
+//! the message rather than to the queue, so the queue's own `VisibilityTimeout` attribute
+//! is untouched and "the visibility timeout for the message reverts to the original
+//! timeout value" the next time it is received.
 //!
 //! ## Shape of an operation
 //!
@@ -219,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sqs::invalid_parameter_message(
                     &requested.to_string(),
                     sqs::VISIBILITY_TIMEOUT,
-                    &format!(
-                        "{} must be >= {min} and <= {max}.",
-                        sqs::VISIBILITY_TIMEOUT
-                    ),
+                    &format!("{} must be >= {min} and <= {max}.", sqs::VISIBILITY_TIMEOUT),
                 ),
             ));
         }
@@ -261,16 +267,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match queue.change_visibility(&input.receipt_handle, requested, now) {
             Ok(()) => Ok(ChangeMessageVisibilityOutput),
-            Err(sqs::VisibilityRefusal::UnknownHandle) => {
+            // A value that is not a receipt handle at all names no message of any queue,
+            // and says so without echoing the string the caller chose.
+            Err(sqs::VisibilityRefusal::MalformedHandle) => {
                 Err(ChangeMessageVisibilityErrorModeled::ReceiptHandleIsInvalid(
                     sqs::receipt_handle_is_invalid(origin),
                 )
                 .into())
             }
+            // A handle this queue holds no message under is a `ReceiptHandle` VALUE this
+            // call cannot act on: the message whose visibility there is to change is gone.
+            // A handle another queue minted is a handle all the same, so it is refused as
+            // the one it is rather than as a message that went away.
+            Err(sqs::VisibilityRefusal::NoSuchMessage) => match origin {
+                sqs::ReceiptHandleOrigin::AnotherQueue(_) => {
+                    Err(ChangeMessageVisibilityErrorModeled::ReceiptHandleIsInvalid(
+                        sqs::receipt_handle_is_invalid(origin),
+                    )
+                    .into())
+                }
+                sqs::ReceiptHandleOrigin::Unrecognised => {
+                    Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        sqs::no_message_for_receipt_handle_message(&input.receipt_handle),
+                    ))
+                }
+            },
             Err(sqs::VisibilityRefusal::NotInFlight) => Err(
                 ChangeMessageVisibilityErrorModeled::MessageNotInflight(MessageNotInflight {})
                     .into(),
             ),
+            Err(sqs::VisibilityRefusal::BeyondLimit) => {
+                Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    sqs::visibility_beyond_limit_message(requested, max),
+                ))
+            }
         }
     }
 }

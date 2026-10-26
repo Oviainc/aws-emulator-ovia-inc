@@ -513,6 +513,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if message.first_received_at.is_none() {
                         message.first_received_at = Some(now);
                     }
+                    // The instant this handle was minted at, which is where the span a
+                    // later visibility change may still ask for is counted from.
+                    message.last_received_at = Some(now);
                     message.invisible_until = Some(invisible_until);
                     minted.push((receipt_handle.clone(), message.message_id.clone()));
                     delivered.push(wire_message(

@@ -760,3 +760,108 @@ async fn a_grant_to_this_account_names_this_account_as_the_principal() {
         "case granting to this account: expected this account's principal, got {statement}"
     );
 }
+
+/// The sentence AWS answers an action name no action of this service answers to, spelled
+/// as AWS publishes it: the caller is pointed at the service's interface description, and
+/// the name is given back QUALIFIED with the service it was looked up in — the form the
+/// statement a grant would have added names an action in.
+fn unknown_action_message(qualified_action: &str) -> String {
+    format!(
+        "Value {qualified_action} for parameter ActionName is invalid. \
+         Reason: Please refer to the appropriate WSDL for a list of valid actions."
+    )
+}
+
+/// An action outside the set this service publishes is refused as an unknown action,
+/// whatever KIND of name it is, while every name the set does carry is granted.
+#[tokio::test]
+async fn an_action_this_service_does_not_have_is_refused_as_an_unknown_action() {
+    let router = emulator();
+    let url = create_ok(&router, "action-names", &json!({})).await;
+
+    // The kinds of name that are not an action of this service: a name of nothing, an
+    // action of ANOTHER service, an action of this one in the wrong case, one already
+    // qualified with the service, and a near-miss of a name the set carries.
+    let refused: &[(&str, &str)] = &[
+        ("a name no service has", "NotARealSqsAction"),
+        ("an action of another service", "GetObject"),
+        ("an action of this service in the wrong case", "sendmessage"),
+        (
+            "an action already qualified with the service",
+            "SQS:SendMessage",
+        ),
+        ("a near-miss of an action this service has", "SendMessages"),
+    ];
+
+    for (index, (case, action)) in refused.iter().enumerate() {
+        let label = format!("refused-{index}");
+        let (status, parsed) = grant(&router, &url, &label, &[OTHER_ACCOUNT], &[action]).await;
+        let code = error_code(&parsed);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidParameterValue"),
+            "case {case}: expected a 400 InvalidParameterValue, got {status} with {parsed}"
+        );
+        let message = parsed
+            .get("message")
+            .or_else(|| parsed.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected = unknown_action_message(&format!("{EXPECTED_ACTION_PREFIX}{action}"));
+        assert_eq!(
+            message, expected,
+            "case {case}: expected the message {expected:?}, got {message:?}"
+        );
+        assert!(
+            policy_of(&router, &url).await.is_none(),
+            "case {case}: a refused grant must leave the queue carrying no policy"
+        );
+    }
+
+    // One bad name among good ones refuses the whole grant, and names the bad one.
+    let (status, parsed) = grant(
+        &router,
+        &url,
+        "mixed-actions",
+        &[OTHER_ACCOUNT],
+        &["SendMessage", "NotARealSqsAction", "ReceiveMessage"],
+    )
+    .await;
+    let message = parsed
+        .get("message")
+        .or_else(|| parsed.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected = unknown_action_message(&format!("{EXPECTED_ACTION_PREFIX}NotARealSqsAction"));
+    assert_eq!(
+        (status, error_code(&parsed).as_str(), message),
+        (400, "InvalidParameterValue", expected.as_str()),
+        "case one bad action among good ones: expected a 400 InvalidParameterValue naming the \
+         bad action, got {status} with {parsed}"
+    );
+
+    // Names the published set DOES carry are granted — entries the refusals above are
+    // near-misses of, plus the wildcard, read from the catalog in the service's state.
+    let accepted: Vec<&str> = ACTION_NAMES
+        .iter()
+        .copied()
+        .filter(|action| ["ChangeMessageVisibility", "ReceiveMessage", "SendMessage"].contains(action))
+        .chain(std::iter::once(EXPECTED_ANY_ACTION))
+        .collect();
+    for (index, action) in accepted.iter().enumerate() {
+        let label = format!("accepted-{index}");
+        let (status, parsed) = grant(&router, &url, &label, &[OTHER_ACCOUNT], &[action]).await;
+        assert_eq!(
+            status, 200,
+            "case granting {action}: expected HTTP 200, got {status} with {parsed}"
+        );
+    }
+    let policy = policy_of(&router, &url)
+        .await
+        .expect("case granting every published action: the queue reports no Policy");
+    assert_eq!(
+        labels(&policy).len(),
+        accepted.len(),
+        "case granting every published action: expected one statement per grant, got {policy}"
+    );
+}
