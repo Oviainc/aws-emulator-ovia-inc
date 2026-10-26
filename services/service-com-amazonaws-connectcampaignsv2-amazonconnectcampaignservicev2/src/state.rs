@@ -97,6 +97,25 @@ pub const TAG_NOT_FOUND_CODE: &str = "NotFoundException";
 /// name of the model's corresponding shape (`ValidationException`).
 pub const TAG_BAD_REQUEST_CODE: &str = "BadRequestException";
 
+/// The refusal a tag operation answers for an ARN whose resource path is not one of
+/// this service's own: HTTP 400 under [`TAG_BAD_REQUEST_CODE`], with the sentence the
+/// recorded responses carry. Reached through [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::tagged_campaign`],
+/// which is what decides when it is answered.
+fn tag_arn_bad_request<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::wire_coded(
+        TAG_BAD_REQUEST_CODE,
+        400,
+        "Invalid input resource arn",
+    )
+}
+
+/// The refusal a tag operation answers for a well-formed campaign ARN the signed-for
+/// region stores nothing under: HTTP 404 under [`TAG_NOT_FOUND_CODE`], with the sentence
+/// the recorded responses carry.
+fn tag_arn_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::wire_coded(TAG_NOT_FOUND_CODE, 404, "Resource was not found")
+}
+
 /// The most tags one resource holds.
 ///
 /// Source: `TagKeyList`, the shape `UntagResource$tagKeys` takes, whose `@length` is
@@ -157,15 +176,38 @@ fn elided(text: &str) -> String {
     format!("{}... [{} bytes]", &text[..end], text.len())
 }
 
-/// Why the tag keys at `member` are a bad request, or `None` when every one of them is
-/// a key `TagKey` admits.
+/// Why `key` is not a key `TagKey` admits, or `None` when it is one.
+///
+/// The one place the key shape's `@length` and `@pattern` are read, so a key in a tag
+/// MAP and a key in a tag-key LIST are held to the same bounds.
+fn tag_key_violation_kind(key: &str) -> Option<::smithy_server_runtime::ViolationKind> {
+    let length = key.chars().count();
+    if length < TAG_KEY_MIN_LENGTH {
+        Some(::smithy_server_runtime::ViolationKind::MinLength(
+            TAG_KEY_MIN_LENGTH as i64,
+        ))
+    } else if length > TAG_KEY_MAX_LENGTH {
+        Some(::smithy_server_runtime::ViolationKind::MaxLength(
+            TAG_KEY_MAX_LENGTH as i64,
+        ))
+    } else if key.starts_with(TAG_KEY_RESERVED_PREFIX) || !tag_key_characters_allowed(key) {
+        Some(::smithy_server_runtime::ViolationKind::Pattern(
+            TAG_KEY_PATTERN.to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Why the tag keys of the MAP at `member` are a bad request, or `None` when every one
+/// of them is a key `TagKey` admits.
 ///
 /// Tag keys reach a handler UNCHECKED, for two reasons that compound: the boundary
 /// walk captures a map's key as the path segment of that entry's value rather than
 /// validating it as a leaf of its own, and `TagKey`'s `@pattern` carries a leading
 /// negative lookahead the pattern engine cannot compile, which it then treats as
 /// matching. So this is the one place the key shape's `@length` and `@pattern` are
-/// enforced, shared by every operation that takes tag keys, and the sentence is built
+/// enforced, shared by every operation that takes a tag map, and the sentence is built
 /// from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
 /// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
 /// lives — so a handler refusal and a boundary refusal read identically.
@@ -182,16 +224,7 @@ pub fn tag_keys_violation<'k>(
     let violations: Vec<::smithy_server_runtime::Violation> = keys
         .into_iter()
         .filter_map(|key| {
-            let length = key.chars().count();
-            let kind = if length < TAG_KEY_MIN_LENGTH {
-                ::smithy_server_runtime::ViolationKind::MinLength(TAG_KEY_MIN_LENGTH as i64)
-            } else if length > TAG_KEY_MAX_LENGTH {
-                ::smithy_server_runtime::ViolationKind::MaxLength(TAG_KEY_MAX_LENGTH as i64)
-            } else if key.starts_with(TAG_KEY_RESERVED_PREFIX) || !tag_key_characters_allowed(key) {
-                ::smithy_server_runtime::ViolationKind::Pattern(TAG_KEY_PATTERN.to_string())
-            } else {
-                return None;
-            };
+            let kind = tag_key_violation_kind(key)?;
             Some(::smithy_server_runtime::Violation {
                 // The path names the offending key, which is what identifies it in a
                 // tag map as in a tag-key list. Elided like the value: it embeds
@@ -200,6 +233,39 @@ pub fn tag_keys_violation<'k>(
                     "{member}.{}",
                     ::aws_smithy_schema_server::constraints::path::entry(key)
                 )),
+                kind,
+                // `Violation::value` must arrive ALREADY elided: the message
+                // interpolates it verbatim.
+                value: Some(elided(key)),
+            })
+        })
+        .take(MAX_REPORTED_VIOLATIONS)
+        .collect();
+
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// Why the tag keys of the LIST at `member` are a bad request, or `None` when every one
+/// of them is a key `TagKey` admits.
+///
+/// Same bounds as [`tag_keys_violation`], read from the same place, differing only in
+/// how an offending element is named: a list member identifies itself by its 1-based
+/// POSITION (`<member>.<position>.member`), the spelling the boundary walk's own path
+/// builder produces, so a refusal points the caller at the element it sent. A key the
+/// `@pattern` rejects reaches a handler even in a list, because the pattern's leading
+/// negative lookahead is one the pattern engine cannot compile and so treats as
+/// matching.
+pub fn tag_key_list_violation(member: &str, keys: &[String]) -> Option<String> {
+    let violations: Vec<::smithy_server_runtime::Violation> = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let kind = tag_key_violation_kind(key)?;
+            Some(::smithy_server_runtime::Violation {
+                path: format!(
+                    "{member}.{}",
+                    ::aws_smithy_schema_server::constraints::path::element(index + 1)
+                ),
                 kind,
                 // `Violation::value` must arrive ALREADY elided: the message
                 // interpolates it verbatim.
@@ -1569,6 +1635,45 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         let id = campaign_id_from_arn(arn)?.to_string();
         self.campaign_mut(region, &id)
             .filter(|stored| stored.arn == arn)
+    }
+
+    /// The campaign a tag operation's `arn` names in `region`, or the refusal that
+    /// operation answers instead.
+    ///
+    /// The one place the resolve-or-refuse step of `/v2/tags/{arn}` lives, so every tag
+    /// operation refuses an ARN it cannot resolve at the same point, with the same wire
+    /// code, status and sentence: an ARN whose resource path is not one of this
+    /// service's own is a bad request, decided before any existence check, and a
+    /// campaign ARN this region stores nothing under is a not-found. Generic over the
+    /// calling operation's modelled error enum, which the refusal does not name — both
+    /// codes are the RECORDED wire codes rather than shape names (see
+    /// [`TAG_BAD_REQUEST_CODE`], [`TAG_NOT_FOUND_CODE`] and
+    /// [`crate::scaffolded::WireCoded`]).
+    pub fn tagged_campaign<E>(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&StoredCampaign, crate::scaffolded::Scaffolded<E>> {
+        if campaign_id_from_arn(arn).is_none() {
+            return Err(tag_arn_bad_request());
+        }
+        self.campaign_by_arn(region, arn)
+            .ok_or_else(tag_arn_not_found)
+    }
+
+    /// The campaign a tag operation's `arn` names, for a handler that writes to it, or
+    /// the refusal it answers instead. Resolved exactly as [`Self::tagged_campaign`]
+    /// resolves it.
+    pub fn tagged_campaign_mut<E>(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&mut StoredCampaign, crate::scaffolded::Scaffolded<E>> {
+        if campaign_id_from_arn(arn).is_none() {
+            return Err(tag_arn_bad_request());
+        }
+        self.campaign_by_arn_mut(region, arn)
+            .ok_or_else(tag_arn_not_found)
     }
 
     /// The id the next outbound request this store takes will carry: a store-wide
