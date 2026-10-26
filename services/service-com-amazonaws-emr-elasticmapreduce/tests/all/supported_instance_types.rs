@@ -231,26 +231,113 @@ async fn a_release_reports_the_families_it_supports() {
 /// The facts a row carries, derived from its `<family>.<size>` name: EC2 sizes a family
 /// in units of two vCPUs (`large` 2, `xlarge` 4, `<n>xlarge` 4n) and memory is a
 /// per-family constant number of GiB per vCPU (4 general purpose, 2 compute optimised,
-/// 8 memory optimised). Rows span both architectures, all three memory ratios and the
-/// bottom, middle and top of several size ladders.
+/// 8 memory optimised). `InstanceFamilyId` is "the Amazon EC2 family and generation" as
+/// EMR reports it: the family's workload class and its generation, never the family part
+/// of the type name. Rows span both architectures, all three memory ratios, all three
+/// classes the catalogue publishes and the bottom, middle and top of several size
+/// ladders.
 const INSTANCE_FACTS: &[(&str, &str, i64, f64, &str, &str)] = &[
     // (release, type, vCPU, MemoryGB, InstanceFamilyId, Architecture)
-    ("emr-7.5.0", "m5.large", 2, 8.0, "m5", "X86_64"),
-    ("emr-7.5.0", "m5.xlarge", 4, 16.0, "m5", "X86_64"),
-    ("emr-7.5.0", "m5.24xlarge", 96, 384.0, "m5", "X86_64"),
-    ("emr-7.5.0", "m5a.12xlarge", 48, 192.0, "m5a", "X86_64"),
-    ("emr-7.5.0", "c5.large", 2, 4.0, "c5", "X86_64"),
-    ("emr-7.5.0", "c5.9xlarge", 36, 72.0, "c5", "X86_64"),
-    ("emr-7.5.0", "c5.18xlarge", 72, 144.0, "c5", "X86_64"),
-    ("emr-7.5.0", "r5.large", 2, 16.0, "r5", "X86_64"),
-    ("emr-7.5.0", "r5.8xlarge", 32, 256.0, "r5", "X86_64"),
-    ("emr-7.5.0", "m6i.32xlarge", 128, 512.0, "m6i", "X86_64"),
-    ("emr-7.5.0", "m6a.48xlarge", 192, 768.0, "m6a", "X86_64"),
-    ("emr-7.5.0", "c7i.48xlarge", 192, 384.0, "c7i", "X86_64"),
-    ("emr-7.5.0", "m6g.large", 2, 8.0, "m6g", "AARCH64"),
-    ("emr-7.5.0", "c7g.large", 2, 4.0, "c7g", "AARCH64"),
-    ("emr-7.5.0", "r7g.16xlarge", 64, 512.0, "r7g", "AARCH64"),
-    ("emr-6.1.0", "r6g.12xlarge", 48, 384.0, "r6g", "AARCH64"),
+    ("emr-7.5.0", "m5.large", 2, 8.0, "GENERAL_CURRENT_GEN", "X86_64"),
+    ("emr-7.5.0", "m5.xlarge", 4, 16.0, "GENERAL_CURRENT_GEN", "X86_64"),
+    (
+        "emr-7.5.0",
+        "m5.24xlarge",
+        96,
+        384.0,
+        "GENERAL_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "m5a.12xlarge",
+        48,
+        192.0,
+        "GENERAL_CURRENT_GEN",
+        "X86_64",
+    ),
+    ("emr-7.5.0", "c5.large", 2, 4.0, "COMPUTE_CURRENT_GEN", "X86_64"),
+    (
+        "emr-7.5.0",
+        "c5.9xlarge",
+        36,
+        72.0,
+        "COMPUTE_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "c5.18xlarge",
+        72,
+        144.0,
+        "COMPUTE_CURRENT_GEN",
+        "X86_64",
+    ),
+    ("emr-7.5.0", "r5.large", 2, 16.0, "HI_MEM_CURRENT_GEN", "X86_64"),
+    (
+        "emr-7.5.0",
+        "r5.8xlarge",
+        32,
+        256.0,
+        "HI_MEM_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "m6i.32xlarge",
+        128,
+        512.0,
+        "GENERAL_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "m6a.48xlarge",
+        192,
+        768.0,
+        "GENERAL_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "c7i.48xlarge",
+        192,
+        384.0,
+        "COMPUTE_CURRENT_GEN",
+        "X86_64",
+    ),
+    (
+        "emr-7.5.0",
+        "m6g.large",
+        2,
+        8.0,
+        "GENERAL_CURRENT_GEN",
+        "AARCH64",
+    ),
+    (
+        "emr-7.5.0",
+        "c7g.large",
+        2,
+        4.0,
+        "COMPUTE_CURRENT_GEN",
+        "AARCH64",
+    ),
+    (
+        "emr-7.5.0",
+        "r7g.16xlarge",
+        64,
+        512.0,
+        "HI_MEM_CURRENT_GEN",
+        "AARCH64",
+    ),
+    (
+        "emr-6.1.0",
+        "r6g.12xlarge",
+        48,
+        384.0,
+        "HI_MEM_CURRENT_GEN",
+        "AARCH64",
+    ),
 ];
 
 #[tokio::test]
@@ -308,6 +395,103 @@ async fn a_row_reports_the_facts_of_its_instance_type() {
             at(row, &["EbsOptimizedAvailable"]).as_bool(),
             Some(true),
             "case {case:?}: expected EbsOptimizedAvailable true, got {row}"
+        );
+    }
+}
+
+/// Every value Amazon EMR reports for `SupportedInstanceType$InstanceFamilyId` ("The
+/// Amazon EC2 family and generation"): a workload class crossed with a generation.
+///
+/// SOURCE: the values EMR reports for this member — the workload classes of the Amazon
+/// EC2 instance-type naming convention (general purpose, compute, memory, storage and
+/// accelerated) under the generation the family belongs to — mirrored by
+/// `crate::state::family_class`.
+const FAMILY_CLASSES: &[&str] = &["GENERAL", "COMPUTE", "HI_MEM", "STORAGE", "GPU"];
+const FAMILY_GENERATIONS: &[&str] = &["CURRENT", "PREVIOUS"];
+
+/// The `InstanceFamilyId` a row's own facts imply: the workload class follows the GiB of
+/// memory per vCPU (4 general purpose, 2 compute optimised, 8 memory optimised), which is
+/// what makes a family general purpose, compute or memory optimised.
+fn class_for_memory_ratio(case: &str, memory_gb: f64, vcpu: i64) -> &'static str {
+    let ratio = memory_gb / vcpu as f64;
+    if (ratio - 4.0).abs() < 0.001 {
+        "GENERAL"
+    } else if (ratio - 2.0).abs() < 0.001 {
+        "COMPUTE"
+    } else if (ratio - 8.0).abs() < 0.001 {
+        "HI_MEM"
+    } else {
+        panic!("case {case:?}: expected a catalogued memory ratio, got {ratio} GiB per vCPU")
+    }
+}
+
+/// THE RULE: `InstanceFamilyId` is the family's workload class and generation, drawn from
+/// the closed set above — never the family part of the type name — and it is the same for
+/// every size of one family and consistent with that family's own reported facts.
+#[tokio::test]
+async fn every_row_reports_its_family_and_generation_class() {
+    let emr = Emr::new();
+    let permitted: BTreeSet<String> = FAMILY_CLASSES
+        .iter()
+        .flat_map(|class| {
+            FAMILY_GENERATIONS
+                .iter()
+                .map(move |generation| format!("{class}_{generation}_GEN"))
+        })
+        .collect();
+
+    // Rows differ along the release, so a family reached through different releases is
+    // checked each time it is reported.
+    for release in ["emr-5.30.0", "emr-6.1.0", "emr-6.15.0", "emr-7.5.0"] {
+        let rows = emr.all_supported(release).await;
+        // family part of the name -> the class every size of it reported
+        let mut by_family: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            let instance_type = at(row, &["Type"]).as_str().unwrap_or_default().to_string();
+            let case = format!("{release}/{instance_type}");
+            let family_id = at(row, &["InstanceFamilyId"])
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: every row carries an InstanceFamilyId"))
+                .to_string();
+            assert!(
+                permitted.contains(&family_id),
+                "case {case:?}: expected one of {permitted:?}, got {family_id:?}"
+            );
+            let family = instance_type
+                .split_once('.')
+                .map(|(family, _)| family.to_string())
+                .unwrap_or_else(|| panic!("case {case:?}: a type is <family>.<size>"));
+            assert_ne!(
+                family_id, family,
+                "case {case:?}: the family and generation class is not the type prefix, got \
+                 {family_id:?}"
+            );
+
+            let vcpu = at(row, &["VCPU"]).as_i64().unwrap_or_default();
+            let memory_gb = at(row, &["MemoryGB"]).as_f64().unwrap_or_default();
+            let expected = class_for_memory_ratio(&case, memory_gb, vcpu);
+            assert_eq!(
+                family_id,
+                format!("{expected}_CURRENT_GEN"),
+                "case {case:?}: a family of {memory_gb} GiB over {vcpu} vCPUs is \
+                 {expected}, got {family_id:?}"
+            );
+
+            match by_family.get(&family) {
+                Some(already) => assert_eq!(
+                    already, &family_id,
+                    "case {case:?}: every size of {family:?} reports one class, got \
+                     {family_id:?} after {already:?}"
+                ),
+                None => {
+                    by_family.insert(family, family_id);
+                }
+            }
+        }
+        assert!(
+            by_family.len() > 3,
+            "case {release:?}: the catalogue must publish several families, got {by_family:?}"
         );
     }
 }

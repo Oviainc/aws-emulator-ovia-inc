@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobFlows
-//! The RETIRED job-flow reporter: "This API is no longer supported and will eventually
-//! be removed" (its own model documentation), and the recorded service answers every
-//! call — whatever its arguments — with a 400 `ValidationException` rather than serving
+//! The RETIRED job-flow reporter: the model marks the operation `@deprecated` and its
+//! documentation states "This API is no longer supported and will eventually be
+//! removed", and the recorded service answers every call — whatever its arguments —
+//! with a 400 `ValidationException` that states the deprecation rather than serving
 //! job-flow data. Serving data here instead would be strictly more permissive than the
-//! service, so this handler refuses, and a client is pointed at the operations the
-//! documentation names as the replacements.
+//! service, so this handler refuses, saying the API is deprecated, and a client is
+//! pointed at the operations the documentation names as the replacements.
 //!
 //! ## Shape of an operation
 //!
@@ -151,8 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` channel because the operation models no client error.
         let _ = (&input, ctx, &self.engine);
         Err(crate::scaffolded::Scaffolded::validation(
-            "DescribeJobFlows is no longer supported. Use ListClusters, DescribeCluster, \
-             ListSteps, ListInstanceGroups and ListBootstrapActions instead.",
+            "The DescribeJobFlows API is deprecated and no longer serves job flows. Use \
+             ListClusters, DescribeCluster, ListSteps, ListInstanceGroups and \
+             ListBootstrapActions instead.",
         ))
     }
 }
