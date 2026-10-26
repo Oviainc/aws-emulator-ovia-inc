@@ -15,6 +15,8 @@
 mod alias_viewer_certificate;
 #[path = "all/anycast_ip_list_lifecycle.rs"]
 mod anycast_ip_list_lifecycle;
+#[path = "all/anycast_ip_list_list.rs"]
+mod anycast_ip_list_list;
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
 #[path = "all/cache_policy_list.rs"]
