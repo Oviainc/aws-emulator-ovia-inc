@@ -159,9 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A map's KEY target is not reached by the boundary validator (its VALUE target
         // is), so `TagKey`'s modelled bounds are enforced here.
-        if let Some(refusal) =
-            crate::state::tag_keys_refusal("tags", input.tags.keys().map(String::as_str))
-        {
+        if let Some(refusal) = crate::state::map_keys_refusal(
+            "tags",
+            crate::state::TAG_KEY_BOUNDS,
+            input.tags.keys().map(String::as_str),
+        ) {
             return Err(TagResourceErrorModeled::ValidationException(refusal).into());
         }
 

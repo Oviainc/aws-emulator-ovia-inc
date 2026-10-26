@@ -193,8 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot drift apart about which templates are admissible. Everything the model
         // CAN express (the required members, the lengths and patterns on `clientToken`,
         // `description` and `roleArn`, the 50-entry tag map) was already refused at the
-        // boundary. All this handler decides is which of its own errors carries the
-        // refusal.
+        // boundary, EXCEPT a map's KEY target, which the boundary validator does not reach
+        // and which that sequence judges first: a tag key, a target name, an action name or
+        // a parameter name outside its modelled bounds is refused rather than persisted.
+        // All this handler decides is which of its own errors carries the refusal.
         if let Some(refusal) = crate::state::template_refusal(&record) {
             return Err(match refusal {
                 crate::state::TemplateRefusal::Invalid(refusal) => {

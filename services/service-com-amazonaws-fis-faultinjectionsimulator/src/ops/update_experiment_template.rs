@@ -173,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this input — the required `id`, the lengths and
         // patterns on `id`, `description` and `roleArn`, the bounds on the collections —
-        // was refused at the boundary. What the model cannot express is that a `roleArn`
+        // was refused at the boundary, except a map's KEY target, which the boundary
+        // validator does not reach and which the admissibility sequence below judges first.
+        // What the model cannot express is that a `roleArn`
         // the request carries names an IAM ROLE; it is the one rule judged over the
         // REQUEST here, BEFORE the lookup and before any write, so a malformed role is
         // refused whether or not the id resolves and the template keeps the role it

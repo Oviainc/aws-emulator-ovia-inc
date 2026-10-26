@@ -24,8 +24,9 @@
 //! none of them, and the template's `emptyTargetResolutionMode` decides what an empty
 //! target resolution does — skip the actions that name such a target, or fail the run.
 //! A template id naming no record answers `ResourceNotFoundException`
-//! (HTTP 404); a template whose role does not let FIS assume it, and one that targets
-//! MULTIPLE accounts while holding no target account configuration to name them, answer
+//! (HTTP 404); a template whose role does not let FIS assume it, one that targets
+//! MULTIPLE accounts while holding no target account configuration to name them, and a
+//! request carrying a tag key outside `TagKey`'s modelled bounds answer
 //! `ValidationException` (HTTP 400); a start beyond the published active-experiments quota
 //! answers `ServiceQuotaExceededException` (HTTP 402); and the `@idempotencyToken` either
 //! replays the experiment it already started or, when the request differs from the one it
@@ -373,6 +374,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(StartExperimentErrorModeled::ValidationException(refusal).into())
             }
         };
+
+        // The tags this start would persist onto the experiment: a map's KEY target is not
+        // reached by the boundary validator (its VALUE target is), so `TagKey`'s modelled
+        // bounds are enforced here — before the store is reached, so a refused start mints
+        // no experiment, consumes no token and leaves no out-of-bounds key for a later read
+        // to report.
+        if let Some(refusal) = crate::state::map_keys_refusal(
+            "tags",
+            crate::state::TAG_KEY_BOUNDS,
+            input.tags.iter().flatten().map(|(key, _)| key.as_str()),
+        ) {
+            return Err(StartExperimentErrorModeled::ValidationException(refusal).into());
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

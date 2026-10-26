@@ -49,6 +49,8 @@ mod list_experiment_target_account_configurations;
 mod list_target_account_configurations;
 #[path = "all/list_target_resource_types.rs"]
 mod list_target_resource_types;
+#[path = "all/modelled_map_key_bounds.rs"]
+mod modelled_map_key_bounds;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/safety_lever.rs"]

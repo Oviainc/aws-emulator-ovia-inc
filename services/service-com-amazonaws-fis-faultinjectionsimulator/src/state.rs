@@ -2708,35 +2708,122 @@ pub fn tagged_resource_not_found(resource: TaggedResource<'_>) -> ResourceNotFou
     }
 }
 
-/// Why `key` is not an acceptable tag key — naming the member and the constraint it breaks
-/// — or `None` when it is acceptable.
+/// What the model admits as ONE key of a map: the `@length` window the key's target shape
+/// declares, whether its `@pattern` admits whitespace, and what a refusal calls such a key.
 ///
-/// The boundary validator captures a map's KEY without checking it (its VALUE target IS
-/// checked), so a request carrying a tag key outside `TagKey`'s modelled bounds reaches
-/// the handler. This is where those bounds are enforced, for every operation of this
-/// service that takes tag keys.
-pub fn tag_key_refusal(member: &str, key: &str) -> Option<ValidationException> {
-    let length = key.chars().count();
-    (!(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length)).then(|| {
-        invalid_input(format!(
-            "{member}: a tag key is {TAG_KEY_MIN_LENGTH} to {TAG_KEY_MAX_LENGTH} \
-             characters long; this request carries one of {length}."
-        ))
-    })
+/// A map's KEY is the one modelled leaf the boundary validator does not reach (its VALUE
+/// target IS checked), so a key outside these bounds arrives at the handler. Every map
+/// this service persists names its key target's bounds here, and [`map_keys_refusal`]
+/// applies them — see [`TAG_KEY_BOUNDS`] and the consts beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapKeyBounds {
+    /// What a refusal calls one key of such a map ("a tag key", "a target name").
+    pub noun: &'static str,
+    /// The shortest key the target shape admits.
+    pub min_length: usize,
+    /// The longest key the target shape admits.
+    pub max_length: usize,
+    /// Whether the target shape's `@pattern` admits whitespace: `^[\s\S]+$` does, and
+    /// `^[\S]+$` does not.
+    pub admits_whitespace: bool,
 }
 
-/// Why this set of tag keys is not acceptable, or `None` when every one of them is.
+/// What `TagMap`'s key target `TagKey` admits: `@length(min: 0, max: 128)` with
+/// `pattern ^[\s\S]+$`, which matches any character and needs at least one — so a key of
+/// whitespace alone IS a tag key ([`TAG_KEY_MIN_LENGTH`], [`TAG_KEY_MAX_LENGTH`]).
+///
+/// Every `TagMap` of this service carries the same key target, so this is the bound on a
+/// caller tag of a resource (`TagResource`, `CreateExperimentTemplate`,
+/// `StartExperiment`) and on the `resourceTags` a template's target identifies resources
+/// by alike.
+pub const TAG_KEY_BOUNDS: MapKeyBounds = MapKeyBounds {
+    noun: "a tag key",
+    min_length: TAG_KEY_MIN_LENGTH,
+    max_length: TAG_KEY_MAX_LENGTH,
+    // `^[\s\S]+$` matches whitespace like any other character.
+    admits_whitespace: true,
+};
+
+/// What the key of a template's `targets` map, `ExperimentTemplateTargetName`, admits:
+/// `@length(min: 0, max: 64)` with `pattern ^[\S]+$`, which carries no whitespace and
+/// needs at least one character
+/// (`smithy_query(query="shape", shape="CreateExperimentTemplateTargetInputMap", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`).
+pub const TARGET_NAME_BOUNDS: MapKeyBounds = MapKeyBounds {
+    noun: "a target name",
+    min_length: 1,
+    max_length: 64,
+    admits_whitespace: false,
+};
+
+/// What the key of a template's `actions` map, `ExperimentTemplateActionName`, admits —
+/// the same `@length(min: 0, max: 64)` and `pattern ^[\S]+$` as [`TARGET_NAME_BOUNDS`]
+/// (`smithy_query(query="shape", shape="CreateExperimentTemplateActionInputMap", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`).
+pub const ACTION_NAME_BOUNDS: MapKeyBounds = MapKeyBounds {
+    noun: "an action name",
+    min_length: 1,
+    max_length: 64,
+    admits_whitespace: false,
+};
+
+/// What the key of a `parameters` map admits. `ExperimentTemplateTargetParameterName` and
+/// `ExperimentTemplateActionParameterName` are both `@length(min: 0, max: 64)` with
+/// `pattern ^[\S]+$`, so a target's and an action's parameter names are bounded alike
+/// (`smithy_query(query="shape", shape="ExperimentTemplateTargetParameterMap,ExperimentTemplateActionParameterMap", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`).
+pub const PARAMETER_NAME_BOUNDS: MapKeyBounds = MapKeyBounds {
+    noun: "a parameter name",
+    min_length: 1,
+    max_length: 64,
+    admits_whitespace: false,
+};
+
+/// Why `key` is not a key the map's key target admits — naming the member and the
+/// constraint it breaks — or `None` when it is one.
+///
+/// The boundary validator captures a map's KEY without checking it (its VALUE target IS
+/// checked), so a request carrying a key outside the modelled bounds of the map's key
+/// target reaches the handler. This is where those bounds are enforced, for every map this
+/// service persists — see [`MapKeyBounds`].
+pub fn map_key_refusal(
+    member: &str,
+    bounds: MapKeyBounds,
+    key: &str,
+) -> Option<ValidationException> {
+    let MapKeyBounds {
+        noun,
+        min_length,
+        max_length,
+        admits_whitespace,
+    } = bounds;
+    // The bound is on CHARACTERS, as a Smithy `@length` on a string is, so a key of
+    // non-ASCII characters is judged by how many of them it carries and not by its bytes.
+    let length = key.chars().count();
+    if !(min_length..=max_length).contains(&length) {
+        return Some(invalid_input(format!(
+            "{member}: {noun} is {min_length} to {max_length} characters long; this \
+             request carries one of {length}."
+        )));
+    }
+    if !admits_whitespace && key.chars().any(char::is_whitespace) {
+        return Some(invalid_input(format!(
+            "{member}: {noun} carries no whitespace; this request carries {key:?}."
+        )));
+    }
+    None
+}
+
+/// Why this set of map keys is not acceptable, or `None` when every one of them is.
 ///
 /// Taken over the keys in sorted order, so one request always earns the same refusal
 /// however the map happened to be iterated.
-pub fn tag_keys_refusal<'a>(
+pub fn map_keys_refusal<'a>(
     member: &str,
+    bounds: MapKeyBounds,
     keys: impl IntoIterator<Item = &'a str>,
 ) -> Option<ValidationException> {
     let mut keys: Vec<&str> = keys.into_iter().collect();
     keys.sort_unstable();
     keys.into_iter()
-        .find_map(|key| tag_key_refusal(member, key))
+        .find_map(|key| map_key_refusal(member, bounds, key))
 }
 
 /// `None` when applying `tags` to a resource that already carries `current` leaves it
@@ -3596,6 +3683,76 @@ pub enum TemplateRefusal {
     QuotaExceeded(ServiceQuotaExceededException),
 }
 
+/// Why a key of one of this template's maps is outside the modelled bounds of that map's
+/// KEY target, or `None` when every one of them is within them.
+///
+/// The boundary validator does not reach a map's key (see [`map_keys_refusal`]), so these
+/// are the modelled constraints a handler of this service applies itself. Judged over the
+/// stored RECORD, so a created and an updated template are judged alike, and in a FIXED
+/// order — the maps in the order the model declares them, each one's entries by name — so a
+/// template outside more than one of them always earns the same message.
+///
+/// An action's `targets` map is not judged here: its key has to be one of the target keys
+/// the action's published entry records ([`action_targets_refusal`]), and every one of
+/// those is within `ExperimentTemplateActionTargetName`'s bounds, so a key outside them is
+/// already refused as a target that action does not take.
+fn template_map_key_refusal(template: &ExperimentTemplateRecord) -> Option<ValidationException> {
+    let mut targets: Vec<(&String, &ExperimentTemplateTarget)> = template.targets.iter().collect();
+    targets.sort_by_key(|(name, _)| *name);
+    for (name, target) in targets {
+        if let Some(refusal) = map_key_refusal("targets", TARGET_NAME_BOUNDS, name) {
+            return Some(refusal);
+        }
+        // `resourceTags` is a `TagMap`, so the tags a target identifies resources by are
+        // bounded by the same key target as a resource's own tags.
+        if let Some(refusal) = map_keys_refusal(
+            &format!("targets.{name}.resourceTags"),
+            TAG_KEY_BOUNDS,
+            target
+                .resource_tags
+                .iter()
+                .flatten()
+                .map(|(key, _)| key.as_str()),
+        ) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = map_keys_refusal(
+            &format!("targets.{name}.parameters"),
+            PARAMETER_NAME_BOUNDS,
+            target
+                .parameters
+                .iter()
+                .flatten()
+                .map(|(key, _)| key.as_str()),
+        ) {
+            return Some(refusal);
+        }
+    }
+    let mut actions: Vec<(&String, &ExperimentTemplateAction)> = template.actions.iter().collect();
+    actions.sort_by_key(|(name, _)| *name);
+    for (name, action) in actions {
+        if let Some(refusal) = map_key_refusal("actions", ACTION_NAME_BOUNDS, name) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = map_keys_refusal(
+            &format!("actions.{name}.parameters"),
+            PARAMETER_NAME_BOUNDS,
+            action
+                .parameters
+                .iter()
+                .flatten()
+                .map(|(key, _)| key.as_str()),
+        ) {
+            return Some(refusal);
+        }
+    }
+    map_keys_refusal(
+        "tags",
+        TAG_KEY_BOUNDS,
+        template.tags.keys().map(String::as_str),
+    )
+}
+
 /// `None` when `template` is a record this service admits; otherwise the refusal it earns.
 ///
 /// The ONE admissibility sequence of an experiment template, judged over the RECORD rather
@@ -3615,7 +3772,16 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
     // FIS publishes with the parameters each one requires of a target, and the actions
     // FIS publishes with the parameters and the targets each one takes. The modelled
     // constraints — the required members, the lengths and patterns, the 50-entry tag map —
-    // were already refused at the boundary.
+    // were already refused at the boundary, with the one exception the boundary validator
+    // does not reach: a map's KEY target, judged first below.
+    //
+    // The modelled bounds of every KEY of this record's maps come FIRST, because they are
+    // constraints the model itself states rather than rules of the service: a template
+    // whose target is named by something no `ExperimentTemplateTargetName` can hold is
+    // refused on that name and not on what the target says.
+    if let Some(refusal) = template_map_key_refusal(template) {
+        return Some(TemplateRefusal::Invalid(refusal));
+    }
     if let Some(refusal) = role_arn_refusal("roleArn", Some(template.role_arn.as_str())) {
         return Some(TemplateRefusal::Invalid(refusal));
     }
