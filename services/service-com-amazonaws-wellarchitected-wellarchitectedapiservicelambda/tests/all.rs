@@ -327,3 +327,8 @@ mod agent_context_deletion;
 // a new suite does not collide with another insertion.
 #[path = "all/create_agent_profile.rs"]
 mod create_agent_profile;
+
+// Declared last for the same reason as the declaration above: the sorted position for a
+// review-template suite falls in a crowded run of this list.
+#[path = "all/review_template_imported_lens_answer_writes.rs"]
+mod review_template_imported_lens_answer_writes;
