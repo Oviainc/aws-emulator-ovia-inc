@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCloudFrontOriginAccessIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCloudFrontOriginAccessIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCloudFrontOriginAccessIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE stored origin access identity, so every later read of that id answers
+//! `NoSuchCloudFrontOriginAccessIdentity` and no listing reports it. The delete is gated
+//! on the caller holding the identity's current version and on no stored Amazon S3 origin
+//! still naming it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCloudFrontOriginAccessIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCloudFrontOriginAccessIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCloudFrontOriginAccessIdentity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it, as every handler here does: whether an identity is still in use is
+        // decided against the distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // The identity being deleted is looked up first: every refusal below is about the
+        // record this id names, and an id the store does not hold is not found whatever the
+        // rest of the request says.
+        let Some(current_etag) = store
+            .origin_access_identity(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteCloudFrontOriginAccessIdentityErrorModeled::NoSuchCloudFrontOriginAccessIdentity(
+                    crate::state::no_such_origin_access_identity(),
+                )
+                .into(),
+            );
+        };
+
+        // "The value of the ETag header you received from a previous GET or PUT request":
+        // the precondition is checked against the STORED version, the way HTTP evaluates
+        // one, so a delete only lands on the identity its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteCloudFrontOriginAccessIdentityErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(
+                    DeleteCloudFrontOriginAccessIdentityErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // An identity an Amazon S3 origin still names is in use: "To delete the origin
+        // access identity from an existing distribution, update the distribution
+        // configuration and include an empty OriginAccessIdentity element." So an identity
+        // a stored configuration still names stays readable, and the refusal names the
+        // distribution holding it.
+        if let Some(holder) = store.distribution_using_origin_access_identity(&input.id) {
+            let in_use = crate::state::origin_access_identity_in_use(holder);
+            return Err(
+                DeleteCloudFrontOriginAccessIdentityErrorModeled::CloudFrontOriginAccessIdentityInUse(
+                    in_use,
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record every read answered from is removed, so the id names
+        // no identity and the caller reference it held is free for a later create to claim.
+        store.origin_access_identities.remove(&input.id);
+
+        Ok(DeleteCloudFrontOriginAccessIdentityOutput)
     }
 }

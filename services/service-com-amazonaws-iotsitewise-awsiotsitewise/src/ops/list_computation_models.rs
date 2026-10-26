@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComputationModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComputationModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComputationModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below enumerates the computation models this
+//! service's store holds, narrowed to the `computationModelType` the request
+//! asks for (every type when it asks for none), in one stable order, cut into
+//! pages of at most `maxResults` entries. Each summary is read from the stored
+//! record, so a listed model reports what `DescribeComputationModel` reports for
+//! it, and a `nextToken` this operation never issued is refused rather than
+//! answered with an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +150,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // A listing needs no request metadata: the enumeration is a function of the
+        // store and the query parameters alone, and every value a summary carries —
+        // the ARN included — is read off the stored record.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComputationModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComputationModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComputationModels"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let now = ::std::time::SystemTime::now();
+
+        // "If a computationModelType is not provided, all types of computation models
+        // are returned": an absent type is no constraint at all. The member carries
+        // the modelled `ComputationModelType` enum, which the runtime validates BEFORE
+        // this handler runs, so a value that arrives here is one the enum declares.
+        let wanted_type = input.computation_model_type.as_deref();
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same enumeration.
+        let store = state.lock();
+
+        // A model's `ComputationModelType` is DERIVED from the configuration it was
+        // created with — the one place that rule lives is
+        // `crate::state::computation_model_type` — so the summary's required `type`
+        // never disagrees with the configuration `DescribeComputationModel` reports. A
+        // configuration naming no computation type describes no computation at all and
+        // the create refuses it, so there is no stored model this leaves out.
+        let mut matching: Vec<(&crate::state::ComputationModelRecord, &'static str)> = store
+            .computation_models
+            .values()
+            .filter_map(|model| {
+                crate::state::computation_model_type(&model.configuration)
+                    .map(|model_type| (model, model_type))
+            })
+            .filter(|(_, model_type)| wanted_type.is_none_or(|wanted| wanted == *model_type))
+            .collect();
+        // A stable order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two models created in the same instant still order
+        // deterministically. The same order `ListAssetModels` enumerates in.
+        matching.sort_by(|(left, _), (right, _)| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first
+        // computation model of the next page, hex-encoded so the token matches the
+        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty page, which would
+        // report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                matching
+                    .iter()
+                    .position(|(model, _)| model.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(matching.len());
+
+        Ok(ListComputationModelsOutput {
+            computation_model_summaries: matching[start..end]
+                .iter()
+                .map(|(model, model_type)| summary(model, model_type, now))
+                .collect(),
+            // "The token for the next set of results, or null if there are no
+            // additional results": a page that leaves nothing to resume from reports
+            // no token at all.
+            next_token: matching
+                .get(end)
+                .map(|(model, _)| ::hex::encode(model.id.as_bytes())),
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the operation documents `maxResults` only as "The
+/// maximum number of results to return for each paginated request". It is the
+/// default this service's other paginated listings already use, so a client that
+/// pages without asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored computation model as this operation's summary, as of `now`.
+///
+/// Every member is read from the stored record, so a listed model reports what
+/// `DescribeComputationModel` reports for it: the same ARN, name, description and
+/// dates, the same derived status and the same stored version counter.
+fn summary(
+    record: &crate::state::ComputationModelRecord,
+    model_type: &str,
+    now: ::std::time::SystemTime,
+) -> ComputationModelSummary {
+    ComputationModelSummary {
+        id: record.id.clone(),
+        arn: record.arn.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        r#type: model_type.to_string(),
+        creation_date: crate::state::to_date_time(record.creation_date),
+        last_update_date: crate::state::to_date_time(record.last_update_date),
+        status: record.status(now),
+        version: record.version_label(),
+    }
+}
+
+/// Decode a `nextToken` back into the computation model id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListComputationModelsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+///
+/// The wording every paginated operation of this service refuses an unusable
+/// token with, so a client matching on the message sees one string whichever
+/// listing it was paging.
+fn invalid_token() -> ListComputationModelsError {
+    ListComputationModelsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListComputationModelsError {
+    ListComputationModelsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
 }

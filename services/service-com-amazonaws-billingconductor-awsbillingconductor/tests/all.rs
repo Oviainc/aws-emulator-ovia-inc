@@ -47,6 +47,8 @@ mod custom_line_item_versions_by_billing_period;
 mod delete_custom_line_item;
 #[path = "all/disassociate_accounts.rs"]
 mod disassociate_accounts;
+#[path = "all/disassociate_pricing_rules.rs"]
+mod disassociate_pricing_rules;
 #[path = "all/list_custom_line_item_versions.rs"]
 mod list_custom_line_item_versions;
 #[path = "all/list_custom_line_items.rs"]

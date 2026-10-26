@@ -1374,45 +1374,44 @@ async fn a_create_past_the_store_ceiling_is_refused() {
     );
 }
 
-/// RULE: an operation this slice did not implement still answers HTTP 501, so a
-/// caller can tell "not written yet" from a working operation.
-#[tokio::test]
-async fn an_unimplemented_operation_still_answers_501() {
-    let emulator = Emulator::new();
-    let bundle = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+/// RULE: no operation of this service is left scaffolded, so none of them
+/// answers the scaffold's HTTP 501 any more.
+///
+/// `DeleteAppAuthorization` was the last operation carrying the scaffold marker,
+/// and its 501 is what this test used to assert on; its behaviour is covered end
+/// to end by `app_authorization_deletion`. What is asserted here is the census
+/// itself — the marker line is this project's one record of which operations are
+/// still stubs — so an operation landing as, or reverting to, a stub fails here
+/// instead of answering 501 to a caller.
+#[test]
+fn no_operation_is_left_scaffolded() {
+    const MARKER: &str = "//! SCAFFOLDED, NOT IMPLEMENTED:";
 
-    // `DeleteAppAuthorization` is one of the operations still carrying the
-    // scaffold marker, so its 501 is what this rule is asserted on.
-    let answer = emulator
-        .call(
-            "DELETE",
-            &format!(
-                "/appbundles/{}/appauthorizations/{}",
-                encode(&bundle),
-                encode(&unknown_uuid())
-            ),
-            None,
-        )
-        .await;
-    assert_eq!(
-        answer.status, 501,
-        "expected HTTP 501 from the still-scaffolded DeleteAppAuthorization, got {} with body {}",
-        answer.status, answer.body
-    );
-    // Naming the operation is what distinguishes the scaffold's 501 from the
-    // 501 a rest service renders for a path that matched no operation at all.
-    let message = answer
-        .body
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let ops = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ops");
+    let mut handlers = 0usize;
+    let mut scaffolded: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&ops).expect("this crate's src/ops directory") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+            continue;
+        }
+        handlers += 1;
+        let source = std::fs::read_to_string(&path).expect("a readable handler");
+        if source.lines().any(|line| line.starts_with(MARKER)) {
+            scaffolded.push(path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    scaffolded.sort();
     assert!(
-        message.contains("DeleteAppAuthorization"),
-        "expected the scaffold 501 to name DeleteAppAuthorization, got {}",
-        answer.body
+        handlers > 1,
+        "expected this crate's operation handlers under {ops:?}, found {handlers}"
+    );
+    assert!(
+        scaffolded.is_empty(),
+        "expected no handler to carry the scaffold marker, got {scaffolded:?}"
     );
 }
 
@@ -1421,13 +1420,13 @@ async fn an_unimplemented_operation_still_answers_501() {
 /// against `tracing` itself (a dependency this crate already carries) rather than
 /// pulling a collector crate in.
 #[derive(Clone, Default)]
-struct AuditCapture {
+pub(crate) struct AuditCapture {
     rendered: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl AuditCapture {
     /// The audit records captured so far — every event carrying `audit = true`.
-    fn audit_records(&self) -> Vec<String> {
+    pub(crate) fn audit_records(&self) -> Vec<String> {
         self.rendered
             .lock()
             .expect("the capture mutex is never poisoned")
@@ -1493,7 +1492,7 @@ impl tracing::Subscriber for AuditCapture {
 /// interest-cache rebuild removes that ordering dependency; the assertions below
 /// are scoped to the ids this test minted, so records other tests produce into
 /// the same capture do not affect them.
-fn audit_capture() -> &'static AuditCapture {
+pub(crate) fn audit_capture() -> &'static AuditCapture {
     static CAPTURE: std::sync::OnceLock<AuditCapture> = std::sync::OnceLock::new();
     CAPTURE.get_or_init(|| {
         let capture = AuditCapture::default();

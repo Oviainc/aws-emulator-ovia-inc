@@ -112,9 +112,8 @@ pub const GRAPH_SOFTWARE_BUILD_NUMBER: &str = env!("CARGO_PKG_VERSION");
 /// The lifecycle statuses this slice of the emulator puts a graph into.
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
-/// (`crate::ops::types::GRAPH_STATUS_VALUES`). The statuses this slice never
-/// produces (`FAILED`, `RESETTING`) belong to operations that are
-/// still scaffolded, and are added with them.
+/// (`crate::ops::types::GRAPH_STATUS_VALUES`). The status this slice never
+/// produces (`FAILED`) belongs to a failure path nothing in this emulator takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStatus {
     /// `CreateGraph` has accepted the graph; it is not usable yet.
@@ -139,6 +138,8 @@ pub enum GraphStatus {
     Starting,
     /// `DeleteGraph` has accepted the deletion.
     Deleting,
+    /// `ResetGraph` has emptied the graph's data; the graph is coming back up on it.
+    Resetting,
 }
 
 impl GraphStatus {
@@ -154,6 +155,7 @@ impl GraphStatus {
             Self::Stopped => "STOPPED",
             Self::Starting => "STARTING",
             Self::Deleting => "DELETING",
+            Self::Resetting => "RESETTING",
         }
     }
 
@@ -2635,6 +2637,7 @@ graph_record_output!(
     GetGraphOutput,
     UpdateGraphOutput,
     DeleteGraphOutput,
+    ResetGraphOutput,
     StopGraphOutput,
     StartGraphOutput,
     RestoreGraphFromSnapshotOutput,
@@ -3905,6 +3908,7 @@ mod tests {
             ),
             ("stopping", GraphStatus::Stopping, GraphStatus::Stopped),
             ("starting", GraphStatus::Starting, GraphStatus::Available),
+            ("resetting", GraphStatus::Resetting, GraphStatus::Available),
         ] {
             let mut graph = sample_graph("g-0123456789", "arn", "us-east-1");
             graph.begin_transition(transient, settled, now);
@@ -4271,6 +4275,7 @@ mod tests {
             GraphStatus::Stopped,
             GraphStatus::Starting,
             GraphStatus::Deleting,
+            GraphStatus::Resetting,
         ] {
             let wire = status.as_wire();
             assert!(

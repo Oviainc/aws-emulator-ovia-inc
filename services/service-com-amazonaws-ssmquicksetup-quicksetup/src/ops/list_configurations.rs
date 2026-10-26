@@ -199,9 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.managers.contains_key(manager_arn) {
                 return Err(ListConfigurationsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no configuration manager with ARN {manager_arn} exists"
-                        )),
+                        message: Some(crate::state::manager_not_found_message(manager_arn)),
                     },
                 )
                 .into());
