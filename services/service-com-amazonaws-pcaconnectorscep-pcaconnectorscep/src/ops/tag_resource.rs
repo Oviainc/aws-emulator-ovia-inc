@@ -170,8 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a resource exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -195,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_arn = input.resource_arn.clone();
         // ONE lookup, taken mutably: the ceiling below is computed from the very map the
         // write then lands on, so there is no second lookup that could miss.
-        let Some(tags) = store.tags_of_mut(&resource_arn) else {
+        let Some(tags) = store.tags_of_mut(&region, &resource_arn) else {
             return Err(not_found(&resource_arn));
         };
 

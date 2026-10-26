@@ -20,6 +20,9 @@ use std::sync::Arc;
 /// A live emulator holding only this service.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so the suite can record the billing
+    /// transfers the organization has — see [`Emulator::designate_transfer`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -39,8 +42,14 @@ impl Emulator {
             .lock()
             .payer_account_id = Some(::engine::emulator_account_id().to_string());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Record a billing transfer the organization HAS, and hand its ARN back — the shared
+    /// seam [`crate::billing_transfer_identity::designate_transfer`].
+    fn designate_transfer(&self, arn: &str) -> String {
+        crate::billing_transfer_identity::designate_transfer(&self.engine, arn)
     }
 
     /// POST a JSON body to one of this service's routes and return the status plus
@@ -917,6 +926,7 @@ async fn list_billing_groups_honours_each_filter() {
     // ^arn:[a-z0-9][a-z0-9-.]{0,62}:organizations::\d{12}:transfer/o-[a-z0-9]{10,32}/(billing)/(inbound|outbound)/rt-[0-9a-z]{8,32}$
     let transfer_arn =
         "arn:aws:organizations::000000000000:transfer/o-abcd123456/billing/inbound/rt-1234abcd";
+    em.designate_transfer(transfer_arn);
     let (status, body) = em
         .post(
             "/create-billing-group",

@@ -148,8 +148,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a challenge exists only in the Region its owning
+        // connector's ARN names, so the Region the request was signed for is part of
+        // resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -157,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let stored = store
-            .challenge(&input.challenge_arn)
+            .challenge(&region, &input.challenge_arn)
             .ok_or_else(|| not_found(&input.challenge_arn))?;
         Ok(GetChallengePasswordOutput {
             password: Some(stored.password.clone()),
@@ -165,8 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No challenge is stored under this ARN — HTTP 404 `ResourceNotFoundException`. A read
-/// after `DeleteChallenge`, or after the owning connector was deleted, lands here.
+/// No challenge is stored under this ARN in the Region the request was signed for — HTTP 404
+/// `ResourceNotFoundException`. A read after `DeleteChallenge`, after the owning connector was
+/// deleted, or with an ARN naming another Region's challenge, lands here.
 fn not_found(challenge_arn: &str) -> GetChallengePasswordError {
     GetChallengePasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Challenge {challenge_arn} could not be found"),

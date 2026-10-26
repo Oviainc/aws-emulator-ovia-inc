@@ -333,14 +333,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        store
-            .tags_by_arn
-            .insert(record.list_arn.clone(), record.tags.clone());
+        let arn = record.list_arn.clone();
         let output = PutProtocolsListOutput {
             protocols_list: Some(record.list()),
             protocols_list_arn: Some(record.list_arn.clone()),
         };
         store.protocols_lists.insert(record.list_id.clone(), record);
+        // The ARN-keyed tag index is maintained from the record just written, by
+        // the store's single index writer.
+        store.refresh_tag_index(&arn);
         Ok(output)
     }
 }

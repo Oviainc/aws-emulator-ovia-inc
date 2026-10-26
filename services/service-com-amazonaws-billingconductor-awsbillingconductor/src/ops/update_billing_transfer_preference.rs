@@ -184,13 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let transfer_arn = input.responsibility_transfer_arn;
         let requested = input.auto_billing_transfer_billing_group_creation;
 
-        // The transfer has to be one of THIS organization's — the same rule, from the
-        // same state method, that `GetBillingTransferPreference` reads it by: a billing
-        // transfer is an AWS Organizations resource whose ARN carries the management
-        // account of the organization that owns it, and this store answers for the one
-        // organization whose management account it records as the payer. Any other
-        // account's transfer is this operation's modelled 404.
-        if !state.transfer_belongs_to_this_organization(&transfer_arn) {
+        // The transfer has to be one this organization HAS — the same rule, from the same
+        // state method, that `GetBillingTransferPreference` reads it by: a billing
+        // transfer is an AWS Organizations resource whose ARN names its whole identity
+        // (management account, organization, direction, transfer id) and that Billing
+        // Conductor never creates, so only a transfer the store holds a record of exists.
+        // Any other ARN is this operation's modelled 404, and a preference is never
+        // recorded against a transfer that does not exist.
+        if !state.billing_transfer_exists(&transfer_arn) {
             return Err(UpdateBillingTransferPreferenceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: "the billing transfer does not exist".to_string(),

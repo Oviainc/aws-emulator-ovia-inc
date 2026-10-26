@@ -177,8 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a connector exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -193,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeat (it schedules the same teardown and nothing else), not that a call about a
         // record that is not there is a success. So a repeat inside the teardown window is
         // accepted and neither extends nor restarts the teardown, while a well-formed ARN
-        // holding no record — one whose teardown has completed, or one never created — is the
-        // only way this operation can reach its modelled `ResourceNotFoundException`, since
-        // that ARN is its whole input.
-        let Some(stored) = store.connectors.get_mut(&input.connector_arn) else {
+        // holding no record in this Region — one whose teardown has completed, one never
+        // created, or one naming a connector of another Region — is the only way this
+        // operation can reach its modelled `ResourceNotFoundException`, since that ARN is its
+        // whole input.
+        let Some(stored) = store.connector_mut(&region, &input.connector_arn) else {
             return Err(not_found(&input.connector_arn));
         };
         stored.begin_deletion(now);
@@ -204,8 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`, carrying the
-/// ARN as `ResourceId` and the kind of resource it names as `ResourceType`.
+/// No connector is stored under this ARN in the Region the request was signed for — HTTP 404
+/// `ResourceNotFoundException`, carrying the ARN as `ResourceId` and the kind of resource it
+/// names as `ResourceType`.
 fn not_found(connector_arn: &str) -> DeleteConnectorError {
     DeleteConnectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Connector {connector_arn} could not be found"),

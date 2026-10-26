@@ -63,6 +63,7 @@ pub use ::service_com_amazonaws_s3_amazons3::state::BucketCreation;
 
 use crate::ops::types::{
     AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, Alarm,
+    AttachedDisk, AutoSnapshotDetails,
     AvailabilityZone, Blueprint, Bucket, BucketAccessLogConfig, BucketBundle, BucketCorsConfig,
     BucketCorsRule, BucketState, Bundle, CacheBehavior, CacheBehaviorPerPath, CacheSettings,
     Certificate, CertificateSummary, Container,
@@ -338,6 +339,18 @@ pub const STOPPED: Lifecycle = Lifecycle {
 /// observes the transient state exactly as it does against AWS.
 pub const STATE_TRANSITION_MILLIS: i64 = 500;
 
+/// How long after the `AutoSnapshot` add-on is enabled on a resource this store
+/// takes the FIRST automatic snapshot of it.
+///
+/// CHOSEN, not an AWS duration: the add-on takes a copy once a day at the hour
+/// it carries, so against AWS the first copy lands up to a day after the call
+/// that enabled the add-on — a wait no caller can be made to serve here, and one
+/// that would leave the copies the add-on exists to take unobservable. The span
+/// is deliberately NON-ZERO, so a caller that reads straight after enabling the
+/// add-on still sees a resource no copy has been taken of yet. Every later copy
+/// follows the add-on's own daily hour ([`next_auto_snapshot_due_ms`]).
+pub const AUTO_SNAPSHOT_FIRST_MILLIS: i64 = STATE_TRANSITION_MILLIS;
+
 /// A state change the clock already owes an instance.
 #[derive(Debug, Clone, Copy)]
 pub struct DueTransition {
@@ -400,6 +413,17 @@ pub const DISK_SNAPSHOT_STATE_COMPLETED: &str = "completed";
 pub const INSTANCE_SNAPSHOT_STATE_PENDING: &str = "pending";
 /// See [`INSTANCE_SNAPSHOT_STATE_PENDING`].
 pub const INSTANCE_SNAPSHOT_STATE_AVAILABLE: &str = "available";
+
+/// `AutoSnapshotStatus` values this slice uses, from the modelled
+/// `AutoSnapshotStatus` enum and the `AutoSnapshotDetails$status` documentation
+/// ("The status of the automatic snapshot"): a copy the service is still taking
+/// reports `InProgress`, and one whose data is all captured reports `Success`.
+/// The enum's `Failed` member describes a copy that failed, which this store
+/// cannot produce — nothing here fails a copy — and its `NotFound` member a copy
+/// the service has no record of, which is not reported at all.
+pub const AUTO_SNAPSHOT_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`AUTO_SNAPSHOT_STATUS_IN_PROGRESS`].
+pub const AUTO_SNAPSHOT_STATUS_SUCCESS: &str = "Success";
 
 /// `RecordState` values this slice uses, from the modelled `RecordState` enum
 /// and the `ExportSnapshotRecord$state` documentation ("The state of the export
@@ -779,6 +803,16 @@ pub const MAX_INSTANCE_SNAPSHOTS: usize = 500;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_RELATIONAL_DATABASE_SNAPSHOTS: usize = 500;
+
+/// The most automatic snapshots this emulator holds of ONE resource.
+///
+/// Emulator resource guard, not a refusal: nobody asks for an automatic
+/// snapshot, so there is no request to refuse — the `AutoSnapshot` add-on takes
+/// one a day for as long as it is enabled, and the oldest copy drops out once a
+/// new one would take the resource past this. It is also what bounds the walk
+/// [`ComAmazonawsLightsailLightsail20161128State::advance_clock`] and
+/// `GetAutoSnapshots` make over one resource's copies.
+pub const MAX_AUTO_SNAPSHOTS_PER_RESOURCE: usize = 7;
 
 /// The most export snapshot records this emulator will hold.
 ///
@@ -5283,6 +5317,108 @@ impl StoredInstanceSnapshot {
             is_from_auto_snapshot: Some(false),
             size_in_gb: Some(self.size_in_gb),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic snapshots
+//
+// An AUTOMATIC snapshot is a copy the `AutoSnapshot` add-on takes of the
+// resource it is enabled for, once a day at the hour that add-on carries. It is
+// not a resource of its own: it has no name, no ARN and no tags, it is addressed
+// by the resource it was taken of plus the DATE it was taken on
+// (`GetAutoSnapshots`, `DeleteAutoSnapshot$date`), and nothing but the clock
+// creates one. So the copies are held beside the schedule that takes them,
+// keyed by the resource, rather than in a map of named records like the
+// snapshots a caller asks for.
+// ---------------------------------------------------------------------------
+
+/// One automatic snapshot the `AutoSnapshot` add-on took.
+#[derive(Debug, Clone)]
+pub struct StoredAutoSnapshot {
+    /// The UTC date the copy was taken on, in the `YYYY-MM-DD` form
+    /// `AutoSnapshotDetails$date` reports and `DeleteAutoSnapshot$date`
+    /// addresses it by. One copy a day, so this identifies it among the
+    /// resource's copies.
+    pub date: String,
+    /// The instant the service started taking the copy, which
+    /// `AutoSnapshotDetails$createdAt` reports.
+    pub created_at_ms: i64,
+    /// The current `AutoSnapshotStatus` value:
+    /// [`AUTO_SNAPSHOT_STATUS_IN_PROGRESS`] or
+    /// [`AUTO_SNAPSHOT_STATUS_SUCCESS`].
+    pub status: &'static str,
+    /// The status the clock owes this copy, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The block storage disks attached to the INSTANCE this copy was taken of
+    /// at the instant it was taken, which `AutoSnapshotDetails$fromAttachedDisks`
+    /// reports as "the block storage disks attached to the instance when the
+    /// automatic snapshot was created" — an empty list for an instance that had
+    /// none, and `None` for a copy of a DISK, which is one volume and has no
+    /// disks attached to it.
+    pub from_attached_disks: Option<Vec<AttachedDisk>>,
+}
+
+impl StoredAutoSnapshot {
+    /// This record as the modelled `AutoSnapshotDetails`.
+    pub fn view(&self) -> AutoSnapshotDetails {
+        AutoSnapshotDetails {
+            date: Some(self.date.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            status: Some(self.status.to_string()),
+            from_attached_disks: self.from_attached_disks.clone(),
+        }
+    }
+}
+
+/// What the `AutoSnapshot` add-on of one resource has taken, and when it next
+/// takes a copy.
+#[derive(Debug, Default)]
+pub struct StoredAutoSnapshots {
+    /// The instant the next automatic snapshot of the resource is due, while
+    /// the add-on is enabled on it. `None` once the add-on is disabled: the
+    /// copies already taken stay, and no further one is owed.
+    pub due_at_ms: Option<i64>,
+    /// The copies taken so far, oldest first — the order they were taken, and
+    /// the order `GetAutoSnapshots` reports them in. At most
+    /// [`MAX_AUTO_SNAPSHOTS_PER_RESOURCE`] of them.
+    pub taken: Vec<StoredAutoSnapshot>,
+}
+
+impl StoredAutoSnapshots {
+    /// Record the copy the schedule owed at `at_ms`, capturing
+    /// `from_attached_disks`.
+    ///
+    /// The copy is taken `InProgress` and the CLOCK settles it into `Success`:
+    /// the modelled `AddOn$snapshotTimeOfDay` documentation says the snapshot
+    /// "is automatically created between the time shown and up to 45 minutes
+    /// after", so there is an interval during which the service holds a copy it
+    /// has not finished taking.
+    ///
+    /// One copy a day: an automatic snapshot is addressed by its date, so a date
+    /// this resource already holds a copy for is not copied a second time.
+    fn take(&mut self, at_ms: i64, from_attached_disks: Option<Vec<AttachedDisk>>) {
+        let date = utc_date(at_ms);
+        if self.taken.iter().any(|taken| taken.date == date) {
+            return;
+        }
+        self.taken.push(StoredAutoSnapshot {
+            date,
+            created_at_ms: at_ms,
+            status: AUTO_SNAPSHOT_STATUS_IN_PROGRESS,
+            due: Some(DueNamedState::after(at_ms, AUTO_SNAPSHOT_STATUS_SUCCESS)),
+            from_attached_disks,
+        });
+        // The oldest copy drops out once a new one would take the resource past
+        // what this store holds of it.
+        while self.taken.len() > MAX_AUTO_SNAPSHOTS_PER_RESOURCE {
+            self.taken.remove(0);
+        }
+    }
+
+    /// Every copy as the modelled `AutoSnapshotDetails`, oldest first.
+    fn view(&self) -> Vec<AutoSnapshotDetails> {
+        self.taken.iter().map(StoredAutoSnapshot::view).collect()
     }
 }
 
@@ -10285,6 +10421,18 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// instance snapshot operation takes. A `BTreeMap` so `GetInstanceSnapshots`
     /// walks a stable, total order and a page token can name the next snapshot.
     pub instance_snapshots: BTreeMap<String, StoredInstanceSnapshot>,
+    /// What the `AutoSnapshot` add-on has taken of each resource it is enabled
+    /// on, keyed by that resource's `ResourceType` and its name — the pair that
+    /// identifies it, because an automatic snapshot has no name of its own and
+    /// one name can be both an instance's and a disk's. A `BTreeMap` so the
+    /// walk in
+    /// [`ComAmazonawsLightsailLightsail20161128State::advance_clock`] is in a
+    /// stable, total order.
+    ///
+    /// Bounded by [`MAX_INSTANCES`] plus [`MAX_DISKS`] (an entry belongs to one
+    /// instance or disk this account holds) and, within one entry, by
+    /// [`MAX_AUTO_SNAPSHOTS_PER_RESOURCE`].
+    pub auto_snapshots: BTreeMap<(&'static str, String), StoredAutoSnapshots>,
     /// Every export snapshot record, keyed by the name this store minted for it
     /// — the only identifier an export snapshot record has, because the caller
     /// names none. A `BTreeMap` so `GetExportSnapshotRecords` walks a stable,
@@ -10429,7 +10577,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
 
     /// Store a newly created instance.
     pub fn insert_instance(&mut self, instance: StoredInstance) {
-        self.instances.insert(instance.name.clone(), instance);
+        // A create that enabled the `AutoSnapshot` add-on started that add-on's
+        // daily schedule at the instant of the create, so the schedule is
+        // anchored there rather than at whenever somebody next calls.
+        let name = instance.name.clone();
+        let created_at_ms = instance.created_at_ms;
+        let hour = enabled_auto_snapshot_hour(&instance.add_ons);
+        self.instances.insert(name.clone(), instance);
+        self.reconcile_auto_snapshots(created_at_ms, RESOURCE_TYPE_INSTANCE, &name, hour.as_deref());
     }
 
     /// Create the GUI (Amazon DCV) session access of the virtual computer
@@ -10487,7 +10642,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
 
     /// Store a newly created block storage disk.
     pub fn insert_disk(&mut self, disk: StoredDisk) {
-        self.disks.insert(disk.name.clone(), disk);
+        // The same anchoring an instance's schedule gets
+        // ([`Self::insert_instance`]): the add-on a create enabled has been
+        // running since that create.
+        let name = disk.name.clone();
+        let created_at_ms = disk.created_at_ms;
+        let hour = enabled_auto_snapshot_hour(&disk.add_ons);
+        self.disks.insert(name.clone(), disk);
+        self.reconcile_auto_snapshots(created_at_ms, RESOURCE_TYPE_DISK, &name, hour.as_deref());
     }
 
     /// The block storage disk `name` names, for an operation the spec says
@@ -10511,6 +10673,12 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// attachments to. A snapshot taken of the disk is a resource of its own and
     /// keeps the source name and ARN it recorded, so it outlives the disk.
     pub fn remove_disk(&mut self, name: &str) -> Option<StoredDisk> {
+        // An automatic snapshot is not a resource of its own: it has no name,
+        // and it is addressed through the disk it was taken of, so it cannot
+        // outlive that disk the way a disk snapshot — a record of its own, with
+        // its own name and ARN — does.
+        self.auto_snapshots
+            .remove(&(RESOURCE_TYPE_DISK, name.to_string()));
         self.disks.remove(name)
     }
 
@@ -10540,6 +10708,108 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .into_iter()
             .map(StoredDisk::view)
             .collect()
+    }
+
+    /// The same disks as [`Self::disks_attached_to`], as the modelled
+    /// `AttachedDisk` an automatic snapshot of the instance records: the device
+    /// path the disk was mounted at and its size, which is what
+    /// `AutoSnapshotDetails$fromAttachedDisks` carries.
+    fn attached_disk_captures(&self, instance_name: &str) -> Vec<AttachedDisk> {
+        self.disks_attached_to(instance_name)
+            .into_iter()
+            .map(|disk| AttachedDisk {
+                path: disk.path.clone(),
+                size_in_gb: Some(disk.size_in_gb),
+            })
+            .collect()
+    }
+
+    /// The automatic snapshots this store holds of the resource `name` names,
+    /// together with the `ResourceType` that resource reports — what
+    /// `GetAutoSnapshots` answers for it. `None` when this account holds no
+    /// instance or disk of that name.
+    ///
+    /// ONE name addresses one resource, and the resources an automatic snapshot
+    /// is taken of are the ones the `AutoSnapshot` add-on describes — "an Amazon
+    /// Lightsail instance or disk" — so this asks the same two maps the add-on
+    /// resolution does ([`Self::with_add_on_record`]), in the same order. A
+    /// resource whose add-on has never been enabled holds no copy, which is an
+    /// EMPTY list rather than a refusal: the resource exists, and the answer is
+    /// that nothing has been copied of it.
+    pub fn auto_snapshots_of(&self, name: &str) -> Option<(&'static str, Vec<AutoSnapshotDetails>)> {
+        let resource_type = if self.instances.contains_key(name) {
+            RESOURCE_TYPE_INSTANCE
+        } else if self.disks.contains_key(name) {
+            RESOURCE_TYPE_DISK
+        } else {
+            return None;
+        };
+        let reported = self
+            .auto_snapshots
+            .get(&(resource_type, name.to_string()))
+            .map(StoredAutoSnapshots::view)
+            .unwrap_or_default();
+        Some((resource_type, reported))
+    }
+
+    /// Bring the automatic snapshot schedule of the resource `name` of kind
+    /// `resource_type` into line with its add-ons at `now_ms`, where `hour` is
+    /// the daily hour its enabled `AutoSnapshot` add-on carries and `None` says
+    /// it carries no such add-on.
+    ///
+    /// The one place a schedule is started or stopped, so every operation that
+    /// writes a resource's add-ons — the creates, through
+    /// [`Self::insert_instance`] and [`Self::insert_disk`], and the add-on
+    /// changes, through [`Self::with_add_on_record`] — starts exactly the same
+    /// schedule. Enabling the add-on makes the service owe the resource a copy:
+    /// the first one falls due a short interval later
+    /// ([`AUTO_SNAPSHOT_FIRST_MILLIS`]), and from then on the copies follow the
+    /// add-on's own daily hour. Disabling it stops the schedule and keeps the
+    /// copies already taken, which are the account's until something deletes
+    /// them.
+    fn reconcile_auto_snapshots(
+        &mut self,
+        now_ms: i64,
+        resource_type: &'static str,
+        name: &str,
+        hour: Option<&str>,
+    ) {
+        let key = (resource_type, name.to_string());
+        if hour.is_none() {
+            if let Some(schedule) = self.auto_snapshots.get_mut(&key) {
+                schedule.due_at_ms = None;
+                if schedule.taken.is_empty() {
+                    self.auto_snapshots.remove(&key);
+                }
+            }
+            return;
+        }
+        let schedule = self.auto_snapshots.entry(key).or_default();
+        // An add-on already taking copies keeps the schedule it is on, so
+        // modifying it does not restart the wait; and a resource that already
+        // holds the copy for the day the first one would fall on is not copied
+        // twice because the add-on was switched off and on again.
+        let first_due_ms = now_ms.saturating_add(AUTO_SNAPSHOT_FIRST_MILLIS);
+        if schedule.due_at_ms.is_none()
+            && schedule
+                .taken
+                .last()
+                .is_none_or(|taken| taken.date != utc_date(first_due_ms))
+        {
+            schedule.due_at_ms = Some(first_due_ms);
+        }
+    }
+
+    /// The daily hour the enabled `AutoSnapshot` add-on of the resource `name`
+    /// of kind `resource_type` carries, and `None` when this account holds no
+    /// such resource or that resource has the add-on disabled.
+    fn auto_snapshot_hour(&self, resource_type: &'static str, name: &str) -> Option<String> {
+        let add_ons = if resource_type == RESOURCE_TYPE_INSTANCE {
+            &self.instances.get(name)?.add_ons
+        } else {
+            &self.disks.get(name)?.add_ons
+        };
+        enabled_auto_snapshot_hour(add_ons)
     }
 
     /// The disk snapshot `name` names, for a reporting operation.
@@ -10646,6 +10916,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// read can observe an attachment to a record that is gone.
     pub fn remove_instance(&mut self, name: &str) -> Option<RemovedInstance> {
         let instance = self.instances.remove(name)?;
+        // The instance's automatic snapshots go with it, for the reason spelled
+        // out on [`Self::remove_disk`]: they are addressed through the instance
+        // and have no identity without it.
+        self.auto_snapshots
+            .remove(&(RESOURCE_TYPE_INSTANCE, name.to_string()));
         let released_attachments = self.release_attachments_to_instance(name);
         Some(RemovedInstance {
             instance,
@@ -11713,7 +11988,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// a certificate reaches the validation status it was owed,
     /// a Region's Lightsail VPC peering walks into the phase it was owed
     /// (established, or gone), a CDN distribution settles into the status it was
-    /// owed, an operation whose work is done settles into `Succeeded`, and a set
+    /// owed, the `AutoSnapshot` add-on of a resource takes the automatic
+    /// snapshot its schedule owed (and one it has finished taking reports
+    /// `Success`), an operation whose work is done settles into `Succeeded`, and a set
     /// of container image registry log in credentials past its 12-hour validity
     /// is forgotten.
     ///
@@ -11730,7 +12007,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`MAX_CERTIFICATES`], [`MAX_DISTRIBUTIONS`] and
     /// [`MAX_OPERATION_HISTORY`] — and, for the peering walk, by the modelled
     /// `RegionName` enum [`vpc_peerings`](Self::vpc_peerings) is keyed by — and a
-    /// record drops out of the work as soon as it has nothing outstanding.
+    /// record drops out of the work as soon as it has nothing outstanding. The
+    /// automatic snapshot walk is bounded by
+    /// [`auto_snapshots`](Self::auto_snapshots)' own bounds.
     fn advance_clock(&mut self, now_ms: i64) {
         for instance in self.instances.values_mut() {
             if let Some(due) = instance.due {
@@ -11944,6 +12223,50 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 certificate.due = None;
             }
         }
+        // The `AutoSnapshot` add-on takes a copy of the resource it is enabled
+        // on once a day: that copy was owed at the instant the schedule named
+        // whether or not anybody called, so the clock is what takes it — and
+        // what settles one the service has finished taking into `Success`.
+        //
+        // The copies due are collected first because taking one READS the rest
+        // of the store (the disks attached to an instance), which cannot be done
+        // while the schedule it is written to is borrowed.
+        let owed: Vec<(&'static str, String)> = self
+            .auto_snapshots
+            .iter()
+            .filter(|(_, schedule)| schedule.due_at_ms.is_some_and(|at_ms| at_ms <= now_ms))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (resource_type, name) in owed {
+            // A resource whose add-on has been disabled, or that this account no
+            // longer holds, is owed no copy — and the hour the add-on carries is
+            // what says when the next one falls due.
+            let Some(hour) = self.auto_snapshot_hour(resource_type, &name) else {
+                continue;
+            };
+            // What the copy captures: for a virtual private server, the block
+            // storage disks attached to it at this instant; a disk's own copy is
+            // of one volume, which has no disks attached to it.
+            let captured = (resource_type == RESOURCE_TYPE_INSTANCE)
+                .then(|| self.attached_disk_captures(&name));
+            let Some(schedule) = self.auto_snapshots.get_mut(&(resource_type, name)) else {
+                continue;
+            };
+            let Some(due_at_ms) = schedule.due_at_ms else {
+                continue;
+            };
+            schedule.take(due_at_ms, captured);
+            schedule.due_at_ms = Some(next_auto_snapshot_due_ms(due_at_ms, &hour));
+        }
+        for schedule in self.auto_snapshots.values_mut() {
+            for taken in &mut schedule.taken {
+                let Some(due) = taken.due.filter(|due| due.at_ms <= now_ms) else {
+                    continue;
+                };
+                taken.status = due.state;
+                taken.due = None;
+            }
+        }
         for operation in &mut self.operations {
             let Some(settles_at_ms) = operation.settles_at_ms else {
                 continue;
@@ -12146,18 +12469,31 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// storage disk, each of which every operation of theirs addresses by name
     /// alone. The one place an add-on change resolves a resource, so every
     /// operation that edits add-ons admits exactly the same set of them.
+    ///
+    /// The automatic snapshot schedule of the record is reconciled with
+    /// whatever add-ons it carries once `body` has run
+    /// ([`Self::reconcile_auto_snapshots`]) — so an add-on change starts or
+    /// stops the schedule, and a call that refused the request and wrote
+    /// nothing leaves the schedule exactly as it was.
     pub fn with_add_on_record<R>(
         &mut self,
         name: &str,
         body: impl FnOnce(&mut dyn AddOnRecord, &'static str) -> R,
     ) -> Option<R> {
-        if let Some(record) = self.instances.get_mut(name) {
-            return Some(body(record, RESOURCE_TYPE_INSTANCE));
-        }
-        if let Some(record) = self.disks.get_mut(name) {
-            return Some(body(record, RESOURCE_TYPE_DISK));
-        }
-        None
+        let now_ms = now_ms();
+        let (outcome, resource_type, hour) = if let Some(record) = self.instances.get_mut(name) {
+            let outcome = body(record, RESOURCE_TYPE_INSTANCE);
+            let hour = enabled_auto_snapshot_hour(&record.add_ons);
+            (outcome, RESOURCE_TYPE_INSTANCE, hour)
+        } else if let Some(record) = self.disks.get_mut(name) {
+            let outcome = body(record, RESOURCE_TYPE_DISK);
+            let hour = enabled_auto_snapshot_hour(&record.add_ons);
+            (outcome, RESOURCE_TYPE_DISK, hour)
+        } else {
+            return None;
+        };
+        self.reconcile_auto_snapshots(now_ms, resource_type, name, hour.as_deref());
+        Some(outcome)
     }
 }
 
@@ -12381,8 +12717,8 @@ pub fn add_ons_from_requests(
         .iter()
         .map(|request| match request.add_on_type.as_str() {
             "AutoSnapshot" => Ok(AddOn {
-                name: Some("AutoSnapshot".to_string()),
-                status: Some("Enabled".to_string()),
+                name: Some(ADD_ON_TYPE_AUTO_SNAPSHOT.to_string()),
+                status: Some(ADD_ON_STATUS_ENABLED.to_string()),
                 snapshot_time_of_day: Some(
                     request
                         .auto_snapshot_add_on_request
@@ -12394,7 +12730,7 @@ pub fn add_ons_from_requests(
             }),
             "StopInstanceOnIdle" => Ok(AddOn {
                 name: Some("StopInstanceOnIdle".to_string()),
-                status: Some("Enabled".to_string()),
+                status: Some(ADD_ON_STATUS_ENABLED.to_string()),
                 threshold: request
                     .stop_instance_on_idle_request
                     .as_ref()
@@ -12422,6 +12758,64 @@ pub fn add_ons_from_requests(
 /// which your virtual computer will automatically stop"), which a block storage
 /// disk does not have.
 pub const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
+
+/// The `AddOn$status` value an add-on a resource has enabled reports ("The
+/// status of the add-on").
+///
+/// A disabled add-on is not reported at all — `DisableAddOn` removes it from the
+/// resource's `addOns` — so this is the status every stored add-on carries, and
+/// what tells the automatic snapshot schedule that the add-on is running.
+pub const ADD_ON_STATUS_ENABLED: &str = "Enabled";
+
+/// The daily hour the enabled `AutoSnapshot` add-on among `add_ons` takes a copy
+/// at, and `None` when none of them is that add-on.
+///
+/// An add-on is named for its type and carries the status it is in, so those two
+/// members are what say whether the service owes the resource a daily copy at
+/// all — and `snapshotTimeOfDay` is when, "in `HH:00` format, and in Coordinated
+/// Universal Time (UTC)".
+fn enabled_auto_snapshot_hour(add_ons: &[AddOn]) -> Option<String> {
+    add_ons
+        .iter()
+        .find(|add_on| {
+            add_on.name.as_deref() == Some(ADD_ON_TYPE_AUTO_SNAPSHOT)
+                && add_on.status.as_deref() == Some(ADD_ON_STATUS_ENABLED)
+        })
+        .and_then(|add_on| add_on.snapshot_time_of_day.clone())
+}
+
+/// How many milliseconds one day of Unix time counts. Unix time has no leap
+/// second, so every UTC day in it is exactly this long — which is what lets the
+/// daily automatic snapshot hour below be found by arithmetic rather than by a
+/// calendar.
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
+
+/// The instant the daily automatic snapshot hour `hour` next comes round after
+/// `after_ms`.
+///
+/// `hour` is the add-on's `snapshotTimeOfDay`, which that member's
+/// documentation states is "in `HH:00` format, and in Coordinated Universal Time
+/// (UTC)" — so the next copy is due that far into a UTC day, on the first such
+/// instant still ahead of `after_ms`. An hour that is not that form (nothing
+/// this store writes) is read as the start of the day.
+fn next_auto_snapshot_due_ms(after_ms: i64, hour: &str) -> i64 {
+    let into_day_ms = minutes_of_day(hour).unwrap_or(0).saturating_mul(60_000);
+    let day_start_ms = after_ms.div_euclid(MILLIS_PER_DAY).saturating_mul(MILLIS_PER_DAY);
+    let at_ms = day_start_ms.saturating_add(into_day_ms);
+    if at_ms > after_ms {
+        at_ms
+    } else {
+        at_ms.saturating_add(MILLIS_PER_DAY)
+    }
+}
+
+/// How many minutes into the day the `HH:MM` time of day `value` names, and
+/// `None` when it is not that form — which the modelled `TimeOfDay` pattern
+/// `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$` every stored hour satisfies.
+fn minutes_of_day(value: &str) -> Option<i64> {
+    let (hours, minutes) = value.split_once(':')?;
+    Some(hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?)
+}
 
 /// The add-ons `requests` enable on a DISK, or a refusal naming the member that
 /// is wrong.
@@ -12678,6 +13072,25 @@ pub fn now_ms() -> i64 {
 /// Epoch milliseconds as the modelled `IsoDate` timestamp.
 pub fn timestamp(epoch_millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(epoch_millis)
+}
+
+/// The UTC calendar date of `epoch_millis`, in the `YYYY-MM-DD` form an
+/// automatic snapshot is dated by: `AutoSnapshotDetails$date` is "the date of
+/// the automatic snapshot in `YYYY-MM-DD` format".
+///
+/// The calendar conversion is the LIBRARY's: `DateTime::fmt(Format::DateTime)`
+/// renders the instant as RFC 3339 in UTC (`2026-10-24T01:05:05Z`), whose first
+/// field is that date, so no leap-year arithmetic is re-derived here.
+pub fn utc_date(epoch_millis: i64) -> String {
+    timestamp(epoch_millis)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .and_then(|rendered| {
+            rendered
+                .split_once('T')
+                .map(|(date, _)| date.to_string())
+        })
+        .unwrap_or_default()
 }
 
 /// Order two modelled timestamps. A `DateTime` carries seconds plus a

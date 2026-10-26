@@ -175,7 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = store.cluster_position(&input.cluster_identifier) else {
             return Err(RebootClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                    // The sentence is this operation's OWN, as the recorded
+                    // refusal shows: the fixed text is "Cluster not found:" and
+                    // the identifier is interpolated verbatim from the request.
+                    // A read of the same missing identifier is worded
+                    // differently, so the template cannot be shared.
+                    message: Some(format!("Cluster not found: {}", input.cluster_identifier)),
                 },
             )
             .into());

@@ -145,10 +145,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable in the assembled emulator — see the note in `create_vpc_link`.
             return Err(crate::scaffolded::Scaffolded::not_implemented("GetVpcLink"));
         };
-        // A reporting operation: it reads the store and writes nothing, so a later
-        // caller sees exactly what this one saw. The status it reports is the one the
-        // CLOCK owes the record (see `state::VpcLink::status`), not one this read moves.
-        let store = state.lock();
+        // A reporting operation: the only write it makes is to materialise a change the
+        // CLOCK already made due — a link whose deprovisioning has finished is no longer
+        // held by the account, and was owed its removal at that instant whether or not
+        // anybody called. The status it reports is likewise the one the clock owes the
+        // record (see `state::VpcLink::status`), not one this read moves.
+        let mut store = state.lock();
+        store.purge_deprovisioned_vpc_links();
         let Some(record) = store.vpc_links.get(&input.vpc_link_id) else {
             return Err(GetVpcLinkErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_identifier_message(

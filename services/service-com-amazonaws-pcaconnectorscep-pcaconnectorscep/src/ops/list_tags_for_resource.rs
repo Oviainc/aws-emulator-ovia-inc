@@ -152,8 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a resource exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -163,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both of this service's resources carry their tags on their own record, so one
         // lookup keyed by the ARN's shape answers for a connector and for a challenge alike.
         let tags = store
-            .tags_of(&input.resource_arn)
+            .tags_of(&region, &input.resource_arn)
             .ok_or_else(|| not_found(&input.resource_arn))?;
         Ok(ListTagsForResourceOutput {
             // `Tags` is the map as stored: empty for a resource created without tags, which

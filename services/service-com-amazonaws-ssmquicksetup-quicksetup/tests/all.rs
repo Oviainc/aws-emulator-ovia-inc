@@ -33,3 +33,5 @@ mod resource_tags;
 mod service_settings_and_types;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_summaries.rs"]
+mod status_summaries;

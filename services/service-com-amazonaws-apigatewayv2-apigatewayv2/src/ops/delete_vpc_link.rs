@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +125,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_vpc_link`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteVpcLink",
+            ));
+        };
+        let mut store = state.lock();
+
+        // A link whose deprovisioning the clock already finished is no longer held by
+        // the account, so it is dropped before the lookup and this request resolves the
+        // id against exactly what a reader at the same instant resolves it against.
+        store.purge_deprovisioned_vpc_links();
+
+        // The link is addressed by the `VpcLinkId` in the URI
+        // (`DELETE /v2/vpclinks/{VpcLinkId}`), so a request naming one no stored link
+        // carries has nothing to delete.
+        let Some(record) = store.vpc_links.get_mut(&input.vpc_link_id) else {
+            return Err(DeleteVpcLinkErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::VPC_LINK_RESOURCE,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The call is ACCEPTED (HTTP 202), not completed: the link's network interfaces
+        // are still being detached, so the record stays readable and reports `DELETING`
+        // until the removal the clock owes falls due, one `VPC_LINK_DELETE_SPAN` from
+        // now. Stored as a due instant and never slept for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcLink"))
+        // Deleting a link already being deleted does not restart that span — the first
+        // accepted delete is what the teardown runs from — so an already-marked record
+        // keeps its own due instant and this call is accepted again.
+        if record.deprovisioned_at.is_none() {
+            record.deprovisioned_at =
+                Some(::std::time::Instant::now() + crate::state::VPC_LINK_DELETE_SPAN);
+        }
+
+        Ok(DeleteVpcLinkOutput {})
     }
 }

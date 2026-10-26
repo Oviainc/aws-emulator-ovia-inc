@@ -113,6 +113,75 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// The error CodeCommit names for a rejected member of a `RepositoryTriggersList`,
+/// or `None` to leave the framework's wording in place.
+///
+/// A trigger's members sit inside a list of structures, so each is a LEAF of a path
+/// like `triggers.1.member.events.1.member` rather than a top-level member, and the
+/// trigger operations name an error per member of the trigger exactly as the rest of
+/// the service names one per top-level member. The wording comes from
+/// [`crate::state::TriggerProblem`], the one place this crate words a trigger
+/// refusal, so a configuration the BOUNDARY rejects is refused in the same terms as
+/// one a handler rejects.
+fn trigger_refusal_for(violation: &Violation) -> Option<Refused> {
+    use crate::state::TriggerProblem;
+
+    let missing = matches!(violation.kind, ViolationKind::MissingRequiredMember);
+    let names = |member: &str| violation.path.split('.').any(|segment| segment == member);
+    let (code, message) = match &violation.kind {
+        // The list itself, rather than anything inside one of its entries.
+        _ if missing && violation.path == "triggers" => (
+            "RepositoryTriggersListRequiredException",
+            crate::state::REPOSITORY_TRIGGERS_LIST_REQUIRED_MESSAGE.to_string(),
+        ),
+        _ if missing && names("name") => (
+            "RepositoryTriggerNameRequiredException",
+            TriggerProblem::NameMissing.message(),
+        ),
+        _ if missing && names("destinationArn") => (
+            "RepositoryTriggerDestinationArnRequiredException",
+            TriggerProblem::DestinationArnMissing.message(),
+        ),
+        _ if missing && names("events") => (
+            "RepositoryTriggerEventsListRequiredException",
+            TriggerProblem::EventsMissing.message(),
+        ),
+        // `events` is the one enumerated member a trigger carries, so a value
+        // outside an enum inside a trigger is an event that is not one.
+        ViolationKind::EnumValue(_) => (
+            "InvalidRepositoryTriggerEventsException",
+            TriggerProblem::EventsInvalid.message(),
+        ),
+        _ if names("events") => (
+            "InvalidRepositoryTriggerEventsException",
+            TriggerProblem::EventsInvalid.message(),
+        ),
+        _ if names("branches") => (
+            "InvalidRepositoryTriggerBranchNameException",
+            TriggerProblem::BranchNameInvalid.message(),
+        ),
+        _ if names("customData") => (
+            "InvalidRepositoryTriggerCustomDataException",
+            TriggerProblem::CustomDataInvalid.message(),
+        ),
+        _ if names("name") => (
+            "InvalidRepositoryTriggerNameException",
+            TriggerProblem::NameInvalid.message(),
+        ),
+        _ if names("destinationArn") => (
+            "InvalidRepositoryTriggerDestinationArnException",
+            TriggerProblem::DestinationArnInvalid.message(),
+        ),
+        // Anything else about the list keeps the framework's own wording: the model
+        // declares no error for the trigger list being malformed as a whole.
+        _ => return None,
+    };
+    Some(Refused {
+        code: code.to_string(),
+        message,
+    })
+}
+
 /// The error CodeCommit names for one rejected member, or `None` to leave the
 /// framework's wording in place.
 ///
@@ -133,6 +202,11 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
     let member = violation.path.split('.').next().unwrap_or_default();
     let leaf = violation.path.rsplit('.').next().unwrap_or_default();
     let missing = matches!(violation.kind, ViolationKind::MissingRequiredMember);
+    // A `triggers` list is the one member whose ENTRIES carry members of their own
+    // that the service names an error for, so it is answered by its own table.
+    if member == "triggers" {
+        return trigger_refusal_for(violation);
+    }
     let (code, requirement) = match (member, &violation.kind) {
         // A `repositoryName` names a repository wherever it sits: as the top-level
         // member of most operations, and as a member of the nested `Target` shape a

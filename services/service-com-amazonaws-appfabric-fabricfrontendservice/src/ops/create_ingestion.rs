@@ -290,7 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .app_bundles
                     .get(&bundle_key)
                     .and_then(|bundle| bundle.resolve_ingestion(&spent.arn))
-                    .map(crate::state::IngestionRecord::to_ingestion);
+                    // A replay reports the ingestion as of NOW, exactly as a read
+                    // of it would: a state the clock has moved since the first
+                    // call is part of the record, not of the token.
+                    .map(|ingestion| ingestion.to_ingestion(::std::time::SystemTime::now()));
                 if let Some(ingestion) = replayed {
                     return Ok(CreateIngestionOutput { ingestion });
                 }
@@ -348,6 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             sequence,
             destinations: ::std::collections::HashMap::new(),
+            // A new ingestion is disabled and has lost no destination, so the
+            // clock owes it no state transition.
+            disables_at: None,
         };
         bundle.ingestions.insert(id.clone(), record);
         // Read the response back out of the store, so what the caller sees is
@@ -355,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = bundle
             .ingestions
             .get(&id)
-            .map(crate::state::IngestionRecord::to_ingestion);
+            .map(|ingestion| ingestion.to_ingestion(created_at));
 
         if let Some(token) = input.client_token.as_deref() {
             store.remember_client_token(

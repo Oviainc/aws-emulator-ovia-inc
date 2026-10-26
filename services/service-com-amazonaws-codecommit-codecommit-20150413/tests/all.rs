@@ -119,6 +119,8 @@ mod repository_encryption_key;
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]
 mod repository_rename;
+#[path = "all/repository_triggers.rs"]
+mod repository_triggers;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
