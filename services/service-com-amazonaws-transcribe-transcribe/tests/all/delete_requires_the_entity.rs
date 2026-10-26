@@ -202,7 +202,11 @@ fn name_forms() -> Vec<(&'static str, String)> {
 /// same rule (`crate::vocabulary_delete_and_tag_sets`), reused rather than spelled a
 /// second time so the two cannot drift; what is local is the EXACT status that helper
 /// leaves open and the no-echo check, which needs the name this row asked about.
-fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str, name: &str) {
+///
+/// `pub(crate)`: a per-family delete suite
+/// (`crate::language_model_delete_requires_the_model`) asserts the same composition for
+/// its own rows, so it calls this rather than keeping a second copy of it.
+pub(crate) fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str, name: &str) {
     crate::vocabulary_delete_and_tag_sets::absent_resource_refusal(reply, case, kind);
     reply.ok_status(case, CLIENT_ERROR_STATUS);
     // The name is the caller's: the text is the service's own wording, not a rendering

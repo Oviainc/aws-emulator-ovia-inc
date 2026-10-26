@@ -153,7 +153,16 @@ async fn fill_to_the_ceiling(transcribe: &Transcribe, region: Option<&str>) -> V
 }
 
 /// The names `ListLanguageModels` reports in `region`, in one page.
-async fn stored_names(transcribe: &Transcribe, region: Option<&str>, case: &str) -> Vec<String> {
+///
+/// `pub(crate)`: the delete suite of this same family
+/// (`crate::language_model_delete_requires_the_model`) asserts WHICH models a Region
+/// holds through the same listing, so it reads it with this rather than keeping a
+/// second copy that could drift from it.
+pub(crate) async fn stored_names(
+    transcribe: &Transcribe,
+    region: Option<&str>,
+    case: &str,
+) -> Vec<String> {
     let listed = transcribe
         .call_in_region(
             "ListLanguageModels",
