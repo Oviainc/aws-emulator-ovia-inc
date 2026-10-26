@@ -8,9 +8,13 @@
 //! The members it answers with are read back out of that record, so
 //! `GetSearchResultExportJob` reports the same values.
 //!
-//! `ClientToken` is idempotent: the same token with the same body answers with the
-//! export job the first call minted, and the same token with a different body is a
-//! `ConflictException` (409).
+//! `ClientToken` is idempotent while the token's validity window is open: the same token
+//! with the same body answers with the export job the first call minted, and the same
+//! token with a different body is a `ConflictException` (409). The window is the one the
+//! model publishes on the member ([`crate::state::CLIENT_TOKEN_VALIDITY`]), measured from
+//! the request that first used the token, so a call carrying a token whose window has
+//! closed is a NEW request: it mints another export job, and a differing body under that
+//! token is no longer a conflict.
 //!
 //! ## What this call refuses, and in which class
 //!
