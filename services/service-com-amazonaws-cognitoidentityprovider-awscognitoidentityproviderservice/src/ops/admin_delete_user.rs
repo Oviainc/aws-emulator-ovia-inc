@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminDeleteUser
-//! Deletes a stored user, with the sessions and tokens issued for it, so a later
-//! `AdminGetUser` for that user answers `UserNotFoundException`.
+//! Deletes a stored user, with the challenge sessions and passkey registrations
+//! that could still sign it in, so a later `AdminGetUser` for that user answers
+//! `UserNotFoundException` — as does a self-service call made with an access
+//! token that was issued to it.
 //!
 //!
 //! ## Shape of an operation
@@ -191,9 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(user_not_found)?
                 .username
         };
-        // A deleted user authenticates nothing, so its sessions and tokens go
-        // with it.
-        guard.forget_user_credentials(&input.user_pool_id, &removed_username);
+        // A deleted user cannot sign in again, so the challenge sessions and
+        // passkey registrations that could have signed it in go with it. The
+        // tokens already issued to it stay stored and keep naming it, so a call
+        // made with one is refused for the user that is gone.
+        guard.forget_user_sign_in_state(&input.user_pool_id, &removed_username);
         Ok(AdminDeleteUserOutput)
     }
 }

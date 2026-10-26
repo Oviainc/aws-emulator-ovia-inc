@@ -499,18 +499,26 @@ async fn issuing_tokens_sweeps_the_records_the_clock_expired() {
     // Two planted records, one already expired and one still live, so the sweep
     // is shown to drop exactly the expired one.
     let now = SystemTime::now();
-    let planted = |expires_at: SystemTime| state::TokenRecord {
-        user_pool_id: user_pool_id.clone(),
-        client_id: client_id.clone(),
-        username: "alice".to_string(),
-        kind: state::TokenKind::Access,
-        issued_at: now - Duration::from_secs(7200),
-        expires_at,
-        revoked: false,
-    };
     {
         let state = state::service_state(&*engine).expect("this service's state");
         let mut guard = state.lock();
+        // Both records name the STORED user, by name and by the id it holds.
+        let alice_sub = guard
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user("alice"))
+            .expect("the stored user")
+            .sub
+            .clone();
+        let planted = |expires_at: SystemTime| state::TokenRecord {
+            user_pool_id: user_pool_id.clone(),
+            client_id: client_id.clone(),
+            username: "alice".to_string(),
+            sub: alice_sub.clone(),
+            kind: state::TokenKind::Access,
+            issued_at: now - Duration::from_secs(7200),
+            expires_at,
+            revoked: false,
+        };
         guard.issued_tokens.insert(
             "planted-expired".to_string(),
             planted(now - Duration::from_secs(60)),

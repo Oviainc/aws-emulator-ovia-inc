@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the stored user the presented `AccessToken` was issued to, with the
+//! challenge sessions and passkey registrations that could still sign it in, so
+//! a later read of that user — through this very token or through an
+//! administrative call — answers the error for a user that is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +182,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        // Request metadata only: the user whose profile goes is named by the access
+        // token in the body, not by the request's signature.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token
+        // is refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Resolve the STORED pool and user the token names FIRST: a refused token
+        // deletes nothing.
+        let (user_pool_id, username) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            (pool.id.clone(), user.username.clone())
+        };
+
+        {
+            let pool = guard.pool_mut(&user_pool_id).ok_or_else(internal_error)?;
+            let key = pool
+                .user_storage_key(&username)
+                .ok_or_else(internal_error)?;
+            // The whole profile goes, so the attributes, group memberships,
+            // remembered devices and passkeys held on it go with it.
+            pool.users.remove(&key).ok_or_else(internal_error)?;
+        }
+        // A deleted user profile "can no longer be used to sign in" (this service's
+        // model), so the challenge sessions and passkey registrations that could
+        // have signed it in go with it. The tokens already issued to it stay
+        // stored and keep naming it, so the next call made with this very token is
+        // refused for the user that is gone.
+        guard.forget_user_sign_in_state(&user_pool_id, &username);
+
+        Ok(DeleteUserOutput)
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model), while a token whose
+/// pool or user has since been deleted answers the error for the resource that is
+/// gone. No message names a stored value, so the refusal reports why the token was
+/// not accepted and nothing else.
+fn token_rejected(rejection: crate::state::TokenRejection) -> DeleteUserError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            DeleteUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message names
+                // none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => {
+            DeleteUserErrorModeled::UserNotFoundException(UserNotFoundException {
+                message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> DeleteUserError {
+    DeleteUserErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteUserError {
+    DeleteUserErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

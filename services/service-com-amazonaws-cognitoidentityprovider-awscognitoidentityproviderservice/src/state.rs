@@ -673,6 +673,13 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let user = pool
             .user(&record.username)
             .ok_or(TokenRejection::UserGone)?;
+        // The record points at the user by name, and a name can be taken again:
+        // the stored user it finds is the one this token was issued to only when
+        // it still carries the same id, so a token outliving its user resolves to
+        // no user rather than to a later namesake.
+        if user.sub != record.sub {
+            return Err(TokenRejection::UserGone);
+        }
         Ok((pool, user))
     }
 
@@ -882,6 +889,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     user_pool_id: user_pool_id.to_string(),
                     client_id: client_id.to_string(),
                     username: stored_username.clone(),
+                    sub: sub.clone(),
                     kind,
                     issued_at: now,
                     expires_at,
@@ -950,14 +958,24 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         })
     }
 
-    /// Forget every session, token and passkey registration issued for
-    /// `username` in `user_pool_id`. Called when the user it authenticates is
-    /// deleted.
-    pub fn forget_user_credentials(&mut self, user_pool_id: &str, username: &str) {
+    /// Forget the outstanding sign-in state of `username` in `user_pool_id`:
+    /// the challenge sessions and the passkey registrations that could still
+    /// carry a sign-in to completion. Called when the user they belong to is
+    /// deleted, which is why a deleted user profile "can no longer be used to
+    /// sign in" (`DeleteUser` in this service's model).
+    ///
+    /// The tokens already ISSUED to that user stay stored and keep naming it:
+    /// they are self-contained bearer tokens their holder still has, so one
+    /// presented after the profile is gone resolves the user it names and finds
+    /// nothing. That is what makes a call made with such a token a refusal for
+    /// the user that is gone ([`TokenRejection::UserGone`]) rather than a
+    /// rejection of the token itself — and the user it names being gone, the
+    /// token authorizes nothing. What bounds the record map is the same thing
+    /// that bounds it for a live user: [`Self::mint_tokens`] sweeps every record
+    /// the clock has expired and evicts the oldest at [`MAX_ISSUED_TOKENS`].
+    pub fn forget_user_sign_in_state(&mut self, user_pool_id: &str, username: &str) {
         self.auth_sessions
             .retain(|_, s| !(s.user_pool_id == user_pool_id && s.username == username));
-        self.issued_tokens
-            .retain(|_, t| !(t.user_pool_id == user_pool_id && t.username == username));
         self.web_authn_registrations
             .retain(|_, r| !(r.user_pool_id == user_pool_id && r.username == username));
     }
@@ -3212,6 +3230,11 @@ pub struct TokenRecord {
     pub user_pool_id: String,
     pub client_id: String,
     pub username: String,
+    /// The `sub` claim this token carries: the immutable id of the user it was
+    /// issued to. A user created later under the same username is a different
+    /// user with a different id, so recording the id beside the name is what
+    /// keeps a token of a deleted user from resolving to its namesake.
+    pub sub: String,
     pub kind: TokenKind,
     pub issued_at: SystemTime,
     pub expires_at: SystemTime,

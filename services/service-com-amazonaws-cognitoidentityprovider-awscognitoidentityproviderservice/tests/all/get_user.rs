@@ -697,26 +697,49 @@ async fn get_user_refuses_a_token_that_names_no_signed_in_user() {
         let service_state = state::service_state(&*engine).expect("this service's state");
         let mut guard = service_state.lock();
         let now = SystemTime::now();
-        let record = |pool: &str, username: &str, expires_at: SystemTime, revoked: bool| {
-            state::TokenRecord {
-                user_pool_id: pool.to_string(),
-                client_id: client_id.clone(),
-                username: username.to_string(),
-                kind: state::TokenKind::Access,
-                issued_at: now - Duration::from_secs(60),
-                expires_at,
-                revoked,
-            }
-        };
+        // The id of the stored user a planted record names, so a record naming a
+        // user this pool HOLDS names that user's id too; one naming a user the
+        // pool does not hold names an id it does not hold either.
+        let ada_sub = guard
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user("ada"))
+            .expect("the stored user")
+            .sub
+            .clone();
+        let record =
+            |pool: &str, username: &str, sub: &str, expires_at: SystemTime, revoked: bool| {
+                state::TokenRecord {
+                    user_pool_id: pool.to_string(),
+                    client_id: client_id.clone(),
+                    username: username.to_string(),
+                    sub: sub.to_string(),
+                    kind: state::TokenKind::Access,
+                    issued_at: now - Duration::from_secs(60),
+                    expires_at,
+                    revoked,
+                }
+            };
         let live = now + Duration::from_secs(3_600);
         for (token, planted) in [
-            (REVOKED, record(&user_pool_id, "ada", live, true)),
+            (REVOKED, record(&user_pool_id, "ada", &ada_sub, live, true)),
             (
                 EXPIRED,
-                record(&user_pool_id, "ada", now - Duration::from_secs(1), false),
+                record(
+                    &user_pool_id,
+                    "ada",
+                    &ada_sub,
+                    now - Duration::from_secs(1),
+                    false,
+                ),
             ),
-            (POOL_GONE, record("us-east-1_absent", "ada", live, false)),
-            (USER_GONE, record(&user_pool_id, "nobody", live, false)),
+            (
+                POOL_GONE,
+                record("us-east-1_absent", "ada", &ada_sub, live, false),
+            ),
+            (
+                USER_GONE,
+                record(&user_pool_id, "nobody", "nobody-has-this-id", live, false),
+            ),
         ] {
             guard.issued_tokens.insert(token.to_string(), planted);
         }

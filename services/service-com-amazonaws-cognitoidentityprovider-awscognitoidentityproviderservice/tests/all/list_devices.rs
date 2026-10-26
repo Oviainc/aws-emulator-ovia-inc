@@ -725,11 +725,21 @@ async fn an_access_token_that_names_no_signed_in_user_is_refused() {
             .expect("the recorded access token")
             .revoked = true;
         let now = SystemTime::now();
-        let record = |user_pool_id: &str, username: &str, expires_at: SystemTime| {
+        // The id of the stored user a planted record names, so a record naming a
+        // user this pool HOLDS names that user's id too; one naming a user the
+        // pool does not hold names an id it does not hold either.
+        let dave_sub = guard
+            .pool(&fixture.user_pool_id)
+            .and_then(|pool| pool.user("dave"))
+            .expect("the stored user")
+            .sub
+            .clone();
+        let record = |user_pool_id: &str, username: &str, sub: &str, expires_at: SystemTime| {
             state::TokenRecord {
                 user_pool_id: user_pool_id.to_string(),
                 client_id: fixture.client_id.clone(),
                 username: username.to_string(),
+                sub: sub.to_string(),
                 kind: state::TokenKind::Access,
                 issued_at: now - Duration::from_secs(60),
                 expires_at,
@@ -740,12 +750,25 @@ async fn an_access_token_that_names_no_signed_in_user_is_refused() {
         for (token, planted) in [
             (
                 EXPIRED,
-                record(&fixture.user_pool_id, "dave", now - Duration::from_secs(1)),
+                record(
+                    &fixture.user_pool_id,
+                    "dave",
+                    &dave_sub,
+                    now - Duration::from_secs(1),
+                ),
             ),
-            (POOL_GONE, record("us-east-1_absent", "dave", live)),
+            (
+                POOL_GONE,
+                record("us-east-1_absent", "dave", &dave_sub, live),
+            ),
             (
                 USER_GONE,
-                record(&fixture.user_pool_id, "absent-user", live),
+                record(
+                    &fixture.user_pool_id,
+                    "absent-user",
+                    "absent-user-has-this-id",
+                    live,
+                ),
             ),
         ] {
             guard.issued_tokens.insert(token.to_string(), planted);

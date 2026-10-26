@@ -686,7 +686,7 @@ fn refresh_sign_in(
         }
         let user_pool_id = pool.id.clone();
 
-        let username = state
+        let (username, sub) = state
             .token(refresh_token)
             .filter(|record| {
                 record.kind == crate::state::TokenKind::Refresh
@@ -695,15 +695,17 @@ fn refresh_sign_in(
                     && record.client_id == client_id
                     && record.user_pool_id == user_pool_id
             })
-            .ok_or_else(invalid_refresh_token)?
-            .username
-            .clone();
+            .map(|record| (record.username.clone(), record.sub.clone()))
+            .ok_or_else(invalid_refresh_token)?;
 
         // The record is only a pointer into the pool: the user it names may have been
-        // disabled, reset or deleted since the token was issued.
+        // disabled, reset or deleted since the token was issued — and a user created
+        // later under that name carries a different id, so it is not the user this
+        // token was issued to.
         let user = state
             .pool(&user_pool_id)
             .and_then(|pool| pool.user(&username))
+            .filter(|user| user.sub == sub)
             .ok_or_else(invalid_refresh_token)?;
         refuse_unusable_user(user)?;
         (user_pool_id, user.username.clone())

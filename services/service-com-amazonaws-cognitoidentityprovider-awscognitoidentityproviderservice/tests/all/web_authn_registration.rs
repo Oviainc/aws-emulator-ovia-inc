@@ -939,23 +939,46 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
             .expect("the recorded access token")
             .revoked = true;
         let now = SystemTime::now();
-        let record = |pool: &str, username: &str, expires_at: SystemTime| state::TokenRecord {
-            user_pool_id: pool.to_string(),
-            client_id: client_id.clone(),
-            username: username.to_string(),
-            kind: state::TokenKind::Access,
-            issued_at: now - Duration::from_secs(60),
-            expires_at,
-            revoked: false,
+        // The id of the stored user a planted record names, so a record naming a
+        // user this pool HOLDS names that user's id too; one naming a user the
+        // pool does not hold names an id it does not hold either.
+        let ada_sub = guard
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user("ada"))
+            .expect("the stored user")
+            .sub
+            .clone();
+        let record = |pool: &str, username: &str, sub: &str, expires_at: SystemTime| {
+            state::TokenRecord {
+                user_pool_id: pool.to_string(),
+                client_id: client_id.clone(),
+                username: username.to_string(),
+                sub: sub.to_string(),
+                kind: state::TokenKind::Access,
+                issued_at: now - Duration::from_secs(60),
+                expires_at,
+                revoked: false,
+            }
         };
         let live = now + Duration::from_secs(3_600);
         for (token, planted) in [
             (
                 EXPIRED,
-                record(&user_pool_id, "ada", now - Duration::from_secs(1)),
+                record(
+                    &user_pool_id,
+                    "ada",
+                    &ada_sub,
+                    now - Duration::from_secs(1),
+                ),
             ),
-            (POOL_GONE, record("us-east-1_absent", "ada", live)),
-            (USER_GONE, record(&user_pool_id, "nobody", live)),
+            (
+                POOL_GONE,
+                record("us-east-1_absent", "ada", &ada_sub, live),
+            ),
+            (
+                USER_GONE,
+                record(&user_pool_id, "nobody", "nobody-has-this-id", live),
+            ),
         ] {
             guard.issued_tokens.insert(token.to_string(), planted);
         }
