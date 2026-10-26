@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackageVersionHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPackageVersionHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPackageVersionHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions of ONE package's content: the sequence this service persisted
+//! on [`crate::state::Package::versions`], oldest first, paged by `MaxResults` and
+//! `NextToken`. The history belongs to the package the `PackageID` names, so an id
+//! naming no package of this account is the modelled not-found refusal rather than an
+//! empty history.
+//!
+//! A REPORT: it writes nothing, because a package's version history has no status the
+//! clock can move.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +89,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_next_token, max_results_out_of_range, package_not_found};
+
+/// The largest page size this operation publishes, as the modelled member's own type:
+/// `MaxResults` is `@range(max: 100)`, so 100 results is the most any request can ask
+/// for.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// [`MAX_PAGE_SIZE`] as a count of results — the page a request that names no page size
+/// gets. Derived from the bound above rather than written twice, so the two cannot
+/// drift.
+const MAX_PAGE: usize = MAX_PAGE_SIZE as usize;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +173,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPackageVersionHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPackageVersionHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPackageVersionHistory"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(GetPackageVersionHistoryErrorModeled::ValidationException(
+                max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
+            )
+            .into());
+        }
+
+        let store = state.lock();
+
+        // "The unique identifier of the package": the history belongs to the package
+        // the request names, so an id this account holds no package under names no
+        // history — the modelled not-found refusal rather than an empty page.
+        let package = store.packages.get(&input.package_id).ok_or_else(|| {
+            GetPackageVersionHistoryErrorModeled::ResourceNotFoundException(package_not_found(
+                &input.package_id,
+            ))
+        })?;
+
+        // The versions of the content a package has had are a SEQUENCE numbered from
+        // one, and the store holds them in the order they were imported — so two reads
+        // report the same order and a token names the same place in it.
+        let history = package.versions.as_slice();
+
+        // The token names the version the next page starts AT, so a caller resumes
+        // exactly where the previous page stopped rather than at an offset a newer
+        // version would have shifted. It is only ever a value this operation handed
+        // out, so one that names no version of this package is a malformed request
+        // rather than an empty page; this operation models no
+        // `InvalidPaginationTokenException`, so the refusal is its
+        // `ValidationException`.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => history
+                .iter()
+                .position(|version| version.version.to_string() == token)
+                .ok_or_else(|| {
+                    GetPackageVersionHistoryErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return": `MaxResults` is `@default(0)`, so a request that asks for no
+        // particular page size reaches here as zero and gets the largest page the model
+        // allows rather than an empty one. Every other value reaching here is in
+        // `1..=MAX_PAGE_SIZE`, the bound check above having refused the rest, so the
+        // `Err` arm is unreachable and treated as that same unbounded case.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(history.len());
+
+        Ok(GetPackageVersionHistoryOutput {
+            // Answered from the STORED record's own id, so the history and the package
+            // it is reported for cannot disagree.
+            package_id: Some(package.package_id.clone()),
+            package_version_history_list: Some(
+                history[start..end]
+                    .iter()
+                    .map(|version| version.to_history())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the token
+            // is the next version in the history, and there is none once this page
+            // ended it.
+            next_token: history
+                .get(end)
+                .map(|version| version.version.to_string()),
+        })
     }
 }

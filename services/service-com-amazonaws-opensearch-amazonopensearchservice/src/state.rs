@@ -56,7 +56,7 @@ use crate::ops::types::{
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
     PackageAssociationConfiguration, PackageConfiguration, PackageDetails,
     PackageEncryptionOptions, PackageSource,
-    PackageVendingOptions,
+    PackageVendingOptions, PackageVersionHistory,
     RecurringCharge, ReservedInstance,
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction,
@@ -4444,6 +4444,51 @@ pub const PACKAGE_QUOTA: usize = 25;
 /// user's access.
 pub const PACKAGE_SCOPE_QUOTA: usize = 100;
 
+/// One version of a package's content, as this emulator persists it.
+///
+/// A package's content is imported, and each import is a new numbered version of it,
+/// so the versions a package has had are a SEQUENCE and this is one entry of it. It
+/// is the ONE record a version is reported through
+/// ([`PackageVersionRecord::to_history`]), the way [`InsightRecord`] is for an
+/// insight — so the version a read of the package reports and the entry its history
+/// lists for that same version cannot disagree.
+#[derive(Debug, Clone)]
+pub struct PackageVersionRecord {
+    /// `PackageVersionHistory$PackageVersion`: which numbered version of the
+    /// package's content this entry is, counting from [`FIRST_PACKAGE_VERSION`].
+    pub version: u32,
+    /// `PackageVersionHistory$CommitMessage`: "a message associated with the package
+    /// version when it was uploaded". Absent where the import that added this version
+    /// carried none — which includes the first version of every package, because the
+    /// create that imports it declares no `CommitMessage` to give.
+    pub commit_message: Option<String>,
+    /// `PackageVersionHistory$CreatedAt`: "the date and time when the package was
+    /// created", for this version of its content.
+    pub created_at: SystemTime,
+    /// `PackageVersionHistory$PackageConfiguration`: the configuration stored with
+    /// this version of the content, absent where the import carried none.
+    pub configuration: Option<PackageConfiguration>,
+}
+
+impl PackageVersionRecord {
+    /// This version as `PackageVersionHistory` — one entry of what
+    /// `GetPackageVersionHistory` answers with, so every operation that reports a
+    /// package version reports it through the one projection.
+    pub fn to_history(&self) -> PackageVersionHistory {
+        PackageVersionHistory {
+            package_version: Some(self.version.to_string()),
+            commit_message: self.commit_message.clone(),
+            created_at: Some(datetime(self.created_at)),
+            // The plugin's name, class and uncompressed size are read out of the
+            // descriptor inside the plugin's own archive, which this emulator does not
+            // fetch, so they stay absent rather than being invented — exactly as
+            // `PackageDetails$AvailablePluginProperties` does in [`Package::to_details`].
+            plugin_properties: None,
+            package_configuration: self.configuration.clone(),
+        }
+    }
+}
+
 /// One custom package of this account, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Package {
@@ -4468,6 +4513,12 @@ pub struct Package {
     /// Which numbered version of its content the package currently has, counting
     /// from [`FIRST_PACKAGE_VERSION`].
     pub version: u32,
+    /// Every version of this package's content, oldest first — the sequence
+    /// `GetPackageVersionHistory` reports. The newest entry is the version
+    /// [`Self::version`] names, because the two are written by the same import: a
+    /// package is minted with its first version recorded here and each later import
+    /// of content appends the next.
+    pub versions: Vec<PackageVersionRecord>,
     /// `PackageDetails$EngineVersion`, absent for a package that is not tied to one.
     pub engine_version: Option<String>,
     /// `PackageDetails$AvailablePackageConfiguration`, absent when the create carried

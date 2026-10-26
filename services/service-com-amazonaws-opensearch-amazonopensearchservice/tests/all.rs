@@ -63,6 +63,8 @@ mod package_listing_page_bounds;
 mod package_registry;
 #[path = "all/package_scope.rs"]
 mod package_scope;
+#[path = "all/package_version_history.rs"]
+mod package_version_history;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]

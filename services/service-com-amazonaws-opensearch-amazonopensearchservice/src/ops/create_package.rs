@@ -92,8 +92,9 @@
 use super::types::*;
 
 use crate::state::{
-    new_package_id, package_name_exists, OwedStatus, Package, FIRST_PACKAGE_VERSION, PACKAGE_QUOTA,
-    PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_ZIP_PLUGIN, PROVISIONING,
+    new_package_id, package_name_exists, OwedStatus, Package, PackageVersionRecord,
+    FIRST_PACKAGE_VERSION, PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
+    PACKAGE_TYPE_ZIP_PLUGIN, PROVISIONING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -224,6 +225,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The create IMPORTS the package's content, which is what makes its first
+        // numbered version — the entry `GetPackageVersionHistory` reports and the
+        // version later reads call the package's available one, recorded together so
+        // the two cannot disagree. `CreatePackageRequest` declares no `CommitMessage`,
+        // so this first version carries none.
+        let first_version = PackageVersionRecord {
+            version: FIRST_PACKAGE_VERSION,
+            commit_message: None,
+            created_at: now,
+            configuration: input.package_configuration.clone(),
+        };
+
         let package = Package {
             package_id: new_package_id(),
             package_name: input.package_name,
@@ -240,7 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: None,
                 due: now + PROVISIONING,
             }),
-            version: FIRST_PACKAGE_VERSION,
+            version: first_version.version,
+            versions: vec![first_version],
             engine_version: input.engine_version,
             configuration: input.package_configuration,
             vending_options: input.package_vending_options,
