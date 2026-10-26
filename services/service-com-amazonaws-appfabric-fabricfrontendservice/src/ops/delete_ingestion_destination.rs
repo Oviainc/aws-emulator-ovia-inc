@@ -2,9 +2,10 @@
 
 //! @op DeleteIngestionDestination
 //! REMOVES one stored ingestion destination from the ingestion that owns it, which is
-//! the only association this call breaks: the ingestion, its other destinations and the
-//! app bundle above them are left exactly as they were (see
-//! [`crate::state::IngestionRecord::destinations`]).
+//! the only association this call breaks: the app bundle above them and the ingestion's
+//! other destinations are left exactly as they were (see
+//! [`crate::state::IngestionRecord::destinations`]), and the ingestion itself keeps every
+//! member but the state transition the paragraph below describes.
 //!
 //! The APP BUNDLE is a resource of its own and the entry point of every path under
 //! `/appbundles/{appBundleIdentifier}`: an identifier naming no stored bundle is the
@@ -23,10 +24,15 @@
 //! owned it, and AWS answers this call 204 rather than a not-found. Only the reporting
 //! path (`GetIngestionDestination`) turns an absent destination into HTTP 404.
 //!
-//! AWS documents that deleting a destination under an ENABLED ingestion eventually
-//! disables that ingestion. No ingestion in this emulator can be enabled yet
-//! (`CreateIngestion` stores `disabled` and `StartIngestion` is still a scaffold), so
-//! the clock owes no ingestion-state transition on this path and none is written.
+//! AWS documents that deleting a destination under an ENABLED ingestion makes that
+//! ingestion fail and be EVENTUALLY disabled. That transition is owed to the CLOCK, not
+//! to this call: the delete records the instant it falls due on the ingestion
+//! ([`crate::state::IngestionRecord::disables_at`],
+//! [`crate::state::INGESTION_DISABLE_AFTER_DESTINATION_LOSS`] past this call) and every
+//! later read of that ingestion reports it from then on, so a caller reading straight
+//! after this call still sees `enabled` and the state refusals that go with it. An
+//! ingestion that is not enabled when its destination goes has no delivery to fail, so
+//! nothing is owed.
 //!
 //! ## Shape of an operation
 //!
@@ -236,12 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteIngestionDestinationOutput {});
         };
 
-        // Removing the record is the whole effect: it breaks the association
-        // between the ingestion and its destination and touches no other record —
-        // its siblings, the ingestion itself and the bundle above it are left as
-        // they were. Previously ingested data and the storage destination itself
-        // live outside this service, so there is nothing else to drop.
+        // Removing the record breaks the association between the ingestion and
+        // its destination and touches no OTHER record — the destination's
+        // siblings and the bundle above it are left as they were. Previously
+        // ingested data and the storage destination itself live outside this
+        // service, so there is nothing else to drop.
+        //
+        // The ingestion that owned it is the one thing the delete does reach:
+        // having lost a destination it was delivering to, an ENABLED ingestion
+        // fails and the service owes it the documented disable, which
+        // `lost_destination` dates rather than writes (see the module header).
         ingestion.destinations.remove(&destination_key);
+        ingestion.lost_destination(::std::time::SystemTime::now());
         crate::state::audit_resource_change(
             ctx.parts(),
             Self::NAME,
