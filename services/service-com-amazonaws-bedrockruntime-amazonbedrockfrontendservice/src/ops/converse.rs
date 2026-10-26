@@ -11,6 +11,13 @@
 //! token accounting, the stop reason and the metrics are all computed from the
 //! request that was actually served.
 //!
+//! A mandatory `toolConfig.toolChoice` (`any` or `tool`) obliges the turn to
+//! request a tool instead of generating text: the assistant message is then one
+//! `toolUse` block whose `toolUseId` is minted here, and the turn stops on
+//! `tool_use`. A later turn's `toolResult` has to address an id this service
+//! issued, which is why the conversation's tool results are validated against
+//! the tool requests it carries.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -311,7 +318,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A conversation is a non-empty sequence of turns that starts with the
         // user and alternates user/assistant — the rule `ConverseStream` states
         // too, so both read it from `crate::state`.
-        crate::state::validate_conversation(input.messages.as_ref()).map_err(validation)?;
+        let messages =
+            crate::state::validate_conversation(input.messages.as_ref()).map_err(validation)?;
+        // Every tool result in that conversation has to address a tool request
+        // the conversation carries, by the id that request was issued under.
+        crate::state::validate_tool_results(messages).map_err(validation)?;
+
+        // The `toolChoice` stage: a mandatory choice obliges the turn to request
+        // a tool, under an id minted here.
+        let tool_use = state
+            .lock()
+            .forced_tool_use(input.tool_config.as_ref(), crate::state::now_millis())
+            .map_err(validation)?;
 
         let turn = crate::state::converse_turn(
             &model,
@@ -322,6 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .inference_config
                 .as_ref()
                 .and_then(|config| config.max_tokens),
+            tool_use,
         );
 
         let logged = crate::state::InvocationLogEntry {
@@ -340,7 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ConverseOutput {
             output: ConverseOutput2::Message(Message {
                 role: "assistant".to_string(),
-                content: vec![ContentBlock::Text(turn.text.clone())],
+                content: turn.content(),
             }),
             stop_reason: turn.stop_reason().to_string(),
             usage: turn.usage(),
