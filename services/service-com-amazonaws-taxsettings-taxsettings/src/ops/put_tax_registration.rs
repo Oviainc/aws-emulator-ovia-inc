@@ -23,13 +23,17 @@
 //!   from the tax number for (`crate::state::TYPES_WITH_DERIVED_LEGAL_ADDRESS`)
 //!   is refused: the address is not the caller's to supply. India's `PAN` is such
 //!   a type, so a `PAN` entry is stored with its address filled in rather than
-//!   submitted.
+//!   submitted. Refused BEFORE every rule that reads the address's own value,
+//!   including the jurisdiction rule below: a member the submitted type does not
+//!   admit is a field violation, and a value the caller may not send is not
+//!   evidence for another refusal.
 //! * a registration type the service ties to ONE country
 //!   (`crate::state::TYPE_JURISDICTIONS`) set for a registration held somewhere
 //!   else is refused with the `errorCode` the model publishes for that type
 //!   (`crate::state::TYPE_OUTSIDE_ITS_COUNTRY_CODES`): the country a
 //!   registration is held in is its `legalAddress.countryCode`, so an entry
-//!   naming another country names a customer that may not set the type.
+//!   naming another country names a customer that may not set the type. Reached
+//!   only for a type whose address the request supplies — see that constant.
 //! * a registration type the account's STORED registration blocks
 //!   (`crate::state::TYPES_BLOCKED_BY_A_STORED_TYPE`) is refused with the
 //!   `errorCode` the model publishes for that pair, and the stored record is

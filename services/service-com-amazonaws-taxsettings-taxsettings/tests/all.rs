@@ -27,6 +27,8 @@ mod country_requirements;
 mod country_rules;
 #[path = "all/declared_member_defaults.rs"]
 mod declared_member_defaults;
+#[path = "all/derived_address_precedence.rs"]
+mod derived_address_precedence;
 #[path = "all/derived_registration_members.rs"]
 mod derived_registration_members;
 #[path = "all/fidelity_rules.rs"]

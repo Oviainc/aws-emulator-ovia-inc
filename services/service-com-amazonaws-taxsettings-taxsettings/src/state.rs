@@ -324,6 +324,17 @@ pub const ERROR_CODE_GST_EXISTENCE_BLOCK_SET_PAN: &str = "GSTExistenceBlockSetPA
 /// enforces the rule for a type, and it publishes a value for this one only. A
 /// later fixer holding a recording of another type refused the same way adds its
 /// row, and nothing else changes.
+///
+/// WHAT DECIDES THE COUNTRY: the customer's own country, which this rule reads
+/// off the legal address the entry carries. A type whose address the service
+/// derives from the tax number ([`TYPES_WITH_DERIVED_LEGAL_ADDRESS`]) admits no
+/// submitted address, so an entry of such a type carries no address to read and
+/// the refusal below is not reached for it: submitting one is the field
+/// violation [`check_registration_type_members`] answers, and omitting one
+/// names only the type's own country. Every type this constant names is such a
+/// type today, so the rule waits for a jurisdiction-bound type whose address the
+/// request supplies, or for a later fixer holding the customer's own country
+/// from somewhere other than the entry.
 pub const TYPE_OUTSIDE_ITS_COUNTRY_CODES: &[(&str, &str)] =
     &[("PAN", ERROR_CODE_NON_INDIA_CUSTOMER_CAN_NOT_SET_PAN)];
 
@@ -1367,11 +1378,16 @@ pub fn check_registration_type_members(
 /// for a registration held in a different country.
 ///
 /// The country the registration is held in is the `countryCode` of the legal
-/// address the entry carries; an entry that carries none identifies no country
-/// but the one its own type belongs to ([`entry_country_code`]), so there is no
-/// other jurisdiction for the rule to refuse it for. The refusal names the
-/// `registrationType` parameter, because the type is what cannot be set here,
-/// and carries the `errorCode`
+/// address the entry carries, and only where that address is the caller's to
+/// supply: a type whose address the service derives from the tax number
+/// ([`type_with_derived_legal_address`]) admits no submitted address at all, so
+/// an entry of such a type carries no value this rule may read — a submitted one
+/// is the field violation [`check_registration_type_members`] refuses, and it is
+/// not evidence of where the customer is. An entry that carries no address
+/// identifies no country but the one its own type belongs to
+/// ([`entry_country_code`]), so there is no other jurisdiction for the rule to
+/// refuse it for either. The refusal names the `registrationType` parameter,
+/// because the type is what cannot be set here, and carries the `errorCode`
 /// [`TYPE_OUTSIDE_ITS_COUNTRY_CODES`] publishes for that type.
 pub fn check_registration_type_jurisdiction(
     entry: &TaxRegistrationEntry,
@@ -1380,6 +1396,9 @@ pub fn check_registration_type_jurisdiction(
     let Some(error_code) = type_outside_its_country_code(registration_type) else {
         return Ok(());
     };
+    if type_with_derived_legal_address(registration_type).is_some() {
+        return Ok(());
+    }
     let Some((country_code, country)) = type_jurisdiction(registration_type) else {
         return Ok(());
     };
@@ -2429,9 +2448,9 @@ pub fn check_country_requirements(
 ///
 /// The one place both writers — `PutTaxRegistration` and the per-account loop of
 /// `BatchPutTaxRegistration` — decide whether an entry is storable, so the two
-/// operations cannot disagree about one entry: the structural refusals (a
-/// registration type set for a jurisdiction it does not belong to, a legal
-/// address submitted for a type AWS derives it from, a legal name or address the
+/// operations cannot disagree about one entry: the structural refusals (a legal
+/// address submitted for a type AWS derives it from, a registration type set for
+/// a jurisdiction it does not belong to, a legal name or address the
 /// entry's own jurisdiction requires and it omits, a blank value the boundary
 /// validator's regex engine could not refuse) and then the per-country business
 /// rules [`COUNTRY_RULES`] carries. Why each is not left to the boundary
@@ -2445,15 +2464,18 @@ pub fn check_country_requirements(
 pub fn check_tax_registration_entry(
     entry: &TaxRegistrationEntry,
 ) -> Result<(), ValidationException> {
-    // A registration type the service ties to one country may be set only for a
-    // registration held in that country. Decided before the members the type
-    // admits, because what is wrong is the type itself rather than a member of
-    // the entry carrying it.
-    check_registration_type_jurisdiction(entry)?;
-
     // A registration type whose legal address AWS derives from the tax number
-    // itself does not take one from the request.
+    // itself does not take one from the request. Decided FIRST: a member the
+    // submitted type does not admit is refused as a field violation before any
+    // rule that would be read off that member's value, so a value the caller was
+    // not allowed to send is never evidence for another refusal.
     check_registration_type_members(entry)?;
+
+    // A registration type the service ties to one country may be set only for a
+    // registration held in that country — the country being the one the entry's
+    // own legal address names, which is reached only for a type that accepts a
+    // submitted address.
+    check_registration_type_jurisdiction(entry)?;
 
     // Which of the two optional members the entry MUST carry is the jurisdiction's
     // rule, so the jurisdiction is resolved first.

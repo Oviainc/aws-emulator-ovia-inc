@@ -6,9 +6,12 @@
 //! RULE 1: a `TaxRegistrationType` the service ties to ONE country and publishes
 //! its own `ValidationExceptionErrorCode` value for may be set only for a
 //! registration held in that country — the country being the
-//! `legalAddress.countryCode` the entry carries — and a request that sets it for
-//! a registration held anywhere else is refused 400 `ValidationException` with
-//! that published `errorCode`, naming the `registrationType` parameter.
+//! `legalAddress.countryCode` the entry carries, and only where that address is
+//! the caller's to supply. A type whose address the service derives from the tax
+//! number admits no submitted address at all, so such an entry is refused for
+//! the member it may not carry and its `countryCode` is never read as evidence of
+//! where the customer is; the precedence itself is
+//! `tests/all/derived_address_precedence.rs`.
 //!
 //! RULE 2: a `TaxRegistrationType` the service publishes a published-pair code
 //! for may not be set while the account's STORED registration is of the type
@@ -17,9 +20,9 @@
 //! record lets the write through.
 //!
 //! Both rules are asserted over tables spanning what they generalise over: the
-//! jurisdiction the entry identifies (seven countries, including countries whose
-//! own per-country rules would otherwise refuse the entry, and the one country
-//! the type belongs to in three spellings), the registration type already stored
+//! jurisdiction the entry's address names (seven countries, including countries
+//! whose own per-country rules would otherwise refuse the entry, and the one
+//! country the type belongs to in three spellings), the registration type already stored
 //! (six of the model's `TaxRegistrationType` values, held in two countries), and
 //! both writers — a 400 response for the single-account write, a row of the
 //! batch response's `errors` list for the batch.
@@ -103,11 +106,9 @@ fn entry_of(registration_type: &str, country_code: Option<&str>) -> Value {
 /// What a request that set a registration type must be answered with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Expected {
-    /// The type belongs to another country than the registration is held in.
-    TypeOutsideItsCountry,
-    /// The type is the country's, and the address is not the caller's to supply
-    /// (the refusal `tests/all/fidelity_rules.rs` pins) — so this row asserts
-    /// that the jurisdiction rule did NOT claim it.
+    /// The address is not the caller's to supply for this type (the refusal
+    /// `tests/all/fidelity_rules.rs` pins) — so this row asserts that the
+    /// jurisdiction rule did NOT claim it, whatever country the address names.
     AddressNotSubmittable,
     /// The entry is stored, held in this `Address$countryCode`.
     Stored(&'static str),
@@ -163,9 +164,12 @@ fn assert_refused(case: &str, answer: &Answer, error_code: &str, parameter: &str
 }
 
 /// RULE 1: a registration type the service ties to one country, and publishes an
-/// `errorCode` for, may be set only for a registration held in that country.
+/// `errorCode` for, is judged on the country of an address the caller was
+/// allowed to supply — so a type whose address the service derives is refused
+/// for that member instead, and a type the service ties to no country of its own
+/// takes the address it was given.
 #[tokio::test]
-async fn a_type_tied_to_one_country_is_refused_for_a_customer_elsewhere() {
+async fn a_type_tied_to_one_country_is_judged_only_on_an_address_it_admits() {
     // The two codes this suite asserts are values of the enum the model
     // publishes, not names this emulator invented.
     for code in [
@@ -179,67 +183,65 @@ async fn a_type_tied_to_one_country_is_refused_for_a_customer_elsewhere() {
     }
 
     let account_id = "000000000001";
-    let outside_message =
-        format!("Only a customer in {INDIA_NAME} can set a {INDIA_TYPE} tax registration.");
     let not_submittable_message =
         format!("Legal address should not be provided for {INDIA_NAME} {INDIA_TYPE} Tax \
                  Registration.");
 
-    // Rows differ in the jurisdiction the entry identifies — countries on three
-    // continents, two of which (Malaysia, Türkiye) have per-country rules of
-    // their own that this refusal precedes, and the type's own country in three
-    // spellings, `Address$countryCode` being a code whose case carries no
+    // Rows differ in the country the submitted address names — countries on
+    // three continents, two of which (Malaysia, Türkiye) have per-country rules
+    // of their own that this refusal precedes, and the type's own country in
+    // three spellings, `Address$countryCode` being a code whose case carries no
     // meaning — and in the registration type, so that the rule is pinned to the
-    // ONE type the model publishes a code for: a type tied to a country the
-    // enum publishes no code for takes the address it was given.
+    // types whose address the service derives: a type that admits a submitted
+    // address takes the address it was given.
     let rows: &[(&str, Value, Expected)] = &[
         (
-            "PAN held in Germany",
+            "PAN submitting an address in Germany",
             entry_of(INDIA_TYPE, Some("DE")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in the United States",
+            "PAN submitting an address in the United States",
             entry_of(INDIA_TYPE, Some("US")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in Brazil",
+            "PAN submitting an address in Brazil",
             entry_of(INDIA_TYPE, Some("BR")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in Malaysia",
+            "PAN submitting an address in Malaysia",
             entry_of(INDIA_TYPE, Some("MY")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in Türkiye",
+            "PAN submitting an address in Türkiye",
             entry_of(INDIA_TYPE, Some("TR")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in the United Kingdom",
+            "PAN submitting an address in the United Kingdom",
             entry_of(INDIA_TYPE, Some("GB")),
-            Expected::TypeOutsideItsCountry,
+            Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in India",
+            "PAN submitting an address in India",
             entry_of(INDIA_TYPE, Some(INDIA)),
             Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in India, lower-cased country code",
+            "PAN submitting an address in India, lower-cased country code",
             entry_of(INDIA_TYPE, Some("in")),
             Expected::AddressNotSubmittable,
         ),
         (
-            "PAN held in India, mixed-case country code",
+            "PAN submitting an address in India, mixed-case country code",
             entry_of(INDIA_TYPE, Some("In")),
             Expected::AddressNotSubmittable,
         ),
         (
-            "PAN identifying no other jurisdiction",
+            "PAN submitting no address at all",
             entry_of(INDIA_TYPE, None),
             Expected::Stored(INDIA),
         ),
@@ -266,15 +268,6 @@ async fn a_type_tied_to_one_country_is_refused_for_a_customer_elsewhere() {
             let (router, _engine) = emulator_with_engine();
             let answer = write(&router, writer, account_id, entry).await;
             match expected {
-                Expected::TypeOutsideItsCountry => {
-                    assert_refused(
-                        &case,
-                        &answer,
-                        ERROR_CODE_NON_INDIA_CUSTOMER_CAN_NOT_SET_PAN,
-                        "REGISTRATION_TYPE",
-                        &outside_message,
-                    );
-                }
                 Expected::AddressNotSubmittable => {
                     assert_refused(
                         &case,
