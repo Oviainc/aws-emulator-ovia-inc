@@ -9,7 +9,13 @@
 //! credential scope, the emulator, the raw `Reply`, the dispatch helpers and the two
 //! calls (`CreateAppMonitor`, `GetAppMonitor`) a suite needs to set up or read back a
 //! resource — live here, so a change to the wire path is made once instead of per suite.
+//!
+//! The extended-metrics helpers at the end are here for the same reason: the
+//! `(Destination, DestinationArn)` pair, the `PutRumMetricsDestination` that has to
+//! precede any metric definition, and the paginated read that is the only way to see a
+//! stored definition are the same for every suite that touches metrics.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -241,6 +247,141 @@ pub(crate) async fn create(router: &MultiServiceRouter, case: &str, body: Value)
         "case {case:?}: expected Id to match AppMonitorId's 36-character UUID pattern, got {id:?}"
     );
     id
+}
+
+/// The ARN of an emulated Evidently experiment — the resource an `Evidently`
+/// extended-metrics destination names — built with the shared `engine::emulator_arn`
+/// helper, so it is a canonical ARN rather than a hand-spelled string.
+pub(crate) fn experiment_arn(experiment: &str) -> String {
+    engine::emulator_arn("evidently", REGION, &format!("experiment/{experiment}"))
+}
+
+/// The ARN of an emulated IAM role — the role RUM assumes to write to an experiment. IAM
+/// is global, so the region segment is empty.
+pub(crate) fn metrics_role_arn(role: &str) -> String {
+    engine::emulator_arn("iam", "", &format!("role/{role}"))
+}
+
+/// The `destination`/`destinationArn` query string every metrics operation addressed by a
+/// `(Destination, DestinationArn)` pair binds that pair to
+/// (`@httpQuery("destination")` / `@httpQuery("destinationArn")`). `Some("")` sends the
+/// member with an empty value, for a case that is about the member's own constraint.
+pub(crate) fn metrics_destination_query(destination: &str, destination_arn: Option<&str>) -> String {
+    let mut query = format!("destination={}", percent_encoded(destination));
+    if let Some(arn) = destination_arn {
+        query.push_str(&format!("&destinationArn={}", percent_encoded(arn)));
+    }
+    query
+}
+
+/// `PutRumMetricsDestination`: the call that has to have created a destination before any
+/// metric definition can be stored under it. An Evidently destination carries the
+/// experiment ARN and the role RUM writes to it through; a CloudWatch one carries neither.
+pub(crate) async fn put_metrics_destination(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+) {
+    let mut body = json!({"Destination": destination});
+    if let Some(arn) = destination_arn {
+        body["DestinationArn"] = json!(arn);
+        body["IamRoleArn"] = json!(metrics_role_arn("rum-writer"));
+    }
+    let reply = call(
+        router,
+        "POST",
+        &format!("/rummetrics/{monitor}/metricsdestination"),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: expected PutRumMetricsDestination to answer 200, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+}
+
+/// One page of `BatchGetRumMetricDefinitions`: `GET /rummetrics/{AppMonitorName}/metrics`
+/// with `query` carrying the target and any `maxResults`/`nextToken` the case binds.
+pub(crate) async fn metric_definitions_page(
+    router: &MultiServiceRouter,
+    monitor: &str,
+    query: &str,
+) -> Reply {
+    call(
+        router,
+        "GET",
+        &format!("/rummetrics/{monitor}/metrics?{query}"),
+        None,
+    )
+    .await
+}
+
+/// The definitions a page reports, with an omitted member read as the empty list it
+/// stands for: restJson1 draws no distinction between an absent list member and an empty
+/// one.
+pub(crate) fn reported_metric_definitions(page: &Value) -> Vec<Value> {
+    page["MetricDefinitions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `MetricDefinitionId` of a reported definition.
+pub(crate) fn metric_definition_id(case: &str, reported: &Value) -> String {
+    reported["MetricDefinitionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: {reported} carries no MetricDefinitionId"))
+        .to_string()
+}
+
+/// Every definition one destination holds, read back through the paginated
+/// `BatchGetRumMetricDefinitions` and following its tokens to the end, keyed by id —
+/// asserting on the way that no page reports a definition twice.
+pub(crate) async fn all_metric_definitions(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    page_size: Option<usize>,
+) -> BTreeMap<String, Value> {
+    let mut collected: BTreeMap<String, Value> = BTreeMap::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut query = metrics_destination_query(destination, destination_arn);
+        if let Some(size) = page_size {
+            query.push_str(&format!("&maxResults={size}"));
+        }
+        if let Some(issued) = &token {
+            query.push_str(&format!("&nextToken={}", percent_encoded(issued)));
+        }
+        let reply = metric_definitions_page(router, monitor, &query).await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: expected a page to answer 200, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let page = reply.json(case);
+        for reported in reported_metric_definitions(&page) {
+            let id = metric_definition_id(case, &reported);
+            assert!(
+                collected.insert(id.clone(), reported).is_none(),
+                "case {case:?}: definition {id:?} was reported twice"
+            );
+        }
+        match page["NextToken"].as_str() {
+            Some(issued) => token = Some(issued.to_string()),
+            None => break,
+        }
+    }
+    collected
 }
 
 /// The `AppMonitor` structure `GetAppMonitor` reports for `name`.

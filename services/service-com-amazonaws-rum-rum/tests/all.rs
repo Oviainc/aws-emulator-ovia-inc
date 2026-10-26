@@ -23,6 +23,8 @@ mod authorization;
 mod batch_create_metric_definitions_targeting;
 #[path = "all/batch_delete_metric_definitions.rs"]
 mod batch_delete_metric_definitions;
+#[path = "all/batch_get_metric_definitions_reads.rs"]
+mod batch_get_metric_definitions_reads;
 #[path = "all/create_app_monitor_tags.rs"]
 mod create_app_monitor_tags;
 #[path = "all/cw_log_delivery.rs"]
