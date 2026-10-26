@@ -444,6 +444,13 @@ pub const EVENT_ACTIVITY_TIMED_OUT: &str = "ActivityTimedOut";
 /// The history event an activity task a worker reported as FAILED writes.
 pub const EVENT_ACTIVITY_FAILED: &str = "ActivityFailed";
 
+/// The history event a `Task` state writes when it schedules a task for its
+/// activity, which a `Retry` writes again for each attempt it schedules.
+pub const EVENT_ACTIVITY_SCHEDULED: &str = "ActivityScheduled";
+
+/// The history event a worker's successful reply to an activity task writes.
+pub const EVENT_ACTIVITY_SUCCEEDED: &str = "ActivitySucceeded";
+
 /// The history event an execution that one of its states failed ends on.
 pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 
@@ -931,6 +938,14 @@ pub struct ActivityTask {
     /// `None` where the state declares none, which is a task with no such bound.
     pub timeout_seconds: Option<u64>,
     pub heartbeat_seconds: Option<u64>,
+    /// How many attempts each retrier of the scheduling state's `Retry` has already
+    /// spent on this task, in the order the state declares them.
+    ///
+    /// Empty for the first attempt, which has spent none. A retrier's `MaxAttempts` is
+    /// its own ("MaxAttempts ... default 3"), so the counts are per retrier rather than
+    /// per task, and they travel with the task a retry re-schedules so the attempt
+    /// after it is the next one of that retrier and not the first again.
+    pub retries_taken: Vec<u64>,
     /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
     /// by [`ComAmazonawsSfnAwsstepfunctionsState::schedule_activity_task`] exactly as
     /// [`StateMachine::retained_bytes`] is.
@@ -945,12 +960,15 @@ impl ActivityTask {
 
     /// When this task's `TimeoutSeconds` makes it due to close.
     ///
-    /// Measured from the instant the state scheduled it, which is when the task's own
-    /// clock starts: the span is "how long the task runs", and a task nobody polls
-    /// for still runs out of it.
+    /// Measured from the instant a worker CLAIMED it, which is when an activity task's
+    /// clock starts: "for Activities, the count begins when GetActivityTask receives a
+    /// token and ActivityStarted is logged in the execution event history." A task no
+    /// worker holds is therefore bounded by nothing — there is no run to be longer than
+    /// the member allows — and stays outstanding until one claims it.
     fn timeout_due_at(&self) -> Option<SystemTime> {
+        let since = self.started_at?;
         self.timeout_seconds
-            .map(|seconds| after(self.available_at, Duration::from_secs(seconds)))
+            .map(|seconds| after(since, Duration::from_secs(seconds)))
     }
 
     /// When this task's `HeartbeatSeconds` makes it due to close: that span after the
@@ -995,6 +1013,7 @@ impl ActivityTask {
             + self.state_name.len()
             + self.input.len()
             + self.state_input.len()
+            + self.retries_taken.len() * std::mem::size_of::<u64>()
             + WORKER_NAME_RESERVE_BYTES
     }
 }
@@ -1077,6 +1096,68 @@ pub struct HistoryEvent {
     pub event_type: String,
     pub timestamp: SystemTime,
     pub state_name: Option<String>,
+    /// What the call that WROTE this event knew about it, which is what
+    /// `GetExecutionHistory` reports as that event type's own detail member.
+    pub details: EventDetails,
+}
+
+/// What one history event carries besides its identity.
+///
+/// Every member is a value the call that wrote the event already had in hand — the
+/// activity a task was scheduled for and the input it was scheduled with, the worker a
+/// claim handed it to, the output a reply carried, the error and cause a failure
+/// reported — so the history reports an event's detail members from the record instead
+/// of leaving them unset. A member no writer knew stays `None`, because a detail this
+/// emulator does not record is not reported at all.
+#[derive(Debug, Clone, Default)]
+pub struct EventDetails {
+    /// The resource the event's work names: the activity ARN of a scheduled task.
+    pub resource: Option<String>,
+    /// The input that work was handed.
+    pub input: Option<String>,
+    /// The output it answered.
+    pub output: Option<String>,
+    /// The `workerName` of the poll that claimed it.
+    pub worker_name: Option<String>,
+    /// The error and cause a failure reported.
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    /// The bounds the scheduling state declared for it.
+    pub timeout_seconds: Option<u64>,
+    pub heartbeat_seconds: Option<u64>,
+}
+
+impl EventDetails {
+    /// The bytes this record holds beyond its own size.
+    fn measure(&self) -> usize {
+        let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+        text(&self.resource)
+            + text(&self.input)
+            + text(&self.output)
+            + text(&self.worker_name)
+            + text(&self.error)
+            + text(&self.cause)
+    }
+
+    /// The detail an activity task's event carries, from the task itself.
+    fn of_scheduled_task(task: &ActivityTask) -> Self {
+        Self {
+            resource: Some(task.activity_arn.clone()),
+            input: Some(task.input.clone()),
+            timeout_seconds: task.timeout_seconds,
+            heartbeat_seconds: task.heartbeat_seconds,
+            ..Self::default()
+        }
+    }
+
+    /// The detail a failure's event carries.
+    fn of_failure(error: Option<String>, cause: Option<String>) -> Self {
+        Self {
+            error,
+            cause,
+            ..Self::default()
+        }
+    }
 }
 
 /// What the store already holding an execution under the ARN a `StartExecution`
@@ -1124,6 +1205,7 @@ fn history_bytes(events: &[HistoryEvent]) -> usize {
             std::mem::size_of::<HistoryEvent>()
                 + event.event_type.len()
                 + event.state_name.as_ref().map_or(0, String::len)
+                + event.details.measure()
         })
         .sum()
 }
@@ -1288,6 +1370,16 @@ impl Execution {
 
     /// Append one event, keeping the history within [`MAX_HISTORY_EVENTS`].
     pub fn push_event(&mut self, event_type: &str, timestamp: SystemTime) {
+        self.push_detailed_event(event_type, timestamp, EventDetails::default());
+    }
+
+    /// Append one event carrying what its writer knew about it.
+    pub fn push_detailed_event(
+        &mut self,
+        event_type: &str,
+        timestamp: SystemTime,
+        details: EventDetails,
+    ) {
         if self.history.len() >= MAX_HISTORY_EVENTS {
             return;
         }
@@ -1298,6 +1390,7 @@ impl Execution {
             event_type: event_type.to_string(),
             timestamp,
             state_name: None,
+            details,
         });
     }
 
@@ -1724,7 +1817,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // activity that task was of. See [`task_token`].
         let id = self.fresh_uuid();
         let token = task_token(&id, &planned.activity_arn);
-        let mut task = ActivityTask {
+        let task = ActivityTask {
             token: token.clone(),
             activity_arn: planned.activity_arn,
             execution_arn: execution_arn.to_string(),
@@ -1737,16 +1830,27 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             heartbeat_at: None,
             timeout_seconds: planned.timeout_seconds,
             heartbeat_seconds: planned.heartbeat_seconds,
+            // The first attempt of this task has spent no retrier's attempts.
+            retries_taken: Vec::new(),
             retained_bytes: 0,
         };
+        self.store_activity_task(task);
+        token
+    }
+
+    /// Queue `task` under its activity, counting what its record retains.
+    ///
+    /// The one place a task record enters the store, so a task a `Retry` scheduled is
+    /// queued and counted exactly as the attempt before it was.
+    fn store_activity_task(&mut self, mut task: ActivityTask) {
         task.retained_bytes = task.measure();
         self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
+        let token = task.token.clone();
         self.activity_tasks_by_activity
             .entry(task.activity_arn.clone())
             .or_default()
             .push(token.clone());
-        self.activity_tasks.insert(token.clone(), task);
-        token
+        self.activity_tasks.insert(token, task);
     }
 
     /// Hand the longest-waiting available task of `activity_arn` to a worker, and
@@ -1784,7 +1888,17 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let claimed = task.clone();
         if let Some(execution) = self.executions.get_mut(&claimed.execution_arn) {
             let before = execution.retained_bytes;
-            execution.push_event(EVENT_ACTIVITY_STARTED, now);
+            // "You can provide an arbitrary name in order to identify the worker that
+            // the task is assigned to": the event the claim writes is where that name
+            // is recorded.
+            execution.push_detailed_event(
+                EVENT_ACTIVITY_STARTED,
+                now,
+                EventDetails {
+                    worker_name: claimed.worker_name.clone(),
+                    ..EventDetails::default()
+                },
+            );
             execution.retained_bytes = execution.measure();
             let after = execution.retained_bytes;
             self.retained_bytes = self
@@ -1924,11 +2038,18 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 
     /// Close `token`'s task at `due`, the instant its own bound made it due, and fail
     /// the execution waiting at it with the error the Amazon States Language names
-    /// for a task that ran out of time.
+    /// for a task that ran out of time — unless the scheduling state RETRIES it.
     ///
     /// `due` is the instant the bound was reached, not the instant somebody looked:
     /// two callers reading afterwards see the same `stopDate`.
     fn time_out_activity_task(&mut self, token: &str, due: SystemTime) {
+        // "If the task runs longer than the specified seconds, this state fails with a
+        // States.Timeout error name": the state's own `Retry` answers for that error
+        // before the execution does, and the attempt it schedules is a task a worker
+        // polls for exactly as this one was.
+        if self.retry_activity_task(token, TASK_TIMEOUT_ERROR, EVENT_ACTIVITY_TIMED_OUT, due) {
+            return;
+        }
         let Some(task) = self.discard_activity_task(token) else {
             return;
         };
@@ -1951,8 +2072,22 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             state_name: task.state_name.clone(),
             state_input: task.state_input.clone(),
         });
-        execution.push_event(EVENT_ACTIVITY_TIMED_OUT, due);
-        execution.push_event(EVENT_EXECUTION_FAILED, due);
+        execution.push_detailed_event(
+            EVENT_ACTIVITY_TIMED_OUT,
+            due,
+            EventDetails::of_failure(
+                Some(TASK_TIMEOUT_ERROR.to_string()),
+                execution.cause.clone(),
+            ),
+        );
+        execution.push_detailed_event(
+            EVENT_EXECUTION_FAILED,
+            due,
+            EventDetails::of_failure(
+                Some(TASK_TIMEOUT_ERROR.to_string()),
+                execution.cause.clone(),
+            ),
+        );
         // The record is re-measured exactly as a stop re-measures it: the execution
         // is terminal now, so the bytes a stop had reserved are given back and the
         // events written here are counted.
@@ -1965,6 +2100,137 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let execution_arn = task.execution_arn;
         self.pending_executions
             .retain(|pending| pending != &execution_arn);
+    }
+
+    /// Re-schedule the task `token` names for its next attempt, when the state that
+    /// scheduled it declares a `Retry` that answers for `error`, and report whether it
+    /// did.
+    ///
+    /// "Retry […] an array of objects, called retriers": the first retrier whose
+    /// `ErrorEquals` names the error decides, it makes at most its own `MaxAttempts`
+    /// attempts, and the next one is due `IntervalSeconds` scaled by `BackoffRate`
+    /// once per attempt already taken and capped by `MaxDelaySeconds` after the
+    /// failure ([`asl::activity_retry`]).
+    ///
+    /// The attempt that failed is CLOSED: its token answers nothing afterwards, so the
+    /// worker that held it cannot report on the attempt that replaces it. An identical
+    /// task is queued in its place, available once the retrier's interval has passed
+    /// and carrying one more spent attempt of that retrier, and the execution's history
+    /// records both the failure and the scheduling of the next attempt. The execution
+    /// stays `RUNNING`, because the state has not failed yet.
+    fn retry_activity_task(
+        &mut self,
+        token: &str,
+        error: &str,
+        failure_event: &str,
+        at: SystemTime,
+    ) -> bool {
+        let Some(task) = self.activity_tasks.get(token).cloned() else {
+            return false;
+        };
+        let Some(definition) = self.definition_of_execution(&task.execution_arn) else {
+            return false;
+        };
+        let Some((retrier, delay)) =
+            asl::activity_retry(&definition, &task.state_name, error, &task.retries_taken)
+        else {
+            return false;
+        };
+        // A task whose execution is no longer running is retried by nobody: it was
+        // stopped, or an earlier bound of the execution already failed it.
+        let Some(execution) = self
+            .executions
+            .get(&task.execution_arn)
+            .filter(|execution| !execution.is_terminal())
+            .cloned()
+        else {
+            return false;
+        };
+        let available_at = after(at, delay);
+        let mut queued = task.clone();
+        queued.token = task_token(&self.fresh_uuid(), &task.activity_arn);
+        queued.worker_name = None;
+        queued.started_at = None;
+        queued.heartbeat_at = None;
+        queued.available_at = available_at;
+        if queued.retries_taken.len() <= retrier {
+            queued.retries_taken.resize(retrier + 1, 0);
+        }
+        if let Some(spent) = queued.retries_taken.get_mut(retrier) {
+            *spent = spent.saturating_add(1);
+        }
+        let mut candidate = execution.clone();
+        // The failure happened when the bound was reached; the next attempt is
+        // scheduled when its interval has passed, which is also when a poll may first
+        // claim it.
+        candidate.push_detailed_event(
+            failure_event,
+            at,
+            EventDetails::of_failure(Some(error.to_string()), None),
+        );
+        candidate.push_detailed_event(
+            EVENT_ACTIVITY_SCHEDULED,
+            available_at,
+            EventDetails::of_scheduled_task(&queued),
+        );
+        let before = execution.retained_bytes;
+        let after_bytes = candidate.measure();
+        // What the retry adds is the two events and whatever the next attempt's record
+        // holds beyond the one it replaces, which is admitted against the store's
+        // ceiling exactly as the first attempt was: a retry the store has no room for
+        // leaves the failure to the execution rather than growing past the ceiling.
+        let grows = (after_bytes + queued.measure())
+            .saturating_sub(before + task.retained_bytes);
+        if grows > 0 && !self.has_room_for(grows) {
+            return false;
+        }
+        candidate.retained_bytes = after_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after_bytes)
+            .saturating_sub(before);
+        self.executions
+            .insert(task.execution_arn.clone(), candidate);
+        self.discard_activity_task(token);
+        self.store_activity_task(queued);
+        true
+    }
+
+    /// Re-schedule the task `token` names after the worker holding it reported it
+    /// FAILED with `error`, and report whether it was retried.
+    ///
+    /// The error a worker reports is what the scheduling state's `Retry` is matched
+    /// against, exactly as the `States.Timeout` the clock reports is: a task the state
+    /// retries is queued for its next attempt and the execution stays `RUNNING`, and
+    /// one it does not leaves the reply to fail the execution.
+    pub fn retry_failed_activity_task(
+        &mut self,
+        token: &str,
+        error: &str,
+        at: SystemTime,
+    ) -> bool {
+        self.retry_activity_task(token, error, EVENT_ACTIVITY_FAILED, at)
+    }
+
+    /// The definition the execution `arn` RUNS, which is where its states are read
+    /// from.
+    ///
+    /// An execution started through a version ARN — or through an alias that routed to
+    /// a version — runs that version's immutable snapshot; every other runs what the
+    /// state machine holds. The same choice `plan_reply`'s callers make, so a retried
+    /// task's `Retry` is read from the definition the execution is running.
+    fn definition_of_execution(&self, arn: &str) -> Option<String> {
+        let execution = self.executions.get(arn)?;
+        if let Some(version) = execution
+            .state_machine_version_arn
+            .as_deref()
+            .and_then(|version_arn| self.state_machine_versions.get(version_arn))
+        {
+            return Some(version.definition.clone());
+        }
+        self.state_machines
+            .get(&execution.state_machine_arn)
+            .map(|machine| machine.definition.clone())
     }
 
     /// Drop every outstanding task of the executions `arns` names, for a removal that
@@ -5272,23 +5538,36 @@ pub fn plan_reply(
     // counts: a task that stayed outstanding was part of this execution's run.
     let elapsed = now.duration_since(start).unwrap_or_default();
     let run = asl::resume(definition, input, start, context, reply, elapsed, tasks)?;
-    Some(plan_from_run(
-        run,
-        now,
-        EXECUTION_SETTLE_DELAY,
-        None,
-        previous_event_id,
-    ))
+    let mut planned = plan_from_run(run, now, EXECUTION_SETTLE_DELAY, None, previous_event_id);
+    // The event that records the task SUCCEEDING carries what the worker answered:
+    // "the JSON output of the task", which is the reply this walk continued from.
+    let answered = planned
+        .opening
+        .iter_mut()
+        .chain(
+            planned
+                .pending
+                .iter_mut()
+                .flat_map(|pending| pending.events.iter_mut()),
+        )
+        .find(|event| event.event_type == EVENT_ACTIVITY_SUCCEEDED);
+    if let Some(event) = answered {
+        event.details = EventDetails {
+            output: Some(reply.result.to_string()),
+            ..EventDetails::default()
+        };
+    }
+    Some(planned)
 }
 
 /// What a worker's reply that reports its activity task FAILED leaves for the store
-/// to record.
+/// to record, once no `Retry` of the scheduling state answers for the error.
 ///
-/// There is no walk to interpret: a `Task` state whose `Resource` is an activity
-/// declares no `Retry` and no `Catch` in the definitions this emulator runs (see
-/// [`asl`]), so a task its worker reports as failed has no state to be retried at and
-/// no catcher to be handed to — the execution waiting at it fails, carrying the
-/// reply's own `error` and `cause`. That outcome is owed to the clock one
+/// There is no walk to interpret: the state has no retrier left for the error
+/// ([`ComAmazonawsSfnAwsstepfunctionsState::retry_failed_activity_task`] is what
+/// answers one that has) and declares no `Catch` this emulator interprets (see
+/// [`asl`]), so the execution waiting at the task fails, carrying the reply's own
+/// `error` and `cause`. That outcome is owed to the clock one
 /// [`EXECUTION_SETTLE_DELAY`] after the reply, exactly as the outcome a SUCCESSFUL
 /// reply continues to is ([`plan_reply`]), so one rule covers both replies: the
 /// execution is `RUNNING` until the instant the reply made its outcome due.
@@ -5313,6 +5592,7 @@ pub fn plan_task_failure(
         event_type: EVENT_ACTIVITY_FAILED.to_string(),
         timestamp: now,
         state_name: Some(state_name.to_string()),
+        details: EventDetails::of_failure(error.clone(), cause.clone()),
     };
     let ended = HistoryEvent {
         id: failed.id + 1,
@@ -5320,6 +5600,7 @@ pub fn plan_task_failure(
         event_type: EVENT_EXECUTION_FAILED.to_string(),
         timestamp: due_at,
         state_name: None,
+        details: EventDetails::of_failure(error.clone(), cause.clone()),
     };
     Planned {
         opening: vec![failed],
@@ -5358,6 +5639,7 @@ fn plan_from_run(
             event_type: event_type.to_string(),
             timestamp: start,
             state_name: None,
+            details: EventDetails::default(),
         })
         .into_iter()
         .collect();
@@ -5383,6 +5665,7 @@ fn plan_from_run(
                 after(start, step.after)
             },
             state_name: step.state_name,
+            details: EventDetails::default(),
         })
         .collect();
     // Every Map Run the walk started, with its offsets turned into instants against
@@ -5414,18 +5697,35 @@ fn plan_from_run(
     if let Some(waiting) = run.waiting {
         let mut history = opened;
         history.extend(events);
+        let scheduled = PlannedActivityTask {
+            activity_arn: waiting.activity_arn,
+            state_name: waiting.state_name,
+            input: waiting.input.to_string(),
+            state_input: waiting.raw_input.to_string(),
+            available_at: after(start, waiting.at),
+            timeout_seconds: waiting.timeout_seconds,
+            heartbeat_seconds: waiting.heartbeat_seconds,
+        };
+        // The event that RECORDS the scheduling carries what was scheduled: the walk
+        // computed the activity, the input and the bounds, so the event the history
+        // keeps reports them rather than leaving its detail member unset.
+        if let Some(event) = history
+            .iter_mut()
+            .rev()
+            .find(|event| event.event_type == EVENT_ACTIVITY_SCHEDULED)
+        {
+            event.details = EventDetails {
+                resource: Some(scheduled.activity_arn.clone()),
+                input: Some(scheduled.input.clone()),
+                timeout_seconds: scheduled.timeout_seconds,
+                heartbeat_seconds: scheduled.heartbeat_seconds,
+                ..EventDetails::default()
+            };
+        }
         return Planned {
             opening: history,
             pending: None,
-            waiting: Some(PlannedActivityTask {
-                activity_arn: waiting.activity_arn,
-                state_name: waiting.state_name,
-                input: waiting.input.to_string(),
-                state_input: waiting.raw_input.to_string(),
-                available_at: after(start, waiting.at),
-                timeout_seconds: waiting.timeout_seconds,
-                heartbeat_seconds: waiting.heartbeat_seconds,
-            }),
+            waiting: Some(scheduled),
             map_runs,
         };
     }

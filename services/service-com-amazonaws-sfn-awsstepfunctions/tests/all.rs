@@ -21,6 +21,8 @@ mod activity_heartbeats;
 mod activity_lifecycle;
 #[path = "all/activity_listing.rs"]
 mod activity_listing;
+#[path = "all/activity_task_retries.rs"]
+mod activity_task_retries;
 #[path = "all/activity_tasks.rs"]
 mod activity_tasks;
 #[path = "all/alias_order_and_redrive_context.rs"]
@@ -29,12 +31,16 @@ mod alias_order_and_redrive_context;
 mod arn_validation;
 #[path = "all/client_error_wrappers.rs"]
 mod client_error_wrappers;
+#[path = "all/definition_path_diagnostics.rs"]
+mod definition_path_diagnostics;
 #[path = "all/definition_validation.rs"]
 mod definition_validation;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/execution_alias_routing.rs"]
 mod execution_alias_routing;
+#[path = "all/execution_history.rs"]
+mod execution_history;
 #[path = "all/execution_interpreter.rs"]
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]

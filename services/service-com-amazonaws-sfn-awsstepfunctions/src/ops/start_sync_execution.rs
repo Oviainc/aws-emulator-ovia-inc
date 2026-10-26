@@ -426,6 +426,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         event_type: crate::state::EVENT_EXECUTION_FAILED.to_string(),
                         timestamp: started,
                         state_name: None,
+                        details: crate::state::EventDetails::default(),
                     }],
                 }
             }

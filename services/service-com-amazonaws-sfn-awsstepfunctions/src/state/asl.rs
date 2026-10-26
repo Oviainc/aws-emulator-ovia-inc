@@ -392,13 +392,16 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "CausePath",
         ],
         // An ACTIVITY task's own work is done by a worker, so the members below are
-        // the ones that decide what is scheduled for it and what the state does with
-        // the reply. `Retry` and `Catch` are deliberately absent: they decide what
-        // happens when the task FAILS or times out, and this emulator does not yet
-        // re-schedule a task or hand a failure to a catcher, so a state that declares
-        // one is not run rather than run as though it declared none. `Credentials` is
-        // absent for the same reason it is on every other type: it changes who the
-        // invocation is made as.
+        // the ones that decide what is scheduled for it, what the state does with the
+        // reply, and what happens when the task fails or runs out of time: a `Retry`
+        // re-schedules the task for its next attempt, which is a task a worker polls
+        // for exactly as the attempt before it was. `Catch` is deliberately absent:
+        // handing the failure to a catcher continues the walk from the catcher's
+        // `Next`, and a state after it may be a service integration whose call is made
+        // from the REQUEST the walk runs inside — a task the clock closes has no
+        // request around it, so a state that declares one is not run rather than run as
+        // though it declared none. `Credentials` is absent for the same reason it is on
+        // every other type: it changes who the invocation is made as.
         "Task" => &[
             "Type",
             "Comment",
@@ -413,6 +416,7 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "ResultSelector",
             "ResultPath",
             "OutputPath",
+            "Retry",
             "Next",
             "End",
         ],
@@ -1761,8 +1765,11 @@ fn transition_targets(state: &Value) -> Vec<String> {
 ///   DECLARED in a machine must carry `Next` or `"End": true`, so a state naming no
 ///   transition is declared as the machine's terminal state.
 ///
-/// Nothing else about the state is altered, and the `Err` is the same first-error
-/// diagnostic [`validate`] answers, in the same words.
+/// Nothing else about the state is altered, and the `Err` is what the service reports
+/// about THAT state: a required member the supplied object does not carry is named on
+/// its own ([`missing_field_message`]), and every other diagnostic is stated without
+/// the name and the JSON pointer the enclosing machine was declared under, neither of
+/// which the request carries ([`about_the_single_state`]).
 pub fn validate_single_state(definition: &str) -> Result<(), String> {
     let Ok(state) = serde_json::from_str::<Value>(definition) else {
         // A definition that is not JSON at all is refused in the same words whichever
@@ -1777,6 +1784,12 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
             .stated()),
         };
     };
+    // The definition IS the state, so a member the language requires of a state is
+    // missing from the object the REQUEST sent: it is reported as that member, and
+    // nothing is said about a state machine the request does not carry.
+    if let Some(member) = missing_required_member(&state) {
+        return Err(missing_field_message(&member));
+    }
     let mut judged = state.clone();
     if let Some(object) = judged.as_object_mut() {
         let continuing = object
@@ -1798,8 +1811,83 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
     let mut found = Diagnosis::until_first_error();
     diagnose_machine(&machine, "", JSONPATH, 1, &mut found);
     match found.diagnostics.iter().find(|found| found.is_error()) {
-        Some(found) => Err(found.stated()),
+        Some(found) => Err(about_the_single_state(found)),
         None => Ok(()),
+    }
+}
+
+/// The members the Amazon States Language requires of a state, as alternatives: a
+/// state carries the first member of each entry, or one of the members beside it.
+///
+/// Every state names what it does with `Type`, and a type whose work ONE member
+/// declares requires that member too: a `Task` "requires a `Resource` field", a
+/// `Choice` carries the `Choices` array its rules live in, a `Parallel` the `Branches`
+/// it runs, and a `Map` the `ItemProcessor` its items go through (the language's
+/// earlier `Iterator` names the same work). A `Pass`, `Succeed`, `Fail` or `Wait`
+/// state declares its work through members none of which it must carry alone.
+fn required_state_members(state_type: &str) -> &'static [&'static [&'static str]] {
+    match state_type {
+        "Task" => &[&["Resource"]],
+        "Choice" => &[&["Choices"]],
+        "Parallel" => &[&["Branches"]],
+        "Map" => &[&["ItemProcessor", "Iterator"]],
+        _ => &[],
+    }
+}
+
+/// The first member `state` must carry and does not: `Type`, and then the member the
+/// type it names requires ([`required_state_members`]).
+///
+/// `None` for a state that carries each of them, and for a `definition` that is not a
+/// state object at all — which is not a member that is missing, and is reported as the
+/// object it is instead.
+fn missing_required_member(state: &Value) -> Option<String> {
+    let state = state.as_object()?;
+    if !state.contains_key("Type") {
+        return Some("Type".to_string());
+    }
+    // A `Type` that is present but is not a string names no state type, so which
+    // members the state owes is not decided here: that is a defect in the member it
+    // carries rather than a member it is missing.
+    let state_type = state.get("Type").and_then(Value::as_str)?;
+    required_state_members(state_type)
+        .iter()
+        .find(|alternatives| {
+            !alternatives
+                .iter()
+                .any(|member| state.contains_key(*member))
+        })
+        .and_then(|alternatives| alternatives.first().map(|member| (*member).to_string()))
+}
+
+/// What the service reports for a required member the state under test does not
+/// carry: the member, named on its own.
+///
+/// The request sent ONE state object, so there is no state name and no path into an
+/// enclosing definition to place the member in.
+fn missing_field_message(member: &str) -> String {
+    format!("Missing required field: '{}'", echoed(member))
+}
+
+/// What a diagnostic of the WRAPPED walk says about the state the request supplied.
+///
+/// The lone state is judged by declaring it as the one state of a state machine, so
+/// each diagnostic names the state under that declared name and locates it inside that
+/// machine. Neither is in the request, so the name is reported as the state under test
+/// and the location is read back to the state's own member — `None` where it was the
+/// state itself.
+fn about_the_single_state(found: &Diagnostic) -> String {
+    let declared = format!("state '{SINGLE_STATE_NAME}'");
+    let message = found.message.replace(&declared, SINGLE_STATE_LABEL);
+    let inside = format!("/States/{SINGLE_STATE_NAME}");
+    let member = found
+        .location
+        .as_deref()
+        .and_then(|location| location.strip_prefix(inside.as_str()))
+        .filter(|member| !member.is_empty());
+    match member {
+        Some(member) => format!("{}: {message} (at {member})", found.code),
+        None => format!("{}: {message}", found.code),
     }
 }
 
@@ -3993,6 +4081,54 @@ fn retry_delay_seconds(retrier: &Map<String, Value>, taken: u64) -> f64 {
     }
 }
 
+/// Which retrier of the `Task` state `state_name` of `definition` retries an activity
+/// task that failed with `error`, and how long after that failure its next attempt is
+/// due.
+///
+/// `taken` is how many attempts each retrier of that state has already spent on the
+/// task, in the order the state declares them. The answer is the FIRST retrier whose
+/// `ErrorEquals` names the error, exactly as a retried walk's is, so one rule decides
+/// every retry this service makes.
+///
+/// `None` when the definition declares no such state, when the state declares no
+/// `Retry`, when no retrier names the error, or when the one that does has spent its
+/// `MaxAttempts`: the failure is then the state's own.
+pub fn activity_retry(
+    definition: &str,
+    state_name: &str,
+    error: &str,
+    taken: &[u64],
+) -> Option<(usize, Duration)> {
+    let document = serde_json::from_str::<Value>(definition).ok()?;
+    let state = document
+        .get("States")
+        .and_then(Value::as_object)?
+        .get(state_name)
+        .and_then(Value::as_object)?;
+    let retriers = state.get("Retry").and_then(Value::as_array)?;
+    for (index, retrier) in retriers.iter().enumerate() {
+        let Some(retrier) = retrier.as_object() else {
+            continue;
+        };
+        if !errors_match(retrier, error) {
+            continue;
+        }
+        let max_attempts = retrier
+            .get("MaxAttempts")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
+        let spent = taken.get(index).copied().unwrap_or(0);
+        if spent >= max_attempts {
+            return None;
+        }
+        return Some((
+            index,
+            Duration::from_secs_f64(retry_delay_seconds(retrier, spent)),
+        ));
+    }
+    None
+}
+
 /// Whether a retrier's or catcher's `ErrorEquals` names `error`.
 ///
 /// "States.ALL — A wildcard that matches any known error name", with one documented
@@ -4172,7 +4308,7 @@ fn render_template(
                             )
                         })?;
                         budget.charge_path()?;
-                        let built = expression(text, input, context)?;
+                        let built = template_expression(key, text, input, context)?;
                         budget.spend(measure_payload(&built, "a payload template")?)?;
                         rendered.insert(stripped.to_string(), built);
                     }
@@ -4199,6 +4335,35 @@ fn render_template(
             Ok(other.clone())
         }
     }
+}
+
+/// Evaluate the value of a `"<name>.$"` member of a payload template, saying which
+/// member a path that selected nothing was written for.
+///
+/// A template member names the field it builds, so that is what the service reports a
+/// path it could not resolve against: "The JSONPath '<path>' specified for the field
+/// '<field>' could not be found in the input '<document>'". The document is the one the
+/// path was evaluated against — the context object for a path that begins with `$$`,
+/// the template's own input for every other — quoted under the one clipping every
+/// caller value in a diagnostic gets.
+fn template_expression(
+    field: &str,
+    text: &str,
+    input: &Value,
+    context: &Value,
+) -> Result<Value, Failure> {
+    if text.starts_with("States.") {
+        return intrinsic(text, input, context);
+    }
+    select_optional(text, input, context)?.ok_or_else(|| {
+        let searched = if is_context_path(text) { context } else { input };
+        runtime(format!(
+            "The JSONPath '{}' specified for the field '{}' could not be found in the input '{}'",
+            echoed(text),
+            echoed(field),
+            echoed(&searched.to_string())
+        ))
+    })
 }
 
 /// Evaluate the value of a `"<name>.$"` member: a path or an intrinsic function.
@@ -4228,14 +4393,24 @@ fn select_optional(
     input: &Value,
     context: &Value,
 ) -> Result<Option<Value>, Failure> {
+    // "paths that begin with $$ ... are evaluated against the Context Object", with
+    // the first `$` naming that object and the rest being the path into it.
+    if is_context_path(path) {
+        return select_path(&path[1..], context);
+    }
     match path.strip_prefix('$') {
-        // "paths that begin with $$ ... are evaluated against the Context Object."
-        Some(rest) if rest.starts_with('$') => select_path(rest, context),
         Some(_) => select_path(path, input),
         None => Err(runtime(format!(
             "'{path}' is not a JSONPath: a path begins with '$'"
         ))),
     }
+}
+
+/// Whether `path` is evaluated against the context object rather than against the
+/// state's data: "paths that begin with $$ ... are evaluated against the Context
+/// Object."
+fn is_context_path(path: &str) -> bool {
+    path.starts_with("$$")
 }
 
 /// Evaluate `expression` against `root`, which must select exactly one value — ASL

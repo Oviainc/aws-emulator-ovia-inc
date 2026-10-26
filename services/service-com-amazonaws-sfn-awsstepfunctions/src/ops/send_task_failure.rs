@@ -6,12 +6,13 @@
 //!
 //! A worker that polled `GetActivityTask` holds the `taskToken` of ONE outstanding
 //! activity task, and this is how it reports that the task FAILED. The task is closed
-//! and the execution waiting at the state that scheduled it fails with the `error` and
-//! `cause` the worker sent: that state declares no `Retry` and no `Catch` in the
-//! definitions this emulator runs, so there is nothing to retry it at and no catcher
-//! to hand the failure to — see [`crate::state::plan_task_failure`]. The outcome is
-//! owed to the clock exactly as the outcome a successful reply continues to is, and
-//! one token answers one task, so no later reply resolves it.
+//! either way, and what happens to the execution waiting at the state that scheduled
+//! it is what that state's `Retry` says: a retrier whose `ErrorEquals` names the
+//! reported error, with attempts left, schedules the next attempt of the task and the
+//! execution stays `RUNNING`; with no such retrier the execution fails with the
+//! `error` and `cause` the worker sent — see [`crate::state::plan_task_failure`]. That
+//! outcome is owed to the clock exactly as the outcome a successful reply continues to
+//! is, and one token answers one task, so no later reply resolves it.
 //!
 //! ## Shape of an operation
 //!
@@ -230,16 +231,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Nothing is interpreted: the state that scheduled the task declares no
-        // `Retry` and no `Catch`, so the failure the worker reported is the
-        // execution's, and what is recorded is the two events that failure writes and
-        // the outcome the clock then owes.
+        let last_event_id = execution.last_event_id();
+
+        // The state that scheduled the task answers for the error first: a `Retry`
+        // whose retrier names it, with attempts left, closes THIS attempt and queues
+        // the next one, so the execution is still running and this reply resolved the
+        // token it carried. A worker that reported no `error` names none, which only a
+        // retrier on the `States.ALL` wildcard answers for.
+        let reported = input.error.clone().unwrap_or_default();
+        if store.retry_failed_activity_task(&input.task_token, &reported, now) {
+            return Ok(SendTaskFailureOutput {});
+        }
+
+        // Nothing is interpreted: no retrier of the scheduling state answers for the
+        // error, and the state declares no `Catch` this emulator interprets, so the
+        // failure the worker reported is the execution's — what is recorded is the two
+        // events that failure writes and the outcome the clock then owes.
         let planned = crate::state::plan_task_failure(
             &state_name,
             now,
             input.error,
             input.cause,
-            execution.last_event_id(),
+            last_event_id,
         );
         match store.fail_activity_task(&input.task_token, planned.opening, planned.pending) {
             Ok(()) => Ok(SendTaskFailureOutput {}),

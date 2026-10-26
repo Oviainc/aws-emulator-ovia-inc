@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExecutionHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExecutionHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExecutionHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! "Returns the history of the specified execution as a list of events. By default,
+//! the results are returned in ascending order of the timeStamp of the events": the
+//! events are the ones the execution's own record holds — written by the walk that ran
+//! it, by the claim and the closure of each activity task it scheduled, and by the
+//! outcome the clock made due — projected in the order the request asked for and paged
+//! the way every list of this service is paged. Nothing is synthesised: an event
+//! detail is reported only where the stored record carries the values that detail is
+//! made of.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +178,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExecutionHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExecutionHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExecutionHistory"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is validated BEFORE the lookup, exactly as every other execution
+        // read of this service validates it: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not an execution that is absent here.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) =
+            crate::state::read_execution_arn(&input.execution_arn, &endpoint_region)
+        {
+            return Err(GetExecutionHistoryErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // "If nextToken is returned, there are more results available. The value of
+        // nextToken is a unique pagination token for each page": a token that is not
+        // one this service issued is the modelled `InvalidToken`.
+        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+            return Err(GetExecutionHistoryErrorModeled::InvalidToken(InvalidToken {
+                message: Some(crate::state::invalid_token_message()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // The one write a report may make: the events an outcome the clock already
+        // made due writes were owed at that instant, whether or not anybody read the
+        // history.
+        store.settle(now);
+
+        let Some(execution) = store.executions.get(&input.execution_arn) else {
+            return Err(GetExecutionHistoryErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::EXECUTION_DOES_NOT_EXIST,
+                        &input.execution_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "This API action is not supported by EXPRESS state machines": an Express
+        // execution keeps no history this API reads, so the ARN names an execution
+        // this action is not for — a defect in the REQUEST rather than an execution
+        // that is absent.
+        let express = store
+            .state_machines
+            .get(&execution.state_machine_arn)
+            .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
+        if express {
+            return Err(GetExecutionHistoryErrorModeled::InvalidArn(InvalidArn {
+                message: Some(crate::state::invalid_arn_message(format!(
+                    "GetExecutionHistory is not supported by {} state machines: {}",
+                    crate::state::STATE_MACHINE_TYPE_EXPRESS, input.execution_arn
+                ))),
+            })
+            .into());
+        }
+
+        // "You can select whether execution data (input or output of a history event)
+        // is returned. The default is true."
+        let with_data = input.include_execution_data.unwrap_or(true);
+        // "Lists events in descending order of their timeStamp": the stored history is
+        // in the order the events happened, which is ascending, so the reverse order
+        // is that same list read from the end.
+        let ordered: Vec<crate::state::HistoryEvent> = if input.reverse_order {
+            execution.history.iter().rev().cloned().collect()
+        } else {
+            execution.history.clone()
+        };
+        let total = ordered.len();
+        let page = crate::state::page_size(input.max_results);
+        let events: Vec<HistoryEvent> = ordered
+            .into_iter()
+            .skip(offset)
+            .take(page)
+            .map(|stored| projected(&stored, execution, with_data))
+            .collect();
+        let next_token = crate::state::next_page_token(offset, events.len(), total);
+
+        Ok(GetExecutionHistoryOutput {
+            events,
+            next_token,
+        })
     }
 }
+
+/// One stored event as this API reports it: the event's own identity, and the detail
+/// member its type names where the execution's record carries what that detail holds.
+///
+/// A detail this emulator does not record is left unset rather than filled with a
+/// stand-in: `stateEnteredEventDetails`/`stateExitedEventDetails` name the state the
+/// event was written for, and the four execution-level details carry the input, the
+/// output, the error and the cause the record holds.
+fn projected(
+    stored: &crate::state::HistoryEvent,
+    execution: &crate::state::Execution,
+    with_data: bool,
+) -> HistoryEvent {
+    // "Indicates whether input or output was included in the response" — it is,
+    // whenever the request asked for execution data, because the stored record carries
+    // it whole and nothing here is truncated.
+    let included = Some(HistoryEventExecutionDataDetails { truncated: false });
+    let data = |value: Option<String>| if with_data { value } else { None };
+    let mut event = HistoryEvent {
+        timestamp: crate::state::to_date_time(stored.timestamp),
+        r#type: stored.event_type.clone(),
+        id: stored.id,
+        previous_event_id: stored.previous_event_id,
+        activity_failed_event_details: None,
+        activity_schedule_failed_event_details: None,
+        activity_scheduled_event_details: None,
+        activity_started_event_details: None,
+        activity_succeeded_event_details: None,
+        activity_timed_out_event_details: None,
+        task_failed_event_details: None,
+        task_scheduled_event_details: None,
+        task_start_failed_event_details: None,
+        task_started_event_details: None,
+        task_submit_failed_event_details: None,
+        task_submitted_event_details: None,
+        task_succeeded_event_details: None,
+        task_timed_out_event_details: None,
+        execution_failed_event_details: None,
+        execution_started_event_details: None,
+        execution_succeeded_event_details: None,
+        execution_aborted_event_details: None,
+        execution_timed_out_event_details: None,
+        execution_redriven_event_details: None,
+        map_state_started_event_details: None,
+        map_iteration_started_event_details: None,
+        map_iteration_succeeded_event_details: None,
+        map_iteration_failed_event_details: None,
+        map_iteration_aborted_event_details: None,
+        lambda_function_failed_event_details: None,
+        lambda_function_schedule_failed_event_details: None,
+        lambda_function_scheduled_event_details: None,
+        lambda_function_start_failed_event_details: None,
+        lambda_function_succeeded_event_details: None,
+        lambda_function_timed_out_event_details: None,
+        state_entered_event_details: None,
+        state_exited_event_details: None,
+        map_run_started_event_details: None,
+        map_run_failed_event_details: None,
+        map_run_redriven_event_details: None,
+        evaluation_failed_event_details: None,
+    };
+    let event_type = stored.event_type.as_str();
+    if let Some(name) = stored.state_name.clone() {
+        if event_type.ends_with(STATE_ENTERED_SUFFIX) {
+            event.state_entered_event_details = Some(StateEnteredEventDetails {
+                name,
+                input: None,
+                input_details: None,
+            });
+            return event;
+        }
+        if event_type.ends_with(STATE_EXITED_SUFFIX) {
+            event.state_exited_event_details = Some(StateExitedEventDetails {
+                name,
+                output: None,
+                output_details: None,
+                assigned_variables: None,
+                assigned_variables_details: None,
+            });
+            return event;
+        }
+    }
+    match event_type {
+        crate::state::EVENT_ACTIVITY_SCHEDULED => {
+            // `resource` is the activity the task was scheduled for, which the event
+            // only reports when the record carries it: the member is required, so a
+            // detail with nothing to name it is not reported at all.
+            if let Some(resource) = stored.details.resource.clone() {
+                event.activity_scheduled_event_details = Some(ActivityScheduledEventDetails {
+                    resource,
+                    input: data(stored.details.input.clone()),
+                    input_details: included.clone().filter(|_| with_data),
+                    timeout_in_seconds: seconds(stored.details.timeout_seconds),
+                    heartbeat_in_seconds: seconds(stored.details.heartbeat_seconds),
+                });
+            }
+        }
+        crate::state::EVENT_ACTIVITY_STARTED => {
+            event.activity_started_event_details = Some(ActivityStartedEventDetails {
+                worker_name: stored.details.worker_name.clone(),
+            });
+        }
+        crate::state::EVENT_ACTIVITY_SUCCEEDED => {
+            event.activity_succeeded_event_details = Some(ActivitySucceededEventDetails {
+                output: data(stored.details.output.clone()),
+                output_details: included
+                    .clone()
+                    .filter(|_| with_data && stored.details.output.is_some()),
+            });
+        }
+        crate::state::EVENT_ACTIVITY_TIMED_OUT => {
+            event.activity_timed_out_event_details = Some(ActivityTimedOutEventDetails {
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
+            });
+        }
+        crate::state::EVENT_ACTIVITY_FAILED => {
+            event.activity_failed_event_details = Some(ActivityFailedEventDetails {
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
+            });
+        }
+        crate::state::EVENT_EXECUTION_STARTED => {
+            event.execution_started_event_details = Some(ExecutionStartedEventDetails {
+                input: data(Some(execution.input.clone())),
+                input_details: included.filter(|_| with_data),
+                role_arn: None,
+                state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
+                state_machine_version_arn: execution.state_machine_version_arn.clone(),
+            });
+        }
+        EVENT_EXECUTION_SUCCEEDED => {
+            event.execution_succeeded_event_details = Some(ExecutionSucceededEventDetails {
+                output: data(execution.output.clone()),
+                output_details: included.filter(|_| with_data && execution.output.is_some()),
+            });
+        }
+        crate::state::EVENT_EXECUTION_FAILED => {
+            event.execution_failed_event_details = Some(ExecutionFailedEventDetails {
+                error: execution.error.clone(),
+                cause: execution.cause.clone(),
+            });
+        }
+        EVENT_EXECUTION_ABORTED => {
+            event.execution_aborted_event_details = Some(ExecutionAbortedEventDetails {
+                error: execution.error.clone(),
+                cause: execution.cause.clone(),
+            });
+        }
+        EVENT_EXECUTION_TIMED_OUT => {
+            event.execution_timed_out_event_details = Some(ExecutionTimedOutEventDetails {
+                error: execution.error.clone(),
+                cause: execution.cause.clone(),
+            });
+        }
+        crate::state::EVENT_EXECUTION_REDRIVEN => {
+            event.execution_redriven_event_details = Some(ExecutionRedrivenEventDetails {
+                redrive_count: Some(execution.redrive_count),
+            });
+        }
+        _ => {}
+    }
+    event
+}
+
+/// The suffix every `<Type>StateEntered` event's type carries, which is what makes
+/// `stateEnteredEventDetails` the detail that event reports.
+const STATE_ENTERED_SUFFIX: &str = "StateEntered";
+
+/// A bound the scheduling state declared, as the modelled `timeoutInSeconds` and
+/// `heartbeatInSeconds` carry it.
+fn seconds(bound: Option<u64>) -> Option<i64> {
+    bound.map(|seconds| i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+/// The same for `<Type>StateExited`.
+const STATE_EXITED_SUFFIX: &str = "StateExited";
+
+/// The history event an execution that reached its `Succeed` end writes.
+const EVENT_EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
+
+/// The history event a STOPPED execution writes.
+const EVENT_EXECUTION_ABORTED: &str = "ExecutionAborted";
+
+/// The history event an execution that ran past its definition's `TimeoutSeconds`
+/// writes.
+const EVENT_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";

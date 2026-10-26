@@ -403,18 +403,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // The definition is JUDGED before it is read, by the walk that words every
-        // definition refusal this service answers: with a `stateName` it is a
-        // fully-formed state machine, and without one it is the single state itself.
+        // The definition is JUDGED before it is read: with a `stateName` it is a
+        // fully-formed state machine, refused in the words every state machine
+        // definition of this service is refused in, and without one it "accepts the
+        // definition of a single state", which is refused in ITS own terms — a state
+        // object is not a state machine, so nothing about the refusal describes one.
         // Either walk refuses a definition that is not JSON, so what the parse below
         // could fail on is already reported in those words.
-        let judged = match input.state_name {
-            Some(_) => asl::validate(&input.definition),
-            None => asl::validate_single_state(&input.definition),
-        };
-        if let Err(diagnostic) = judged {
-            return Err(invalid_definition(diagnostic));
-        }
+        match input.state_name {
+            Some(_) => asl::validate(&input.definition).map_err(invalid_definition),
+            None => asl::validate_single_state(&input.definition).map_err(|about_the_state| {
+                TestStateErrorModeled::InvalidDefinition(InvalidDefinition {
+                    message: Some(about_the_state),
+                })
+                .into()
+            }),
+        }?;
         let Ok(document) = serde_json::from_str::<Value>(&input.definition) else {
             return Err(invalid_definition(
                 "the definition is not valid JSON".to_string(),

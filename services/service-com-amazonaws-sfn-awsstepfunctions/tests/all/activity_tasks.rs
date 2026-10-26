@@ -21,9 +21,9 @@
 //!    region is `InvalidArn` (400) before any lookup, and an ARN the store holds no
 //!    activity under is `ActivityDoesNotExist` (400);
 //! 4. a task the scheduling state BOUNDED is closed by the clock when that bound runs
-//!    out — `TimeoutSeconds` from the instant the state scheduled it, `HeartbeatSeconds`
-//!    from the instant a worker took it — and the execution waiting at it then reports
-//!    the language's own `States.Timeout`;
+//!    out — both `TimeoutSeconds` and `HeartbeatSeconds` running from the instant a
+//!    worker took it — and the execution waiting at it then reports the language's own
+//!    `States.Timeout`;
 //! 5. a `Task` state that names any other integration schedules nothing: it is the
 //!    call to another service this emulator does not make, so the execution ends
 //!    `FAILED` with `States.Runtime` and no worker is handed anything.
@@ -54,19 +54,23 @@ const MAX_TASK_TOKEN_CHARS: usize = 2048;
 const PAST_A_ONE_SECOND_BOUND: Duration = Duration::from_millis(1_300);
 
 /// The ARN an activity of `name` carries in the region every request here signs for.
-fn activity_arn(name: &str) -> String {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so the suite
+/// that drives a RETRIED activity task reads these helpers rather than carrying a
+/// second copy of them.
+pub(crate) fn activity_arn(name: &str) -> String {
     format!("arn:aws:states:{REGION}:{ACCOUNT}:activity:{name}")
 }
 
 /// Create an activity that must succeed, and return its ARN.
-async fn create_activity(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn create_activity(emulator: &Emulator, name: &str) -> String {
     let created = emulator.ok("CreateActivity", &json!({ "name": name })).await;
     string(&created, "activityArn")
 }
 
 /// A one-state definition whose `Task` state polls `activity_arn`, plus whatever
 /// other members `extra` declares for that state.
-fn activity_definition(activity_arn: &str, extra: Value) -> String {
+pub(crate) fn activity_definition(activity_arn: &str, extra: Value) -> String {
     let Value::Object(extra) = extra else {
         panic!("expected an object of state members, got {extra:?}")
     };
@@ -79,7 +83,7 @@ fn activity_definition(activity_arn: &str, extra: Value) -> String {
 }
 
 /// Poll `activity_arn` once, requiring a 200, and return the body.
-async fn poll(emulator: &Emulator, activity_arn: &str, worker: Option<&str>) -> Value {
+pub(crate) async fn poll(emulator: &Emulator, activity_arn: &str, worker: Option<&str>) -> Value {
     let mut request = json!({ "activityArn": activity_arn });
     if let Some(worker) = worker {
         request
@@ -91,7 +95,7 @@ async fn poll(emulator: &Emulator, activity_arn: &str, worker: Option<&str>) -> 
 }
 
 /// The `(taskToken, input)` a poll that must have been handed a task answered.
-async fn claimed(
+pub(crate) async fn claimed(
     emulator: &Emulator,
     case: &str,
     activity_arn: &str,
@@ -134,7 +138,7 @@ fn is_empty_answer(answer: &Value) -> bool {
 /// by the one test below that waits a hold out. Every other assertion here is about
 /// what the store holds, so it reads the store, the way `sync_execution` does for a
 /// record no operation of this API reports.
-fn queued_tasks(emulator: &Emulator, activity_arn: &str) -> (usize, usize) {
+pub(crate) fn queued_tasks(emulator: &Emulator, activity_arn: &str) -> (usize, usize) {
     let state = emulator.store();
     let store = state.lock();
     let now = SystemTime::now();
@@ -517,21 +521,19 @@ async fn deleting_an_activity_orphans_its_outstanding_task() {
 // ---------------------------------------------------------------------------
 
 /// A task the scheduling state BOUNDED is closed when that bound runs out, and the
-/// execution waiting at it fails with the language's own `States.Timeout`: the
-/// task's own timeout runs from the instant it was scheduled, the heartbeat window
-/// from the instant a worker took it.
+/// execution waiting at it fails with the language's own `States.Timeout`: both
+/// bounds run from the instant a worker took the task, because an activity task's
+/// clock starts at the claim ("for Activities, the count begins when GetActivityTask
+/// receives a token and ActivityStarted is logged in the execution event history").
 #[tokio::test]
 async fn a_bound_the_state_declared_closes_the_task_and_fails_the_execution() {
     let emulator = Emulator::new();
 
     // Each row: the bounds the state declares, and whether a worker claims the task
-    // before the bound is waited out.
+    // before the bound is waited out. Every row claims: a task no worker holds has
+    // started nothing, so neither bound has anything to run against
+    // (`an_unclaimed_task_is_never_timed_out` is that rule's own test).
     let cases: Vec<(&str, Value, bool)> = vec![
-        (
-            "TimeoutSeconds, which runs whether or not anybody polls",
-            json!({ "TimeoutSeconds": 1 }),
-            false,
-        ),
         (
             "TimeoutSeconds, with the task out with a worker",
             json!({ "TimeoutSeconds": 1 }),
