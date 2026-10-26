@@ -32,11 +32,21 @@ pub const DEFAULT_COMPUTE_PLATFORM: &str = "Default";
 /// `AggregationPeriod` enum declares (PT5M, PT1H, P1D), with the lengths the
 /// `GetProfile` doc states — "Aggregated profiles are available with aggregation
 /// periods of 5 minutes, 1 hour, and 1 day, aligned to UTC."
+///
+/// Listed from the MOST GRANULAR window to the coarsest, so the first entry is the finest
+/// period a posted profile is collected into ([`FINEST_AGGREGATION_PERIOD`]).
 pub const AGGREGATION_PERIODS: &[(&str, i64)] = &[
     ("PT5M", 5 * 60),
     ("PT1H", 60 * 60),
     ("P1D", 24 * 60 * 60),
 ];
+
+/// The MOST GRANULAR aggregation period this service aggregates at, as (the modelled
+/// `AggregationPeriod` value, its length in whole seconds): the first entry of
+/// [`AGGREGATION_PERIODS`], which lists them shortest window first. This is the finest
+/// window a posted profile can be collected into — and so the finest resolution a time
+/// series over those profiles can have.
+pub const FINEST_AGGREGATION_PERIOD: (&str, i64) = AGGREGATION_PERIODS[0];
 
 /// The length in seconds of a modelled `AggregationPeriod` value, or `None` when the
 /// string is not one of [`AGGREGATION_PERIODS`], which covers every value the
@@ -74,6 +84,110 @@ pub fn period_validation_message(period: &str) -> String {
     )
 }
 
+/// What a read says when a request names ALL THREE of the members a window is expressed
+/// with: the trio over-determines the range, so the request is refused rather than served
+/// about one reading of it. The `GetProfile` doc states the rule — "Specify the time range
+/// for the requested aggregated profile using 1 or 2 of the following parameters:
+/// startTime, endTime, period. … If you specify all 3 parameters, an exception is thrown."
+pub const OVER_DETERMINED_WINDOW_MESSAGE: &str =
+    "specify 1 or 2 of startTime, endTime and period, not all 3";
+
+/// The time range a request names with the three members this service's reads express a
+/// window with, as [`requested_window`] read them.
+///
+/// Either bound may be OPEN: the trio names a window with 1 or 2 of its members, so a
+/// request that named only one of them leaves the other side to the operation reading it.
+/// `span` is the length the request named, kept beside the bounds for an operation that
+/// completes an open bound with it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestedWindow {
+    /// `startTime`, or the start the named `endTime` and length imply.
+    pub start: Option<DateTime>,
+    /// `endTime`, or the end the named `startTime` and length imply.
+    pub end: Option<DateTime>,
+    /// The length `period` named, or `None` when the request named no length.
+    pub span: Option<Duration>,
+}
+
+/// The window a request names with `startTime`, `endTime` and a `period` giving the
+/// window's LENGTH — this service's one reading of that trio, for every operation that
+/// takes a time range expressed with it.
+///
+/// The rule, as the `GetProfile` doc states it: "Specify the time range for the requested
+/// aggregated profile using 1 or 2 of the following parameters: startTime, endTime,
+/// period. … If you specify all 3 parameters, an exception is thrown." So a length
+/// completes whichever single bound was given, all three together are refused
+/// ([`OVER_DETERMINED_WINDOW_MESSAGE`]), and a length on its own leaves both bounds open —
+/// it says how LONG the window is, not where it sits.
+///
+/// `Err` carries the sentence this service states for the refusal, for each handler to
+/// lift into its own modelled client-input error (HTTP 400): a `period` naming no fixed
+/// span ([`period_validation_message`]), a request naming all three members, or a
+/// COMPLETED pair of bounds that is no interval ([`validate_interval`], so a zero-length
+/// `period` is refused as the zero-width window it names).
+pub fn requested_window(
+    start_time: Option<DateTime>,
+    end_time: Option<DateTime>,
+    period: Option<&str>,
+) -> Result<RequestedWindow, String> {
+    // `period` here is the free-form `Period` string — the LENGTH of the window, stated as
+    // an ISO 8601 duration — and not the `AggregationPeriod` enum a resolution is named
+    // by, so the one read of it is [`iso8601_period`]. Only a string that names no fixed
+    // span is refused.
+    let span = match period {
+        None => None,
+        Some(period) => {
+            Some(iso8601_period(period).ok_or_else(|| period_validation_message(period))?)
+        }
+    };
+
+    let (start, end) = match (start_time, end_time, span) {
+        (Some(_), Some(_), Some(_)) => {
+            return Err(OVER_DETERMINED_WINDOW_MESSAGE.to_string());
+        }
+        (Some(start), None, Some(span)) => (Some(start), Some(shifted(start, span_nanos(span)))),
+        (None, Some(end), Some(span)) => (Some(shifted(end, -span_nanos(span))), Some(end)),
+        // A length alone (and no member at all) names no bound.
+        (start, end, _) => (start, end),
+    };
+
+    // A window that names BOTH bounds names an interval, and a pair of bounds is one only
+    // when the start is strictly before the end. It is checked on the COMPLETED window, so
+    // a length of zero is refused as the zero-width window it names rather than served as
+    // a window at all.
+    if let (Some(start), Some(end)) = (start, end) {
+        validate_interval(start, end)?;
+    }
+    Ok(RequestedWindow { start, end, span })
+}
+
+/// `span` as whole nanoseconds, saturating — the sign is the caller's, which is how the
+/// same span completes a window forwards from a start and backwards from an end.
+pub fn span_nanos(span: Duration) -> i128 {
+    i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
+}
+
+/// `at` moved by `nanos` nanoseconds, exactly: a window length is an arbitrary ISO 8601
+/// duration, so a bound it completes keeps the sub-second part of both the instant and
+/// the span rather than rounding either to whole seconds.
+pub fn shifted(at: DateTime, nanos: i128) -> DateTime {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos()) + nanos;
+    // `div_euclid`/`rem_euclid` floor towards the past on both sides of the epoch, so the
+    // remainder is always in `0..NANOS_PER_SECOND` and is always the in-range sub-second
+    // part of the instant.
+    let seconds = total.div_euclid(NANOS_PER_SECOND);
+    let subsec = total.rem_euclid(NANOS_PER_SECOND);
+    DateTime::from_secs_and_nanos(
+        i64::try_from(seconds).unwrap_or(if seconds.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }),
+        u32::try_from(subsec).unwrap_or(0),
+    )
+}
+
 /// The start of the `period_seconds`-long aggregation window, aligned to the UTC
 /// epoch, that contains the instant `at`. Alignment to UTC is what the `GetProfile`
 /// doc states for every aggregation period, and the epoch is a whole number of
@@ -92,14 +206,9 @@ pub fn aggregation_window_start(at: DateTime, period_seconds: i64) -> DateTime {
 }
 
 /// The SHORTEST aggregation period this service aggregates at, in whole seconds: the
-/// smallest of [`AGGREGATION_PERIODS`], which is the finest window a posted profile can
-/// be collected into. `0` only if the table were empty, which it is not.
+/// length of [`FINEST_AGGREGATION_PERIOD`].
 pub fn finest_aggregation_period_seconds() -> i64 {
-    AGGREGATION_PERIODS
-        .iter()
-        .map(|(_, seconds)| *seconds)
-        .min()
-        .unwrap_or(0)
+    FINEST_AGGREGATION_PERIOD.1
 }
 
 /// How long after an aggregation window CLOSES its aggregated profile is available, in
@@ -190,6 +299,26 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// unparameterised request cannot materialise a response that grows with the number of
 /// stored elements. Inside the modelled `maxResults` range (1..1000).
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// How many frame metrics ONE `BatchGetFrameMetricData` request asks about. An
+/// emulator-chosen bound, for the same reason as [`DEFAULT_LIST_PAGE_SIZE`]: that
+/// operation answers with one value per requested metric per time step, so the response
+/// grows with the PRODUCT of the two and a small request must not be able to materialise
+/// an arbitrarily large one. The model's `FrameMetrics` list declares no maximum length
+/// of its own, so a longer list is refused with that operation's modelled
+/// `ValidationException`, worded the way every other over-long member of this service is
+/// ([`validate_tags`]).
+pub const MAX_FRAME_METRICS_PER_REQUEST: usize = 100;
+
+/// How many thread states ONE requested frame metric names. Emulator-chosen, beside
+/// [`MAX_FRAME_METRICS_PER_REQUEST`] and for the same reason: deriving a metric's value
+/// tests the counts a stored profile document records against the states that metric asks
+/// about, so the work of reading one request's documents grows with this list as well as
+/// with the number of metrics. The model's `ThreadStates` list declares no maximum of its
+/// own, and the runtime thread states a profile records are a small fixed set, so a longer
+/// list is refused with the operation's modelled `ValidationException` in the same wording
+/// ([`validate_tags`]).
+pub const MAX_THREAD_STATES_PER_METRIC: usize = 32;
 
 /// How many anomaly-notification channels one profiling group holds. NOT an
 /// emulator-chosen bound: the model's `Channels` list carries `@length(min: 1, max: 2)`
@@ -995,6 +1124,31 @@ impl ProfilingGroup {
         starts.sort_unstable();
         starts.dedup();
         starts.into_iter().map(DateTime::from_secs).collect()
+    }
+
+    /// Every profile this group retains whose receipt time falls in the HALF-OPEN window
+    /// `[start, end)`, oldest first.
+    ///
+    /// Half-open at the end, like every other window this service steps a time axis with
+    /// ([`aggregated_profile_starts`] reports one aggregated profile per aligned window),
+    /// so back-to-back windows hold each profile exactly once. Aggregated or not: a
+    /// caller that reports only AGGREGATED data asks [`AgentProfile::is_aggregated`],
+    /// while a caller that has to tell "no data in this window" from "data not collected
+    /// yet" needs to see both.
+    ///
+    /// Instants are compared through [`instant_key`], so a receipt a fraction of a
+    /// microsecond inside a bound still falls on the right side of it.
+    ///
+    /// [`aggregated_profile_starts`]: ProfilingGroup::aggregated_profile_starts
+    pub fn profiles_in(&self, start: DateTime, end: DateTime) -> Vec<&AgentProfile> {
+        let (lower, upper) = (instant_key(start), instant_key(end));
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                let at = instant_key(profile.received_at);
+                at >= lower && at < upper
+            })
+            .collect()
     }
 
     /// This group's resource-based policy, or `None` when it has none. A policy with
