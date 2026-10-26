@@ -10,6 +10,13 @@
 //! one that names no job template and does not itself carry the `executionRoleArn`,
 //! `releaseLabel` and `jobDriver` a run cannot exist without.
 //!
+//! `clientToken` is `@idempotencyToken`, so a token already spent on this cluster does
+//! NOT submit the same work twice: the same submission replayed answers with the run the
+//! first call minted, while the same token carrying a DIFFERENT submission is refused
+//! with the modelled `ValidationException` — answering it with the earlier run would drop
+//! the work this call asked for, and nothing would ever run it
+//! ([`crate::state::request_fingerprint`] is what tells the two apart).
+//!
 //! A submission that names a `jobTemplateId` is built from the stored template instead:
 //! `JobTemplateData` is "the values of StartJobRun API requests used in job runs started
 //! using the job template", so the template's `executionRoleArn`, `releaseLabel`,
@@ -199,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
         let scope = crate::state::start_job_run_scope(&input.virtual_cluster_id);
+        // The submission this `clientToken` stands for, digested from the request BEFORE
+        // the store is locked: it depends on nothing in state, and the lock is what
+        // serialises racing submissions that share one token.
+        let fingerprint = crate::state::request_fingerprint(&input);
         let mut state = store.lock();
         state.settle();
 
@@ -364,13 +375,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the job
-        // run the first call minted rather than submitting the work twice.
+        // run the first call minted rather than submitting the work twice. The same token
+        // carrying a DIFFERENT submission is not a replay — answering it with the earlier
+        // run would silently drop the work this call asked for, and nothing would ever
+        // run it — so it is refused.
         let replayed = state
             .replayed_idempotency(&region, &scope, &input.client_token)
             .cloned();
         if let Some(existing) =
             replayed.and_then(|id| state.job_run(&region, &input.virtual_cluster_id, &id))
         {
+            if existing.request_fingerprint != fingerprint {
+                return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "clientToken {} was already used to start job run {}, with different parameters",
+                        input.client_token, existing.id
+                    )),
+                })
+                .into());
+            }
             return Ok(StartJobRunOutput {
                 id: Some(existing.id.clone()),
                 name: existing.name.clone(),
@@ -425,6 +448,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no free slot waits in PENDING past its due instant (`state::settle`).
             state: crate::state::JOB_PENDING.to_string(),
             client_token: input.client_token.clone(),
+            request_fingerprint: fingerprint,
             execution_role_arn: candidate.execution_role_arn,
             release_label: candidate.release_label,
             job_driver: candidate.job_driver,

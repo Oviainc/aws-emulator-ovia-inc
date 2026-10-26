@@ -4,7 +4,9 @@
 //! Mints a virtual cluster and persists it in [`crate::state`]: a fresh
 //! `ResourceIdString` id, the `VirtualClusterArn` built from it, `state = RUNNING` and
 //! `createdAt = now`, plus every member the request carried. A replayed `clientToken`
-//! (`@idempotencyToken`) returns the cluster the first call minted, not a second one.
+//! (`@idempotencyToken`) returns the cluster the first call minted, not a second one;
+//! that same token carrying a DIFFERENT request is refused with the modelled
+//! `ValidationException` ([`crate::state::request_fingerprint`] tells the two apart).
 //!
 //! Both references the request carries are resolved out of state first: a
 //! `securityConfigurationId` that names no stored security configuration is refused with
@@ -175,6 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx);
+        // The request this `clientToken` stands for, digested before the store is locked:
+        // it depends on nothing in state, and the lock is what serialises racing creates
+        // that share one token.
+        let fingerprint = crate::state::request_fingerprint(&input);
         let mut state = store.lock();
         state.settle();
 
@@ -204,6 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken` is `@idempotencyToken`: the same token replayed names the
         // cluster the first call minted, so a retried create never doubles the resource.
         // The token is remembered per region, because the cluster it names exists in one.
+        // The same token carrying a DIFFERENT request is not a replay — answering it with
+        // the first cluster would silently drop the parameters this call asked for — so it
+        // is refused.
         let replayed = state
             .replayed_idempotency(
                 &region,
@@ -212,6 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .cloned();
         if let Some(existing) = replayed.and_then(|id| state.virtual_cluster(&region, &id)) {
+            if existing.request_fingerprint != fingerprint {
+                return Err(CreateVirtualClusterErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "clientToken {} was already used to create virtual cluster {}, with different parameters",
+                            input.client_token, existing.id
+                        )),
+                    },
+                )
+                .into());
+            }
             return Ok(CreateVirtualClusterOutput {
                 id: Some(existing.id.clone()),
                 name: Some(existing.name.clone()),
@@ -291,6 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.scheduler_configuration,
             ),
             client_token: input.client_token.clone(),
+            request_fingerprint: fingerprint,
             update_client_tokens: Vec::new(),
             sequence,
             pending: None,

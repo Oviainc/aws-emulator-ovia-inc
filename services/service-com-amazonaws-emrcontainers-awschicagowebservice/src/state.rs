@@ -26,17 +26,18 @@
 //! that minted it, and an id offered to another region's endpoint names nothing. The
 //! region a request is in is [`request_region`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::Schema;
+use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Configuration, ConfigurationOverrides, ContainerInfo, ContainerProvider, Endpoint, JobDriver,
-    JobRun, JobTemplate, JobTemplateData, ParametricConfigurationOverrides,
-    RetryPolicyConfiguration,
-    SchedulerConfiguration, SchedulerStatus, SecurityConfiguration, SecurityConfigurationData,
-    TemplateParameterConfiguration, VirtualCluster,
+    ConfigurationOverrides, ContainerInfo, ContainerProvider, Endpoint, JobDriver, JobRun,
+    JobTemplate, JobTemplateData, RetryPolicyConfiguration, SchedulerConfiguration,
+    SchedulerStatus, SecurityConfiguration, SecurityConfigurationData, VirtualCluster,
 };
 
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
@@ -501,6 +502,10 @@ pub struct VirtualClusterRecord {
     pub session_enabled: Option<bool>,
     pub scheduler_configuration: Option<SchedulerConfiguration>,
     pub client_token: String,
+    /// [`request_fingerprint`] of the `CreateVirtualCluster` request that minted this
+    /// cluster, so a later call carrying the same `clientToken` is answered as a replay
+    /// only when it is the same request.
+    pub request_fingerprint: String,
     /// The `UpdateVirtualCluster` `clientToken`s this cluster has already applied, most
     /// recent last, at most [`MAX_RETAINED_UPDATE_TOKENS`] of them.
     pub update_client_tokens: Vec<String>,
@@ -579,6 +584,10 @@ pub struct JobRunRecord {
     pub arn: String,
     pub state: String,
     pub client_token: String,
+    /// [`request_fingerprint`] of the `StartJobRun` request that submitted this run, so a
+    /// later call carrying the same `clientToken` is answered as a replay only when it is
+    /// the same submission.
+    pub request_fingerprint: String,
     pub execution_role_arn: Option<String>,
     pub release_label: Option<String>,
     pub job_driver: Option<JobDriver>,
@@ -657,166 +666,368 @@ fn push_part(rendered: &mut String, part: &str) {
     rendered.push(';');
 }
 
-/// Append an optional component, with a present/absent marker of its own, so an absent
-/// member and a member whose value is the empty string are told apart.
-fn push_option(rendered: &mut String, part: Option<&str>) {
-    match part {
-        Some(value) => {
-            push_part(rendered, "1");
-            push_part(rendered, value);
-        }
-        None => push_part(rendered, "0"),
-    }
+/// The one-character tag a rendered value carries ahead of itself, so a member a second
+/// request spells with a value of another KIND cannot render like the value it replaced.
+const KIND_STRING: char = 's';
+const KIND_NUMBER: char = 'n';
+const KIND_BOOLEAN: char = 'b';
+const KIND_TIMESTAMP: char = 't';
+const KIND_BLOB: char = 'x';
+const KIND_STRUCTURE: char = 'r';
+const KIND_LIST: char = 'l';
+const KIND_MAP: char = 'm';
+const KIND_DOCUMENT: char = 'd';
+const KIND_NULL: char = 'z';
+
+/// One level of a [`RequestRendering`].
+enum Frame {
+    /// Children render in the order they were written: a structure's members, or a
+    /// list's elements, whose order is part of the list's value.
+    Ordered {
+        rendered: String,
+        /// Whether these children are a structure's MEMBERS. Only a member may be left
+        /// unwritten, so only a member position can read an omitted value back out of a
+        /// rendering that does not carry it; dropping a list element or a map value
+        /// instead would renumber the list or leave its key without a value.
+        members: bool,
+    },
+    /// A map's entries, held until the whole map is rendered so they can be put in key
+    /// order rather than in hash iteration order. The walk writes an entry as its key
+    /// followed by its value, so a write arriving while no key is held IS the next key.
+    Keyed {
+        entries: Vec<(String, String)>,
+        pending_key: Option<String>,
+    },
 }
 
-/// Append a `TagMap`-shaped member, its entries in key order so the fingerprint does not
-/// depend on hash iteration order. An absent map and an empty one render alike, because
-/// they persist the same record.
-fn push_string_map(rendered: &mut String, map: Option<&HashMap<String, String>>) {
-    let sorted: BTreeMap<&str, &str> = map
-        .into_iter()
-        .flatten()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    push_part(rendered, &sorted.len().to_string());
-    for (key, value) in sorted {
-        push_part(rendered, key);
-        push_part(rendered, value);
-    }
-}
-
-/// Append a `ConfigurationList`. A list is ORDER-SIGNIFICANT, so it renders in request
-/// order.
-///
-/// `Configuration` NESTS ITSELF and this list comes straight from request input, so the
-/// walk is driven by an explicit worklist rather than by recursion: nesting depth then
-/// costs heap — which the server's request-body cap bounds — instead of one stack frame
-/// per level. A Rust stack overflow aborts the process rather than raising a catchable
-/// panic, so one deeply nested request must not be able to reach it.
-///
-/// The rendering stays unambiguous because every list is framed by its own length and
-/// every item contributes exactly its classification, its properties and one child list,
-/// visited depth-first in list order.
-fn push_configurations(rendered: &mut String, list: Option<&[Configuration]>) {
-    let mut worklist: Vec<&[Configuration]> = vec![list.unwrap_or_default()];
-    while let Some(items) = worklist.pop() {
-        push_part(rendered, &items.len().to_string());
-        for item in items {
-            push_part(rendered, &item.classification);
-            push_string_map(rendered, item.properties.as_ref());
-        }
-        // Pushed in reverse, so the next list popped is the FIRST item's children and the
-        // walk stays depth-first in list order.
-        for item in items.iter().rev() {
-            worklist.push(item.configurations.as_deref().unwrap_or_default());
+impl Frame {
+    /// A frame for a structure's members.
+    fn members() -> Self {
+        Frame::Ordered {
+            rendered: String::new(),
+            members: true,
         }
     }
-}
 
-/// Append a `ParametricConfigurationOverrides`, member by member.
-fn push_parametric_overrides(
-    rendered: &mut String,
-    overrides: Option<&ParametricConfigurationOverrides>,
-) {
-    let Some(overrides) = overrides else {
-        push_part(rendered, "0");
-        return;
-    };
-    push_part(rendered, "1");
-    push_configurations(rendered, overrides.application_configuration.as_deref());
-    match overrides.monitoring_configuration.as_ref() {
-        None => push_part(rendered, "0"),
-        Some(monitoring) => {
-            push_part(rendered, "1");
-            push_option(rendered, monitoring.persistent_app_ui.as_deref());
-            match monitoring.cloud_watch_monitoring_configuration.as_ref() {
-                None => push_part(rendered, "0"),
-                Some(cloud_watch) => {
-                    push_part(rendered, "1");
-                    push_option(rendered, cloud_watch.log_group_name.as_deref());
-                    push_option(rendered, cloud_watch.log_stream_name_prefix.as_deref());
+    /// A frame for a list's elements.
+    fn elements() -> Self {
+        Frame::Ordered {
+            rendered: String::new(),
+            members: false,
+        }
+    }
+
+    /// A frame for a map's entries.
+    fn entries() -> Self {
+        Frame::Keyed {
+            entries: Vec::new(),
+            pending_key: None,
+        }
+    }
+
+    /// This frame's finished rendering.
+    fn into_rendering(self) -> String {
+        match self {
+            Frame::Ordered { rendered, .. } => rendered,
+            Frame::Keyed { mut entries, .. } => {
+                entries.sort();
+                let mut rendered = String::new();
+                for (key, value) in entries {
+                    push_part(&mut rendered, &key);
+                    push_part(&mut rendered, &value);
                 }
-            }
-            match monitoring.s3_monitoring_configuration.as_ref() {
-                None => push_part(rendered, "0"),
-                Some(s3) => {
-                    push_part(rendered, "1");
-                    push_option(rendered, s3.log_uri.as_deref());
-                }
+                rendered
             }
         }
     }
 }
 
-/// Append a `JobDriver`: both union-shaped members, each present or absent.
-fn push_job_driver(rendered: &mut String, driver: &JobDriver) {
-    match driver.spark_submit_job_driver.as_ref() {
-        None => push_part(rendered, "0"),
-        Some(spark_submit) => {
-            push_part(rendered, "1");
-            push_part(rendered, &spark_submit.entry_point);
-            let arguments = spark_submit.entry_point_arguments.as_deref().unwrap_or(&[]);
-            push_part(rendered, &arguments.len().to_string());
-            for argument in arguments {
-                push_part(rendered, argument);
+/// A canonical rendering of a request, built by walking the request value itself.
+///
+/// Every generated input struct implements
+/// [`SerializableStruct`](aws_smithy_schema::serde::SerializableStruct), whose
+/// `serialize_members` threads each member's `&Schema` through every write — the same
+/// visitor the boundary's constraint walk is driven by. So this is ONE rendering good for
+/// every member of every input shape, rather than a per-operation list of members that a
+/// model change could leave behind.
+///
+/// Two renderings are equal exactly when the two requests carried the same members with
+/// the same values:
+///
+/// * every component is written behind its own byte length ([`push_part`]), so no value
+///   can run into its neighbour;
+/// * a structure member renders behind its member name, so two requests that fill
+///   different members of one shape differ even where the value is the same;
+/// * a list renders in request order and a map in key order, so one request never
+///   renders two ways;
+/// * a collection the request omitted and one it sent EMPTY render alike, because a
+///   handler persists the same record for both. A structure is not collapsed that way: an
+///   empty one is a member the request carried.
+///
+/// The walk descends as the request nests, which is the depth the protocol boundary
+/// already deserialized and constraint-checked this same value at.
+struct RequestRendering {
+    /// The nesting being built, innermost last. The bottom frame is the request itself.
+    frames: Vec<Frame>,
+}
+
+impl RequestRendering {
+    fn new() -> Self {
+        Self {
+            frames: vec![Frame::members()],
+        }
+    }
+
+    /// Whether what is being emitted now sits in a structure MEMBER.
+    fn in_member_position(&self) -> bool {
+        matches!(self.frames.last(), Some(Frame::Ordered { members: true, .. }))
+    }
+
+    /// Emit one finished value into the frame being built.
+    fn emit(&mut self, member: Option<&str>, value: &str) {
+        let Some(frame) = self.frames.last_mut() else {
+            return;
+        };
+        match frame {
+            Frame::Ordered { rendered, .. } => {
+                push_part(rendered, member.unwrap_or(""));
+                push_part(rendered, value);
             }
-            push_option(rendered, spark_submit.spark_submit_parameters.as_deref());
+            Frame::Keyed {
+                entries,
+                pending_key,
+            } => match pending_key.take() {
+                None => *pending_key = Some(value.to_string()),
+                Some(key) => entries.push((key, value.to_string())),
+            },
         }
     }
-    match driver.spark_sql_job_driver.as_ref() {
-        None => push_part(rendered, "0"),
-        Some(spark_sql) => {
-            push_part(rendered, "1");
-            push_option(rendered, spark_sql.entry_point.as_deref());
-            push_option(rendered, spark_sql.spark_sql_parameters.as_deref());
+
+    /// Emit one leaf: its kind tag, then the value as text.
+    fn leaf(&mut self, schema: &Schema, kind: char, value: &str) {
+        let mut rendered = String::with_capacity(value.len() + 1);
+        rendered.push(kind);
+        rendered.push_str(value);
+        self.emit(schema.member_name(), &rendered);
+    }
+
+    /// Render one container's children into their own frame, then emit the result.
+    ///
+    /// `collapse_empty` is what makes an absent collection and an empty one render alike,
+    /// and it applies only where the container sits in a structure MEMBER: that is the
+    /// only position a request can leave unwritten.
+    fn container(
+        &mut self,
+        schema: &Schema,
+        kind: char,
+        frame: Frame,
+        collapse_empty: bool,
+        write_children: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        self.frames.push(frame);
+        let outcome = write_children(self);
+        let children = self
+            .frames
+            .pop()
+            .map(Frame::into_rendering)
+            .unwrap_or_default();
+        outcome?;
+        if collapse_empty && children.is_empty() && self.in_member_position() {
+            return Ok(());
+        }
+        let mut rendered = String::with_capacity(children.len() + 1);
+        rendered.push(kind);
+        rendered.push_str(&children);
+        self.emit(schema.member_name(), &rendered);
+        Ok(())
+    }
+
+    /// The finished rendering of the whole request.
+    fn finish(mut self) -> String {
+        self.frames
+            .pop()
+            .map(Frame::into_rendering)
+            .unwrap_or_default()
+    }
+}
+
+impl ShapeSerializer for RequestRendering {
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> Result<(), SerdeError> {
+        self.container(
+            schema,
+            KIND_STRUCTURE,
+            Frame::members(),
+            false,
+            &|children| value.serialize_members(children),
+        )
+    }
+
+    fn write_list(
+        &mut self,
+        schema: &Schema,
+        write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        self.container(
+            schema,
+            KIND_LIST,
+            Frame::elements(),
+            true,
+            write_elements,
+        )
+    }
+
+    fn write_map(
+        &mut self,
+        schema: &Schema,
+        write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        self.container(
+            schema,
+            KIND_MAP,
+            Frame::entries(),
+            true,
+            write_entries,
+        )
+    }
+
+    fn write_boolean(&mut self, schema: &Schema, value: bool) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_BOOLEAN, &value.to_string());
+        Ok(())
+    }
+
+    fn write_byte(&mut self, schema: &Schema, value: i8) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_short(&mut self, schema: &Schema, value: i16) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_integer(&mut self, schema: &Schema, value: i32) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_long(&mut self, schema: &Schema, value: i64) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_float(&mut self, schema: &Schema, value: f32) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_double(&mut self, schema: &Schema, value: f64) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, &value.to_string());
+        Ok(())
+    }
+
+    fn write_big_integer(&mut self, schema: &Schema, value: &BigInteger) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, value.as_ref());
+        Ok(())
+    }
+
+    fn write_big_decimal(&mut self, schema: &Schema, value: &BigDecimal) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NUMBER, value.as_ref());
+        Ok(())
+    }
+
+    fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_STRING, value);
+        Ok(())
+    }
+
+    fn write_blob(&mut self, schema: &Schema, value: &[u8]) -> Result<(), SerdeError> {
+        // The bytes themselves, not their length: two blobs of one size are two values.
+        self.leaf(schema, KIND_BLOB, &hex::encode(value));
+        Ok(())
+    }
+
+    fn write_timestamp(&mut self, schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_TIMESTAMP, &millis_of(value).to_string());
+        Ok(())
+    }
+
+    fn write_document(&mut self, schema: &Schema, value: &Document) -> Result<(), SerdeError> {
+        let mut rendered = String::new();
+        push_document(&mut rendered, value);
+        self.leaf(schema, KIND_DOCUMENT, &rendered);
+        Ok(())
+    }
+
+    fn write_null(&mut self, schema: &Schema) -> Result<(), SerdeError> {
+        self.leaf(schema, KIND_NULL, "");
+        Ok(())
+    }
+}
+
+/// Append a free-form `Document`, which carries no schema to walk, so its own shape is
+/// what is rendered: an object's members in key order, on the same terms as a modelled
+/// map's, and an array's items in order.
+///
+/// No input shape of this service targets a document, so nothing reaches this today; it
+/// is here because [`request_fingerprint`] is the rendering of a request for every
+/// operation, and a renderer that silently dropped a member's value would answer a
+/// different request as a replay.
+fn push_document(rendered: &mut String, document: &Document) {
+    match document {
+        Document::Null => push_part(rendered, &KIND_NULL.to_string()),
+        Document::Bool(value) => push_part(rendered, &format!("{KIND_BOOLEAN}{value}")),
+        Document::Number(number) => {
+            let value = match number {
+                ::aws_smithy_types::Number::PosInt(value) => value.to_string(),
+                ::aws_smithy_types::Number::NegInt(value) => value.to_string(),
+                ::aws_smithy_types::Number::Float(value) => value.to_string(),
+            };
+            push_part(rendered, &format!("{KIND_NUMBER}{value}"));
+        }
+        Document::String(value) => push_part(rendered, &format!("{KIND_STRING}{value}")),
+        Document::Array(items) => {
+            push_part(rendered, &format!("{KIND_LIST}{}", items.len()));
+            for item in items {
+                push_document(rendered, item);
+            }
+        }
+        Document::Object(members) => {
+            push_part(rendered, &format!("{KIND_MAP}{}", members.len()));
+            let mut sorted: Vec<(&String, &Document)> = members.iter().collect();
+            sorted.sort_unstable_by_key(|(name, _)| *name);
+            for (name, member) in sorted {
+                push_part(rendered, name);
+                push_document(rendered, member);
+            }
         }
     }
 }
 
-/// Append a `TemplateParameterConfigurationMap`, its entries in key order.
-fn push_parameter_configuration(
-    rendered: &mut String,
-    map: Option<&HashMap<String, TemplateParameterConfiguration>>,
-) {
-    let sorted: BTreeMap<&str, &TemplateParameterConfiguration> = map
-        .into_iter()
-        .flatten()
-        .map(|(key, value)| (key.as_str(), value))
-        .collect();
-    push_part(rendered, &sorted.len().to_string());
-    for (key, value) in sorted {
-        push_part(rendered, key);
-        push_option(rendered, value.r#type.as_deref());
-        push_option(rendered, value.default_value.as_deref());
-    }
-}
-
-/// A fixed-size fingerprint of EVERY parameter a job template is built from.
+/// A fixed-size fingerprint of EVERY member a request carried.
 ///
 /// `clientToken` is `@idempotencyToken`, which means "the same token names the same
 /// request": a second call carrying a token already spent is a replay only when it
-/// really is the same request. This digest is how that is decided, so it has to cover
-/// every member that ends up on the stored record — `name`, the whole
-/// `jobTemplateData` tree, `tags` and `kmsKeyArn` — and nothing that does not.
+/// really is the same request, and this digest is how that is decided. It is taken from
+/// the request value itself ([`RequestRendering`]), so every operation whose input
+/// carries such a token decides a replay the same way and no member is left out of the
+/// comparison.
 ///
-/// SHA-256, so the size is fixed however large the request was, and a map's entries are
-/// rendered in key order so one request never fingerprints two ways.
-pub fn job_template_fingerprint(
-    name: &str,
-    data: &JobTemplateData,
-    tags: Option<&HashMap<String, String>>,
-    kms_key_arn: Option<&str>,
-) -> String {
-    let mut rendered = String::new();
-    push_part(&mut rendered, name);
-    push_part(&mut rendered, &data.execution_role_arn);
-    push_part(&mut rendered, &data.release_label);
-    push_parametric_overrides(&mut rendered, data.configuration_overrides.as_ref());
-    push_job_driver(&mut rendered, &data.job_driver);
-    push_parameter_configuration(&mut rendered, data.parameter_configuration.as_ref());
-    push_string_map(&mut rendered, data.job_tags.as_ref());
-    push_string_map(&mut rendered, tags);
-    push_option(&mut rendered, kms_key_arn);
+/// SHA-256, so the size is fixed however large the request was.
+pub fn request_fingerprint(input: &dyn SerializableStruct) -> String {
+    let mut rendering = RequestRendering::new();
+    // Nothing in this walk can fail — every write appends to a `String` — so this is the
+    // serializer error channel going unused. A failure is folded INTO the rendering
+    // rather than dropped, so a request this could not render whole never fingerprints
+    // like one it could.
+    let outcome = input.serialize_members(&mut rendering);
+    let mut rendered = rendering.finish();
+    if let Err(error) = outcome {
+        push_part(&mut rendered, &error.to_string());
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(rendered.as_bytes());
@@ -844,7 +1055,7 @@ pub struct JobTemplateRecord {
     /// The principal that created this template ([`caller_identity_arn`]), recorded at
     /// `CreateJobTemplate` so every later read attributes it to the same identity.
     pub created_by: String,
-    /// [`job_template_fingerprint`] of the request that minted this template, so a later
+    /// [`request_fingerprint`] of the request that minted this template, so a later
     /// call carrying the same `clientToken` is answered as a replay only when it is the
     /// same request.
     pub request_fingerprint: String,
@@ -890,6 +1101,10 @@ pub struct SecurityConfigurationRecord {
     pub container_provider: Option<ContainerProvider>,
     pub tags: HashMap<String, String>,
     pub client_token: String,
+    /// [`request_fingerprint`] of the `CreateSecurityConfiguration` request that minted
+    /// this configuration, so a later call carrying the same `clientToken` is answered as
+    /// a replay only when it is the same request.
+    pub request_fingerprint: String,
     /// The principal that created this configuration ([`caller_identity_arn`]), recorded
     /// at `CreateSecurityConfiguration` so every later read attributes it to the same
     /// identity.
@@ -946,6 +1161,10 @@ pub struct ManagedEndpointRecord {
     pub created_at_millis: i64,
     pub tags: HashMap<String, String>,
     pub client_token: String,
+    /// [`request_fingerprint`] of the `CreateManagedEndpoint` request that minted this
+    /// endpoint, so a later call carrying the same `clientToken` is answered as a replay
+    /// only when it is the same request.
+    pub request_fingerprint: String,
     /// Creation sequence, so endpoints minted within one millisecond still have a total
     /// order for `ListManagedEndpoints` to page through.
     pub sequence: u64,
