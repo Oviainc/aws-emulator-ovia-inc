@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUICustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUICustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUICustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the classic hosted UI branding in force for one app client of a user
+//! pool, or for the pool itself, rendered from what `SetUICustomization` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUICustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUICustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUICustomization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The endpoint this request arrived at, which is where the stored logo
+        // image is located for the caller.
+        let host = crate::state::request_host(ctx);
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "The ID of the app client that you want to query for branding
+        // settings" (this operation's `ClientId`): an app client the pool does
+        // not hold has no branding settings to query. The pool-level default,
+        // which a request names with a `ClientId` of ALL, is a level of the
+        // pool itself rather than an app client.
+        if let Some(client_id) = input
+            .client_id
+            .as_deref()
+            .filter(|id| *id != crate::state::UI_CUSTOMIZATION_ALL_CLIENTS)
+        {
+            if !pool.clients.contains_key(client_id) {
+                return Err(client_not_found(client_id));
+            }
+        }
+
+        // Rendered from the STORED configuration of the level in force, which
+        // falls back to the pool-level default; a pool that has had no branding
+        // applied at either level "returns an empty object" (this operation).
+        // This read changes nothing.
+        let ui_customization = pool
+            .ui_customization(input.client_id.as_deref())
+            .map(|stored| pool.to_ui_customization_type(stored, host.as_deref()))
+            .unwrap_or_default();
+        Ok(GetUICustomizationOutput { ui_customization })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> GetUICustomizationError {
+    GetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+fn client_not_found(client_id: &str) -> GetUICustomizationError {
+    GetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GetUICustomizationError {
+    GetUICustomizationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

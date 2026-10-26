@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetUICustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetUICustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetUICustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the classic hosted UI branding of one user pool, or of one app client of
+//! it, keeping every value the request leaves out, and answers the configuration
+//! that level holds afterwards, read back from what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetUICustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetUICustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetUICustomization"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // The level this call configures: the app client it names, or the
+        // pool-level default, since "when this value isn't present, the
+        // customization applies to all user pool app clients that don't have
+        // client-level settings" (`UICustomizationType.ClientId`) and that
+        // default is the level "with a ClientId of ALL" (this operation).
+        let client_id = input
+            .client_id
+            .clone()
+            .unwrap_or_else(|| crate::state::UI_CUSTOMIZATION_ALL_CLIENTS.to_string());
+        let now = ::std::time::SystemTime::now();
+        // The endpoint this request arrived at, which is where the stored logo
+        // image is located for the caller.
+        let host = crate::state::request_host(ctx);
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "The ID of the app client that you want to customize" (this
+        // operation's `ClientId`): branding named for an app client the pool
+        // does not hold customizes nothing. The pool-level default is a level
+        // of the pool itself rather than an app client, so it is always there
+        // to configure.
+        if client_id != crate::state::UI_CUSTOMIZATION_ALL_CLIENTS
+            && !pool.clients.contains_key(&client_id)
+        {
+            return Err(client_not_found(&client_id));
+        }
+
+        // Stored first, then rendered from the STORED record, so the response
+        // is exactly what a later `GetUICustomization` of this level reads back.
+        pool.apply_ui_customization(&client_id, input.css, input.image_file, now);
+        let stored = pool
+            .ui_customizations
+            .get(&client_id)
+            .ok_or_else(internal_error)?;
+        Ok(SetUICustomizationOutput {
+            ui_customization: pool.to_ui_customization_type(stored, host.as_deref()),
+        })
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> SetUICustomizationError {
+    SetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an app client the named pool
+/// does not hold.
+fn client_not_found(client_id: &str) -> SetUICustomizationError {
+    SetUICustomizationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> SetUICustomizationError {
+    SetUICustomizationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

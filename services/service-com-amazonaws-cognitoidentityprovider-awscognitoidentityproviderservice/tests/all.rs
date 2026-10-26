@@ -101,6 +101,8 @@ mod state_roundtrip;
 mod terms_documents;
 #[path = "all/token_signing.rs"]
 mod token_signing;
+#[path = "all/ui_customization.rs"]
+mod ui_customization;
 #[path = "all/update_group.rs"]
 mod update_group;
 #[path = "all/update_resource_server.rs"]

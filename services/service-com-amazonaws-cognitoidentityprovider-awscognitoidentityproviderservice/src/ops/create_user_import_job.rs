@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         // The endpoint this request arrived at, which is what the job's CSV
         // upload locator is built from.
-        let host = request_host(ctx);
+        let host = crate::state::request_host(ctx);
 
         let mut guard = state.lock();
         let pool = guard
@@ -240,24 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// How many `JobId` candidates one create tries before giving up, so a
 /// collision cannot make the mint loop.
 const MINT_ATTEMPTS: usize = 8;
-
-/// The endpoint host this request addressed — its `Host` header, or the
-/// authority of the request URI when it carries one — which is the endpoint a
-/// locator this operation hands out has to name. `None` when the request names
-/// no endpoint of its own.
-fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
-    ctx.parts()
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| {
-            ctx.parts()
-                .uri
-                .authority()
-                .map(::http::uri::Authority::as_str)
-        })
-        .map(ToString::to_string)
-}
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 fn user_pool_not_found(user_pool_id: &str) -> CreateUserImportJobError {

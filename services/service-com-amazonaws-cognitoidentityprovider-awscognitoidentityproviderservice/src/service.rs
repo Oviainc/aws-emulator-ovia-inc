@@ -31,9 +31,12 @@
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
 //!   404, …). Return `Some(resp)` to answer in your own envelope if desired. This
-//!   service answers one such request itself: a GET of a pool's
+//!   service answers two such requests itself: a GET of a pool's
 //!   `/<UserPoolId>/.well-known/jwks.json`, the public key set its tokens are
-//!   verified against, which the Smithy model does not describe.
+//!   verified against, and a GET of a level's
+//!   `/<UserPoolId>/<ClientId>/assets/login_logo.png`, the classic hosted UI logo
+//!   image `SetUICustomization` stored — neither of which the Smithy model
+//!   describes.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -56,10 +59,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The shared engine, so the one non-API route a user-pool endpoint serves
-    /// (the pool's JSON Web Key Set, see [`EmulatedService::override_routing_error`])
-    /// can be answered from this service's stored state. Operations reach the
-    /// engine through the entry that constructed them, not through this field.
+    /// The shared engine, so the non-API routes a user-pool endpoint serves
+    /// (the pool's JSON Web Key Set and a level's hosted logo image, see
+    /// [`EmulatedService::override_routing_error`]) can be answered from this
+    /// service's stored state. Operations reach the engine through the entry
+    /// that constructed them, not through this field.
     engine: Arc<Eng>,
 }
 
@@ -113,6 +117,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // through, and where this rule belongs for them.
         routes_to_signing_name(parts, self.entry.identity().signing_name())
             || unsigned_target_names_shape(parts, self.entry.identity().shape_id())
+            // The hosted UI logo image this service hands out a locator for
+            // (`UICustomizationType.ImageUrl`) is fetched by an anonymous
+            // browser, with no credential scope and no `X-Amz-Target` to name
+            // this service by — only the path this service itself published. A
+            // GET of exactly that path is therefore claimed here, so the image
+            // is reachable at the URL this service reported; every other path
+            // still needs one of the two routing keys above.
+            || (parts.method == http::Method::GET
+                && hosted_logo_route(&parts.uri.to_string()).is_some())
     }
 
     fn override_operation(
@@ -155,22 +168,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation. A user-pool endpoint serves ONE route this
-        // service's Smithy model does not describe: the pool's JSON Web Key
-        // Set at `/<UserPoolId>/.well-known/jwks.json`, which every verifier of
-        // a Cognito token fetches to check the token's signature, under the
-        // algorithm the key set itself names (Amazon
+        // modeled operation. A user-pool endpoint serves TWO routes this
+        // service's Smithy model does not describe. The first is the pool's JSON
+        // Web Key Set at `/<UserPoolId>/.well-known/jwks.json`, which every
+        // verifier of a Cognito token fetches to check the token's signature,
+        // under the algorithm the key set itself names (Amazon
         // Cognito Developer Guide, "Verifying a JSON web token"). It carries
         // only PUBLIC key parameters and AWS serves it unauthenticated, which
         // is what this seam gives: the router consults it before it
         // authenticates anything, so an anonymous GET reaches the document the
-        // same way it does on AWS. Every other unrouted request keeps the
-        // framework's protocol-correct refusal.
+        // same way it does on AWS. The second is the classic hosted UI logo
+        // image of one level of a pool, which `UICustomizationType.ImageUrl`
+        // locates for an anonymous browser to fetch. Every other unrouted
+        // request keeps the framework's protocol-correct refusal.
         if req.method() != "GET" {
             return None;
         }
-        let user_pool_id = jwks_route_pool_id(req.uri())?.to_string();
         let state = crate::state::service_state(&*self.engine)?;
+        if let Some((user_pool_id, client_id)) = hosted_logo_route(req.uri()) {
+            // A path naming no stored image is not this route: it falls through
+            // to the framework's refusal rather than answering an empty body.
+            // Rendering the STORED bytes is a pure read.
+            let image = {
+                let guard = state.lock();
+                guard.pool(user_pool_id)?.hosted_logo(client_id)?.to_vec()
+            };
+            let media_type = logo_media_type(&image);
+            let mut response = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200).ok()?,
+                ::aws_smithy_types::body::SdkBody::from(image),
+            );
+            response.headers_mut().insert("content-type", media_type);
+            return Some(response);
+        }
+        let user_pool_id = jwks_route_pool_id(req.uri())?.to_string();
         let document = {
             let guard = state.lock();
             // A path naming no stored pool is not this route: it falls through
@@ -214,6 +245,73 @@ fn jwks_route_pool_id(uri: &str) -> Option<&str> {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
     let (user_pool_id, tail) = path.strip_prefix('/')?.split_once('/')?;
     (!user_pool_id.is_empty() && tail == ".well-known/jwks.json").then_some(user_pool_id)
+}
+
+/// The pool and the level whose hosted UI logo image `uri` addresses, for a
+/// request path of the form `/<UserPoolId>/<ClientId>/assets/login_logo.png`,
+/// and `None` for every other path.
+///
+/// This is the path [`crate::state::hosted_logo_url`] builds — the two read the
+/// same [`crate::state::HOSTED_LOGO_FILE`], so a locator this service hands out
+/// and the route that serves it cannot drift. Both segments have to have the
+/// FORM this service mints them in, so a path of the same shape addressed to
+/// another mounted service (a path-style object GET, say) is not mistaken for a
+/// locator this service published.
+fn hosted_logo_route(uri: &str) -> Option<(&str, &str)> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (user_pool_id, tail) = path.strip_prefix('/')?.split_once('/')?;
+    let (client_id, file) = tail.split_once('/')?;
+    (file == crate::state::HOSTED_LOGO_FILE
+        && is_user_pool_id_shaped(user_pool_id)
+        && is_client_id_shaped(client_id))
+    .then_some((user_pool_id, client_id))
+}
+
+/// Whether `candidate` has the form of a `UserPoolIdType`: the modelled pattern
+/// `^[\w-]+_[0-9a-zA-Z]+$` and length 1..55 (this service's model). The suffix
+/// carries no underscore, so the LAST one separates the two halves.
+fn is_user_pool_id_shaped(candidate: &str) -> bool {
+    let Some((prefix, suffix)) = candidate.rsplit_once('_') else {
+        return false;
+    };
+    candidate.len() <= 55
+        && !prefix.is_empty()
+        && !suffix.is_empty()
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether `candidate` has the form of a `ClientIdType`: the modelled pattern
+/// `^[\w+]+$` and length 1..128 (this service's model), which the pool-level
+/// default [`crate::state::UI_CUSTOMIZATION_ALL_CLIENTS`] also satisfies.
+fn is_client_id_shaped(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 128
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+'))
+}
+
+/// The media type a stored logo image is served as, read from the image's own
+/// leading bytes: the file formats a browser renders a login logo in each
+/// announce themselves there (PNG, RFC 2083 §3.1; JPEG, ISO/IEC 10918-1;
+/// GIF87a and GIF89a; the RIFF container WebP rides in). Bytes that announce
+/// none of them are served as unnamed binary rather than as an image they are
+/// not.
+fn logo_media_type(image: &[u8]) -> &'static str {
+    if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if image.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if image.starts_with(b"GIF87a") || image.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if image.starts_with(b"RIFF") && image.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 /// Whether the routing key the framework resolves for `parts` is `signing_name`.
@@ -270,12 +368,121 @@ fn unsigned_target_names_shape(parts: &http::request::Parts, service_shape_id: &
 #[cfg(test)]
 mod tests {
     //! The two names this ONE `awsJson` endpoint answers on, over the signals a request
-    //! can carry, beside the one non-modelled path this endpoint serves a document on.
-    //! `tests/all/initiate_auth.rs` asserts the routing rule on the wire, through the
-    //! router, and `tests/all/token_signing.rs` fetches the key set over it; these
-    //! tables are the rules themselves, row by row.
+    //! can carry, beside the two non-modelled paths this endpoint serves a document and
+    //! an image on. `tests/all/initiate_auth.rs` asserts the routing rule on the wire,
+    //! through the router, `tests/all/token_signing.rs` fetches the key set over it and
+    //! `tests/all/ui_customization.rs` fetches a stored logo over it; these tables are
+    //! the rules themselves, row by row.
 
-    use super::{jwks_route_pool_id, routes_to_signing_name, unsigned_target_names_shape};
+    use super::{
+        hosted_logo_route, jwks_route_pool_id, logo_media_type, routes_to_signing_name,
+        unsigned_target_names_shape,
+    };
+
+    /// [`hosted_logo_route`] over the paths that reach this service: the locator
+    /// this service publishes, and the paths that are not it — including one of
+    /// the same SHAPE whose segments are not the form this service mints, which
+    /// another mounted service may own.
+    #[test]
+    fn only_a_published_logo_locator_names_a_pool_and_a_level() {
+        /// One row: a path that reaches this service, and the pool and level it
+        /// addresses a logo of, if any.
+        struct Row {
+            case: &'static str,
+            path: &'static str,
+            expected: Option<(&'static str, &'static str)>,
+        }
+
+        let rows = [
+            Row {
+                case: "the pool-level default's logo",
+                path: "/us-east-1_abc123def/ALL/assets/login_logo.png",
+                expected: Some(("us-east-1_abc123def", "ALL")),
+            },
+            Row {
+                case: "an app client's own logo",
+                path: "/us-west-2_0a9b8c7d6/1h57kf5cpq17m0eml12eu8b4cg/assets/login_logo.png",
+                expected: Some(("us-west-2_0a9b8c7d6", "1h57kf5cpq17m0eml12eu8b4cg")),
+            },
+            Row {
+                case: "a logo with a cache-busting query",
+                path: "/us-east-1_abc123def/ALL/assets/login_logo.png?v=2",
+                expected: Some(("us-east-1_abc123def", "ALL")),
+            },
+            Row {
+                case: "a path-style object of the same shape, whose first segment is no pool id",
+                path: "/my-bucket/branding/assets/login_logo.png",
+                expected: None,
+            },
+            Row {
+                case: "a level whose id is outside ClientIdType's pattern",
+                path: "/us-east-1_abc123def/not a client/assets/login_logo.png",
+                expected: None,
+            },
+            Row {
+                case: "another asset of the same level",
+                path: "/us-east-1_abc123def/ALL/assets/background.png",
+                expected: None,
+            },
+            Row {
+                case: "the pool's key set, which is the other non-modelled route",
+                path: "/us-east-1_abc123def/.well-known/jwks.json",
+                expected: None,
+            },
+            Row {
+                case: "the root path, where every modelled call goes",
+                path: "/",
+                expected: None,
+            },
+            Row {
+                case: "a logo path with no leading slash",
+                path: "us-east-1_abc123def/ALL/assets/login_logo.png",
+                expected: None,
+            },
+        ];
+
+        for row in rows {
+            let actual = hosted_logo_route(row.path);
+            assert_eq!(
+                actual, row.expected,
+                "case {:?} ({}): expected {:?}, got {actual:?}",
+                row.case, row.path, row.expected
+            );
+        }
+    }
+
+    /// [`logo_media_type`] over the leading bytes each image format announces
+    /// itself with, and over bytes that announce none.
+    #[test]
+    fn a_logo_is_served_as_the_format_its_own_bytes_announce() {
+        // (case, leading bytes, expected media type)
+        let rows: &[(&str, &[u8], &str)] = &[
+            ("a PNG", b"\x89PNG\r\n\x1a\n rest", "image/png"),
+            ("a JPEG", b"\xff\xd8\xff\xe0 rest", "image/jpeg"),
+            ("a GIF87a", b"GIF87a rest", "image/gif"),
+            ("a GIF89a", b"GIF89a rest", "image/gif"),
+            ("a WebP", b"RIFF\x10\x00\x00\x00WEBPVP8 ", "image/webp"),
+            (
+                "a RIFF container that is not WebP",
+                b"RIFF\x10\x00\x00\x00WAVEfmt ",
+                "application/octet-stream",
+            ),
+            (
+                "markup, which is never served as markup",
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+                "application/octet-stream",
+            ),
+            ("bytes too short to announce anything", b"\x89P", "application/octet-stream"),
+        ];
+
+        for (case, image, expected) in rows {
+            let actual = logo_media_type(image);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
 
     /// [`jwks_route_pool_id`] over the paths that reach this service: the key-set
     /// route, and the paths that are not it.

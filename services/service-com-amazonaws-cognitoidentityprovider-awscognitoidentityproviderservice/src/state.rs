@@ -1125,6 +1125,15 @@ pub struct UserPool {
     /// one entry of this map and it holds at most [`MAX_CLIENTS_PER_POOL`]
     /// styles.
     pub managed_login_branding: BTreeMap<String, ManagedLoginBranding>,
+    /// This pool's classic hosted UI branding keyed by the app client it
+    /// customizes, with [`UI_CUSTOMIZATION_ALL_CLIENTS`] holding the pool-level
+    /// default: "Set the default configuration for all clients with a ClientId
+    /// of ALL. When the ClientId value is an app client ID, the settings you
+    /// pass in this request apply to that app client and override the default
+    /// ALL configuration" (`SetUICustomization`), so one entry per level and at
+    /// most one more than [`MAX_CLIENTS_PER_POOL`]. Ordered, so a read of
+    /// several is stable.
+    pub ui_customizations: BTreeMap<String, UiCustomization>,
     /// This pool's user import jobs keyed by their minted `JobId`, ordered so a
     /// read of several is stable: "Import jobs are retained in user pool
     /// configuration so that you can stage, stop, start, review, and delete
@@ -1749,6 +1758,91 @@ impl UserPool {
         self.managed_login_branding
             .values()
             .find(|stored| stored.client_id == client_id)
+    }
+
+    /// The classic hosted UI branding in force for `client_id`, or `None` when
+    /// neither that app client nor the pool has any.
+    ///
+    /// "Returns user-pool level branding information if no app client branding
+    /// is applied, or if you don't specify an app client ID"
+    /// (`GetUICustomization`), so a client-level entry answers when the named
+    /// app client has one and the pool-level default answers otherwise. A caller
+    /// that names [`UI_CUSTOMIZATION_ALL_CLIENTS`] names that default itself.
+    pub fn ui_customization(&self, client_id: Option<&str>) -> Option<&UiCustomization> {
+        client_id
+            .filter(|id| *id != UI_CUSTOMIZATION_ALL_CLIENTS)
+            .and_then(|id| self.ui_customizations.get(id))
+            .or_else(|| self.ui_customizations.get(UI_CUSTOMIZATION_ALL_CLIENTS))
+    }
+
+    /// Store the classic hosted UI branding of `client_id`, keeping every value
+    /// the request leaves out.
+    ///
+    /// `SetUICustomization` models `CSS` and `ImageFile` as optional members of
+    /// a call that "configures UI branding settings", so a member the request
+    /// omits names no new value for it and the stored one stays in force; an
+    /// `ImageFile` of no bytes (`ImageFileType`'s length admits the empty blob)
+    /// carries no image, so it stores none.
+    pub fn apply_ui_customization(
+        &mut self,
+        client_id: &str,
+        css: Option<String>,
+        image_file: Option<Vec<u8>>,
+        now: SystemTime,
+    ) {
+        let version = css_version_stamp(now);
+        let stored = self
+            .ui_customizations
+            .entry(client_id.to_string())
+            .or_insert_with(|| UiCustomization {
+                client_id: client_id.to_string(),
+                css: None,
+                image_file: None,
+                css_version: version.clone(),
+                creation_date: now,
+                last_modified_date: now,
+            });
+        if let Some(css) = css {
+            stored.css = Some(css);
+        }
+        if let Some(image_file) = image_file {
+            stored.image_file = (!image_file.is_empty()).then_some(image_file);
+        }
+        stored.css_version = version;
+        stored.last_modified_date = now;
+    }
+
+    /// The modelled view of the stored classic hosted UI branding
+    /// `customization` of this pool, rendered from what is stored, with its
+    /// stored logo image located on the endpoint `host` the reading request
+    /// arrived at.
+    pub fn to_ui_customization_type(
+        &self,
+        customization: &UiCustomization,
+        host: Option<&str>,
+    ) -> crate::ops::types::UICustomizationType {
+        crate::ops::types::UICustomizationType {
+            user_pool_id: Some(self.id.clone()),
+            client_id: Some(customization.client_id.clone()),
+            image_url: customization.image_file.as_ref().and_then(|_| {
+                host.and_then(|host| {
+                    hosted_logo_url(host, &self.id, &customization.client_id)
+                })
+            }),
+            css: customization.css.clone(),
+            css_version: Some(customization.css_version.clone()),
+            last_modified_date: Some(to_date_time(customization.last_modified_date)),
+            creation_date: Some(to_date_time(customization.creation_date)),
+        }
+    }
+
+    /// The logo image this pool serves for `client_id`, which is the image
+    /// stored for THAT level: the locator a read handed out names one level, so
+    /// it serves that level's image and never another's.
+    pub fn hosted_logo(&self, client_id: &str) -> Option<&[u8]> {
+        self.ui_customizations
+            .get(client_id)
+            .and_then(|stored| stored.image_file.as_deref())
     }
 
     /// The domain this pool's passkeys name as their relying party, or `None`
@@ -3113,6 +3207,59 @@ impl ManagedLoginBranding {
     }
 }
 
+/// The `ClientId` that names a user pool's POOL-LEVEL classic hosted UI
+/// branding: "Set the default configuration for all clients with a ClientId of
+/// ALL" (`SetUICustomization`), which is also the level an app client without
+/// branding of its own is served from.
+pub const UI_CUSTOMIZATION_ALL_CLIENTS: &str = "ALL";
+
+/// One stored classic hosted UI branding configuration of a user pool: what
+/// `SetUICustomization` persisted for one level, and what every later read of
+/// that level renders.
+///
+/// The level is the app client the branding applies to, or
+/// [`UI_CUSTOMIZATION_ALL_CLIENTS`] for the pool-level default: "When the
+/// ClientId value is an app client ID, the settings you pass in this request
+/// apply to that app client and override the default ALL configuration"
+/// (`SetUICustomization`).
+#[derive(Debug, Clone)]
+pub struct UiCustomization {
+    /// The level this branding applies to, which is the key it is stored under.
+    pub client_id: String,
+    /// The stored style sheet: "A plaintext CSS file that contains the custom
+    /// fields that you want to apply to your user pool or app client"
+    /// (`SetUICustomization.CSS`), kept exactly as submitted.
+    pub css: Option<String>,
+    /// The stored logo image: "The image that you want to set as your login in
+    /// the classic hosted UI" (`SetUICustomization.ImageFile`), kept byte for
+    /// byte as submitted.
+    pub image_file: Option<Vec<u8>>,
+    /// The version this branding is at, reported as
+    /// `UICustomizationType.CSSVersion`, "The CSS version number": the stamp of
+    /// the write that produced what is stored, so a read reports the version of
+    /// the configuration it renders.
+    pub css_version: String,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+}
+
+/// The version a write of a classic hosted UI branding configuration at `at`
+/// is at: that instant in UTC as the digits of the modelled timestamp rendering
+/// (`yyyymmddhhmmss`), so a later write is at a later version and the version
+/// is a number as `UICustomizationType.CSSVersion` reports one.
+fn css_version_stamp(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs(seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect()
+}
+
 /// The most a managed login branding style's settings and image files may
 /// occupy together: "This operation has a 2-megabyte request-size limit and
 /// include the CSS settings and image assets for your app client"
@@ -3925,6 +4072,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         identity_providers: BTreeMap::new(),
         terms: BTreeMap::new(),
         managed_login_branding: BTreeMap::new(),
+        ui_customizations: BTreeMap::new(),
         user_import_jobs: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
@@ -3996,6 +4144,47 @@ pub fn new_user_import_job_id() -> String {
 /// get a string of its own into the value this service reports.
 pub fn user_import_csv_upload_url(host: &str, user_pool_id: &str, job_id: &str) -> Option<String> {
     is_host_shaped(host).then(|| format!("https://{host}/user-import-jobs/{user_pool_id}/{job_id}"))
+}
+
+/// The path segment under a user pool's level that the classic hosted UI serves
+/// its logo image on. Shared by the locator [`hosted_logo_url`] hands out and by
+/// the route that serves it (`crate::service`), so the two cannot drift.
+pub const HOSTED_LOGO_FILE: &str = "assets/login_logo.png";
+
+/// Where a client fetches the logo image stored for `client_id` of
+/// `user_pool_id`: `UICustomizationType.ImageUrl`, "A URL path to the hosted
+/// logo image of your UI customization".
+///
+/// AWS serves it from the content delivery network that fronts the classic
+/// hosted UI. This emulator provisions none, so the locator names the image on
+/// the endpoint THIS REQUEST ARRIVED AT, which this service serves itself (see
+/// `crate::service`) — a URL a caller can fetch the stored bytes from, rather
+/// than one pointing at the real service. A request that names no host of its
+/// own gets no locator at all.
+///
+/// `host` is taken only when it LOOKS like a `host[:port]`, so a caller cannot
+/// get a string of its own into the value this service reports.
+pub fn hosted_logo_url(host: &str, user_pool_id: &str, client_id: &str) -> Option<String> {
+    is_host_shaped(host)
+        .then(|| format!("https://{host}/{user_pool_id}/{client_id}/{HOSTED_LOGO_FILE}"))
+}
+
+/// The endpoint host this request addressed — its `Host` header, or the
+/// authority of the request URI when it carries one — which is the endpoint a
+/// locator an operation hands out has to name. `None` when the request names no
+/// endpoint of its own.
+pub fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            ctx.parts()
+                .uri
+                .authority()
+                .map(::http::uri::Authority::as_str)
+        })
+        .map(ToString::to_string)
 }
 
 /// Whether `host` is a non-empty `host[:port]` of the characters a hostname
