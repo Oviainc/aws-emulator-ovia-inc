@@ -174,10 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The account gate comes FIRST: before the pagination token is read and before any
         // override is, so a non-onboarded account is refused identically whether or not the
         // rotation it named exists and whatever else the request carries. The refusal is the
-        // ARN-shaped one `GetRotation`/`GetRotationOverride` answer, since this listing's
-        // whole subject is the resources under one rotation ARN.
+        // account-level one `GetRotation`/`GetRotationOverride` answer: what is missing is
+        // the account's own registry entry, not anything the request named.
         state
-            .require_active_replication_set_for(&input.rotation_id)
+            .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
         // The resume point: the creation sequence the previous page ended on, as

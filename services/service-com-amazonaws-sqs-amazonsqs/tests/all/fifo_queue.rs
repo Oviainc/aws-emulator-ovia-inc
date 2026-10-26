@@ -111,86 +111,97 @@ async fn the_members_a_send_must_carry_follow_the_queue_type() {
     .await;
     let standard = create_ok(&router, "tokens-standard", &json!({})).await;
 
-    // (case, queue, extra members, accepted)
-    let rows: &[(&str, &str, Value, bool)] = &[
+    // (case, queue, extra members, the code the refusal carries, or None when the send
+    // is accepted): a parameter the request had to carry and did not is refused as
+    // absent, while one the queue type does not take, or whose value it does not
+    // accept, is refused as an invalid value.
+    let rows: &[(&str, &str, Value, Option<&str>)] = &[
         (
             "FIFO with both tokens",
             &plain,
             json!({ "MessageGroupId": "g", "MessageDeduplicationId": "d1" }),
-            true,
+            None,
         ),
         (
             "FIFO without a MessageGroupId",
             &plain,
             json!({ "MessageDeduplicationId": "d2" }),
-            false,
+            Some("MissingParameter"),
         ),
-        ("FIFO with no FIFO member at all", &plain, json!({}), false),
+        (
+            "FIFO with no FIFO member at all",
+            &plain,
+            json!({}),
+            Some("MissingParameter"),
+        ),
         (
             "FIFO without a MessageDeduplicationId and no ContentBasedDeduplication",
             &plain,
             json!({ "MessageGroupId": "g" }),
-            false,
+            Some("InvalidParameterValue"),
         ),
         (
             "FIFO without a MessageDeduplicationId, ContentBasedDeduplication enabled",
             &content_based,
             json!({ "MessageGroupId": "g" }),
-            true,
+            None,
         ),
         (
             "FIFO with a MessageDeduplicationId overriding the derived one",
             &content_based,
             json!({ "MessageGroupId": "g", "MessageDeduplicationId": "explicit" }),
-            true,
+            None,
         ),
         (
             "FIFO with a per-message DelaySeconds",
             &content_based,
             json!({ "MessageGroupId": "g", "DelaySeconds": 5 }),
-            false,
+            Some("InvalidParameterValue"),
         ),
         (
             "standard with a MessageGroupId, which enables fair queues",
             &standard,
             json!({ "MessageGroupId": "tenant-7" }),
-            true,
+            None,
         ),
         (
             "standard with a MessageDeduplicationId, which applies only to FIFO",
             &standard,
             json!({ "MessageDeduplicationId": "d" }),
-            false,
+            Some("InvalidParameterValue"),
         ),
         (
             "standard with a per-message DelaySeconds",
             &standard,
             json!({ "DelaySeconds": 0 }),
-            true,
+            None,
         ),
     ];
 
-    for (case, url, extra, accepted) in rows {
+    for (case, url, extra, refusal) in rows {
         let mut body = json!({ "QueueUrl": url, "MessageBody": format!("body for {case}") });
         for (member, value) in extra.as_object().expect("an object of members") {
             body[member] = value.clone();
         }
         let (status, answer) = send(&router, &body).await;
-        if *accepted {
-            assert_eq!(
-                status, 200,
-                "case {case}: expected HTTP 200, got {status} with {answer}"
-            );
-            assert!(
-                answer["MessageId"].as_str().is_some_and(|id| !id.is_empty()),
-                "case {case}: expected a MessageId, got {answer}"
-            );
-        } else {
-            assert_eq!(
-                (status, error_code(&answer).as_str()),
-                (400, "ValidationException"),
-                "case {case}: expected a 400 ValidationException, got {status} with {answer}"
-            );
+        match refusal {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected HTTP 200, got {status} with {answer}"
+                );
+                assert!(
+                    answer["MessageId"].as_str().is_some_and(|id| !id.is_empty()),
+                    "case {case}: expected a MessageId, got {answer}"
+                );
+            }
+            Some(code) => {
+                assert_eq!(
+                    (status, error_code(&answer).as_str()),
+                    (400, *code),
+                    "case {case}: expected a 400 {code}, got {status} with {answer}"
+                );
+            }
         }
     }
 }
@@ -257,8 +268,8 @@ async fn a_fifo_token_is_bounded_in_length_and_in_its_characters() {
             } else {
                 assert_eq!(
                     (status, error_code(&answer).as_str()),
-                    (400, "ValidationException"),
-                    "case {member} {case}: expected a 400 ValidationException, got {status} \
+                    (400, "InvalidParameterValue"),
+                    "case {member} {case}: expected a 400 InvalidParameterValue, got {status} \
                      with {answer}"
                 );
                 assert!(

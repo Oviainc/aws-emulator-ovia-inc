@@ -945,3 +945,180 @@ async fn rule_group_rules_must_reference_an_entity_of_the_same_scope() {
         }
     }
 }
+
+/// `UpdateRuleGroup` replaces a stored rule group with what the request describes,
+/// under the optimistic-lock token, and keeps what a rule group cannot change.
+///
+/// The rows differ in WHICH way a save can be refused — an unknown triple, a stale
+/// token, a rule list that does not fit the capacity the group was created with (a
+/// rule group's `Capacity` is declared at create and "you cannot change it after
+/// creation", and "when you add or modify the rules in a rule group, WAF enforces
+/// this limit") — and each refusal is followed by a read proving nothing changed.
+#[tokio::test]
+async fn update_rule_group_replaces_the_stored_rule_group_under_its_lock_token() {
+    let waf = Waf::new();
+    // One SQLi match statement costs 20 WCUs, which `CheckCapacity` publishes, so a
+    // group declared at 20 fits exactly one of them and no more.
+    let declared_capacity = 20;
+    let name = "updated-group";
+    let (id, arn, create_lock) = create_rule_group(
+        &waf,
+        "REGIONAL",
+        name,
+        declared_capacity,
+        json!([rule("block-sqli", sqli_statement())]),
+    )
+    .await;
+    let before = waf
+        .ok(
+            "GetRuleGroup",
+            json!({ "Name": name, "Scope": "REGIONAL", "Id": &id }),
+        )
+        .await;
+
+    let update_body = |lock: &str, rules: Value| {
+        json!({
+            "Name": name,
+            "Scope": "REGIONAL",
+            "Id": &id,
+            "LockToken": lock,
+            "VisibilityConfig": visibility(name),
+            "Description": "second generation",
+            "Rules": rules,
+        })
+    };
+    let fitting_rules = json!([labelled_rule(
+        "block-sqli-again",
+        sqli_statement(),
+        &["generation:two"]
+    )]);
+
+    // An unknown triple names no rule group, whatever the token says.
+    waf.refused(
+        "UpdateRuleGroup",
+        json!({
+            "Name": name,
+            "Scope": "REGIONAL",
+            "Id": "00000000-1111-2222-3333-444444444444",
+            "LockToken": &create_lock,
+            "VisibilityConfig": visibility(name),
+            "Rules": fitting_rules.clone(),
+        }),
+        "WAFNonexistentItemException",
+        "UpdateRuleGroup with an Id no rule group carries",
+    )
+    .await;
+    // A stale token is refused for the lock.
+    waf.refused(
+        "UpdateRuleGroup",
+        update_body("00000000-0000-4000-8000-000000000000", fitting_rules.clone()),
+        "WAFOptimisticLockException",
+        "UpdateRuleGroup with a stale LockToken",
+    )
+    .await;
+    // Rules that cost more than the declared capacity are refused rather than
+    // stored under a capacity they do not fit.
+    let mut second_sqli = rule("block-sqli-b", sqli_statement());
+    second_sqli["Priority"] = json!(1);
+    waf.refused(
+        "UpdateRuleGroup",
+        update_body(
+            &create_lock,
+            json!([rule("block-sqli-a", sqli_statement()), second_sqli]),
+        ),
+        "WAFLimitsExceededException",
+        "UpdateRuleGroup with rules above the declared capacity",
+    )
+    .await;
+    let unchanged = waf
+        .ok(
+            "GetRuleGroup",
+            json!({ "Name": name, "Scope": "REGIONAL", "Id": &id }),
+        )
+        .await;
+    assert_eq!(
+        unchanged, before,
+        "a refused UpdateRuleGroup must leave the stored rule group and its lock \
+         token untouched, got {unchanged}"
+    );
+
+    // The current token applies the update and rotates to a fresh one.
+    let updated = waf
+        .ok("UpdateRuleGroup", update_body(&create_lock, fitting_rules.clone()))
+        .await;
+    let next_lock = updated["NextLockToken"]
+        .as_str()
+        .expect("NextLockToken")
+        .to_string();
+    assert!(
+        is_model_uuid(&next_lock),
+        "UpdateRuleGroup must answer a UUID NextLockToken, got {next_lock:?}"
+    );
+    assert_ne!(
+        next_lock, create_lock,
+        "UpdateRuleGroup must rotate the lock token"
+    );
+    let after = waf
+        .ok(
+            "GetRuleGroup",
+            json!({ "Name": name, "Scope": "REGIONAL", "Id": &id }),
+        )
+        .await;
+    assert_eq!(
+        after["RuleGroup"]["Rules"], fitting_rules,
+        "the update must replace the stored rules, got {after}"
+    );
+    assert_eq!(
+        after["RuleGroup"]["Description"],
+        json!("second generation"),
+        "the update must replace the stored description, got {after}"
+    );
+    assert_eq!(
+        after["RuleGroup"]["AvailableLabels"],
+        label_summaries(&["generation:two"]),
+        "the update must re-derive the labels from the stored rules, got {after}"
+    );
+    assert_eq!(
+        after["LockToken"],
+        json!(next_lock),
+        "the read must answer the rotated lock token, got {after}"
+    );
+    // What a rule group cannot change: its name, its id, its ARN and its capacity.
+    assert_eq!(
+        after["RuleGroup"]["Capacity"],
+        json!(declared_capacity),
+        "the update must keep the declared capacity, got {after}"
+    );
+    assert_eq!(
+        after["RuleGroup"]["ARN"],
+        json!(arn),
+        "the update must keep the ARN, got {after}"
+    );
+    assert_eq!(
+        after["RuleGroup"]["Id"],
+        json!(id),
+        "the update must keep the Id, got {after}"
+    );
+
+    // The token the update rotated away stops working, and the fresh one works.
+    waf.refused(
+        "UpdateRuleGroup",
+        update_body(&create_lock, json!([])),
+        "WAFOptimisticLockException",
+        "UpdateRuleGroup with the token the last update rotated away",
+    )
+    .await;
+    waf.ok("UpdateRuleGroup", update_body(&next_lock, json!([])))
+        .await;
+    let emptied = waf
+        .ok(
+            "GetRuleGroup",
+            json!({ "Name": name, "Scope": "REGIONAL", "Id": &id }),
+        )
+        .await;
+    assert_eq!(
+        emptied["RuleGroup"]["Rules"],
+        json!([]),
+        "an update with no rules must leave the rule group with none, got {emptied}"
+    );
+}

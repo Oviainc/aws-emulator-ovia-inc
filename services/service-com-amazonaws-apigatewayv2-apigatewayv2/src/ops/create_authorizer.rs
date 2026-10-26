@@ -305,11 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAuthorizerErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     limit_type: Some("IdentitySource".to_string()),
-                    message: Some(format!(
-                        "The maximum number of identity sources ({}) for an authorizer has \
-                         been reached.",
-                        crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER
-                    )),
+                    message: Some(crate::state::identity_source_limit_message()),
                 },
             )
             .into());

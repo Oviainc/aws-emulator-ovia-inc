@@ -97,6 +97,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/stack_event_timeline.rs"]
+mod stack_event_timeline;
 #[path = "all/stack_exports.rs"]
 mod stack_exports;
 #[path = "all/stack_lifecycle.rs"]

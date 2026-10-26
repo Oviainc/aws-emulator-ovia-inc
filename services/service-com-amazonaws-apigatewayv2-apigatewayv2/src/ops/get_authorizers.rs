@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthorizers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthorizers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthorizers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthorizers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthorizersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthorizers"))
+        let _ = ctx;
+        // `MaxResults` is modelled `__string` on this collection, so the numeric rule is
+        // this handler's, shared with every other collection of this service.
+        let max_results = crate::state::parse_max_results(input.max_results.as_deref())
+            .map_err(|message| -> Self::Error {
+                GetAuthorizersErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            })?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetAuthorizers",
+            ));
+        };
+        // A reporting operation: it reads the store and writes nothing.
+        let store = state.lock();
+
+        // The authorizers of an api are addressed through that api, so an api this
+        // service does not hold has no collection to report — not an empty one.
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(GetAuthorizersErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "API",
+                        &input.api_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // One page of the api's OWN authorizers, in the store's stable key order, each
+        // projected from the ONE record `GetAuthorizer` reports — so the collection and
+        // the single reader cannot disagree about an authorizer. The token is scoped to
+        // this collection, so one issued for another is refused rather than served.
+        let (page, next_token) = crate::state::page(
+            &api.authorizers,
+            &crate::state::page_scope(&["apis", &input.api_id, "authorizers"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetAuthorizersErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
+
+        Ok(GetAuthorizersOutput {
+            items: Some(
+                page.into_iter()
+                    .map(crate::state::Authorizer::to_wire)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

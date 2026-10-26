@@ -105,7 +105,7 @@ pub use official_lenses::{
 use crate::ops::types::{
     AccountJiraConfigurationOutput, AgentProfileSummary, AgentRecommendationGenerationSummary,
     AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
-    ContextContent, ContextSummary, GetGlobalSettingsOutput, GoalSummary,
+    ContextContent, ContextSummary, GetGlobalSettingsOutput, GoalSummary, JiraConfiguration,
     JiraSelectedQuestionConfiguration, LensReview, LensSummary,
     Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion,
     ProfileShareSummary, ProfileSummary, Progress, ResourceNotFoundException, ReviewTemplate,
@@ -174,6 +174,15 @@ pub const TRUSTED_ADVISOR_INTEGRATION_ENABLED: &str = "ENABLED";
 /// and discovery integration features", so an account no write has opted in is not opted
 /// in.
 pub const GLOBAL_SETTING_DISABLED: &str = "DISABLED";
+
+/// `IssueManagementType$MANUAL`: the issue management type under which the questions that
+/// carry an issue in the integrated service are the ones the CALLER selected, where `AUTO`
+/// — the other member the enum publishes (`smithy_query(query="shape",
+/// shape="IssueManagementType")`) — leaves every question of a review covered. It is what
+/// gives `LensReview$JiraConfiguration`'s selected pillars and questions their effect: a
+/// sync of a workload whose issue management is manual covers exactly the questions that
+/// selection names ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::sync_workload_integration`]).
+pub const ISSUE_MANAGEMENT_TYPE_MANUAL: &str = "MANUAL";
 
 /// `IntegrationStatus$NOT_CONFIGURED`: what an account's Jira integration reports until
 /// it is connected. The reported status publishes `CONFIGURED` and `NOT_CONFIGURED`,
@@ -1416,6 +1425,7 @@ impl AnswerRecord {
 pub fn answer_projection(
     question: &ReviewQuestion,
     answer: Option<&AnswerRecord>,
+    jira_configuration: Option<JiraConfiguration>,
 ) -> crate::ops::types::Answer {
     crate::ops::types::Answer {
         question_id: Some(question.question_id.clone()),
@@ -1457,9 +1467,9 @@ pub fn answer_projection(
         // `Notes` and `Reason` exist only once an answer records them.
         notes: answer.and_then(|answer| answer.notes.clone()),
         reason: answer.and_then(|answer| answer.reason.clone()),
-        // A question's Jira issue exists once the workload's Jira integration has synced
-        // one; `UpdateIntegration` is still a stub, so nothing is synced here.
-        jira_configuration: None,
+        // The integration state of this question's issue in the integrated service, which
+        // exists once a sync has recorded one ([`WorkloadRecord::question_jira_configuration`]).
+        jira_configuration,
     }
 }
 
@@ -1836,6 +1846,13 @@ pub struct LensReviewRecord {
     /// `LensReview$JiraConfiguration`: the pillars and questions of this review a caller
     /// has selected, absent until one is written.
     pub jira_configuration: Option<JiraSelectedQuestionConfiguration>,
+    /// When each question of this review was last synced with the integrated service,
+    /// keyed by `QuestionId` — what `UpdateIntegration` records and what every read of an
+    /// answer reports as `JiraConfiguration$LastSyncedTime`
+    /// ([`WorkloadRecord::question_jira_configuration`]). A question nothing has synced
+    /// carries no entry, and one a later sync no longer covers keeps the instant it was
+    /// last synced at.
+    pub jira_question_syncs: BTreeMap<String, SystemTime>,
     /// The `LensVersion` this review is against: the version the lens's content was
     /// published as when the lens was associated with the workload
     /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::applied_lens_version`]),
@@ -2176,6 +2193,74 @@ impl WorkloadRecord {
         self.lens_review_records
             .entry(lens_alias(lens).to_string())
             .or_default()
+    }
+
+    /// Whether this workload leaves the choice of which questions carry an issue in the
+    /// integrated service to the CALLER.
+    ///
+    /// `IssueManagementType` publishes `AUTO` and `MANUAL`
+    /// (`smithy_query(query="shape", shape="IssueManagementType")`): under
+    /// [`ISSUE_MANAGEMENT_TYPE_MANUAL`] the questions covered are the ones the review's own
+    /// selection names, and under `AUTO` \u2014 and for a workload that records no type, which
+    /// has selected nothing to manage by hand \u2014 every question of the review is covered.
+    pub fn jira_issue_management_is_manual(&self) -> bool {
+        self.jira_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.issue_management_type.as_deref())
+            == Some(ISSUE_MANAGEMENT_TYPE_MANUAL)
+    }
+
+    /// The `QuestionId`s of ONE of this workload's lens reviews the caller has selected for
+    /// the integrated service (`LensReview$JiraConfiguration` ->
+    /// `SelectedPillar$SelectedQuestionIds`), EMPTY when the review selects none.
+    ///
+    /// `lens` is a lens as a request names it, so the selection is found by either
+    /// spelling ([`lens_review_record`](Self::lens_review_record)). The pillar a question
+    /// is selected under is not re-checked here: the selection is recorded against the
+    /// review by `UpdateLensReview`, which refuses a pillar or question the lens does not
+    /// define, so what is stored already belongs to this lens.
+    pub fn jira_selected_question_ids(&self, lens: &str) -> BTreeSet<String> {
+        self.lens_review_record(lens)
+            .and_then(|written| written.jira_configuration.as_ref())
+            .and_then(|configuration| configuration.selected_pillars.as_ref())
+            .map(|pillars| {
+                pillars
+                    .iter()
+                    .filter_map(|pillar| pillar.selected_question_ids.as_ref())
+                    .flatten()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `JiraConfiguration` one question of one of this workload's lens reviews
+    /// reports: the integration state of that question's issue, absent until a sync has
+    /// recorded one ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::sync_workload_integration`]).
+    ///
+    /// `LastSyncedTime` is "the date and time when the Jira configuration was last synced"
+    /// (`smithy_query(query="shape", shape="JiraConfiguration")`), so it is the instant the
+    /// sync that covered this question was served at. `JiraIssueUrl` is omitted: the issue
+    /// it addresses lives in the account's own Jira site, which this emulator holds nothing
+    /// of ([`GlobalSettingsRecord::to_global_settings`]) \u2014 the member is optional, so it is
+    /// left off rather than filled with a URL that addresses nothing.
+    ///
+    /// Lives on the record because the single answer read, the answer list and the
+    /// improvement plan all report it, so the three cannot disagree about when a question
+    /// was synced.
+    pub fn question_jira_configuration(
+        &self,
+        lens: &str,
+        question_id: &str,
+    ) -> Option<JiraConfiguration> {
+        let synced_at = *self
+            .lens_review_record(lens)?
+            .jira_question_syncs
+            .get(question_id)?;
+        Some(JiraConfiguration {
+            jira_issue_url: None,
+            last_synced_time: Some(::aws_smithy_types::DateTime::from(synced_at)),
+        })
     }
 
     /// The `LensVersion` ONE lens review of this workload is against, as it was pinned
@@ -4273,6 +4358,22 @@ pub struct UpgradeProfileVersionToken {
     pub fingerprint: String,
 }
 
+/// What an `UpdateIntegration` idempotency token resolves to: the workload the original
+/// request synced, plus that request's parameter fingerprint.
+///
+/// The operation answers an EMPTY body, so a replay has no value to return — what the
+/// token is for here is keeping the replay from syncing a second time, which matters
+/// because a sync records the instant it was served at against every question it covers,
+/// so acting twice would move an instant the original request already reported. The
+/// workload id is kept so a token reused with different parameters can name the resource
+/// it already synced, and so the token goes with the workload it synced
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remove_workload`]).
+#[derive(Debug, Clone)]
+pub struct UpdateIntegrationToken {
+    pub workload_id: String,
+    pub fingerprint: String,
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for an
 /// AGENT profile — the resource `CreateAgentProfile` mints and every
 /// `/api/v1/agent-profiles/{profileArn}` route resolves.
@@ -5201,6 +5302,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
     /// through [`TokenLedger::remember`].
     pub upgrade_profile_version_tokens: TokenLedger<UpgradeProfileVersionToken>,
+    /// `UpdateIntegration`'s `ClientRequestToken` -> the sync the original request
+    /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
+    /// through [`TokenLedger::remember`].
+    pub update_integration_tokens: TokenLedger<UpdateIntegrationToken>,
     /// Every share recorded against a Well-Architected Tool profile, keyed by that
     /// profile's `ProfileArn` then by `ShareId`. A `BTreeMap` because `ShareId` order is
     /// the stable order `ListProfileShares` pages over, exactly as
@@ -5918,6 +6023,84 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .find(|question| question.question_id == question_id)
     }
 
+    /// Sync one workload's lens reviews with the integrated service, recording `at`
+    /// against every question the integration covers and answering how many questions
+    /// that was.
+    ///
+    /// The sync is of the WORKLOAD, so it covers each lens associated with it, and the
+    /// questions of one review are the ones that lens's own content defines
+    /// ([`Self::lens_review_questions`]) — narrowed, for a workload whose issue management
+    /// is manual, to the questions that review's selection names
+    /// ([`WorkloadRecord::jira_issue_management_is_manual`],
+    /// [`WorkloadRecord::jira_selected_question_ids`]). What it records is what every read
+    /// of an answer reports as the instant its integration configuration was last synced
+    /// ([`WorkloadRecord::question_jira_configuration`]), so nothing derives a sync from a
+    /// read.
+    ///
+    /// Answers 0 for a workload this store does not hold, one associated with no lens, one
+    /// whose lenses this emulator holds no question content for, and one whose manual
+    /// selection names no question — in each case there is no question to carry an issue,
+    /// so nothing is written and the workload is left as it stood.
+    ///
+    /// The issue management STATUS is deliberately not consulted: `IssueManagementStatus`
+    /// (`ENABLED` | `DISABLED` | `INHERIT`, inheriting the account's
+    /// `AccountJiraIssueManagementStatus`) governs whether the service manages a question's
+    /// issue on its own, where a call that asks for a sync is the caller asking for one
+    /// outright — and the account-level connection it would inherit from can never report
+    /// `CONFIGURED` through this API ([`JIRA_INTEGRATION_NOT_CONFIGURED`]), so gating the
+    /// sync on either status would leave this operation with nothing it could ever sync.
+    pub fn sync_workload_integration(&mut self, workload_id: &str, at: SystemTime) -> usize {
+        // Which questions the sync covers is read off the stored workload and the lens
+        // content BEFORE anything is written, because resolving a lens's question set
+        // borrows this store while the write borrows it mutably.
+        let covered: Vec<(String, Vec<String>)> = match self.workloads.get(workload_id) {
+            Some(workload) => {
+                let manual = workload.jira_issue_management_is_manual();
+                workload
+                    .lenses
+                    .iter()
+                    .map(|lens| {
+                        let selected = manual.then(|| workload.jira_selected_question_ids(lens));
+                        let questions = self
+                            .lens_review_questions(lens)
+                            .into_iter()
+                            .map(|question| question.question_id)
+                            .filter(|question_id| {
+                                selected
+                                    .as_ref()
+                                    .is_none_or(|selected| selected.contains(question_id))
+                            })
+                            .collect();
+                        (lens.clone(), questions)
+                    })
+                    .collect()
+            }
+            None => return 0,
+        };
+
+        let Some(workload) = self.workloads.get_mut(workload_id) else {
+            return 0;
+        };
+        let mut synced = 0usize;
+        for (lens, questions) in covered {
+            if questions.is_empty() {
+                continue;
+            }
+            let review = workload.lens_review_record_mut(&lens);
+            for question_id in questions {
+                review.jira_question_syncs.insert(question_id, at);
+                synced = synced.saturating_add(1);
+            }
+        }
+        if synced > 0 {
+            // The sync changes this workload's lens reviews, which is what a read of the
+            // workload and of each of its reviews reports as the instant they were last
+            // updated (`Workload$UpdatedAt`, `LensReview$UpdatedAt`).
+            workload.updated_at = at;
+        }
+        synced
+    }
+
     /// The `LensArn` the lens a request named is reported by, in the Region the request
     /// was signed for.
     ///
@@ -6047,6 +6230,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                         notes: None,
                         pillar_notes: BTreeMap::new(),
                         jira_configuration: None,
+                        // A question of this review carries no issue in the integrated
+                        // service until a sync records one
+                        // ([`Self::sync_workload_integration`]).
+                        jira_question_syncs: BTreeMap::new(),
                         lens_version: self.applied_lens_version(lens, now),
                     },
                 )
@@ -6307,6 +6494,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // An upgrade token resolves to the upgrade of an association OF this workload, so
         // it goes with the associations the record above carried.
         self.upgrade_profile_version_tokens
+            .retain(|token| token.workload_id != workload_id);
+        // A sync token resolves to a sync OF this workload's lens reviews, so it goes with
+        // the reviews the record above carried.
+        self.update_integration_tokens
             .retain(|token| token.workload_id != workload_id);
         // A lens-review upgrade token resolves to a lens review OF this workload, so it
         // cannot outlive it either: the next request carrying one acts afresh.

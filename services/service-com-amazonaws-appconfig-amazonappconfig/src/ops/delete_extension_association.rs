@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteExtensionAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteExtensionAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteExtensionAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the extension association the request addresses out of the store,
+//! with the tags assigned to it, and leaves the extension it was binding where it was —
+//! so every later call naming that association id misses, and the extension still reads.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +154,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteExtensionAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteExtensionAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteExtensionAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "AppConfig state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The delete IS the removal of the stored record: the association, the binding it
+        // held and the tags assigned to it go out of this service's state, so once this
+        // answers 204 `GetExtensionAssociation`, `UpdateExtensionAssociation`,
+        // `ListExtensionAssociations`, the tagging operations and a second delete all miss
+        // on the id this call named, because each of them reads the map this took it out
+        // of.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteExtensionAssociation"))
+        // "This action doesn't delete extensions defined in the association": the
+        // extension and its versions are held in their own map, so removing the
+        // association leaves them exactly where they were — and with the association gone,
+        // the version it was binding is no longer an association `DeleteExtension` refuses
+        // on.
+        //
+        // `ExtensionAssociationId` is an id rather than an "ID or name" identifier, so it
+        // is looked up as the stored key, exactly as `GetExtensionAssociation` and
+        // `UpdateExtensionAssociation` look it up, and an id that addresses no association
+        // is the same modelled 404 those two answer rather than a 204 claiming a deletion
+        // that removed nothing.
+        let Some(removed) = store.remove_extension_association(&input.extension_association_id)
+        else {
+            // An attribution record for the refusal: which association was addressed and
+            // what this call answered, so a destructive call that changed nothing leaves a
+            // trace beside the ones that did.
+            tracing::debug!(
+                operation = "DeleteExtensionAssociation",
+                outcome = "ResourceNotFoundException",
+                extension_association_id = input.extension_association_id.as_str(),
+                "refused an extension association delete"
+            );
+            return Err(
+                DeleteExtensionAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::extension_association_not_found()),
+                        resource_name: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An attribution record for the removal, naming what the association was binding,
+        // so the call that takes a binding out of this service's state is observable.
+        tracing::debug!(
+            operation = "DeleteExtensionAssociation",
+            outcome = "deleted",
+            extension_association_id = removed.id.as_str(),
+            extension_id = removed.extension_id.as_str(),
+            extension_version_number = removed.extension_version_number,
+            "deleted an extension association"
+        );
+
+        Ok(DeleteExtensionAssociationOutput)
     }
 }
+

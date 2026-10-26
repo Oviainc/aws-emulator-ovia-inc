@@ -177,6 +177,15 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code a refusal names when a parameter the call requires was not
+/// supplied. Owned here, beside the variant that carries it, and read from here by
+/// everything else that has to name it — a batch result entry's per-entry `Code`.
+pub const MISSING_PARAMETER: &str = "MissingParameter";
+
+/// The wire error code a refusal names when a supplied parameter's VALUE is not one
+/// this service accepts. Owned here for the same reason.
+pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
 /// The `message` member of the synthetic `MissingParameter` error shape.
 static MISSING_PARAMETER_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -215,12 +224,13 @@ pub struct MissingParameter {
 }
 
 impl MissingParameter {
-    /// The refusal for the parameter called `parameter`, worded as Amazon SQS words it:
-    /// "The request must contain the parameter <name>." Only the member NAME reaches
-    /// the payload, never the value the request carried for it.
+    /// The refusal for the parameter called `parameter`, worded as Amazon SQS words it
+    /// — the one template, in `crate::state`, that every refusal of an absent parameter
+    /// uses, including a batch entry reporting it per entry. Only the member NAME
+    /// reaches the payload, never the value the request carried for it.
     pub fn new(parameter: &str) -> Self {
         Self {
-            message: format!("The request must contain the parameter {parameter}."),
+            message: crate::state::missing_parameter_message(parameter),
         }
     }
 }
@@ -309,16 +319,8 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
-    /// The request was refused as invalid. Renders as HTTP 400 with the error code
-    /// `ValidationException`.
-    ///
-    /// On the JSON and CBOR protocols that is the same status and code the boundary
-    /// validator answers with. Two differences are worth knowing, and neither is
-    /// specific to this variant — every handler-returned error shares them:
-    /// the awsJson families omit the `x-amzn-errortype` header that the boundary
-    /// path sets, and the query protocols render a boundary refusal as
-    /// `MalformedQueryString` rather than `ValidationException`, so a client
-    /// matching on the error code there sees two codes for one logical failure.
+    /// The request was refused under one of this SERVICE's own documented error codes:
+    /// see the two parameter variants below.
     ValidationException(ValidationException),
     /// A parameter the request had to carry was not supplied. Renders as HTTP 400 with
     /// the error code `MissingParameter`.
@@ -345,6 +347,13 @@ impl<E> Scaffolded<E> {
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
+    ///
+    /// NOT the channel for this service: Amazon SQS has no `ValidationException` shape,
+    /// and a parameter-level refusal it answers under a code outside its API is one no
+    /// client can classify. Use [`Scaffolded::missing_parameter`] or
+    /// [`Scaffolded::invalid_parameter_value`] — whose messages come from the templates
+    /// in `crate::state` — and keep this for a service that has no documented code for
+    /// the fault at all.
     ///
     /// Reach for this when the request is wrong in a way the model cannot express,
     /// so the boundary validator passed it: a value outside a rule the service
@@ -436,8 +445,11 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
-            Self::MissingParameter(_) => "MissingParameter",
-            Self::InvalidParameterValue(_) => "InvalidParameterValue",
+            // The two codes the service documents for a parameter-level refusal, spelled
+            // once beside the variants that carry them: a batch result entry reports the
+            // same pair.
+            Self::MissingParameter(_) => MISSING_PARAMETER,
+            Self::InvalidParameterValue(_) => INVALID_PARAMETER_VALUE,
         }
     }
 
@@ -462,7 +474,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason as the scaffold signal: the synthetic shape carries no
+            // `awsQueryError` trait.
             Self::ValidationException(_) => None,
             Self::MissingParameter(_) => None,
             Self::InvalidParameterValue(_) => None,

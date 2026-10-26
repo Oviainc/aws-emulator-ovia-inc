@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRuleGroup
+//! Replaces the stored rule group `(Scope, Name, Id)` names with what the request
+//! describes, once its `LockToken` still matches the stored one. An unknown triple
+//! is `WAFNonexistentItemException`, a stale token `WAFOptimisticLockException`, a
+//! rule list that does not fit the group's immutable `Capacity`
+//! `WAFLimitsExceededException` (all HTTP 400). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -269,6 +275,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
                 crate::state::invalid_parameter_exception(field, "Rules", &reason),
+            )
+            .into());
+        }
+
+        // A `ChallengeConfig` is "available at the web ACL level and in each rule",
+        // and for the Challenge action the immunity time has a floor of its own,
+        // above the modelled one that applies to a CAPTCHA immunity: a save carrying
+        // a value below it is refused, so nothing is stored and the lock token does
+        // not rotate.
+        if let Some(immunity_time) = crate::state::below_minimum_challenge_immunity(
+            None,
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_CHALLENGE_CONFIG,
+                    &immunity_time.to_string(),
+                    crate::state::CHALLENGE_IMMUNITY_BELOW_MINIMUM_REASON,
+                ),
             )
             .into());
         }

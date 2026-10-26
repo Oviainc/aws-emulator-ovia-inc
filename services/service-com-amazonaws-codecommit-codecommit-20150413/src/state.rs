@@ -19,6 +19,7 @@
 //! commit objects: each carries the flattened tree snapshot at that commit, so
 //! reading a file at a commit specifier is a lookup rather than a tree walk.
 
+pub mod conflict_report;
 pub mod git_object;
 pub mod merge;
 
@@ -3514,6 +3515,20 @@ pub fn is_object_id(candidate: &str) -> bool {
     git_object::is_object_id(candidate)
 }
 
+/// Can this commit specifier name a commit at all? `CommitName` is "the branch,
+/// tag, HEAD, or other fully qualified reference used to identify a commit (for
+/// example, a branch name or a full commit ID)", so a git object id and any git
+/// reference name can; anything git itself would refuse as a reference name
+/// cannot, and that is what the merge operations' `Invalid…CommitException` /
+/// `Invalid…CommitSpecifierException` report.
+///
+/// One reading for every operation that takes a `sourceCommitSpecifier` /
+/// `destinationCommitSpecifier`, so two of them cannot disagree about which
+/// specifier is addressable at all.
+pub fn names_a_commit(specifier: &str) -> bool {
+    is_object_id(specifier) || is_valid_branch_name(specifier)
+}
+
 /// The longest reference name this service accepts.
 ///
 /// `BranchName`'s modelled `length`
@@ -3866,22 +3881,24 @@ pub fn page_of(
 }
 
 /// The same one page, for an operation that publishes its OWN `maxResults`
-/// maximum and default rather than the range the list operations share.
+/// maximum and default rather than the range the list operations share, or that
+/// pages items of its own rather than names.
 ///
 /// The pagination rule is [`page_of`]'s in every other respect — the token is one
 /// this service issued for THIS listing, and the answer carries a token only when
 /// a further page exists — so an operation whose documentation states a different
 /// page size (`DescribePullRequestEvents`'s
-/// [`PULL_REQUEST_EVENTS_PAGE_MAX`]) pages through the same code rather than a
-/// second copy of it.
-pub fn page_of_at_most(
+/// [`PULL_REQUEST_EVENTS_PAGE_MAX`]), or whose paginated member is not a list of
+/// names at all (`DescribeMergeConflicts`'s merge hunks), pages through the same
+/// code rather than a second copy of it.
+pub fn page_of_at_most<T: Clone>(
     scope: &str,
-    ordered: &[String],
+    ordered: &[T],
     next_token: Option<&str>,
     max_results: Option<i32>,
     page_maximum: i32,
     page_default: i32,
-) -> Result<(Vec<String>, Option<String>), PageProblem> {
+) -> Result<(Vec<T>, Option<String>), PageProblem> {
     let limit = match max_results {
         None => page_default,
         Some(requested) if (MIN_MAX_RESULTS..=page_maximum).contains(&requested) => requested,

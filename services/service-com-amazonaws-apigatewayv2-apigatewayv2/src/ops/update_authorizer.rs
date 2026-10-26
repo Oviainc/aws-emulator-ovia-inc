@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -233,18 +224,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAuthorizer"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateAuthorizer",
+            ));
+        };
+        let mut store = state.lock();
+
+        // An authorizer is a CHILD of an api: it is addressed through the api that owns
+        // it, so an api that does not exist holds no authorizer to update.
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_identifier_message(
+                "API",
+                &input.api_id,
+            )));
+        };
+        // The api's protocol decides which members the MERGED configuration may carry,
+        // read off the record before the patch borrows the api's authorizers.
+        let protocol_type = api.protocol_type.clone();
+
+        // An authorizer is addressed by the api that owns it AND its own id, so an id
+        // that names an authorizer of ANOTHER api is not found here either — the same
+        // addressing `GetAuthorizer` and `DeleteAuthorizer` report on.
+        let Some(existing) = api.authorizers.get(&input.authorizer_id) else {
+            return Err(not_found(
+                crate::state::INVALID_AUTHORIZER_IDENTIFIER_MESSAGE.to_string(),
+            ));
+        };
+
+        // The update is a PATCH (`PATCH /v2/apis/{ApiId}/authorizers/{AuthorizerId}`): a
+        // member the request carries replaces the stored one, and a member it omits
+        // leaves the stored value exactly as it was. A list member is a VALUE like any
+        // other, so an `IdentitySource` the request carries replaces the stored list
+        // wholesale. Nothing here is defaulted: a default belongs to the create, and
+        // applying one again would silently undo a value a later `GetAuthorizer` reports.
+        let mut updated = existing.clone();
+        if let Some(name) = input.name {
+            updated.name = name;
+        }
+        if let Some(authorizer_type) = input.authorizer_type {
+            updated.authorizer_type = authorizer_type;
+        }
+        if let Some(authorizer_uri) = input.authorizer_uri {
+            updated.authorizer_uri = Some(authorizer_uri);
+        }
+        if let Some(credentials_arn) = input.authorizer_credentials_arn {
+            updated.authorizer_credentials_arn = Some(credentials_arn);
+        }
+        if let Some(version) = input.authorizer_payload_format_version {
+            updated.authorizer_payload_format_version = Some(version);
+        }
+        if let Some(ttl) = input.authorizer_result_ttl_in_seconds {
+            updated.authorizer_result_ttl_in_seconds = Some(ttl);
+        }
+        if let Some(enable_simple_responses) = input.enable_simple_responses {
+            updated.enable_simple_responses = Some(enable_simple_responses);
+        }
+        if let Some(identity_source) = input.identity_source {
+            updated.identity_source = identity_source;
+        }
+        if let Some(expression) = input.identity_validation_expression {
+            updated.identity_validation_expression = Some(expression);
+        }
+        if let Some(jwt_configuration) = input.jwt_configuration {
+            updated.jwt_configuration = Some(jwt_configuration);
+        }
+
+        // The MERGED record is what has to hold together, under the same requirement the
+        // create applies: an authorizer that already carries the member a type needs may
+        // switch to that type without resending it, and one that does not cannot. Checked
+        // before anything is written, so a refused patch leaves the authorizer exactly as
+        // it was and a later reader sees the configuration it had.
+        if let Err(message) = crate::state::validate_authorizer_config(
+            &protocol_type,
+            &updated.authorizer_type,
+            updated.authorizer_uri.as_deref(),
+            updated.authorizer_payload_format_version.as_deref(),
+            updated.jwt_configuration.as_ref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // And the growth INSIDE one authorizer the create bounds: every request the api's
+        // authorization step serves reads the whole `IdentitySource` list, so a patch
+        // cannot raise it past the bound the create holds it to.
+        if updated.identity_source.len() > crate::state::MAX_IDENTITY_SOURCES_PER_AUTHORIZER {
+            return Err(UpdateAuthorizerErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("IdentitySource".to_string()),
+                    message: Some(crate::state::identity_source_limit_message()),
+                },
+            )
+            .into());
+        }
+
+        // Replace the record rather than minting a second one — the `AuthorizerId` is the
+        // key and the clone carried it over — and project the response from the record
+        // that was STORED, so what the caller gets is what a later `GetAuthorizer` will
+        // report rather than an echo of the request.
+        api.authorizers
+            .insert(input.authorizer_id.clone(), updated.clone());
+        tracing::info!(
+            api_id = %input.api_id,
+            authorizer_id = %input.authorizer_id,
+            authorizer_type = %updated.authorizer_type,
+            "updated an authorizer"
+        );
+        let stored = updated.to_wire();
+        Ok(UpdateAuthorizerOutput {
+            authorizer_credentials_arn: stored.authorizer_credentials_arn,
+            authorizer_id: stored.authorizer_id,
+            authorizer_payload_format_version: stored.authorizer_payload_format_version,
+            authorizer_result_ttl_in_seconds: stored.authorizer_result_ttl_in_seconds,
+            authorizer_type: stored.authorizer_type,
+            authorizer_uri: stored.authorizer_uri,
+            enable_simple_responses: stored.enable_simple_responses,
+            identity_source: stored.identity_source,
+            identity_validation_expression: stored.identity_validation_expression,
+            jwt_configuration: stored.jwt_configuration,
+            name: Some(stored.name),
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_authorizer` does.
+fn bad_request(message: &str) -> UpdateAuthorizerError {
+    UpdateAuthorizerErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's "the resource specified in the request was not found" refusal: the
+/// modelled `NotFoundException`, carrying the sentence API Gateway answers for the
+/// identifier that resolved to nothing.
+fn not_found(message: String) -> UpdateAuthorizerError {
+    UpdateAuthorizerErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

@@ -707,7 +707,8 @@ async fn untag_queue_changes_only_the_queue_it_names() {
 }
 
 /// A `TagKeys` list that names no tag removes nothing: refused as a 400
-/// `ValidationException`, exactly as an empty `Tags` map is, and the queue keeps its tags.
+/// `MissingParameter` naming that parameter, exactly as an empty `Tags` map is, and the
+/// queue keeps its tags.
 #[tokio::test]
 async fn untag_queue_refuses_a_tag_keys_list_that_names_no_tag() {
     let router = emulator();
@@ -727,8 +728,8 @@ async fn untag_queue_refuses_a_tag_keys_list_that_names_no_tag() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "ValidationException"),
-        "case an empty TagKeys list: expected a 400 ValidationException, got {status} with {parsed}"
+        (400, "MissingParameter"),
+        "case an empty TagKeys list: expected a 400 MissingParameter, got {status} with {parsed}"
     );
     assert_eq!(
         list_tags(&router, &url).await,
@@ -737,8 +738,9 @@ async fn untag_queue_refuses_a_tag_keys_list_that_names_no_tag() {
     );
 }
 
-/// A `Tags` map that names no tag adds nothing: refused as a 400 `ValidationException`,
-/// exactly as an empty `Attributes` map is, and the queue keeps the tags it had.
+/// A `Tags` map that names no tag adds nothing: refused as a 400 `MissingParameter`
+/// naming that parameter, exactly as an empty `Attributes` map is, and the queue keeps
+/// the tags it had.
 #[tokio::test]
 async fn tag_queue_refuses_a_tags_map_that_names_no_tag() {
     let router = emulator();
@@ -758,8 +760,8 @@ async fn tag_queue_refuses_a_tags_map_that_names_no_tag() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "ValidationException"),
-        "case an empty Tags map: expected a 400 ValidationException, got {status} with {parsed}"
+        (400, "MissingParameter"),
+        "case an empty Tags map: expected a 400 MissingParameter, got {status} with {parsed}"
     );
     assert_eq!(
         list_tags(&router, &url).await,
