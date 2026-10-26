@@ -3004,6 +3004,50 @@ pub fn event_source_is_mappable_by_this_account(arn: &::service_common::arn::Arn
             && arn.resource_type() == EVENT_SOURCE_RESOURCE_VPC_CONNECTION)
 }
 
+/// The `VisibilityTimeout` of the Amazon SQS queue `event_source_arn` names, in seconds,
+/// read out of that queue's own store through the shared engine.
+///
+/// `None` when nothing here can answer for the queue — the value names no queue of this
+/// account, this engine carries no queue store, or no queue of that name was created — so
+/// there is no configured timeout to compare a function's against, and a mapping on it is
+/// accepted on its own terms rather than refused against a default nobody chose.
+#[must_use]
+pub fn queue_visibility_timeout_seconds<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    event_source_arn: &str,
+) -> Option<i64> {
+    use ::service_com_amazonaws_sqs_amazonsqs as sqs;
+
+    let name = sqs::state::queue_name_from_arn(event_source_arn)?;
+    let queues = sqs::state::service_state(engine)?;
+    let queues = queues.lock();
+    let queue = queues.queues.get(name)?;
+    Some(queue.integer(sqs::state::VISIBILITY_TIMEOUT))
+}
+
+/// Lambda's refusal of a mapping between a queue whose visibility timeout is
+/// `visibility_timeout_seconds` and a function whose `Timeout` is
+/// `function_timeout_seconds` — `None` when the queue's timeout is at least the
+/// function's, which is the combination Lambda accepts.
+///
+/// A queue hands a message to ONE consumer for the length of its visibility timeout and
+/// makes it visible again once that lapses, so a queue whose timeout is shorter than the
+/// function's own re-delivers a message that is still being worked on. Lambda compares
+/// the two when the mapping between the queue and the function is made, which is the one
+/// call that can still refuse the combination.
+#[must_use]
+pub fn queue_visibility_refusal(
+    visibility_timeout_seconds: i64,
+    function_timeout_seconds: i32,
+) -> Option<String> {
+    (visibility_timeout_seconds < i64::from(function_timeout_seconds)).then(|| {
+        format!(
+            "Queue visibility timeout: {visibility_timeout_seconds} seconds is less than \
+             Function timeout: {function_timeout_seconds} seconds"
+        )
+    })
+}
+
 /// One event source mapping this emulator holds.
 ///
 /// `CreateEventSourceMapping` "creates a mapping between an event source and an Lambda
