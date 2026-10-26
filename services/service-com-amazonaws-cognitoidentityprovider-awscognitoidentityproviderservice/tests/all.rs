@@ -71,6 +71,8 @@ mod list_terms;
 mod list_user_pools;
 #[path = "all/list_users_in_group.rs"]
 mod list_users_in_group;
+#[path = "all/managed_login_branding.rs"]
+mod managed_login_branding;
 #[path = "all/log_delivery_configuration.rs"]
 mod log_delivery_configuration;
 #[path = "all/resend_confirmation_code.rs"]

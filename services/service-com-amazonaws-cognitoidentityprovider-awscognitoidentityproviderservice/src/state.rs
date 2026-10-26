@@ -1082,6 +1082,15 @@ pub struct UserPool {
     /// needed: `TermsNameType` admits two names and a document names a stored
     /// app client, so this map holds at most twice [`MAX_CLIENTS_PER_POOL`].
     pub terms: BTreeMap<String, Terms>,
+    /// This pool's managed login branding styles keyed by their minted
+    /// `ManagedLoginBrandingId`, ordered so a read of several is stable. A style
+    /// "is linked to an app client until you delete it"
+    /// (`CreateManagedLoginBranding.ClientId`) and an app client "that already
+    /// has an assigned style" refuses a second one
+    /// (`ManagedLoginBrandingExistsException`), so `ClientId` identifies at most
+    /// one entry of this map and it holds at most [`MAX_CLIENTS_PER_POOL`]
+    /// styles.
+    pub managed_login_branding: BTreeMap<String, ManagedLoginBranding>,
     /// This pool's user import jobs keyed by their minted `JobId`, ordered so a
     /// read of several is stable: "Import jobs are retained in user pool
     /// configuration so that you can stage, stop, start, review, and delete
@@ -1611,6 +1620,20 @@ impl UserPool {
         self.terms
             .values()
             .find(|stored| stored.client_id == client_id && stored.terms_name == terms_name)
+    }
+
+    /// This pool's managed login branding style assigned to app client
+    /// `client_id`, or `None` when that app client has none.
+    ///
+    /// "Each style is linked to an app client until you delete it"
+    /// (`CreateManagedLoginBranding.ClientId`) and a second style for an app
+    /// client "that already has an assigned style" is refused
+    /// (`ManagedLoginBrandingExistsException`), so at most one stored style can
+    /// answer.
+    pub fn branding_for_client(&self, client_id: &str) -> Option<&ManagedLoginBranding> {
+        self.managed_login_branding
+            .values()
+            .find(|stored| stored.client_id == client_id)
     }
 
     /// The domain this pool's passkeys name as their relying party, or `None`
@@ -2911,6 +2934,123 @@ impl Terms {
     }
 }
 
+/// One stored managed login branding style of a user pool: what
+/// `CreateManagedLoginBranding` persisted and every later read of that style
+/// renders.
+///
+/// A style belongs to exactly one app client of the pool — "Creates a new set of
+/// branding settings for a user pool style and associates it with an app
+/// client" — and keeps the customizations the request supplied: "Amazon Cognito
+/// doesn't require that you pass all parameters in one request and preserves
+/// existing style settings that you don't specify"
+/// (`CreateManagedLoginBranding` in this service's model).
+#[derive(Debug, Clone)]
+pub struct ManagedLoginBranding {
+    pub branding_id: String,
+    pub user_pool_id: String,
+    /// The app client the style is assigned to. `ManagedLoginBrandingType`
+    /// models no `ClientId`, so this is not rendered; it is what makes the
+    /// style reachable by app client and what the uniqueness rule keys on.
+    pub client_id: String,
+    /// Whether the style takes "the default branding style options" Amazon
+    /// Cognito manages (`CreateManagedLoginBranding.UseCognitoProvidedValues`).
+    pub use_cognito_provided_values: bool,
+    /// The customized settings document, or `None` for a style that carries no
+    /// customization of its own.
+    pub settings: Option<::aws_smithy_types::Document>,
+    /// The customized image files, in the order they were submitted.
+    pub assets: Vec<crate::ops::types::AssetType>,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+}
+
+impl ManagedLoginBranding {
+    /// The modelled view of this style, rendered from what is stored.
+    ///
+    /// `Assets` is reported only when the style stores image files, because the
+    /// member is optional and an empty list is not the same answer as no list.
+    pub fn to_managed_login_branding_type(&self) -> crate::ops::types::ManagedLoginBrandingType {
+        crate::ops::types::ManagedLoginBrandingType {
+            managed_login_branding_id: Some(self.branding_id.clone()),
+            user_pool_id: Some(self.user_pool_id.clone()),
+            use_cognito_provided_values: self.use_cognito_provided_values,
+            settings: self.settings.clone(),
+            assets: (!self.assets.is_empty()).then(|| self.assets.clone()),
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+        }
+    }
+}
+
+/// The most a managed login branding style's settings and image files may
+/// occupy together: "This operation has a 2-megabyte request-size limit and
+/// include the CSS settings and image assets for your app client"
+/// (`CreateManagedLoginBranding` in this service's model), so a style past it is
+/// a style Amazon Cognito would not have accepted in one request.
+pub const MAX_BRANDING_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// The bytes a branding style's payload takes on the wire: its settings
+/// document plus the image files it carries, which is what
+/// [`MAX_BRANDING_PAYLOAD_BYTES`] bounds. An approximation of the request's own
+/// size — it counts the members that carry the style and not the surrounding
+/// protocol framing — so a style measured inside the limit is one a single
+/// request can carry.
+pub fn branding_payload_bytes(
+    settings: Option<&::aws_smithy_types::Document>,
+    assets: &[crate::ops::types::AssetType],
+) -> usize {
+    let settings = settings.map(document_bytes).unwrap_or_default();
+    assets.iter().fold(settings, |total, asset| {
+        total
+            .saturating_add(asset.category.len())
+            .saturating_add(asset.color_mode.len())
+            .saturating_add(asset.extension.len())
+            .saturating_add(asset.resource_id.as_ref().map_or(0, String::len))
+            // A blob travels base64-encoded (`AssetType.Bytes` is "the image
+            // file, in Base64-encoded binary"), which is four characters per
+            // three bytes, rounded up to the next quantum.
+            .saturating_add(base64_len(asset.bytes.as_ref().map_or(0, Vec::len)))
+    })
+}
+
+/// The length base64 encodes `bytes` bytes to: four characters per three-byte
+/// group, the last group padded.
+fn base64_len(bytes: usize) -> usize {
+    bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// The bytes a settings document takes on the wire: every string and member name
+/// counts its own UTF-8 length, a number counts eight bytes and every other
+/// scalar one byte, so a document cannot be grown without the count growing with
+/// it.
+///
+/// Walked ITERATIVELY over an explicit worklist: the document's nesting depth is
+/// the caller's to choose, and a recursive walk of it would put that depth on
+/// the stack.
+fn document_bytes(document: &::aws_smithy_types::Document) -> usize {
+    let mut total: usize = 0;
+    let mut pending: Vec<&::aws_smithy_types::Document> = vec![document];
+    while let Some(node) = pending.pop() {
+        let node_bytes = match node {
+            ::aws_smithy_types::Document::Null | ::aws_smithy_types::Document::Bool(_) => 1,
+            ::aws_smithy_types::Document::Number(_) => ::std::mem::size_of::<f64>(),
+            ::aws_smithy_types::Document::String(text) => text.len(),
+            ::aws_smithy_types::Document::Array(items) => {
+                pending.extend(items.iter());
+                1
+            }
+            ::aws_smithy_types::Document::Object(members) => {
+                members.iter().fold(1_usize, |names, (name, member)| {
+                    pending.push(member);
+                    names.saturating_add(name.len())
+                })
+            }
+        };
+        total = total.saturating_add(node_bytes);
+    }
+    total
+}
+
 /// A challenge session: what a `RespondToAuthChallenge` for this session resumes.
 #[derive(Debug, Clone)]
 pub struct AuthSession {
@@ -3591,6 +3731,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         resource_servers: BTreeMap::new(),
         identity_providers: BTreeMap::new(),
         terms: BTreeMap::new(),
+        managed_login_branding: BTreeMap::new(),
         user_import_jobs: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
