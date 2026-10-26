@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpamScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpamScope`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: creates one further scope in the IPAM the request names, stores it as the
+//! modelled [`IpamScope`] shape through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_created_ipam_scope`], and answers
+//! it in `create-in-progress` with the instant the clock owes it `create-complete`. The
+//! scope's IPAM ARN and Region are taken from the stored IPAM rather than from the request,
+//! an IPAM id the account holds no IPAM for is refused with `InvalidIpamId.NotFound`, and a
+//! replayed `ClientToken` answers with the scope that token minted or refuses with
+//! `IdempotentParameterMismatch` when the rest of the request differs. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpamScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +155,278 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpamScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpamScope"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a scope
+        // belongs to its IPAM, so "the Amazon Web Services Region of the IPAM scope"
+        // (`IpamScope$IpamRegion`) comes from the stored IPAM rather than from the Region
+        // this call was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun
+        // arm below: "not an IPAM id at all" is a malformed request rather than an IPAM that
+        // does not exist, which is the order every resource of this crate asks the two
+        // questions in (`crate::state::require_well_formed_id`).
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateIpamScopeRequest$ClientToken`): the token map keeps whatever
+        // it is given for the process's lifetime, so its length is bounded the way every
+        // other create in this crate bounds it.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The configuration that links an Amazon VPC IPAM scope to an external authority
+        // system. It specifies the type of external system AND the external resource
+        // identifier that identifies your account or instance in that system"
+        // (`ExternalAuthorityConfiguration`): a configuration naming only one of the two
+        // links the scope to nothing, so it is refused rather than stored half-written. The
+        // type itself is the modelled `IpamScopeExternalAuthorityType` enum, so a spelling
+        // outside it was already refused before this handler ran.
+        let external_authority_configuration = match input.external_authority_configuration.as_ref()
+        {
+            None => None,
+            Some(requested) => {
+                let authority_type = requested
+                    .r#type
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        state::missing_parameter(
+                            "An external authority configuration must have a type",
+                        )
+                    })?;
+                let identifier = requested
+                    .external_resource_identifier
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        state::missing_parameter(
+                            "An external authority configuration must have an external \
+                             resource identifier",
+                        )
+                    })?;
+                // The identifier is caller-chosen text the scope keeps for the process's
+                // lifetime and the model publishes no `@length` for it, so it is held to the
+                // bound this crate gives a caller-chosen text member of that kind.
+                if identifier.chars().count() > state::MAX_TAG_VALUE_CHARS {
+                    return Err(state::invalid_parameter_value(format!(
+                        "externalResourceIdentifier accepts at most {max} characters",
+                        max = state::MAX_TAG_VALUE_CHARS,
+                    )));
+                }
+                Some(IpamScopeExternalAuthorityConfiguration {
+                    r#type: Some(authority_type.to_string()),
+                    external_resource_identifier: Some(identifier.to_string()),
+                })
+            }
+        };
+
+        // "The key/value combination of a tag assigned to the resource"
+        // (`CreateIpamScopeRequest$TagSpecifications`): the scope is the only resource this
+        // call creates, so a specification naming any other resource type is refused rather
+        // than accepted and discarded — by the one helper every create in this crate bounds
+        // its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_SCOPE,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this create would retain for the process's lifetime, asked
+        // of the store below: a COUNT ceiling admits megabytes on its own, because each
+        // record holds strings the caller chose the length of.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::tag_list_bytes(&tags)
+            + input.description.as_deref().unwrap_or_default().len()
+            + input.client_token.as_deref().unwrap_or_default().len()
+            + external_authority_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.external_resource_identifier.as_deref())
+                .unwrap_or_default()
+                .len();
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`CreateIpamScopeRequest$DryRun`): the flag asks about PERMISSION, not about the
+        // resources the request names, so it is answered once the request's own form has
+        // been checked and before anything is resolved — the same place the IPAM create
+        // beside this one answers it (`crate::ops::create_ipam_pool`). Every caller of this
+        // emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts:
+        // a scope whose `create-complete` move has fallen due is already in that state, so a
+        // `ClientToken` replay below answers the scope as it ACTUALLY stands rather than as
+        // the create left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM for which you're creating this scope"
+        // (`CreateIpamScopeRequest$IpamId`): an IPAM this account holds none of is refused
+        // with the IPAM's own `NotFound` code, and the scope's IPAM ARN and Region are then
+        // taken from that IPAM rather than from the request — a scope cannot report an IPAM
+        // the store does not hold.
+        let ipam = store
+            .ipams
+            .get(ipam_id)
+            .cloned()
+            .ok_or_else(|| state::invalid_ipam_id_not_found(ipam_id))?;
+
+        // Idempotency: one token names the one scope it minted, so a replay reports that
+        // scope and creates nothing.
+        if let Some(scope_id) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.ipam_scope_client_tokens.get(token).cloned())
+        {
+            let scope = store.ipam_scopes.get(&scope_id).ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "a client token names IPAM scope '{scope_id}', which is not stored"
+                ))
+            })?;
+            // A token is only idempotent for the REQUEST it was first given with: replayed
+            // with different parameters it names a scope the caller did not ask for, which
+            // EC2 refuses rather than answers.
+            if !same_request(
+                scope,
+                &ipam,
+                input.description.as_deref(),
+                &tags,
+                external_authority_configuration.as_ref(),
+            ) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            return Ok(CreateIpamScopeOutput {
+                ipam_scope: Some(scope.clone()),
+            });
+        }
+
+        // The store's ceilings, asked before the first write: nothing in this emulator
+        // reclaims a scope, so both the COUNT of records and the caller-chosen BYTES they
+        // retain are bounded.
+        if !store.has_ipam_scope_capacity() {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {max} IPAM scopes, which is as many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let view = IpamScope {
+            // Taken from the IPAM the scope is created in: "the ARN of the IPAM"
+            // (`IpamScope$IpamArn`) and "the Amazon Web Services Region of the IPAM scope"
+            // (`IpamScope$IpamRegion`), which is the IPAM's home Region.
+            ipam_arn: ipam.ipam_arn.clone(),
+            ipam_region: ipam.ipam_region.clone(),
+            // "An IPAM contains two default scopes … The private scope is intended for all
+            // private IP address space. The public scope is intended for all public IP
+            // address space" (`IpamScope`): the public space of an account is the one the
+            // IPAM comes up with, and a scope created afterwards represents a further
+            // private network, so a created scope is a private one.
+            ipam_scope_type: Some(state::IPAM_SCOPE_TYPE_PRIVATE.to_string()),
+            // "A description for the scope you're creating"
+            // (`CreateIpamScopeRequest$Description`).
+            description: input.description.clone(),
+            tags: Some(tags),
+            external_authority_configuration,
+            // Derived by the store's one writer: the id, the ARN, the owning account, the
+            // pool count, the `create-in-progress` state the scope starts in and the fact
+            // that a created scope is not a default one.
+            ipam_scope_id: None,
+            ipam_scope_arn: None,
+            owner_id: None,
+            pool_count: None,
+            state: None,
+            is_default: None,
+        };
+
+        let scope_id = store
+            .insert_created_ipam_scope(ipam_id, input.client_token.as_deref(), view)
+            .ok_or_else(|| {
+                state::resource_limit_exceeded(format!(
+                    "This emulator holds {max} IPAM scopes, which is as many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ))
+            })?;
+
+        // Read the answer back OUT of the store, so the caller sees the scope a later reader
+        // will see rather than the request object.
+        store
+            .ipam_scopes
+            .get(&scope_id)
+            .cloned()
+            .map(|scope| CreateIpamScopeOutput {
+                ipam_scope: Some(scope),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created IPAM scope '{scope_id}' could not be read back"
+                ))
+            })
     }
+}
+
+/// Does `scope` — the scope a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a scope
+/// the caller did not ask for; the same contract `create_ipam_pool`'s `same_request` has for
+/// a pool. The members this service derives (the id, the ARN, the owner, the pool count, the
+/// state, the scope type and the default flag) are not compared: they follow from the ones
+/// that are.
+fn same_request(
+    scope: &IpamScope,
+    ipam: &Ipam,
+    description: Option<&str>,
+    tags: &[Tag],
+    external_authority_configuration: Option<&IpamScopeExternalAuthorityConfiguration>,
+) -> bool {
+    let tag_pairs = |tags: &[Tag]| {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let authority = |configuration: Option<&IpamScopeExternalAuthorityConfiguration>| {
+        configuration.map(|configuration| {
+            (
+                configuration.r#type.clone(),
+                configuration.external_resource_identifier.clone(),
+            )
+        })
+    };
+    scope.ipam_arn == ipam.ipam_arn
+        && scope.description.as_deref() == description
+        && tag_pairs(scope.tags.as_deref().unwrap_or_default()) == tag_pairs(tags)
+        && authority(scope.external_authority_configuration.as_ref())
+            == authority(external_authority_configuration)
 }
