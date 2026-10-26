@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartOTelEnrichment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartOTelEnrichment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartOTelEnrichment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +77,9 @@
 //!
 //! * `ValidationException` (HTTP 400) — The request failed validation. One or more input
 //!   parameters do not satisfy the constraints that the operation requires.
+//! * `InternalServiceFault` (HTTP 500) — widened in through `extra_errors` (see below): an
+//!   unreachable shared store is a server-side condition, and this is the server failure
+//!   every sibling writer in this crate reports it as.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,9 +95,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `StartOTelEnrichmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#StartOTelEnrichment")]
+// `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it
+// (`PutMetricStream`, `PutDashboard` and the other writers declare it) while this operation's
+// own `errors` list omits it, so an unreachable store has a modelled server failure to answer
+// with instead of a success that would claim enrichment had been stored.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#StartOTelEnrichment",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum StartOTelEnrichmentErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     ValidationException(ValidationException),
 }
 
@@ -158,18 +160,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartOTelEnrichment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartOTelEnrichmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartOTelEnrichment"))
+        // Enrichment is the account's ("Enables enrichment and PromQL access for CloudWatch
+        // vended metrics ... in the account"), so the Region the request was signed for does
+        // not select which configuration this call starts.
+        let _ = ctx;
+        // The model bounds each filter list at 100 on its own; the COMBINED bound is prose the
+        // model cannot express, so it is enforced here, against the modelled
+        // `ValidationException`.
+        if let Some(message) = crate::state::o_tel_enrichment_filters_error(
+            input.include_filters.as_deref(),
+            input.exclude_filters.as_deref(),
+        ) {
+            return Err(StartOTelEnrichmentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartOTelEnrichmentErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch OTel enrichment store is unavailable".into()),
+            })
+        })?;
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+        let stored = store.otel_enrichment.get_or_insert_with(Default::default);
+
+        // "Calling StartOTelEnrichment for an account where enrichment is already running has
+        // no effect and does not modify the filters that are applied. To change them, use
+        // UpdateOTelEnrichment." — so a repeat call reports the configuration the first one
+        // stored, with its own instants, rather than restating the request.
+        if !stored.running {
+            stored.running = true;
+            // "These filters are stored only when this operation starts enrichment."
+            stored.include_filters = input.include_filters.clone().unwrap_or_default();
+            stored.exclude_filters = input.exclude_filters.clone().unwrap_or_default();
+            stored.created_at_secs = Some(now);
+            stored.updated_at_secs = now;
+        }
+
+        Ok(StartOTelEnrichmentOutput {
+            include_filters: crate::state::o_tel_enrichment_filters(&stored.include_filters),
+            exclude_filters: crate::state::o_tel_enrichment_filters(&stored.exclude_filters),
+            created_at: stored.created_at_secs.map(crate::state::to_timestamp),
+            updated_at: Some(crate::state::to_timestamp(stored.updated_at_secs)),
+        })
     }
 }

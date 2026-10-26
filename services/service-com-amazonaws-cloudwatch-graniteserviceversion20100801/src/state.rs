@@ -26,6 +26,9 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dashboards`] — the
 //!   dashboards written by `PutDashboard` and read back by `GetDashboard` and
 //!   `ListDashboards`, each holding the `DashboardBody` document verbatim.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::otel_enrichment`] — the
+//!   account's vended-metric enrichment configuration, written by `StartOTelEnrichment`,
+//!   `UpdateOTelEnrichment` and `StopOTelEnrichment` and read back by `GetOTelEnrichment`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dataset_kms_keys`] — the
 //!   customer managed KMS key each Region's default dataset is encrypted with, read back by
 //!   `GetDataset`.
@@ -43,7 +46,7 @@ use ::serde_json::{Map, Value};
 use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, CompositeAlarm, Dimension, EvaluationCriteria,
     EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm, MetricAlarm, MetricDataQuery,
-    ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
+    OTelEnrichmentMetricSelector, ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
 };
 
 /// The action notifications an alarm state transition owes, and how they are delivered to
@@ -851,6 +854,85 @@ pub struct StoredDashboard {
     pub tags: Vec<Tag>,
 }
 
+/// The account's vended-metric enrichment configuration, as the start/stop/update operations
+/// last stored it and `GetOTelEnrichment` reports it.
+///
+/// One record per account rather than per Region: every operation describes enrichment as the
+/// account's ("the current status of vended metric enrichment for the account",
+/// `GetOTelEnrichment`), which is also how the metric store beside it is keyed — a series this
+/// store holds belongs to the account, not to the Region whose endpoint published it.
+///
+/// A store with NO record is an account where enrichment has never been configured, which is
+/// not the same as one that has been stopped: both report the stopped status, but only the
+/// latter has a configuration that was ever "last stored" to report an `UpdatedAt` for.
+#[derive(Debug, Clone, Default)]
+pub struct StoredOTelEnrichment {
+    /// Whether enrichment is enabled for the account: the `Running` / `Stopped` status
+    /// `GetOTelEnrichment` reports.
+    pub running: bool,
+    /// The include filters stored for the account, empty when "every namespace that Amazon
+    /// CloudWatch supports for enrichment is in scope" (`StartOTelEnrichmentInput$IncludeFilters`).
+    pub include_filters: Vec<OTelEnrichmentMetricSelector>,
+    /// The exclude filters stored for the account, empty when "nothing is excluded"
+    /// (`StartOTelEnrichmentInput$ExcludeFilters`).
+    pub exclude_filters: Vec<OTelEnrichmentMetricSelector>,
+    /// When enrichment started for the account, as epoch seconds, or `None` while it is
+    /// stopped: "The date and time that enrichment started for the account. This parameter is
+    /// omitted when enrichment is stopped." (`GetOTelEnrichmentOutput$CreatedAt`)
+    pub created_at_secs: Option<f64>,
+    /// When this configuration was last stored, as epoch seconds: "The date and time that the
+    /// enrichment configuration for the account was last stored."
+    /// (`GetOTelEnrichmentOutput$UpdatedAt`)
+    pub updated_at_secs: f64,
+}
+
+/// `Running`, one of the two modelled `OTelEnrichmentStatus` values
+/// (`O_TEL_ENRICHMENT_STATUS_VALUES`): "enrichment is enabled"
+/// (`GetOTelEnrichmentOutput$Status`).
+pub const O_TEL_ENRICHMENT_RUNNING: &str = "Running";
+
+/// `Stopped`, the other modelled `OTelEnrichmentStatus` value
+/// (`O_TEL_ENRICHMENT_STATUS_VALUES`): "enrichment is disabled"
+/// (`GetOTelEnrichmentOutput$Status`).
+pub const O_TEL_ENRICHMENT_STOPPED: &str = "Stopped";
+
+/// The most metric selectors one account's enrichment configuration holds: "A maximum of 100
+/// filters is allowed across `IncludeFilters` and `ExcludeFilters` combined."
+/// (`OTelEnrichmentMetricSelector`)
+///
+/// The model bounds each list at 100 on its own, so only the COMBINED bound is left for a
+/// handler to enforce.
+pub const MAX_O_TEL_ENRICHMENT_FILTERS: usize = 100;
+
+/// Why this pair of enrichment filter lists cannot be stored, or `None` when it can.
+///
+/// Shared by the two operations that accept the pair (`StartOTelEnrichment` and
+/// `UpdateOTelEnrichment`), so one rule is enforced in one place.
+pub fn o_tel_enrichment_filters_error(
+    include_filters: Option<&[OTelEnrichmentMetricSelector]>,
+    exclude_filters: Option<&[OTelEnrichmentMetricSelector]>,
+) -> Option<String> {
+    let combined = include_filters.map_or(0, <[OTelEnrichmentMetricSelector]>::len)
+        + exclude_filters.map_or(0, <[OTelEnrichmentMetricSelector]>::len);
+    if combined > MAX_O_TEL_ENRICHMENT_FILTERS {
+        return Some(format!(
+            "A maximum of {MAX_O_TEL_ENRICHMENT_FILTERS} filters is allowed across \
+             IncludeFilters and ExcludeFilters combined"
+        ));
+    }
+    None
+}
+
+/// The stored filter list as the modelled member reports it: `None` for an empty list, which
+/// every enrichment response documents as "omitted" rather than empty — an omitted
+/// `IncludeFilters` means every supported namespace is in scope, and an omitted
+/// `ExcludeFilters` means nothing is excluded.
+pub fn o_tel_enrichment_filters(
+    filters: &[OTelEnrichmentMetricSelector],
+) -> Option<Vec<OTelEnrichmentMetricSelector>> {
+    (!filters.is_empty()).then(|| filters.to_vec())
+}
+
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
@@ -891,6 +973,9 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// Which claim on the alarm clock is current, so a clock that stands down releases only
     /// its own.
     pub alarm_clock_generation: u64,
+    /// The account's vended-metric enrichment configuration, once any of the enrichment
+    /// operations has stored one.
+    pub otel_enrichment: Option<StoredOTelEnrichment>,
     /// The customer managed KMS key associated with a Region's default dataset, by Region.
     ///
     /// There is no dataset record to create: "The default dataset is implicit for every
