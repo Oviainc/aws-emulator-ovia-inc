@@ -777,6 +777,17 @@
 //! is account-wide because this store is per ACCOUNT and not per Region (see "The default
 //! VPC's default subnets" below).
 //!
+//! The *block public access for AMIs* setting is the same kind of single-word setting, with
+//! one difference: it is a setting OF A REGION — "block public access for AMIs at the
+//! account level in the specified Amazon Web Services Region"
+//! (`GetImageBlockPublicAccessState`) — so
+//! [`ComAmazonawsEc2Amazonec2State::image_block_public_access`] is keyed by the Region of
+//! the request that set it, the way the EBS encryption-by-default set below is, and a Region
+//! with no entry is one the setting has never been enabled in
+//! ([`IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED`]), which is also where a disable puts a Region
+//! back. Like the snapshot setting it has no clock-owed move: the mode an enable asks for is
+//! the mode the next read reports, which is what the pair of operations is observed to do.
+//!
 //! The account-level instance metadata service (IMDS) defaults are the same kind of thing,
 //! with one difference: each of their settings can also be in NO state at all. "To remove a
 //! parameter's account-level default setting, specify `no-preference`. If an account-level
@@ -3223,6 +3234,26 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The Regions this account has *block public access for AMIs* turned ON in, each under
+    /// the mode the enable put it in — see the module docs.
+    ///
+    /// Keyed by the Region of the request that set it ([`request_region`]), the way
+    /// [`Self::ebs_encryption_by_default_regions`] is, because the setting is an
+    /// account-level fact OF A REGION: "block public access for AMIs at the account level in
+    /// the specified Amazon Web Services Region"
+    /// (`GetImageBlockPublicAccessState`). A Region that is absent is one the account has
+    /// never enabled it in, which is [`IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED`]; a disable
+    /// REMOVES the entry, so the map only ever holds the Regions an enable has reached,
+    /// bounded by [`MAX_IMAGE_BLOCK_PUBLIC_ACCESS_REGIONS`].
+    ///
+    /// The mode is a `&'static str` so only a member of the modelled
+    /// `ImageBlockPublicAccessEnabledState` catalog can ever be stored here: the word comes
+    /// from this module's own constants ([`image_block_public_access_mode`]), never from a
+    /// request. Read it through [`Self::image_block_public_access_state`] and write it
+    /// through [`Self::enable_image_block_public_access`] /
+    /// [`Self::disable_image_block_public_access`], so the operation that reports the
+    /// setting and the two that change it cannot disagree.
+    image_block_public_access: BTreeMap<String, &'static str>,
     /// The account's instance metadata service (IMDS) defaults — see the module docs.
     ///
     /// Read it through [`Self::instance_metadata_defaults`] and write it through
@@ -3480,6 +3511,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // No Region has block public access for AMIs turned on until an enable reaches
+            // it there, so a fresh account holds the empty map.
+            image_block_public_access: BTreeMap::new(),
             // An account that has never called `ModifyInstanceMetadataDefaults` has no
             // account-level IMDS default at all: every setting is absent, which is what
             // `AccountInstanceMetadataDefaults::default()` is.
@@ -27431,6 +27465,115 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block public access for AMIs (the account-level setting of a Region)
+// ---------------------------------------------------------------------------
+
+/// "`unblocked` - Your AMIs in the specified Region can be publicly shared"
+/// (`GetImageBlockPublicAccessStateResult$ImageBlockPublicAccessState`).
+///
+/// It is both where a Region the account has never enabled the setting in sits and the state
+/// `DisableImageBlockPublicAccess` returns it to — "Returns `unblocked` if the request
+/// succeeds" (`DisableImageBlockPublicAccessResult$ImageBlockPublicAccessState`), whose
+/// whole catalog is the generated
+/// [`crate::ops::types::IMAGE_BLOCK_PUBLIC_ACCESS_DISABLED_STATE_VALUES`].
+pub const IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED: &str = "unblocked";
+
+/// "`block-new-sharing` - Any attempt to publicly share your AMIs in the specified Region is
+/// blocked" (`GetImageBlockPublicAccessStateResult$ImageBlockPublicAccessState`): the one
+/// mode `EnableImageBlockPublicAccess` puts the setting into, whose whole catalog is the
+/// generated [`crate::ops::types::IMAGE_BLOCK_PUBLIC_ACCESS_ENABLED_STATE_VALUES`].
+pub const IMAGE_BLOCK_PUBLIC_ACCESS_BLOCK_NEW_SHARING: &str = "block-new-sharing";
+
+/// The modes `EnableImageBlockPublicAccess` accepts: "Specify `block-new-sharing` to enable
+/// block public access for AMIs at the account level in the specified Region"
+/// (`EnableImageBlockPublicAccessRequest$ImageBlockPublicAccessState`) — the whole
+/// `ImageBlockPublicAccessEnabledState` catalog, which holds that one mode. The generated
+/// member list is [`crate::ops::types::IMAGE_BLOCK_PUBLIC_ACCESS_ENABLED_STATE_VALUES`].
+pub const IMAGE_BLOCK_PUBLIC_ACCESS_MODES: [&str; 1] = [IMAGE_BLOCK_PUBLIC_ACCESS_BLOCK_NEW_SHARING];
+
+/// The [`IMAGE_BLOCK_PUBLIC_ACCESS_MODES`] member `requested` names, or `None` when it names
+/// none.
+///
+/// Answering a `&'static str` out of this module's own constants is what keeps request text
+/// out of the store: the writer stores what this returns, so the stored word is always a
+/// modelled catalog member. One line over [`catalog_member`], the module's single catalog
+/// resolver, like [`snapshot_block_public_access_mode`] beside it.
+pub fn image_block_public_access_mode(requested: &str) -> Option<&'static str> {
+    catalog_member(&IMAGE_BLOCK_PUBLIC_ACCESS_MODES, requested)
+}
+
+/// How many Regions this emulator holds the block public access for AMIs setting for.
+///
+/// CHOSEN, like [`MAX_ENCRYPTION_BY_DEFAULT_REGIONS`] and for the same reason: the Region
+/// comes from the caller's SigV4 credential scope, so without a ceiling a caller could
+/// enable the setting in unboundedly many Region names and nothing would ever reclaim the
+/// entries. An emulator storage bound, not an AWS-modelled refusal —
+/// `EnableImageBlockPublicAccess` models no error at all.
+pub const MAX_IMAGE_BLOCK_PUBLIC_ACCESS_REGIONS: usize = MAX_ENCRYPTION_BY_DEFAULT_REGIONS;
+
+/// What ONE Region's *block public access for AMIs* setting holds is the MODE an enable put
+/// it in, so [`ComAmazonawsEc2Amazonec2State::image_block_public_access`] stores that mode
+/// per Region; a Region with no entry at all is one the setting is
+/// [`IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED`] in.
+impl ComAmazonawsEc2Amazonec2State {
+    /// The state of this account's *block public access for AMIs* setting in `region`.
+    ///
+    /// A pure READ: a Region with no stored mode answers
+    /// [`IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED`] without storing anything, and the setting has
+    /// no clock-owed move — the mode an enable asks for is the mode the next read reports,
+    /// which is what the pair of operations is observed to do — so nothing about it changes
+    /// with time and `GetImageBlockPublicAccessState` cannot change what a later caller sees.
+    pub fn image_block_public_access_state(&self, region: &str) -> &'static str {
+        self.image_block_public_access
+            .get(region)
+            .copied()
+            .unwrap_or(IMAGE_BLOCK_PUBLIC_ACCESS_UNBLOCKED)
+    }
+
+    /// Enable the setting in `region` with `mode` and answer the state now in effect —
+    /// "Returns `block-new-sharing` if the request succeeds"
+    /// (`EnableImageBlockPublicAccessResult$ImageBlockPublicAccessState`).
+    ///
+    /// `mode` is a `&'static str` so only one of this module's catalog constants can be
+    /// stored ([`image_block_public_access_mode`] is what turns a request's word into one),
+    /// and the answer is read back off the store rather than echoed, so a writer reports
+    /// exactly what a later read will.
+    ///
+    /// Idempotent: enabling a Region it is already on in changes nothing and answers the same
+    /// mode.
+    pub fn enable_image_block_public_access(
+        &mut self,
+        region: &str,
+        mode: &'static str,
+    ) -> &'static str {
+        self.image_block_public_access.insert(region.to_string(), mode);
+        self.image_block_public_access_state(region)
+    }
+
+    /// Disable the setting in `region` and answer the state now in effect.
+    ///
+    /// "This removes the block public access restriction from your account"
+    /// (`DisableImageBlockPublicAccess`): the mode goes back out of the store, which is where
+    /// a Region that never had one stands, so the answer is read back off the store rather
+    /// than echoed. Idempotent: disabling a Region it was never on in changes nothing and
+    /// answers the same state.
+    pub fn disable_image_block_public_access(&mut self, region: &str) -> &'static str {
+        self.image_block_public_access.remove(region);
+        self.image_block_public_access_state(region)
+    }
+
+    /// Would enabling the setting in `region` take the store past
+    /// [`MAX_IMAGE_BLOCK_PUBLIC_ACCESS_REGIONS`]?
+    ///
+    /// A Region the store already holds a mode for costs nothing, so re-enabling one is never
+    /// refused.
+    pub fn would_exceed_image_block_public_access_regions(&self, region: &str) -> bool {
+        !self.image_block_public_access.contains_key(region)
+            && self.image_block_public_access.len() >= MAX_IMAGE_BLOCK_PUBLIC_ACCESS_REGIONS
     }
 }
 
