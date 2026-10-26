@@ -33,12 +33,28 @@
 //!
 //! `StartResourceScan` is what starts a scan, and
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_resource_scan`] is
-//! the ONE way a record enters the store — so that operation (still a scaffold stub, with
-//! its own issue) and the suites that cover the reads over records a bound's worth of wire
-//! calls cannot create both write through it rather than reaching into the vector. An
-//! account whose resources have never been scanned is exactly what this store holds for
-//! now, and that is what the read reports: the empty list, for every filter a request can
-//! name.
+//! the ONE way a record enters the store — so that operation, and the suites that cover the
+//! reads over records a bound's worth of wire calls cannot create, both write through it
+//! rather than reaching into the vector.
+//!
+//! ## What a scan READS
+//!
+//! The resources of this account and Region that this service holds a record of: every
+//! resource of every live stack of that Region
+//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]).
+//! Each one is therefore managed by a CloudFormation stack, which is what `ScannedResource`'s
+//! `ManagedByStack` reports of it, and the stack that manages it is recorded on the row.
+//!
+//! A scan is a POINT-IN-TIME read: the rows are taken when the scan starts and nothing
+//! recomputes them afterwards, so a resource created after that instant belongs to the next
+//! scan rather than to this one — and a read of the record cannot change what it reports.
+//!
+//! ## One scan at a time
+//!
+//! "Only one can be run at a time for an account in a Region" — the modelled
+//! `ResourceScanInProgressException`. The set that refusal is metered over is the records
+//! [`StoredResourceScan::is_in_flight`] answers true for, in the Region the request was
+//! signed for, so the refusal LIFTS on its own as the scan it counted completes.
 
 use std::time::{Duration, SystemTime};
 
@@ -95,6 +111,34 @@ pub const PERCENTAGE_COMPLETE: f64 = 100.0;
 /// `PercentageCompleted` of a scan that has only just started.
 pub const PERCENTAGE_STARTED: f64 = 0.0;
 
+/// The wildcard a resource-type filter may end with: "To scan all resource types within a
+/// service, you can use a wildcard, represented by an asterisk (`*`). You can place an
+/// asterisk at only the end of the string, for example, `AWS::S3::*`"
+/// (`ScanFilter$Types`).
+pub const TYPE_FILTER_WILDCARD: char = '*';
+
+/// One resource a scan FOUND: what identifies it, and the stack that manages it.
+///
+/// `DescribeResourceScan` reports the COUNT of these rows and the distinct types among them;
+/// the per-resource members are what a row IS, and `ListResourceScanResources` — still a
+/// scaffold stub with its own issue — is the read that reports each one, so no implemented
+/// read names them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundResource {
+    /// "The type of the resource, such as `AWS::DynamoDB::Table`"
+    /// (`ScannedResource$ResourceType`).
+    pub resource_type: String,
+    /// The resource's physical id in the service that owns it — the value the stack recorded
+    /// for it, which is what names the resource outside CloudFormation.
+    pub physical_resource_id: String,
+    /// The logical id the stack that manages this resource declares it under.
+    pub logical_resource_id: String,
+    /// The ARN of the stack that manages the resource, which is what
+    /// `ScannedResource$ManagedByStack` reports the presence of ("if `true`, the resource is
+    /// managed by a CloudFormation stack").
+    pub stack_id: String,
+}
+
 /// The terminal status a scan is headed for, and the instant it is due.
 #[derive(Debug, Clone)]
 pub struct PendingScanOutcome {
@@ -138,6 +182,21 @@ pub struct StoredResourceScan {
     /// [`crate::state::ComAmazonawsCloudformationCloudformationState::settle`] materialises
     /// it.
     pub pending: Option<PendingScanOutcome>,
+    /// `StartResourceScanInput$ClientRequestToken`: "A unique identifier for this
+    /// StartResourceScan request. Specify this token if you plan to retry requests so that
+    /// CloudFormation knows that you're not attempting to start a new resource scan" — so a
+    /// retry under the token of the scan still running addresses this record instead of
+    /// starting a second one.
+    pub client_request_token: Option<String>,
+    /// The `ScanFilters` the call supplied, one entry per filter carrying that filter's
+    /// `Types`, which `DescribeResourceScan` reports back as "the scan filters that were
+    /// used".
+    pub scan_filters: Vec<Vec<String>>,
+    /// How many resources the scan READ from the account and Region: every resource it looked
+    /// at, before its filters decided which ones it lists.
+    pub resources_read: usize,
+    /// The resources the scan LISTED: the ones it read that its filters retained.
+    pub resources: Vec<FoundResource>,
 }
 
 impl StoredResourceScan {
@@ -164,6 +223,10 @@ impl StoredResourceScan {
                 percentage_completed: PERCENTAGE_COMPLETE,
                 due_at: now + SCAN_DELAY,
             }),
+            client_request_token: None,
+            scan_filters: Vec::new(),
+            resources_read: 0,
+            resources: Vec::new(),
         }
     }
 
@@ -188,7 +251,128 @@ impl StoredResourceScan {
     pub fn is_scan_type(&self, scan_type: &str) -> bool {
         self.scan_type == scan_type
     }
+
+    /// Whether this scan is still running — the set the one-scan-at-a-time refusal meters.
+    pub fn is_in_flight(&self) -> bool {
+        self.status == status::IN_PROGRESS
+    }
+
+    /// Whether `resource_scan_id` addresses this record in `region`: a scan is addressed by
+    /// its own ARN, and nothing outside the request's own Region is addressable — the way
+    /// every other read of this service is Regional
+    /// ([`crate::state::ComAmazonawsCloudformationCloudformationState::resolve`]).
+    pub fn is_addressed_by(&self, region: &str, resource_scan_id: &str) -> bool {
+        self.region == region && self.resource_scan_id == resource_scan_id
+    }
+
+    /// "The number of resources that were listed": the rows the scan's filters retained.
+    pub fn resources_scanned(&self) -> usize {
+        self.resources.len()
+    }
+
+    /// "The list of resource types for the specified scan": the distinct types among the
+    /// resources the scan listed, in sorted order so the read is deterministic.
+    pub fn resource_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .resources
+            .iter()
+            .map(|resource| resource.resource_type.clone())
+            .collect();
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    /// Whether the counts the scan took are readable: "only available for scans with a
+    /// `Status` set to `COMPLETE`, `EXPIRED`, or `FAILED`" — so a scan still running reports
+    /// no counts rather than partial ones.
+    pub fn counts_are_available(&self) -> bool {
+        !self.is_in_flight()
+    }
+
+    /// Whether the types the scan found are readable: "resource types are only available for
+    /// scans with a `Status` set to `COMPLETE` or `FAILED`", which leaves out a scan still
+    /// running and one whose results have expired.
+    pub fn types_are_available(&self) -> bool {
+        matches!(self.status.as_str(), status::COMPLETE | status::FAILED)
+    }
 }
+
+/// Whether a scan given `filters` lists a resource of `resource_type`.
+///
+/// A scan with no filter, or a filter that names no type, covers every resource it read —
+/// `ScanFilter` is "a filter that is used to specify which resource types to scan", so naming
+/// none narrows nothing. Otherwise the resource is listed when any named type matches it.
+pub fn filters_admit(filters: &[Vec<String>], resource_type: &str) -> bool {
+    let mut named_any = false;
+    for types in filters {
+        for filter in types {
+            named_any = true;
+            if type_filter_matches(filter, resource_type) {
+                return true;
+            }
+        }
+    }
+    !named_any
+}
+
+/// Whether one `ScanFilter$Types` entry matches `resource_type`: a literal type matches
+/// itself, and one ending in the documented wildcard matches every type under the prefix
+/// before it ("to scan all resource types within a service, you can use a wildcard … for
+/// example, `AWS::S3::*`").
+pub fn type_filter_matches(filter: &str, resource_type: &str) -> bool {
+    match filter.strip_suffix(TYPE_FILTER_WILDCARD) {
+        Some(prefix) => resource_type.starts_with(prefix),
+        None => filter == resource_type,
+    }
+}
+
+/// Whether one `ScanFilter$Types` entry is one the service accepts: the wildcard may be
+/// placed "at only the end of the string", so an asterisk anywhere else makes the filter
+/// invalid.
+pub fn is_valid_type_filter(filter: &str) -> bool {
+    let body = filter.strip_suffix(TYPE_FILTER_WILDCARD).unwrap_or(filter);
+    !body.contains(TYPE_FILTER_WILDCARD)
+}
+
+/// The scan type a call that supplied `filters` runs as: a scan given resource-type filters
+/// covered PART of the account, and one given none covered all of it.
+pub fn scan_type_of(filters: &[Vec<String>]) -> &'static str {
+    if filters.iter().any(|types| !types.is_empty()) {
+        scan_type::PARTIAL
+    } else {
+        scan_type::FULL
+    }
+}
+
+/// The message answered for a `ScanFilters` entry that places the wildcard anywhere but at
+/// the end of the string, built from the value the request supplied.
+///
+/// The rule is the model's own (`ScanFilter$Types`); the sentence that states it back to the
+/// caller is this emulator's, since neither the model nor a recorded refusal of this request
+/// carries the service's own wording for it.
+pub fn invalid_type_filter(filter: &str) -> String {
+    format!(
+        "Invalid resource type filter [{filter}] in ScanFilters: an asterisk can only be \
+         placed at the end of the string"
+    )
+}
+
+/// The message answered when a request names a resource scan this account and Region holds no
+/// record of, built from what the request named.
+///
+/// Shaped like the other "cannot be found" messages of this service
+/// ([`crate::state::generated_template::does_not_exist`]): no recorded refusal of this request
+/// is available to take the service's own wording from.
+pub fn does_not_exist(resource_scan_id: &str) -> String {
+    format!("Resource scan {resource_scan_id} cannot be found")
+}
+
+/// The message answered when a scan of this account and Region is already running, which is
+/// the sentence the modelled `ResourceScanInProgressException` documents.
+pub const SCAN_IN_PROGRESS: &str =
+    "A resource scan is currently in progress. Only one can be run at a time for an account \
+     in a Region.";
 
 /// A scan's ARN from its id: `ResourceScanId` is "the Amazon Resource Name (ARN) of the
 /// resource scan. The format is

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one `ImportSummary` per import record this store holds that the
+//! request selects — the region it reached, the table its `TableArn` names, and the
+//! documented window "within the past 90 days" ([`crate::state::IMPORT_HISTORY_WINDOW`])
+//! — each read from [`crate::state::Import`], so every member reported is what the
+//! import wrote and nothing is canned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is taken in ascending `ImportArn` order (the order the store keys imports
+//! by, which is ascending request instant per table — [`crate::state::new_import_arn`]),
+//! `PageSize` entries at a time, and `NextToken` is reported exactly when more remain,
+//! so the next call resumes strictly after the entry this page stopped on — the paging
+//! rule every listing of this service follows. The token is that cursor in the form the
+//! member models (`ImportNextToken`: 16-hex-digit groups, at least 112 characters), so a
+//! token this operation mints is one a client may send straight back.
+//!
+//! An account that has run no import is answered an empty list and no token: the records
+//! are written by the IMPORT surface (`ImportTable`), which is still a scaffold tracked
+//! by its own stub issue, so a store driven through this slice's own API holds none.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +104,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dynamodb-dynamodb-20120
 // here — hence the `ListImportsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dynamodb#ListImports")]
+// `InternalServerError` is widened in through `extra_errors`: this SERVICE models it
+// ("An error occurred on the server side") and every sibling listing declares it, while
+// this operation's own `errors` list omits it — so an unreachable shared store has a
+// modelled server error to report rather than being dressed up as a client failure.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dynamodb#ListImports",
+    extra_errors = ["InternalServerError"]
+)]
 #[derive(Debug)]
 pub enum ListImportsErrorModeled {
+    InternalServerError(InternalServerError),
     LimitExceededException(LimitExceededException),
 }
 
@@ -151,18 +169,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImports"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "The Amazon Resource Name (ARN) associated with the table that was imported
+        // to" (`ListImports$TableArn`): the member narrows the listing to one table's
+        // imports, and a request that names none is answered over every table's.
+        let table = input
+            .table_arn
+            .as_deref()
+            .map(|arn| crate::state::check_table_arn(arn, &region))
+            .transpose()
+            .map_err(lift)?;
+        // "must be copied from the output of a previous call to ListImports"
+        // (`ListImports$NextToken`), so a token this operation did not mint stands for no
+        // page and is refused rather than quietly taken for the first one.
+        let cursor = input.next_token.as_deref().map(decode_token).transpose()?;
+
+        let store = state.lock();
+        // A reporting operation, and one that reports nothing a transition could change:
+        // an import record is fixed once written, and whether it still falls inside the
+        // documented window is derived from the clock on each read. So this reads only.
+        let mut summaries: Vec<ImportSummary> = store
+            // Imports are recorded per region, so a listing answers with the ones this
+            // request's own region holds, in the ascending ARN order the store keys by.
+            .imports_in(&region)
+            .filter(|import| {
+                table
+                    .as_deref()
+                    .is_none_or(|named| import.table_name == named)
+                    // "Lists completed imports within the past 90 days" (the operation's
+                    // own doc): a record older than that window is no longer reported.
+                    && import.within_history_window(now)
+            })
+            // The cursor: this page starts strictly after the entry the previous one
+            // stopped on, which that page's `NextToken` carried.
+            .filter(|import| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|start| import.arn.as_str() > start)
+            })
+            .map(crate::state::Import::summary)
+            .collect();
+        drop(store);
+
+        // "The number of ImportSummary objects returned in a single page"
+        // (`ListImports$PageSize`), which the model bounds at 25 — the page size this
+        // reports when the request names none.
+        let limit = usize::try_from(input.page_size.unwrap_or(DEFAULT_PAGE_SIZE)).unwrap_or(0);
+        let truncated = summaries.len() > limit;
+        summaries.truncate(limit);
+        // "If this value is returned, there are additional results to be displayed"
+        // (`ListImportsOutput$NextToken`): reported only where entries remain beyond this
+        // page, and standing for the entry the page stopped on.
+        let next_token = truncated
+            .then(|| {
+                summaries
+                    .last()
+                    .and_then(|summary| summary.import_arn.as_deref())
+                    .map(encode_token)
+            })
+            .flatten();
+
+        Ok(ListImportsOutput {
+            import_summary_list: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The page size this operation reports when the request names no `PageSize`: the
+/// ceiling the model declares for the member (`ListImportsMaxLimit`, range 1..=25), so a
+/// request that asks for no bound is answered with as many imports as one page may carry.
+const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The bytes one group of the token's pattern carries: `^([0-9a-f]{16})+$`
+/// (`ImportNextToken`) is a whole number of 16-hex-digit groups, and 16 hex digits are 8
+/// bytes.
+const TOKEN_GROUP_BYTES: usize = 8;
+
+/// The fewest bytes a token carries: the member's 112-character minimum
+/// (`ImportNextToken`, len 112..=1024) is 56 bytes of hex.
+const MIN_TOKEN_BYTES: usize = 56;
+
+/// The cursor a truncated page reports, in the form the `ImportNextToken` member models:
+/// the cursor's bytes in hex, padded with NULs to the 8-byte boundary its 16-hex-digit
+/// groups require and up to its 112-character floor.
+///
+/// A token is therefore opaque to a client and carries nothing but the entry the page
+/// stopped on, and it satisfies the member's own constraints — so the value this
+/// operation reports is one the next request may send straight back.
+fn encode_token(cursor: &str) -> String {
+    let mut bytes = cursor.as_bytes().to_vec();
+    while bytes.len() < MIN_TOKEN_BYTES || !bytes.len().is_multiple_of(TOKEN_GROUP_BYTES) {
+        bytes.push(0);
+    }
+    ::hex::encode(bytes)
+}
+
+/// The cursor a `NextToken` stands for, or the refusal for a token this operation did
+/// not mint.
+fn decode_token(token: &str) -> Result<String, ListImportsError> {
+    let mut bytes = ::hex::decode(token).map_err(|_| invalid_next_token())?;
+    // Drop the NUL padding [`encode_token`] added, without indexing: the position is
+    // derived from the vector itself, so there is no request-derived index at all.
+    let unpadded = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    bytes.truncate(unpadded);
+    let cursor = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
+    if cursor.is_empty() {
+        return Err(invalid_next_token());
+    }
+    Ok(cursor)
+}
+
+/// How a `NextToken` that is not one of this operation's is refused: the wording this
+/// service states for that case wherever a reader pages by a token.
+fn invalid_next_token() -> ListImportsError {
+    crate::scaffolded::Scaffolded::validation("Invalid NextToken")
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListImportsError {
+    ListImportsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// The only one this operation can meet is a `TableArn` that addresses no table of this
+/// endpoint — it looks up no table, because a listing is answered over whatever records
+/// the store holds — so a refusal here is about the request's own member and is reported
+/// as the `ValidationException` such a value is.
+fn lift(error: crate::state::RequestError) -> ListImportsError {
+    crate::scaffolded::Scaffolded::validation(error.message().to_string())
 }

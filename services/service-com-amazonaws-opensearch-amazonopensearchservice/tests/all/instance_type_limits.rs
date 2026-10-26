@@ -515,7 +515,7 @@ async fn a_pairing_the_release_does_not_offer_is_refused() {
         ("Elasticsearch_7.8", "r6g.2xlarge.search"),
         ("Elasticsearch_7.8", "t4g.small.search"),
         ("Elasticsearch_7.10", "or1.large.search"),
-        ("OpenSearch_2.10", "or1.large.search"),
+        ("OpenSearch_2.9", "or1.large.search"),
     ] {
         let case = format!("{version} {instance_type}");
         let answer = describe_limits(&emulator, version, instance_type, "").await;

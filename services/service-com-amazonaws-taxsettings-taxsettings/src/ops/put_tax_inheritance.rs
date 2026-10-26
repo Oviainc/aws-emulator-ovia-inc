@@ -2,20 +2,16 @@
 
 //! @op PutTaxInheritance
 //!
-//! Records the account's tax-inheritance election — for the AWS Organizations
-//! management account, which is the only caller allowed to make it.
+//! Records the account's tax-inheritance election: the submitted
+//! `heritageStatus` becomes the account's election, and `GetTaxInheritance`
+//! reports it from then on.
 //!
-//! Tax inheritance is an organization-level election (whether an organization's
-//! member accounts inherit the management account's tax settings), so AWS refuses
-//! the call from any other account with `ValidationException` /
-//! `FieldValidationFailed`. This emulator presents ONE standalone account that
-//! belongs to no organization, so no caller it serves is a management account and
-//! every call gets that refusal rather than a success that stores an election AWS
-//! would not have stored; see [`crate::state::MANAGEMENT_ACCOUNT_ONLY`]. The
-//! election itself is state
+//! The election is this service's state
 //! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::tax_inheritance`]),
-//! which `GetTaxInheritance` reports, so a caller that can be shown to be a
-//! management account has somewhere to write it.
+//! so the write is a plain replacement of the one value the account has: writing
+//! the election it already holds leaves the same value recorded, and the response
+//! carries no members at all (the modelled output is empty), so the only way to
+//! observe the write is to read it back.
 //!
 //! ## Shape of an operation
 //!
@@ -146,15 +142,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata and the engine is held on `self`; this
-        // operation stores nothing (see below), so neither is read.
-        let _ = (ctx, &self.engine);
+        let _ = ctx;
 
         // The election IS this operation's only input, so a request that omits it
-        // asks for nothing: refuse before anything else, because the request is
-        // unusable whoever sent it. An unlisted `HeritageStatus` value is already
-        // refused by the boundary validator, which carries the enum's value set.
-        if input.heritage_status.is_none() {
+        // asks for nothing: refuse before anything is stored. An unlisted
+        // `HeritageStatus` value is already refused by the boundary validator,
+        // which carries the enum's value set.
+        let Some(heritage_status) = input.heritage_status else {
             return Err(PutTaxInheritanceErrorModeled::ValidationException(
                 crate::state::validation(
                     crate::state::ERROR_CODE_MISSING_INPUT,
@@ -163,18 +157,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
-        }
+        };
 
-        // The caller is not an AWS Organizations management account — nothing
-        // this emulator serves is — so the election is refused the way AWS
-        // refuses it, and nothing is stored. The refusal is about the CALLER, not
-        // about a parameter, so it names no field.
-        Err(PutTaxInheritanceErrorModeled::ValidationException(
-            crate::state::validation_of_the_call(
-                crate::state::ERROR_CODE_FIELD_VALIDATION_FAILED,
-                crate::state::MANAGEMENT_ACCOUNT_ONLY,
-            ),
-        )
-        .into())
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutTaxInheritanceErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The account has ONE election, so the write replaces whatever it held:
+        // the value recorded here is the value `GetTaxInheritance` reports until
+        // the next write.
+        let replaced = state
+            .lock()
+            .tax_inheritance
+            .replace(heritage_status.clone());
+
+        // The access record for a state-changing call: which operation ran, what
+        // it changed and how it ended. Only the modelled enum values travel here;
+        // no credential and no request header does.
+        ::tracing::info!(
+            operation = "PutTaxInheritance",
+            outcome = "recorded",
+            heritage_status = %heritage_status,
+            replaced = replaced.as_deref().unwrap_or(""),
+            "recorded the account's tax inheritance election"
+        );
+
+        // The modelled output carries no members: the write is observed by
+        // reading the election back.
+        Ok(PutTaxInheritanceOutput {})
     }
 }

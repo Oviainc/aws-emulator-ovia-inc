@@ -182,6 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let created_after = input.created_after.map(|bound| bound.as_secs_f64());
         let created_before = input.created_before.map(|bound| bound.as_secs_f64());
+        // The two bounds name ONE window, each of them exclusive: a
+        // `createdAfter` at or after the `createdBefore` beside it spans no
+        // instant, so the pair states a period rather than selecting on one
+        // (`crate::state::time_window_refusal`).
+        if let Some(refusal) = crate::state::time_window_refusal(
+            created_after,
+            created_before,
+            "createdAfter",
+            "createdBefore",
+        ) {
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         // The token resumes THIS listing: one minted for a different set of
         // filters would index into a different sequence.
         let scope = crate::state::billing_adjustment_scope(

@@ -102,7 +102,7 @@ use super::types::*;
 // absent actual value is selected only by an absent filter, so a filter on a member no
 // enablement here carries selects nothing (see the module header on `parentIdentifiers`
 // and `inheritanceDriftStatuses`).
-use crate::state::{filter_set, selected, selected_optional};
+use crate::state::{filter_set, resolve_baseline, selected, selected_optional, selected_resolved};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -210,7 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .values()
             .filter(|enabled_baseline| {
                 selected(&target_identifiers, &enabled_baseline.target_identifier)
-                    && selected(&baseline_identifiers, &enabled_baseline.baseline_identifier)
+                    // A baseline is selected by the catalog entry a filter value
+                    // resolves to, so an enablement is found by any of the identifiers
+                    // that name its baseline, not only by the one the enabling call sent.
+                    && selected_resolved(
+                        &baseline_identifiers,
+                        &enabled_baseline.baseline_identifier,
+                        resolve_baseline,
+                    )
                     && selected(&statuses, enabled_baseline.status.as_wire())
                     // An enablement whose inheritance drift is not assessed has no status
                     // for this filter to match, so only an absent filter selects it; see

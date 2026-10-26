@@ -23,18 +23,22 @@
 //! 0. a `SearchJobIdentifier` that is not a well-formed identifier of this service —
 //!    `ValidationException` (400) from [`crate::state::check_job_identifier`], judged
 //!    before any store lookup, because a string that cannot be an identifier names no
-//!    resource rather than a missing one;
+//!    resource rather than a missing one; and, beside it, a `RoleArn` that is no ARN at
+//!    all or is outside the modelled length — `ValidationException` (400) from
+//!    [`crate::state::role_arn_input_refusal`], the member refusal the boundary no longer
+//!    makes (`skip_validation`);
 //! 1. a `SearchJobIdentifier` that names no job — `ResourceNotFoundException` (404);
 //! 2. a search job whose results have not settled (any status outside
 //!    [`crate::state::EXPORTABLE_SEARCH_JOB_STATES`]) — `ValidationException` (400)
-//!    naming the status it is in and the ones export permits, because the caller's fix
-//!    is to poll and retry rather than to change the request;
+//!    naming the status it is in and the ones export permits
+//!    ([`crate::state::export_status_refusal_message`]), because the caller's fix is to
+//!    poll and retry rather than to change the request;
 //! 3. an `ExportSpecification` carrying no member — `InternalServerException` (500):
 //!    the service accepts the malformed union through input validation and fails on it
 //!    server-side (see [`ReceivedExportSpecification`]);
 //! 4. a `RoleArn` this service cannot be passed — `AccessDeniedException` (403) from
 //!    [`crate::state::pass_role_denial`], an authorization decision rather than an
-//!    input refusal;
+//!    input refusal, which is why every well-formed ARN reaches it;
 //! 5. a tag set past the caps on one record, and the store's own export-job cap —
 //!    `ValidationException` (400) and the modelled `ServiceQuotaExceededException`
 //!    (402).
@@ -216,6 +220,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_job_identifier(&input.search_job_identifier)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // `RoleArn` carries `skip_validation` (see
+        // [`super::types::StartSearchResultExportJobInput`]), so the modelled member
+        // constraints are applied HERE, in the same place the boundary applied them —
+        // before any lookup — and in the boundary's own wording: a value outside the
+        // modelled length, and one that is not an ARN at all, is a member-value fault and
+        // keeps its `ValidationException` (400). A value that IS a well-formed ARN is a
+        // role REFERENCE and is not judged on its text; it reaches the pass-role decision
+        // below.
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(message) = crate::state::role_arn_input_refusal(role_arn) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
+
         let now = SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(store_unavailable());
@@ -292,11 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
         if !crate::state::EXPORTABLE_SEARCH_JOB_STATES.contains(&search_job_status.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "search job '{identifier}' is {search_job_status}; its results can only be \
-                 exported once it is {}",
-                crate::state::EXPORTABLE_SEARCH_JOB_STATES.join(" or ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::export_status_refusal_message(&search_job_status),
+            ));
         }
 
         // The union the request carried, which `ReceivedExportSpecification` let through
@@ -315,8 +331,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Writing the results means assuming the submitted role, so the role has to be
-        // one this service can be passed. A well-formed ARN reaches this check rather
-        // than being turned away by input validation.
+        // one this service can be passed. Every well-formed ARN reaches this check rather
+        // than being turned away by input validation — including one that names no IAM
+        // role, which is a role this account cannot pass either.
         if let Some(role_arn) = input.role_arn.as_deref() {
             if let Some(message) = crate::state::pass_role_denial(role_arn) {
                 return Err(

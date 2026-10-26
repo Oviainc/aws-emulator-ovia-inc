@@ -49,6 +49,8 @@ mod item_write_expressions;
 mod item_write_vocabularies;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
+#[path = "all/list_imports.rs"]
+mod list_imports;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
 #[path = "all/on_demand_backups.rs"]

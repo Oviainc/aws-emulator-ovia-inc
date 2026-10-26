@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeResourceScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeResourceScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeResourceScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the scan `StartResourceScan` started: the record's own status and the result it
+//! took, read back by the ARN that call handed out. A reporting operation — the only write is
+//! materialising the transition the clock had already made due (the scan's conclusion), which
+//! was owed at the same instant whether or not anybody read it.
+//!
+//! What a member reports is gated by the status the way the model documents it: the counts are
+//! "only available for scans with a `Status` set to `COMPLETE`, `EXPIRED`, or `FAILED`" and
+//! the resource types "only available for scans with a `Status` set to `COMPLETE` or
+//! `FAILED`", so a scan still running reports its progress rather than partial results.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeResourceScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeResourceScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeResourceScan"))
+        use crate::state::resource_scans as scans;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no scan to read, so this answers 501
+            // rather than a status nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeResourceScan",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — the scan's own conclusion, which was owed at the same instant
+        // whether or not anybody read it.
+        store.settle(now);
+
+        let scan = store
+            .resolve_resource_scan(&region, &input.resource_scan_id)
+            .ok_or_else(|| {
+                DescribeResourceScanErrorModeled::ResourceScanNotFoundException(
+                    ResourceScanNotFoundException {
+                        message: Some(scans::does_not_exist(&input.resource_scan_id)),
+                    },
+                )
+            })?;
+
+        let counts = scan.counts_are_available();
+        Ok(DescribeResourceScanOutput {
+            resource_scan_id: Some(scan.resource_scan_id.clone()),
+            status: Some(scan.status.clone()),
+            status_reason: scan.status_reason.clone(),
+            start_time: Some(crate::state::timestamp(scan.start_time)),
+            // "The time that the resource scan was finished" — absent while it is running.
+            end_time: scan.end_time.map(crate::state::timestamp),
+            percentage_completed: scan.percentage_completed,
+            resource_types: scan
+                .types_are_available()
+                .then(|| crate::state::non_empty(scan.resource_types()))
+                .flatten(),
+            resources_scanned: counts
+                // The store holds far fewer resources than `i32::MAX`
+                // (`crate::state::MAX_CONCURRENT_RESOURCES` bounds them), so the saturating
+                // conversion is unreachable rather than a silently wrong count.
+                .then(|| i32::try_from(scan.resources_scanned()).unwrap_or(i32::MAX)),
+            resources_read: counts
+                .then(|| i32::try_from(scan.resources_read).unwrap_or(i32::MAX)),
+            // "The scan filters that were used": the ones the call that started the scan
+            // supplied, read off the record rather than from this request.
+            scan_filters: crate::state::non_empty(
+                scan.scan_filters
+                    .iter()
+                    .map(|types| ScanFilter {
+                        types: crate::state::non_empty(types.clone()),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

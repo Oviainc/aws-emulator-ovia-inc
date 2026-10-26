@@ -24,7 +24,7 @@ use crate::ops::types::{
     AutoParticipantRecordingConfiguration, Composition, CompositionSummary, ConflictException,
     CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
     DestinationSummary, EncoderConfiguration, Event, GridConfiguration, IngestConfiguration,
-    InternalServerException, LayoutConfiguration, Participant,
+    IngestConfigurationSummary, InternalServerException, LayoutConfiguration, Participant,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
     ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
@@ -871,6 +871,10 @@ const PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-even
 /// token issued by one listing names no position in another and is refused there.
 const COMPOSITION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-composition-after:";
 
+/// The same marker for a `ListIngestConfigurations` page, kept distinct from the others
+/// so a token issued by one listing names no position in another and is refused there.
+const INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-ingest-configuration-after:";
+
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
 pub struct StageRecord {
@@ -1019,7 +1023,7 @@ impl IngestConfigurationRecord {
     /// The modelled `IngestConfiguration` this record reports, read against `store`:
     /// the configuration's `state` is not a stored value but a fact about the stage it
     /// is associated with right now, so it is computed from the records that hold that
-    /// fact ([`ingest_configuration_publishers`]) on every read.
+    /// fact on every read ([`Self::state`]).
     pub fn to_ingest_configuration(
         &self,
         store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
@@ -1031,13 +1035,7 @@ impl IngestConfigurationRecord {
             stream_key: self.stream_key.clone(),
             stage_arn: self.stage_arn.clone(),
             participant_id: self.participant_id.clone(),
-            // `ACTIVE` exactly while a publisher is broadcasting with this
-            // configuration, as the member's own doc states it.
-            state: if ingest_configuration_publishers(store, self).is_empty() {
-                NO_PUBLISHER_INGEST_CONFIGURATION_STATE.to_string()
-            } else {
-                PUBLISHING_INGEST_CONFIGURATION_STATE.to_string()
-            },
+            state: self.state(store),
             user_id: self.user_id.clone(),
             redundant_ingest: self.redundant_ingest,
             // "present only when `redundantIngest` is set to `true`", as the member's
@@ -1055,6 +1053,52 @@ impl IngestConfigurationRecord {
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
             tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The modelled `IngestConfigurationSummary` this record reports —
+    /// `ListIngestConfigurations`' "summary information only".
+    ///
+    /// Every member it carries is the member of the same name on the full
+    /// [`Self::to_ingest_configuration`], read off the same record at the same instant,
+    /// so a listing and a read cannot disagree about one configuration. The summary shape
+    /// carries neither the ingest keys (`streamKey`,
+    /// `redundantIngestCredentials`) nor `attributes` nor `tags`
+    /// (`smithy_query(query="shape",shape="IngestConfigurationSummary")`), which is why a
+    /// page reports fewer members than a read rather than different ones.
+    pub fn to_summary(
+        &self,
+        store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    ) -> IngestConfigurationSummary {
+        IngestConfigurationSummary {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            ingest_protocol: self.ingest_protocol.clone(),
+            stage_arn: self.stage_arn.clone(),
+            participant_id: self.participant_id.clone(),
+            state: self.state(store),
+            user_id: self.user_id.clone(),
+            redundant_ingest: self.redundant_ingest,
+        }
+    }
+
+    /// The `state` this configuration reports right now, read against `store`.
+    ///
+    /// `ACTIVE` exactly while a publisher is broadcasting with this configuration, as
+    /// the member's own doc states it; `INACTIVE` otherwise. Not a stored value but a
+    /// fact about the stage the configuration is associated with at this instant, so it
+    /// is computed from the records that hold that fact
+    /// ([`ingest_configuration_publishers`]) on every read — and computed HERE, the one
+    /// place, so a full read and a listing's summary cannot report two states for one
+    /// configuration.
+    pub fn state(
+        &self,
+        store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    ) -> String {
+        if ingest_configuration_publishers(store, self).is_empty() {
+            NO_PUBLISHER_INGEST_CONFIGURATION_STATE.to_string()
+        } else {
+            PUBLISHING_INGEST_CONFIGURATION_STATE.to_string()
         }
     }
 
@@ -2959,6 +3003,16 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         compositions
     }
 
+    /// Every ingest configuration in creation order — the order
+    /// `ListIngestConfigurations` pages over, so a configuration created or deleted
+    /// mid-pagination cannot shift a later page onto an already-returned one.
+    pub fn ingest_configurations_in_order(&self) -> Vec<&IngestConfigurationRecord> {
+        let mut configurations: Vec<&IngestConfigurationRecord> =
+            self.ingest_configurations.values().collect();
+        configurations.sort_by_key(|record| record.sequence);
+        configurations
+    }
+
     /// Every storage configuration in creation order — the order
     /// `ListStorageConfigurations` pages over.
     pub fn storage_configurations_in_order(&self) -> Vec<&StorageConfigurationRecord> {
@@ -3796,6 +3850,19 @@ pub fn encode_storage_configuration_page_token(after_sequence: u64) -> String {
 /// token from another listing included.
 pub fn decode_storage_configuration_page_token(token: &str) -> Option<u64> {
     decode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListIngestConfigurations` page: the creation sequence the
+/// next page of ingest configurations resumes after, under that listing's own marker.
+pub fn encode_ingest_configuration_page_token(after_sequence: u64) -> String {
+    encode_after(INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The creation sequence an ingest-configuration `nextToken` resumes after, or `None`
+/// when the token was not issued by [`encode_ingest_configuration_page_token`] — a token
+/// from another listing included.
+pub fn decode_ingest_configuration_page_token(token: &str) -> Option<u64> {
+    decode_after(INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// [`encode_page_token`] for a `ListCompositions` page: the start sequence the next page

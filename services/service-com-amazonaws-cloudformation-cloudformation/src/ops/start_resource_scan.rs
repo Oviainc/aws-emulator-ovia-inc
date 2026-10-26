@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartResourceScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartResourceScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartResourceScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a scan over the resources this account holds in the Region the request was signed
+//! for, and hands back the scan's ARN. The scan itself is asynchronous and exclusive: "only
+//! one can be run at a time for an account in a Region", so a second call while one is
+//! running is refused with the modelled `ResourceScanInProgressException` and leaves no
+//! record behind — while a retry under the `ClientRequestToken` that started the running scan
+//! addresses THAT scan and answers its id again. The exclusivity is transient: it counts the
+//! scans that have not concluded, so it lifts as they conclude
+//! ([`crate::state::resource_scans`] holds that clock).
+//!
+//! The other modelled refusal, `ResourceScanLimitExceededException`, has no reachable path:
+//! its documented reasons are a daily quota the model carries no number for, a ten-minute
+//! wait after a scan that FAILED (a scan here reads this service's own store, so none fails)
+//! and a twenty-four-hour wait after a scan that exceeded 100,000 resources, which is far
+//! above the resources this store can hold at all
+//! ([`crate::state::MAX_CONCURRENT_RESOURCES`]). What bounds the records a caller can create
+//! is [`crate::state::resource_scans::MAX_RESOURCE_SCANS`], oldest reclaimed first.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartResourceScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartResourceScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartResourceScan"))
+        use crate::state::resource_scans as scans;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no store to record a scan in, so
+            // this answers 501 rather than an id nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartResourceScan",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The scan filters to use": one entry per filter, carrying the resource types that
+        // filter names. The wildcard may be placed "at only the end of the string", which the
+        // model carries no pattern for, so a filter that places it anywhere else is refused
+        // here rather than silently matching nothing.
+        let scan_filters: Vec<Vec<String>> = input
+            .scan_filters
+            .iter()
+            .flatten()
+            .map(|filter| filter.types.clone().unwrap_or_default())
+            .collect();
+        for filter in scan_filters.iter().flatten() {
+            if !scans::is_valid_type_filter(filter) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    scans::invalid_type_filter(filter),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        // Settled FIRST, so the exclusivity below meters the scan that is really still
+        // running at this instant rather than one the clock has already concluded.
+        store.settle(now);
+
+        // A retry under the token of a scan that is still RUNNING is not a new scan: "specify
+        // this token if you plan to retry requests so that CloudFormation knows that you're
+        // not attempting to start a new resource scan", so the request answers that scan's id
+        // and writes nothing.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(scan) = store.resource_scan_by_token(&region, token) {
+                return Ok(StartResourceScanOutput {
+                    resource_scan_id: Some(scan.resource_scan_id.clone()),
+                });
+            }
+        }
+
+        // "A resource scan is currently in progress. Only one can be run at a time for an
+        // account in a Region" — metered in the Region the request was signed for, the way
+        // every CloudFormation quota is. Refused BEFORE anything is written, so a refused
+        // call leaves no scan behind.
+        if store.resource_scan_in_flight(&region).is_some() {
+            return Err(
+                StartResourceScanErrorModeled::ResourceScanInProgressException(
+                    ResourceScanInProgressException {
+                        message: Some(scans::SCAN_IN_PROGRESS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the scan READS: the resources this account and Region holds right now. A scan
+        // is a point-in-time read, so the rows are taken here and nothing recomputes them
+        // later; the filters decide which of them it LISTS.
+        let read = store.scannable_resources(&region);
+        let resources_read = read.len();
+        let resources: Vec<scans::FoundResource> = read
+            .into_iter()
+            .filter(|resource| scans::filters_admit(&scan_filters, &resource.resource_type))
+            .collect();
+
+        let resource_scan_id = crate::state::new_resource_scan_id(&region);
+        // "You can the status of a scan using the ListResourceScans API action": the scan is
+        // answered while it is still running and concludes on the clock.
+        let mut scan = scans::StoredResourceScan::starting(
+            resource_scan_id.clone(),
+            region,
+            scans::scan_type_of(&scan_filters).to_string(),
+            now,
+        );
+        scan.client_request_token = input.client_request_token.clone();
+        scan.scan_filters = scan_filters;
+        scan.resources_read = resources_read;
+        scan.resources = resources;
+        store.record_resource_scan(scan);
+
+        Ok(StartResourceScanOutput {
+            resource_scan_id: Some(resource_scan_id),
+        })
     }
 }

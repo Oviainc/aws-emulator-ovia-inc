@@ -3447,14 +3447,31 @@ pub fn validation_message(reason: &str) -> String {
 /// path, which for a member of a list element carries the element's position
 /// (`filters.1.member.name`).
 pub fn validation_exception(reason: &str, path: impl Into<String>) -> ValidationException {
+    let path = path.into();
+    validation_exception_naming(reason, &[path.as_str()])
+}
+
+/// A `ValidationException` naming SEVERAL members, for a rule that is about the
+/// members together rather than about one of them being wrong on its own.
+///
+/// The envelope carries one `reason` — the rule's own — and one `fields` entry
+/// per member named, which is the same shape [`validation_exception_for`] gives
+/// a request that broke constraints on several members: the entries say which
+/// members to look at, and nothing about the request is echoed back.
+pub fn validation_exception_naming(reason: &str, paths: &[&str]) -> ValidationException {
     ValidationException {
         request_id: Some(next_request_id()),
         message: Some(validation_message(reason)),
         reason: Some(reason.to_string()),
-        fields: Some(vec![ValidationExceptionField {
-            name: path.into(),
-            message: RefusalKind::of_reason(reason).field_message().to_string(),
-        }]),
+        fields: Some(
+            paths
+                .iter()
+                .map(|path| ValidationExceptionField {
+                    name: (*path).to_string(),
+                    message: RefusalKind::of_reason(reason).field_message().to_string(),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -3508,6 +3525,50 @@ pub fn selector_value_refusal(
         return Some(validation_exception("INVALID_AGREEMENT_TYPE", "agreementType"));
     }
     None
+}
+
+/// The `ValidationExceptionReason` a period no instant can fall in is reported
+/// under: the ONE value `ValidationExceptionReason` publishes about a period at
+/// all (`smithy_query(query="shape", shape="ValidationExceptionReason")`). The
+/// catch-all [`REASON_OTHER`] would leave a client nothing to branch on, and no
+/// other value names the condition.
+///
+/// So it is the reason for EVERY pair of bounds this service refuses as a
+/// malformed period, whichever instant the pair bounds — the creation of a
+/// billing adjustment request and the issuing of an invoice alike: the model
+/// publishes no reason naming either of those periods, and one condition must
+/// not read as two reasons depending on which listing was called.
+pub const REASON_INVALID_PERIOD: &str = "INVALID_INVOICE_ADJUSTMENT_PERIOD";
+
+/// Refuse a request that names BOTH ends of one instant's window with its lower
+/// bound at or after its upper bound, BEFORE anything is selected.
+///
+/// An `after`/`before` pair of members bounds ONE instant of the records
+/// reported, each bound exclusive — "after the specified timestamp" and "before
+/// the specified timestamp" — so a lower bound at or after the upper one spans
+/// no instant at all. Such a pair is a malformed period rather than a selector
+/// that happens to select nothing: no record of any store could satisfy it,
+/// including a store holding everything, so the request states a period rather
+/// than selecting on one and is answered with the modelled
+/// [`REASON_INVALID_PERIOD`] naming both members that bound it.
+///
+/// A window that spans any instant at all, and a request naming only one of the
+/// two bounds (an open-ended period), stay selectors: they are left to the
+/// listing to match, so an empty page remains a legitimate answer.
+///
+/// Nothing here reads the store, so the answer is the same whatever it holds.
+pub fn time_window_refusal(
+    after: Option<f64>,
+    before: Option<f64>,
+    after_member: &str,
+    before_member: &str,
+) -> Option<ValidationException> {
+    let (Some(after), Some(before)) = (after, before) else {
+        return None;
+    };
+    (after >= before).then(|| {
+        validation_exception_naming(REASON_INVALID_PERIOD, &[after_member, before_member])
+    })
 }
 
 /// The `ValidationException` for constraint violations the boundary validator

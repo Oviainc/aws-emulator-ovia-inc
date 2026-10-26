@@ -188,8 +188,7 @@ fn lifecycle_rows() -> Vec<Row> {
                 // `TimePeriod$End` is deleted with everything hanging off it
                 // (`tests/all/budget_end_date_expiry.rs`), so a lifecycle row needs one
                 // that is still running.
-                "TimePeriod": {"Start": 1_704_067_200, "End": 3_471_292_800_i64},
-                "CostTypes": {"IncludeTax": false, "UseAmortized": true}
+                "TimePeriod": {"Start": 1_704_067_200, "End": 3_471_292_800_i64}
             }),
             notifications: json!([]),
             updated: json!({
@@ -210,7 +209,10 @@ fn lifecycle_rows() -> Vec<Row> {
                 },
                 "TimeUnit": "QUARTERLY",
                 "BudgetType": "COST",
-                "CostFilters": {"Service": ["Amazon EC2", "Amazon Redshift"]}
+                "CostFilters": {"Service": ["Amazon EC2", "Amazon Redshift"]},
+                // The legacy filter syntax's other half, on the one budget type that
+                // HAS cost types (`tests/all/budget_cost_types_by_type.rs`).
+                "CostTypes": {"IncludeTax": false, "UseAmortized": true}
             }),
             notifications: json!([
                 {

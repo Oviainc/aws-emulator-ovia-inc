@@ -15,7 +15,9 @@
 //! operation is `@idempotent` — the same request twice leaves the same tag set.
 //!
 //! Three things it refuses, each with one of the operation's own modelled errors: an
-//! ARN that is not the ARN a stored resource carries (`ResourceNotFoundException`), a
+//! ARN that is not the ARN a stored resource carries, or that names a resource of a
+//! Region other than the one the request was signed for (`ResourceNotFoundException`,
+//! since the resource this endpoint tags is the one "in the current region"), a
 //! resource whose deletion has already been accepted (`ConflictException`, as every
 //! other mutation of a record on its way out is refused), and a tag map this service
 //! does not store — a key outside the modelled `TagKey` bounds, a key in the reserved
@@ -191,8 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region the request was signed for, which is the
+        // endpoint it reached and so the Region whose resources it may touch.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -218,8 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions(std::time::Instant::now());
 
         // The ARN names the resource WHOLE — kind, id, region and account — so anything
-        // that is not the ARN a stored record carries names no resource of this store.
-        let Some(mut resource) = state.tagged_resource_mut(&input.resource_arn) else {
+        // that is not the ARN a stored record carries names no resource of this store,
+        // and the record it names has to be one of the CURRENT Region's, since that is
+        // the resource this endpoint tags.
+        let Some(mut resource) = state.tagged_resource_mut(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

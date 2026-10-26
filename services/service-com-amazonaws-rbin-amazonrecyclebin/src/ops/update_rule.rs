@@ -2,8 +2,9 @@
 
 //! @op UpdateRule
 //! IMPLEMENTED: merges the supplied members into the PERSISTED retention rule and
-//! answers with the stored, merged record (HTTP 200). This is the ONLY file to touch for
-//! this operation.
+//! answers with the stored, merged record (HTTP 200) — unless the merged record is one
+//! the service could never have produced, which is refused instead. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -214,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The merge is computed first, and the whole store is still free to be read
         // afterwards, because the cross-rule quota below counts the OTHER rules.
-        let (merged_resource_tags, merged_exclude_resource_tags) = {
+        let (merged_resource_tags, merged_exclude_resource_tags, holds_lock) = {
             let Some(rule) = store.rule_mut(&region, &input.identifier) else {
                 return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
                     crate::state::rule_not_found(&input.identifier),
@@ -245,6 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input
                     .exclude_resource_tags
                     .unwrap_or_else(|| rule.exclude_resource_tags.clone()),
+                rule.holds_lock(),
             )
         };
         if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
@@ -257,6 +259,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        }
+        // Recycle Bin holds a lock only on a Region-level rule that carries no exclusion
+        // tags, so a rule that HOLDS a lock cannot be given a selection of either other
+        // kind: this is the third door onto the same invariant `CreateRule` holds a
+        // request to before it mints a rule and `LockRule` holds an existing rule to, so
+        // no door leaves behind a rule whose lock configuration the service could never
+        // have put there. A rule that has never been locked holds no lock, and is free to
+        // take a selection of either kind.
+        if holds_lock {
+            if let Some(blocker) =
+                crate::state::unlockable_rule(&merged_resource_tags, &merged_exclude_resource_tags)
+            {
+                return Err(UpdateRuleErrorModeled::ValidationException(
+                    crate::state::lock_holding_selection_not_allowed(blocker),
+                )
+                .into());
+            }
         }
         // One resource tag key and value pair selects a bounded number of retention
         // rules, so a request that would make a pair the selector of one rule too many

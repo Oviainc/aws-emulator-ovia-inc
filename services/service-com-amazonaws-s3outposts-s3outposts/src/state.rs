@@ -720,41 +720,30 @@ pub fn endpoint_cursor(
     list_cursor(next_token, operation, decode_endpoint_cursor)
 }
 
-/// Whether `access_type` and `customer_owned_ipv4_pool` describe one endpoint, or
-/// the refusal a contradictory pair earns.
+/// Whether `access_type` carries the `customer_owned_ipv4_pool` it requires, or
+/// the refusal the one stated requirement earns.
 ///
-/// `CreateEndpointRequest$AccessType` states the two values as alternative
-/// network paths — the VPC for "Private", an on-premises network for
-/// "CustomerOwnedIp" — and adds that "if you choose `CustomerOwnedIp`, you must
-/// also provide the customer-owned IP address pool (CoIP pool)". That pool is
-/// where "IP addresses are allocated from ... for the endpoint", and
-/// `Endpoint$CustomerOwnedIpv4Pool` reports "the ID of the customer-owned IPv4
-/// address pool USED for the endpoint", so the two members agree in BOTH
-/// directions: the CoIP access type names a pool, and the VPC access type —
-/// which allocates out of its subnet — names none. Either member without the
-/// other is a contradictory input, refused with the modelled
-/// `ValidationException` rather than materialised into an endpoint reporting a
-/// pool it does not allocate from.
+/// `CreateEndpointRequest$AccessType` states the requirement in exactly ONE
+/// direction — "if you choose `CustomerOwnedIp`, you must also provide the
+/// customer-owned IP address pool (CoIP pool)" — and adds that "`Private` is the
+/// default access type value". Nothing in the model or the documentation ties
+/// the pool the other way round, so that is the only pairing this service
+/// enforces: a pool named alongside the VPC access type (explicitly, or by the
+/// default an absent member takes) is admitted like any other optional member
+/// and stored as given, and the request goes on to resolve the resources it
+/// names.
 pub fn check_coip_pool(
     access_type: &str,
     customer_owned_ipv4_pool: Option<&str>,
 ) -> Result<(), ValidationException> {
-    match (
-        access_type == ACCESS_TYPE_CUSTOMER_OWNED_IP,
-        customer_owned_ipv4_pool,
-    ) {
-        (true, None) => Err(ValidationException {
+    if access_type == ACCESS_TYPE_CUSTOMER_OWNED_IP && customer_owned_ipv4_pool.is_none() {
+        return Err(ValidationException {
             message: Some(format!(
                 "CustomerOwnedIpv4Pool is required when AccessType is {ACCESS_TYPE_CUSTOMER_OWNED_IP}"
             )),
-        }),
-        (false, Some(_)) => Err(ValidationException {
-            message: Some(format!(
-                "CustomerOwnedIpv4Pool cannot be specified when AccessType is {access_type}"
-            )),
-        }),
-        (true, Some(_)) | (false, None) => Ok(()),
+        });
     }
+    Ok(())
 }
 
 /// The page every endpoint listing serves: the endpoints `include` accepts, in

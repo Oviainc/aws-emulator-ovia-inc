@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSuppressedDestinations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSuppressedDestinations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSuppressedDestinations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the suppression list the request selects — a tenant's when it carries
+//! `TenantName`, the account-level list when it omits it — as summaries computed
+//! from the stored entries, narrowed by the request's `Reasons` and date window and
+//! paged by `PageSize` with a `NextToken` of this listing's own making.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSuppressedDestinations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSuppressedDestinationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata is not needed: the listing covers one suppression list of
+        // the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListSuppressedDestinations without the shared emulator state",
+            ));
+        };
+
+        let tenant = input.tenant_name;
+        // A `TenantName` names a resource, so a value outside its documented form is
+        // a bad request and a well-formed name the account does not hold is a
+        // not-found — the same two refusals every operation that takes one makes.
+        if let Some(tenant) = &tenant {
+            if !crate::state::tenant_name_is_well_formed(tenant) {
+                return Err(ListSuppressedDestinationsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_tenant_name(tenant)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The number of results to show in a single call": the model declares no range
+        // on `PageSize`, so only a positive count truncates a page and a non-positive
+        // one is read as no truncation rather than refused.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this listing's own: it names the last entry the previous page
+        // returned, so the next page resumes strictly after it. A token this listing
+        // never handed out — one of another listing's making, or one naming a position
+        // in a different suppression list than the request selects — is the modelled
+        // `InvalidNextTokenException`, never read as "start from the beginning". A
+        // position whose entry has since been deleted stays valid: it is a point in the
+        // order, not a record.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .filter(|position| {
+                    position.starts_with(&crate::state::suppression_list_prefix(tenant.as_deref()))
+                })
+                .ok_or_else(|| {
+                    ListSuppressedDestinationsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(crate::state::invalid_next_token()),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        // "The factors that caused the email address to be added to the suppression
+        // list": a request that names reasons keeps only the entries suppressed for one
+        // of them, and a request that names none keeps every entry.
+        let reasons = input.reasons.unwrap_or_default();
+        let start_date = input.start_date.map(|at| at.as_secs_f64());
+        let end_date = input.end_date.map(|at| at.as_secs_f64());
+
+        // Reporting only: nothing about a suppression-list entry falls due with the
+        // clock, so this read leaves the store exactly as a later caller finds it.
+        let store = state.lock();
+        if let Some(tenant) = &tenant {
+            if !store.tenants.contains_key(tenant) {
+                return Err(ListSuppressedDestinationsErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::tenant_not_found(tenant)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "To target a tenant's suppression list, specify the TenantName parameter. If
+        // you omit TenantName, the operation targets the account-level suppression
+        // list" — so the list to enumerate is chosen by the request, and an entry on
+        // one list is not on the other.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSuppressedDestinations"))
+        // `suppressed_destinations` is ordered by storage key, so a page is a window
+        // over the matching entries and the resume point is a position in that order —
+        // which keeps a token valid even if the entry it names has since been deleted.
+        let matching: Vec<(&String, &crate::state::SuppressedDestinationRecord)> = store
+            .suppressed_destinations
+            .iter()
+            .filter(|(_, record)| {
+                record.tenant_name.as_deref() == tenant.as_deref()
+                    && (reasons.is_empty() || reasons.contains(&record.reason))
+                    && record.updated_within(start_date, end_date)
+            })
+            .collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|(key, _)| key.as_str() <= last),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        let summaries: Vec<SuppressedDestinationSummary> =
+            page.iter().map(|(_, record)| record.summary()).collect();
+        // A token only when entries remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|(key, _)| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::SUPPRESSED_DESTINATIONS_PAGE_TOKEN_TAG,
+                        key,
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListSuppressedDestinationsOutput {
+            suppressed_destination_summaries: Some(summaries),
+            next_token,
+        })
     }
 }

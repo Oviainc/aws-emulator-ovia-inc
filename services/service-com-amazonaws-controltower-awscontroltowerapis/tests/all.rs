@@ -15,6 +15,8 @@
 mod baseline_catalog;
 #[path = "all/baseline_operations.rs"]
 mod baseline_operations;
+#[path = "all/catalog_identifier_equivalence.rs"]
+mod catalog_identifier_equivalence;
 #[path = "all/control_operations.rs"]
 mod control_operations;
 #[path = "all/disable_baseline.rs"]

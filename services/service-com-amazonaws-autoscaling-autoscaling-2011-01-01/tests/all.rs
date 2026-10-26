@@ -17,6 +17,8 @@ mod auto_scaling_group_lifecycle;
 mod error_envelope;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
+#[path = "all/metric_collection_catalog.rs"]
+mod metric_collection_catalog;
 #[path = "all/reference_data_catalogs.rs"]
 mod reference_data_catalogs;
 #[path = "all/state_roundtrip.rs"]

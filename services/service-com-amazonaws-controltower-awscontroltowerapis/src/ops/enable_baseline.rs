@@ -261,11 +261,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One baseline per target: the pair is what identifies an enablement, so a second
         // enable of the same pair would leave two `EnabledBaseline` resources describing
-        // one target. The rule is read off the store, so it holds whichever call enabled
-        // the existing one. (A baseline whose DISABLE has become due is already out of
-        // the map above, so that pair enables again.)
-        if let Some(existing) = store
-            .enabled_baseline_on_target(&input.baseline_identifier, &input.target_identifier)
+        // one target. The pair is read off the CATALOG ENTRY this request resolved to, not
+        // off the identifier's text, so a repeat written with any of the other identifiers
+        // that name the same baseline is the same pair. The rule is read off the store, so
+        // it holds whichever call enabled the existing one. (A baseline whose DISABLE has
+        // become due is already out of the map above, so that pair enables again.)
+        if let Some(existing) =
+            store.enabled_baseline_on_target(baseline, &input.target_identifier)
         {
             return Err(EnableBaselineErrorModeled::ConflictException(
                 ConflictException {

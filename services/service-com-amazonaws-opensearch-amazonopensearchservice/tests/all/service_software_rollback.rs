@@ -19,9 +19,8 @@
 //! deployment already in flight, and a rollback that has itself just landed.
 //!
 //! The precondition a landed deployment leaves is written into the store directly
-//! (through [`super::domain_lifecycle::Emulator::store`]): the operation that deploys
-//! service software, `StartServiceSoftwareUpdate`, is still a scaffold stub, so no
-//! wire call can leave it yet. Everything the rule is asserted ON is read back
+//! (through [`super::domain_lifecycle::Emulator::store`]), so each row starts from
+//! exactly the record it is about. Everything the rule is asserted ON is read back
 //! through the wire — the rollback's own answer and `DescribeDomain`.
 
 use std::time::{Duration, SystemTime};
@@ -85,6 +84,7 @@ fn after_update(current: &str, came_off: &str, remaining: Duration) -> ServiceSo
         current_version: current.to_string(),
         available_version: None,
         deployment: None,
+        pending_update: None,
         rollback_to: Some(came_off.to_string()),
         rollback_until: Some(SystemTime::now() + remaining),
         optional_deployment: true,

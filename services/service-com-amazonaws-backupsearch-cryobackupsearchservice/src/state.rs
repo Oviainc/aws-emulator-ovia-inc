@@ -166,6 +166,23 @@ pub fn stop_conflict_message(status: &str) -> String {
 /// refused rather than accepted into a success nothing could back.
 pub const EXPORTABLE_SEARCH_JOB_STATES: &[&str] = &[COMPLETED, STOPPED];
 
+/// The message this service refuses an export of a search job whose results have not
+/// settled with.
+///
+/// Recorded behaviour, not modelled: the model states no text for the refusal, so the
+/// service's own wording is the requirement — ONE fixed sentence naming the statuses an
+/// export is supported from ([`EXPORTABLE_SEARCH_JOB_STATES`], comma-separated as the
+/// service lists them) and the status the job is in, read from the record rather than from
+/// the request. It names no identifier: the refusal is about the status, and the caller's
+/// fix is to poll and retry, which is what the closing clause says.
+pub fn export_status_refusal_message(status: &str) -> String {
+    format!(
+        "Export is only supported for search job with {} statuses. SearchJob has status \
+         {status}. Please try again later",
+        EXPORTABLE_SEARCH_JOB_STATES.join(",")
+    )
+}
+
 /// How long after the call that starts a transition the clock owes the next status (the
 /// terminal status [`scan_outcome`] gives a new search job, `STOPPING` -> `STOPPED` after
 /// `StopSearchJob`, and an export job's `RUNNING` -> `COMPLETED` after
@@ -503,28 +520,191 @@ pub fn arn_resource_type(arn: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether `arn` is a well-formed ARN at all — the `arn` scheme followed by the six
+/// colon-separated fields of the ARN grammar,
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, with a non-empty partition,
+/// service and resource field (the region and account fields are empty on the ARNs of a
+/// global or account-less service, so neither is required here).
+///
+/// This is what separates a value the service takes as a RESOURCE REFERENCE from a string
+/// that cannot be one at all: see [`role_arn_input_refusal`].
+pub fn arn_well_formed(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    matches!(
+        (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ),
+        (Some("arn"), Some(partition), Some(service), Some(_), Some(_), Some(resource))
+            if !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+    )
+}
+
+/// The account segment of `role_arn` when the value names an IAM ROLE, and `None` when it
+/// names anything else.
+///
+/// The form judged is the one the `IamRoleArn` member publishes,
+/// `^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$`
+/// (`smithy_query(query="shape",shape="IamRoleArn")`): one of the three partitions, the
+/// `iam` service, an EMPTY region because IAM is global, an account of `[a-z0-9-]+`, and a
+/// resource field introduced by `role/` with a non-empty name after it. The name itself
+/// may say anything — the pattern's trailing group is `(.+)`, which is how a role under a
+/// path (`role/service-role/<name>`) is one value.
+pub fn iam_role_arn_account(role_arn: &str) -> Option<&str> {
+    let mut fields = role_arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if !IAM_ROLE_ARN_PARTITIONS.contains(&partition) {
+        return None;
+    }
+    let account_is_published_form = !account.is_empty()
+        && account
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-');
+    if !account_is_published_form {
+        return None;
+    }
+    let name = resource.strip_prefix("role/")?;
+    (!name.is_empty()).then_some(account)
+}
+
+/// The partitions the `IamRoleArn` `@pattern` admits, in the order it lists them.
+const IAM_ROLE_ARN_PARTITIONS: &[&str] = &["aws", "aws-cn", "aws-us-gov"];
+
 /// Why this service cannot pass `role_arn` to itself, or `None` when it can.
 ///
 /// Starting an export makes the service assume the submitted role to write the results,
-/// so the role has to be passable to it. A role can only be passed by a principal in the
-/// role's OWN account — AWS refuses a cross-account pass-role — and every caller of this
-/// emulator is attributed to [`::engine::emulator_account_id`], so a `RoleArn` naming any
-/// other account cannot be passed and the modelled `AccessDeniedException` (HTTP 403) is
-/// the answer. A well-formed ARN is never turned away by input validation for this: the
-/// refusal is an authorization decision, which is the class a caller branches on.
-///
-/// A string with no account field at all cannot be judged here and is not denied; the
-/// `IamRoleArn` member's own `@pattern` already refuses it before any handler runs.
+/// so the value is USED as a role rather than read as a string: what decides is whether
+/// it names a role this caller can pass, not whether its text matches a published syntax.
+/// A role can only be passed by a principal in the role's OWN account — AWS refuses a
+/// cross-account pass-role — and every caller of this emulator is attributed to
+/// [`::engine::emulator_account_id`], so a value naming a role of any other account cannot
+/// be passed; neither can one that names no IAM role at all, because it names no role in
+/// this account either ([`iam_role_arn_account`]). Both are the modelled
+/// `AccessDeniedException` (HTTP 403): the refusal is an authorization decision, which is
+/// the class a caller branches on, and no well-formed ARN is turned away as invalid input
+/// for it ([`role_arn_input_refusal`]).
 pub fn pass_role_denial(role_arn: &str) -> Option<String> {
-    let account = arn_account(role_arn)?;
-    (account != ::engine::emulator_account_id())
-        .then(|| CROSS_ACCOUNT_PASS_ROLE.to_string())
+    let passable =
+        iam_role_arn_account(role_arn).is_some_and(|account| account == ::engine::emulator_account_id());
+    (!passable).then(|| CROSS_ACCOUNT_PASS_ROLE.to_string())
 }
 
 /// The `AccessDeniedException` message for a role in another account. AWS states this
 /// refusal in one fixed sentence, because the rule behind it names nothing from the
 /// request: passing a role across accounts is not allowed at all.
 pub const CROSS_ACCOUNT_PASS_ROLE: &str = "Cross-account pass role is not allowed.";
+
+/// The input member whose modelled constraints this service applies itself rather than at
+/// the request boundary (`skip_validation = ["RoleArn"]` on
+/// `StartSearchResultExportJobInput`). Spelled as the MODEL spells it, so the validation
+/// path the framework reports is the lowerCamel `roleArn` a boundary refusal reports.
+const ROLE_ARN_MEMBER: &str = "RoleArn";
+
+/// The `IamRoleArn` `@length` bound, min and max
+/// (`smithy_query(query="shape",shape="IamRoleArn")`), which this service keeps enforcing
+/// after `skip_validation` takes it off the generated member schema.
+const ROLE_ARN_LENGTH: (i64, i64) = (20, 2048);
+
+/// The `IamRoleArn` `@pattern`, verbatim from the model
+/// (`smithy_query(query="shape",shape="IamRoleArn")`).
+const ROLE_ARN_PATTERN: &str = "^arn:(?:aws|aws-cn|aws-us-gov):iam::[a-z0-9-]+:role/(.+)$";
+
+/// The constraints a `RoleArn` that is not an ARN at all is judged against: the modelled
+/// `@length` and the modelled `@pattern`, exactly the pair the boundary carried.
+static ROLE_ARN_TRAITS: std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(
+                Some(ROLE_ARN_LENGTH.0),
+                Some(ROLE_ARN_LENGTH.1),
+            ),
+        ));
+        traits.insert(Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(ROLE_ARN_PATTERN),
+        ));
+        traits
+    });
+
+/// The constraints a `RoleArn` that IS a well-formed ARN is judged against: the modelled
+/// `@length` alone. The `@pattern` is deliberately absent — for a value of that kind the
+/// pass-role decision ([`pass_role_denial`]) takes its place.
+static ROLE_ARN_LENGTH_TRAITS: std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(
+                Some(ROLE_ARN_LENGTH.0),
+                Some(ROLE_ARN_LENGTH.1),
+            ),
+        ));
+        traits
+    });
+
+/// `RoleArn` as a MEMBER schema carrying [`ROLE_ARN_TRAITS`], so the check itself is the
+/// framework's own walk: the violation's kind, its path and the ceiling on how much of the
+/// refused value is echoed are the boundary's, not this module's.
+static ROLE_ARN_SCHEMA: std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    std::sync::LazyLock::new(|| role_arn_member_schema(&ROLE_ARN_TRAITS));
+
+/// `RoleArn` as a member schema carrying [`ROLE_ARN_LENGTH_TRAITS`].
+static ROLE_ARN_LENGTH_SCHEMA: std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    std::sync::LazyLock::new(|| role_arn_member_schema(&ROLE_ARN_LENGTH_TRAITS));
+
+/// The `RoleArn` member schema carrying `traits`, named as the model names the member.
+fn role_arn_member_schema(
+    traits: &'static std::sync::LazyLock<::aws_smithy_schema::TraitMap>,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.backupsearch#StartSearchResultExportJobInput$RoleArn",
+            "com.amazonaws.backupsearch",
+            ROLE_ARN_MEMBER,
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        ROLE_ARN_MEMBER,
+        0,
+    )
+    .with_traits(traits)
+}
+
+/// Why `role_arn` is not a value this service accepts as INPUT at all, or `None` when it
+/// is one the pass-role decision judges ([`pass_role_denial`]).
+///
+/// The two refusals a `RoleArn` can draw are different classes, so what separates them is
+/// decided here once: a value that is not an ARN at all cannot name a role, so it is a
+/// member-value fault and keeps the `ValidationException` (HTTP 400) the boundary answered
+/// — in the boundary's own wording, because the check is the framework's walk over the
+/// modelled `@length` and `@pattern` — while a value that IS a well-formed ARN
+/// ([`arn_well_formed`]) is a resource reference the service resolves, and only its
+/// `@length` is judged here. A reference it cannot resolve to a role it may pass is an
+/// authorization refusal, not an input one.
+pub fn role_arn_input_refusal(role_arn: &str) -> Option<String> {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let schema: &::aws_smithy_schema::Schema = if arn_well_formed(role_arn) {
+        &ROLE_ARN_LENGTH_SCHEMA
+    } else {
+        &ROLE_ARN_SCHEMA
+    };
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    // Infallible: the walk accumulates violations instead of failing.
+    let _ = validator.write_string(schema, role_arn);
+    ::aws_smithy_schema_server::envelope(&validator.into_violations())
+}
 
 /// One persisted search job. Every member a modelled response carries is read from
 /// here; nothing in a response is recomputed from the request.

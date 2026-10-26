@@ -11,8 +11,9 @@
 //! every caller, in every region, whatever the store holds — so this handler takes
 //! no lock and writes nothing. Its membership and ordering live in
 //! [`crate::state::METRIC_COLLECTION_TYPES`] and
-//! [`crate::state::METRIC_GRANULARITIES`], which name the model members that
-//! publish them.
+//! [`crate::state::METRIC_GRANULARITIES`], which name where their membership
+//! comes from — the model member that publishes it, plus, where that member's
+//! documentation is behind the service, the metrics it omits.
 //!
 //! HAND-AUTHORED. The op-stub generator declined to emit a stub for this operation
 //! because the model binds it to Smithy's `Unit` input, which it cannot type yet

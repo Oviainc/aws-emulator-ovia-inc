@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAuthenticationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAuthenticationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAuthenticationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes an authentication profile from this service's store and reports the
+//! name of the profile it removed. A name that identifies no profile is refused
+//! with `AuthenticationProfileNotFoundFault`, and a removed profile is absent
+//! from every later read, leaving its name free for a new one.
 //!
 //! ## Shape of an operation
 //!
@@ -83,11 +79,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DeleteAuthenticationProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteAuthenticationProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteAuthenticationProfile",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteAuthenticationProfileErrorModeled {
     AuthenticationProfileNotFoundFault(AuthenticationProfileNotFoundFault),
     InvalidAuthenticationProfileRequestFault(InvalidAuthenticationProfileRequestFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,20 +139,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAuthenticationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAuthenticationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAuthenticationProfile"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteAuthenticationProfileErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // A delete only removes the profile, so its only precondition is that
+        // the name identifies one.
+        let Some(position) =
+            store.authentication_profile_position(&input.authentication_profile_name)
+        else {
+            return Err(
+                DeleteAuthenticationProfileErrorModeled::AuthenticationProfileNotFoundFault(
+                    AuthenticationProfileNotFoundFault {
+                        message: Some(st::authentication_profile_not_found_message(
+                            &input.authentication_profile_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The profile has no status for a later read to report, so the deletion
+        // is complete when this returns: it is gone from every later read and
+        // its name is free for a new profile. `remove` keeps the insertion order
+        // of the records around it.
+        let removed = store.authentication_profiles.remove(position);
+
+        Ok(DeleteAuthenticationProfileOutput {
+            authentication_profile_name: removed.authentication_profile_name,
+        })
     }
 }

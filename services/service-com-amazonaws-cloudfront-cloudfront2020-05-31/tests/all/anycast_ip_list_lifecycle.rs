@@ -57,7 +57,10 @@ use crate::response_headers_policy_lifecycle::assert_absent;
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/anycast-ip-list` with the request document `body`.
-async fn create_anycast_ip_list(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling listing suite drives the same create path rather than
+/// growing its own copy of it.
+pub(crate) async fn create_anycast_ip_list(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -69,7 +72,7 @@ async fn create_anycast_ip_list(router: &MultiServiceRouter, body: &str) -> Answ
 }
 
 /// `GET /2020-05-31/anycast-ip-list/{Id}`.
-async fn get_anycast_ip_list(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_anycast_ip_list(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -86,17 +89,17 @@ async fn get_anycast_ip_list(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// One `CreateAnycastIpList` request a client submits.
 #[derive(Debug, Clone)]
-struct Create {
-    case: &'static str,
-    name: String,
-    ip_count: i32,
+pub(crate) struct Create {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
+    pub(crate) ip_count: i32,
     /// `IpAddressType`, or `None` to leave the optional member out of the document
     /// entirely.
-    ip_address_type: Option<&'static str>,
+    pub(crate) ip_address_type: Option<&'static str>,
     /// `IpamCidrConfigs`, as `(Cidr, IpamPoolArn)` pairs.
-    ipam_cidr_configs: Vec<(&'static str, &'static str)>,
+    pub(crate) ipam_cidr_configs: Vec<(&'static str, &'static str)>,
     /// `Tags.Items`, as `(Key, Value)` pairs.
-    tags: Vec<(&'static str, &'static str)>,
+    pub(crate) tags: Vec<(&'static str, &'static str)>,
 }
 
 impl Create {
@@ -105,7 +108,7 @@ impl Create {
     /// `IpamCidrConfigList`'s member carries `xmlName` `IpamCidrConfig`
     /// (`smithy_query(query="shape",shape="IpamCidrConfigList")`), so each configuration
     /// travels in an element of that name.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<CreateAnycastIpListRequest \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -142,7 +145,7 @@ impl Create {
 
     /// The `IpAddressType` the record must report: the one submitted, or the IPv4 family
     /// every Anycast static IP list carries when the create named none.
-    fn expected_ip_address_type(&self) -> &str {
+    pub(crate) fn expected_ip_address_type(&self) -> &str {
         self.ip_address_type.unwrap_or(IP_ADDRESS_TYPE_IPV4)
     }
 }
@@ -155,7 +158,7 @@ impl Create {
 /// character class the pattern admits, use both documented counts, cover every
 /// `IpAddressType` the model's enum admits plus a request that names none, and cover a
 /// create with no IPAM CIDR configuration, one with several, and one with tags.
-fn create_table() -> Vec<Create> {
+pub(crate) fn create_table() -> Vec<Create> {
     vec![
         Create {
             case: "the shortest admissible name, no optional member",
@@ -226,7 +229,7 @@ fn create_table() -> Vec<Create> {
 /// `AnycastIps`' member carries `xmlName` `AnycastIp`
 /// (`smithy_query(query="shape",shape="AnycastIps")`), so each address travels in an
 /// element of that name inside the `AnycastIps` wrapper.
-fn anycast_ips(list: &Node) -> Vec<String> {
+pub(crate) fn anycast_ips(list: &Node) -> Vec<String> {
     match list.at("AnycastIps") {
         Some(wrapper) => wrapper
             .children_named("AnycastIp")
