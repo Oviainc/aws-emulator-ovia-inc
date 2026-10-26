@@ -208,3 +208,5 @@ mod usage_plan_key_collection;
 mod stage_invoke_request_id;
 #[path = "all/update_api_key_patch_path_refusal.rs"]
 mod update_api_key_patch_path_refusal;
+#[path = "all/delete_request_validator.rs"]
+mod delete_request_validator;
