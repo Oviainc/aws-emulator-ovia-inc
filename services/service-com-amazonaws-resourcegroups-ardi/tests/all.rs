@@ -35,6 +35,8 @@ mod group_untag;
 mod grouping_statuses;
 #[path = "all/list_groups_filters.rs"]
 mod list_groups_filters;
+#[path = "all/list_tag_sync_tasks.rs"]
+mod list_tag_sync_tasks;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_group_lifecycle.rs"]

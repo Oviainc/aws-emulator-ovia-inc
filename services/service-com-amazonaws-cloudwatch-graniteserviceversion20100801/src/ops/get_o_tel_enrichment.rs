@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOTelEnrichment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOTelEnrichment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOTelEnrichment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +62,12 @@
 //!   Stopped (enrichment is disabled).
 //! * `UpdatedAt` (Timestamp) — The date and time that the enrichment configuration for the
 //!   account was last stored.
+//!
+//! ## Errors
+//!
+//! * `InternalServiceFault` (HTTP 500) — widened in through `extra_errors` (see below): an
+//!   unreachable shared store is a server-side condition, and this is the server failure
+//!   every sibling reader in this crate reports it as.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,9 +83,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetOTelEnrichmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetOTelEnrichment")]
+// `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it
+// (`GetMetricStream`, `ListMetrics` and the other readers declare it) while this operation's
+// own `errors` list is empty, so an unreachable store has a modelled server failure to answer
+// with instead of a success that would claim enrichment is stopped.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetOTelEnrichment",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetOTelEnrichmentErrorModeled {
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +147,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOTelEnrichment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOTelEnrichmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOTelEnrichment"))
+        // "Returns the current status of vended metric enrichment for the account": a report
+        // of what the start/stop/update operations last stored, so nothing is written here and
+        // a later caller sees exactly what this call reported. The configuration is the
+        // account's, so the Region the request was signed for does not select it.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOTelEnrichmentErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch OTel enrichment store is unavailable".into()),
+            })
+        })?;
+        let stored = state.lock().otel_enrichment.clone();
+
+        // An account no enrichment operation has ever been called for is stopped, with no
+        // configuration that was ever stored to carry an `UpdatedAt`.
+        let Some(stored) = stored else {
+            return Ok(GetOTelEnrichmentOutput {
+                status: crate::state::O_TEL_ENRICHMENT_STOPPED.to_string(),
+                include_filters: None,
+                exclude_filters: None,
+                created_at: None,
+                updated_at: None,
+            });
+        };
+
+        // While enrichment is stopped the filters and the start instant are omitted ("This
+        // parameter is omitted when enrichment is stopped", `GetOTelEnrichmentOutput$CreatedAt`
+        // / `$IncludeFilters` / `$ExcludeFilters`); `UpdatedAt` is not, because the stop itself
+        // is the configuration "last stored" for the account.
+        let running = stored.running;
+        Ok(GetOTelEnrichmentOutput {
+            status: if running {
+                crate::state::O_TEL_ENRICHMENT_RUNNING.to_string()
+            } else {
+                crate::state::O_TEL_ENRICHMENT_STOPPED.to_string()
+            },
+            include_filters: running
+                .then(|| crate::state::o_tel_enrichment_filters(&stored.include_filters))
+                .flatten(),
+            exclude_filters: running
+                .then(|| crate::state::o_tel_enrichment_filters(&stored.exclude_filters))
+                .flatten(),
+            created_at: stored
+                .created_at_secs
+                .filter(|_| running)
+                .map(crate::state::to_timestamp),
+            updated_at: Some(crate::state::to_timestamp(stored.updated_at_secs)),
+        })
     }
 }

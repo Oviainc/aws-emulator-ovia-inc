@@ -270,3 +270,7 @@ mod agent_context_updates;
 // workload suite falls in a crowded run of this list.
 #[path = "all/workload_lens_review_upgrade.rs"]
 mod workload_lens_review_upgrade;
+
+// Declared last for the same reason as the declaration above.
+#[path = "all/workload_integration_sync.rs"]
+mod workload_integration_sync;
