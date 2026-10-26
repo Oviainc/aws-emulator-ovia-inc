@@ -42,7 +42,10 @@ use crate::vpc_authorization_deletion::{deauthorize, deauthorize_ok};
 
 /// The `Error/Message` of a refusal, or a panic naming the case: a refusal whose
 /// message is the thing under test has to carry one.
-fn message_of(reply: &Reply, case: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite asserting another refusal's wording reads it
+/// out of the reply the same way rather than growing a second copy of this.
+pub(crate) fn message_of(reply: &Reply, case: &str) -> String {
     reply
         .first("Error/Message")
         .unwrap_or_else(|| {

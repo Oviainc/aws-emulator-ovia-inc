@@ -93,13 +93,16 @@ pub(crate) async fn create_set(
 }
 
 /// Read one reusable delegation set back.
-async fn get_set(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling suite covering the DELETE of a set reads it back
+/// through the same request rather than growing a second copy of it.
+pub(crate) async fn get_set(router: &MultiServiceRouter, id: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/delegationset/{id}"), "").await
 }
 
 /// How many reusable delegation sets the account holds, as `GetAccountLimit`
 /// reports it — the count that has to agree with the sets in the store.
-async fn set_count(router: &MultiServiceRouter) -> String {
+pub(crate) async fn set_count(router: &MultiServiceRouter) -> String {
     let reply = call(
         router,
         "GET",
@@ -120,14 +123,14 @@ async fn set_count(router: &MultiServiceRouter) -> String {
 
 /// One `DelegationSet` as the wire reports it.
 #[derive(Debug, PartialEq, Eq)]
-struct SetView {
-    id: String,
+pub(crate) struct SetView {
+    pub(crate) id: String,
     caller_reference: Option<String>,
     name_servers: Vec<String>,
 }
 
 /// The `DelegationSet` a reply carries.
-fn set_of(reply: &Reply, case: &str) -> SetView {
+pub(crate) fn set_of(reply: &Reply, case: &str) -> SetView {
     SetView {
         id: reply
             .first("DelegationSet/Id")
@@ -167,7 +170,7 @@ fn name_servers_of(reply: &Reply, case: &str) -> Vec<String> {
 
 /// The bare (`N…`) id behind a `DelegationSet/Id`, which the API reports with
 /// the `/delegationset/` prefix.
-fn bare_set_id(id: &str) -> &str {
+pub(crate) fn bare_set_id(id: &str) -> &str {
     id.trim_start_matches(DELEGATION_SET_PREFIX)
 }
 
@@ -224,7 +227,7 @@ fn assert_name_servers(case: &str, servers: &[String]) {
 }
 
 /// A `DelegationSetId` element, for the `config` slot of [`create_zone`].
-fn delegation_set_element(id: &str) -> String {
+pub(crate) fn delegation_set_element(id: &str) -> String {
     format!("<DelegationSetId>{}</DelegationSetId>", escape_xml(id))
 }
 

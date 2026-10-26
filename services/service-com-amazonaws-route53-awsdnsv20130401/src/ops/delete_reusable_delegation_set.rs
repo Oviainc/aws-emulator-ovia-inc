@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReusableDelegationSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReusableDelegationSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReusableDelegationSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a reusable delegation set from this service's store, and refuses to
+//! remove one hosted zones were still created in.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +65,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    no_such_delegation_set, normalize_delegation_set_id, DELEGATION_SET_IN_USE_MESSAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,20 +139,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReusableDelegationSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReusableDelegationSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReusableDelegationSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            DeleteReusableDelegationSetErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The caller may pass the bare id or the `/delegationset/`-prefixed `Id`
+        // a delegation-set response handed it back; both name the same set.
+        let id = normalize_delegation_set_id(&input.id).to_string();
+        let mut store = state.lock();
+        let caller_reference = store
+            .delegation_sets
+            .get(&id)
+            .map(|set| set.caller_reference.clone())
+            .ok_or_else(|| {
+                DeleteReusableDelegationSetErrorModeled::NoSuchDelegationSet(
+                    no_such_delegation_set(&input.id),
+                )
+            })?;
+
+        // "You can delete a reusable delegation set only if it isn't associated
+        // with any hosted zones." The zones are counted off the store, so a set
+        // whose last zone was deleted is deletable again, and the refusal leaves
+        // the set exactly where it was.
+        if store.zones_in_delegation_set(&id) > 0 {
+            return Err(DeleteReusableDelegationSetErrorModeled::DelegationSetInUse(
+                DelegationSetInUse {
+                    message: Some(DELEGATION_SET_IN_USE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        store.delegation_sets.remove(&id);
+        // The CallerReference index is the SET's, so it goes with the set: a
+        // later CreateReusableDelegationSet may reuse the reference the deleted
+        // set held, exactly as `DeleteHostedZone` releases a zone's.
+        store
+            .delegation_set_by_caller_reference
+            .remove(&caller_reference);
+
+        Ok(DeleteReusableDelegationSetOutput {})
     }
 }

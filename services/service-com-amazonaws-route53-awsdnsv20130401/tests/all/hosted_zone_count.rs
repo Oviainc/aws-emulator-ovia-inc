@@ -89,7 +89,10 @@ async fn account_limit_count(router: &MultiServiceRouter, case: &str) -> String 
 }
 
 /// Delete one zone by its bare (`Z…`) id.
-async fn delete_zone(router: &MultiServiceRouter, zone_id: &str, case: &str) {
+///
+/// `pub(crate)` so a sibling suite that needs a zone out of the way drives the
+/// same request rather than growing a second copy of it.
+pub(crate) async fn delete_zone(router: &MultiServiceRouter, zone_id: &str, case: &str) {
     let reply = call(
         router,
         "DELETE",

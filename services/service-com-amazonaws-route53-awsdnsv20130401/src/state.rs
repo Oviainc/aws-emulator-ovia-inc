@@ -344,6 +344,18 @@ pub const DELEGATION_SET_ALREADY_CREATED_MESSAGE: &str =
 pub const DELEGATION_SET_ALREADY_REUSABLE_MESSAGE: &str =
     "The specified delegation set has already been marked as reusable.";
 
+/// The refusal text `DeleteReusableDelegationSet` answers a set hosted zones
+/// were still created in with (`DelegationSetInUse`, HTTP 400).
+///
+/// A CONSTANT naming neither the set nor the zones still delegating to it, like
+/// [`DELEGATION_SET_ALREADY_REUSABLE_MESSAGE`] above it: the operation's own
+/// documentation states the rule without either ("You can delete a reusable
+/// delegation set only if it isn't associated with any hosted zones"), and the
+/// zones that hold it are in state, where `ListHostedZones` filtered by the set
+/// reports them.
+pub const DELEGATION_SET_IN_USE_MESSAGE: &str =
+    "The specified delegation set contains associated hosted zones.";
+
 /// The refusal text `DeleteHostedZone` answers a zone that still holds records
 /// of the caller's with (`HostedZoneNotEmpty`, HTTP 400).
 ///
@@ -2633,14 +2645,14 @@ fn missing_hosted_zone_message(requested_id: &str) -> String {
 ///
 /// The ONE place this service words that refusal, beside
 /// [`no_such_hosted_zone`], so every operation that takes a delegation set id —
-/// the delegation-set reads and the hosted-zone operations that name one —
-/// answers a missing set identically. REQUEST-DERIVED, like the wording beside
-/// it: it names the id the request asked about, as the request wrote it.
+/// the delegation-set reads and writes and the hosted-zone operations that name
+/// one — answers a missing set identically. The message is ENTIRELY
+/// request-derived and carries no fixed text at all: Route 53 reports a
+/// delegation set id that resolves to nothing as that id alone, in its bare
+/// form, however the request spelled it.
 pub fn no_such_delegation_set(requested_id: &str) -> NoSuchDelegationSet {
     NoSuchDelegationSet {
-        message: Some(format!(
-            "no reusable delegation set exists with the ID {requested_id}"
-        )),
+        message: Some(normalize_delegation_set_id(requested_id).to_string()),
     }
 }
 
