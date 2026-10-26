@@ -549,6 +549,22 @@ impl Task {
         self.state == "IN_PROGRESS"
     }
 
+    /// Record this task reaching the terminal `TaskState` `state` at `at`.
+    ///
+    /// The three members a terminal record carries move TOGETHER: the state, "when
+    /// the state of the task was last updated" and "when the task was completed".
+    /// `completedAt` is therefore present on every record that stopped holding work
+    /// and absent only while the task is in flight, which is what lets a caller
+    /// tell the two apart. Every path that terminalises a task goes through here —
+    /// the clock carrying every execution to its outcome (`COMPLETED`) and a cancel
+    /// stopping the queued work (`CANCELED`) — because nothing revisits a record
+    /// that is no longer in flight.
+    pub fn terminalise(&mut self, state: &str, at: SystemTime) {
+        self.state = state.to_string();
+        self.completed_at = Some(at);
+        self.last_updated_at = at;
+    }
+
     /// The tags `DescribeTask` reports.
     pub fn tag_map(&self) -> HashMap<String, String> {
         self.tags
@@ -1229,9 +1245,7 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             let Some(task) = self.tasks.get_mut(&task_id) else {
                 continue;
             };
-            task.state = "COMPLETED".to_string();
-            task.completed_at = Some(completed_at);
-            task.last_updated_at = completed_at;
+            task.terminalise("COMPLETED", completed_at);
         }
     }
 }

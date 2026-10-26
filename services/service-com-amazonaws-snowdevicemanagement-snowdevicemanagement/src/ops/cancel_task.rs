@@ -3,8 +3,8 @@
 //! @op CancelTask
 //! Stops the work of the stored task `taskId` names that no device has started yet:
 //! every execution of it still `QUEUED` becomes `CANCELED`, and the task moves to
-//! `CANCELED` with a bumped `lastUpdatedAt` only when the call had such an execution to
-//! stop. An execution a device has already begun stays `IN_PROGRESS` and still runs to
+//! `CANCELED` with a bumped `lastUpdatedAt` and the same instant in `completedAt` only
+//! when the call had such an execution to stop. An execution a device has already begun stays `IN_PROGRESS` and still runs to
 //! its own outcome, so a following `DescribeTask` / `ListExecutions` /
 //! `DescribeExecution` observes exactly that. A `taskId` naming no task is answered with
 //! the modelled `ResourceNotFoundException`.
@@ -209,11 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The task reports CANCELED only when this call actually cancelled work;
         // a task whose every execution was already running or finished keeps the
-        // state its executions carry it to.
+        // state its executions carry it to. Reaching CANCELED is a terminal
+        // transition, so it is recorded the way the other one is
+        // ([`crate::state::Task::terminalise`]): the instant the task stopped
+        // holding work lands in `completedAt` as well as in `lastUpdatedAt`,
+        // because nothing revisits a record that is no longer in flight.
         if cancelled_any {
             if let Some(task) = store.task_in_mut(&region, &input.task_id) {
-                task.state = "CANCELED".to_string();
-                task.last_updated_at = now;
+                task.terminalise("CANCELED", now);
             }
         }
 
