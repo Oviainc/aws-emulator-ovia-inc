@@ -4954,6 +4954,72 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         })
     }
 
+    /// Make the task set `key` names the one serving production traffic, and hand the
+    /// service the parameters it deploys with.
+    ///
+    /// `TaskSet$status`: "PRIMARY: The task set is serving production traffic. ACTIVE: The
+    /// task set isn't serving production traffic" — exactly ONE task set of a service is
+    /// the primary one, so whichever held that status loses it here. The
+    /// `UpdateServicePrimaryTaskSet` doc adds "Any parameters that are updated on the
+    /// primary task set in a service will transition to the service": the service deploys
+    /// through its primary task set, so the task definition, the capacity the tasks run
+    /// on, and the network, load-balancer and service-registry bindings the service
+    /// reports are the primary task set's.
+    ///
+    /// Promoting the task set that is already primary changes nothing, so the instants the
+    /// records carry are left where they are and a repeat of the call reads the same.
+    ///
+    /// A task set whose tasks "are being stopped, and their corresponding targets are
+    /// being deregistered from their target group" (the `DRAINING` status) is one the
+    /// delete of its service drained away with it, and such a service is not one to update
+    /// at all — the caller's request is refused with `ServiceNotActiveException` before it
+    /// reaches here.
+    ///
+    /// Answers the task set as it now STANDS in the store, so the operation reporting it
+    /// projects the stored record rather than reading the map a second time, and `None`
+    /// for a key this store does not hold.
+    pub fn promote_primary_task_set(
+        &mut self,
+        key: &(String, String, String),
+        now: SystemTime,
+    ) -> Option<TaskSetRecord> {
+        let promoted = self.task_sets.get(key).cloned()?;
+        let at = DateTime::from(now);
+        for task_set in self.task_sets.values_mut().filter(|task_set| {
+            task_set.cluster_name == promoted.cluster_name
+                && task_set.service_name == promoted.service_name
+                && task_set.id != promoted.id
+                && task_set.status == TASK_SET_PRIMARY
+        }) {
+            task_set.status = TASK_SET_ACTIVE.to_string();
+            task_set.updated_at = at;
+        }
+        if let Some(task_set) = self.task_sets.get_mut(key) {
+            if task_set.status != TASK_SET_PRIMARY {
+                task_set.status = TASK_SET_PRIMARY.to_string();
+                task_set.updated_at = at;
+            }
+        }
+        let service_key = (
+            promoted.cluster_name.clone(),
+            promoted.service_name.clone(),
+        );
+        if let Some(service) = self.services.get_mut(&service_key) {
+            service.task_definition_arn = Some(promoted.task_definition_arn.clone());
+            service.task_definition = Some(promoted.task_definition.clone());
+            // "A service will return either a capacityProviderStrategy or launchType
+            // parameter, but not both": the task set carries exactly one of the two, and
+            // the service takes the pair as it stands rather than mixing the two sources.
+            service.launch_type = promoted.launch_type.clone();
+            service.capacity_provider_strategy = promoted.capacity_provider_strategy.clone();
+            service.platform_version = promoted.platform_version.clone();
+            service.network_configuration = promoted.network_configuration.clone();
+            service.load_balancers = promoted.load_balancers.clone();
+            service.service_registries = promoted.service_registries.clone();
+        }
+        self.task_sets.get(key).cloned()
+    }
+
     /// How many tasks `task_set` wants. `TaskSet$computedDesiredCount`: "This is
     /// calculated by multiplying the service's `desiredCount` by the task set's `scale`
     /// percentage. The result is always rounded up."
