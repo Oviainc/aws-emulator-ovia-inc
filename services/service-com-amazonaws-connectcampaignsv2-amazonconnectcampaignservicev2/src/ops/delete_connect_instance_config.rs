@@ -190,6 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(unknown) =
             policy.filter(|named| !CAMPAIGN_DELETION_POLICY_VALUES.contains(named))
         {
+            // A refused attempt to change the instance is still an attempt to change
+            // it, so it leaves the same record a successful one does, naming the
+            // outcome it ended in.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ValidationException",
+            );
             return Err(
                 DeleteConnectInstanceConfigErrorModeled::ValidationException(ValidationException {
                     message: format!(
@@ -236,7 +245,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The instance holds no configuration at `now` — the same predicate
             // `GetConnectInstanceConfig` projects through, so the two cannot disagree
             // about an instance this service holds no config for — and a refusal wrote
-            // nothing.
+            // nothing. The refusal is audited all the same: what the audit trail
+            // records is the attempt and how it ended, not whether anything changed.
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ResourceNotFoundException",
+            );
             return Err(
                 DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

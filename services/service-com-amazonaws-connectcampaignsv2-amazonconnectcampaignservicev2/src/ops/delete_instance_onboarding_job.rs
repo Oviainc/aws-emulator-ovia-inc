@@ -198,29 +198,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 Ok(DeleteInstanceOnboardingJobOutput)
             }
-            crate::state::DeleteOnboardingOutcome::NoSuchJob => Err(
-                DeleteInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "No onboarding job found for Connect instance {}",
-                            input.connect_instance_id
-                        ),
-                        x_amz_error_type: None,
-                    },
+            crate::state::DeleteOnboardingOutcome::NoSuchJob => {
+                // A refused attempt to change the instance is still an attempt to
+                // change it, so it leaves the same record a successful one does,
+                // naming the outcome it ended in.
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "ResourceNotFoundException",
+                );
+                Err(
+                    DeleteInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "No onboarding job found for Connect instance {}",
+                                input.connect_instance_id
+                            ),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
                 )
-                .into(),
-            ),
+            }
             // The job exists and has not failed, so it stays: the refusal is the
-            // conflict the model declares for exactly this, and it wrote nothing.
-            crate::state::DeleteOnboardingOutcome::NotFailed => Err(
-                DeleteInstanceOnboardingJobErrorModeled::InvalidStateException(
-                    InvalidStateException {
-                        message: crate::state::ONBOARDING_JOB_NOT_FAILED_MESSAGE.to_string(),
-                        x_amz_error_type: None,
-                    },
+            // conflict the model declares for exactly this, and it wrote nothing of
+            // the job — only the audit record of the attempt and how it ended.
+            crate::state::DeleteOnboardingOutcome::NotFailed => {
+                crate::state::audit_onboarding_change(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.connect_instance_id,
+                    "InvalidStateException",
+                );
+                Err(
+                    DeleteInstanceOnboardingJobErrorModeled::InvalidStateException(
+                        InvalidStateException {
+                            message: crate::state::ONBOARDING_JOB_NOT_FAILED_MESSAGE.to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into(),
                 )
-                .into(),
-            ),
+            }
         }
     }
 }

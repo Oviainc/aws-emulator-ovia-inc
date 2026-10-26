@@ -940,7 +940,10 @@ impl StoredCampaign {
 /// Connect instance it named and how the call ended.
 ///
 /// The one place this service writes an instance audit record, so a later instance
-/// mutator records the same fields. Only wire metadata and the request's instance id
+/// mutator records the same fields. Called on EVERY path such a call returns through
+/// — the accepted one and each refusal, named by the modelled error the refusal
+/// answers with — so an attempt to change an instance is as visible when it was
+/// refused as when it succeeded. Only wire metadata and the request's instance id
 /// go in: never a stored encryption, integration or communication-limits config, a
 /// key or resource ARN or any credential material.
 pub fn audit_onboarding_change(
