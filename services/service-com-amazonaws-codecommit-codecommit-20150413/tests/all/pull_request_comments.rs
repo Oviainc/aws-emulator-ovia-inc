@@ -38,11 +38,14 @@ use crate::wire::{caller_arn, DEFAULT_ACCESS_KEY_ID};
 /// The file the pull request changes, and the two versions of it the destination
 /// and the source branch carry. The line counts (2 and 3) are what a comment's
 /// `filePosition` is checked against.
-const PATH: &str = "README.md";
+///
+/// `pub(crate)` on the path and the after-version line count: the sibling reply
+/// suite anchors its parent comments in the same file of this same fixture.
+pub(crate) const PATH: &str = "README.md";
 const BEFORE_CONTENT: &[u8] = b"alpha\nbeta\n";
 const AFTER_CONTENT: &[u8] = b"alpha\nbeta\ngamma\n";
 const BEFORE_LINES: i64 = 2;
-const AFTER_LINES: i64 = 3;
+pub(crate) const AFTER_LINES: i64 = 3;
 
 /// The documented comment size bound: "The comment is too large. Comments are
 /// limited to 10,240 characters."
@@ -51,20 +54,23 @@ const MAX_COMMENT_CHARACTERS: usize = 10_240;
 
 /// One repository with an open pull request between two branches, each at its own
 /// version of [`PATH`]: everything a comment on a pull request is posted against.
-struct PullRequest {
-    repository: String,
-    pull_request_id: String,
+///
+/// `pub(crate)` here and on [`pull_request_on`]: the sibling reply suite posts its
+/// parent comments on this same fixture rather than building a second copy of it.
+pub(crate) struct PullRequest {
+    pub(crate) repository: String,
+    pub(crate) pull_request_id: String,
     /// The tip of the destination branch — the before side of the pull request.
-    before_commit: String,
+    pub(crate) before_commit: String,
     /// The tip of the source branch — the after side.
-    after_commit: String,
-    before_blob: String,
-    after_blob: String,
+    pub(crate) after_commit: String,
+    pub(crate) before_blob: String,
+    pub(crate) after_blob: String,
 }
 
 /// Build that repository and pull request on an already-running emulator through
 /// the implemented write path, so every id below is one the service itself stored.
-async fn pull_request_on(router: &MultiServiceRouter, repository: &str) -> PullRequest {
+pub(crate) async fn pull_request_on(router: &MultiServiceRouter, repository: &str) -> PullRequest {
     ok(
         router,
         "CreateRepository",

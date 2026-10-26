@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PostCommentReply
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PostCommentReply`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PostCommentReply::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores a reply to a comment `crate::state` already holds, in the
+//! thread, the comparison and (where there is one) the pull request of the comment
+//! it replies to.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +162,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PostCommentReply` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PostCommentReplyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // What content a comment may carry is `crate::state`'s rule, so every
+        // operation that posts one agrees about it; this only maps each outcome
+        // onto the error THIS operation models for it.
+        crate::state::checked_comment_content(&input.content).map_err(|problem| {
+            let message = Some(problem.message());
+            match problem {
+                crate::state::CommentContentProblem::Required => {
+                    PostCommentReplyErrorModeled::CommentContentRequiredException(
+                        CommentContentRequiredException { message },
+                    )
+                }
+                crate::state::CommentContentProblem::TooLarge => {
+                    PostCommentReplyErrorModeled::CommentContentSizeLimitExceededException(
+                        CommentContentSizeLimitExceededException { message },
+                    )
+                }
+            }
+        })?;
+
+        // Which ids address a comment is `crate::state`'s rule too, so every
+        // operation taking a comment id agrees about it.
+        let in_reply_to = match crate::state::normalize_comment_id(&input.in_reply_to) {
+            Ok(comment_id) => comment_id.to_string(),
+            Err(crate::state::CommentIdProblem::Missing) => {
+                return Err(PostCommentReplyErrorModeled::CommentIdRequiredException(
+                    CommentIdRequiredException {
+                        message: Some(
+                            "The comment ID is missing or null. A comment ID is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::CommentIdProblem::Invalid) => {
+                return Err(PostCommentReplyErrorModeled::InvalidCommentIdException(
+                    InvalidCommentIdException {
+                        message: Some(format!(
+                            "the comment ID {} is not in a valid format",
+                            input.in_reply_to
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The idempotency token the request names. Which tokens are acceptable is
+        // `crate::state`'s rule, so every operation carrying the member agrees
+        // about it: leaving it out names no earlier request, while a present token
+        // that names none (an empty one, one past the length bound) is MALFORMED
+        // rather than absent and is refused before anything is written.
+        let client_request_token = match input.client_request_token.as_deref() {
+            Some(token) if !crate::state::is_client_request_token(token) => {
+                return Err(
+                    PostCommentReplyErrorModeled::InvalidClientRequestTokenException(
+                        InvalidClientRequestTokenException {
+                            message: Some(
+                                crate::state::INVALID_CLIENT_REQUEST_TOKEN_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            token => token,
+        };
+
+        let now = std::time::SystemTime::now();
+        let author_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // A reply is a comment of the repository that holds the comment it replies
+        // to: a comment id is addressable on its own, and a comment's lifetime is
+        // its repository's, so the repository is found through the comment rather
+        // than named by the request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PostCommentReply"))
+        // A reply sits in the thread of that comment, so it is filed under the
+        // comment's comparison, its place in that comparison, and the pull request
+        // it was posted on where there is one — this operation's request names none
+        // of those, which is why they are read off the comment here. The comment
+        // replied to may have had its CONTENT deleted; this operation models no
+        // refusal for that, so a reply to it is stored like any other.
+        let thread = store.repositories.values_mut().find_map(|repository| {
+            let parent = repository.comments.get(&in_reply_to)?;
+            let inherited = (
+                parent.pull_request_id,
+                parent.comparison.clone(),
+                parent.location.clone(),
+            );
+            Some((repository, inherited))
+        });
+        let Some((repository, (pull_request_id, comparison, location))) = thread else {
+            return Err(
+                PostCommentReplyErrorModeled::CommentDoesNotExistException(
+                    CommentDoesNotExistException {
+                        message: Some(format!("no comment exists with the ID {in_reply_to}")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An idempotency token that was already used: the same request returns the
+        // comment it first posted, and a changed one is refused rather than posting
+        // a second comment under the same token.
+        if let Some(token) = client_request_token {
+            if let Some(existing) = repository
+                .comment_tokens
+                .get(token)
+                .and_then(|comment_id| repository.comments.get(comment_id))
+            {
+                // The token is judged against the request it was first accepted
+                // for, so a later edit of the comment does not turn a replay of
+                // that request into a mismatch.
+                let unchanged = existing.posted_content == input.content
+                    && existing.in_reply_to.as_deref() == Some(in_reply_to.as_str());
+                return if unchanged {
+                    // A replay of the request the token was first accepted for
+                    // posted no second comment, so it is no new activity on the
+                    // pull request either: it answers the first reply and leaves
+                    // `lastActivityDate` where that first post left it.
+                    Ok(PostCommentReplyOutput {
+                        comment: Some(existing.comment_as(&author_arn)),
+                    })
+                } else {
+                    Err(
+                        PostCommentReplyErrorModeled::IdempotencyParameterMismatchException(
+                            IdempotencyParameterMismatchException {
+                                message: Some(format!(
+                                    "the client request token {token} was used in a previous request with different parameters"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                };
+            }
+        }
+
+        if repository.comments.len() >= crate::state::MAX_COMMENTS_PER_REPOSITORY {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} comments per repository",
+                crate::state::MAX_COMMENTS_PER_REPOSITORY
+            )));
+        }
+
+        let repository_name = repository.name.clone();
+        let sequence = repository.next_comment_sequence;
+        repository.next_comment_sequence = sequence.saturating_add(1);
+        let record = crate::state::CommentRecord {
+            comment_id: crate::state::comment_id(&repository_name, sequence, now),
+            content: input.content.clone(),
+            posted_content: input.content.clone(),
+            in_reply_to: Some(in_reply_to),
+            creation_date: now,
+            last_modified_date: now,
+            author_arn: author_arn.clone(),
+            deleted: false,
+            client_request_token: client_request_token.map(str::to_string),
+            pull_request_id,
+            comparison,
+            location,
+            // Reactions arrive through `PutCommentReaction`; a comment is posted
+            // with none.
+            reactions: std::collections::BTreeMap::new(),
+            sequence,
+        };
+        if let Some(token) = client_request_token {
+            repository
+                .comment_tokens
+                .insert(token.to_string(), record.comment_id.clone());
+        }
+        let response = PostCommentReplyOutput {
+            comment: Some(record.comment_as(&author_arn)),
+        };
+        repository.comments.insert(record.comment_id.clone(), record);
+        // "The day and time of the last user or system activity on the pull
+        // request" (`smithy_query(query="doc",shape="PullRequest",member="lastActivityDate")`):
+        // replying to a comment on a pull request is activity on it, so the pull
+        // request a later read reports carries this instant. The reviewable state
+        // of the pull request has NOT moved, so its `revisionId` is untouched.
+        if let Some(pull_request) =
+            pull_request_id.and_then(|id| repository.pull_requests.get_mut(&id))
+        {
+            pull_request.last_activity_date = now;
+        }
+        Ok(response)
     }
 }
+

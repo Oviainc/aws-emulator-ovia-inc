@@ -291,11 +291,14 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidCommitIdException",
             crate::state::INVALID_COMMIT_ID_MESSAGE,
         ),
-        ("commentId", _) if missing => (
+        // Every member that carries a `CommentId` names a comment, so each takes the
+        // comment id errors: `inReplyTo` is `PostCommentReply`'s name for one, and it
+        // models these same codes for it.
+        ("commentId" | "inReplyTo", _) if missing => (
             "CommentIdRequiredException",
             "The comment ID is missing or null. A comment ID is required.",
         ),
-        ("commentId", _) => (
+        ("commentId" | "inReplyTo", _) => (
             "InvalidCommentIdException",
             "The comment ID is not in a valid format.",
         ),
