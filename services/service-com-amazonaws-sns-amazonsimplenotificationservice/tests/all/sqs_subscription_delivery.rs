@@ -466,3 +466,112 @@ async fn each_publish_delivers_once_and_only_to_confirmed_subscriptions() {
         );
     }
 }
+
+/// One row of the attribute table: the case, the published attribute's data type and value,
+/// and the value the queue must receive as its own attribute.
+type AttributeCase<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+/// A RAW delivery carries the published attributes as the QUEUE's own, and the value of a
+/// `Number` attribute is the number it names — "Number – Numbers are positive or negative
+/// integers or floating-point numbers" (`MessageAttributeValue$DataType`) — so the redundant
+/// sign and zero padding the publisher spelled it with are not part of it. A value of any
+/// other type is text, and a `Number` whose value is not a decimal number cannot be respelled,
+/// so both are carried exactly as published.
+///
+/// The rows differ along what the rule generalises over: the data type, the sign, the padding
+/// (leading zeros, trailing fraction zeros), the magnitude (one no binary float holds), the
+/// notation, and a value that is not a number at all.
+#[tokio::test]
+async fn a_raw_delivery_carries_the_number_a_number_attribute_names() {
+    let emulator = emulator();
+    let topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "attribute-values")]).await,
+        "TopicArn",
+    );
+    let (url, arn) = given_queue(&emulator, "attribute-values-queue").await;
+    let subscription = element(
+        &sns(
+            &emulator,
+            "Subscribe",
+            &[
+                ("TopicArn", &topic),
+                ("Protocol", "sqs"),
+                ("Endpoint", &arn),
+                ("ReturnSubscriptionArn", "true"),
+            ],
+        )
+        .await,
+        "SubscriptionArn",
+    );
+    sns(
+        &emulator,
+        "SetSubscriptionAttributes",
+        &[
+            ("SubscriptionArn", &subscription),
+            ("AttributeName", "RawMessageDelivery"),
+            ("AttributeValue", "true"),
+        ],
+    )
+    .await;
+
+    let rows: &[AttributeCase<'_>] = &[
+        ("a number with a redundant sign", "Number", "+5", "5"),
+        ("a number already canonical", "Number", "5", "5"),
+        ("a negative number", "Number", "-5", "-5"),
+        ("a number padded with leading zeros", "Number", "007", "7"),
+        ("a fraction padded with trailing zeros", "Number", "5.50", "5.5"),
+        ("a signed zero", "Number", "-0", "0"),
+        (
+            // A magnitude no binary float holds: the digits the publisher sent survive.
+            "a number past the precision of a double",
+            "Number",
+            "12345678901234567890.5",
+            "12345678901234567890.5",
+        ),
+        (
+            // Not a plain decimal number, so there is no canonical spelling to give it.
+            "a number in exponent notation",
+            "Number",
+            "1e2",
+            "1e2",
+        ),
+        ("a number that is not a number", "Number", "five", "five"),
+        // Only a Number is a number: a String's value is text, sign and all.
+        ("a string that looks like a number", "String", "+5", "+5"),
+    ];
+
+    for (case, data_type, published, expected) in rows {
+        sns(
+            &emulator,
+            "Publish",
+            &[
+                ("TopicArn", &topic),
+                ("Message", "an attributed message"),
+                ("MessageAttributes.entry.1.Name", "n"),
+                ("MessageAttributes.entry.1.Value.DataType", data_type),
+                ("MessageAttributes.entry.1.Value.StringValue", published),
+            ],
+        )
+        .await;
+        let delivered = drain(&emulator, &url).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "case {case:?}: expected one delivered message, got {delivered:?}"
+        );
+        let (_, attributes) = &delivered[0];
+        let actual = attributes["n"]["StringValue"].as_str();
+        assert_eq!(
+            actual,
+            Some(*expected),
+            "case {case:?}: expected the queue to receive {expected:?}, got {actual:?}"
+        );
+        let carried_type = attributes["n"]["DataType"].as_str();
+        assert_eq!(
+            carried_type,
+            Some(*data_type),
+            "case {case:?}: the attribute keeps the data type it was published with, got \
+             {carried_type:?}"
+        );
+    }
+}

@@ -236,6 +236,11 @@ pub mod iot_job_executions;
 /// The ONE minification of a JSON document a service takes as an opaque string member and
 /// reports back on every read, so no two services report one document's bytes differently.
 pub mod json_document;
+/// The ONE reading of WHERE a JSON document a caller submitted stopped parsing — the
+/// character or the unquoted word the parse stopped on, what was expected there, and the
+/// line and column — for every service whose refusal carries its JSON parser's own
+/// diagnostic.
+pub mod json_parse_fault;
 pub mod lex;
 pub mod management_events;
 pub mod network;

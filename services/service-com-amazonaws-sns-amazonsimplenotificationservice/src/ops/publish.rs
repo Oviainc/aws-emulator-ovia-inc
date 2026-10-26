@@ -417,28 +417,61 @@ pub(crate) const SQS_PROTOCOL: &str = "sqs";
 /// delivery is not part of the answer, so it is carried out of the store as this record and
 /// performed with the store's lock released.
 ///
-/// The body is SHARED, not copied per subscription: every subscriber of one published message
-/// receives the same bytes (the envelope carries nothing subscription-specific), so one
-/// publish holds ONE body however many queues are subscribed.
+/// The body is rendered per SUBSCRIPTION, because the enveloped form carries the receiving
+/// subscription's own unsubscribe link; the raw form carries nothing subscription-specific,
+/// so every raw subscriber of one published message shares one body.
 #[derive(Debug, Clone)]
 pub struct QueueDelivery {
-    /// The subscription that owes the delivery, for the log when it cannot be made.
+    /// The subscription that owes the delivery: the log names it when it cannot be made, and
+    /// its own dead-letter queue is where the message is parked then.
     subscription_arn: String,
-    /// The url of the queue the subscription's endpoint ARN names.
-    queue_url: String,
-    /// The ARN of that same queue — the subscription's endpoint — which is the RESOURCE the
-    /// queue's own policy is asked about before the delivery is made.
-    queue_arn: String,
+    /// The queue the subscription's endpoint ARN names.
+    target: QueueLocation,
     /// The topic the message was published to: the source the queue's policy may scope its
     /// grant to (`aws:SourceArn`).
     topic_arn: String,
-    /// The Region the queue is in: the one its own ARN names.
-    region: String,
-    /// The body the queue receives, shared with every other delivery of this message.
+    /// The body the queue receives.
     body: ::std::sync::Arc<str>,
     /// The message attributes the queue receives, set only on a RAW delivery: without the
     /// notification envelope that carries them, they are the only place they survive.
     attributes: Vec<(String, MessageAttributeValue)>,
+    /// Where this message is parked when the delivery cannot be made: the dead-letter queue
+    /// the subscription's own `RedrivePolicy` names, or `None` when it asks for no redrive.
+    dead_letter: Option<QueueLocation>,
+}
+
+/// One SQS queue a message is handed to, however it was addressed — as a subscription's
+/// endpoint or as its dead-letter target.
+#[derive(Debug, Clone)]
+struct QueueLocation {
+    /// The url the queue is reached at.
+    queue_url: String,
+    /// The queue's own ARN: the RESOURCE its policy is asked about before a message is
+    /// handed to it.
+    queue_arn: String,
+    /// The Region the queue is in: the one its own ARN names.
+    region: String,
+}
+
+impl QueueLocation {
+    /// The queue `arn` names, or `None` when `arn` is not the ARN of a queue.
+    fn of_queue_arn(arn: &str) -> Option<Self> {
+        let parsed = ::service_common::arn::parse(arn)?;
+        if parsed.vendor != SQS_ARN_NAMESPACE || parsed.resource.contains([':', '/']) {
+            // A queue's ARN names the queue directly: a resource field carrying a type
+            // separator addresses no queue.
+            return None;
+        }
+        let region = ::service_common::arn::region_of(arn, SQS_ARN_NAMESPACE)?;
+        Some(Self {
+            queue_url: format!(
+                "https://sqs.{region}.amazonaws.com/{}/{}",
+                parsed.account, parsed.resource
+            ),
+            queue_arn: arn.to_string(),
+            region: region.to_string(),
+        })
+    }
 }
 
 /// How many deliveries ONE publishing request may make, across every message it publishes
@@ -497,17 +530,17 @@ impl DeliveryBudget {
 /// The deliveries `published` owes to the SQS queues among `subscriptions`, within what
 /// `budget` has left.
 ///
-/// The body is rendered ONCE here — the enveloped form and the raw form at most once each —
-/// and shared by every delivery, so a fan-out does not re-serialize the message per
-/// subscriber. `pub(crate)` with [`deliver_to_queues`]: `PublishBatch` publishes the same
-/// messages to the same subscriptions, so it goes through this one definition of the envelope
-/// and the fan-out rather than a second copy, and shares one budget across its entries.
+/// The RAW form of the body is rendered at most once and shared by every raw subscriber, so a
+/// fan-out does not re-serialize it per subscriber; the ENVELOPED form is rendered per
+/// subscription, because it carries that subscription's own unsubscribe link.
+/// `pub(crate)` with [`deliver_to_queues`]: `PublishBatch` publishes the same messages to the
+/// same subscriptions, so it goes through this one definition of the envelope and the fan-out
+/// rather than a second copy, and shares one budget across its entries.
 pub(crate) fn queue_deliveries(
     subscriptions: &[state::SubscriptionRecord],
     published: &PublishedMessage,
     budget: &mut DeliveryBudget,
 ) -> Vec<QueueDelivery> {
-    let mut enveloped: Option<::std::sync::Arc<str>> = None;
     let mut raw_body: Option<::std::sync::Arc<str>> = None;
     let mut deliveries: Vec<QueueDelivery> = Vec::new();
     for subscription in subscriptions {
@@ -519,9 +552,7 @@ pub(crate) fn queue_deliveries(
                 .get_or_insert_with(|| published.message.clone())
                 .clone()
         } else {
-            enveloped
-                .get_or_insert_with(|| ::std::sync::Arc::from(notification_envelope(published)))
-                .clone()
+            ::std::sync::Arc::from(notification_envelope(published, &subscription.arn))
         };
         if !budget.charge(body.len()) {
             ::tracing::warn!(
@@ -535,36 +566,102 @@ pub(crate) fn queue_deliveries(
         }
         deliveries.push(QueueDelivery {
             subscription_arn: subscription.arn.clone(),
-            queue_url: target.queue_url,
-            queue_arn: target.queue_arn,
+            target: target.location,
             topic_arn: published.topic_arn.clone(),
-            region: target.region,
             body,
             attributes: if target.raw {
                 published
                     .message_attributes
                     .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .map(|(name, value)| (name.clone(), queue_attribute(value)))
                     .collect()
             } else {
                 Vec::new()
             },
+            dead_letter: target.dead_letter,
         });
     }
     deliveries
 }
 
+/// One published message attribute as the subscribed queue's OWN message attribute.
+///
+/// A raw delivery carries the published attributes as the queue's own, and the value of a
+/// `Number` attribute is a NUMBER: the queue receives the number the publisher named, not the
+/// way it spelled it (a leading `+`, a trailing `.0`). An attribute of any other type carries
+/// its value verbatim — it is text or bytes, so the publisher's spelling of it is all there
+/// is — and so does a `Number` whose value is not a number this service can read, which it
+/// passes on rather than rewriting.
+fn queue_attribute(value: &MessageAttributeValue) -> MessageAttributeValue {
+    let is_number = value.data_type == NUMBER_DATA_TYPE
+        || value
+            .data_type
+            .starts_with(&format!("{NUMBER_DATA_TYPE}{DATA_TYPE_LABEL_SEPARATOR}"));
+    let Some(number) = value
+        .string_value
+        .as_deref()
+        .filter(|_| is_number)
+        .and_then(canonical_number)
+    else {
+        return value.clone();
+    };
+    MessageAttributeValue {
+        string_value: Some(number),
+        ..value.clone()
+    }
+}
+
+/// The data type of a numeric message attribute: "Number – Numbers are positive or negative
+/// integers or floating-point numbers" (`MessageAttributeValue$DataType` doc).
+const NUMBER_DATA_TYPE: &str = "Number";
+
+/// What separates a data type from the custom label a publisher may append to it
+/// (`Number.int`): "You can also append custom labels" (`MessageAttributeValue$DataType`).
+const DATA_TYPE_LABEL_SEPARATOR: char = '.';
+
+/// `value` as the number it names, spelled canonically — or `None` when it names none.
+///
+/// The spelling is normalised in the DECIMAL TEXT the publisher sent: the redundant leading
+/// `+`, the leading zeros of the integer part and the trailing zeros of the fraction are
+/// dropped, and nothing else about the number changes. It is never round-tripped through a
+/// binary float, which would respell an exponent and lose the digits a double cannot hold. A
+/// value that is not a plain decimal number — one in exponent form, one that is not a number
+/// at all — names no canonical spelling here and is passed on as the publisher sent it.
+fn canonical_number(value: &str) -> Option<String> {
+    let (sign, magnitude) = match value.strip_prefix(['+', '-']) {
+        Some(magnitude) if value.starts_with('-') => ("-", magnitude),
+        Some(magnitude) => ("", magnitude),
+        None => ("", value),
+    };
+    let (whole, fraction) = match magnitude.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (magnitude, ""),
+    };
+    let is_decimal = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !is_decimal(whole) || !is_decimal(fraction) {
+        return None;
+    }
+    let whole = whole.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    if whole.is_empty() && fraction.is_empty() {
+        // Zero is zero, however many digits and whichever sign it was written with.
+        return Some("0".to_string());
+    }
+    let whole = if whole.is_empty() { "0" } else { whole };
+    if fraction.is_empty() {
+        return Some(format!("{sign}{whole}"));
+    }
+    Some(format!("{sign}{whole}.{fraction}"))
+}
+
 /// Where one subscription's deliveries go, and in which form.
 struct QueueTarget {
-    /// The url of the queue the subscription's endpoint ARN names.
-    queue_url: String,
-    /// The ARN of that queue: the subscription's endpoint, as the queue's own policy names
-    /// the resource.
-    queue_arn: String,
-    /// The Region the queue is in: the one its own ARN names.
-    region: String,
+    /// The queue the subscription's endpoint ARN names.
+    location: QueueLocation,
     /// Whether the subscription asked for RAW delivery.
     raw: bool,
+    /// The dead-letter queue the subscription's `RedrivePolicy` names, if any.
+    dead_letter: Option<QueueLocation>,
 }
 
 impl QueueTarget {
@@ -578,13 +675,7 @@ impl QueueTarget {
             return None;
         }
         let endpoint = subscription.endpoint.as_deref()?;
-        let arn = ::service_common::arn::parse(endpoint)?;
-        if arn.vendor != SQS_ARN_NAMESPACE || arn.resource.contains([':', '/']) {
-            // A queue's ARN names the queue directly: a resource field carrying a type
-            // separator addresses no queue.
-            return None;
-        }
-        let region = ::service_common::arn::region_of(endpoint, SQS_ARN_NAMESPACE)?;
+        let location = QueueLocation::of_queue_arn(endpoint)?;
         if subscription
             .attributes
             .contains_key(state::FILTER_POLICY_ATTRIBUTE)
@@ -601,12 +692,7 @@ impl QueueTarget {
             return None;
         }
         Some(Self {
-            queue_url: format!(
-                "https://sqs.{region}.amazonaws.com/{}/{}",
-                arn.account, arn.resource
-            ),
-            queue_arn: endpoint.to_string(),
-            region: region.to_string(),
+            location,
             // "RawMessageDelivery – When set to true, enables raw message delivery to Amazon
             // SQS […] endpoints. This eliminates the need for the endpoints to process JSON
             // formatting, which is otherwise created for Amazon SNS metadata."
@@ -614,11 +700,18 @@ impl QueueTarget {
                 .attributes
                 .get(state::RAW_MESSAGE_DELIVERY_ATTRIBUTE)
                 .is_some_and(|value| value == state::RAW_MESSAGE_DELIVERY_ENABLED),
+            // "RedrivePolicy – When specified, sends undeliverable messages to the specified
+            // Amazon SQS dead-letter queue" — the queue a delivery this subscription cannot
+            // receive is parked in.
+            dead_letter: state::dead_letter_target_arn(&subscription.attributes)
+                .as_deref()
+                .and_then(QueueLocation::of_queue_arn),
         })
     }
 }
 
-/// Deliver each queued message to the queue its subscription names.
+/// Deliver each queued message to the queue its subscription names, and park the ones that
+/// cannot be delivered in that subscription's dead-letter queue.
 ///
 /// A queue is reached the way any emulated service reaches another: through the in-process
 /// callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no
@@ -630,47 +723,133 @@ impl QueueTarget {
 /// one publish may owe several messages to the same queue — so the reads this adds are
 /// bounded by the same [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are, and so is the
 /// per-request table they are remembered in.
+///
+/// A delivery that could NOT be made to a subscription carrying a `RedrivePolicy` is written
+/// to the queue that policy names instead: "sends undeliverable messages to the specified
+/// Amazon SQS dead-letter queue. Messages that can't be delivered due to client errors (for
+/// example, when the subscribed endpoint is unreachable) […] are held in the dead-letter
+/// queue for further analysis or reprocessing"
+/// (`SetSubscriptionAttributesInput$AttributeName`). The copy is the body the subscription
+/// itself would have received, in that subscription's own delivery format, because that is
+/// the message that could not be delivered.
 pub(crate) async fn deliver_to_queues(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     deliveries: &[QueueDelivery],
 ) {
-    let mut client: Option<(String, ::aws_sdk_sqs::Client)> = None;
-    // The `Policy` each queue of this fan-out answered with, keyed by its url: at most one
-    // read per queue, whatever this request owes it.
-    let mut policies: Vec<(String, Option<String>)> = Vec::new();
+    let mut queues = Queues::new(ctx);
     for delivery in deliveries {
-        let client = match client.as_ref() {
-            // One client per Region: every queue of one Region is reached through the same
-            // endpoint, and a publish rarely fans out across Regions.
-            Some((region, client)) if *region == delivery.region => client,
-            _ => {
-                let fresh = sqs_client(ctx, &delivery.region);
-                &client.insert((delivery.region.clone(), fresh)).1
-            }
+        if queues.hand_over(&delivery.target, delivery).await {
+            continue;
+        }
+        let Some(dead_letter) = delivery.dead_letter.as_ref() else {
+            continue;
         };
-        let policy = match policies
-            .iter()
-            .find(|(queue_url, _)| *queue_url == delivery.queue_url)
-        {
-            Some((_, policy)) => policy.clone(),
-            None => {
-                let read = queue_policy(client, &delivery.queue_url).await;
-                policies.push((delivery.queue_url.clone(), read.clone()));
-                read
-            }
-        };
-        if !delivery_is_authorized(policy.as_deref(), &delivery.queue_arn, &delivery.topic_arn) {
+        if queues.hand_over(dead_letter, delivery).await {
+            ::tracing::info!(
+                subscription = %delivery.subscription_arn,
+                queue = %dead_letter.queue_url,
+                "the notification could not be delivered, so it was held in the \
+                 subscription's dead-letter queue"
+            );
+        } else {
             ::tracing::warn!(
                 subscription = %delivery.subscription_arn,
-                queue = %delivery.queue_url,
+                queue = %dead_letter.queue_url,
+                "the notification could not be delivered and its subscription's \
+                 dead-letter queue could not be written to either"
+            );
+        }
+    }
+}
+
+/// The SQS queues ONE publishing request hands its messages to.
+///
+/// It remembers what each queue of the fan-out answered — the client its Region is reached
+/// through and the `Policy` the queue itself reports — so a request that owes several
+/// messages to one queue reads that queue once. Both tables are bounded by the same
+/// [`MAX_DELIVERIES_PER_REQUEST`] the deliveries are.
+struct Queues<'ctx, 'op> {
+    ctx: &'ctx smithy_server_runtime::OperationContext<'op>,
+    /// One client per Region: every queue of one Region is reached through the same endpoint,
+    /// and a publish rarely fans out across Regions.
+    clients: Vec<(String, ::aws_sdk_sqs::Client)>,
+    /// The `Policy` each queue answered with, keyed by its url.
+    policies: Vec<(String, QueuePolicy)>,
+}
+
+/// What a queue answered when the `Policy` it carries was read.
+#[derive(Debug, Clone)]
+enum QueuePolicy {
+    /// The queue answered: the policy document it carries, or `None` when it carries none.
+    Stated(Option<String>),
+    /// The queue did not answer at all — one that was deleted, or that never existed — so
+    /// nothing can be handed to it.
+    Unreachable,
+}
+
+impl<'ctx, 'op> Queues<'ctx, 'op> {
+    fn new(ctx: &'ctx smithy_server_runtime::OperationContext<'op>) -> Self {
+        Self {
+            ctx,
+            clients: Vec::new(),
+            policies: Vec::new(),
+        }
+    }
+
+    /// The client `region`'s queues are reached through, built on first use.
+    ///
+    /// Handed back by value: the client is a handle over the shared in-process transport, so
+    /// a copy of it addresses the same endpoint.
+    fn client(&mut self, region: &str) -> ::aws_sdk_sqs::Client {
+        if let Some((_, client)) = self.clients.iter().find(|(held, _)| held == region) {
+            return client.clone();
+        }
+        let fresh = sqs_client(self.ctx, region);
+        self.clients.push((region.to_string(), fresh.clone()));
+        fresh
+    }
+
+    /// The `Policy` the queue at `queue_url` reports, read at most once per request.
+    async fn policy(&mut self, client: &::aws_sdk_sqs::Client, queue_url: &str) -> QueuePolicy {
+        if let Some((_, policy)) = self.policies.iter().find(|(held, _)| held == queue_url) {
+            return policy.clone();
+        }
+        let read = queue_policy(client, queue_url).await;
+        self.policies.push((queue_url.to_string(), read.clone()));
+        read
+    }
+
+    /// Hand `delivery`'s message to `queue`, and report whether the queue took it.
+    ///
+    /// `false` is every way the message did not reach the queue: a queue that does not
+    /// answer, a queue whose own policy does not grant this service the send, and a send the
+    /// queue refused — the client errors a redrive exists to make visible.
+    async fn hand_over(&mut self, queue: &QueueLocation, delivery: &QueueDelivery) -> bool {
+        let client = self.client(&queue.region);
+        let policy = match self.policy(&client, &queue.queue_url).await {
+            QueuePolicy::Stated(policy) => policy,
+            QueuePolicy::Unreachable => {
+                ::tracing::warn!(
+                    subscription = %delivery.subscription_arn,
+                    queue = %queue.queue_url,
+                    "the subscribed queue does not answer, so the notification cannot be \
+                     delivered to it"
+                );
+                return false;
+            }
+        };
+        if !delivery_is_authorized(policy.as_deref(), &queue.queue_arn, &delivery.topic_arn) {
+            ::tracing::warn!(
+                subscription = %delivery.subscription_arn,
+                queue = %queue.queue_url,
                 "the subscribed queue's policy does not allow this service to send it a \
                  message, so the notification is withheld"
             );
-            continue;
+            return false;
         }
         let mut request = client
             .send_message()
-            .queue_url(&delivery.queue_url)
+            .queue_url(&queue.queue_url)
             .message_body(&*delivery.body);
         for (name, value) in &delivery.attributes {
             let mut attribute =
@@ -695,11 +874,13 @@ pub(crate) async fn deliver_to_queues(
         if let Err(error) = request.send().await {
             ::tracing::warn!(
                 subscription = %delivery.subscription_arn,
-                queue = %delivery.queue_url,
+                queue = %queue.queue_url,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed queue could not be delivered to"
             );
+            return false;
         }
+        true
     }
 }
 
@@ -764,10 +945,14 @@ fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str
     )
 }
 
-/// The `Policy` the queue at `queue_url` reports, or `None` when it carries none — which
-/// includes a queue this call could not read at all, because a queue that cannot be read
-/// cannot have granted anything either.
-async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> Option<String> {
+/// What the queue at `queue_url` answered when its `Policy` was read: the document it
+/// carries, none, or nothing at all.
+///
+/// A queue that does not answer the read is one no message can be handed to either — it was
+/// deleted, or never existed — which is told apart from a queue that answered and carries no
+/// policy, because the first is an undeliverable endpoint and the second is a queue that has
+/// granted nothing.
+async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> QueuePolicy {
     let answered = client
         .get_queue_attributes()
         .queue_url(queue_url)
@@ -775,19 +960,21 @@ async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> Option
         .send()
         .await;
     match answered {
-        Ok(answer) => answer
-            .attributes()
-            .and_then(|attributes| {
-                attributes.get(&::aws_sdk_sqs::types::QueueAttributeName::Policy)
-            })
-            .cloned(),
+        Ok(answer) => QueuePolicy::Stated(
+            answer
+                .attributes()
+                .and_then(|attributes| {
+                    attributes.get(&::aws_sdk_sqs::types::QueueAttributeName::Policy)
+                })
+                .cloned(),
+        ),
         Err(error) => {
             ::tracing::warn!(
                 queue = %queue_url,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed queue's policy could not be read"
             );
-            None
+            QueuePolicy::Unreachable
         }
     }
 }
@@ -823,12 +1010,12 @@ fn sqs_client(
 /// (`GetSubscriptionAttributesResponse$Attributes`, `RawMessageDelivery`).
 ///
 /// The envelope carries the metadata the message was published with — its type, id, topic,
-/// subject, body, attributes and the instant it was published — and nothing that depends on
-/// WHICH subscription receives it, so one publish renders it once for every subscriber. It
-/// carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a message in
-/// this emulator, and a member that looked like a signature would be one a subscriber could
-/// not verify.
-fn notification_envelope(published: &PublishedMessage) -> String {
+/// subject, body, attributes and the instant it was published — and the link that cancels THE
+/// SUBSCRIPTION IT IS DELIVERED TO, so it is rendered per subscriber rather than once per
+/// publish. It carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a
+/// message in this emulator, and a member that looked like a signature would be one a
+/// subscriber could not verify.
+fn notification_envelope(published: &PublishedMessage, subscription_arn: &str) -> String {
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "Type".to_string(),
@@ -857,6 +1044,9 @@ fn notification_envelope(published: &PublishedMessage) -> String {
             "SequenceNumber".to_string(),
             serde_json::Value::from(sequence_number),
         );
+    }
+    if let Some(url) = unsubscribe_url(&published.topic_arn, subscription_arn) {
+        envelope.insert("UnsubscribeURL".to_string(), serde_json::Value::from(url));
     }
     if !published.message_attributes.is_empty() {
         // "MessageAttributes": {"<name>": {"Type": "<data type>", "Value": "<value>"}} — the
@@ -900,3 +1090,20 @@ fn rfc3339(at: std::time::SystemTime) -> Option<String> {
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
 }
+
+/// The call that cancels ONE subscription, as the notification delivered to it carries it:
+/// the `Unsubscribe` action of the Region the topic is in, naming that subscription.
+///
+/// Each subscriber of a topic is handed the link to ITS OWN subscription, never a sibling's,
+/// because following it ends the subscription it was delivered to. `None` for a topic whose
+/// ARN names no Region, which addresses no regional endpoint.
+fn unsubscribe_url(topic_arn: &str, subscription_arn: &str) -> Option<String> {
+    let region = ::service_common::arn::region_of(topic_arn, SNS_ARN_NAMESPACE)?;
+    Some(format!(
+        "https://sns.{region}.amazonaws.com/?Action=Unsubscribe&\
+         SubscriptionArn={subscription_arn}"
+    ))
+}
+
+/// The ARN namespace of this service, which its topics' and subscriptions' ARNs name.
+const SNS_ARN_NAMESPACE: &str = "sns";
