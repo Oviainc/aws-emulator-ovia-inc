@@ -27,13 +27,17 @@ tracing = { workspace = true }
 # into this same emulator (no network client feature is enabled: the transport is the
 # emulator's own).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The digest and the hexadecimal rendering a scheduled managed action's `ActionId` is
+# derived with, from the environment, the work and the window that identify it. Already
+# this crate's (the source-bundle suite checksums an archive with the same two), so the
+# id needs no hash or codec written here.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 # The source-bundle suite mounts the S3 service beside Elastic Beanstalk on one engine,
 # because CreateApplicationVersion and CreatePlatformVersion download the archive their
 # request names by calling object storage in process.

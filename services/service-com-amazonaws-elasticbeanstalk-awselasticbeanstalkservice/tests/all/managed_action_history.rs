@@ -12,13 +12,15 @@
 //! is refused rather than answered.
 //!
 //! A managed action is work the SERVICE schedules in an environment's
-//! maintenance window, and this emulator runs no such scheduler (which is why
-//! `ApplyEnvironmentManagedAction` refuses every `ActionId`), so no implemented
-//! operation records one yet. The history is therefore SEEDED through
-//! `Emulator::store` — the harness's seam for exactly that — and every assertion
-//! below is still made over what the HTTP read answers, so a handler that
-//! fabricated items, dropped a member, reported another environment's actions or
-//! paged by position rather than by order fails these tests.
+//! maintenance window, and a record reaches the history only once the clock has
+//! carried one out. This suite does not drive that lifecycle — the suite that
+//! does is `all/managed_actions.rs` — so the history is SEEDED here through
+//! `Emulator::store`, the harness's seam for exactly that, with the spread of
+//! action types, statuses, failures and instants this rule generalises over.
+//! Every assertion below is still made over what the HTTP read answers, so a
+//! handler that fabricated items, dropped a member, reported another
+//! environment's actions or paged by position rather than by order fails these
+//! tests.
 //!
 //! Each test is a TABLE over the class the rule generalises over: which
 //! identifier names the environment, which action type, status and failure a

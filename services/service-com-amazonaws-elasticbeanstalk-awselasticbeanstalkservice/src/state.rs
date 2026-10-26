@@ -10,7 +10,9 @@
 //! catalog the service publishes, the environment information
 //! `RequestEnvironmentInfo` compiles and `RetrieveEnvironmentInfo` reports,
 //! and the event log those operations append to
-//! and `DescribeEvents` reports. It also owns the few derivations all
+//! and `DescribeEvents` reports, and the managed actions the service has
+//! carried out on an environment in its maintenance window. It also owns the
+//! few derivations all
 //! of them share — the server clock, the request's region, this service's ARN
 //! forms, and the clock-owed environment status transitions — so no handler
 //! spells one of them a second way.
@@ -23,8 +25,10 @@ use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
     ApplicationVersionLifecycleConfig, ConfigurationOptionDescription, ConfigurationOptionSetting,
     CustomAmi, EnvironmentInfoDescription, EnvironmentTier,
+    ACTION_HISTORY_STATUS_VALUES, ACTION_STATUS_VALUES, ACTION_TYPE_VALUES,
     CONFIGURATION_DEPLOYMENT_STATUS_VALUES, CONFIGURATION_OPTION_VALUE_TYPE_VALUES,
-    EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, OptionRestrictionRegex,
+    EventDescription, ManagedAction, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule,
+    OptionRestrictionRegex,
     OptionSpecification,
     PlatformBranchSummary, PlatformDescription, PlatformFramework, PlatformProgrammingLanguage,
     PlatformSummary, S3Location, Tag,
@@ -436,6 +440,15 @@ pub const MAX_RETAINED_EVENTS: usize = 10_000;
 /// (`len 1..100`), so an unbounded request is answered with as large a page as
 /// the model admits.
 pub const DEFAULT_MANAGED_ACTION_HISTORY_PAGE_SIZE: usize = 100;
+
+/// How many managed-action records the store keeps.
+///
+/// A record is appended whenever the clock finishes a managed action a caller
+/// applied, so a caller applying one action after another grows the log; the
+/// oldest records are dropped first, as the event log's are. The count is
+/// chosen, not documented, and is the event log's
+/// ([`MAX_RETAINED_EVENTS`]) so the two bounds cannot drift apart.
+pub const MAX_RETAINED_MANAGED_ACTIONS: usize = MAX_RETAINED_EVENTS;
 
 /// Where `severity` sits on [`EVENT_SEVERITY_LADDER`], or `None` when it is not
 /// one of the modelled values.
@@ -1354,6 +1367,13 @@ pub const OPTION_VALUE_TYPE_SCALAR: &str = CONFIGURATION_OPTION_VALUE_TYPE_VALUE
 /// `ValueOptions`. See [`OPTION_VALUE_TYPE_SCALAR`].
 pub const BOOLEAN_VALUE_OPTIONS: &[&str] = &["false", "true"];
 
+/// The `false` of that pair — the value a boolean option that is OFF carries,
+/// read from the published set so the catalog and the handlers that read a
+/// boolean option out of a configuration cannot spell it two ways.
+pub const BOOLEAN_FALSE: &str = BOOLEAN_VALUE_OPTIONS[0];
+/// The `true` of that pair. See [`BOOLEAN_FALSE`].
+pub const BOOLEAN_TRUE: &str = BOOLEAN_VALUE_OPTIONS[1];
+
 /// One configuration option a platform version defines — one
 /// `ConfigurationOptionDescription` before it reaches the wire.
 ///
@@ -1835,46 +1855,43 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     // aws:elasticbeanstalk:managedactions — managed platform updates, the
     // window they run in and the role that runs them.
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:managedactions",
-        "ManagedActionsEnabled",
+        NAMESPACE_MANAGED_ACTIONS,
+        OPTION_MANAGED_ACTIONS_ENABLED,
         CHANGE_SEVERITY_NO_INTERRUPTION,
-        "false",
+        BOOLEAN_FALSE,
     )
     .boolean(),
     // "PreferredStartTime: configure a maintenance window for managed actions
     // in UTC", stated as `day:hour:minute` (`Tue:09:00`) — a string option whose
     // form IS its restriction, so the catalog publishes it as one.
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:managedactions",
-        "PreferredStartTime",
+        NAMESPACE_MANAGED_ACTIONS,
+        OPTION_PREFERRED_START_TIME,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
-    .with_regex(
-        "^(Mon|Tue|Wed|Thu|Fri|Sat|Sun):([01][0-9]|2[0-3]):[0-5][0-9]$",
-        "DayOfWeekAndTime",
-    ),
+    .with_regex(PREFERRED_START_TIME_PATTERN, "DayOfWeekAndTime"),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:managedactions",
+        NAMESPACE_MANAGED_ACTIONS,
         "ServiceRoleForManagedUpdates",
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
     .with_max_length(500),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:managedactions:platformupdate",
-        "InstanceRefreshEnabled",
+        NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE,
+        OPTION_INSTANCE_REFRESH_ENABLED,
         CHANGE_SEVERITY_NO_INTERRUPTION,
-        "false",
+        BOOLEAN_FALSE,
     )
     .boolean(),
     ConfigurationOption::new(
-        "aws:elasticbeanstalk:managedactions:platformupdate",
-        "UpdateLevel",
+        NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE,
+        OPTION_UPDATE_LEVEL,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
-    .with_values(&["minor", "patch"]),
+    .with_values(&[UPDATE_LEVEL_MINOR, UPDATE_LEVEL_PATCH]),
     // aws:elasticbeanstalk:monitoring — what the service does with an instance
     // enhanced health reports as failing.
     ConfigurationOption::new(
@@ -3737,13 +3754,12 @@ impl Event {
 /// terminal and its [`Self::status`] is one of the modelled
 /// `crate::ops::types::ACTION_HISTORY_STATUS_VALUES`.
 ///
-/// NOTHING writes a record here: a managed action exists because the service's
-/// maintenance-window scheduler scheduled one, and this emulator runs no such
-/// scheduler — which is also why `ApplyEnvironmentManagedAction` refuses every
-/// `ActionId` it is given, no action ever being `Scheduled`. So no action has
-/// ever executed on an environment this store holds, and
-/// `DescribeEnvironmentManagedActionHistory` pages over THIS log rather than
-/// reporting an action nothing performed.
+/// A record lands here when an action the service scheduled for an environment
+/// ([`ScheduledManagedAction`]) has FINISHED: the clock completes the action an
+/// `ApplyEnvironmentManagedAction` started ([`AppliedManagedAction`]), the
+/// environment carries the change it made, and the action becomes this
+/// record. `DescribeEnvironmentManagedActionHistory` pages over THIS log, so it
+/// reports the actions that really ran and nothing else.
 #[derive(Debug, Clone)]
 pub struct ManagedActionRecord {
     /// Append order within this emulator, so "most recent first" is a total
@@ -3798,6 +3814,451 @@ impl ManagedActionRecord {
             executed_time: Some(self.executed_time),
             finished_time: self.finished_time,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Managed actions
+//
+// A managed action is maintenance the SERVICE performs on an environment in the
+// environment's own maintenance window, rather than work a caller asked for.
+// Which actions an environment has is decided by the managed-update options its
+// configuration carries (`aws:elasticbeanstalk:managedactions`) together with
+// what the service has to do to it: a platform update is due while the
+// environment runs a release its platform branch has superseded, and an
+// instance replacement is due a week after the instances it runs were launched.
+// So the SCHEDULE is DERIVED from the stored environment and the published
+// catalog, and only what a caller has changed about it — the action an
+// `ApplyEnvironmentManagedAction` started, and the record of one that has
+// finished — is stored.
+//
+// Nothing RUNS a scheduled action when its window comes round: the service's own
+// maintenance scheduler is not emulated, so an action is carried out only when a
+// caller applies it. A window is days away, so inside one run an action stays
+// upcoming; over a longer-lived store the same maintenance is reported in the
+// next window once the one it named has passed, under the id that window gives
+// it.
+// ---------------------------------------------------------------------------
+
+/// The configuration-option namespace Elastic Beanstalk's published option
+/// reference puts the managed-update options in, and the options in it this
+/// service reads: whether managed actions run at all
+/// ("`ManagedActionsEnabled`: enable managed platform updates") and the
+/// maintenance window they run in ("`PreferredStartTime`: configure a
+/// maintenance window for managed actions in UTC").
+const NAMESPACE_MANAGED_ACTIONS: &str = "aws:elasticbeanstalk:managedactions";
+/// See [`NAMESPACE_MANAGED_ACTIONS`].
+const OPTION_MANAGED_ACTIONS_ENABLED: &str = "ManagedActionsEnabled";
+/// See [`NAMESPACE_MANAGED_ACTIONS`].
+const OPTION_PREFERRED_START_TIME: &str = "PreferredStartTime";
+
+/// The namespace of that same reference's platform-update options, and the two
+/// this service reads: whether the environment's instances are replaced weekly
+/// ("`InstanceRefreshEnabled`: enable weekly instance replacement") and how far
+/// an update may go ("`UpdateLevel`: the highest level of update to apply with
+/// managed platform updates").
+const NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE: &str =
+    "aws:elasticbeanstalk:managedactions:platformupdate";
+/// See [`NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE`].
+const OPTION_INSTANCE_REFRESH_ENABLED: &str = "InstanceRefreshEnabled";
+/// See [`NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE`].
+const OPTION_UPDATE_LEVEL: &str = "UpdateLevel";
+
+/// The `UpdateLevel` that admits every update of the environment's platform
+/// branch, "minor" and "patch" releases alike. The option's documented values
+/// are `patch | minor`, and it is the level the service applies up to, so this
+/// is also how an environment whose configuration states NO level is
+/// maintained: nothing is holding the service to patches.
+const UPDATE_LEVEL_MINOR: &str = "minor";
+/// The other `UpdateLevel`: only a release inside the version line the
+/// environment already runs — same major and minor version — is applied.
+const UPDATE_LEVEL_PATCH: &str = "patch";
+
+/// The published restriction on `PreferredStartTime`: the weekday-and-time form
+/// a maintenance window is stated in (`Tue:09:00`), which is what
+/// [`maintenance_window`] reads one back out of. The weekday names are
+/// [`PREFERRED_START_TIME_DAYS`] and the two agree.
+const PREFERRED_START_TIME_PATTERN: &str =
+    "^(Mon|Tue|Wed|Thu|Fri|Sat|Sun):([01][0-9]|2[0-3]):[0-5][0-9]$";
+
+/// The weekday names `PreferredStartTime` states its window's day by, in week
+/// order, so a name's position in this list is how many days into the week that
+/// day is. The set is the one the option's own published pattern lists
+/// ([`PREFERRED_START_TIME_PATTERN`]).
+const PREFERRED_START_TIME_DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// Seconds in a day and days in a week.
+///
+/// A maintenance window is stated in UTC, where every day is exactly this many
+/// seconds long, so placing a window is integer arithmetic over whole epoch days
+/// — no month, year, leap day or time zone takes part in it, and no calendar is
+/// consulted.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+/// See [`SECONDS_PER_DAY`].
+const DAYS_PER_WEEK: i64 = 7;
+
+/// How many days into its week the epoch day is: 1970-01-01 was a Thursday, the
+/// fourth day of a week that starts on Monday as
+/// [`PREFERRED_START_TIME_DAYS`] does.
+const EPOCH_WEEKDAY: i64 = 3;
+
+/// How often an environment's maintenance window comes round.
+///
+/// "`PreferredStartTime`: configure a maintenance window for managed actions in
+/// UTC" is stated as ONE weekday and time of day
+/// ([`PREFERRED_START_TIME_PATTERN`]), so the window it names recurs once a
+/// week; "`InstanceRefreshEnabled`: enable WEEKLY instance replacement" puts
+/// the replacement on the same period. Both come from the published options, so
+/// this period is DOCUMENTED rather than chosen here.
+const MAINTENANCE_WINDOW_PERIOD: i64 = DAYS_PER_WEEK * SECONDS_PER_DAY;
+
+/// The `ActionStatus` of an action the service has scheduled and not started
+/// yet — the one status `ApplyEnvironmentManagedAction` accepts ("A managed
+/// action can be applied only if its status is Scheduled"). Read from the
+/// modelled value set, so this service reports no status the model does not
+/// declare.
+pub const ACTION_STATUS_SCHEDULED: &str = ACTION_STATUS_VALUES[2];
+/// The `ActionStatus` of an action that is being carried out now. See
+/// [`ACTION_STATUS_SCHEDULED`].
+pub const ACTION_STATUS_RUNNING: &str = ACTION_STATUS_VALUES[1];
+
+/// The `ActionType` of a managed platform update, and of a managed replacement
+/// of the environment's Amazon EC2 instances. Read from the modelled value set
+/// ([`crate::ops::types::ACTION_TYPE_VALUES`]).
+pub const ACTION_TYPE_INSTANCE_REFRESH: &str = ACTION_TYPE_VALUES[0];
+/// See [`ACTION_TYPE_INSTANCE_REFRESH`].
+pub const ACTION_TYPE_PLATFORM_UPDATE: &str = ACTION_TYPE_VALUES[1];
+
+/// The `ActionHistoryStatus` of an action that ran to completion — what a
+/// managed action the clock has finished is recorded in the history as. Read
+/// from the modelled value set
+/// ([`crate::ops::types::ACTION_HISTORY_STATUS_VALUES`]).
+pub const ACTION_HISTORY_STATUS_COMPLETED: &str = ACTION_HISTORY_STATUS_VALUES[0];
+
+/// The weekday and time of day an environment's maintenance window opens at, as
+/// `PreferredStartTime` states it, in the units the window arithmetic works in:
+/// whole epoch days and seconds into the day (see [`SECONDS_PER_DAY`]).
+#[derive(Debug, Clone, Copy)]
+struct MaintenanceWindow {
+    /// How many days into the week the window's day is; see
+    /// [`PREFERRED_START_TIME_DAYS`].
+    weekday: i64,
+    /// How many seconds into that day the window opens.
+    second_of_day: i64,
+}
+
+/// The maintenance window the configuration `settings` state, if they state one.
+///
+/// The value is read back in exactly the form the option publishes
+/// ([`PREFERRED_START_TIME_PATTERN`]); a value outside it states no window, so
+/// the environment is maintained on the week of its own launch instead (see
+/// [`next_maintenance_window`]).
+fn maintenance_window(settings: &[ConfigurationOptionSetting]) -> Option<MaintenanceWindow> {
+    let stated = option_value(
+        settings,
+        NAMESPACE_MANAGED_ACTIONS,
+        OPTION_PREFERRED_START_TIME,
+    )?;
+    let mut components = stated.split(':');
+    let day = components.next()?;
+    // The option publishes the hour and the minute as a two-digit field each,
+    // inside the hours of a day and the minutes of an hour
+    // ([`PREFERRED_START_TIME_PATTERN`]). Nothing validates a configuration
+    // option's value where it is WRITTEN, so a value in any other form — more
+    // components, a sign, a word, a number outside the field — reaches here
+    // from the request and states no window at all, which leaves the
+    // environment maintained on the week of its own launch.
+    let hour = preferred_start_time_field(components.next()?, 23)?;
+    let minute = preferred_start_time_field(components.next()?, 59)?;
+    if components.next().is_some() {
+        return None;
+    }
+    let weekday = PREFERRED_START_TIME_DAYS
+        .iter()
+        .position(|name| *name == day)?;
+    Some(MaintenanceWindow {
+        weekday: i64::try_from(weekday).ok()?,
+        // Both fields are inside their own field's range, so the second of the
+        // day they name is inside a day and nothing here can overflow.
+        second_of_day: i64::from(hour) * 60 * 60 + i64::from(minute) * 60,
+    })
+}
+
+/// The value one field of `PreferredStartTime` names, when the field is exactly
+/// the two ASCII digits the option publishes it as and the value it names is not
+/// above `highest`.
+fn preferred_start_time_field(stated: &str, highest: u8) -> Option<u8> {
+    if stated.len() != 2 || !stated.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    stated.parse::<u8>().ok().filter(|value| *value <= highest)
+}
+
+/// The epoch second an environment's maintenance window next opens at, at or
+/// after `not_before`.
+///
+/// `window` is the weekday and time the configuration states, when it states
+/// one. When it does not, the window is counted from `origin`, the environment's
+/// own launch instant: the service has no stated window to wait for, so the week
+/// it maintains the environment in is the week that started when the environment
+/// did.
+fn next_maintenance_window(
+    window: Option<MaintenanceWindow>,
+    origin: i64,
+    not_before: i64,
+) -> i64 {
+    let opened = match window {
+        // The window's own weekday in the week `not_before` falls in: step back
+        // to that week's first day and forward to the window's day. In UTC a day
+        // is a fixed number of seconds ([`SECONDS_PER_DAY`]), so this is whole
+        // epoch days throughout. Saturating, so an instant near the end of the
+        // representable range answers the last window it can rather than
+        // overflowing.
+        Some(window) => {
+            let day = not_before.div_euclid(SECONDS_PER_DAY);
+            let weekday = (day + EPOCH_WEEKDAY).rem_euclid(DAYS_PER_WEEK);
+            (day - weekday + window.weekday)
+                .saturating_mul(SECONDS_PER_DAY)
+                .saturating_add(window.second_of_day)
+        }
+        None => origin,
+    };
+    first_recurrence_at_or_after(opened, not_before)
+}
+
+/// The first instant of the weekly series through `opened` that is at or after
+/// `not_before`. Saturating, for the same reason as above.
+fn first_recurrence_at_or_after(opened: i64, not_before: i64) -> i64 {
+    let periods = not_before
+        .saturating_sub(opened)
+        .saturating_add(MAINTENANCE_WINDOW_PERIOD - 1)
+        .div_euclid(MAINTENANCE_WINDOW_PERIOD)
+        .max(0);
+    opened.saturating_add(periods.saturating_mul(MAINTENANCE_WINDOW_PERIOD))
+}
+
+/// The `ActionId` of the managed action of `action_type` scheduled for the
+/// environment `environment_id` in the window that opens at `window_start`, for
+/// the occasion `occasion`.
+///
+/// A scheduled action IS those four things — the environment it maintains, the
+/// work it does, the window it does it in, and what makes this occurrence of
+/// that work the one that is due (the release an update moves to; the instances
+/// a replacement replaces) — so its id is DERIVED from exactly them: every call
+/// that reports that action reports it under the same id, no report has to mint
+/// one, and the next occurrence of recurring work is an action of its own even
+/// where it falls in the same window.
+///
+/// The form is the one the service issues an `ActionId` in: 128 bits in the
+/// canonical `8-4-4-4-12` lowercase-hexadecimal grouping of a UUID, with the
+/// version and variant bits of a name-based UUID whose name is the action's own
+/// (RFC 9562's version 8, the one reserved for a custom derivation). The 128
+/// bits are the leading half of the SHA-256 digest of that name, so the digest
+/// and its hexadecimal rendering are the `sha2` and `hex` crates' and nothing
+/// here hashes or encodes by hand.
+fn managed_action_id(
+    environment_id: &str,
+    action_type: &str,
+    window_start: i64,
+    occasion: &str,
+) -> String {
+    use ::sha2::Digest;
+
+    let name =
+        format!("urn:{ARN_NAMESPACE}:{environment_id}:{action_type}:{window_start}:{occasion}");
+    let digest = ::sha2::Sha256::digest(name.as_bytes());
+    let mut body = [0u8; UUID_BYTES];
+    body.copy_from_slice(&digest[..UUID_BYTES]);
+    // The version nibble and the two variant bits, in the octets the UUID layout
+    // puts them in.
+    body[6] = (body[6] & 0x0f) | 0x80;
+    body[8] = (body[8] & 0x3f) | 0x80;
+    let rendered = ::hex::encode(body);
+    UUID_GROUPS
+        .iter()
+        .scan(0usize, |at, length| {
+            let from = *at;
+            *at += length;
+            rendered.get(from..*at)
+        })
+        .collect::<Vec<&str>>()
+        .join("-")
+}
+
+/// How many bytes a UUID carries, and how many hexadecimal characters each group
+/// of its canonical rendering does. See [`managed_action_id`].
+const UUID_BYTES: usize = 16;
+/// See [`UUID_BYTES`].
+const UUID_GROUPS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// What a managed action DOES to the environment it is scheduled for, carried
+/// out when the action finishes.
+#[derive(Debug, Clone)]
+pub enum ManagedActionTarget {
+    /// Move the environment to the platform version named by this solution stack
+    /// name and this ARN — the two names of the one release the update applies.
+    PlatformVersion {
+        solution_stack_name: String,
+        platform_arn: String,
+    },
+    /// Replace the environment's Amazon EC2 instances.
+    InstanceReplacement,
+}
+
+/// One managed action the service has scheduled for an environment and not
+/// carried out yet — the model's `ManagedAction`, which
+/// `DescribeEnvironmentManagedActions` reports ("an environment's upcoming and
+/// in-progress managed actions").
+///
+/// An upcoming action is DERIVED (see
+/// `ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::due_managed_actions`):
+/// it exists because the environment's configuration asks the service to
+/// maintain it and there is maintenance to do, so reporting one stores nothing.
+/// An action a caller has applied is held as an [`AppliedManagedAction`] until
+/// the clock finishes it, and reported from there with its status moved to
+/// `Running`.
+#[derive(Debug, Clone)]
+pub struct ScheduledManagedAction {
+    /// "A unique identifier for the managed action"; see [`managed_action_id`].
+    pub action_id: String,
+    /// The environment the action is scheduled for, by `EnvironmentId`.
+    pub environment_id: String,
+    /// "The type of managed action" — one of
+    /// [`crate::ops::types::ACTION_TYPE_VALUES`].
+    pub action_type: String,
+    /// "A description of the managed action."
+    pub action_description: String,
+    /// "The status of the managed action" — one of
+    /// [`crate::ops::types::ACTION_STATUS_VALUES`].
+    pub status: String,
+    /// "The start time of the maintenance window in which the managed action
+    /// will execute."
+    pub window_start_time: ::aws_smithy_types::DateTime,
+    /// What the action does when it finishes.
+    pub target: ManagedActionTarget,
+}
+
+impl ScheduledManagedAction {
+    /// The action of `action_type` the service has SCHEDULED for
+    /// `environment_id` in the window opening at `window_start`, for the
+    /// occasion `occasion` (see [`managed_action_id`]).
+    fn scheduled(
+        environment_id: &str,
+        action_type: &str,
+        action_description: String,
+        window_start: i64,
+        occasion: &str,
+        target: ManagedActionTarget,
+    ) -> Self {
+        Self {
+            action_id: managed_action_id(environment_id, action_type, window_start, occasion),
+            environment_id: environment_id.to_string(),
+            action_type: action_type.to_string(),
+            action_description,
+            status: ACTION_STATUS_SCHEDULED.to_string(),
+            window_start_time: ::aws_smithy_types::DateTime::from_secs(window_start),
+            target,
+        }
+    }
+
+    /// The modelled `ManagedAction` for this action.
+    pub fn to_managed_action(&self) -> ManagedAction {
+        ManagedAction {
+            action_id: Some(self.action_id.clone()),
+            action_description: Some(self.action_description.clone()),
+            action_type: Some(self.action_type.clone()),
+            status: Some(self.status.clone()),
+            window_start_time: Some(self.window_start_time),
+        }
+    }
+}
+
+/// One managed action an `ApplyEnvironmentManagedAction` has started — "applies
+/// a scheduled managed action IMMEDIATELY", so the action is running now rather
+/// than waiting for its window — and the work the clock owes when it finishes.
+#[derive(Debug, Clone)]
+pub struct AppliedManagedAction {
+    /// The action as it was scheduled, with its status moved to
+    /// [`ACTION_STATUS_RUNNING`]: the same id, type, description and window it
+    /// was reported under before it was applied.
+    pub action: ScheduledManagedAction,
+    /// When the action finishes, one [`STATUS_TRANSITION_SPAN`] after the call
+    /// that applied it.
+    pub due_at: Instant,
+    /// The same instant on the server clock — the `FinishedTime` the history
+    /// records, dated when the action finished rather than when a later call
+    /// happened to observe it as finished.
+    pub due_date: ::aws_smithy_types::DateTime,
+    /// "The date and time that the action started executing": when it was
+    /// applied.
+    pub executed_time: ::aws_smithy_types::DateTime,
+    /// The request that applied the action, which the event its completion
+    /// records belongs to.
+    pub request_id: String,
+}
+
+impl AppliedManagedAction {
+    /// The history record this action becomes once it has finished.
+    fn to_record(&self, sequence: u64) -> ManagedActionRecord {
+        ManagedActionRecord {
+            sequence,
+            environment_id: self.action.environment_id.clone(),
+            action_id: self.action.action_id.clone(),
+            action_type: self.action.action_type.clone(),
+            action_description: Some(self.action.action_description.clone()),
+            // Nothing fails an applied action here, so every action this
+            // emulator completes completed, and carries neither failure member.
+            status: ACTION_HISTORY_STATUS_COMPLETED.to_string(),
+            failure_type: None,
+            failure_description: None,
+            executed_time: self.executed_time,
+            finished_time: Some(self.due_date),
+        }
+    }
+}
+
+/// The managed platform update available to an environment: the release its
+/// branch publishes above the one it runs, by both of that release's names.
+struct AvailablePlatformUpdate {
+    /// The version the environment runs now, and the one the update moves it to.
+    from_version: String,
+    to_version: String,
+    solution_stack_name: String,
+    platform_arn: String,
+}
+
+impl AvailablePlatformUpdate {
+    /// "A description of the managed action", naming the update this action
+    /// applies. The wording is this emulator's own — the model documents the
+    /// member only as a description — and it names the two platform versions the
+    /// update moves between, which is what the action is.
+    fn description(&self) -> String {
+        format!(
+            "Platform update from {} to {}",
+            self.from_version, self.to_version
+        )
+    }
+}
+
+/// "A description of the managed action" for a managed replacement of an
+/// environment's Amazon EC2 instances. See
+/// [`AvailablePlatformUpdate::description`] for the wording.
+const INSTANCE_REFRESH_DESCRIPTION: &str = "Instance refresh";
+
+/// Whether moving from the platform version `from` to `to` stays inside one
+/// version line — the same major and minor version — which is what makes it a
+/// `patch` update rather than a `minor` one.
+fn is_patch_update(from: &str, to: &str) -> bool {
+    let line = |version: &str| {
+        let mut components = version.split('.');
+        Some((
+            components.next()?.to_string(),
+            components.next()?.to_string(),
+        ))
+    };
+    match (line(from), line(to)) {
+        (Some(from), Some(to)) => from == to,
+        _ => false,
     }
 }
 
@@ -5088,6 +5549,17 @@ impl EnvironmentResources {
         }
     }
 
+    /// Replace every instance in this inventory, as a managed instance
+    /// replacement does: the Auto Scaling group launches as many instances as it
+    /// held, and each new one carries its own id — the way a scaling group's
+    /// membership changes when an instance is replaced rather than scaled away.
+    /// Everything else the environment is made of keeps its name.
+    pub fn replace_instances(&mut self) {
+        for instance in &mut self.instances {
+            *instance = ec2_resource_id(EC2_INSTANCE_ID_PREFIX);
+        }
+    }
+
     /// Bring this inventory in line with the configuration options the
     /// environment now carries, keeping every resource the new configuration
     /// still calls for under the name it was provisioned with.
@@ -5188,6 +5660,13 @@ pub struct Environment {
     /// were created in; this is, which is what `DescribeEnvironments` reports
     /// and pages in so two calls cannot disagree about the order.
     pub sequence: u64,
+    /// When the Amazon EC2 instances this environment runs now were launched:
+    /// its own launch, the last rebuild that recreated them, or the last
+    /// managed instance replacement that replaced them. The week a managed
+    /// instance replacement is due a week after
+    /// ([`MAINTENANCE_WINDOW_PERIOD`]) is counted from here, so a replacement
+    /// that has just run is not due again immediately.
+    pub instances_replaced_at: ::aws_smithy_types::DateTime,
 }
 
 impl Environment {
@@ -5211,6 +5690,50 @@ impl Environment {
             &self.region,
             self.tier.as_ref(),
             &self.option_settings,
+        ));
+        // The instances this environment runs were launched by this
+        // provisioning, so the week a managed replacement of them is due after
+        // starts here.
+        self.instances_replaced_at = now();
+    }
+
+    /// Replace the Amazon EC2 instances this environment runs, as a managed
+    /// instance replacement does, keeping every other resource it is made of:
+    /// the Auto Scaling group launches each instance again, so each one is a
+    /// new instance with its own id, and the week until the next replacement is
+    /// counted from `at`.
+    pub fn replace_instances(&mut self, at: ::aws_smithy_types::DateTime) {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.replace_instances();
+        }
+        self.instances_replaced_at = at;
+        self.date_updated = at;
+    }
+
+    /// Start the managed action `action_description` on this environment:
+    /// Elastic Beanstalk is now updating it ("Updating: Environment is in the
+    /// process of updating its configuration settings or application version"),
+    /// which is what a client polling the environment sees until the action
+    /// finishes, and the return to `Ready` is what the clock owes one
+    /// [`STATUS_TRANSITION_SPAN`] later — the same span the action's own
+    /// completion is due in, so the environment is available again exactly when
+    /// the action has been carried out.
+    ///
+    /// The update is NOT reported as abortable: `AbortableOperationInProgress`
+    /// covers the update a caller asked for, which `AbortEnvironmentUpdate`
+    /// cancels, and a managed action is the service's own maintenance.
+    ///
+    /// Health goes `Grey`/`Pending` for the duration, as the model documents for
+    /// an environment whose "health checks are suspended during an
+    /// UpdateEnvironment or RestartEnvironment request".
+    pub fn begin_managed_action(&mut self, request_id: &str, action_description: &str) {
+        self.status = STATUS_UPDATING.to_string();
+        self.health = HEALTH_GREY.to_string();
+        self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
+        self.date_updated = now();
+        self.pending_status = Some(PendingStatus::completion_to_ready(
+            request_id,
+            format!("{action_description} completed successfully."),
         ));
     }
 
@@ -5803,8 +6326,15 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// OLDEST first, in the append order the record's `sequence` records:
     /// `DescribeEnvironmentManagedActionHistory` reports one environment's
     /// slice of this log, newest first. See [`ManagedActionRecord`], which also
-    /// says why nothing appends to it.
+    /// says what appends to it.
     pub managed_action_history: Vec<ManagedActionRecord>,
+    /// The managed actions an `ApplyEnvironmentManagedAction` has started and
+    /// the clock has not finished yet, by `ActionId`:
+    /// `DescribeEnvironmentManagedActions` reports them as the environment's
+    /// in-progress actions, and each becomes a [`ManagedActionRecord`] when it
+    /// finishes. See [`AppliedManagedAction`]; an action nobody has applied is
+    /// DERIVED from the environment's configuration rather than held here.
+    pub applied_managed_actions: BTreeMap<String, AppliedManagedAction>,
     /// The Amazon S3 buckets `CreateStorageLocation` has created, by name — one
     /// per region an account has asked for one in. "If the storage location
     /// already exists, `CreateStorageLocation` still returns the bucket name but
@@ -5854,6 +6384,8 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             // No managed action has executed on any environment: see
             // `ManagedActionRecord`.
             managed_action_history: Vec::new(),
+            // And none is running: nothing has been applied.
+            applied_managed_actions: BTreeMap::new(),
             // No storage bucket until `CreateStorageLocation` creates one.
             storage_buckets: BTreeSet::new(),
             platform_branches: managed_platform_branch_catalog(),
@@ -5982,6 +6514,304 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             format!("{operation_name} is starting."),
             subject,
         );
+    }
+
+    /// What `DescribeEnvironmentManagedActions` reports for the environment
+    /// `environment_id` — "an environment's upcoming and in-progress managed
+    /// actions" — ordered by when their maintenance window opens.
+    ///
+    /// The in-progress ones are the actions a caller has applied and the clock
+    /// has not finished ([`AppliedManagedAction`]); the upcoming ones are the
+    /// actions the environment's configuration has due and nothing has carried
+    /// out yet ([`Self::due_managed_actions`]). An action that has FINISHED is
+    /// in the history instead — it is neither upcoming nor in progress — so it
+    /// is never reported here twice.
+    ///
+    /// The order is the window each action opens in, earliest first, with the
+    /// action type breaking a tie between two scheduled in the same window, so
+    /// the order is total and two calls cannot disagree about it.
+    pub fn upcoming_managed_actions(&self, environment_id: &str) -> Vec<ScheduledManagedAction> {
+        let mut actions: Vec<ScheduledManagedAction> = self
+            .applied_managed_actions
+            .values()
+            .filter(|applied| applied.action.environment_id == environment_id)
+            .map(|applied| applied.action.clone())
+            .collect();
+        for due in self.due_managed_actions(environment_id) {
+            let already_reported = actions
+                .iter()
+                .any(|action| action.action_id == due.action_id)
+                || self
+                    .managed_action_history
+                    .iter()
+                    .any(|record| record.action_id == due.action_id);
+            if !already_reported {
+                actions.push(due);
+            }
+        }
+        actions.sort_by(|left, right| {
+            instant_key(&left.window_start_time)
+                .cmp(&instant_key(&right.window_start_time))
+                .then_with(|| left.action_type.cmp(&right.action_type))
+        });
+        actions
+    }
+
+    /// The managed actions the environment `environment_id` has DUE: the
+    /// maintenance its managed-update configuration asks this service to
+    /// perform on it and that there is something to do.
+    ///
+    /// "`ManagedActionsEnabled`: enable managed platform updates" — an
+    /// environment whose configuration does not ask for them has no managed
+    /// action at all. One that does has a `PlatformUpdate` due while it runs a
+    /// release its platform branch has superseded and its `UpdateLevel` admits
+    /// that release ([`Self::available_platform_update`]), and an
+    /// `InstanceRefresh` due while "`InstanceRefreshEnabled`: enable weekly
+    /// instance replacement" is set, one period after the instances it runs now
+    /// were launched. Each is scheduled in the first maintenance window that
+    /// opens at or after the moment it comes due.
+    ///
+    /// A terminated environment runs nothing, so there is nothing left to
+    /// maintain and nothing is due for it.
+    fn due_managed_actions(&self, environment_id: &str) -> Vec<ScheduledManagedAction> {
+        let Some(environment) = self.environments.get(environment_id) else {
+            return Vec::new();
+        };
+        if environment.is_terminated() {
+            return Vec::new();
+        }
+        // The configuration IN FORCE on the environment, resolved the one way
+        // every read of it resolves ([`Self::resolved_configuration_settings`]),
+        // so the managed-update options read here are the ones
+        // `DescribeConfigurationSettings` reports for it.
+        let settings = self.resolved_configuration_settings(
+            &environment.region,
+            environment.solution_stack_name.as_deref(),
+            environment.platform_arn.as_deref(),
+            &environment.option_settings,
+        );
+        if option_value(
+            &settings,
+            NAMESPACE_MANAGED_ACTIONS,
+            OPTION_MANAGED_ACTIONS_ENABLED,
+        ) != Some(BOOLEAN_TRUE)
+        {
+            return Vec::new();
+        }
+        let window = maintenance_window(&settings);
+        let launched = environment.date_created.secs();
+        // The first window still TO COME: a window that opened at this very
+        // instant is one the service is running an action in now, not one an
+        // upcoming action waits for.
+        let next = now().secs().saturating_add(1);
+        let mut due = Vec::new();
+        if let Some(update) = self.available_platform_update(environment, &settings) {
+            due.push(ScheduledManagedAction::scheduled(
+                environment_id,
+                ACTION_TYPE_PLATFORM_UPDATE,
+                update.description(),
+                next_maintenance_window(window, launched, next),
+                // The release the update moves to is what makes this update the
+                // one that is due.
+                &update.to_version,
+                ManagedActionTarget::PlatformVersion {
+                    solution_stack_name: update.solution_stack_name,
+                    platform_arn: update.platform_arn,
+                },
+            ));
+        }
+        if option_value(
+            &settings,
+            NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE,
+            OPTION_INSTANCE_REFRESH_ENABLED,
+        ) == Some(BOOLEAN_TRUE)
+        {
+            // "Enable WEEKLY instance replacement": the replacement is due one
+            // period after the instances the environment runs now were
+            // launched, and then in the first window that opens.
+            let launched_instances = environment.instances_replaced_at.secs();
+            let replaceable = launched_instances
+                .saturating_add(MAINTENANCE_WINDOW_PERIOD)
+                .max(next);
+            due.push(ScheduledManagedAction::scheduled(
+                environment_id,
+                ACTION_TYPE_INSTANCE_REFRESH,
+                INSTANCE_REFRESH_DESCRIPTION.to_string(),
+                next_maintenance_window(window, launched, replaceable),
+                // The instances this replacement replaces are what make it the
+                // one that is due: the next replacement after it is the one due
+                // a period after the instances IT launches.
+                &launched_instances.to_string(),
+                ManagedActionTarget::InstanceReplacement,
+            ));
+        }
+        due
+    }
+
+    /// The managed platform update `environment` has available: the release its
+    /// platform branch publishes above the one the environment runs, when the
+    /// `UpdateLevel` its configuration `settings` state admits that release.
+    ///
+    /// Elastic Beanstalk publishes every release of a branch it has made, and
+    /// only the newest is the branch's recommended one
+    /// ([`SolutionStack::published_versions`]), so an environment running any
+    /// other release of its branch has an update available to the newest.
+    /// "`UpdateLevel`: the highest level of update to apply" then decides
+    /// whether this one is applied: `patch` admits only a release inside the
+    /// version line the environment already runs, `minor` admits any release of
+    /// the branch, and a configuration stating no level is held to neither.
+    ///
+    /// A CUSTOM platform version is published by no branch of this catalog, so
+    /// the service has no newer release of it to apply and no update is
+    /// available.
+    fn available_platform_update(
+        &self,
+        environment: &Environment,
+        settings: &[ConfigurationOptionSetting],
+    ) -> Option<AvailablePlatformUpdate> {
+        let running = named_platform_version(
+            &environment.region,
+            environment.solution_stack_name.as_deref(),
+            environment.platform_arn.as_deref(),
+        )?;
+        let current = running.stack.platform_version;
+        if running.platform_version == current {
+            return None;
+        }
+        let level = option_value(
+            settings,
+            NAMESPACE_MANAGED_ACTIONS_PLATFORM_UPDATE,
+            OPTION_UPDATE_LEVEL,
+        )
+        .filter(|level| !level.is_empty())
+        .unwrap_or(UPDATE_LEVEL_MINOR);
+        if level == UPDATE_LEVEL_PATCH && !is_patch_update(&running.platform_version, current) {
+            return None;
+        }
+        Some(AvailablePlatformUpdate {
+            from_version: running.platform_version.clone(),
+            to_version: current.to_string(),
+            // The two names of the release the update applies, derived the one
+            // way the catalog derives them, so the environment reports two
+            // names of the SAME version once the update has been carried out.
+            solution_stack_name: running.stack.name(),
+            platform_arn: running.stack.platform_arn(&environment.region),
+        })
+    }
+
+    /// Start the scheduled managed action `action` immediately — the write
+    /// `ApplyEnvironmentManagedAction` performs ("applies a scheduled managed
+    /// action immediately").
+    ///
+    /// The action moves from `Scheduled` to `Running` and the work it does is
+    /// due one [`STATUS_TRANSITION_SPAN`] later, when the clock carries it out
+    /// ([`Self::complete_due_managed_actions`]); the environment it maintains
+    /// reports that it is being updated until then.
+    pub fn apply_managed_action(
+        &mut self,
+        action: &ScheduledManagedAction,
+        request_id: &str,
+    ) -> AppliedManagedAction {
+        let mut running = action.clone();
+        running.status = ACTION_STATUS_RUNNING.to_string();
+        let applied = AppliedManagedAction {
+            action: running,
+            due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            due_date: due_date(),
+            executed_time: now(),
+            request_id: request_id.to_string(),
+        };
+        if let Some(environment) = self.environments.get_mut(&action.environment_id) {
+            environment.begin_managed_action(request_id, &action.action_description);
+        }
+        self.applied_managed_actions
+            .insert(action.action_id.clone(), applied.clone());
+        applied
+    }
+
+    /// The managed action `action_id` has become in the history, if it has
+    /// finished: the record of a managed action the clock has carried out on
+    /// the environment `environment_id`.
+    pub fn completed_managed_action(
+        &self,
+        environment_id: &str,
+        action_id: &str,
+    ) -> Option<&ManagedActionRecord> {
+        self.managed_action_history
+            .iter()
+            .find(|record| record.environment_id == environment_id && record.action_id == action_id)
+    }
+
+    /// Carry out every applied managed action the clock has finished by `at`:
+    /// the environment carries the change the action made, and the action
+    /// becomes the history record of a completed action.
+    ///
+    /// The action was due to finish at an instant that had passed whether or not
+    /// anybody called, so carrying it out here cannot show a caller a state the
+    /// clock had not already reached. The event the completion owes is recorded
+    /// by the environment's own return to `Ready`, which the same instant makes
+    /// due, so it is not recorded a second time here.
+    fn complete_due_managed_actions(&mut self, at: Instant) {
+        let finished: Vec<AppliedManagedAction> = self
+            .applied_managed_actions
+            .values()
+            .filter(|applied| applied.due_at <= at)
+            .cloned()
+            .collect();
+        for applied in finished {
+            self.applied_managed_actions
+                .remove(&applied.action.action_id);
+            match &applied.action.target {
+                ManagedActionTarget::PlatformVersion {
+                    solution_stack_name,
+                    platform_arn,
+                } => {
+                    if let Some(environment) =
+                        self.environments.get_mut(&applied.action.environment_id)
+                    {
+                        // "The highest level of update to APPLY": the update has
+                        // been applied, so the environment now runs the release
+                        // it moved to, under both of that release's names.
+                        environment.solution_stack_name = Some(solution_stack_name.clone());
+                        environment.platform_arn = Some(platform_arn.clone());
+                        environment.date_updated = applied.due_date;
+                    }
+                }
+                ManagedActionTarget::InstanceReplacement => {
+                    if let Some(environment) =
+                        self.environments.get_mut(&applied.action.environment_id)
+                    {
+                        environment.replace_instances(applied.due_date);
+                    }
+                }
+            }
+            let sequence = self.next_counter();
+            self.managed_action_history.push(applied.to_record(sequence));
+            self.evict_retired_managed_actions();
+        }
+    }
+
+    /// Hold the count bound on the managed-action history: past
+    /// [`MAX_RETAINED_MANAGED_ACTIONS`] the oldest-FINISHED record is dropped,
+    /// so a caller applying one action after another cannot grow the log without
+    /// bound. Oldest by the instant the record is ordered by, which is the order
+    /// `DescribeEnvironmentManagedActionHistory` reports and pages in, so the
+    /// record dropped is one that had already fallen off the end of the answer.
+    fn evict_retired_managed_actions(&mut self) {
+        while self.managed_action_history.len() > MAX_RETAINED_MANAGED_ACTIONS {
+            let oldest = self
+                .managed_action_history
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, record)| (record.history_instant(), record.sequence))
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) => {
+                    self.managed_action_history.remove(index);
+                }
+                None => break,
+            }
+        }
     }
 
     /// One environment's completed and failed managed actions, NEWEST first:
@@ -6270,11 +7100,12 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     }
 
     /// Materialise every change the clock has already made due — an
-    /// environment's status, a platform version's status, and an application
-    /// whose deletion has completed — record the event each completed change
-    /// owes, and drop the events the clock has carried out of the reporting
-    /// window. Every handler that reads or acts on one of them calls this first,
-    /// so no two of them disagree about what state the store is in.
+    /// environment's status, a platform version's status, an application whose
+    /// deletion has completed and a managed action that has finished — record
+    /// the event each completed change owes, and drop the events the clock has
+    /// carried out of the reporting window. Every handler that reads or acts on
+    /// one of them calls this first, so no two of them disagree about what state
+    /// the store is in.
     pub fn materialize_due_transitions(&mut self) {
         let at = Instant::now();
         self.materialize_due_application_deletions(at);
@@ -6296,6 +7127,11 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             );
         }
         self.expire_events();
+        // After the environments' own transitions, so a managed action and the
+        // environment's return to `Ready` — which the same instant makes due —
+        // are carried out in that order, and the environment reports the change
+        // the action made as soon as it is available again.
+        self.complete_due_managed_actions(at);
         for platform_version in self.platform_versions.values_mut() {
             platform_version.materialize_due(at);
         }

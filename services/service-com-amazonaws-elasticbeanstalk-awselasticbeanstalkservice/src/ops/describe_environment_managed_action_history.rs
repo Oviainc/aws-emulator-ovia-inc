@@ -12,13 +12,12 @@
 //!
 //! NOTE on what this emulator holds: a managed action is work the SERVICE schedules in
 //! an environment's maintenance window (a managed platform update, an instance
-//! refresh), and this emulator runs no such scheduler — which is why
-//! `ApplyEnvironmentManagedAction` refuses every `ActionId`, no action ever being
-//! `Scheduled`. So no action has executed on any environment this store holds, and this
-//! operation pages over `crate::state::ManagedActionRecord` rather than reporting an
-//! action nothing performed: for an environment whose history nothing recorded that is
-//! an empty page with no `NextToken`, which is also what AWS answers for an environment
-//! no managed action has run on yet.
+//! refresh). An action lands in the history when the clock has carried it out — the
+//! completion of an `ApplyEnvironmentManagedAction` — so this operation pages over
+//! `crate::state::ManagedActionRecord` rather than reporting an action nothing
+//! performed: for an environment whose history nothing recorded that is an empty page
+//! with no `NextToken`, which is also what AWS answers for an environment no managed
+//! action has run on yet.
 //!
 //! ## Shape of an operation
 //!

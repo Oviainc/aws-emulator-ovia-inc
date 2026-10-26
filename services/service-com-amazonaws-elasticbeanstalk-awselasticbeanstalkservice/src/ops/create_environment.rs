@@ -458,6 +458,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
             sequence,
+            // The launch provisions the instances below, which is when the week
+            // until a managed replacement of them is due starts; the field is
+            // dated with the launch so the record never carries no date at all.
+            instances_replaced_at: created,
             // Provisioned below, from the tier and the options this record now
             // carries, so the inventory is derived from the stored environment
             // rather than from the request a second time.

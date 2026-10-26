@@ -457,10 +457,12 @@ async fn an_associated_operations_role_is_what_every_later_read_reports() {
     );
 }
 
-/// RULE: ApplyEnvironmentManagedAction applies a SCHEDULED managed action, and
-/// this emulator schedules none, so no `ActionId` resolves to one and the call is
-/// refused with the modelled `ElasticBeanstalkServiceException` (400) rather than
-/// reporting an action nobody scheduled.
+/// RULE: ApplyEnvironmentManagedAction applies a SCHEDULED managed action, so an
+/// `ActionId` that names no managed action of the environment is refused with the
+/// modelled `ElasticBeanstalkServiceException` (400) rather than reporting an
+/// action nobody scheduled. The fixture environment asks for no managed updates
+/// (`aws:elasticbeanstalk:managedactions` / `ManagedActionsEnabled` defaults to
+/// `false`), so it has no managed action for any id to name.
 #[tokio::test]
 async fn applying_a_managed_action_nothing_scheduled_is_refused_not_invented() {
     let emulator = Emulator::new();

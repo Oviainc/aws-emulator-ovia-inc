@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplyEnvironmentManagedAction
-//! Implemented: resolves the target environment and the scheduled managed action the
-//! request names. This emulator schedules no managed actions — nothing in the store ever
-//! holds one — so an `ActionId` resolves to nothing and the call is refused with the
-//! modelled service exception rather than reporting an action nobody scheduled. This is
-//! the ONLY file to touch for this operation.
+//! Implemented: resolves the target environment and the managed action the request
+//! names among the ones `DescribeEnvironmentManagedActions` reports for it, and starts
+//! that action immediately — it moves to `Running` and the clock carries its work out,
+//! after which it is in the environment's managed-action history. An action in any
+//! other state is refused with the modelled invalid-state exception. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,25 +178,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::missing_environment_message(Some(environment_id.as_str()), None),
             )
         })?;
+        let environment_name = environment.environment_name.clone();
+        let subject = environment.event_subject();
 
         // "Applies a scheduled managed action immediately. A managed action can
         // be applied only if its status is Scheduled. Get the status and action
-        // ID of a managed action with DescribeEnvironmentManagedActions." This
-        // emulator runs no managed-action scheduler — no platform update or
-        // instance refresh is ever scheduled against an environment — so no
-        // `ActionId` names a scheduled action, and the generic modelled service
-        // exception says exactly that instead of reporting an action that was
-        // never scheduled and nothing applied.
-        Err(
-            ApplyEnvironmentManagedActionErrorModeled::ElasticBeanstalkServiceException(
-                ElasticBeanstalkServiceException {
-                    message: Some(format!(
-                        "No scheduled managed action with ActionId = '{}' exists for environment {}.",
-                        input.action_id, environment.environment_name
-                    )),
-                },
-            )
-            .into(),
-        )
+        // ID of a managed action with DescribeEnvironmentManagedActions." So the
+        // action is resolved among exactly the ones that operation reports for
+        // this environment, and only a `Scheduled` one is applied: one already
+        // running, and one the service has already carried out, are both in a
+        // state the action cannot be moved out of, which is what the modelled
+        // `ManagedActionInvalidStateException` says.
+        let action = store
+            .upcoming_managed_actions(&environment_id)
+            .into_iter()
+            .find(|action| action.action_id == input.action_id);
+        let Some(action) = action else {
+            if store
+                .completed_managed_action(&environment_id, &input.action_id)
+                .is_some()
+            {
+                return Err(managed_action_invalid_state());
+            }
+            // No action of this environment answers to the id at all: there is
+            // nothing to apply, and the generic modelled service exception says
+            // so rather than reporting an action nobody scheduled.
+            return Err(
+                ApplyEnvironmentManagedActionErrorModeled::ElasticBeanstalkServiceException(
+                    ElasticBeanstalkServiceException {
+                        message: Some(format!(
+                            "No managed action with ActionId = '{}' exists for environment {environment_name}.",
+                            input.action_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if action.status != crate::state::ACTION_STATUS_SCHEDULED {
+            return Err(managed_action_invalid_state());
+        }
+
+        // Every event this call records belongs to this one request's activity;
+        // the event the action's completion owes is recorded when the clock
+        // makes that completion due.
+        let request_id = crate::state::new_request_id();
+        store.apply_managed_action(&action, &request_id);
+        store.record_activity_start(
+            &request_id,
+            APPLY_ENVIRONMENT_MANAGED_ACTION_ACTIVITY,
+            subject,
+        );
+
+        // The action as it stands at the moment this call applied it: the same
+        // id, type and description it was reported under, and the `Scheduled`
+        // status it still carries — the call has brought the action forward to
+        // run immediately, it has not run it. That is what the real service
+        // answers here, so the status reported is deliberately NOT the one the
+        // action carries from now on: the service is carrying it out from here,
+        // which `DescribeEnvironmentManagedActions` reports as `Running` until
+        // it is done.
+        Ok(ApplyEnvironmentManagedActionOutput {
+            action_id: Some(action.action_id),
+            action_description: Some(action.action_description),
+            action_type: Some(action.action_type),
+            status: Some(action.status),
+        })
     }
+}
+
+/// The operation name this call's events are recorded under — the lower
+/// camel case form this service's event log names an operation in.
+const APPLY_ENVIRONMENT_MANAGED_ACTION_ACTIVITY: &str = "applyEnvironmentManagedAction";
+
+/// The refusal of an action that is not `Scheduled` any more: the one this
+/// emulator ever has to answer, since an action is applied, running or already
+/// carried out — "ManagedActionInvalidStateException: Cannot modify the managed
+/// action in its current state".
+///
+/// The sentence is the service's own for that exception, and it carries no
+/// variable part: it names the three states an action cannot be applied out of
+/// rather than the one it is in.
+fn managed_action_invalid_state() -> ApplyEnvironmentManagedActionError {
+    ApplyEnvironmentManagedActionErrorModeled::ManagedActionInvalidStateException(
+        ManagedActionInvalidStateException {
+            message: Some(
+                "Managed action is scheduled to execute imminently, is going to be retried, or \
+                 is already running"
+                    .to_string(),
+            ),
+        },
+    )
+    .into()
 }
