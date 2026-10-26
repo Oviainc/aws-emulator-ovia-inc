@@ -3717,6 +3717,238 @@ fn object_size_matches(size: i64, greater_than: Option<i64>, less_than: Option<i
         && less_than.is_none_or(|maximum| size < maximum)
 }
 
+/// The `TableStatus` a metadata table carries while it is still being created:
+/// "`CREATING` - The journal table is in the process of being created in the specified
+/// table bucket" (`smithy_query(query="doc",shape="JournalTableConfigurationResult",
+/// member="TableStatus")`).
+pub const METADATA_TABLE_STATUS_CREATING: &str = "CREATING";
+
+/// The `TableStatus` a metadata table carries once it is in service: "`ACTIVE` - The
+/// journal table has been created successfully, and records are being delivered to the
+/// table" (same member's documentation). The third value that member publishes, `FAILED`,
+/// is the one this emulator never reports: nothing here fails to create a table.
+pub const METADATA_TABLE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long after the call that asked for it a metadata table reaches
+/// [`METADATA_TABLE_STATUS_ACTIVE`] in this emulator.
+///
+/// A CHOSEN span, not an AWS-documented duration: what IS faithful is that the table is
+/// NOT in service when the create returns — the status member publishes a transient
+/// `CREATING` value for exactly that window — so a caller reading the configuration
+/// straight after the create still observes `CREATING`, as it would against AWS. The
+/// instant it falls due is stored ([`MetadataTable::active_at`]) and nothing sleeps for
+/// it, the way [`RESTORE_COMPLETION_DELAY`] is handled.
+pub const METADATA_TABLE_ACTIVATION_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// `DestinationResult$TableBucketType` of a bucket's metadata configuration: "V2 metadata
+/// configurations are stored in Amazon Web Services managed table buckets"
+/// (`smithy_query(query="doc",shape="DestinationResult",member="TableBucketType")`), and
+/// `aws` is the value that "indicates an Amazon Web Services managed table bucket". One of
+/// `S3TablesBucketType`'s own two values.
+pub const METADATA_TABLE_BUCKET_TYPE: &str = "aws";
+
+/// The name of the Amazon Web Services managed table bucket this emulator reports a
+/// metadata configuration's tables as stored in.
+///
+/// ONE managed bucket per Region, shared by every configuration, which is what the `aws`
+/// bucket type means: the caller names no table bucket on a V2 create and AWS does not
+/// publish the managed bucket's name, so this is the name this emulator reports. It
+/// satisfies the form every S3 Tables operation accepts for a table bucket
+/// (`[a-z0-9_-]{3,63}`, from the `TableBucketARN` pattern those requests publish).
+///
+/// REPORTED-ONLY: no table bucket is created in the `s3tables` emulator behind this ARN,
+/// so a caller cannot follow it into that service and find one. The bucket is that
+/// service's resource and this service owns no part of its state, so the ARN names where
+/// the metadata tables WOULD live — which is all `GetBucketMetadataConfiguration` reports
+/// about them.
+pub const METADATA_TABLE_BUCKET_NAME: &str = "aws-s3";
+
+/// The namespace inside that table bucket a bucket's metadata tables live in — "the
+/// namespace in the table bucket where the metadata tables for a metadata configuration
+/// are stored" (`smithy_query(query="doc",shape="DestinationResult",
+/// member="TableNamespace")`), which S3 Metadata names `aws_s3_metadata`.
+pub const METADATA_TABLE_NAMESPACE: &str = "aws_s3_metadata";
+
+/// The service namespace of a metadata table's (and its table bucket's) ARN, so one reads
+/// `arn:aws:s3tables:<region>:<account>:bucket/<bucket>` and a table's
+/// `…:bucket/<bucket>/table/<table>` — the two forms every S3 Tables request publishes a
+/// pattern for.
+const METADATA_TABLE_ARN_SERVICE: &str = "s3tables";
+
+/// What a metadata table's name ends in, per table: the journal table, the inventory
+/// table and the annotation table of one general purpose bucket are three tables in one
+/// namespace, so the suffix is what tells them apart.
+pub const METADATA_JOURNAL_TABLE_SUFFIX: &str = "_journal";
+/// See [`METADATA_JOURNAL_TABLE_SUFFIX`].
+pub const METADATA_INVENTORY_TABLE_SUFFIX: &str = "_inventory";
+/// See [`METADATA_JOURNAL_TABLE_SUFFIX`].
+pub const METADATA_ANNOTATION_TABLE_SUFFIX: &str = "_annotation";
+
+/// The `ConfigurationState` value that asks for a table to be created, for both the
+/// inventory table (`InventoryConfigurationState`) and the annotation table
+/// (`AnnotationConfigurationState`) — each enum publishes `ENABLED` and `DISABLED`
+/// (`smithy_query(query="shape",shape="InventoryConfigurationState,AnnotationConfigurationState")`).
+pub const METADATA_CONFIGURATION_STATE_ENABLED: &str = "ENABLED";
+
+/// The `TableSseAlgorithm` value that encrypts a metadata table with a Key Management
+/// Service key, and so the one value that needs a key ARN beside it: the other value that
+/// enum publishes, `AES256`, is S3 managed encryption and takes none
+/// (`smithy_query(query="shape",shape="TableSseAlgorithm")`).
+pub const METADATA_TABLE_SSE_KMS_ALGORITHM: &str = "aws:kms";
+
+/// The fewest days journal table records may be retained for: "Journal table records must
+/// be retained for a minimum of 7 days. To set this value, specify any whole number from
+/// `7` to `2147483647`" (`smithy_query(query="doc",shape="RecordExpiration",
+/// member="Days")`).
+pub const MIN_METADATA_RECORD_EXPIRATION_DAYS: i32 = 7;
+
+/// The most days journal table records may be retained for — the upper end of the same
+/// published range.
+pub const MAX_METADATA_RECORD_EXPIRATION_DAYS: i32 = 2_147_483_647;
+
+/// The longest IAM role ARN this emulator records for an annotation table.
+///
+/// An emulator resource guard, NOT an AWS quota: `Role` is "The ARN of the IAM role used
+/// to manage the annotation table" (`AnnotationTableConfiguration$Role`) and the model
+/// bounds its length at neither end, so this is what keeps the one caller-supplied string
+/// a metadata configuration retains from growing without limit. 2048 is the longest ARN
+/// AWS accepts anywhere in an IAM request.
+pub const MAX_METADATA_TABLE_ROLE_CHARS: usize = 2048;
+
+/// One table of a bucket's S3 Metadata configuration: its name, and when it falls due to
+/// be in service.
+///
+/// Nothing here is table CONTENT: the Iceberg table itself is an S3 Tables resource this
+/// service owns no part of. What is recorded is what every reader of the configuration
+/// reports about the table — the name S3 created it under and the status it is in
+/// ([`Self::status_at`]).
+#[derive(Debug, Clone)]
+pub struct MetadataTable {
+    /// The table's name in [`METADATA_TABLE_NAMESPACE`], as
+    /// [`metadata_table_name`] derived it from the general purpose bucket's name.
+    pub name: String,
+    /// When the table falls due to be in service — the instant it stops being reported as
+    /// `CREATING`, [`METADATA_TABLE_ACTIVATION_DELAY`] after the call that asked for it.
+    pub active_at: SystemTime,
+}
+
+impl MetadataTable {
+    /// The table `name`, as the call that asked for it at `created_at` records it: being
+    /// created now, in service a span later.
+    pub fn creating(name: String, created_at: SystemTime) -> Self {
+        Self {
+            name,
+            active_at: created_at + METADATA_TABLE_ACTIVATION_DELAY,
+        }
+    }
+
+    /// The `TableStatus` the table is in at `instant`: being created until it falls due,
+    /// in service from then on.
+    pub fn status_at(&self, instant: SystemTime) -> &'static str {
+        if instant < self.active_at {
+            METADATA_TABLE_STATUS_CREATING
+        } else {
+            METADATA_TABLE_STATUS_ACTIVE
+        }
+    }
+}
+
+/// One of the OPTIONAL tables of a metadata configuration — the inventory table or the
+/// annotation table — as the configuration names it.
+///
+/// The state is what the request carried, and the TABLE is there exactly when that state
+/// is [`METADATA_CONFIGURATION_STATE_ENABLED`]: a disabled table is a configuration with
+/// no table behind it, which is why `InventoryTableConfigurationResult` requires its
+/// `ConfigurationState` and leaves its `TableStatus`, `TableName` and `TableArn` optional
+/// (`smithy_query(query="shape",shape="InventoryTableConfigurationResult")`).
+///
+/// ONE type for both, because both are the same record: a state, the table it has while
+/// that state is enabled, and — for the annotation table alone — the IAM role that
+/// manages it (`AnnotationTableConfiguration$Role`; the inventory table has no such
+/// member, so its `role` is always `None`).
+#[derive(Debug, Clone)]
+pub struct MetadataTableConfiguration {
+    /// The `ConfigurationState` the request named for this table.
+    pub configuration_state: String,
+    /// The table itself, or `None` while the state above is not enabled.
+    pub table: Option<MetadataTable>,
+    /// "The ARN of the IAM role used to manage the annotation table"
+    /// (`AnnotationTableConfiguration$Role`), for the annotation table and nothing else.
+    pub role: Option<String>,
+}
+
+/// The S3 Metadata configuration a general purpose bucket carries, as
+/// `CreateBucketMetadataConfiguration` recorded it.
+///
+/// A bucket carries at most one: the create "creates an S3 Metadata V2 metadata
+/// configuration for a general purpose bucket" (that operation's own documentation) and
+/// every other operation on it names only the bucket, so this lives behind an `Option` on
+/// [`Bucket`] and a second create while one is there is refused rather than recorded.
+///
+/// The JOURNAL table is not optional, because `MetadataConfiguration$JournalTableConfiguration`
+/// is a required member: a configuration always has one, and the inventory and annotation
+/// tables are there only when the create named them.
+#[derive(Debug, Clone)]
+pub struct BucketMetadataConfiguration {
+    /// The journal table, which every configuration has.
+    pub journal: MetadataTable,
+    /// "The journal table record expiration settings for the journal table"
+    /// (`JournalTableConfiguration$RecordExpiration`), stored as the modelled container
+    /// the request carried — the way [`Bucket::replication`] keeps its own — so a reader
+    /// reports the settings the bucket actually carries rather than a re-derived copy.
+    pub journal_record_expiration: crate::ops::types::RecordExpiration,
+    /// The inventory table configuration, or `None` when the create named none.
+    pub inventory: Option<MetadataTableConfiguration>,
+    /// The annotation table configuration, or `None` when the create named none.
+    pub annotation: Option<MetadataTableConfiguration>,
+}
+
+/// The name of one metadata table of the general purpose bucket `bucket`: its name, folded
+/// to the character set an S3 Tables table name is written in, and `suffix` naming which of
+/// the configuration's tables it is.
+///
+/// A general purpose bucket's name may carry dots and hyphens, which a table name may not
+/// (every S3 Tables request publishes `[a-zA-Z0-9-_]{1,255}` for the table portion of a
+/// table ARN, and S3 Tables table names are written in lowercase letters, digits and
+/// underscores), so each character outside that set becomes an underscore. Derived from the
+/// bucket's own name rather than minted, so the table a reader reports for one bucket is
+/// the same on every read and two buckets never share a table.
+pub fn metadata_table_name(bucket: &str, suffix: &str) -> String {
+    let stem: String = bucket
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{stem}{suffix}")
+}
+
+/// The ARN of the managed table bucket a metadata configuration's tables live in, in
+/// `region` — see [`METADATA_TABLE_BUCKET_NAME`] for what it does and does not claim.
+pub fn metadata_table_bucket_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        METADATA_TABLE_ARN_SERVICE,
+        region,
+        &format!("bucket/{METADATA_TABLE_BUCKET_NAME}"),
+    )
+}
+
+/// The ARN of the metadata table `table` in `region`: the table bucket's own ARN above with
+/// the table's name appended, which is the form every S3 Tables request publishes for a
+/// table ARN.
+pub fn metadata_table_arn(region: &str, table: &str) -> String {
+    ::engine::emulator_arn(
+        METADATA_TABLE_ARN_SERVICE,
+        region,
+        &format!("bucket/{METADATA_TABLE_BUCKET_NAME}/table/{table}"),
+    )
+}
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -4078,6 +4310,16 @@ pub struct Bucket {
     /// [`ComAmazonawsS3Amazons3State::create_multipart_upload`], which is the only place
     /// that sees the ceilings an in-progress upload counts against.
     multipart_uploads: BTreeMap<String, MultipartUpload>,
+    /// The bucket's S3 Metadata configuration, as `CreateBucketMetadataConfiguration`
+    /// recorded it, or `None` while the bucket carries none — the state a bucket is
+    /// created in, and what makes `GetBucketMetadataConfiguration` answer
+    /// [`NO_SUCH_CONFIGURATION_CODE`] until a create records one.
+    ///
+    /// At most one, so a value rather than a map: see [`BucketMetadataConfiguration`].
+    ///
+    /// Private, like `tags` and `encryption`, so the accessor pair below is the only way
+    /// in or out.
+    metadata_configuration: Option<BucketMetadataConfiguration>,
 }
 
 impl Bucket {
@@ -4439,6 +4681,22 @@ impl Bucket {
     /// associated with it.
     pub fn replication(&self) -> Option<&crate::ops::types::ReplicationConfiguration> {
         self.replication.as_ref()
+    }
+
+    /// The bucket's S3 Metadata configuration, or `None` while it carries none — in which
+    /// case a read of it answers [`NO_SUCH_CONFIGURATION_CODE`].
+    pub fn metadata_configuration(&self) -> Option<&BucketMetadataConfiguration> {
+        self.metadata_configuration.as_ref()
+    }
+
+    /// Associate `configuration` with the bucket as its whole S3 Metadata configuration.
+    ///
+    /// The caller decides whether the bucket may take one: a bucket already carrying a
+    /// metadata configuration is one `CreateBucketMetadataConfiguration` refuses rather
+    /// than overwrites, so this is reached only once per configuration — with
+    /// `GetBucketMetadataConfiguration` reporting it from then on.
+    pub fn set_metadata_configuration(&mut self, configuration: BucketMetadataConfiguration) {
+        self.metadata_configuration = Some(configuration);
     }
 
     /// Associate `configuration` with the bucket as its whole replication configuration.
@@ -7849,6 +8107,21 @@ pub const NO_SUCH_CONFIGURATION_MESSAGE: &str = "The specified configuration doe
 /// The HTTP status [`NO_SUCH_CONFIGURATION_CODE`] is rendered with: 404, from the same
 /// list.
 pub const NO_SUCH_CONFIGURATION_STATUS: u16 = 404;
+
+/// The code S3 answers a `CreateBucketMetadataConfiguration` for a bucket that already
+/// carries one: the create cannot be carried out because the resource it would create is
+/// already there, and the code names that condition.
+///
+/// AWS's text for it is fixed, with nothing from the request in it:
+/// [`METADATA_CONFIGURATION_ALREADY_EXISTS_MESSAGE`].
+pub const METADATA_CONFIGURATION_ALREADY_EXISTS_CODE: &str = "MetadataConfigurationAlreadyExists";
+/// See [`METADATA_CONFIGURATION_ALREADY_EXISTS_CODE`] — the text S3 sends for that code.
+pub const METADATA_CONFIGURATION_ALREADY_EXISTS_MESSAGE: &str =
+    "The metadata configuration already exists";
+/// The HTTP status [`METADATA_CONFIGURATION_ALREADY_EXISTS_CODE`] is rendered with: 409
+/// Conflict, the status S3 renders every "the resource is already there" code with
+/// (`BucketAlreadyExists` and `BucketAlreadyOwnedByYou` carry the same one).
+pub const METADATA_CONFIGURATION_ALREADY_EXISTS_STATUS: u16 = 409;
 
 /// What [`Bucket::put_metrics_configuration`] or [`Bucket::put_analytics_configuration`]
 /// did, so the caller answers each outcome without re-deriving it — and cannot reach the
