@@ -164,40 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The token is this service's own: the creation-order position the next page
-        // starts after. Anything else never came from here.
-        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
-            None => 0u64,
-            Some(token) => token.parse::<u64>().map_err(|_| {
-                ListApprovalTeamsError::Modeled(ListApprovalTeamsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: "NextToken is not a token this service issued.".to_string(),
-                    },
-                ))
-            })?,
-        };
-        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
-        // validator has already closed it; the clamp only keeps the slice width sane.
-        let page_size = usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE))
-            .unwrap_or(1);
-
+        // The page and the token are the service's one seq-token paging rule
+        // ([`crate::state::page_by_seq_token`]): the token is the creation-order position
+        // the next page starts after, and anything else never came from here.
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        let ordered = state.teams_in_creation_order();
-        let remaining: Vec<&crate::state::ApprovalTeam> = ordered
-            .into_iter()
-            .filter(|team| team.seq > after)
-            .collect();
-        let page = &remaining[..remaining.len().min(page_size)];
-        let next_token = page
-            .last()
-            .filter(|_| remaining.len() > page.len())
-            .map(|team| team.seq.to_string());
+        let page = crate::state::page_by_seq_token(
+            state.teams_in_creation_order(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListApprovalTeamsErrorModeled::ValidationException)?;
 
         Ok(ListApprovalTeamsOutput {
-            approval_teams: Some(page.iter().copied().map(summary).collect()),
-            next_token,
+            approval_teams: Some(page.records.iter().copied().map(summary).collect()),
+            next_token: page.next_token,
         })
     }
 }

@@ -196,16 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0usize,
             Some(token) => token.parse::<usize>().map_err(|_| {
                 ListResourcePoliciesError::Modeled(
-                    ListResourcePoliciesErrorModeled::ValidationException(ValidationException {
-                        message: "NextToken is not a token this service issued.".to_string(),
-                    }),
+                    ListResourcePoliciesErrorModeled::ValidationException(
+                        crate::state::foreign_next_token(),
+                    ),
                 )
             })?,
         };
-        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
-        // validator has already closed it; the clamp only keeps the slice width sane.
-        let page_size =
-            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+        // The width one `MaxResults` asks for, from the one place this service decides it
+        // ([`crate::state::list_page_size`]).
+        let page_size = crate::state::list_page_size(input.max_results);
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListResourcePoliciesError::Modeled(

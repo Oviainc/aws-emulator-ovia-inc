@@ -222,17 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let predicates = compile_filters(input.filters.as_deref().unwrap_or_default())?;
 
         // The token is this service's own: the initiation-order position the next page
-        // starts after. Anything else never came from here.
-        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
-            None => 0u64,
-            Some(token) => token.parse::<u64>().map_err(|_| {
-                validation("NextToken is not a token this service issued.".to_string())
-            })?,
-        };
-        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
-        // validator has already closed it; the clamp only keeps the slice width sane.
-        let page_size =
-            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+        // starts after, read by the one token reader this service's listings share
+        // ([`crate::state::seq_token_position`]). It is read HERE, with the request's
+        // other shape, so a token this service did not issue is refused before the team
+        // is resolved.
+        let after = crate::state::seq_token_position(input.next_token.as_deref())
+            .map_err(ListSessionsErrorModeled::ValidationException)?;
 
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
@@ -247,25 +242,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let remaining: Vec<&crate::state::Session> = state
+        // The sessions this request asks for, in initiation order, cut into a page by
+        // the one paging rule this service's record listings share.
+        let matching = state
             .team_sessions_in_initiation_order(&input.approval_team_arn)
             .into_iter()
-            .filter(|session| session.seq > after)
             .filter(|session| {
                 predicates
                     .iter()
                     .all(|predicate| predicate.matches(session))
-            })
-            .collect();
-        let page = &remaining[..remaining.len().min(page_size)];
-        let next_token = page
-            .last()
-            .filter(|_| remaining.len() > page.len())
-            .map(|session| session.seq.to_string());
+            });
+        let page = crate::state::page_after_seq(matching, after, input.max_results);
 
         Ok(ListSessionsOutput {
-            sessions: Some(page.iter().copied().map(entry).collect()),
-            next_token,
+            sessions: Some(page.records.iter().copied().map(entry).collect()),
+            next_token: page.next_token,
         })
     }
 }

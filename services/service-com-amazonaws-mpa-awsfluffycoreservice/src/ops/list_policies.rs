@@ -172,10 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
-        // validator has already closed it; the clamp only keeps the slice width sane.
-        let page_size =
-            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+        // The width one `MaxResults` asks for, from the one place this service decides it
+        // ([`crate::state::list_page_size`]).
+        let page_size = crate::state::list_page_size(input.max_results);
 
         let state = store.lock();
 
@@ -185,9 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) if state.policy(token).is_some() => Some(token),
             Some(_) => {
-                return Err(ListPoliciesErrorModeled::ValidationException(ValidationException {
-                    message: "NextToken is not a token this service issued.".to_string(),
-                })
+                return Err(ListPoliciesErrorModeled::ValidationException(
+                    crate::state::foreign_next_token(),
+                )
                 .into())
             }
         };

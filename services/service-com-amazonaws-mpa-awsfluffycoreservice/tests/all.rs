@@ -55,6 +55,8 @@ mod resource_arn_reads;
 mod resource_policies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/seq_token_pagination.rs"]
+mod seq_token_pagination;
 #[path = "all/session_cancellation.rs"]
 mod session_cancellation;
 #[path = "all/session_listing.rs"]

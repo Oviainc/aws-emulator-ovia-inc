@@ -116,6 +116,18 @@
 //! immutable as the policy that owns it — nothing in this model mints or retires one — so
 //! no reader of the catalog writes to it.
 //!
+//! # Paging a listing
+//!
+//! Every paginated listing of this service pages the same way, so the rule lives here
+//! rather than once per handler: [`list_page_size`] is the width one `MaxResults` asks
+//! for, and [`page_by_seq_token`] is the whole seq-token rule the RECORD listings
+//! (`ListApprovalTeams`, `ListIdentitySources`, `ListSessions`) share — the token is the
+//! position ([`SeqOrdered`]) of the last record the previous page reported, the page is
+//! the records ordered after it, and the next token is the last of them while records
+//! remain ([`SeqPage`]). The catalog listings page over a key the catalog itself orders
+//! (a policy ARN, a version id) and so carry their own token, but take their page width
+//! from [`list_page_size`] too.
+//!
 //! # Authorization
 //!
 //! This module also owns this service's authorization rules, so every handler states
@@ -144,6 +156,8 @@
 //!   ([`is_malformed_arn_violation`]) for the members it does.
 //! * [`reserved_tag_key`] — the one message every path that WRITES tags refuses a key in
 //!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]).
+//! * [`foreign_next_token`] / [`FOREIGN_NEXT_TOKEN_MESSAGE`] — the one message every
+//!   paginated listing refuses a `NextToken` it did not issue with.
 //! * [`unattachable_policy`] — the one message a policy reference the catalog cannot
 //!   resolve is refused with
 //!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]).
@@ -307,6 +321,114 @@ pub const MAX_IDENTITY_SOURCES: usize = 20;
 /// modelled `range(min: 1, max: 20)` / `default: 20` — the same shape every one of them
 /// binds (`ListApprovalTeams`, `ListPolicies`, …).
 pub const MAX_LIST_PAGE: i32 = 20;
+
+/// Width of one page, from the `MaxResults` the request carries.
+///
+/// `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary validator
+/// has already closed it; the clamp only keeps the slice width sane. Every paginated
+/// listing of this service takes its page width from here, so none of them can disagree
+/// about what a given `MaxResults` means.
+#[must_use]
+pub fn list_page_size(max_results: i32) -> usize {
+    usize::try_from(max_results.clamp(1, MAX_LIST_PAGE)).unwrap_or(1)
+}
+
+/// A record a listing pages over in SEQUENCE order: the stable position this store gave
+/// the record when it was written, which is also the `NextToken` the listing hands back.
+pub trait SeqOrdered {
+    /// This record's position in the order its listing reports.
+    fn seq(&self) -> u64;
+}
+
+impl SeqOrdered for ApprovalTeam {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl SeqOrdered for IdentitySource {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl SeqOrdered for Session {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// One page of a seq-token listing: the records it reports, and the token the NEXT page
+/// resumes after — absent once nothing is left, which is how a client knows the listing
+/// is over.
+#[derive(Debug)]
+pub struct SeqPage<'a, T> {
+    /// The records this page reports, in the order `ordered` held them.
+    pub records: Vec<&'a T>,
+    /// `NextToken`: the position of the last record on this page, when records remain.
+    pub next_token: Option<String>,
+}
+
+/// The position a seq-token listing resumes AFTER, read out of the request's `NextToken`.
+///
+/// This is the ONE place the token grammar of this service's record listings lives: an
+/// absent or empty token starts at the beginning, and any other token is the decimal
+/// position a page of this service handed out. A token that is not one is refused with
+/// [`foreign_next_token`]; the caller lifts that into its own operation's
+/// `ValidationException` (400).
+pub fn seq_token_position(next_token: Option<&str>) -> Result<u64, ValidationException> {
+    match next_token.filter(|token| !token.is_empty()) {
+        None => Ok(0),
+        Some(token) => token.parse::<u64>().map_err(|_| foreign_next_token()),
+    }
+}
+
+/// One page of `ordered`, resuming after the position `after` names.
+///
+/// This is the ONE place the page of a seq-token listing is cut, so the slice width and
+/// the next-token condition cannot drift between the listings: `ordered` is the records
+/// in the order the listing reports them, the page is the records ordered after `after`,
+/// at most [`list_page_size`] of them, and the token for the page after is the position
+/// of the last record reported — absent once the page reached the end of `ordered`,
+/// which is how a client knows the listing is over.
+pub fn page_after_seq<'a, T, I>(ordered: I, after: u64, max_results: i32) -> SeqPage<'a, T>
+where
+    T: SeqOrdered + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    let page_size = list_page_size(max_results);
+    let mut records: Vec<&'a T> = ordered
+        .into_iter()
+        .filter(|record| record.seq() > after)
+        .collect();
+    let more_remain = records.len() > page_size;
+    records.truncate(page_size);
+    let next_token = records
+        .last()
+        .filter(|_| more_remain)
+        .map(|record| record.seq().to_string());
+    SeqPage {
+        records,
+        next_token,
+    }
+}
+
+/// One page of `ordered`, the page width and the resume position read off the request's
+/// `MaxResults` and `NextToken`: [`seq_token_position`] then [`page_after_seq`], the
+/// whole seq-token paging rule in one call for a listing that decides nothing between
+/// reading the token and cutting the page.
+pub fn page_by_seq_token<'a, T, I>(
+    ordered: I,
+    next_token: Option<&str>,
+    max_results: i32,
+) -> Result<SeqPage<'a, T>, ValidationException>
+where
+    T: SeqOrdered + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    let after = seq_token_position(next_token)?;
+    Ok(page_after_seq(ordered, after, max_results))
+}
 
 /// Largest number of tags one resource holds.
 ///
@@ -2802,6 +2924,24 @@ pub const INVALID_ARN_MESSAGE: &str = "Invalid Resource Arn";
 pub fn invalid_arn() -> ValidationException {
     ValidationException {
         message: INVALID_ARN_MESSAGE.to_string(),
+    }
+}
+
+/// The one message this service refuses a `NextToken` it did not issue with.
+///
+/// `ValidationException$Message` is `@required` and the model fixes no text for it, so
+/// the rule is RECORDED behaviour: every paginated listing of this service answers one
+/// and the same sentence for a token it cannot read as a position of its own, naming
+/// neither the operation nor the value supplied — the pagination-token class is one
+/// service-level rule.
+pub const FOREIGN_NEXT_TOKEN_MESSAGE: &str = "NextToken is not a token this service issued.";
+
+/// The `ValidationException` (400) a `NextToken` no page of this service handed out is
+/// refused with: [`FOREIGN_NEXT_TOKEN_MESSAGE`].
+#[must_use]
+pub fn foreign_next_token() -> ValidationException {
+    ValidationException {
+        message: FOREIGN_NEXT_TOKEN_MESSAGE.to_string(),
     }
 }
 

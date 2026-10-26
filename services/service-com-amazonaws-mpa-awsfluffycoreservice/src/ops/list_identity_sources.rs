@@ -171,40 +171,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The token is this service's own: the creation-order position the next page
-        // starts after. Anything else never came from here.
-        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
-            None => 0u64,
-            Some(token) => token.parse::<u64>().map_err(|_| {
-                ListIdentitySourcesError::Modeled(
-                    ListIdentitySourcesErrorModeled::ValidationException(ValidationException {
-                        message: "NextToken is not a token this service issued.".to_string(),
-                    }),
-                )
-            })?,
-        };
-        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
-        // validator has already closed it; the clamp only keeps the slice width sane.
-        let page_size =
-            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
-
+        // The page and the token are the service's one seq-token paging rule
+        // ([`crate::state::page_by_seq_token`]): the token is the creation-order position
+        // the next page starts after, and anything else never came from here.
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        let ordered = state.identity_sources_in_creation_order();
-        let remaining: Vec<&crate::state::IdentitySource> = ordered
-            .into_iter()
-            .filter(|source| source.seq > after)
-            .collect();
-        let page = &remaining[..remaining.len().min(page_size)];
-        let next_token = page
-            .last()
-            .filter(|_| remaining.len() > page.len())
-            .map(|source| source.seq.to_string());
+        let page = crate::state::page_by_seq_token(
+            state.identity_sources_in_creation_order(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListIdentitySourcesErrorModeled::ValidationException)?;
 
         Ok(ListIdentitySourcesOutput {
-            identity_sources: Some(page.iter().copied().map(summary).collect()),
-            next_token,
+            identity_sources: Some(page.records.iter().copied().map(summary).collect()),
+            next_token: page.next_token,
         })
     }
 }
