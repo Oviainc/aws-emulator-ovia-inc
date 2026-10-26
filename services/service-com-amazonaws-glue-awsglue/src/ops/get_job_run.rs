@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or over-long one is refused at the boundary: reaching here, the only question
         // is whether THIS Region holds that job and that job holds that run.
         let Some(job) = store.job_mut(&region, &input.job_name) else {
-            return Err(not_found(format!("Job {} not found", input.job_name)));
+            return Err(not_found(crate::state::messages::job_not_found(
+                &input.job_name,
+            )));
         };
         // The only write a read makes: the state changes the clock had already made due.
         job.settle_due_runs(now);

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.job_name,
                         run_id,
                         ENTITY_NOT_FOUND_CODE,
-                        format!("Job {} not found", input.job_name),
+                        crate::state::messages::job_not_found(&input.job_name),
                     ));
                 }
             }

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a trigger in this service's store: the request's members are persisted as
+//! written, the one server-set member (`State`) is filled here from the request's `Type`
+//! and `StartOnCreation`, and a later `GetTrigger` reports exactly what was stored.
+//!
+//! The definition has to be one the service could fire, so the create is refused with
+//! `InvalidInputException` when a member the named `Type` requires is missing (a
+//! `Schedule` for a scheduled trigger, a `Predicate` for a conditional one), when the
+//! `Schedule` is no cron expression, when `StartOnCreation` asks to start a type that
+//! cannot be started on creation, or when the trigger would initiate nothing; and with
+//! `EntityNotFoundException` when the trigger names a workflow, or an action or condition
+//! names a job or crawler, that this account does not hold (see
+//! [`crate::state::missing_trigger_reference`]).
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +185,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrigger"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server-side store failure of its own, so an
+            // unreachable store is reported as its modelled timeout rather than as a
+            // shape the model does not declare for it.
+            return Err(CreateTriggerErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The actions initiated by this trigger when it fires": a trigger that names no
+        // action initiates nothing when it fires, so an empty list is refused rather than
+        // stored. The model makes `Actions` required, so a request reaching here carries
+        // the member; only its emptiness is left to decide.
+        if input.actions.is_empty() {
+            return Err(invalid_input(
+                crate::state::messages::TRIGGER_ACTIONS_REQUIRED.to_string(),
+            ));
+        }
+
+        // The members a type requires: "This field is required when the trigger type is
+        // SCHEDULED" (`Schedule`) and "...is CONDITIONAL" (`Predicate`). Without them the
+        // service would hold a trigger with nothing to decide when it fires.
+        if input.r#type == crate::state::TRIGGER_TYPE_SCHEDULED && input.schedule.is_none() {
+            return Err(invalid_input(
+                crate::state::messages::trigger_member_required("Schedule", &input.r#type),
+            ));
+        }
+        let conditions = input
+            .predicate
+            .as_ref()
+            .and_then(|predicate| predicate.conditions.as_ref())
+            .map_or(0, Vec::len);
+        if input.r#type == crate::state::TRIGGER_TYPE_CONDITIONAL && conditions == 0 {
+            return Err(invalid_input(
+                crate::state::messages::trigger_member_required("Predicate", &input.r#type),
+            ));
+        }
+
+        // "An optional field if only one condition is listed. If multiple conditions are
+        // listed, then this field is required" (`Predicate$Logical`): without it a
+        // multi-condition predicate does not say whether all or any of them must hold.
+        if conditions > 1
+            && input
+                .predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.logical.is_none())
+        {
+            return Err(invalid_input(
+                crate::state::messages::predicate_logical_required(conditions),
+            ));
+        }
+
+        // A `Schedule` is "a cron expression used to specify the schedule", whose
+        // documented form is `cron(<six fields>)`. Anything else is not a schedule this
+        // service can run, so it is refused rather than stored and reported back.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(invalid_input(
+                    crate::state::messages::schedule_not_a_cron_expression(schedule),
+                ));
+            }
+        }
+
+        // "Set to true to start SCHEDULED and CONDITIONAL triggers when created. True is
+        // not supported for ON_DEMAND triggers": an on-demand trigger fires only when a
+        // caller starts it, so there is nothing for the create to start. ON_DEMAND is the
+        // one type the model excludes, and an EVENT trigger is like a scheduled or
+        // conditional one in the way that matters here — it waits for something outside
+        // the caller to happen — so starting it on creation is meaningful and accepted.
+        if input.start_on_creation && input.r#type == crate::state::TRIGGER_TYPE_ON_DEMAND {
+            return Err(invalid_input(
+                crate::state::messages::start_on_creation_not_supported(&input.r#type),
+            ));
+        }
+
+        // A started trigger is waiting to fire; one the create did not start is registered
+        // and idle. Both are steady states: this create registers a definition, so the
+        // clock owes the trigger no later transition.
+        let trigger_state = if input.start_on_creation {
+            crate::state::TRIGGER_STATE_ACTIVATED
+        } else {
+            crate::state::TRIGGER_STATE_CREATED
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A trigger is addressed by name alone, so the name has to be free in THIS Region:
+        // the same name in another Region names another trigger.
+        if store.trigger(&region, &input.name).is_some() {
+            return Err(CreateTriggerErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::TRIGGER_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+        // The entities the trigger belongs to, runs and waits on have to exist for the
+        // definition to resolve: a trigger cannot run a job this account does not hold,
+        // nor belong to a workflow nothing created.
+        if let Some(missing) = crate::state::missing_trigger_reference(
+            &store,
+            &region,
+            input.workflow_name.as_deref(),
+            &input.actions,
+            input.predicate.as_ref(),
+        ) {
+            let message = match missing {
+                crate::state::TriggerReference::Job(name) => {
+                    crate::state::messages::job_not_found(name)
+                }
+                crate::state::TriggerReference::Crawler(name) => {
+                    crate::state::messages::crawler_not_found(name)
+                }
+                crate::state::TriggerReference::Workflow(name) => {
+                    crate::state::messages::workflow_not_found(name)
+                }
+            };
+            return Err(CreateTriggerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the operation's own modelled limit error.
+        if !store.can_store_trigger() {
+            return Err(
+                CreateTriggerErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} triggers",
+                            crate::state::MAX_TRIGGERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::TriggerEntry::from_create_input(&input, trigger_state);
+        store.insert_trigger(&region, entry);
+        ::tracing::info!(
+            operation = "CreateTrigger",
+            trigger = %input.name,
+            region = %region,
+            trigger_type = %input.r#type,
+            state = %trigger_state,
+            "created a Glue trigger"
+        );
+
+        Ok(CreateTriggerOutput {
+            // "The name of the trigger."
+            name: Some(input.name),
+        })
     }
+}
+
+/// Refuse a request this operation models no more specific error for, with the modelled
+/// `InvalidInputException` ("The input provided was not valid.") and `message` as its
+/// wording. One helper, so every input refusal this handler makes answers alike.
+fn invalid_input(message: String) -> CreateTriggerError {
+    CreateTriggerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

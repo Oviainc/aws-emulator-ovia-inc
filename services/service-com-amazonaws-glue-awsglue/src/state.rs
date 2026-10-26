@@ -120,6 +120,14 @@
 //! keyed by profile name ([`ComAmazonawsGlueAwsglueState::usage_profiles`]), because every
 //! operation that addresses a profile names it by `Name` alone and carries no `CatalogId`.
 //!
+//! TRIGGERS — the records `CreateTrigger` registers, each naming the jobs and crawlers it
+//! initiates — sit beside the catalog tree too
+//! ([`ComAmazonawsGlueAwsglueState::triggers`]), keyed by the REGION they were created in
+//! and then by trigger name: every operation that addresses a trigger names it by `Name`
+//! alone with no `CatalogId`, and the jobs a trigger's actions run are themselves reachable
+//! only through the Region that created them, so a trigger is served by the endpoint that
+//! created it exactly as a job definition is.
+//!
 //! MACHINE LEARNING TRANSFORMS — the transforms `CreateMLTransform` registers — sit beside
 //! that tree in a per-account namespace keyed by the opaque `TransformId` the create mints
 //! ([`ComAmazonawsGlueAwsglueState::ml_transforms`]), because every operation that
@@ -141,20 +149,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AssetTypeFormReference,
+    Action, AssetTypeFormReference,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput, CreateJobInput,
     CreateMLTransformInput,
-    CreateSecurityConfigurationInput, CreateWorkflowInput, CustomEntityType,
+    CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal,
     DataQualityRuleRecommendationRunAdditionalRunOptions,
     DataSource, Database, DatabaseIdentifier, DatabaseInput,
-    EncryptionAtRest, EncryptionConfiguration, ErrorDetail, ExecutionProperty, FederatedDatabase,
+    EncryptionAtRest, EncryptionConfiguration, ErrorDetail, EventBatchingCondition,
+    ExecutionProperty, FederatedDatabase,
     FederatedTable, GlueTable, Job, MLTransform,
     CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
-    NotificationProperty, Partition, PartitionInput, PrincipalPermissions, ProfileConfiguration,
+    NotificationProperty, Partition, PartitionInput, Predicate, PrincipalPermissions,
+    ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
@@ -162,6 +172,7 @@ use crate::ops::types::{
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
+    Trigger,
     UpdateCrawlerInput, Workflow, WorkflowGraph,
 };
 
@@ -272,6 +283,11 @@ pub const MAX_CRAWLERS: usize = 1_000;
 /// `ResourceNumberLimitExceededException`.
 pub const MAX_JOBS: usize = 1_000;
 
+/// Ceiling on the triggers this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]. A create past it is refused with `CreateTrigger`'s own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_TRIGGERS: usize = 1_000;
+
 /// Ceiling on the custom entity types this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]. A create past it is refused with `CreateCustomEntityType`'s own
 /// modelled `ResourceNumberLimitExceededException`.
@@ -375,6 +391,38 @@ pub const CRAWLER_STATE_STOPPING: &str = "STOPPING";
 /// `TRANSITIONING`); a crawler created WITHOUT a `Schedule` has no schedule object at
 /// all, so `NOT_SCHEDULED` is not reachable from a create alone.
 pub const SCHEDULE_STATE_SCHEDULED: &str = "SCHEDULED";
+
+/// The `TriggerState` of a trigger that is registered but not started: the state a
+/// trigger is in the moment `CreateTrigger` returns when the create did not ask for it to
+/// be started. One of the modelled `TriggerState` values, whose published list the
+/// generated [`crate::ops::types::TRIGGER_STATE_VALUES`] carries.
+///
+/// A create answers with the trigger in this STEADY state rather than in the enum's
+/// `CREATING`: the create is synchronous — it registers a definition and starts nothing —
+/// so the clock owes a freshly created trigger no further transition.
+pub const TRIGGER_STATE_CREATED: &str = "CREATED";
+
+/// The `TriggerState` of a trigger that is started and waiting to fire: what
+/// `CreateTrigger` leaves a trigger in when the request set `StartOnCreation` ("Set to
+/// true to start SCHEDULED and CONDITIONAL triggers when created").
+pub const TRIGGER_STATE_ACTIVATED: &str = "ACTIVATED";
+
+/// The `TriggerType` of a trigger that fires only when a caller starts it: the one type
+/// `StartOnCreation` cannot be set for ("True is not supported for ON_DEMAND triggers" —
+/// `CreateTriggerRequest$StartOnCreation`). One of the modelled `TriggerType` values,
+/// whose published list the generated [`crate::ops::types::TRIGGER_TYPE_VALUES`] carries
+/// (`CONDITIONAL`, `EVENT`, `ON_DEMAND`, `SCHEDULED`).
+pub const TRIGGER_TYPE_ON_DEMAND: &str = "ON_DEMAND";
+
+/// The `TriggerType` of a trigger that fires on a cron schedule, for which the request's
+/// `Schedule` is required ("This field is required when the trigger type is SCHEDULED" —
+/// `CreateTriggerRequest$Schedule`).
+pub const TRIGGER_TYPE_SCHEDULED: &str = "SCHEDULED";
+
+/// The `TriggerType` of a trigger that fires when its predicate is satisfied, for which
+/// the request's `Predicate` is required ("This field is required when the trigger type is
+/// CONDITIONAL" — `CreateTriggerRequest$Predicate`).
+pub const TRIGGER_TYPE_CONDITIONAL: &str = "CONDITIONAL";
 
 /// The `Version` a crawler carries straight after `CreateCrawler`: the first version of
 /// a crawler is 1, and an update moves it on. The model's `@default` of 0 on
@@ -588,6 +636,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// through that endpoint, and the same name is free in every other Region. The inner
     /// key is the name exactly as sent — the model documents no case fold for `Job$Name`.
     pub jobs: HashMap<String, HashMap<String, JobEntry>>,
+    /// Every trigger this emulator holds, keyed by the REGION it was created in and then
+    /// by its name, in name order.
+    ///
+    /// Triggers live BESIDE the catalog tree, like jobs: `GetTrigger`, `UpdateTrigger`,
+    /// `StartTrigger`, `StopTrigger` and `DeleteTrigger` address a trigger by name alone,
+    /// with no `CatalogId` member. The outer key is the Region for the reason a job's is:
+    /// Glue is a REGIONAL service, and a trigger's actions name the jobs and crawlers of
+    /// the endpoint that created it, so a trigger created through one Region's endpoint is
+    /// served only through that endpoint and the same name is free in every other Region.
+    /// The inner map is ordered, so `ListTriggers`/`GetTriggers` have one deterministic
+    /// order to page over, and its key is the name exactly as sent — the model documents
+    /// no case fold for `Trigger$Name`.
+    pub triggers: HashMap<String, BTreeMap<String, TriggerEntry>>,
     /// Every schema registry this emulator holds, keyed by `RegistryName`, in name order.
     ///
     /// Registries live BESIDE the catalog tree: a schema-registry operation addresses its
@@ -1196,6 +1257,15 @@ impl ComAmazonawsGlueAwsglueState {
         self.crawlers.len() < MAX_CRAWLERS
     }
 
+    /// The crawler `name`, or `None` when this account holds no crawler under that name.
+    ///
+    /// A crawler is addressed by name alone, in ONE per-account namespace — the rule the
+    /// `crawlers` field documents — so this is where that addressing lives, as
+    /// [`Self::job`] is for a job definition's Region-scoped namespace.
+    pub fn crawler(&self, name: &str) -> Option<&CrawlerEntry> {
+        self.crawlers.get(name)
+    }
+
     /// Whether the store can hold another job definition, i.e. is below [`MAX_JOBS`].
     pub fn can_store_job(&self) -> bool {
         self.stored_jobs() < MAX_JOBS
@@ -1240,6 +1310,34 @@ impl ComAmazonawsGlueAwsglueState {
             .collect();
         found.sort_by(|left, right| left.name.cmp(&right.name));
         found
+    }
+
+    /// Whether the store can hold another trigger, i.e. is below [`MAX_TRIGGERS`].
+    pub fn can_store_trigger(&self) -> bool {
+        self.stored_triggers() < MAX_TRIGGERS
+    }
+
+    /// How many triggers this store holds across every Region. The walk is over the
+    /// Regions one process has been addressed in, so it is bounded.
+    pub fn stored_triggers(&self) -> usize {
+        self.triggers.values().map(BTreeMap::len).sum()
+    }
+
+    /// The trigger `name` of the Region `region`, or `None` when that Region holds no
+    /// trigger under that name — which is every trigger of every other Region, because a
+    /// trigger is served only through the endpoint that created it.
+    pub fn trigger(&self, region: &str, name: &str) -> Option<&TriggerEntry> {
+        self.triggers
+            .get(region)
+            .and_then(|triggers| triggers.get(name))
+    }
+
+    /// Store `entry` as the Region `region`'s trigger under its own name.
+    pub fn insert_trigger(&mut self, region: &str, entry: TriggerEntry) {
+        self.triggers
+            .entry(region.to_string())
+            .or_default()
+            .insert(entry.name.clone(), entry);
     }
 
     /// Whether the store can hold another schema registry, i.e. is below
@@ -2615,6 +2713,153 @@ impl CrawlerEntry {
             catalog_id: Some(self.catalog_id.clone()),
         }
     }
+}
+
+/// A stored trigger: the `Trigger` every read projects, plus the `Tags` the create
+/// carried, which that shape does not hold.
+///
+/// Every member of the modelled `Trigger` shape is held here except `Id`, which the model
+/// states is "Reserved for future use" and which therefore has no value to report. The one
+/// member the server sets is [`Self::state`]: a client names a trigger's type, schedule,
+/// actions and predicate, and whether the create should start it, and the service decides
+/// the state those leave it in.
+///
+/// Tags are kept on the record so they are not lost by the create, as a crawler's and a
+/// custom entity type's are; [`TaggedResourceKind`] carries no trigger variant yet, so
+/// resolving one through the tagging operations belongs to those operations' own issues.
+#[derive(Debug, Clone)]
+pub struct TriggerEntry {
+    /// `Trigger$Name`, which is also this entry's key in its Region's map inside
+    /// [`ComAmazonawsGlueAwsglueState::triggers`].
+    pub name: String,
+    /// `Trigger$Type`: one of the modelled `TriggerType` values, as the create sent it.
+    pub trigger_type: String,
+    /// `Trigger$State`: one of the modelled `TriggerState` values, decided by the service
+    /// rather than sent — [`TRIGGER_STATE_ACTIVATED`] when the create asked for the
+    /// trigger to be started, else [`TRIGGER_STATE_CREATED`].
+    pub state: String,
+    /// `Trigger$WorkflowName`: "The name of the workflow associated with the trigger",
+    /// stored as sent.
+    pub workflow_name: Option<String>,
+    pub description: Option<String>,
+    /// `Trigger$Schedule`: the cron expression the create supplied, if any.
+    pub schedule: Option<String>,
+    /// `Trigger$Actions`: "The actions initiated by this trigger."
+    pub actions: Vec<Action>,
+    /// `Trigger$Predicate`: "The predicate of this trigger, which defines when it will
+    /// fire", absent for a trigger created without one.
+    pub predicate: Option<Predicate>,
+    pub event_batching_condition: Option<EventBatchingCondition>,
+    /// The request's `Tags`, which are not part of the `Trigger` shape.
+    pub tags: HashMap<String, String>,
+}
+
+impl TriggerEntry {
+    /// Build a stored trigger from a `CreateTrigger` request, in the state the create
+    /// leaves it in.
+    ///
+    /// `state` is that state, decided by the handler from the request's `StartOnCreation`
+    /// and `Type` — the one member of the record the client does not set.
+    pub fn from_create_input(input: &CreateTriggerInput, state: &str) -> Self {
+        Self {
+            name: input.name.clone(),
+            trigger_type: input.r#type.clone(),
+            state: state.to_string(),
+            workflow_name: input.workflow_name.clone(),
+            description: input.description.clone(),
+            schedule: input.schedule.clone(),
+            actions: input.actions.clone(),
+            predicate: input.predicate.clone(),
+            event_batching_condition: input.event_batching_condition.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `Trigger` output shape from what is stored.
+    pub fn to_trigger(&self) -> Trigger {
+        Trigger {
+            name: Some(self.name.clone()),
+            workflow_name: self.workflow_name.clone(),
+            // "Reserved for future use": a trigger carries no id of its own, so there is
+            // none to report.
+            id: None,
+            r#type: Some(self.trigger_type.clone()),
+            state: Some(self.state.clone()),
+            description: self.description.clone(),
+            schedule: self.schedule.clone(),
+            actions: Some(self.actions.clone()),
+            predicate: self.predicate.clone(),
+            event_batching_condition: self.event_batching_condition.clone(),
+        }
+    }
+}
+
+/// One Glue entity a trigger's definition names: the workflow it belongs to, the job an
+/// action runs or a condition waits on, or the crawler of either.
+///
+/// Returned by [`missing_trigger_reference`], so a refusal can say which kind of entity it
+/// could not find and under which name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerReference<'a> {
+    /// `Action$JobName` or `Condition$JobName`.
+    Job(&'a str),
+    /// `Action$CrawlerName` or `Condition$CrawlerName`.
+    Crawler(&'a str),
+    /// `CreateTriggerRequest$WorkflowName`.
+    Workflow(&'a str),
+}
+
+/// The first workflow, job or crawler a trigger's definition names that this store holds
+/// no record of, or `None` when every one of them is a stored entity.
+///
+/// A trigger belongs to the workflow it names and runs the actions and waits on the
+/// conditions it carries, so the definition is resolvable only if those entities exist;
+/// `region` is the Region the request is served in, which is where its job definitions
+/// live, while a workflow and a crawler live in one per-account namespace. An
+/// `Action$SecurityConfiguration` is NOT resolved here: it configures how an action runs
+/// rather than naming the entity the action initiates.
+///
+/// The walk visits each action once and each condition once — the conditions bounded by
+/// the modelled `ConditionList` length of at most 500, the actions by the request body the
+/// transport accepted — and every lookup is a map probe.
+pub fn missing_trigger_reference<'a>(
+    store: &ComAmazonawsGlueAwsglueState,
+    region: &str,
+    workflow_name: Option<&'a str>,
+    actions: &'a [Action],
+    predicate: Option<&'a Predicate>,
+) -> Option<TriggerReference<'a>> {
+    if let Some(workflow_name) = workflow_name {
+        if store.workflow(workflow_name).is_none() {
+            return Some(TriggerReference::Workflow(workflow_name));
+        }
+    }
+    let action_targets = actions
+        .iter()
+        .map(|action| (action.job_name.as_deref(), action.crawler_name.as_deref()));
+    let condition_targets = predicate
+        .and_then(|predicate| predicate.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|condition| {
+            (
+                condition.job_name.as_deref(),
+                condition.crawler_name.as_deref(),
+            )
+        });
+    for (job_name, crawler_name) in action_targets.chain(condition_targets) {
+        if let Some(job_name) = job_name {
+            if store.job(region, job_name).is_none() {
+                return Some(TriggerReference::Job(job_name));
+            }
+        }
+        if let Some(crawler_name) = crawler_name {
+            if store.crawler(crawler_name).is_none() {
+                return Some(TriggerReference::Crawler(crawler_name));
+            }
+        }
+    }
+    None
 }
 
 /// A stored custom entity type: the custom pattern `CreateCustomEntityType` registers
@@ -5254,13 +5499,13 @@ pub mod messages {
         format!("Crawler with name {name} is running")
     }
 
-    /// A crawler write whose `Schedule` is not the `cron(..)` expression the service
+    /// A write whose `Schedule` is not the `cron(..)` expression the service
     /// documents ([`super::is_cron_expression`]). NOT recorded: what is pinned is the
     /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
     /// sentence carrying only the requested expression plus the form it has to take.
     /// Shared by every operation that writes that member (`CreateCrawler`,
-    /// `UpdateCrawler`, `UpdateCrawlerSchedule`), so one refusal cannot drift from
-    /// another's.
+    /// `UpdateCrawler`, `UpdateCrawlerSchedule`, `CreateTrigger`), so one refusal cannot
+    /// drift from another's.
     pub fn schedule_not_a_cron_expression(expression: &str) -> String {
         format!(
             "Schedule {expression} is not a cron expression of the form \
@@ -5287,6 +5532,59 @@ pub mod messages {
              action",
             super::request_principal()
         )
+    }
+
+    /// A trigger lookup (`GetTrigger`, and every other operation that addresses a trigger
+    /// by name) for a name no trigger of the request's Region has. NOT recorded: the
+    /// sentence follows the per-resource template of [`database_not_found`], built from
+    /// the requested name, which is the whole address of a trigger.
+    pub fn trigger_not_found(name: &str) -> String {
+        format!("Trigger {name} not found.")
+    }
+
+    /// `CreateTrigger` for a name the request's Region already holds a trigger under. NOT
+    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name.
+    pub const TRIGGER_ALREADY_EXISTS: &str = "Trigger already exists.";
+
+    /// A trigger create whose `Actions` list is empty. NOT recorded: what is pinned is the
+    /// behaviour — 400 with the operation's modelled `InvalidInputException` — and the
+    /// sentence names the member that has to name something, the way the crawler create's
+    /// own at-least-one refusal does.
+    pub const TRIGGER_ACTIONS_REQUIRED: &str = "Actions must specify at least one action.";
+
+    /// A trigger create missing the member its `Type` requires: `Schedule` for a scheduled
+    /// trigger ("This field is required when the trigger type is SCHEDULED" —
+    /// `CreateTriggerRequest$Schedule`) and `Predicate` for a conditional one ("This field
+    /// is required when the trigger type is CONDITIONAL"). The sentence is those modelled
+    /// requirements, with the member and the type the request named.
+    pub fn trigger_member_required(member: &str, trigger_type: &str) -> String {
+        format!("{member} is required when the trigger type is {trigger_type}")
+    }
+
+    /// A trigger create that asks for a type that cannot be started on creation ("True is
+    /// not supported for ON_DEMAND triggers" — `CreateTriggerRequest$StartOnCreation`).
+    /// The sentence is that modelled requirement, with the type the request named.
+    pub fn start_on_creation_not_supported(trigger_type: &str) -> String {
+        format!("StartOnCreation true is not supported for {trigger_type} triggers")
+    }
+
+    /// A trigger create whose `Predicate` lists several conditions without a `Logical`
+    /// ("An optional field if only one condition is listed. If multiple conditions are
+    /// listed, then this field is required" — `Predicate$Logical`). The sentence is that
+    /// modelled requirement, with the number of conditions the request listed.
+    pub fn predicate_logical_required(conditions: usize) -> String {
+        format!("Logical is required when a Predicate lists {conditions} conditions")
+    }
+
+    /// Any operation whose `JobName`/`Name` names no job definition of the Region it is
+    /// served in — a read or a write that addresses a job (`GetJob`, `UpdateJob`,
+    /// `GetJobRun`, `BatchStopJobRun`), and the job an action of a trigger would run. The
+    /// per-resource template this crate's job-miss refusals already carried inline, now in
+    /// one place: it names neither the Region nor the resource that referred to the job.
+    pub fn job_not_found(name: &str) -> String {
+        format!("Job {name} not found")
     }
 
     /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`)
