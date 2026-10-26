@@ -193,13 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A default policy is one created either by naming `DefaultPolicy`, or by
         // a `PolicyDetails` whose `PolicyLanguage` is `SIMPLIFIED` ("To create a
         // default policy"); everything else is a custom policy.
-        let default_policy_type = input.default_policy.clone().or_else(|| {
-            input
-                .policy_details
-                .as_ref()
-                .and_then(|details| details.resource_type.clone())
-                .filter(|_| policy_language_is_simplified(input.policy_details.as_ref()))
-        });
         let is_default = input.default_policy.is_some()
             || policy_language_is_simplified(input.policy_details.as_ref());
 
@@ -209,7 +202,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // PolicyDetails request structure, but not both."
         let stated_in_body = default_policy_only_body_parameters(&input);
         if is_default && input.policy_details.is_some() {
-            let duplicated = stated_in_body.stated_names("");
+            let mut duplicated = stated_in_body.stated_names("");
+            // The resource type is one of those parameters: `DefaultPolicy` and
+            // `PolicyDetails$ResourceType` carry the same documentation, so a
+            // request naming both states it in both places. The refusal names it
+            // by the BODY member the caller used, the alternative to the
+            // structure.
+            if input.default_policy.is_some()
+                && crate::state::DefaultPolicyOnlyParameters::in_policy_details(
+                    input.policy_details.as_ref(),
+                )
+                .resource_type
+            {
+                duplicated.insert(0, crate::state::DEFAULT_POLICY_MEMBER.to_string());
+            }
             if !duplicated.is_empty() {
                 return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
                     crate::state::configuration_stated_twice(&duplicated),
@@ -363,9 +369,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // places this request stated it in: the members stated inside the
         // structure are MOVED out of it onto the record, so no stored value can
         // shadow another and a later update of either form is what a read
-        // reports. A request that is not creating a default policy may state none
-        // of them anywhere (refused above), so this moves nothing for one.
+        // reports. The resource type is one of those members: the request body
+        // states it as `DefaultPolicy` and the structure as
+        // `PolicyDetails$ResourceType`, and it comes to rest in
+        // `default_policy_type`. A request that is not creating a default policy
+        // may state none of them anywhere (refused above), so this moves nothing
+        // for one.
         let configuration = crate::state::DefaultPolicyConfiguration {
+            resource_type: input.default_policy,
             create_interval: input.create_interval,
             retain_interval: input.retain_interval,
             copy_tags: input.copy_tags,
@@ -395,7 +406,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_modified: now,
             policy_details,
             default_policy: is_default,
-            default_policy_type,
+            default_policy_type: configuration.resource_type,
             create_interval: configuration.create_interval,
             retain_interval: configuration.retain_interval,
             copy_tags: configuration.copy_tags,
@@ -426,9 +437,10 @@ fn policy_language_is_simplified(details: Option<&PolicyDetails>) -> bool {
 /// The `[Default policies only]` parameters this request states in the request
 /// BODY, as against inside its `PolicyDetails` structure.
 ///
-/// `PolicyDetails$ResourceType` has no request-body counterpart of its own:
-/// `DefaultPolicy` states the type of default policy to create, and it is what
-/// makes the request a default-policy request in the first place.
+/// `PolicyDetails$ResourceType`'s request-body counterpart is `DefaultPolicy`,
+/// which is also the member that makes the request a default-policy request in
+/// the first place, so it is read where that name belongs rather than from this
+/// set of same-named members.
 fn default_policy_only_body_parameters(
     input: &CreateLifecyclePolicyInput,
 ) -> crate::state::DefaultPolicyOnlyParameters {
