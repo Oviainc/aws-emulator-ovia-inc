@@ -167,7 +167,15 @@ pub(crate) async fn create_subject(
 /// The resource `arn` addresses, as the IMPLEMENTED reader for its kind reports it —
 /// GetRouterInput, GetRouterOutput and BatchGetRouterNetworkInterface respectively, each of
 /// which computes its answer from the stored record.
-async fn read_back(emulator: &Emulator, case: &str, kind: GlobalKind, arn: &str) -> Value {
+///
+/// `pub(crate)` because the global UNTAGGING suite reads the same three records back, so
+/// there is one reader per kind in this test binary rather than one per suite.
+pub(crate) async fn read_back(
+    emulator: &Emulator,
+    case: &str,
+    kind: GlobalKind,
+    arn: &str,
+) -> Value {
     let uri = match kind {
         GlobalKind::Input => format!("/v1/routerInput/{arn}"),
         GlobalKind::Output => format!("/v1/routerOutput/{arn}"),
@@ -218,7 +226,9 @@ async fn tags_of(emulator: &Emulator, case: &str, kind: GlobalKind, arn: &str) -
 
 /// A timestamp a reader reports, in seconds since the epoch (this emulator's codec renders
 /// every timestamp in restJson1's default epoch-seconds form).
-fn timestamp(case: &str, member: &str, resource: &Value) -> f64 {
+///
+/// `pub(crate)` because the global UNTAGGING suite asserts the same `UpdatedAt` rule.
+pub(crate) fn timestamp(case: &str, member: &str, resource: &Value) -> f64 {
     resource[member].as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be reported as a timestamp, got {resource}")
     })

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagGlobalResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagGlobalResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagGlobalResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REMOVES the named tag keys from the tags of the GLOBAL resource `ResourceArn` addresses
+//! in [`crate::state`] — a router input, a router output or a router network interface
+//! ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::global_resource_tags_mut`]):
+//! a key the request names stops being carried, a key it does not name keeps the value it
+//! had, and the resource afterwards reports what is left. Idempotent, as the model marks
+//! it: a key the resource does not carry removes nothing and is still a success.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +69,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The modelled 404 for a `ResourceArn` that addresses no global resource this service
+/// holds: `NotFoundException`, "one or more of the resources in the request does not exist
+/// in the system". The wording is the crate's one not-found message, so an ARN that
+/// resolves nothing reads here exactly as it does on the global tag write and the global
+/// tag report, which resolve the ARN the same way.
+fn not_found(resource_arn: &str) -> UntagGlobalResourceError {
+    UntagGlobalResourceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(resource_arn),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,20 +174,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagGlobalResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagGlobalResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagGlobalResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UntagGlobalResourceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect global resource store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let Some(resource) = store.global_resource_tags_mut(&input.resource_arn, now) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // Remove exactly the named keys. The operation is `@idempotent`: a key the resource
+        // does not carry is not an error, it removes nothing, and a key the request does not
+        // name keeps the value it had — the same removal the regional UntagResource applies
+        // to a flow's tag map.
+        let mut changed = false;
+        for key in &input.tag_keys {
+            changed |= resource.tags.remove(key).is_some();
+        }
+
+        if changed {
+            // The tags are a member of the resource (`RouterInput$Tags` and its output and
+            // interface counterparts), so a removal that took a key away changed the record
+            // and its `UpdatedAt` moves with it — and a request that removed nothing changed
+            // nothing, so it does not, exactly as the global tag write decides it.
+            *resource.updated_at = now;
+        }
+
+        Ok(UntagGlobalResourceOutput)
     }
 }
