@@ -157,14 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         // A tag set is reported for whichever resource the ARN names: every taggable
         // resource this emulator holds is keyed by its own ARN, so the lookup is the ARN
-        // itself rather than anything parsed out of it.
-        let Some(tags) = state.tags_of(&input.resource_arn) else {
+        // itself rather than anything parsed out of it — within the region this call was
+        // signed for, so another region's resource is as absent here as an ARN this
+        // service never minted.
+        let Some(tags) = state.tags_of(&region, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "resourceArn",

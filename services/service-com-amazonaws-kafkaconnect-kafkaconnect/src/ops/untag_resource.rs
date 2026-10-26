@@ -169,15 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
 
         // The same ARN-keyed seam `TagResource` and `ListTagsForResource` use, so
         // an untag is applied to the one stored tag map a later read answers
-        // from. Per key: only the named keys go, and a key that was never there
-        // is no failure, so the call is safe to retry.
-        match state.remove_tags(&input.resource_arn, &input.tag_keys) {
+        // from, and only within the region this call was signed for. Per key:
+        // only the named keys go, and a key that was never there is no failure,
+        // so the call is safe to retry.
+        match state.remove_tags(&region, &input.resource_arn, &input.tag_keys) {
             Ok(()) => Ok(UntagResourceOutput {}),
             // A key AWS reserves is not a caller's to strip, and a key outside
             // the tag character set is not a tag at all: the modelled 400,
