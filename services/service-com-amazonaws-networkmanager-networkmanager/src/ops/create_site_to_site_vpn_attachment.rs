@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request member carries it — and it has to be one the core network's policy
         // configures an edge for, since an attachment attaches to an EDGE of the core
         // network.
-        let edge_location = crate::state::ec2_arn_region(&input.vpn_connection_arn)
+        let edge_location = crate::state::arn_region(&input.vpn_connection_arn)
             .ok_or_else(|| {
                 CreateSiteToSiteVpnAttachmentErrorModeled::ValidationException(
                     crate::state::field_rejection(

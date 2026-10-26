@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subnets follow.
         let subnet_arn = input.subnet_arn.clone().filter(|arn| !arn.is_empty());
         if let Some(arn) = subnet_arn.as_deref() {
-            if crate::state::ec2_arn_region(arn) != Some(edge_location.as_str()) {
+            if crate::state::arn_region(arn) != Some(edge_location.as_str()) {
                 return Err(CreateConnectPeerErrorModeled::ValidationException(
                     crate::state::field_rejection(
                         crate::state::FIELD_SUBNET_ARN,

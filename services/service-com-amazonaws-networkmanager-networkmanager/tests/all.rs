@@ -111,6 +111,8 @@ mod list_tags_for_resource;
 mod network_resource_counts;
 #[path = "all/network_resource_regions.rs"]
 mod network_resource_regions;
+#[path = "all/network_resource_relationships.rs"]
+mod network_resource_relationships;
 #[path = "all/network_resources.rs"]
 mod network_resources;
 #[path = "all/network_telemetry.rs"]

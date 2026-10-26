@@ -71,7 +71,7 @@ use crate::ops::types::{
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkPolicyVersion,
     CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
-    NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
+    NetworkResource, NetworkTelemetry, OrganizationStatus, Peering, Relationship,
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
     RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
     ServiceInsertionSegments, Site, SiteToSiteVpnAttachment, Tag,
@@ -2186,7 +2186,7 @@ pub fn check_subnet_list(
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for subnet_arn in requested {
-        if ec2_arn_region(subnet_arn) != Some(edge_location) {
+        if arn_region(subnet_arn) != Some(edge_location) {
             return Err(field_rejection(
                 member,
                 VALIDATION_REASON_OTHER,
@@ -3589,6 +3589,25 @@ pub fn arn_account_id(arn: &str) -> Option<&str> {
     (!account.is_empty()).then_some(account)
 }
 
+/// The Region an ARN carries (its fourth colon-separated field), or `None` when the string
+/// has no such field or carries it empty — which is what every ARN of this global service
+/// carries, and what an ARN of a global resource of another service carries too.
+///
+/// The companion of [`arn_account_id`], for the same reason: the Region a resource of
+/// ANOTHER service lives in is spelled by its own ARN, so a reader comparing Regions reads
+/// it from there rather than from a second copy. A VPC attachment's edge location is not a
+/// request member either: it is the Region the VPC is in, which only the VPC's ARN names,
+/// and the same holds for a site-to-site VPN attachment and the VPN connection it attaches.
+/// The modelled patterns for `VpcArn`, `SubnetArn` and `VpnConnectionArn` all allow an
+/// EMPTY Region segment
+/// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`, `smithy_query
+/// shape=VpcArn`), so an ARN that names no Region answers `None` here and is refused by the
+/// caller rather than stored with an edge location no edge has.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    let region = arn.split(':').nth(3)?;
+    (!region.is_empty()).then_some(region)
+}
+
 /// Per-service state for com-amazonaws-networkmanager-networkmanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
@@ -4239,6 +4258,230 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         resources.into_iter().collect()
     }
 
+    /// Every relationship the global network `global_network_id` holds, keyed by
+    /// [`relationship_key`] so the listing is ordered and a page token can name an offset
+    /// into it.
+    ///
+    /// A relationship is one TIE the store holds between two resources named by ARN: the
+    /// parent that owns a resource of this global network's inventory
+    /// ([`Self::network_resources_of`]), the resource an attachment or a peering joins to
+    /// it, and each resource an association ties it to. `From` is the resource the tie is
+    /// recorded on — the child, the attaching resource, or, for an association that is no
+    /// resource of its own, the DEVICE (and the LINK, where the association names one) of
+    /// this global network it ties — and `To` is the resource at the other end. Every ARN
+    /// comes from a stored record, so a tie whose other end belongs to another service (a
+    /// customer gateway, a VPC, a transit gateway, a managed prefix list) is reported under
+    /// the ARN that service's resource carries, and a pair two ties both name is held once.
+    ///
+    /// Two things deliberately contribute no pair:
+    ///
+    /// * A transit gateway registration ties a gateway to the GLOBAL NETWORK itself, which
+    ///   is the scope this listing is taken over rather than a resource inside it.
+    /// * The subnets a VPC attachment reaches its VPC through, and the subnet a device's
+    ///   AWS location names, say HOW and WHERE a resource is reached rather than naming
+    ///   another resource the tie joins — the resource an attachment attaches is the one
+    ///   [`AttachmentRecord::resource_arn`] names.
+    pub fn network_resource_relationships(
+        &self,
+        global_network_id: &str,
+    ) -> Vec<(String, Relationship)> {
+        /// Hold the pair `from` -> `to`. Keyed by the pair, so two stored ties that name
+        /// the same pair leave one relationship rather than two.
+        fn tie(pairs: &mut BTreeMap<String, Relationship>, from: &str, to: &str) {
+            pairs.insert(
+                relationship_key(from, to),
+                Relationship {
+                    from: Some(from.to_string()),
+                    to: Some(to.to_string()),
+                },
+            );
+        }
+
+        // Each resolver answers the stored ARN of a resource of THIS global network, and
+        // `None` for an id it holds none for — an id of another global network included, so
+        // a tie never reaches out of the scope the listing is taken over.
+        let site_arn = |id: &str| {
+            self.sites
+                .get(id)
+                .filter(|record| record.global_network_id == global_network_id)
+                .map(|record| record.arn.clone())
+        };
+        let link_arn = |id: &str| {
+            self.links
+                .get(id)
+                .filter(|record| record.global_network_id == global_network_id)
+                .map(|record| record.arn.clone())
+        };
+        let device_arn = |id: &str| {
+            self.devices
+                .get(id)
+                .filter(|record| record.global_network_id == global_network_id)
+                .map(|record| record.arn.clone())
+        };
+        let core_network_arn = |id: &str| {
+            self.core_networks
+                .get(id)
+                .filter(|record| record.global_network_id == global_network_id)
+                .map(|record| record.arn.clone())
+        };
+        let attachment_arn = |id: &str| {
+            self.attachments
+                .get(id)
+                .filter(|record| self.holds_core_network(global_network_id, &record.core_network_id))
+                .map(|record| record.arn.clone())
+        };
+        let peering_arn = |id: &str| {
+            self.peerings
+                .get(id)
+                .filter(|record| self.holds_core_network(global_network_id, &record.core_network_id))
+                .map(|record| record.arn.clone())
+        };
+        let connect_peer_arn = |id: &str| {
+            self.connect_peers
+                .get(id)
+                .filter(|record| self.holds_core_network(global_network_id, &record.core_network_id))
+                .map(|record| record.arn.clone())
+        };
+
+        let mut pairs: BTreeMap<String, Relationship> = BTreeMap::new();
+
+        // A link belongs to a site, and a device sits at one where its create named one.
+        for record in self
+            .links
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            if let Some(site) = site_arn(&record.site_id) {
+                tie(&mut pairs, &record.arn, &site);
+            }
+        }
+        for record in self
+            .devices
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            if let Some(site) = record.site_id.as_deref().and_then(&site_arn) {
+                tie(&mut pairs, &record.arn, &site);
+            }
+        }
+
+        // A connection joins two devices of the global network, each over the link the
+        // create named for it.
+        for record in self
+            .connections
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            for device in [&record.device_id, &record.connected_device_id] {
+                if let Some(arn) = device_arn(device) {
+                    tie(&mut pairs, &record.arn, &arn);
+                }
+            }
+            for link in [record.link_id.as_deref(), record.connected_link_id.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(arn) = link_arn(link) {
+                    tie(&mut pairs, &record.arn, &arn);
+                }
+            }
+        }
+
+        // An attachment belongs to its core network and attaches one resource; a transit
+        // gateway route table attachment reaches that route table THROUGH a peering, which
+        // is the one kind whose detail names a further resource of its own.
+        for record in self.attachments.values().filter(|record| {
+            self.holds_core_network(global_network_id, &record.core_network_id)
+        }) {
+            tie(&mut pairs, &record.arn, &record.core_network_arn);
+            tie(&mut pairs, &record.arn, &record.resource_arn);
+            if let AttachmentDetail::TransitGatewayRouteTable { peering_id } = &record.detail {
+                if let Some(arn) = peering_arn(peering_id) {
+                    tie(&mut pairs, &record.arn, &arn);
+                }
+            }
+        }
+
+        // A peering joins its core network to the resource it peers with.
+        for record in self.peerings_of_global_network(global_network_id) {
+            tie(&mut pairs, &record.arn, &record.core_network_arn);
+            tie(&mut pairs, &record.arn, &record.resource_arn);
+        }
+
+        // A Connect peer is carried over its Connect attachment.
+        for record in self
+            .connect_peers
+            .values()
+            .filter(|record| self.holds_core_network(global_network_id, &record.core_network_id))
+        {
+            if let Some(arn) = attachment_arn(&record.connect_attachment_id) {
+                tie(&mut pairs, &record.arn, &arn);
+            }
+        }
+
+        // A core network is tied to each managed prefix list associated with it.
+        for record in self.prefix_list_associations.values() {
+            if let Some(arn) = core_network_arn(&record.core_network_id) {
+                tie(&mut pairs, &arn, &record.prefix_list_arn);
+            }
+        }
+
+        // Every remaining tie is one an association holds between a resource and a DEVICE
+        // of this global network, optionally over one of that device's LINKS: the tie is
+        // recorded on each of those two, so each is a `From` of the resource it reaches.
+        let mut device_ties: Vec<(&str, Option<&str>, String)> = Vec::new();
+        for record in self
+            .link_associations
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            if let Some(arn) = link_arn(&record.link_id) {
+                device_ties.push((&record.device_id, None, arn));
+            }
+        }
+        for record in self
+            .customer_gateway_associations
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            device_ties.push((
+                &record.device_id,
+                record.link_id.as_deref(),
+                record.customer_gateway_arn.clone(),
+            ));
+        }
+        for record in self
+            .connect_peer_associations
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            if let Some(arn) = connect_peer_arn(&record.connect_peer_id) {
+                device_ties.push((&record.device_id, record.link_id.as_deref(), arn));
+            }
+        }
+        for record in self
+            .transit_gateway_connect_peer_associations
+            .values()
+            .filter(|record| record.global_network_id == global_network_id)
+        {
+            device_ties.push((
+                &record.device_id,
+                record.link_id.as_deref(),
+                record.transit_gateway_connect_peer_arn.clone(),
+            ));
+        }
+        for (device_id, link_id, to) in device_ties {
+            if let Some(from) = device_arn(device_id) {
+                tie(&mut pairs, &from, &to);
+            }
+            if let Some(from) = link_id.and_then(&link_arn) {
+                tie(&mut pairs, &from, &to);
+            }
+        }
+
+        pairs.into_iter().collect()
+    }
+
     /// Register `record` as a telemetry-bearing connection of its global network,
     /// replacing any registration that global network already holds for the same resource
     /// ARN (see [`telemetry_key`]).
@@ -4509,6 +4752,17 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
 /// offset, see [`paginate`]) can resume inside it.
 pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
     format!("{resource_type}/{resource_id}")
+}
+
+/// The key one relationship is listed under: the ARN it leads FROM, then the ARN it names.
+///
+/// A relationship has no identity beyond the ordered pair of ARNs it joins, so the pair is
+/// its key: the listing is then ordered by the resource a relationship leads from and then
+/// by the one it reaches, every key is unique, a pair reached from two stored ties is held
+/// once, and a page token (which names a key offset, see [`paginate`]) can resume inside
+/// it. The separator is one no ARN carries, so no two pairs can produce the same key.
+pub fn relationship_key(from: &str, to: &str) -> String {
+    format!("{from}|{to}")
 }
 
 /// The members every network resource of this service carries, whatever its kind: the
@@ -7452,27 +7706,11 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
     members(left) == members(right)
 }
 
-/// The Region segment of an EC2 resource ARN
-/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it names no
-/// Region an endpoint could carry.
-///
-/// A VPC attachment's edge location is not a request member: it is the Region the VPC is
-/// in, which only the VPC's ARN names; the same holds for a site-to-site VPN attachment
-/// and the VPN connection it attaches. The modelled patterns for `VpcArn`, `SubnetArn` and
-/// `VpnConnectionArn` all allow an EMPTY Region segment
-/// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`, `smithy_query
-/// shape=VpcArn`), so an ARN that names none is refused by the caller rather than stored
-/// with an edge location no edge has.
-pub fn ec2_arn_region(arn: &str) -> Option<&str> {
-    let region = arn.split(':').nth(3)?;
-    (!region.is_empty()).then_some(region)
-}
-
 /// The Region of an EC2 resource ARN that must name a resource of type `resource_type`
 /// (`arn:<partition>:ec2:<region>:<account>:<resource_type>/<id>`), or `None` when the
 /// string is not such an ARN or names no Region.
 ///
-/// [`ec2_arn_region`] is enough where the MODEL constrains the ARN's form, but
+/// [`arn_region`] is enough where the MODEL constrains the ARN's form, but
 /// `TransitGatewayArn` and `TransitGatewayRouteTableArn` carry only a length and the
 /// permissive `^[\s\S]*$` (`smithy_query shape=TransitGatewayArn`), so for those the
 /// handler is what has to establish the resource an ARN names before anything is stored

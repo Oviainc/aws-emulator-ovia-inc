@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkResourceRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkResourceRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkResourceRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `GetNetworkResourceRelationships::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Reports the resource graph of one global network: one `Relationship` per tie the store
+//! holds between two resources named by ARN — the parent that owns a resource of that
+//! global network's network-resource inventory, the resource an attachment or a peering
+//! joins to it, and each resource an association ties it to — narrowed by every filter
+//! member the request carries and paginated by `MaxResults`/`NextToken`. A reporting
+//! operation: it never writes. This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -166,17 +156,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkResourceRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkResourceRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetNetworkResourceRelationshipsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        // The resource the path addresses is checked first: an unknown global network holds
+        // no resource graph at all, whatever the query string carries. This operation models
+        // `ResourceNotFoundException` (`smithy_query
+        // operation=GetNetworkResourceRelationships`), as `GetNetworkResources` does, so the
+        // refusal is the 404.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(
+                GetNetworkResourceRelationshipsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A `ResourceType` outside the set the member's documentation enumerates
+        // (`crate::state::NETWORK_RESOURCE_TYPES`) names no resource kind at all, so it is
+        // refused on the member rather than answered with an empty page — the same rule
+        // `GetNetworkResources` and `GetNetworkResourceCounts` apply to the same member. The
+        // modelled `ConstrainedString` only bounds the length, so this is the operation's
+        // own check.
+        if let Some(resource_type) = input.resource_type.as_deref() {
+            if !crate::state::is_network_resource_type(resource_type) {
+                return Err(GetNetworkResourceRelationshipsErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        "ResourceType",
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        format!(
+                            "ResourceType {resource_type:?} is not one of the supported network resource types: {}",
+                            crate::state::NETWORK_RESOURCE_TYPES.join(", ")
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                GetNetworkResourceRelationshipsErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        "NextToken",
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        "NextToken is not a token this service issued".to_string(),
+                    ),
+                )
+            })?),
+            None => None,
+        };
+
+        // The filters select RESOURCES, exactly as they do for `GetNetworkResources`, and a
+        // relationship is reported when one of the two resources it joins is selected: a
+        // request naming a resource therefore gets that resource's ties, whichever end of
+        // each it sits at, and an absent filter member selects everything.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkResourceRelationships"))
+        // What a resource reports for a filtered member is what the global network's one
+        // network-resource inventory reports for it (`network_resources_of`, the inventory
+        // `GetNetworkResources` answers from). A tie's other end may be a resource of
+        // ANOTHER service, which that inventory does not hold; its own ARN names its type,
+        // its owning account and its Region, so those three are read from the ARN, and the
+        // two members only an inventory resource carries — the core network it belongs to
+        // and the gateway it is reached through — select none of them.
+        let inventory: ::std::collections::BTreeMap<String, NetworkResource> = store
+            .network_resources_of(&input.global_network_id, now)
+            .into_iter()
+            .filter_map(|(_, resource)| {
+                resource
+                    .resource_arn
+                    .clone()
+                    .map(|arn| (arn, resource))
+            })
+            .collect();
+        let selects = |want: Option<&str>, reported: Option<&str>| {
+            want.is_none_or(|value| reported == Some(value))
+        };
+        let selected = |arn: &str| {
+            let held = inventory.get(arn);
+            let resource_type = held
+                .and_then(|resource| resource.resource_type.as_deref())
+                .or_else(|| crate::state::arn_resource_kind(arn));
+            let account_id = held
+                .and_then(|resource| resource.account_id.as_deref())
+                .or_else(|| crate::state::arn_account_id(arn));
+            let aws_region = held
+                .and_then(|resource| resource.aws_region.as_deref())
+                .or_else(|| crate::state::arn_region(arn));
+            selects(input.resource_arn.as_deref(), Some(arn))
+                && selects(input.resource_type.as_deref(), resource_type)
+                && selects(input.account_id.as_deref(), account_id)
+                && selects(input.aws_region.as_deref(), aws_region)
+                && selects(
+                    input.core_network_id.as_deref(),
+                    held.and_then(|resource| resource.core_network_id.as_deref()),
+                )
+                && selects(
+                    input.registered_gateway_arn.as_deref(),
+                    held.and_then(|resource| resource.registered_gateway_arn.as_deref()),
+                )
+        };
+
+        let entries: Vec<(String, Relationship)> = store
+            .network_resource_relationships(&input.global_network_id)
+            .into_iter()
+            .filter(|(_, relationship)| {
+                [relationship.from.as_deref(), relationship.to.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(&selected)
+            })
+            .collect();
+        drop(store);
+
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(GetNetworkResourceRelationshipsOutput {
+            relationships: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The attachment's edge location is the Region the VPC is in — no request member
         // carries it — and it has to be one the core network's policy configures an edge
         // for, since an attachment attaches to an EDGE of the core network.
-        let edge_location = crate::state::ec2_arn_region(&input.vpc_arn)
+        let edge_location = crate::state::arn_region(&input.vpc_arn)
             .ok_or_else(|| {
                 CreateVpcAttachmentErrorModeled::ValidationException(
                     crate::state::field_rejection(
