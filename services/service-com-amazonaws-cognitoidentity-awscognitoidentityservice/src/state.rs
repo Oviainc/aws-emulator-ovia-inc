@@ -357,6 +357,49 @@ pub struct IssuedOpenIdToken {
     pub principal_tags: Option<BTreeMap<String, String>>,
 }
 
+/// The `Logins` provider name a token THIS service minted is presented under — the Cognito
+/// Identity principal: "If the token is for cognito-identity.amazonaws.com, it will be
+/// passed through to Security Token Service with the appropriate role for the token"
+/// (`GetCredentialsForIdentity`, this service's model). A `Logins` entry under any other
+/// provider name carries a token an EXTERNAL provider issued, which this emulator never saw
+/// minted and so cannot decide; an entry under THIS name names an issuance this service
+/// recorded itself, which is what makes its validity window readable here.
+pub const COGNITO_IDENTITY_LOGIN_PROVIDER: &str = COGNITO_IDENTITY_PRINCIPAL;
+
+/// How AWS words the refusal of a request presenting a token of this service whose validity
+/// window has closed — the window `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity`
+/// recorded when they minted it.
+///
+/// Fixed text with no request- or state-derived part: the caller of a credential exchange
+/// holds no credential yet, so the refusal says that the token's time is up and nothing
+/// about the identity, the pool or the token it was made with.
+pub const EXPIRED_LOGIN_TOKEN_MESSAGE: &str = "Invalid login token. Token is expired.";
+
+/// How AWS words the refusal of a request presenting a token under this service's own
+/// provider name that this service cannot resolve at all: one it never issued, or one it
+/// has forgotten. Nothing in it is vouched for, so nothing in it authorizes anything.
+pub const UNVERIFIABLE_LOGIN_TOKEN_MESSAGE: &str =
+    "Invalid login token. Couldn't verify signed token.";
+
+/// Why a token presented under [`COGNITO_IDENTITY_LOGIN_PROVIDER`] authorizes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginTokenRefusal {
+    /// The validity window the issuance recorded has closed.
+    Expired,
+    /// This service holds no issuance for the token.
+    Unverifiable,
+}
+
+impl LoginTokenRefusal {
+    /// The message the refusal carries.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Expired => EXPIRED_LOGIN_TOKEN_MESSAGE,
+            Self::Unverifiable => UNVERIFIABLE_LOGIN_TOKEN_MESSAGE,
+        }
+    }
+}
+
 /// The credentials `GetCredentialsForIdentity` issued for one identity. The id and the
 /// secrets are the emulator's own credential store's: a handler never constructs them.
 #[derive(Debug, Clone)]
@@ -628,6 +671,46 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         self.open_id_tokens
             .get(token)
             .filter(|issued| issued.expiration > now)
+    }
+
+    /// The issuance a token presented under [`COGNITO_IDENTITY_LOGIN_PROVIDER`] resolves
+    /// to, or why it resolves to none: a token this service minted is honoured only INSIDE
+    /// the validity window its issuance recorded, and only when this service issued it at
+    /// all.
+    ///
+    /// The window is read from the token's OWN claims as well as from the record, because
+    /// the two are the same window ([`open_id_token`] writes the recorded instants into the
+    /// claims): a token whose record a sweep has already forgotten is still answered as the
+    /// expired token it is rather than as one this service never issued.
+    pub fn resolve_login_token(
+        &self,
+        token: &str,
+        now: SystemTime,
+    ) -> Result<&IssuedOpenIdToken, LoginTokenRefusal> {
+        if claimed_token_expiration(token).is_some_and(|expiration| expiration <= now) {
+            return Err(LoginTokenRefusal::Expired);
+        }
+        match self.open_id_tokens.get(token) {
+            Some(issued) if issued.expiration > now => Ok(issued),
+            Some(_) => Err(LoginTokenRefusal::Expired),
+            None => Err(LoginTokenRefusal::Unverifiable),
+        }
+    }
+
+    /// Why the `Logins` map of a request authorizes nothing, if so: every token it presents
+    /// under this service's own provider name has to resolve to an issuance whose window is
+    /// still open ([`Self::resolve_login_token`]). A map presenting none is decided by the
+    /// providers that issued its tokens, which this emulator does not reach, so it is not
+    /// refused here.
+    pub fn refuse_presented_login_tokens(
+        &self,
+        logins: &HashMap<String, String>,
+        now: SystemTime,
+    ) -> Option<LoginTokenRefusal> {
+        logins
+            .iter()
+            .filter(|(provider, _)| provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER)
+            .find_map(|(_, token)| self.resolve_login_token(token, now).err())
     }
 
     /// Mint an `IdentityPoolId` in `region` that no stored pool already uses.
@@ -936,6 +1019,41 @@ pub fn base64_url(bytes: &[u8]) -> String {
         .replace('/', "_")
         .trim_end_matches('=')
         .to_string()
+}
+
+/// The claim set a token this service minted carries, read back out of the token itself:
+/// the payload segment of the unsecured JWS [`open_id_token`] produced. `None` for a value
+/// that is not one of this service's tokens — one that is no compact JWS, one whose payload
+/// is not a JSON claim set, or one naming another issuer.
+///
+/// The reading is [`::service_common::jwt`], the tree's ONE bounded reading of a compact
+/// JWS, through the reader a service that MINTED the token it is reading calls: the tokens
+/// [`unsecured_jws`] produces carry no signature, which is the form that reader admits.
+/// Nothing is VERIFIED here and nothing is granted on what it reads — an unsecured token is
+/// one nothing signed, so the claim set is only ever read to REFUSE a token the service's
+/// own issuance registry also refuses.
+fn minted_token_claims(token: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
+    let read = ::service_common::jwt::read_unsecured(token).ok()?;
+    (read.claim_str(ISSUER_CLAIM) == Some(OIDC_TOKEN_ISSUER)).then_some(read.claims)
+}
+
+/// The claim naming who issued a token (RFC 7519 §4.1.1), which [`open_id_token`] writes
+/// this service's own issuer into.
+const ISSUER_CLAIM: &str = "iss";
+
+/// The claim naming the instant a token's validity window closes (RFC 7519 §4.1.4).
+const EXPIRATION_CLAIM: &str = "exp";
+
+/// The instant a token this service minted says its validity window closes at, from the
+/// `exp` claim [`open_id_token`] writes it into. `None` for a value that is not one of this
+/// service's tokens, or whose claim set carries no instant there.
+pub fn claimed_token_expiration(token: &str) -> Option<SystemTime> {
+    let seconds = minted_token_claims(token)?
+        .get(EXPIRATION_CLAIM)?
+        .as_u64()?;
+    // An instant past what this platform can represent is no instant the clock has
+    // reached, so it is answered as no window rather than overflowing.
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 
 /// `time` as whole seconds since the epoch, which is how a token claim carries an instant

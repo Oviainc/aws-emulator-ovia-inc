@@ -23,6 +23,11 @@
 //! refused — a token whose header names the unsecured algorithm of RFC 7519 §6 (`alg`
 //! `none`), or whose signature segment is empty, is one no issuer signed.
 //!
+//! A service that MINTED the token it is reading is the one case where that unsecured form
+//! is the expected one, because the emulator publishes no verification key to sign with:
+//! such a service reads its own token back through [`read_unsecured`], which applies every
+//! other rule here and leaves the issuer judgement to the claims.
+//!
 //! Services with their own copy of this reading — `service/jwt.rs` in
 //! `service-com-amazonaws-apigatewayv2-apigatewayv2` and `parse_service_account_token` in
 //! `service-com-amazonaws-eksauth-eksauthfrontend` — are to be MIGRATED onto it, each in
@@ -120,9 +125,39 @@ impl CompactJws {
 
 /// Read `presented` as a compact JWS and report its header and claim set.
 ///
+/// An UNSECURED token — one whose header names `alg` `none`, or whose signature segment is
+/// empty — is refused here ([`FormDefect::Unsecured`]): a value a caller presents as an
+/// ISSUER's token is one no issuer signed. A service reading back a token it minted ITSELF
+/// is the other case, and calls [`read_unsecured`].
+///
 /// Total: a value that is not a token is a [`FormDefect`], never a panic — nothing is
 /// indexed, sliced or unwrapped on the way through.
 pub fn read(presented: &str) -> Result<CompactJws, FormDefect> {
+    let (token, unsecured) = read_form(presented)?;
+    // Decidable from the token alone: an unsecured JWT (RFC 7519 §6) is one nothing
+    // signed, whatever its claims say.
+    if unsecured {
+        return Err(FormDefect::Unsecured);
+    }
+    Ok(token)
+}
+
+/// Read `presented` as a compact JWS and report its header and claim set, WITHOUT refusing
+/// the unsecured form.
+///
+/// The one reading a service makes of a token of its OWN minting. This emulator publishes no
+/// verification key, so a service that mints a token mints the form RFC 7515 §6 defines for
+/// a JWS carrying no signature; asked later what one of those tokens claims — the window it
+/// was minted for, the subject it names — that service reads it back through here, where
+/// every other form rule and the size bound are the ones [`read`] applies. Nothing is
+/// VERIFIED by either function: a claim read out of a value a caller supplied is evidence
+/// for refusing it, never for granting anything.
+pub fn read_unsecured(presented: &str) -> Result<CompactJws, FormDefect> {
+    read_form(presented).map(|(token, _)| token)
+}
+
+/// The form rule both readers apply: the token, with whether it is an UNSECURED one.
+fn read_form(presented: &str) -> Result<(CompactJws, bool), FormDefect> {
     let token = presented.trim();
     if token.is_empty() {
         return Err(FormDefect::Empty);
@@ -148,16 +183,15 @@ pub fn read(presented: &str) -> Result<CompactJws, FormDefect> {
         .ok_or(FormDefect::Algorithm)?
         .to_string();
     let claims = json_segment(claims).ok_or(FormDefect::Claims)?;
-    // Decidable from the token alone: an unsecured JWT (RFC 7519 §6) is one nothing
-    // signed, whatever its claims say.
-    if algorithm.eq_ignore_ascii_case(UNSECURED_ALGORITHM) || signature.is_empty() {
-        return Err(FormDefect::Unsecured);
-    }
-    Ok(CompactJws {
-        algorithm,
-        header,
-        claims,
-    })
+    let unsecured = algorithm.eq_ignore_ascii_case(UNSECURED_ALGORITHM) || signature.is_empty();
+    Ok((
+        CompactJws {
+            algorithm,
+            header,
+            claims,
+        },
+        unsecured,
+    ))
 }
 
 /// One base64url segment of a token, read as a JSON object. `None` when the segment is not
@@ -195,7 +229,7 @@ mod tests {
     //! behaviour — which refusal each defect becomes — is pinned by the suites of the
     //! services that call it.
 
-    use super::{read, CompactJws, FormDefect, MAX_TOKEN_BYTES};
+    use super::{read, read_unsecured, CompactJws, FormDefect, MAX_TOKEN_BYTES};
 
     /// One base64url segment (unpadded, as a compact JWS carries it) of `value`.
     fn segment(value: &str) -> String {
@@ -297,6 +331,78 @@ mod tests {
             assert!(
                 !expected.to_string().is_empty(),
                 "case {case:?}: every defect must render a reason"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsecured_token_reports_its_claims_only_to_the_reader_that_asks_for_one() {
+        // The rows differ along what makes a token unsecured, and in what a signed one does
+        // instead: the two readers must differ on exactly that and on nothing else.
+        let rows: Vec<(&str, String, bool)> = vec![
+            (
+                "the unsecured algorithm",
+                token(r#"{"alg":"none","typ":"JWT"}"#, r#"{"iss":"self","exp":42}"#),
+                false,
+            ),
+            (
+                "an empty signature segment",
+                format!(
+                    "{}.{}.",
+                    segment(r#"{"alg":"none","typ":"JWT"}"#),
+                    segment(r#"{"iss":"self","exp":42}"#)
+                ),
+                false,
+            ),
+            (
+                "a signed token",
+                token(r#"{"alg":"RS256","typ":"JWT"}"#, r#"{"iss":"self","exp":42}"#),
+                true,
+            ),
+        ];
+
+        for (case, presented, signed) in rows {
+            let unsecured_read = read_unsecured(&presented)
+                .unwrap_or_else(|defect| panic!("case {case:?}: expected a claim set, got {defect:?}"));
+            assert_eq!(
+                unsecured_read.claims.get("exp").and_then(::serde_json::Value::as_u64),
+                Some(42),
+                "case {case:?}: the claim set must be reported, got {:?}",
+                unsecured_read.claims
+            );
+            let signed_read = read(&presented);
+            assert_eq!(
+                signed_read.is_ok(),
+                signed,
+                "case {case:?}: expected read() to accept == {signed}, got {signed_read:?}"
+            );
+            if !signed {
+                assert_eq!(
+                    read(&presented).err(),
+                    Some(FormDefect::Unsecured),
+                    "case {case:?}: an unsecured token is refused as unsecured"
+                );
+            }
+        }
+
+        // Every OTHER form defect is the same for both readers: neither reads a value that
+        // is no token at all.
+        for (case, presented) in [
+            ("empty", String::new()),
+            ("no segments", "opaque-value".to_string()),
+            (
+                "claims not JSON",
+                format!(
+                    "{}.{}.",
+                    segment(r#"{"alg":"none"}"#),
+                    segment("not json")
+                ),
+            ),
+        ] {
+            assert!(
+                read_unsecured(&presented).is_err(),
+                "case {case:?}: a value that is no token must be refused, got {:?}",
+                read_unsecured(&presented)
             );
         }
     }

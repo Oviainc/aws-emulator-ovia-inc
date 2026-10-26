@@ -27,6 +27,17 @@
 //! authenticated one, and the pool's `authenticated` role is the one assumed, which is
 //! also the `amr` the trust-policy decision is made with.
 //!
+//! ## The login the exchange is made with
+//!
+//! An entry presented under this service's own provider name carries a token THIS service
+//! minted, so its validity window is one the service recorded and can read: such a token
+//! is a time-bounded credential and is honoured only inside that window. The window is
+//! read before any role is resolved and before any session is minted or handed back, and a
+//! request presenting a token whose window has closed — or one this service cannot resolve
+//! at all — is answered with the modelled `NotAuthorizedException` (HTTP 403) instead of a
+//! credential. A token of any other provider is decided by the provider that issued it,
+//! which this emulator does not reach.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -218,8 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Logins` provider NAMES a request presented, in the order the map holds them. The
-/// tokens themselves are the caller's secrets and are never read out of the map here.
+/// The `Logins` provider NAMES a request presented, in the order the map holds them: what
+/// the audit record of a vend carries. The token VALUES are the caller's secrets, so none
+/// of them is recorded — the vend itself reads only the one presented under this service's
+/// own provider name, and only to decide whether its window is still open.
 fn login_providers(input: &GetCredentialsForIdentityInput) -> Vec<String> {
     input
         .logins
@@ -288,6 +301,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
                             message: Some(UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+
+                // A `Logins` entry made under THIS service's own provider name carries a
+                // token this service minted — "If the token is for
+                // cognito-identity.amazonaws.com, it will be passed through to Security
+                // Token Service with the appropriate role for the token" (this operation's
+                // own doc) — and such a token is a time-bounded credential: it buys an
+                // exchange only inside the validity window its issuance recorded. The
+                // window is read HERE, before any role is resolved and before any session
+                // is minted or handed back, so a token whose window the clock has closed —
+                // and a token this service cannot resolve at all — is refused rather than
+                // vended for.
+                if let Some(refusal) = store.refuse_presented_login_tokens(&logins, now) {
+                    return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(refusal.message().to_string()),
                         },
                     )
                     .into());

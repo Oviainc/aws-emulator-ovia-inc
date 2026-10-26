@@ -27,6 +27,8 @@ mod identity_pool_roles;
 mod identity_pool_roles_presence;
 #[path = "all/list_identity_pools.rs"]
 mod list_identity_pools;
+#[path = "all/login_token_window.rs"]
+mod login_token_window;
 #[path = "all/lookup_developer_identity.rs"]
 mod lookup_developer_identity;
 #[path = "all/open_id_token.rs"]
