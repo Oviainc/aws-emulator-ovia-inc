@@ -4604,6 +4604,84 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// The resources `workspace_name` CONTAINS, as `(resource kind, how many)`
+    /// pairs in one fixed order, listing only the kinds that hold at least one.
+    ///
+    /// These are the kinds a caller creates INSIDE a workspace and addresses as
+    /// resources of their own — each with its own create and its own delete — so
+    /// they are what a delete of the container has to find empty. The records
+    /// this store keys by a workspace but a caller cannot address one at a time
+    /// (a search, a query, an enrichment job, a dataset export job, a capture
+    /// source) are NOT contents in this sense: they are what running the
+    /// workspace produced, and they go with it in [`Self::forget_workspace`]. A
+    /// pipeline execution goes with its own PIPELINE
+    /// ([`Self::forget_pipeline`]), which is a content and so has to be gone
+    /// before the workspace can be deleted at all.
+    pub fn workspace_contents(&self, workspace_name: &str) -> Vec<(&'static str, usize)> {
+        let datasets = self
+            .datasets
+            .values()
+            .filter(|dataset| dataset.workspace_name.as_deref() == Some(workspace_name))
+            .count();
+        let pipelines = self
+            .pipelines
+            .keys()
+            .filter(|(workspace, _)| workspace == workspace_name)
+            .count();
+        let tasks = self
+            .tasks
+            .keys()
+            .filter(|(workspace, _)| workspace == workspace_name)
+            .count();
+        let applications = self
+            .applications
+            .values()
+            .filter(|application| application.workspace_name == workspace_name)
+            .count();
+        [
+            (RESOURCE_DATASET, datasets),
+            (RESOURCE_PIPELINE, pipelines),
+            (RESOURCE_TASK, tasks),
+            (RESOURCE_APPLICATION, applications),
+        ]
+        .into_iter()
+        .filter(|(_, held)| *held > 0)
+        .collect()
+    }
+
+    /// Forget a workspace and everything keyed off it: its tags (on the record),
+    /// the searches, asynchronous queries, enrichment jobs and dataset export
+    /// jobs started in it, the capture sources it holds together with the alias
+    /// index they resolve through, and the logging scope set for it.
+    ///
+    /// Each of those is addressable ONLY inside the workspace, so a workspace
+    /// this service no longer holds can leave none of them behind for a later
+    /// read — or for the per-workspace bounds those maps are capped by. The
+    /// logging options of the workspace scope go too, so a workspace later
+    /// created under the same name reports the default level rather than
+    /// inheriting what was set for the one that is gone; the
+    /// account-and-region-wide scope ([`ACCOUNT_LOGGING_SCOPE`]) is keyed under a
+    /// name no workspace can carry and so survives.
+    ///
+    /// The resources a caller addresses one at a time are NOT removed here:
+    /// [`Self::workspace_contents`] is what refuses a delete while any of them
+    /// stands.
+    pub fn forget_workspace(&mut self, workspace_name: &str) -> Option<WorkspaceRecord> {
+        let record = self.workspaces.remove(workspace_name)?;
+        self.searches
+            .retain(|(workspace, _), _| workspace != workspace_name);
+        self.queries
+            .retain(|(workspace, _), _| workspace != workspace_name);
+        self.enrichment_jobs
+            .retain(|(workspace, _), _| workspace != workspace_name);
+        self.dataset_export_jobs
+            .retain(|(workspace, _), _| workspace != workspace_name);
+        self.capture_sources.remove(workspace_name);
+        self.capture_source_aliases.remove(workspace_name);
+        self.logging_options.remove(workspace_name);
+        Some(record)
+    }
+
     /// Re-materialise every asset created from asset model `asset_model_id`
     /// against that model's CURRENT property and hierarchy definitions.
     ///
