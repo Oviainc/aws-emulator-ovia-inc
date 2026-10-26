@@ -69,7 +69,8 @@ use crate::ops::types::{
     DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
     GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
     PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
-    ServerlessV2ScalingConfigurationInfo, Subnet, Tag, VpcSecurityGroupMembership,
+    ServerlessV2ScalingConfigurationInfo, SourceNotFoundFault, Subnet, Tag,
+    VpcSecurityGroupMembership,
 };
 
 // The catalog of engine parameters each family publishes, and the rules over it, are
@@ -5197,6 +5198,20 @@ pub fn check_event_subscription_source_type(source_type: &str) -> Result<(), Str
         "invalid value {source_type} for SourceType: must be one of {}",
         EVENT_SUBSCRIPTION_SOURCE_TYPES.join(", ")
     ))
+}
+
+/// The `SourceNotFoundFault` this service answers a request that names an event source
+/// which does not exist, built HERE so every handler that resolves a source identifier
+/// words the one fault the same way.
+///
+/// Its text is fixed — `Could not find source :` — and its only variable part is the
+/// identifier the request supplied, carried verbatim: RDS interpolates neither the source
+/// type the identifier was resolved against nor the region the call was signed for, and
+/// appends no trailing period.
+pub fn source_not_found(source_identifier: &str) -> SourceNotFoundFault {
+    SourceNotFoundFault {
+        message: Some(format!("Could not find source :{source_identifier}")),
+    }
 }
 
 /// The categories of `source_type` a subscription may subscribe to, with the one that

@@ -201,16 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The identifier is resolved against the stored resources of the subscription's
         // source type: a source that does not exist is one no event could ever come from,
-        // which is the modelled `SourceNotFoundFault`.
+        // which is the modelled `SourceNotFoundFault`. Its wording comes from the one
+        // shared constructor, so every handler that resolves a source identifier answers
+        // the same text: the identifier the request named, and nothing else.
         if let Some(stored) = store.event_source_identifiers_in(&region, &source_type) {
             if !stored.contains(&source_identifier) {
                 return Err(
                     AddSourceIdentifierToSubscriptionErrorModeled::SourceNotFoundFault(
-                        SourceNotFoundFault {
-                            message: Some(format!(
-                                "{source_type} {source_identifier} not found in {region}"
-                            )),
-                        },
+                        crate::state::source_not_found(&source_identifier),
                     )
                     .into(),
                 );

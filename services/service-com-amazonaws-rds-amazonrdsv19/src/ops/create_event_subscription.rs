@@ -348,7 +348,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEventSubscr
 
         // Each `SourceIds` entry is resolved against the stored resources of its source
         // type: a subscription whose source does not exist is one no event could ever
-        // match.
+        // match. The refusal is worded by the one shared constructor, so this path and
+        // every other that resolves a source identifier answer the same text.
         if let Some(source_type) = &source_type {
             if let Some(stored) = store.event_source_identifiers_in(&region, source_type) {
                 if let Some(missing) = source_ids
@@ -356,11 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEventSubscr
                     .find(|source_id| !stored.contains(source_id))
                 {
                     return Err(CreateEventSubscriptionErrorModeled::SourceNotFoundFault(
-                        SourceNotFoundFault {
-                            message: Some(format!(
-                                "{source_type} {missing} not found in {region}"
-                            )),
-                        },
+                        crate::state::source_not_found(missing),
                     )
                     .into());
                 }
