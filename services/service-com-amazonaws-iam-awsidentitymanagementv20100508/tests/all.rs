@@ -153,6 +153,8 @@ mod service_specific_credential_status;
 mod service_specific_credentials;
 #[path = "all/simulated_principal_sources.rs"]
 mod simulated_principal_sources;
+#[path = "all/simulated_resource_policy.rs"]
+mod simulated_resource_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/user_attached_policies.rs"]

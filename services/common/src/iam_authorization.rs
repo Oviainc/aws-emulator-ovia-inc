@@ -26,6 +26,11 @@
 //!   than "refused" — the identity-based and resource-based decisions are combined by
 //!   [`is_allowed`], where either grant suffices and a single deny refuses.
 //!
+//! A caller that must also report WHICH statements produced the decision — the IAM policy
+//! simulator, whose response attributes an allow or a deny to the document it came from —
+//! asks through [`identity_outcome_prepared`] / [`resource_outcome_prepared`], which answer
+//! that same decision together with the statements it was reached from ([`Outcome`]).
+//!
 //! `Action`/`NotAction`, `Resource`/`NotResource` and `Principal`/`NotPrincipal` are each
 //! either one string or a list of them, and the `Not…` spelling matches everything its
 //! values do NOT. IAM compares action names case-insensitively and resource ARNs
@@ -133,7 +138,7 @@ const BOOL_OPERATOR: &str = "Bool";
 pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 
 /// What one set of policy documents says about a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Decision {
     /// At least one statement about the request is an `Allow`, and none is a `Deny`.
     Allowed,
@@ -141,7 +146,38 @@ pub enum Decision {
     Denied,
     /// No statement is about the request at all (or the only ones that are cannot be
     /// decided): these documents neither grant nor refuse.
+    #[default]
     NotStated,
+}
+
+/// One statement that CONTRIBUTED to a decision, as WHERE it was read from.
+///
+/// Nothing here names a policy: which document of the set is which policy is the
+/// caller's own knowledge — it passed them — so a caller reporting the attribution
+/// names the documents in its own vocabulary rather than in this module's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchedStatement {
+    /// Which document of the set the decision was made from, counted from zero in the
+    /// order the caller passed them.
+    pub document: usize,
+    /// Which statement of that document's `Statement` element, counted from zero in
+    /// document order.
+    pub statement: usize,
+}
+
+/// What a set of documents decided, together with the statements that decided it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// The decision itself: the same answer [`identity_decision_prepared`] gives for the
+    /// same documents and request.
+    pub decision: Decision,
+    /// The statements the decision was reached from, in document order: the DENYING ones
+    /// when it is [`Decision::Denied`] — "even if multiple statements allow the operation
+    /// on the resource, if only one statement denies that operation, then the explicit
+    /// deny overrides any allow. In addition, the deny statement is the only entry
+    /// included in the result" — the ALLOWING ones when it is [`Decision::Allowed`], and
+    /// none when the documents state nothing about the request.
+    pub matched: Vec<MatchedStatement>,
 }
 
 /// The access request a decision is made about.
@@ -257,16 +293,33 @@ pub fn identity_decision_prepared(
     documents: &[PreparedDocument],
     request: &Request<'_>,
 ) -> Decision {
-    combine(
-        documents
-            .iter()
-            .map(|document| decide(document, request, Flavor::Identity)),
-    )
+    identity_outcome_prepared(documents, request).decision
 }
 
 /// What the resource's own resource-based policy says about the request.
 pub fn resource_decision(document: &str, request: &Request<'_>) -> Decision {
-    decide(&PreparedDocument::read(document), request, Flavor::Resource)
+    resource_outcome_prepared(&PreparedDocument::read(document), request).decision
+}
+
+/// [`identity_decision_prepared`], with the statements the decision was reached from.
+///
+/// For a caller that must also report WHICH documents produced the decision — the IAM
+/// policy simulator attributes an allow or a deny to the policy it came from — rather
+/// than only what the decision is. The decision is the SAME one
+/// [`identity_decision_prepared`] gives: both come from this one walk.
+#[must_use]
+pub fn identity_outcome_prepared(
+    documents: &[PreparedDocument],
+    request: &Request<'_>,
+) -> Outcome {
+    outcome(documents, request, Flavor::Identity)
+}
+
+/// [`resource_decision`] over a document already read, with the statements the decision
+/// was reached from. The one document is document `0` of the outcome.
+#[must_use]
+pub fn resource_outcome_prepared(document: &PreparedDocument, request: &Request<'_>) -> Outcome {
+    outcome(::std::slice::from_ref(document), request, Flavor::Resource)
 }
 
 /// Whether the request is allowed, given the two decisions.
@@ -281,6 +334,40 @@ pub fn is_allowed(identity: Decision, resource: Decision) -> bool {
         return false;
     }
     identity == Decision::Allowed || resource == Decision::Allowed
+}
+
+/// The spellings a policy's `Principal`/`NotPrincipal` element names a whole ACCOUNT by:
+/// that account's root ARN and its bare account id.
+///
+/// `arn` is any ARN of a principal in the account — the account and the partition are read
+/// out of it through the tree's one ARN parse ([`super::arn::parse`]), so a principal in
+/// another partition is answered in that partition. An ARN this cannot read, or one
+/// carrying no account, names no account and is answered with no spellings rather than a
+/// guess.
+///
+/// Naming the ACCOUNT is not naming a principal, which is why the two sets are separate:
+/// IAM reads a resource statement that ALLOWS an account as delegating the decision to
+/// that account's own identity-based policies ("the default key policy … gives the Amazon
+/// Web Services account that owns the KMS key permission to use it"), while one that
+/// DENIES the account refuses each of its principals. So a caller decides a DENY with
+/// these spellings beside the principal's own, and a GRANT with the principal's alone.
+///
+/// `service-com-amazonaws-sqs-amazonsqs/src/state/authorization.rs` and
+/// `…/src/state/encryption.rs` each still carry their own spelling of the account root,
+/// inlined before this one existed and pinned by that service's suites; they are to be
+/// migrated onto this rather than copied again.
+#[must_use]
+pub fn account_principals(arn: &str) -> Vec<String> {
+    let Some(parsed) = super::arn::parse(arn) else {
+        return Vec::new();
+    };
+    if parsed.account.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("arn:{}:iam::{}:root", parsed.partition, parsed.account),
+        parsed.account.to_string(),
+    ]
 }
 
 /// Whether `pattern` matches `value`, with IAM's `*` (any run of characters, including
@@ -338,21 +425,55 @@ pub fn wildcard_match(pattern: &str, value: &str, case_sensitive: bool) -> bool 
     pattern[pattern_at..].iter().all(|glyph| *glyph == '*')
 }
 
-/// The decision ONE document reaches about the request.
-fn decide(document: &PreparedDocument, request: &Request<'_>, flavor: Flavor) -> Decision {
+/// What one SET of documents decides about the request, and which of their statements
+/// decided it.
+///
+/// The ONE walk every answer this module gives comes from, so a caller reading the
+/// attribution can never be told a decision the attribution does not support: a `Deny`
+/// among the statements about the request wins over every `Allow`, whichever document and
+/// whichever order they are written in, and is then the only thing the decision came from.
+fn outcome(documents: &[PreparedDocument], request: &Request<'_>, flavor: Flavor) -> Outcome {
+    let mut applying: Vec<(bool, MatchedStatement)> = Vec::new();
+    for (position, document) in documents.iter().enumerate() {
+        collect_applying(document, request, flavor, position, &mut applying);
+    }
+    let denied = applying.iter().any(|(denies, _)| *denies);
+    let decision = match (denied, applying.is_empty()) {
+        (true, _) => Decision::Denied,
+        (false, false) => Decision::Allowed,
+        (false, true) => Decision::NotStated,
+    };
+    Outcome {
+        decision,
+        matched: applying
+            .into_iter()
+            .filter(|(denies, _)| *denies == denied)
+            .map(|(_, matched)| matched)
+            .collect(),
+    }
+}
+
+/// Every statement of ONE document that APPLIES to the request, pushed onto `into` in
+/// document order as `(whether it denies, where it was read from)`.
+fn collect_applying(
+    document: &PreparedDocument,
+    request: &Request<'_>,
+    flavor: Flavor,
+    position: usize,
+    into: &mut Vec<(bool, MatchedStatement)>,
+) {
     let Some(policy) = document.policy.as_ref() else {
         // Not a policy this can be read out of: it states nothing.
-        return Decision::NotStated;
+        return;
     };
     let statement = &policy["Statement"];
     let statements: Vec<&::serde_json::Value> = match statement {
         ::serde_json::Value::Array(entries) => entries.iter().collect(),
         ::serde_json::Value::Object(_) => vec![statement],
-        _ => return Decision::NotStated,
+        _ => return,
     };
 
-    let mut allowed = false;
-    for entry in statements {
+    for (at, entry) in statements.into_iter().enumerate() {
         let effect = entry["Effect"].as_str().unwrap_or_default();
         let denies = effect.eq_ignore_ascii_case("Deny");
         let allows = effect.eq_ignore_ascii_case("Allow");
@@ -374,33 +495,13 @@ fn decide(document: &PreparedDocument, request: &Request<'_>, flavor: Flavor) ->
             None if allows => continue,
             _ => {}
         }
-        if denies {
-            return Decision::Denied;
-        }
-        allowed = true;
-    }
-    if allowed {
-        Decision::Allowed
-    } else {
-        Decision::NotStated
-    }
-}
-
-/// Fold the per-document decisions of one document SET: a `Deny` anywhere wins, otherwise
-/// an `Allow` anywhere grants.
-fn combine(decisions: impl IntoIterator<Item = Decision>) -> Decision {
-    let mut allowed = false;
-    for decision in decisions {
-        match decision {
-            Decision::Denied => return Decision::Denied,
-            Decision::Allowed => allowed = true,
-            Decision::NotStated => {}
-        }
-    }
-    if allowed {
-        Decision::Allowed
-    } else {
-        Decision::NotStated
+        into.push((
+            denies,
+            MatchedStatement {
+                document: position,
+                statement: at,
+            },
+        ));
     }
 }
 
@@ -1249,6 +1350,57 @@ mod tests {
                 matched, expected,
                 "case {case:?}: {pattern:?} against {value:?} (case_sensitive={case_sensitive}) \
                  expected {expected}, got {matched}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_accounts_spellings_come_from_the_principals_own_arn() {
+        let rows: [(&str, &str, Vec<String>); 6] = [
+            (
+                "a user of the commercial partition",
+                "arn:aws:iam::000000000000:user/writer",
+                vec![
+                    "arn:aws:iam::000000000000:root".to_string(),
+                    "000000000000".to_string(),
+                ],
+            ),
+            (
+                "a role under a path",
+                "arn:aws:iam::123456789012:role/team/writer",
+                vec![
+                    "arn:aws:iam::123456789012:root".to_string(),
+                    "123456789012".to_string(),
+                ],
+            ),
+            (
+                "an assumed-role session of another service's namespace",
+                "arn:aws:sts::123456789012:assumed-role/writer/session",
+                vec![
+                    "arn:aws:iam::123456789012:root".to_string(),
+                    "123456789012".to_string(),
+                ],
+            ),
+            (
+                "another partition keeps its own",
+                "arn:aws-cn:iam::123456789012:user/writer",
+                vec![
+                    "arn:aws-cn:iam::123456789012:root".to_string(),
+                    "123456789012".to_string(),
+                ],
+            ),
+            (
+                "an account-less ARN names no account",
+                "arn:aws:s3:::reports/june.csv",
+                Vec::new(),
+            ),
+            ("not an ARN at all", "writer", Vec::new()),
+        ];
+        for (case, arn, expected) in rows {
+            let spellings = account_principals(arn);
+            assert_eq!(
+                spellings, expected,
+                "case {case:?}: expected {expected:?}, got {spellings:?}"
             );
         }
     }

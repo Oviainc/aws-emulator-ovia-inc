@@ -30,7 +30,7 @@ pub(crate) const EXPLICIT_DENY: &str = "explicitDeny";
 pub(crate) const IMPLICIT_DENY: &str = "implicitDeny";
 
 /// Create a user carrying `policies`, answering the ARN the account holds it under.
-async fn principal(
+pub(crate) async fn principal(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
@@ -64,8 +64,9 @@ async fn principal(
 /// One `SimulatePrincipalPolicy` call, with the list members the query protocol
 /// flattens into `<member>.N` parameters.
 ///
-/// Shared with the sibling simulation suite
-/// (`tests/all/simulated_principal_sources.rs`), so a simulation request is built
+/// Shared with the sibling simulation suites
+/// (`tests/all/simulated_principal_sources.rs`,
+/// `tests/all/simulated_resource_policy.rs`), so a simulation request is built
 /// exactly one way.
 pub(crate) async fn simulate(
     router: &MultiServiceRouter,

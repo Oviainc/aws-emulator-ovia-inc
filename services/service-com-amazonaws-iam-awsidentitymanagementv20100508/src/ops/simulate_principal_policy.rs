@@ -452,7 +452,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing — simulating a call neither performs it nor records it. The lock is
         // held only for the collection, so nothing else waits on it while the
         // decisions below are made.
-        let documents: Vec<String> = {
+        let (documents, sources): (Vec<String>, Vec<String>) = {
             let store = state.lock();
             let Some(carried) = store.principal_sourced_policies(&input.policy_source_arn) else {
                 return Err(SimulatePrincipalPolicyErrorModeled::NoSuchEntityException(
@@ -489,11 +489,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "An optional list of additional policy documents to include in the
             // simulation": the principal's own documents TOGETHER with the supplied
-            // ones.
+            // ones. Each is collected BESIDE the identifier the response names it by, so
+            // a decision reached from a document can be attributed to that document
+            // ([`source_policy_id`]).
             kept.into_iter()
-                .filter_map(|policy| policy.document)
-                .chain(supplied)
-                .collect()
+                .filter_map(|policy| {
+                    let crate::state::SourcedPolicy { source, document } = policy;
+                    document.map(|document| (document, source_policy_id(&source)))
+                })
+                .chain(supplied.into_iter().enumerate().map(|(at, document)| {
+                    (document, format!("{SUPPLIED_POLICY_ID}.{}", at + 1))
+                }))
+                .unzip()
         };
 
         // "Whenever a context key is evaluated in one of the simulated IAM permissions
@@ -568,6 +575,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
         let prepared_boundary = ::service_common::iam_authorization::prepare_documents(&boundary);
+        // "A resource-based policy to include in the simulation provided as a string.
+        // Each resource in the simulation is treated as if it had this policy attached":
+        // ONE document, read once here rather than per (action, resource) pair.
+        let prepared_resource_policy = input
+            .resource_policy
+            .as_deref()
+            .map(::service_common::iam_authorization::PreparedDocument::read);
+        // "The ARN of the IAM user, group, or role that you want to specify as the
+        // simulated caller of the API operations. If you do not specify a CallerArn, it
+        // defaults to the ARN of the user, group, or role that you specify in
+        // PolicySourceArn": the simulation HAS a principal identity, and it is that
+        // identity a resource-based statement's `Principal` element is matched against —
+        // the policies in force are still the ones `PolicySourceArn` carries, "as if Bob
+        // had David's policies".
+        let caller_arn = input
+            .caller_arn
+            .as_deref()
+            .unwrap_or(&input.policy_source_arn)
+            .to_string();
+        let granting_principals = [caller_arn.clone()];
+        // The caller's own spelling PLUS the ones naming its account
+        // ([`service_common::iam_authorization::account_principals`]): a statement that
+        // denies the account denies each of its principals, so a DENY is decided under
+        // these, while a statement that allows the account root hands the decision to
+        // that account's identity-based policies rather than granting by itself, so a
+        // GRANT is decided under the caller's own spelling alone.
+        let mut denying_principals = vec![caller_arn.clone()];
+        denying_principals.extend(::service_common::iam_authorization::account_principals(
+            &caller_arn,
+        ));
+        let simulated = Simulated {
+            documents: &prepared,
+            sources: &sources,
+            boundary: &prepared_boundary,
+            no_boundary: boundary.is_empty(),
+            resource_policy: prepared_resource_policy.as_ref(),
+            granting_principals: &granting_principals,
+            denying_principals: &denying_principals,
+            context: &context,
+        };
         // One result per action, and the page is taken BEFORE anything is decided, so a
         // request asking about many actions does the work of the page it asked for
         // rather than of the whole list.
@@ -582,16 +629,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for action in paged {
             let mut per_resource: Vec<ResourceSpecificResult> = Vec::new();
             for resource in &resources {
-                let decided = decide(
-                    &prepared,
-                    &prepared_boundary,
-                    boundary.is_empty(),
-                    action,
-                    resource,
-                    input.resource_policy.as_deref(),
-                    &context,
-                );
-                per_resource.push(decided);
+                per_resource.push(decide(&simulated, action, resource));
                 decided_pairs += 1;
                 // The evaluation is synchronous work inside an async handler, so it
                 // hands the executor back periodically: one simulation never holds a
@@ -613,6 +651,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             let first = per_resource.first().cloned().unwrap_or_default();
+            // "In the top-level result, this field contains the union of matched
+            // statements across all requested resources" — so the statements the
+            // action's own result reports are every resource's, each named once.
+            let mut matched: Vec<Statement> = Vec::new();
+            for result in &per_resource {
+                for entry in result.matched_statements.iter().flatten() {
+                    report_once(&mut matched, entry.clone());
+                }
+            }
             results.push(EvaluationResult {
                 eval_action_name: action.clone(),
                 eval_resource_name: Some(first.eval_resource_name.clone()),
@@ -622,11 +669,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .permissions_boundary_decision_detail
                     .clone(),
                 resource_specific_results: reports_each_resource.then_some(per_resource),
-                // `MatchedStatements` reports the SOURCE POSITION (line and column) of
-                // each statement that matched, which the shared evaluator does not
-                // track; reporting a position that was not measured would be worse
-                // than reporting none, so the member is left absent.
-                matched_statements: None,
+                matched_statements: Some(matched),
                 // This emulator models no organization, so nothing about one is
                 // reported, and `EvalDecisionDetails` is for a decision taken from
                 // several sources (an organization policy, a boundary), none of which
@@ -774,43 +817,71 @@ fn supplied_context_values(entries: Option<&[ContextEntry]>) -> usize {
         .sum()
 }
 
-/// What the documents in force decide about one `(action, resource)` pair.
+/// Everything one simulation decides every `(action, resource)` pair from: the documents
+/// in force, the identity the simulation is of, and the condition values the request
+/// carries. Read once per request rather than per pair.
+struct Simulated<'a> {
+    /// The identity-based documents in force: the simulated principal's own, then the
+    /// ones the request supplied.
+    documents: &'a [::service_common::iam_authorization::PreparedDocument],
+    /// How the response names each of those documents, one per entry of
+    /// [`Self::documents`] ([`source_policy_id`]).
+    sources: &'a [String],
+    /// The simulated permissions boundary's documents.
+    boundary: &'a [::service_common::iam_authorization::PreparedDocument],
+    /// Whether the request simulated no permissions boundary at all.
+    no_boundary: bool,
+    /// The resource-based policy the request supplied, when it supplied one.
+    resource_policy: Option<&'a ::service_common::iam_authorization::PreparedDocument>,
+    /// The spelling of the simulated caller a resource-based statement GRANTS to.
+    granting_principals: &'a [String],
+    /// The spellings a resource-based statement DENIES: the caller's own and its
+    /// account's (see the handler).
+    denying_principals: &'a [String],
+    /// The condition values the request supplied.
+    context: &'a [(String, String)],
+}
+
+/// What the documents in force decide about one `(action, resource)` pair, and which
+/// statements decided it.
 ///
 /// The decision is the shared evaluation's ([`service_common::iam_authorization`]):
 /// the identity-based documents and, when the request supplies one, the resource-based
-/// policy. A simulated permissions boundary bounds the result the way IAM's does — a
-/// request the boundary does not allow is denied, and the boundary can only take
-/// permission away, never grant it.
+/// policy — evaluated against the simulated caller, so a statement whose `Principal`
+/// element names that identity is one the simulation can match. A simulated permissions
+/// boundary bounds the result the way IAM's does — a request the boundary does not allow
+/// is denied, and the boundary can only take permission away, never grant it.
 ///
 /// `MissingContextValues` is not filled in here: the keys the request supplied no value
 /// for are the same for every pair, so the caller computes that list ONCE and reports it
 /// on each result rather than this deriving it per pair.
-#[allow(clippy::too_many_arguments)]
-fn decide(
-    documents: &[::service_common::iam_authorization::PreparedDocument],
-    boundary: &[::service_common::iam_authorization::PreparedDocument],
-    no_boundary: bool,
-    action: &str,
-    resource: &str,
-    resource_policy: Option<&str>,
-    context: &[(String, String)],
-) -> ResourceSpecificResult {
+fn decide(simulated: &Simulated<'_>, action: &str, resource: &str) -> ResourceSpecificResult {
     use ::service_common::iam_authorization as iam;
 
-    let principals: [String; 0] = [];
-    let request = iam::Request::new(action, resource, &principals).with_context(context);
-    let identity = iam::identity_decision_prepared(documents, &request);
-    let from_resource = match resource_policy {
-        Some(document) => iam::resource_decision(document, &request),
-        None => iam::Decision::NotStated,
+    let granting = iam::Request::new(action, resource, simulated.granting_principals)
+        .with_context(simulated.context);
+    let identity = iam::identity_outcome_prepared(simulated.documents, &granting);
+    let from_resource = match simulated.resource_policy {
+        Some(document) => {
+            let denying = iam::Request::new(action, resource, simulated.denying_principals)
+                .with_context(simulated.context);
+            let denied = iam::resource_outcome_prepared(document, &denying);
+            if denied.decision == iam::Decision::Denied {
+                denied
+            } else {
+                iam::resource_outcome_prepared(document, &granting)
+            }
+        }
+        None => iam::Outcome::default(),
     };
-    let decision = crate::state::authorization::decision_name(identity, from_resource);
+    let decision =
+        crate::state::authorization::decision_name(identity.decision, from_resource.decision);
 
     // "The permissions boundary sets the maximum permissions that the entity can
     // have": a request outside it is denied even where the identity policies allow it.
-    let allowed_by_boundary = no_boundary
+    let allowed_by_boundary = simulated.no_boundary
         || iam::is_allowed(
-            iam::identity_decision_prepared(boundary, &request),
+            iam::identity_decision_prepared(simulated.boundary, &granting),
             iam::Decision::NotStated,
         );
     let decision = if allowed_by_boundary
@@ -821,17 +892,120 @@ fn decide(
         crate::state::authorization::DECISION_IMPLICIT_DENY
     };
 
+    // "A list of the statements in the input policies that determine the result for this
+    // part of the simulation ... Only statements that contributed to the reported
+    // decision are included": the statements that DENIED when the reported decision is
+    // the explicit deny, the ones that GRANTED when it is the allow, and none at all for
+    // an implicit deny — nothing stated it, including one a permissions boundary caused,
+    // where the grant the boundary took away no longer determines the result.
+    let contributing = if decision == crate::state::authorization::DECISION_EXPLICIT_DENY {
+        Some(iam::Decision::Denied)
+    } else if decision == crate::state::authorization::DECISION_ALLOWED {
+        Some(iam::Decision::Allowed)
+    } else {
+        None
+    };
+    let mut matched: Vec<Statement> = Vec::new();
+    if let Some(contributing) = contributing {
+        if identity.decision == contributing {
+            for entry in &identity.matched {
+                report_once(
+                    &mut matched,
+                    statement_entry(
+                        simulated.sources.get(entry.document).cloned(),
+                        IDENTITY_POLICY_SOURCE,
+                    ),
+                );
+            }
+        }
+        if from_resource.decision == contributing && !from_resource.matched.is_empty() {
+            report_once(
+                &mut matched,
+                statement_entry(Some(RESOURCE_POLICY_ID.to_string()), RESOURCE_POLICY_SOURCE),
+            );
+        }
+    }
+
     ResourceSpecificResult {
         eval_resource_name: resource.to_string(),
         eval_resource_decision: decision.to_string(),
         // Filled in by the caller, from the one list it computed (see the docs above).
         missing_context_values: None,
-        matched_statements: None,
+        matched_statements: Some(matched),
         eval_decision_details: None,
-        permissions_boundary_decision_detail: (!no_boundary).then_some(
+        permissions_boundary_decision_detail: (!simulated.no_boundary).then_some(
             PermissionsBoundaryDecisionDetail {
                 allowed_by_permissions_boundary: allowed_by_boundary,
             },
         ),
+    }
+}
+
+/// How a `MatchedStatements` entry names an identity-based policy in force on the
+/// simulated principal (`Statement$SourcePolicyType`, "the type of the policy").
+///
+/// The two kinds of document a simulation decides from are the ones the operation takes:
+/// the identity-based policies (the principal's own and the ones supplied in
+/// `PolicyInputList`) and the single resource-based policy supplied in `ResourcePolicy` —
+/// which is the discriminator the member exists to give, "which policy type is
+/// responsible for an allow or deny decision".
+const IDENTITY_POLICY_SOURCE: &str = "IAM Policy";
+
+/// How a `MatchedStatements` entry names the resource-based policy the request supplied.
+/// See [`IDENTITY_POLICY_SOURCE`].
+const RESOURCE_POLICY_SOURCE: &str = "Resource Policy";
+
+/// How a `MatchedStatements` entry identifies the resource-based policy the request
+/// supplied (`Statement$SourcePolicyId`, "the identifier of the policy that was provided
+/// as an input"): the input member it arrived in, of which there is exactly one.
+const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
+
+/// How a `MatchedStatements` entry identifies a document the request supplied in
+/// `PolicyInputList`: that member and the document's position in it, counted from one.
+const SUPPLIED_POLICY_ID: &str = "PolicyInputList";
+
+/// How a `MatchedStatements` entry identifies one identity-based policy in force on the
+/// simulated principal: an inline policy by its own name, a managed policy by its
+/// friendly name — the names those policies were put and created under, so a caller
+/// reading the attribution can look the policy up again.
+fn source_policy_id(source: &crate::state::PolicySource) -> String {
+    match source {
+        crate::state::PolicySource::Inline { policy_name, .. } => policy_name.clone(),
+        crate::state::PolicySource::Managed { policy_arn, .. } => {
+            crate::state::parse_policy_arn(policy_arn)
+                .map(|parsed| parsed.policy_name)
+                .unwrap_or_else(|| policy_arn.clone())
+        }
+    }
+}
+
+/// One `MatchedStatements` entry: which policy a contributing statement is in, and of
+/// which kind.
+///
+/// `StartPosition`/`EndPosition` are "the row and column of the beginning/end of the
+/// Statement in an IAM policy", which nothing here measures — reporting a position that
+/// was not measured would be worse than reporting none, so they stay absent, and the
+/// source identification they are reported beside does not depend on them.
+fn statement_entry(source_policy_id: Option<String>, source_policy_type: &str) -> Statement {
+    Statement {
+        source_policy_id,
+        source_policy_type: Some(source_policy_type.to_string()),
+        start_position: None,
+        end_position: None,
+    }
+}
+
+/// Append `entry` to `into` unless the same policy is already named there.
+///
+/// Without the statement positions, two contributing statements of ONE policy are the
+/// same entry — the policy they are in and its kind — and the member is a list of what
+/// determined the result, so naming that policy twice would report a distinction the
+/// response does not carry.
+fn report_once(into: &mut Vec<Statement>, entry: Statement) {
+    if !into.iter().any(|held| {
+        held.source_policy_id == entry.source_policy_id
+            && held.source_policy_type == entry.source_policy_type
+    }) {
+        into.push(entry);
     }
 }
