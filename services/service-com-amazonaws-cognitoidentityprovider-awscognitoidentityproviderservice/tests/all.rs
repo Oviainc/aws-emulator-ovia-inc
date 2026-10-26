@@ -121,6 +121,8 @@ mod token_signing;
 mod ui_customization;
 #[path = "all/update_group.rs"]
 mod update_group;
+#[path = "all/update_identity_provider.rs"]
+mod update_identity_provider;
 #[path = "all/update_resource_server.rs"]
 mod update_resource_server;
 #[path = "all/update_terms.rs"]

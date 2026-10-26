@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIdentityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIdentityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIdentityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies a stored identity provider's configuration and returns the STORED
+//! provider, so a later `DescribeIdentityProvider` renders the same resource. A member
+//! the request carries replaces what the provider held, and one it leaves out keeps its
+//! stored value, while the provider's pool, name, type and creation instant are
+//! untouched. An unknown `UserPoolId` or `ProviderName` is refused with
+//! `ResourceNotFoundException`, and a submitted detail map an OIDC provider's endpoints
+//! cannot be resolved from with `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,20 +185,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIdentityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIdentityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let provider = pool
+            .identity_providers
+            .get_mut(&input.provider_name)
+            .ok_or_else(|| provider_not_found(&input.provider_name, &input.user_pool_id))?;
+
+        // This operation "modifies the configuration and trust relationship between a
+        // third-party identity provider (IdP) and a user pool"
+        // (`UpdateIdentityProvider`), so a member the request carries REPLACES what the
+        // provider held and a member it leaves out keeps its stored value: updating one
+        // part of the configuration never discards another. The provider's identity (its
+        // pool, its name and its type) is not a member of this input, so it stays exactly
+        // as `CreateIdentityProvider` stored it, and so does its creation instant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIdentityProvider"))
+        // `ProviderDetails` is submitted whole — the map the request carries becomes the
+        // provider's detail map rather than patching the stored one — so the endpoints
+        // the IdP is reached at are resolved from the submitted map alone, and resolved
+        // BEFORE anything is written: a refused update leaves the stored provider exactly
+        // as it was.
+        if let Some(details) = input.provider_details {
+            if provider.provider_type == OIDC_PROVIDER_TYPE {
+                resolve_oidc_endpoints(&details)?;
+            }
+            provider.provider_details = details;
+        }
+        if let Some(attribute_mapping) = input.attribute_mapping {
+            provider.attribute_mapping = attribute_mapping;
+        }
+        if let Some(idp_identifiers) = input.idp_identifiers {
+            provider.idp_identifiers = idp_identifiers;
+        }
+        if let Some(acr_mapping) = input.acr_mapping {
+            provider.acr_mapping = Some(acr_mapping);
+        }
+
+        // The provider was modified, so its last-modified instant advances.
+        provider.last_modified_date = now;
+
+        // Rendered from the STORED provider, so the response is exactly what a later
+        // read sees.
+        Ok(UpdateIdentityProviderOutput {
+            identity_provider: provider.to_identity_provider_type(),
+        })
     }
 }
+
+/// The `ProviderType` whose endpoints Amazon Cognito resolves from an OpenID Connect
+/// discovery document, one of the values
+/// [`super::types::IDENTITY_PROVIDER_TYPE_TYPE_VALUES`] lists.
+const OIDC_PROVIDER_TYPE: &str = "OIDC";
+
+/// The detail key naming the OIDC issuer whose discovery document carries the endpoints
+/// a request does not state (`ProviderDetails` in this service's model).
+const OIDC_ISSUER_KEY: &str = "oidc_issuer";
+
+/// The endpoints of an OIDC IdP: "Amazon Cognito accepts the following elements when it
+/// can't discover endpoint URLs from `oidc_issuer`: `attributes_url`, `authorize_url`,
+/// `jwks_uri`, `token_url`" (`ProviderDetails` in this service's model), in the order
+/// that sentence lists them.
+const OIDC_ENDPOINT_KEYS: [&str; 4] = ["attributes_url", "authorize_url", "jwks_uri", "token_url"];
+
+/// Resolve an OIDC IdP's endpoints from the detail map a request submitted.
+///
+/// A map that states all four endpoints resolves without reading anything from the IdP.
+/// A map that leaves any of them out is one Amazon Cognito has to read the rest from the
+/// issuer's discovery document, which means looking the issuer's host up; this emulator
+/// reaches no host but its own, so that lookup cannot succeed, and the host it could not
+/// reach is what the refusal reports. A map that names no issuer to read from has to
+/// state the endpoints itself, so the refusal names the keys it is missing.
+fn resolve_oidc_endpoints(
+    details: &::std::collections::HashMap<String, String>,
+) -> Result<(), UpdateIdentityProviderError> {
+    let undiscovered: Vec<&str> = OIDC_ENDPOINT_KEYS
+        .into_iter()
+        .filter(|key| stated(details, key).is_none())
+        .collect();
+    if undiscovered.is_empty() {
+        return Ok(());
+    }
+
+    match issuer_host(details) {
+        Some(host) => Err(invalid_parameter(host)),
+        None => {
+            let mut missing = undiscovered;
+            missing.push(OIDC_ISSUER_KEY);
+            missing.sort_unstable();
+            Err(invalid_parameter(format!(
+                "ProviderDetails must be provided with the following keys: [{}]",
+                missing.join(", ")
+            )))
+        }
+    }
+}
+
+/// The value `details` states for `key`, or `None` when the map carries no such key or
+/// carries it with nothing in it: a key with an empty value states no endpoint.
+fn stated<'a>(
+    details: &'a ::std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    details
+        .get(key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The host of the submitted `oidc_issuer`, which is the name a discovery read has to
+/// look up — the host of a locator, or a bare authority stated on its own. `None` when
+/// the details name no issuer, or name one carrying no host to look up.
+fn issuer_host(details: &::std::collections::HashMap<String, String>) -> Option<String> {
+    stated(details, OIDC_ISSUER_KEY)?
+        .parse::<::http::Uri>()
+        .ok()?
+        .host()
+        .map(ToString::to_string)
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateIdentityProviderError {
+    UpdateIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a provider name the pool does not
+/// hold, worded as every operation that resolves an IdP against a pool words it
+/// ([`crate::state::identity_provider_not_found_message`]).
+fn provider_not_found(provider_name: &str, user_pool_id: &str) -> UpdateIdentityProviderError {
+    UpdateIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::identity_provider_not_found_message(
+            provider_name,
+            user_pool_id,
+        )),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`.
+fn invalid_parameter(message: String) -> UpdateIdentityProviderError {
+    UpdateIdentityProviderErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateIdentityProviderError {
+    UpdateIdentityProviderErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
