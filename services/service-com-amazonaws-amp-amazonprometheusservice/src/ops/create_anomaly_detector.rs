@@ -263,8 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workspace.status_code == crate::state::STATUS_DELETING {
             return Err(CreateAnomalyDetectorErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "The workspace is {}; it cannot take new anomaly detectors",
+                    message: crate::state::workspace_refuses_new_detector_message(
                         crate::state::STATUS_DELETING,
                     ),
                     resource_id: workspace.workspace_id.clone(),
@@ -293,19 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateAnomalyDetectorErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: format!(
-                            "The workspace already holds the maximum of \
-                             {detector_quota} anomaly detectors"
-                        ),
+                        message: crate::state::anomaly_detector_quota_message(),
                         // The bound is per workspace, so the workspace is the resource
                         // that reached it.
                         resource_id: workspace_id,
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                         service_code: ctx.identity().signing_name().to_string(),
-                        // Named for what it bounds: a real quota code is an identifier
-                        // Service Quotas issues, which this emulator does not model and
-                        // so must not invent one of.
-                        quota_code: "AnomalyDetectorsPerWorkspace".to_string(),
+                        quota_code: crate::state::ANOMALY_DETECTOR_QUOTA_CODE.to_string(),
                     },
                 )
                 .into(),

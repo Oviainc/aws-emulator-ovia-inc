@@ -428,8 +428,10 @@ pub const ANOMALY_DETECTOR_RESOURCE_TYPE: &str = "AWS::APS::AnomalyDetector";
 /// rather than a second copy of the id.
 pub const ANOMALY_DETECTOR_NOT_FOUND_MESSAGE: &str = "Anomaly detector not found.";
 
-/// How many anomaly detectors one workspace holds before `CreateAnomalyDetector`
-/// refuses with the modelled `ServiceQuotaExceededException`.
+/// How many anomaly detectors one workspace holds before an operation that would bring
+/// another into existence — `CreateAnomalyDetector`, or `PutAnomalyDetector` addressing an
+/// id the workspace holds nothing for — refuses with the modelled
+/// `ServiceQuotaExceededException`.
 ///
 /// Amazon Managed Service for Prometheus publishes no fixed number here, and this
 /// emulator models neither Service Quotas nor an account's adjustments, so this is the
@@ -437,6 +439,31 @@ pub const ANOMALY_DETECTOR_NOT_FOUND_MESSAGE: &str = "Anomaly detector not found
 /// workspaces. It is what stops a workspace's detector map (and the client-token map
 /// the same deletion releases) growing without end.
 pub const ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA: usize = 1_000;
+
+/// The `quotaCode` the modelled `ServiceQuotaExceededException` reports when
+/// [`ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA`] is reached.
+///
+/// Named for what it bounds: a real quota code is an identifier Service Quotas issues,
+/// which this emulator does not model and so must not invent one of. Shared by both
+/// operations that can reach the bound, so they report the same code.
+pub const ANOMALY_DETECTOR_QUOTA_CODE: &str = "AnomalyDetectorsPerWorkspace";
+
+/// The `message` the modelled `ServiceQuotaExceededException` carries when a workspace
+/// already holds [`ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA`] anomaly detectors — one
+/// sentence for both operations that can reach that bound.
+pub fn anomaly_detector_quota_message() -> String {
+    format!(
+        "The workspace already holds the maximum of \
+         {ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA} anomaly detectors"
+    )
+}
+
+/// The `message` the modelled `ConflictException` carries when a workspace whose status
+/// does not allow new children is asked to take an anomaly detector — one sentence for
+/// both operations that can bring one into existence.
+pub fn workspace_refuses_new_detector_message(workspace_status: &str) -> String {
+    format!("The workspace is {workspace_status}; it cannot take new anomaly detectors")
+}
 
 /// How many scrapers this account holds before `CreateScraper` refuses with the modelled
 /// `ServiceQuotaExceededException`.
@@ -845,7 +872,10 @@ pub struct AnomalyDetector {
     /// The workspace this detector belongs to — the `ws-` segment of its ARN.
     pub workspace_id: String,
     pub arn: String,
-    /// `AnomalyDetectorDescription$alias` is **required**, so a detector always has one.
+    /// `AnomalyDetectorDescription$alias` is **required**, so a detector always has one:
+    /// the `alias` its `CreateAnomalyDetector` was given, or — for a detector brought into
+    /// existence by `PutAnomalyDetector`, whose request carries no `alias` member — the
+    /// `anomalyDetectorId` that call addressed it by, the only name its caller gave it.
     pub alias: String,
     pub evaluation_interval_in_seconds: i32,
     pub missing_data_action: Option<crate::ops::types::AnomalyDetectorMissingDataAction>,
@@ -863,10 +893,11 @@ pub struct AnomalyDetector {
     /// pending: `CREATING` becomes `ACTIVE`, `UPDATING` becomes `ACTIVE`, `DELETING`
     /// is removed.
     pub transition_due: Option<SystemTime>,
-    /// The `clientToken` of the update STILL PENDING on this detector, for the same
-    /// reason [`Scraper::update_token`] records a scraper's: replaying that exact call
+    /// The `clientToken` of the change STILL PENDING on this detector — the update a
+    /// `PutAnomalyDetector` applied, or the creation it performed — for the same reason
+    /// [`Scraper::update_token`] records a scraper's: replaying that exact call
     /// is the SAME request, so it answers from the record that call wrote instead of
-    /// applying the change twice. Cleared once the update settles, since the token then
+    /// applying the change twice. Cleared once the change settles, since the token then
     /// stands for no pending change.
     pub update_token: Option<String>,
 }
