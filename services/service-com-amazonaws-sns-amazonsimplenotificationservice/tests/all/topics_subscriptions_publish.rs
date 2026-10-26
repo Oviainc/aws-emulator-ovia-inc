@@ -1881,7 +1881,9 @@ async fn publish_enforces_the_documented_ordering_id_rule() {
     for (case, group, dedup, accepted) in cases {
         let mut params = vec![
             ("TopicArn", topic.as_str()),
-            ("Message", "m"),
+            // One body per case: the topic deduplicates on the body, so repeating one
+            // body would make every publish after the first a duplicate of it.
+            ("Message", *case),
             ("MessageGroupId", *group),
         ];
         if let Some(dedup) = dedup {

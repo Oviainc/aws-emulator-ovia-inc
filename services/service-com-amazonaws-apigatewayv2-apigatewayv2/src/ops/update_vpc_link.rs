@@ -172,6 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A link whose deprovisioning the clock already finished is no longer held by
+        // the account, so it is dropped before the lookup: a patch cannot resurrect a
+        // link a reader at the same instant no longer reports.
+        store.purge_deprovisioned_vpc_links();
+
         // The link is addressed by the `VpcLinkId` in the URI, so a request naming one no
         // stored link carries has nothing to patch.
         let Some(record) = store.vpc_links.get_mut(&input.vpc_link_id) else {
@@ -189,9 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A PATCH (`PATCH /v2/vpclinks/{VpcLinkId}`): `Name` is the only member this
         // operation takes, so one the request carries replaces the stored name and one it
         // omits leaves the stored name exactly as it was. Everything else about the link
-        // — its subnets, security groups, tags, creation time and the provisioning the
-        // clock owes it — is not an input here and is left untouched: renaming a link
-        // neither re-attaches its interfaces nor moves its status.
+        // — its subnets, security groups, tags, creation time and the provisioning or
+        // removal the clock owes it — is not an input here and is left untouched:
+        // renaming a link neither re-attaches its interfaces nor moves its status, and a
+        // link whose deletion was already accepted keeps the removal it is owed rather
+        // than being held back by the rename. A DELIBERATE choice, not an oversight: the
+        // operation models no error for "this link is going away", and the name is not
+        // what the teardown runs on.
         if let Some(name) = input.name {
             record.name = name;
         }

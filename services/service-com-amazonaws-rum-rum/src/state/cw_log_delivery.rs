@@ -40,8 +40,59 @@
 //! alone, because the telemetry already in it belongs to the account (the same reason
 //! b2bi's `DeleteProfile` leaves its group behind) and nothing documents RUM deleting a
 //! customer's logs.
+//!
+//! # The copies themselves
+//!
+//! Provisioning the group is only half of the contract: `CwLogEnabled` is "whether RUM
+//! sends a copy of this telemetry data to Amazon CloudWatch Logs in your account" and
+//! `CwLog$CwLogGroup` is "the name of the log group where the copies are stored", so a
+//! batch delivered by `PutRumEvents` to a monitor with delivery ON has to REACH that group
+//! — a client that reads the advertised name and then tails it
+//! (`logs:DescribeLogStreams`, `logs:GetLogEvents`, `logs:FilterLogEvents`) finds one log
+//! event per delivered RUM event. Storing the batch in this service's own buffer and
+//! advertising a group name is not the behaviour; the group has to receive something
+//! ([`deliver_events`]).
+//!
+//! Three choices the copy's shape rests on, because the model describes the copy only as
+//! "a copy of this telemetry data" and publishes no log schema for it:
+//!
+//! * the MESSAGE is one JSON object per delivered event, carrying the event exactly as the
+//!   batch delivered it beside the batch context it arrived with, every member spelled as
+//!   this service's own model spells it ([`copy_of`]);
+//! * the STREAM is the user session the batch came from ([`delivery_stream_name`]), since
+//!   "each PutRumEvents operation can send a batch of events from one user session", so one
+//!   session's copies accumulate in one stream across the batches it sends;
+//! * the log event's TIMESTAMP is the instant RUM delivered the copy, not the instant the
+//!   client says the event occurred. `RumEvent$timestamp` is "the exact time that this
+//!   event occurred" as measured by the sending application's own clock, which is neither
+//!   this emulator's nor CloudWatch Logs': an event stamped with it would be dropped by
+//!   CloudWatch Logs' ingestion window whenever the sender's clock is skewed or the batch
+//!   is replayed, and the copy would silently not exist. The event's own instant is carried
+//!   verbatim in the message, so a reader still sees when the event occurred.
+//!
+//! Delivery is BEST EFFORT, as it is for every vended-logs destination: a group the
+//! account has since deleted, or a write CloudWatch Logs refuses, loses the copies and is
+//! reported in this service's own tracing rather than failing the `PutRumEvents` call,
+//! which asked for none of this and whose own buffer already holds the batch.
 
-use super::authorization;
+use super::{authorization, StoredRumEvent};
+
+/// The most bytes ONE `PutLogEvents` batch may carry, from that operation's documented
+/// quota: "The maximum batch size is 1,048,576 bytes."
+const MAX_LOG_EVENT_BATCH_BYTES: usize = 1_048_576;
+
+/// What that quota charges per event beside its message: the batch size "is calculated as
+/// the sum of all event messages in UTF-8, plus 26 bytes for each log event".
+const LOG_EVENT_OVERHEAD_BYTES: usize = 26;
+
+/// The most events ONE `PutLogEvents` batch may carry, from the same quota: "The maximum
+/// number of log events in a batch is 10,000."
+const MAX_LOG_EVENTS_PER_BATCH: usize = 10_000;
+
+/// The most bytes ONE log event's message may carry, from the same quota: "Each log event
+/// can be no larger than 1 MB." A copy past it is one CloudWatch Logs refuses, so it is
+/// left out rather than taking the whole batch down with it.
+const MAX_LOG_EVENT_BYTES: usize = 1_048_576;
 
 /// A CloudWatch Logs client over the in-process callback into this same emulator.
 ///
@@ -124,4 +175,209 @@ pub async fn provision_log_group(
             ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string(),
         ),
     }
+}
+
+/// The log stream one batch's copies are written to: the user session the batch was
+/// collected from, and the app monitor's own id for a batch that named no session.
+///
+/// `UserDetails$sessionId` is "the session ID that the performance events are from" and
+/// one `PutRumEvents` call "can send a batch of events from one user session", so the
+/// session is what groups copies into a stream: the batches of one session accumulate in
+/// one stream, and two sessions never interleave in one. Both values are 36-character
+/// identifiers in the model, so neither carries a character a CloudWatch Logs stream name
+/// may not (`:` or `*`).
+pub fn delivery_stream_name(session_id: Option<&str>, app_monitor_id: &str) -> String {
+    session_id
+        .filter(|session| !session.is_empty())
+        .unwrap_or(app_monitor_id)
+        .to_string()
+}
+
+/// One delivered RUM event as the copy stored in the vended log group.
+///
+/// The event is carried exactly as the batch delivered it — the members
+/// `AppMonitorRecord`'s buffer already holds it under, which is the form
+/// `GetAppMonitorData` reports — with the context the batch arrived with beside it, each
+/// member spelled as this service's model spells it (`BatchId`, `Alias`,
+/// `AppMonitorDetails`, `UserDetails`). A MEMBER the batch did not carry is LEFT OUT
+/// rather than written as `null`, so nothing is reported that the client did not send;
+/// `AppMonitorDetails` and `UserDetails` are `@required` on the request, so each of those
+/// two structures is always present, carrying only the members the batch filled.
+pub fn copy_of(event: &StoredRumEvent) -> String {
+    let mut document = match ::serde_json::from_str(&event.event_json) {
+        // The stored event is a JSON object this service rendered, so this is the arm a
+        // copy takes; the other one keeps a document that somehow does not parse readable
+        // instead of dropping it.
+        Ok(::serde_json::Value::Object(members)) => members,
+        _ => {
+            let mut members = ::serde_json::Map::new();
+            members.insert(
+                "RumEvent".to_string(),
+                ::serde_json::Value::String(event.event_json.clone()),
+            );
+            members
+        }
+    };
+    document.insert(
+        "BatchId".to_string(),
+        ::serde_json::Value::String(event.batch_id.clone()),
+    );
+    if let Some(alias) = &event.alias {
+        document.insert(
+            "Alias".to_string(),
+            ::serde_json::Value::String(alias.clone()),
+        );
+    }
+    let mut details = ::serde_json::Map::new();
+    for (member, value) in [
+        ("name", &event.app_monitor_details.name),
+        ("id", &event.app_monitor_details.id),
+        ("version", &event.app_monitor_details.version),
+    ] {
+        if let Some(value) = value {
+            details.insert(
+                member.to_string(),
+                ::serde_json::Value::String(value.clone()),
+            );
+        }
+    }
+    document.insert(
+        "AppMonitorDetails".to_string(),
+        ::serde_json::Value::Object(details),
+    );
+    let mut user = ::serde_json::Map::new();
+    for (member, value) in [("userId", &event.user_id), ("sessionId", &event.session_id)] {
+        if let Some(value) = value {
+            user.insert(
+                member.to_string(),
+                ::serde_json::Value::String(value.clone()),
+            );
+        }
+    }
+    document.insert("UserDetails".to_string(), ::serde_json::Value::Object(user));
+    ::serde_json::Value::Object(document).to_string()
+}
+
+/// Write a copy of every event of one delivered batch into `log_group`, in the stream
+/// `log_stream` ([`delivery_stream_name`]).
+///
+/// The stream is created first (a stream that is already there is the one this session has
+/// been writing to), and the copies go out in batches within `PutLogEvents`' documented
+/// quotas, so a large batch delivers all of its copies instead of having one oversized
+/// request refused. Every copy carries the ONE delivery instant, which is both why no
+/// reordering is needed — a batch must be in chronological order — and what keeps the copy
+/// inside CloudWatch Logs' ingestion window.
+///
+/// Best effort and never fatal: see this module's header. Call it with NO state guard
+/// held — it awaits.
+pub async fn deliver_events(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    log_group: &str,
+    log_stream: &str,
+    events: &[StoredRumEvent],
+) {
+    if events.is_empty() {
+        return;
+    }
+    let delivered_at = epoch_millis(::std::time::SystemTime::now());
+    let client = logs_client(ctx, region);
+    match client
+        .create_log_stream()
+        .log_group_name(log_group)
+        .log_stream_name(log_stream)
+        .send()
+        .await
+    {
+        Ok(_) => {}
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|service| service.is_resource_already_exists_exception()) => {}
+        Err(error) => {
+            ::tracing::warn!(
+                log_group = %log_group,
+                log_stream = %log_stream,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the app monitor's log stream could not be created, so this batch is not \
+                 copied to CloudWatch Logs"
+            );
+            return;
+        }
+    }
+
+    let mut batch: Vec<::aws_sdk_cloudwatchlogs::types::InputLogEvent> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for event in events {
+        let message = copy_of(event);
+        if message.len() > MAX_LOG_EVENT_BYTES {
+            ::tracing::warn!(
+                log_group = %log_group,
+                log_stream = %log_stream,
+                bytes = message.len(),
+                limit = MAX_LOG_EVENT_BYTES,
+                "a delivered RUM event is larger than one log event may be, so it is not \
+                 copied to CloudWatch Logs"
+            );
+            continue;
+        }
+        let cost = message.len() + LOG_EVENT_OVERHEAD_BYTES;
+        if !batch.is_empty()
+            && (batch.len() >= MAX_LOG_EVENTS_PER_BATCH
+                || batch_bytes + cost > MAX_LOG_EVENT_BATCH_BYTES)
+        {
+            put_log_events(&client, log_group, log_stream, batch).await;
+            batch = Vec::new();
+            batch_bytes = 0;
+        }
+        let Ok(input_event) = ::aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
+            .timestamp(delivered_at)
+            .message(message)
+            .build()
+        else {
+            continue;
+        };
+        batch_bytes += cost;
+        batch.push(input_event);
+    }
+    if !batch.is_empty() {
+        put_log_events(&client, log_group, log_stream, batch).await;
+    }
+}
+
+/// Send ONE batch of copies to `log_group`/`log_stream`, tracing a refusal rather than
+/// failing the `PutRumEvents` call that produced them.
+async fn put_log_events(
+    client: &::aws_sdk_cloudwatchlogs::Client,
+    log_group: &str,
+    log_stream: &str,
+    events: Vec<::aws_sdk_cloudwatchlogs::types::InputLogEvent>,
+) {
+    let count = events.len();
+    if let Err(error) = client
+        .put_log_events()
+        .log_group_name(log_group)
+        .log_stream_name(log_stream)
+        .set_log_events(Some(events))
+        .send()
+        .await
+    {
+        ::tracing::warn!(
+            log_group = %log_group,
+            log_stream = %log_stream,
+            events = count,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the app monitor's telemetry could not be copied to CloudWatch Logs"
+        );
+    }
+}
+
+/// `at` in milliseconds since the Unix epoch, which is the stamp a log event carries.
+///
+/// An instant before the epoch, which no log event can carry, clamps to the epoch rather
+/// than wrapping.
+fn epoch_millis(at: ::std::time::SystemTime) -> i64 {
+    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }

@@ -230,15 +230,6 @@ fn lookup_refusal(
     }
 }
 
-/// Whether `left` is a sequence number no larger than `right`.
-///
-/// `SequenceNumber` is a decimal integer without leading zeros (`^(0|([1-9]\d{0,128}))$`),
-/// which is wider than any integer type this crate holds — so the comparison is by digit
-/// COUNT first and then lexicographic, which for that form is the numeric order.
-fn sequence_number_le(left: &str, right: &str) -> bool {
-    (left.len(), left) <= (right.len(), right)
-}
-
 /// Where in the shard the request asks to start, refusing a request whose members its own
 /// `ShardIteratorType` does not admit.
 ///
@@ -249,11 +240,17 @@ fn sequence_number_le(left: &str, right: &str) -> bool {
 /// Timestamp" — so a request that omits that member names no position, and one that carries
 /// a member its type does not read is refused rather than answered with a position it did
 /// not ask for.
+///
+/// `LATEST` is PINNED here rather than resolved when the records are read: "LATEST - Start
+/// reading just after the most recent record in the shard" names the most recent record at
+/// the instant the iterator is handed out, so a record written afterwards is read by that
+/// iterator rather than skipped by it.
 fn requested_position(
     input: &GetShardIteratorInput,
     shard: &crate::state::ShardRecord,
-    trim_horizon_millis: u128,
+    trim_horizon: ::std::time::SystemTime,
 ) -> Result<crate::state::ShardPosition, GetShardIteratorError> {
+    let trim_horizon_millis = crate::state::epoch_millis(trim_horizon);
     let iterator_type = input.shard_iterator_type.as_str();
     // `ShardIteratorType` is a modelled enum, so the request walk refuses an unknown value
     // before this handler runs; this states the same refusal for a caller that reaches the
@@ -293,11 +290,16 @@ fn requested_position(
         // A sequence number is "the identifier associated with every record ingested in the
         // stream", and every one a shard can hold lies inside the range the shard publishes
         // (`Shard$SequenceNumberRange`): a value outside it names a position in no shard.
-        let inside = sequence_number_le(&shard.starting_sequence_number, sequence_number)
+        let inside = crate::state::sequence_number_le(
+            &shard.starting_sequence_number,
+            sequence_number,
+        )
             && shard
                 .ending_sequence_number
                 .as_deref()
-                .is_none_or(|ending| sequence_number_le(sequence_number, ending));
+                .is_none_or(|ending| {
+                    crate::state::sequence_number_le(sequence_number, ending)
+                });
         if !inside {
             return Err(invalid_argument(format!(
                 "StartingSequenceNumber {sequence_number} is not a sequence number of shard \
@@ -334,13 +336,18 @@ fn requested_position(
             crate::state::ShardPosition::AtTimestamp(millis)
         });
     }
-    Ok(
-        if iterator_type == crate::state::SHARD_ITERATOR_TYPE_TRIM_HORIZON {
-            crate::state::ShardPosition::TrimHorizon
-        } else {
-            crate::state::ShardPosition::Latest
-        },
-    )
+    if iterator_type == crate::state::SHARD_ITERATOR_TYPE_TRIM_HORIZON {
+        return Ok(crate::state::ShardPosition::TrimHorizon);
+    }
+    // The most recent record the shard holds right now is what `LATEST` starts just after.
+    // A shard that holds none is pinned by the position itself: every record it holds when
+    // it is read arrived after this iterator was issued, so all of them are read.
+    Ok(match shard.retained(trim_horizon).next_back() {
+        Some(newest) => {
+            crate::state::ShardPosition::AfterSequenceNumber(newest.sequence_number.clone())
+        }
+        None => crate::state::ShardPosition::Latest,
+    })
 }
 
 impl<Eng> GetShardIterator<Eng> {
@@ -418,8 +425,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        let trim_horizon_millis = crate::state::epoch_millis(stream.trim_horizon(now));
-        let position = requested_position(&input, shard, trim_horizon_millis)?;
+        let trim_horizon = stream.trim_horizon(now);
+        let position = requested_position(&input, shard, trim_horizon)?;
 
         // "Checks if your request will succeed. DryRun is an optional parameter"
         // (`GetShardIteratorInput$DryRun`): the request is judged in full above and then

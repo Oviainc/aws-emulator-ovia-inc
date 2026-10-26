@@ -43,6 +43,8 @@ mod device_remembering;
 mod error_message_wording;
 #[path = "all/explicit_auth_flows.rs"]
 mod explicit_auth_flows;
+#[path = "all/forgot_password_caller_identity.rs"]
+mod forgot_password_caller_identity;
 #[path = "all/get_identity_provider_by_identifier.rs"]
 mod get_identity_provider_by_identifier;
 #[path = "all/group_lifecycle.rs"]

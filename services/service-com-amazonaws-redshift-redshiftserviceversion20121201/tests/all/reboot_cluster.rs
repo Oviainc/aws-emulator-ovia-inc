@@ -307,6 +307,126 @@ async fn a_cluster_that_cannot_take_a_restart_is_refused_and_unchanged() {
     );
 }
 
+/// The refusal's MESSAGE is this operation's own sentence, not the one a read of
+/// the same missing identifier answers with.
+///
+/// The rule: each operation words its `ClusterNotFound` refusal the way the
+/// service words it for that operation, interpolating the identifier verbatim
+/// from the request — so `RebootCluster` answers `Cluster not found: <id>` while
+/// `DescribeClusters` answers `Cluster <id> not found.` for the very same name.
+/// The rows differ along what the rule generalises over: the identifier's
+/// spelling, its length (both documented bounds), its case, and whether it never
+/// existed or was created and then deleted.
+#[tokio::test]
+async fn the_not_found_message_is_this_operations_own_sentence() {
+    let emulator = Emulator::new();
+
+    // One cluster that DOES exist, so a refusal below cannot be an "everything
+    // is refused" artefact, and one created-then-deleted name — the shape the
+    // lifecycle takes: a restart after the delete names nothing.
+    let present = emulator.create_minimal("reboot-message-present").await;
+    assert_eq!(
+        present.status, 200,
+        "case seed the present cluster: expected 200, got {} with body {}",
+        present.status, present.body
+    );
+    let doomed = emulator.create_minimal("reboot-message-deleted").await;
+    assert_eq!(
+        doomed.status, 200,
+        "case seed the doomed cluster: expected 200, got {} with body {}",
+        doomed.status, doomed.body
+    );
+    let deleted = emulator
+        .call(
+            "DeleteCluster",
+            &[
+                ("ClusterIdentifier", "reboot-message-deleted"),
+                ("SkipFinalClusterSnapshot", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case delete the doomed cluster: expected 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+
+    // `max_len` is the documented bound on `ClusterIdentifier`; see
+    // `state::CLUSTER_IDENTIFIER_RULE`.
+    let longest: String = std::iter::once('c')
+        .chain(std::iter::repeat_n('x', state::CLUSTER_IDENTIFIER_RULE.max_len - 1))
+        .collect();
+    let cases: Vec<(&str, String)> = vec![
+        ("a plain identifier nothing created", "no-reboot-target".to_string()),
+        (
+            "the shortest identifier the documented rule admits",
+            "c".to_string(),
+        ),
+        ("the longest identifier the documented rule admits", longest),
+        (
+            "an identifier one character off a stored one",
+            "reboot-message-presen".to_string(),
+        ),
+        (
+            "an identifier in mixed case",
+            "Reboot-Message-Absent".to_string(),
+        ),
+        (
+            "a cluster this account created and then deleted",
+            "reboot-message-deleted".to_string(),
+        ),
+    ];
+
+    for (case, identifier) in cases {
+        let refused = reboot(&emulator, &identifier).await;
+        assert_eq!(
+            (refused.status, refused.error_code()),
+            (404, Some("ClusterNotFound".to_string())),
+            "case {case}: expected 404 ClusterNotFound, got {} / {:?} with body {}",
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+        let expected = format!("Cluster not found: {identifier}");
+        assert_eq!(
+            refused.text("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case}: expected the message {expected:?}, got {:?} with body {}",
+            refused.text("Message"),
+            refused.body
+        );
+
+        // The SAME missing identifier, read rather than restarted, carries the
+        // read's own sentence: the two templates are distinguishable.
+        let read = describe(&emulator, &identifier).await;
+        let expected_read = format!("Cluster {identifier} not found.");
+        assert_eq!(
+            read.text("Message").as_deref(),
+            Some(expected_read.as_str()),
+            "case {case}: expected the read's message {expected_read:?}, got {:?} with body {}",
+            read.text("Message"),
+            read.body
+        );
+        assert_ne!(
+            refused.text("Message"),
+            read.text("Message"),
+            "case {case}: expected the two operations to word the refusal differently, got \
+             {:?} from both",
+            refused.text("Message")
+        );
+    }
+
+    // The stored cluster is still restartable once it is available: the rows
+    // above refused the NAME, not the operation.
+    settle().await;
+    let accepted = reboot(&emulator, "reboot-message-present").await;
+    assert_eq!(
+        accepted.status, 200,
+        "case the stored cluster still restarts: expected 200, got {} with body {}",
+        accepted.status, accepted.body
+    );
+}
+
 /// One row of the pending-parameter table: the case name, the group and cluster
 /// the row uses, the name-value pairs set on the group, and the apply status
 /// every membership entry reports BEFORE the restart.

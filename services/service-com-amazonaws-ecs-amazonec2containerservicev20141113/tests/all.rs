@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/agent_plane.rs"]
 mod agent_plane;
+#[path = "all/attachment_state_reports.rs"]
+mod attachment_state_reports;
 #[path = "all/awsvpc_configuration_store.rs"]
 mod awsvpc_configuration_store;
 #[path = "all/capacity_providers.rs"]

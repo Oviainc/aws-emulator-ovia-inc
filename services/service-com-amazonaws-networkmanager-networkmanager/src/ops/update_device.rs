@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored device the path addresses, writing ONLY the members the request
+//! carried, so every later reader answers from that record. This is the ONLY file to touch
+//! for this operation.
+//!
+//! The device's own lifecycle state is a function of the clock, never a stored field, so
+//! reading one back never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDeviceErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // Three of the free-form descriptors carry a documented maximum the model's own
+        // `ConstrainedString` (len 0..256) does not express — "Constraints: Maximum length
+        // of 128 characters" (`smithy_query query="doc" shape="UpdateDeviceRequest"
+        // member="Vendor"`, the same sentence for `Model` and `SerialNumber`) — so they are
+        // refused here rather than by the pre-handler constraint walk, through the one
+        // shared check `CreateDevice` applies. `Description` and `Type` carry no bound
+        // beyond the modelled one, so that walk already covers them.
+        for (member, value) in [
+            ("Vendor", &input.vendor),
+            ("Model", &input.model),
+            ("SerialNumber", &input.serial_number),
+        ] {
+            if let Some(problem) = value
+                .as_deref()
+                .and_then(crate::state::device_descriptor_problem)
+            {
+                return Err(UpdateDeviceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("{member} {problem}"),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: member.to_string(),
+                            message: problem,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The update acts on an EXISTING resource addressed by its path, so a parent the
+        // store does not hold is the missing-resource answer (404), not a field failure.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(UpdateDeviceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // A device is addressed through its global network, so one stored under a different
+        // parent is not found here either. The site it currently sits at is read now,
+        // because the site the request asks for is judged against it below.
+        let held_site = match store
+            .devices
+            .get(&input.device_id)
+            .filter(|record| record.global_network_id == input.global_network_id)
+        {
+            Some(record) => record.site_id.clone(),
+            None => {
+                return Err(UpdateDeviceErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::DEVICE_KIND, &input.device_id),
+                )
+                .into())
+            }
+        };
+
+        // `SiteId` is the one member of this request that is a REFERENCE rather than a
+        // free-form value, so it is resolved before anything is written: an absent member
+        // leaves the device where it sits, the empty string removes the assignment ("To
+        // remove information for any of the parameters, specify an empty string",
+        // `smithy_query query="doc" shape="UpdateDevice"`) and leaves the device unsited —
+        // which `SiteId` being optional makes legal — and any other value must name a site
+        // of the global network the path addresses, exactly as `CreateDevice` requires of
+        // the one its input carries. An unresolvable reference is therefore the same FIELD
+        // failure that create answers, not the missing-resource answer this operation gives
+        // for the resources its PATH addresses.
+        let requested_site: Option<Option<String>> = match input.site_id.as_deref() {
+            None => None,
+            Some("") => Some(None),
+            Some(site_id) => {
+                let site_resolves = store
+                    .sites
+                    .get(site_id)
+                    .is_some_and(|site| site.global_network_id == input.global_network_id);
+                if !site_resolves {
+                    return Err(UpdateDeviceErrorModeled::ValidationException(
+                        crate::state::unknown_reference(
+                            crate::state::FIELD_SITE_ID,
+                            crate::state::SITE_KIND,
+                        ),
+                    )
+                    .into());
+                }
+                Some(Some(site_id.to_string()))
+            }
+        };
+
+        // A link association exists only while its device and its link sit at the SAME site
+        // ("The device and link must be in the same global network and the same site",
+        // `smithy_query query="doc" shape="AssociateLink"`), so moving a device that is
+        // still associated with a link — or unsiting it — would leave that tie standing on a
+        // precondition it no longer satisfies. The service already makes the caller untie it
+        // first for the other change that would break it ("You must first disassociate the
+        // device from any links and customer gateways", `smithy_query query="doc"
+        // shape="DeleteDevice"`), and leaving the tie inconsistent is exactly the state the
+        // modelled `ConflictException` (409) reports, so the move is refused and nothing is
+        // written; an update that leaves the device at the site it already sits at is
+        // unaffected.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDevice"))
+        // Like every other refusal of this service the prose is the FIXED text the error
+        // class documents (`smithy_query query="doc" shape="ConflictException"`), with the
+        // identifying detail in the shape's own required `ResourceId` and `ResourceType` —
+        // the same division [`crate::state::resource_not_found`] keeps.
+        if requested_site
+            .as_ref()
+            .is_some_and(|requested| requested.as_deref() != held_site.as_deref())
+            && store.link_associations.values().any(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.device_id == input.device_id
+            })
+        {
+            return Err(UpdateDeviceErrorModeled::ConflictException(ConflictException {
+                message: "There was a conflict processing the request. Updating or deleting \
+                    the resource can cause an inconsistent state."
+                    .to_string(),
+                resource_id: input.device_id.clone(),
+                resource_type: crate::state::DEVICE_KIND.to_string(),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // The device was found above under the same held lock, so this lookup answers the
+        // same record; it carries the not-found answer rather than a second wording of it.
+        let record = store.devices.get_mut(&input.device_id).ok_or_else(|| {
+            UpdateDeviceErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+                crate::state::DEVICE_KIND,
+                &input.device_id,
+            ))
+        })?;
+
+        // Only the members the request supplied are changed: an absent member leaves the
+        // stored value alone and a supplied one replaces it — an empty `Description`, or an
+        // `AWSLocation` or `Location` whose own members are empty strings, is how the caller
+        // removes the information it holds. The ids, the ARN, `CreatedAt` and the tags are
+        // never rewritten, so the device keeps the identity and the history it was created
+        // with.
+        if input.description.is_some() {
+            record.description = input.description;
+        }
+        if input.r#type.is_some() {
+            record.device_type = input.r#type;
+        }
+        if input.vendor.is_some() {
+            record.vendor = input.vendor;
+        }
+        if input.model.is_some() {
+            record.model = input.model;
+        }
+        if input.serial_number.is_some() {
+            record.serial_number = input.serial_number;
+        }
+        if input.aws_location.is_some() {
+            record.aws_location = input.aws_location;
+        }
+        if input.location.is_some() {
+            record.location = input.location;
+        }
+        if let Some(site_id) = requested_site {
+            record.site_id = site_id;
+        }
+        // An update is not applied instantly: the reconfigured device is answered in the
+        // non-terminal `UPDATING` state (`smithy_query shape="DeviceState"`), so the clock
+        // owes the `UPDATING` -> `AVAILABLE` transition and a caller reading straight after
+        // this call still observes it. The due instant is stored and compared against the
+        // clock; nothing sleeps for it.
+        record.updating_until = Some(now + crate::state::SETTLE_DELAY);
+        let device = record.to_shape(now);
+
+        Ok(UpdateDeviceOutput {
+            device: Some(device),
+        })
     }
 }

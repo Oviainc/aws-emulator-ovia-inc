@@ -42,6 +42,11 @@ mod cognito_vended_session_reads_sse_kms_object;
 mod cognito_vended_session_is_audited;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
+// At the head for the reason the entries above record: the appended tail and the sorted
+// `e…` span (where the other events suites land) are both regions concurrent suites add
+// their line to.
+#[path = "all/events_fan_out_to_each_matched_target.rs"]
+mod events_fan_out_to_each_matched_target;
 // Out of order for the same reason as the two entries above it.
 #[path = "all/redshift_cluster_iam_role_poll_lifecycle.rs"]
 mod redshift_cluster_iam_role_poll_lifecycle;

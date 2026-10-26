@@ -372,6 +372,12 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// issued while paging groups is not read as a position among the users or roles.
 pub const MARKER_SCOPE_GROUPS: &str = "groups";
 
+/// The marker scope of the MEMBERSHIP of ONE group — the users that group holds —
+/// which `GetGroup` pages over. The group's key follows it, so a marker issued
+/// while paging one group's members does not name a position in another's, nor in
+/// the account's group collection: see [`group_members_marker_scope`].
+pub const MARKER_SCOPE_GROUP_MEMBERS: &str = "group-members";
+
 /// The marker scope of the account's instance profile collection, which
 /// `ListInstanceProfiles` pages over. It is its OWN scope, exactly as the user and
 /// role collections are, so a marker issued while paging another collection is not
@@ -819,6 +825,19 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `Group::group_name` keeps the case the creator chose. `CreateGroup` fills
     /// this map and `ListGroups` pages over it.
     pub groups: BTreeMap<String, Group>,
+    /// The users each group holds: [`name_key`] of the group name -> [`name_key`] of
+    /// every member user's name. A `BTreeSet` because a user belongs to a group at
+    /// most once (adding a member it already holds is the same membership) and
+    /// because the total key order is what lets `GetGroup` hand out a resumable
+    /// marker over the membership.
+    ///
+    /// The membership is held HERE rather than on either entity, so the group and the
+    /// user records stay what their own reads report and one place answers which
+    /// users a group holds. `AddUserToGroup` is what fills it and
+    /// `RemoveUserFromGroup` what empties it; both are still scaffolded 501s with
+    /// their own stub issues, so the account holds no membership yet and `GetGroup`
+    /// reports each group's members as the empty list this map answers with.
+    pub group_members: BTreeMap<String, BTreeSet<String>>,
     /// Inline user policies: [`name_key`] of the user name -> [`name_key`] of the
     /// policy name -> the policy. Policy names are case-folded for the same reason
     /// user names are: the model's `CreateUser$UserName` documentation says "user,
@@ -1882,6 +1901,12 @@ const SERVICE_PROVISIONED_ROLE_ID_BASE: u64 = 1 << 63;
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the membership of the group keyed by `group_key`.
+/// See [`MARKER_SCOPE_GROUP_MEMBERS`].
+pub fn group_members_marker_scope(group_key: &str) -> String {
+    format!("{MARKER_SCOPE_GROUP_MEMBERS}:{group_key}")
 }
 
 /// The marker scope of the attachment set of the user keyed by `user_key`.

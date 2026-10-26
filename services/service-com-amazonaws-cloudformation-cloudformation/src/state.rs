@@ -1012,6 +1012,13 @@ pub struct PendingDeployment {
     /// [`StoredStack::begin_transition`] is what opens a barrier for each one the
     /// operation has to wait at.
     pub wait_conditions: Vec<wait_conditions::DeclaredWaitCondition>,
+    /// The logical ids this operation has ACTED ON: every resource it planned a transition
+    /// for ([`StoredStack::schedule_resource_events`]).
+    ///
+    /// CloudFormation reports a resource once the operation's work on it has STARTED, so
+    /// this is the set whose records survive an operation that disposed of the deployment
+    /// — a declaration the walk never reached has nothing to report.
+    pub attempted: BTreeSet<String>,
     /// The direct dependency relation of the template being deployed
     /// ([`template::direct_dependencies`]): what each resource it declares waits for.
     /// Read where the template is READ, outside the store lock, and installed as the
@@ -1088,8 +1095,10 @@ pub struct StoredStack {
     pub pending: Option<PendingStatus>,
     /// The resources the stack's last COMPLETED create or update materialised (see
     /// [`StoredStack::deploy_template`]), each with the status that operation left it in.
-    /// A completed DELETE leaves them in place, in `DELETE_COMPLETE`: CloudFormation
-    /// reports a deleted stack's resources for as long as it reports the stack.
+    /// A completed DELETE leaves them in place, in `DELETE_COMPLETE`, and so does the
+    /// ROLLBACK of a failed create over the resources that create had made or declared
+    /// ([`disposed_resources`]): CloudFormation reports a stack's resources for as long as
+    /// it reports the stack, and those rows are what say which resource was disposed of.
     pub resources: Vec<DeployedResource>,
     /// The stack's evaluated outputs, in `OutputKey` order, as of that same completed
     /// operation — what `DescribeStacks` reports as `Stack$Outputs`.
@@ -1472,6 +1481,8 @@ impl StoredStack {
             resources,
             outputs,
             wait_conditions,
+            // Nothing has been acted on yet: this deployment has not started.
+            attempted: BTreeSet::new(),
             dependencies,
         });
         Ok(())
@@ -1727,6 +1738,15 @@ impl StoredStack {
         &mut self,
         transitions: &[provisioning::ResourceTransition],
     ) {
+        // A resource the operation planned a transition for is one it ACTED ON, which is
+        // what the deployment in flight remembers about it: CloudFormation reports a
+        // resource once the work on it has started, and that record outlives an operation
+        // that then disposed of the resource.
+        if let Some(deployment) = self.pending_deployment.as_mut() {
+            for transition in transitions {
+                deployment.attempted.insert(transition.logical_id.clone());
+            }
+        }
         // The walk belongs to the operation in flight, so its timeline is measured from
         // the instant that operation started.
         let started_at = self
@@ -1984,27 +2004,21 @@ impl StoredStack {
         // The reason the terminal status carries: the one the operation failed with, and
         // nothing for one that completed.
         self.status_reason = pending.status_reason.clone();
-        if completing_deletion {
-            self.deletion_time = Some(due_at);
-            // The deletion completed, so every resource of the stack was deleted as of
-            // that instant — reported, not dropped: "For deleted stacks,
-            // DescribeStackResources returns resource information for up to 90 days after
-            // the stack has been deleted." The output VALUES go, since they were
-            // evaluated against resources that no longer exist.
-            for deployed in &mut self.resources {
-                deployed.status = resource_status::DELETE_COMPLETE.to_string();
-                deployed.status_timestamp = finished_at
-                    .get(&deployed.resource.logical_id)
-                    .copied()
-                    .unwrap_or(due_at);
+        if completing_deletion || self.status == status::ROLLBACK_COMPLETE {
+            if completing_deletion {
+                self.deletion_time = Some(due_at);
             }
-            self.outputs.clear();
-        } else if self.status == status::ROLLBACK_COMPLETE {
-            // The create was ROLLED BACK: the template it was deploying never came into
-            // force, and the resources it had made were removed again, so nothing is
-            // installed and no output resolves — the stack reports what it really has,
-            // which is nothing. (The deployment was taken above, so there is nothing left
-            // to install.)
+            // The operation DISPOSED of the stack's resources — a deletion that completed,
+            // and the rollback of a create that removed again what the create was
+            // deploying. Each resource it disposed of keeps its RECORD, at its terminal
+            // delete status as of the instant the walk disposed of it — reported, not
+            // dropped: "For deleted stacks, DescribeStackResources returns resource
+            // information for up to 90 days after the stack has been deleted", and a
+            // rolled-back stack's rows are the only thing left that says WHICH resource
+            // the rollback disposed of. The output VALUES go, since they were evaluated
+            // against resources that no longer exist.
+            self.resources =
+                disposed_resources(&self.resources, deployed, due_at, &finished_at);
             self.outputs.clear();
         } else if let Some(deployment) = deployed {
             // The create or update completed: the template it deployed is what the stack
@@ -2342,13 +2356,25 @@ impl StoredStack {
         }
     }
 
-    /// How many resources the stack holds right now — [`Self::current_resources`] counted
-    /// rather than cloned, for the account-wide resource ceiling
-    /// ([`ComAmazonawsCloudformationCloudformationState::current_resource_count`]).
+    /// How many resources the stack OCCUPIES right now, for the account-wide resource
+    /// ceiling ([`ComAmazonawsCloudformationCloudformationState::current_resource_count`]).
+    ///
+    /// Not quite [`Self::current_resources`] counted: a record an operation that DISPOSED
+    /// of the resource left behind, at `DELETE_COMPLETE`, is still REPORTED (and still
+    /// carried by `current_resources`, which is the set a deletion walks) but is NOT
+    /// counted, for the same reason a deleted stack's records are not — the stack goes on
+    /// naming what became of that resource, while nothing of it exists to occupy the
+    /// account's concurrent-resource quota. What bounds the stored set is the per-template
+    /// resource ceiling ([`template::MAX_RESOURCES_PER_TEMPLATE`]) over the stacks the
+    /// store keeps ([`MAX_STACKS`], [`MAX_LIVE_STACKS`]).
     pub fn current_resource_count(&self) -> usize {
         match &self.pending_deployment {
             Some(deployment) => deployment.resources.len(),
-            None => self.resources.len(),
+            None => self
+                .resources
+                .iter()
+                .filter(|deployed| deployed.status != resource_status::DELETE_COMPLETE)
+                .count(),
         }
     }
 
@@ -2540,6 +2566,77 @@ fn initiated_reason(in_progress_status: &str) -> &'static str {
         resource_status::UPDATE_IN_PROGRESS => "Resource update Initiated",
         _ => "Resource creation Initiated",
     }
+}
+
+/// The resource records a stack keeps once an operation has DISPOSED of its resources: a
+/// deletion that completed, and the rollback of a create that removed again what it was
+/// deploying.
+///
+/// Every resource the stack had installed, and every resource the disposed-of deployment
+/// had ACTED ON ([`PendingDeployment::attempted`]), keeps a record at `DELETE_COMPLETE` as
+/// of that instant. CloudFormation reports a resource of such a stack rather than
+/// forgetting it — "For deleted stacks, ListStackResources returns resource information
+/// for up to 90 days after the stack has been deleted" — and for a stack whose create was
+/// rolled back those rows are the only per-resource view left: they are what names the
+/// resource the rollback disposed of, under the logical id and the type the template
+/// declared, and what a client waiting for a resource's cleanup to be confirmed observes.
+/// A declaration the deployment never reached is not among them: nothing was created under
+/// it and nothing disposed of it.
+///
+/// The record states no reason: the status says what became of the resource, and the
+/// reason the create failed with belongs to the create's own event and to the stack's
+/// `StackStatusReason`, not to the disposal that followed it.
+///
+/// The instant a record's status was updated is that RESOURCE's own: `finished_at` is when
+/// the operation's walk finished each one ([`timeline`]), and `at` is the fallback for a
+/// resource the walk recorded nothing for — one no owning service holds, which has no
+/// deletion to go through.
+///
+/// A disposed record no longer claims the resource EXISTS anywhere: the operation took it
+/// away in the service that owns it, so the record is reported with its identity and
+/// without `materialised` — a later deletion of the stack asks nothing about it
+/// ([`StoredStack::current_resources`]) and a later deployment cannot adopt it as a
+/// resource that is already there.
+fn disposed_resources(
+    installed: &[DeployedResource],
+    deployment: Option<PendingDeployment>,
+    at: SystemTime,
+    finished_at: &BTreeMap<String, SystemTime>,
+) -> Vec<DeployedResource> {
+    let mut records: Vec<DeployedResource> = installed.to_vec();
+    let PendingDeployment {
+        resources,
+        attempted,
+        ..
+    } = deployment.unwrap_or_default();
+    let acted_on = resources
+        .into_iter()
+        .filter(|resource| attempted.contains(&resource.logical_id));
+    for resource in acted_on {
+        match records
+            .iter_mut()
+            .find(|record| record.resource.logical_id == resource.logical_id)
+        {
+            // The stack already had a record under that logical id: the operation disposed
+            // of the resource as the deployment last computed it, so that is the record.
+            Some(record) => record.resource = resource,
+            None => records.push(DeployedResource::new(
+                resource,
+                resource_status::DELETE_COMPLETE,
+                at,
+            )),
+        }
+    }
+    for record in &mut records {
+        record.status = resource_status::DELETE_COMPLETE.to_string();
+        record.status_timestamp = finished_at
+            .get(&record.resource.logical_id)
+            .copied()
+            .unwrap_or(at);
+        record.status_reason = None;
+        record.resource.materialised = false;
+    }
+    records
 }
 
 /// The resources a completed create or update leaves the stack with, each carrying the

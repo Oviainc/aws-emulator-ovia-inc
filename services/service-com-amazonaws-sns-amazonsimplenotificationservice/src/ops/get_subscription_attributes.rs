@@ -207,6 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::OWNER_ATTRIBUTE.to_string(),
             subscription.owner.clone(),
         );
+        // The principal whose call created the subscription, kept with the record: what a
+        // client auditing who subscribed an endpoint reads.
+        attributes.insert(
+            state::SUBSCRIPTION_PRINCIPAL_ATTRIBUTE.to_string(),
+            subscription.principal.clone(),
+        );
         // A subscription awaiting its subscriber's confirmation is pending, and nothing
         // has confirmed it yet; one SNS confirmed itself was confirmed by the
         // authenticated API call that created it.
@@ -229,33 +235,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .cloned()
                 .unwrap_or_else(|| state::RAW_MESSAGE_DELIVERY_DISABLED.to_string()),
         );
-        // A filter policy is applied under a scope, so a subscription that holds a
-        // policy and no explicit scope reports the documented default scope with it.
-        if subscription
-            .attributes
-            .contains_key(state::FILTER_POLICY_ATTRIBUTE)
-        {
+        // A filter policy is applied under a scope, so the scope is reported with the
+        // policy it governs and not without one — whatever scope the subscription holds
+        // for a policy it has not been given yet.
+        if let Some(scope) = state::reported_filter_policy_scope(&subscription.attributes) {
             attributes.insert(
                 state::FILTER_POLICY_SCOPE_ATTRIBUTE.to_string(),
-                state::DEFAULT_FILTER_POLICY_SCOPE.to_string(),
+                scope.to_string(),
             );
         }
         // The retry policy a delivery to this subscription is actually run under: the
         // account system defaults, with the topic's delivery policy and then the
-        // subscription's own laid over them. Every subscription delivers under one, and
-        // the model lists it among the attributes a subscription's map carries with no
-        // protocol qualifying it.
-        attributes.insert(
-            state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.to_string(),
-            state::effective_subscription_delivery_policy(
-                store.topics.get(&subscription.topic_arn),
-                subscription,
-            ),
-        );
-        // Every attribute the subscription holds — a filter policy and its scope, a
-        // delivery or redrive or replay policy, a Firehose role ARN — reported because
-        // its owner set it, and with the value its owner set.
+        // subscription's own laid over them. It governs the delivery to an endpoint a
+        // delivery policy retries — an HTTP/S one — so only such a subscription reports
+        // one.
+        if state::DELIVERY_POLICY_PROTOCOLS.contains(&subscription.protocol.as_str()) {
+            attributes.insert(
+                state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.to_string(),
+                state::effective_subscription_delivery_policy(
+                    store.topics.get(&subscription.topic_arn),
+                    subscription,
+                ),
+            );
+        }
+        // Every attribute the subscription holds — a filter policy, a delivery or redrive
+        // or replay policy, a Firehose role ARN — reported because its owner set it, and
+        // with the value its owner set. The filtering SCOPE is not among them: whether it
+        // is in force depends on the policy beside it, which the entry above decides.
         for (name, value) in &subscription.attributes {
+            if name == state::FILTER_POLICY_SCOPE_ATTRIBUTE {
+                continue;
+            }
             attributes.insert(name.clone(), value.clone());
         }
 

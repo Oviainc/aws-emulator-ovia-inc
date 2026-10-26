@@ -429,6 +429,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A policy-valued attribute is REMOVED by an empty value, so an attribute a
+        // request carries empty leaves the subscription holding none of it rather than
+        // naming a document that failed to parse.
+        let cleared: Vec<String> = attributes
+            .iter()
+            .filter(|(name, value)| state::clears_attribute(name, value))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let attributes: ::std::collections::HashMap<String, String> = attributes
+            .into_iter()
+            .filter(|(name, _)| !cleared.contains(name))
+            .collect();
         // An attribute carries only the values SNS documents for it, and only on a
         // subscription of a protocol SNS documents it for — the SAME two rules
         // `SetSubscriptionAttributes` holds a write to, so an attribute this call
@@ -458,6 +470,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An attribute the TOPIC gives nothing to govern is refused too — a replay of a
+        // topic that archives nothing — under the rule every write of a subscription
+        // attribute shares.
+        for name in attributes.keys() {
+            if let Some(message) = state::subscription_attribute_topic_refusal(
+                name,
+                store.topics.get(&input.topic_arn),
+            ) {
+                return Err(SubscribeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
         // What SNS holds is the MEANING of each value, in the form it reports back, so a
         // subscription reads the same whichever call carried the attribute.
         let attributes: ::std::collections::HashMap<String, String> = attributes
@@ -482,6 +510,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_default();
                 for (name, value) in attributes {
                     merged.insert(name, value);
+                }
+                for name in &cleared {
+                    merged.remove(name);
                 }
                 if let Some(refusal) = oversized(&merged) {
                     return Err(refusal);
@@ -511,6 +542,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let id = store.next_unique_id();
                     state::subscription_arn(&input.topic_arn, &id)
                 };
+                let owner = state::owner_account_id();
                 store.subscriptions.insert(
                     arn.clone(),
                     SubscriptionRecord {
@@ -518,7 +550,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         topic_arn: input.topic_arn.clone(),
                         protocol,
                         endpoint: input.endpoint,
-                        owner: state::owner_account_id(),
+                        // The principal this subscription was created by: the identity
+                        // every call this emulator serves is made by.
+                        principal: state::calling_principal_arn(),
+                        owner,
                         attributes,
                         pending_confirmation,
                         created_at: std::time::SystemTime::now(),

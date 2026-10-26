@@ -151,8 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a challenge exists only in the Region its owning
+        // connector's ARN names, so the Region the request was signed for is part of
+        // resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -163,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // found through it: a challenge whose connector's teardown has come due is gone with
         // it, and both cases are the same 404.
         let stored = store
-            .challenge(&input.challenge_arn)
+            .challenge(&region, &input.challenge_arn)
             .ok_or_else(|| not_found(&input.challenge_arn))?;
         Ok(GetChallengeMetadataOutput {
             challenge_metadata: Some(stored.to_metadata()),

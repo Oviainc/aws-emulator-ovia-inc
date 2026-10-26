@@ -200,12 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ingestion and you must delete all associated ingestion destinations
         // before you can delete an app ingestion." The state is required to BE
         // `disabled` rather than merely not `enabled`, so a state added to
-        // `IngestionState` later is refused rather than silently deletable.
-        if ingestion.state != crate::state::INGESTION_STATE_DISABLED {
+        // `IngestionState` later is refused rather than silently deletable. It is
+        // the state a read reports AS OF NOW
+        // (`crate::state::IngestionRecord::state_at`), so an ingestion the clock
+        // has already disabled is deletable without a further stop call.
+        let now = ::std::time::SystemTime::now();
+        if ingestion.state_at(now) != crate::state::INGESTION_STATE_DISABLED {
             return Err(DeleteIngestionErrorModeled::ValidationException(
                 crate::state::precondition_not_met(format!(
                     "Ingestion {} is {} and must be stopped before it can be deleted.",
-                    ingestion.arn, ingestion.state
+                    ingestion.arn,
+                    ingestion.state_at(now)
                 )),
             )
             .into());

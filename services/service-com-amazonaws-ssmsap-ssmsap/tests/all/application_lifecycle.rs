@@ -352,7 +352,10 @@ pub(crate) fn tag_pairs(value: Option<&Value>) -> BTreeMap<String, String> {
 }
 
 /// The `Components` list of an `Application`, as strings.
-fn string_list(value: Option<&Value>) -> Vec<String> {
+///
+/// `pub(crate)` because the suites of this target share one harness:
+/// `tests/all/registration_derived_state.rs` reads the SAME list out of its own replies.
+pub(crate) fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
         .map(|items| {

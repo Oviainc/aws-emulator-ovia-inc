@@ -1381,9 +1381,10 @@ async fn invoke_resolves_the_function_and_runs_nothing_it_cannot() {
         within_sync_limit.status
     );
 
-    // Running the deployment package is not implemented, so the invocation types that
-    // need it answer 501 rather than a payload no function produced.
-    for invocation_type in [None, Some("RequestResponse"), Some("Event")] {
+    // Running the deployment package is not implemented, so the SYNCHRONOUS invocation
+    // type, whose answer IS what the function returned, answers 501 rather than a
+    // payload no function produced.
+    for invocation_type in [None, Some("RequestResponse")] {
         let answer = invoke(
             "invokable".to_string(),
             "",
@@ -1403,6 +1404,35 @@ async fn invoke_resolves_the_function_and_runs_nothing_it_cannot() {
             answer.error_code().contains("NotImplemented"),
             "case {invocation_type:?}: expected NotImplemented, got {}",
             answer.error_code()
+        );
+    }
+
+    // "Event – Invoke the function asynchronously. […] The API response only includes a
+    // status code": the answer is the queueing receipt and says nothing about the run,
+    // so it is served — "For the Event invocation type, this status code is 202" — with
+    // no payload and no executed version, exactly as `InvokeAsync` answers one.
+    for (case, payload) in [
+        ("an event document", br#"{"k":1}"#.to_vec()),
+        ("no event at all", Vec::new()),
+    ] {
+        let queued = invoke("invokable".to_string(), "", Some("Event"), payload).await;
+        assert_eq!(
+            queued.status,
+            202,
+            "case {case}: expected 202 for an accepted asynchronous invocation, got {} {}",
+            queued.status,
+            String::from_utf8_lossy(&queued.body)
+        );
+        assert!(
+            queued.body.is_empty(),
+            "case {case}: an accepted asynchronous invocation carries no payload, got {:?}",
+            String::from_utf8_lossy(&queued.body)
+        );
+        assert_eq!(
+            queued.header("x-amz-executed-version"),
+            None,
+            "case {case}: no version has executed when the event is queued, got {:?}",
+            queued.header("x-amz-executed-version")
         );
     }
 

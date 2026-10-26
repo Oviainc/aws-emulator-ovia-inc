@@ -260,7 +260,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string(),
             ));
         }
-        if let Some(value) = input.attribute_value.as_deref() {
+        // A policy-valued attribute is REMOVED by an empty value, so such a request
+        // clears the attribute rather than naming a document that failed to parse.
+        let requested = input
+            .attribute_value
+            .filter(|value| !state::clears_attribute(&input.attribute_name, value));
+        if let Some(value) = requested.as_deref() {
             if let Some(message) = attribute_value_refusal(&input.attribute_name, value) {
                 return Err(invalid_parameter(message));
             }
@@ -288,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::TOPIC_RECORD,
             &topic.attributes,
             &input.attribute_name,
-            input.attribute_value.as_deref(),
+            requested.as_deref(),
         ) {
             return Err(invalid_parameter(refusal));
         }
@@ -296,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The new value for the attribute" (`AttributeValue` doc) — and a request that
         // carries none clears the attribute, so the topic reports what SNS reports for
         // a topic that was never given one.
-        match input.attribute_value {
+        match requested {
             Some(value) => {
                 topic.attributes.insert(input.attribute_name, value);
             }
@@ -304,6 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 topic.attributes.remove(&input.attribute_name);
             }
         }
+        // The archive window follows the attribute map: setting the archive policy starts
+        // archiving now, and clearing it leaves the topic with no replayable window.
+        topic.refresh_archive_window();
 
         Ok(SetTopicAttributesOutput)
     }

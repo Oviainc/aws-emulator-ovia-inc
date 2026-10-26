@@ -20,7 +20,7 @@
 //! Every call goes over the wire through the router the emulator serves in production, so
 //! nothing but persisted state carries information between calls.
 
-use super::topics_subscriptions_publish::{Answer, Sns};
+use super::topics_subscriptions_publish::{attribute_map, Answer, Sns};
 
 /// The clause every refusal of an unparseable filter policy opens with.
 const LEADING_CLAUSE: &str = "Invalid parameter: Attributes Reason: FilterPolicy: failed to \
@@ -196,7 +196,6 @@ async fn a_filter_policy_with_no_offending_word_is_refused_for_the_parse_alone()
     let rows: &[(&str, &str, bool)] = &[
         ("an object that ends early", "{", true),
         ("an array that ends early", "[\"created\"", true),
-        ("an empty document", "", true),
         ("a well-formed object", r#"{"event":["created"]}"#, false),
     ];
 
@@ -217,4 +216,25 @@ async fn a_filter_policy_with_no_offending_word_is_refused_for_the_parse_alone()
             "case {case:?}: expected a refusal opening with {LEADING_CLAUSE:?}, got {message:?}"
         );
     }
+
+    // An EMPTY value is no document at all: it REMOVES the policy, so it is accepted and
+    // the subscription that held the well-formed policy above holds none afterwards.
+    let answer = subscribe_with(&sns, &topic, &[("FilterPolicy", "")]).await;
+    assert_eq!(
+        answer.status, 200,
+        "an empty filter policy removes the policy rather than failing to parse, got {} / {}",
+        answer.status, answer.body
+    );
+    let arn = answer
+        .element("SubscriptionArn")
+        .unwrap_or_else(|| panic!("no SubscriptionArn in {}", answer.body));
+    let held = attribute_map(
+        &sns.call("GetSubscriptionAttributes", &[("SubscriptionArn", &arn)])
+            .await,
+    );
+    assert_eq!(
+        held.get("FilterPolicy"),
+        None,
+        "a removed filter policy must not be reported, got {held:?}"
+    );
 }

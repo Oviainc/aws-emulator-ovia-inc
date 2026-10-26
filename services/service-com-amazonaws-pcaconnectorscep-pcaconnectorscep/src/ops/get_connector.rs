@@ -151,8 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // This service is regional: a connector exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
@@ -160,8 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let stored = store
-            .connectors
-            .get(&input.connector_arn)
+            .connector(&region, &input.connector_arn)
             .ok_or_else(|| not_found(&input.connector_arn))?;
         Ok(GetConnectorOutput {
             connector: Some(stored.to_connector()),
@@ -169,9 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`. A read
-/// after `DeleteConnector` lands here once the teardown the delete scheduled has come due and
-/// the record is gone; until then the connector is reported with `Status` `DELETING`.
+/// No connector is stored under this ARN in the Region the request was signed for — HTTP 404
+/// `ResourceNotFoundException`. A read after `DeleteConnector` lands here once the teardown the
+/// delete scheduled has come due and the record is gone; until then the connector is reported
+/// with `Status` `DELETING`. An ARN naming another Region's connector lands here too: that
+/// connector does not exist in this Region.
 fn not_found(connector_arn: &str) -> GetConnectorError {
     GetConnectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Connector {connector_arn} could not be found"),

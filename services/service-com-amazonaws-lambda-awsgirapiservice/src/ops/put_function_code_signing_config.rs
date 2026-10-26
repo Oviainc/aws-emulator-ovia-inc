@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFunctionCodeSigningConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFunctionCodeSigningConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFunctionCodeSigningConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The code signing configuration of a function is ONE value on that function's record
+//! ([`crate::state::FunctionRecord::code_signing_config_arn`]): this call stores the ARN
+//! of a configuration the store already holds, and `GetFunctionCodeSigningConfig` reports
+//! exactly what is stored there, so nothing is echoed back out of a request.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFunctionCodeSigningConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFunctionCodeSigningConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFunctionCodeSigningConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutFunctionCodeSigningConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // "Changes to the code signing configuration take effect the next time a user
+        // tries to deploy a code package to the function", and a package is deployed to
+        // the function rather than to one of its published versions, so the association
+        // belongs to the function as a whole and a qualified name names no resource that
+        // carries one.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "The qualifier '{qualifier}' in 'functionName' names a version or alias, and \
+                 a code signing configuration applies to the function as a whole, which is \
+                 what a code package is deployed to"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The configuration has to be one this account holds: the association names a
+        // stored record, so what is persisted is that record's own ARN rather than the
+        // string the request carried.
+        let Some(config_arn) = store
+            .code_signing_configs
+            .get(&input.code_signing_config_arn)
+            .map(|config| config.arn.clone())
+        else {
+            return Err(
+                PutFunctionCodeSigningConfigErrorModeled::CodeSigningConfigNotFoundException(
+                    CodeSigningConfigNotFoundException {
+                        r#type: None,
+                        message: Some(crate::state::code_signing_config_not_found_message(
+                            &input.code_signing_config_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The function has to exist before anything can be associated with it, and
+        // resolution is what brings the record up to whatever the clock already made due.
+        let (record, _version) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                    crate::state::ResolveFailure::NotFound(message) => {
+                        PutFunctionCodeSigningConfigErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                r#type: None,
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                })?;
+
+        // "When the code is Creating, you can't invoke or modify the function" (the
+        // model's own `StateReasonCode` documentation), and a function that is still being
+        // provisioned is in exactly that state.
+        if record.state == crate::state::STATE_PENDING {
+            return Err(
+                PutFunctionCodeSigningConfigErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The operation cannot be performed at this time. The function is \
+                             currently in the following state: {}",
+                            record.state
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.code_signing_config_arn = Some(config_arn);
+
+        // Answered by reading the record back, so the response reports the association
+        // that is stored and the name the stored function carries.
+        Ok(PutFunctionCodeSigningConfigOutput {
+            code_signing_config_arn: record.code_signing_config_arn.clone().unwrap_or_default(),
+            function_name: record.config.name.clone(),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PutFunctionCodeSigningConfigError {
+    PutFunctionCodeSigningConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

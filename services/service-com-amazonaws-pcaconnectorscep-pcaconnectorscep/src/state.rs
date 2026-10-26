@@ -81,14 +81,28 @@ pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 /// size used when a caller names none.
 pub const MAX_RESULTS_LIMIT: i32 = 1000;
 
-/// How many connectors this emulator will hold.
+/// How many connectors this emulator will hold for one account in one Region.
 ///
 /// The real service caps connectors per account per Region with a service quota, and
 /// `CreateConnector` models `ServiceQuotaExceededException` for exceeding it. The number
 /// here is NOT a fidelity claim about the published quota: it is the emulator's own
-/// ceiling, set generously so no realistic workflow meets it, so that a caller looping on
-/// create cannot grow this process's memory without bound.
+/// per-Region ceiling, set generously so no realistic workflow meets it.
 pub const MAX_CONNECTORS: usize = 1_000;
+
+/// How many connectors this emulator will hold AT ALL, across every Region.
+///
+/// The Region a connector is filed under comes from the request ([`request_region`]), so the
+/// per-Region ceiling above bounds one Region's inventory but not the number of Regions a
+/// caller addresses. This bounds the product, and with it the memory a caller looping on
+/// create can make this process hold: it is the ceiling that keeps that growth finite, and
+/// it is reached only by a caller inventing Regions, never by a workflow.
+pub const MAX_CONNECTORS_TOTAL: usize = 4 * MAX_CONNECTORS;
+
+/// How long a Region name this service will file a record under may be.
+///
+/// Neither ARN pattern bounds the length of its Region segment, so this is the emulator's
+/// own bound on a value the request chooses, well above every published Region name.
+pub const MAX_REGION_LENGTH: usize = 64;
 
 /// The same ceiling for the challenge passwords of one connector, for the same reason.
 pub const MAX_CHALLENGES_PER_CONNECTOR: usize = 1_000;
@@ -349,16 +363,27 @@ impl StoredConnector {
 }
 
 /// Per-service state for com-amazonaws-pcaconnectorscep-pcaconnectorscep. A handler reaches it through [`service_state`].
+///
+/// This service is regional: a resource exists in exactly one Region — the one named by its
+/// own ARN — so every record below is reached through an accessor that takes the Region the
+/// request was signed for ([`request_region`]) and answers only for records of that Region.
+/// A handler never indexes the maps directly, which is what keeps one Region's endpoint from
+/// reporting, resolving or deleting another Region's resources.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsPcaconnectorscepPcaconnectorscepState {
-    /// Every connector, keyed by its ARN and ordered by it, so `ListConnectors` paginates
-    /// deterministically. A connector owns its challenges and both own their tags, so
-    /// deleting a connector drops all three and leaves nothing behind.
+    /// Every connector of every Region, keyed by its ARN and ordered by it, so a listing
+    /// paginates deterministically. The ARN carries the Region the connector exists in, so a
+    /// Region's own inventory is the entries whose ARN names it
+    /// ([`ComAmazonawsPcaconnectorscepPcaconnectorscepState::connectors_in`]). A connector
+    /// owns its challenges and both own their tags, so deleting a connector drops all three
+    /// and leaves nothing behind.
     pub connectors: BTreeMap<String, StoredConnector>,
-    /// `CreateConnector`'s `ClientToken` -> the connector ARN it created.
-    pub connector_tokens: BTreeMap<String, IdempotencyRecord>,
-    /// `CreateChallenge`'s `ClientToken` -> the challenge ARN it created.
-    pub challenge_tokens: BTreeMap<String, IdempotencyRecord>,
+    /// `CreateConnector`'s (Region, `ClientToken`) -> the connector ARN it created. The
+    /// Region is half the key because a token identifies a retry of a call made against ONE
+    /// Region's endpoint: the same token sent to another Region asks for a connector there.
+    pub connector_tokens: BTreeMap<(String, String), IdempotencyRecord>,
+    /// `CreateChallenge`'s (Region, `ClientToken`) -> the challenge ARN it created.
+    pub challenge_tokens: BTreeMap<(String, String), IdempotencyRecord>,
 }
 
 impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
@@ -375,22 +400,61 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         self.challenge_tokens.retain(|_, record| live(record));
     }
 
-    /// The challenge stored under `challenge_arn`, found through the connector its ARN names.
-    pub fn challenge(&self, challenge_arn: &str) -> Option<&StoredChallenge> {
-        let connector_arn = connector_arn_of_challenge(challenge_arn)?;
+    /// The connectors that exist in `region`, in ARN order: the stored records whose ARN
+    /// names that Region, which is the whole inventory a call signed for it can see.
+    ///
+    /// Every ARN this service mints starts with the same prefix for a given Region
+    /// ([`connector_arn_prefix`]), and the map is keyed by ARN, so one Region's records are a
+    /// contiguous range: this walks that range and stops at its end rather than scanning the
+    /// other Regions' records.
+    pub fn connectors_in<'a>(
+        &'a self,
+        region: &str,
+    ) -> impl Iterator<Item = (&'a String, &'a StoredConnector)> {
+        let prefix = connector_arn_prefix(region);
         self.connectors
-            .get(connector_arn)?
+            .range(prefix.clone()..)
+            .take_while(move |(arn, _)| arn.starts_with(&prefix))
+    }
+
+    /// The connector `connector_arn` names, as a call signed for `region` sees it: `None`
+    /// when no record is stored under that ARN, and equally when the ARN names a connector
+    /// of another Region, because that connector does not exist here.
+    pub fn connector(&self, region: &str, connector_arn: &str) -> Option<&StoredConnector> {
+        self.connectors
+            .get(connector_arn)
+            .filter(|_| arn_region(connector_arn) == Some(region))
+    }
+
+    /// The mutable twin of [`Self::connector`], refusing a foreign-Region ARN the same way,
+    /// so no call can change — or tear down — a resource of a Region it was not signed for.
+    pub fn connector_mut(
+        &mut self,
+        region: &str,
+        connector_arn: &str,
+    ) -> Option<&mut StoredConnector> {
+        if arn_region(connector_arn) != Some(region) {
+            return None;
+        }
+        self.connectors.get_mut(connector_arn)
+    }
+
+    /// The challenge stored under `challenge_arn`, found through the connector its ARN names
+    /// — so a challenge is reachable only in the Region that connector exists in.
+    pub fn challenge(&self, region: &str, challenge_arn: &str) -> Option<&StoredChallenge> {
+        let connector_arn = connector_arn_of_challenge(challenge_arn)?;
+        self.connector(region, connector_arn)?
             .challenges
             .get(challenge_arn)
     }
 
-    /// Remove the challenge `challenge_arn` names, answering whether it was there.
-    pub fn remove_challenge(&mut self, challenge_arn: &str) -> bool {
+    /// Remove the challenge `challenge_arn` names, answering whether it was there — in
+    /// `region`, which is the only Region its owning connector exists in.
+    pub fn remove_challenge(&mut self, region: &str, challenge_arn: &str) -> bool {
         let Some(connector_arn) = connector_arn_of_challenge(challenge_arn) else {
             return false;
         };
-        self.connectors
-            .get_mut(connector_arn)
+        self.connector_mut(region, connector_arn)
             .is_some_and(|connector| connector.challenges.remove(challenge_arn).is_some())
     }
 
@@ -400,13 +464,16 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
     /// Which of the two kinds an ARN names follows from its shape ([`resource_type_of`]), and
     /// the tags come off that record — both kinds carry their own map — so a tag listing is
     /// computed from the resource itself and disappears with it.
-    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+    pub fn tags_of(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&BTreeMap<String, String>> {
         if connector_arn_of_challenge(resource_arn).is_some() {
-            self.challenge(resource_arn)
+            self.challenge(region, resource_arn)
                 .map(|challenge| &challenge.tags)
         } else {
-            self.connectors
-                .get(resource_arn)
+            self.connector(region, resource_arn)
                 .map(|connector| &connector.tags)
         }
     }
@@ -417,34 +484,60 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
     /// The mutable twin of [`tags_of`], reaching the same single map on the same record, so a
     /// tag written through here is the one a listing reads back and is dropped with the
     /// resource rather than lingering in a second table.
-    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+    pub fn tags_of_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
         match connector_arn_of_challenge(resource_arn) {
             Some(connector_arn) => self
-                .connectors
-                .get_mut(connector_arn)?
+                .connector_mut(region, connector_arn)?
                 .challenges
                 .get_mut(resource_arn)
                 .map(|challenge| &mut challenge.tags),
             None => self
-                .connectors
-                .get_mut(resource_arn)
+                .connector_mut(region, resource_arn)
                 .map(|connector| &mut connector.tags),
         }
     }
 
-    /// The record a still-live `ClientToken` of `CreateConnector` is bound to.
-    pub fn connector_for_token(&self, client_token: Option<&str>) -> Option<IdempotencyRecord> {
+    /// The record a still-live `ClientToken` of `CreateConnector`, sent to `region`, is
+    /// bound to.
+    pub fn connector_for_token(
+        &self,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> Option<IdempotencyRecord> {
         client_token
-            .and_then(|token| self.connector_tokens.get(token))
+            .and_then(|token| self.connector_tokens.get(&token_key(region, token)))
             .cloned()
     }
 
-    /// The record a still-live `ClientToken` of `CreateChallenge` is bound to.
-    pub fn challenge_for_token(&self, client_token: Option<&str>) -> Option<IdempotencyRecord> {
+    /// The record a still-live `ClientToken` of `CreateChallenge`, sent to `region`, is
+    /// bound to.
+    pub fn challenge_for_token(
+        &self,
+        region: &str,
+        client_token: Option<&str>,
+    ) -> Option<IdempotencyRecord> {
         client_token
-            .and_then(|token| self.challenge_tokens.get(token))
+            .and_then(|token| self.challenge_tokens.get(&token_key(region, token)))
             .cloned()
     }
+}
+
+/// The key a `ClientToken` seen in `region` is remembered under, so one token stands for one
+/// call against one Region's endpoint.
+pub fn token_key(region: &str, client_token: &str) -> (String, String) {
+    (region.to_string(), client_token.to_string())
+}
+
+/// The Region segment of an ARN: field four of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, which is where both
+/// `ConnectorArn`'s and `ChallengeArn`'s own patterns put it. `None` for a string that
+/// carries no non-empty Region segment there.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| !region.is_empty())
 }
 
 /// Which of this service's two resource kinds an ARN names, as the `ResourceType` member of
@@ -550,10 +643,45 @@ pub fn tags_rejection<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) ->
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.
+///
+/// The record store is partitioned by this value, so only a Region-shaped one is taken from
+/// the request ([`is_region_shaped`]): a scope carrying anything else is served in
+/// [`DEFAULT_REGION`], which keeps the Region a resource is filed under one that its ARN can
+/// actually name.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_shaped(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `value` has the shape every ARN of this service requires of its Region segment:
+/// `[a-z]+(-[a-z]+)+-[1-9]\d*` (smithy_query shape=ConnectorArn), within
+/// [`MAX_REGION_LENGTH`] — two or more lower-case words joined by `-`, then a number with no
+/// leading zero.
+pub fn is_region_shaped(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_REGION_LENGTH {
+        return false;
+    }
+    let Some((words, number)) = value.rsplit_once('-') else {
+        return false;
+    };
+    if !number
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut word_count = 0usize;
+    for word in words.split('-') {
+        if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return false;
+        }
+        word_count += 1;
+    }
+    word_count >= 2
 }
 
 /// A fresh identifier in the UUID form every id in this service's ARNs and its challenge
@@ -620,6 +748,14 @@ fn id_seed() -> u64 {
 /// which is what `ConnectorArn`'s own pattern requires.
 pub fn connector_arn(region: &str, connector_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("connector/{connector_id}"))
+}
+
+/// The prefix every connector ARN of `region` begins with — the same ARN
+/// [`connector_arn`] builds, up to and including the resource segment, with no id. Because
+/// the store is keyed by ARN, this is the lower bound of that Region's contiguous range of
+/// records.
+pub fn connector_arn_prefix(region: &str) -> String {
+    connector_arn(region, "")
 }
 
 /// The ARN of a challenge: the owning connector's ARN plus `/challenge/<uuid>`, which is
@@ -772,8 +908,16 @@ const CURSOR_SEPARATOR: char = '\n';
 /// token still matches `NextToken`'s pattern.
 const CURSOR_PADDING: &str = "==";
 
-/// Cursor scope of `ListConnectors`.
+/// Cursor-scope prefix of `ListConnectors`.
 pub const CURSOR_SCOPE_CONNECTORS: &str = "connectors";
+
+/// Cursor scope of `ListConnectors`, which lists the connectors of ONE Region: the scope
+/// names that Region, so a token minted against another Region's endpoint — or by the
+/// challenge listing — names no position here and is refused rather than resuming a walk it
+/// was not taken from.
+pub fn cursor_scope_connectors(region: &str) -> String {
+    format!("{CURSOR_SCOPE_CONNECTORS}/{region}")
+}
 
 /// Cursor scope of `ListChallengeMetadata`, which lists ONE connector's challenges: the
 /// scope names that connector, so a token minted for another connector — or for the

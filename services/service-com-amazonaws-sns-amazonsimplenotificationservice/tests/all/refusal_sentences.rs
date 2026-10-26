@@ -497,18 +497,6 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             message: "Invalid parameter: RedrivePolicy: missing required value",
         },
         Refusal {
-            case: "SetSubscriptionAttributes with an empty RedrivePolicy",
-            action: "SetSubscriptionAttributes",
-            params: params(&[
-                ("SubscriptionArn", &subscription),
-                ("AttributeName", "RedrivePolicy"),
-                ("AttributeValue", ""),
-            ]),
-            status: 400,
-            code: "InvalidParameter",
-            message: "Invalid parameter: RedrivePolicy: missing required value",
-        },
-        Refusal {
             case: "ListTagsForResource on a topic that does not exist",
             action: "ListTagsForResource",
             params: params(&[("ResourceArn", absent)]),

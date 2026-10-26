@@ -83,12 +83,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_next_token, package_not_found};
+use crate::state::{invalid_next_token, max_results_out_of_range, package_not_found};
 
-/// The largest page this operation answers with, and the page size a request that
-/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
-/// any request can ask for.
-const MAX_PAGE: usize = 100;
+/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`,
+/// so 100 results is the most any request can ask for. Held as the modelled member's
+/// own type, for the bound check below.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// [`MAX_PAGE_SIZE`] as a count of results — the page a request that names no page
+/// size gets.
+const MAX_PAGE: usize = MAX_PAGE_SIZE as usize;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,6 +170,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(ListDomainsForPackageErrorModeled::ValidationException(
+                max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -221,7 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MaxResults` is "an optional parameter": the model defaults it to 0, so a
         // request that asks for no particular page size gets the largest page the model
-        // allows rather than an empty one.
+        // allows rather than an empty one. Every other value reaching here is in
+        // `1..=MAX_PAGE_SIZE`, the bound check above having refused the rest.
         let page_size = match usize::try_from(input.max_results) {
             Ok(0) | Err(_) => MAX_PAGE,
             Ok(size) => size.min(MAX_PAGE),

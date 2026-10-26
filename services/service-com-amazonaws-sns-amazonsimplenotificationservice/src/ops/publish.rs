@@ -359,11 +359,36 @@ fn publish_into_store(
         Ok(deduplication_id) => deduplication_id,
         Err(reason) => return Err(invalid_parameter(reason)),
     };
+    // A FIFO publish is deduplicated: "If a message with a particular
+    // MessageDeduplicationId is sent successfully, subsequent messages within the
+    // deduplication scope and interval, with the same MessageDeduplicationId, are
+    // accepted successfully but aren't delivered"
+    // (`PublishInput$MessageDeduplicationId` doc) — so a duplicate answers with the
+    // message id and sequence number of the copy that WAS delivered, and nothing is
+    // recorded or handed to a queue for it.
+    let deduplication_key = message_deduplication_id
+        .as_deref()
+        .map(|id| state::deduplication_key(&topic, input.message_group_id.as_deref(), id));
+    if let Some(accepted) = deduplication_key
+        .as_deref()
+        .and_then(|key| store.deduplicated_publish(key))
+    {
+        return Ok((
+            PublishOutput {
+                message_id: Some(accepted.message_id),
+                sequence_number: accepted.sequence_number,
+            },
+            Vec::new(),
+        ));
+    }
     // Only a FIFO topic is sequenced: "This response element applies only to FIFO
     // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc).
     let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
 
     let message_id = store.next_unique_id();
+    if let Some(key) = deduplication_key {
+        store.remember_deduplication(key, &message_id, sequence_number.as_deref());
+    }
     // ONE record of the published message, SHARED by every subscription that receives
     // it: the retained log holds handles, not a copy of the body per subscriber.
     let published = ::std::sync::Arc::new(PublishedMessage {
@@ -435,6 +460,14 @@ pub struct QueueDelivery {
     /// The message attributes the queue receives, set only on a RAW delivery: without the
     /// notification envelope that carries them, they are the only place they survive.
     attributes: Vec<(String, MessageAttributeValue)>,
+    /// The group the published message belongs to, passed on to the queue: "For standard
+    /// topics: The MessageGroupId is … forwarded only to Amazon SQS standard
+    /// subscriptions to activate fair queues" (`PublishInput$MessageGroupId` doc), and a
+    /// FIFO queue orders by it — and cannot take a message without one.
+    message_group_id: Option<String>,
+    /// The token the published message is deduplicated under, passed on to a FIFO queue,
+    /// which deduplicates on it in turn. A standard queue takes no such token.
+    message_deduplication_id: Option<String>,
     /// Where this message is parked when the delivery cannot be made: the dead-letter queue
     /// the subscription's own `RedrivePolicy` names, or `None` when it asks for no redrive.
     dead_letter: Option<QueueLocation>,
@@ -471,6 +504,14 @@ impl QueueLocation {
             queue_arn: arn.to_string(),
             region: region.to_string(),
         })
+    }
+
+    /// Whether this is a FIFO queue: "the name of a FIFO queue must end with the .fifo
+    /// suffix" (`CreateQueueInput$QueueName` doc), and the resource part of a queue's ARN
+    /// is its name. A FIFO queue is the only kind that takes the ordering members of a
+    /// published message.
+    fn is_fifo(&self) -> bool {
+        self.queue_arn.ends_with(crate::state::FIFO_SUFFIX)
     }
 }
 
@@ -604,6 +645,8 @@ pub(crate) fn queue_deliveries(
             } else {
                 Vec::new()
             },
+            message_group_id: published.message_group_id.clone(),
+            message_deduplication_id: published.message_deduplication_id.clone(),
             dead_letter: target.dead_letter,
         });
     }
@@ -877,6 +920,20 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
             .send_message()
             .queue_url(&queue.queue_url)
             .message_body(&*delivery.body);
+        // The ordering members of the published message, passed on to the queue: a FIFO
+        // queue orders and deduplicates by them, and takes no message without a group.
+        // A STANDARD queue takes a group ("In standard queues, using MessageGroupId
+        // enables fair queues") but no deduplication token, which is a FIFO member.
+        if let Some(group) = delivery.message_group_id.as_deref() {
+            request = request.message_group_id(group);
+        }
+        if let Some(token) = delivery
+            .message_deduplication_id
+            .as_deref()
+            .filter(|_| queue.is_fifo())
+        {
+            request = request.message_deduplication_id(token);
+        }
         for (name, value) in &delivery.attributes {
             let mut attribute =
                 ::aws_sdk_sqs::types::MessageAttributeValue::builder().data_type(&value.data_type);
@@ -1065,7 +1122,7 @@ fn notification_envelope(
         envelope.insert("Subject".to_string(), serde_json::Value::from(subject));
     }
     envelope.insert("Message".to_string(), serde_json::Value::from(body));
-    if let Some(timestamp) = rfc3339(published.published_at) {
+    if let Some(timestamp) = state::rfc3339(published.published_at) {
         envelope.insert("Timestamp".to_string(), serde_json::Value::from(timestamp));
     }
     if let Some(sequence_number) = published.sequence_number.as_deref() {
@@ -1110,14 +1167,6 @@ fn notification_envelope(
         );
     }
     serde_json::Value::Object(envelope).to_string()
-}
-
-/// `at` as the RFC 3339 instant the envelope reports, or `None` for an instant the timestamp
-/// type cannot render.
-fn rfc3339(at: std::time::SystemTime) -> Option<String> {
-    ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
 }
 
 /// The call that cancels ONE subscription, as the notification delivered to it carries it:

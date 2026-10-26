@@ -588,6 +588,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &definition,
                 initial_status,
             );
+            // The elastic network interface an `awsvpc` task is allocated, out of the
+            // networking this run launches it with.
+            let attachments = guard.mint_task_attachments(
+                &definition.network_mode,
+                input.network_configuration.as_ref(),
+            );
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -626,6 +632,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
                 // has protected holds none.
                 protection_expires_at: None,
+                attachments,
             };
             // `RunTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.
