@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Removes the association of every member account the request
+//! names with the organization's management account, by storing the removal
+//! where the enrollment configuration of that account lives: its organization
+//! rule mode becomes `NoneAllowed`, which is what records that "organization
+//! rules no longer apply to the member account". The account's own enrollment
+//! status is left alone — only that account's `UpdateEnrollmentConfiguration`
+//! sets it. Answers with the accounts the STORE reports as no longer
+//! associated, never with the request's own list.
+//!
+//! An account the enrollment store has never seen carries no association to
+//! remove, so this operation writes only entries that are already there and can
+//! never grow the store.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +173,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateAccountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // The one rule on `accountIds` the model's constraints cannot carry.
+        // Each account id itself matched `AccountId`'s `^[0-9]{12}$` at the
+        // protocol boundary, so reaching here means every entry is well formed.
+        if let Some(message) = invalid_parameter(&input) {
+            return Err(
+                DisassociateAccountsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The accounts this request names, each ONCE and in the order the
+        // request first names them: an id repeated in the list names the same
+        // account, and an account is associated or it is not.
+        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        let requested: Vec<String> = input
+            .account_ids
+            .iter()
+            .filter(|account_id| seen.insert(account_id.as_str()))
+            .cloned()
+            .collect();
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        // The service-wide enrollment gate, AHEAD of the token ledger and of
+        // the store: an account that is not opted in may not perform this
+        // action, and a refused call must not consume its client token either.
+        // It reads the CALLER's enrollment — the accounts the request names are
+        // judged by nothing here, since what is being removed is the
+        // organization's reach into them. See `crate::state::…::opt_in_required`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAccounts"))
+        // `NotManagementAccountException` is the refusal for a caller that is
+        // neither the management account nor a delegated administrator ("Only
+        // the management account or a delegated administrator can perform this
+        // action"). This emulator serves exactly one account
+        // (`state::caller_account_id`), which is the organization's management
+        // account, so no request can reach that refusal.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(DisassociateAccountsErrorModeled::OptInRequiredException(refusal).into());
+        }
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {
+                let disassociated_at = crate::state::now();
+                for account_id in &requested {
+                    guard.disassociate_account(account_id, disassociated_at);
+                }
+                guard.record_token(client_token, Self::NAME, &request_fingerprint, None);
+            }
+            // A retry of the same removal: the accounts already carry no
+            // association, so the answer is recomputed from the store and
+            // nothing is stored again — in particular no timestamp is
+            // re-stamped.
+            crate::state::TokenOutcome::Replay(_) => {}
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    DisassociateAccountsErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    DisassociateAccountsErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Answer from the store: `accountIds` is "The IDs of the member accounts
+        // that were successfully disassociated", so an account appears only
+        // while the store reports it NOT associated.
+        let account_ids: Vec<String> = requested
+            .into_iter()
+            .filter(|account_id| !guard.is_associated(account_id))
+            .collect();
+
+        Ok(DisassociateAccountsOutput {
+            account_ids: Some(account_ids),
+            // `errors` is "Any errors that occurred during the disassociation
+            // process" — one entry per account the service could not
+            // disassociate. This emulator holds no organization-membership
+            // directory to disagree with the request, and every id reaching
+            // here matched `AccountId`, so nothing fails per account and the
+            // list is empty.
+            errors: Some(Vec::new()),
+        })
     }
+}
+
+/// Why this request's parameter values are not valid, if they are not.
+///
+/// The clause is the size of `accountIds`, which the `AccountIdList` shape
+/// carries no `@length` for: an organization-association request of this
+/// service names at least one account and at most
+/// [`crate::state::MAX_ACCOUNT_IDS_PER_REQUEST`] of them — the bound documented
+/// on the member of the paired request, which targets the same list shape — so
+/// a request naming none, and one naming more, is refused with the operation's
+/// `InvalidParameterValueException` rather than acting on a prefix of the list.
+fn invalid_parameter(input: &DisassociateAccountsInput) -> Option<String> {
+    if input.account_ids.is_empty() {
+        return Some(crate::state::constraint_report(
+            "accountIds",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    if input.account_ids.len() > crate::state::MAX_ACCOUNT_IDS_PER_REQUEST {
+        return Some(crate::state::constraint_report(
+            "accountIds",
+            &format!(
+                "Member must have length less than or equal to {}",
+                crate::state::MAX_ACCOUNT_IDS_PER_REQUEST
+            ),
+        ));
+    }
+    None
 }

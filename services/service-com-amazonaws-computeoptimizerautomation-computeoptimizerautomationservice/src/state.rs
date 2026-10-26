@@ -3070,6 +3070,46 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         changed
     }
 
+    /// Remove `account_id`'s association with the organization's management
+    /// account, as `DisassociateAccounts` documents the removal: "Once
+    /// disassociated, organization rules no longer apply to the member account,
+    /// and the management account (or delegated administrator) cannot create
+    /// Automation rules for that account" — which is exactly what the other
+    /// `OrganizationRuleMode`, [`ORGANIZATION_RULE_MODE_NONE_ALLOWED`], records
+    /// ([`EnrollmentConfig::reported_organization_rule_mode`]).
+    ///
+    /// The account's OWN enrollment is left alone: an association and an
+    /// enrollment are two different facts about an account, the status is "The
+    /// enrollment status of the account" and only that account's
+    /// `UpdateEnrollmentConfiguration` sets it, so a member account that enabled
+    /// the Automation feature keeps it enabled (and keeps the inventory that
+    /// enrollment produced) once the organization stops reaching it.
+    ///
+    /// Only an account the enrollment store already holds an entry for is
+    /// written: an account the store has never seen carries no association to
+    /// remove, so a disassociation never GROWS the store and no capacity bound
+    /// applies to it.
+    ///
+    /// Answers whether the stored configuration CHANGED. `at` is stamped as the
+    /// account's `lastUpdatedTimestamp` only when it did, so disassociating an
+    /// account that carries no association leaves its stored configuration,
+    /// timestamp included, exactly where it was.
+    pub fn disassociate_account(
+        &mut self,
+        account_id: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> bool {
+        let Some(enrollment) = self.enrollments.get_mut(account_id) else {
+            return false;
+        };
+        if enrollment.reported_organization_rule_mode() == ORGANIZATION_RULE_MODE_NONE_ALLOWED {
+            return false;
+        }
+        enrollment.organization_rule_mode = Some(ORGANIZATION_RULE_MODE_NONE_ALLOWED.to_string());
+        enrollment.last_updated_timestamp = Some(at);
+        true
+    }
+
     /// Record the recommended actions the analysis of `account_id`'s resources
     /// produces, for an account this service now holds as enrolled.
     ///

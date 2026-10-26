@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_association.rs"]
 mod account_association;
+#[path = "all/account_disassociation.rs"]
+mod account_disassociation;
 #[path = "all/account_listing.rs"]
 mod account_listing;
 #[path = "all/automation_event_and_tagging.rs"]

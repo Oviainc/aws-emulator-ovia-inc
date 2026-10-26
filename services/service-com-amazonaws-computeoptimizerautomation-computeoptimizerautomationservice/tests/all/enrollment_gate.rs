@@ -51,11 +51,9 @@ const GATE_MEMBER_ACCOUNT_ID: &str = "123456789012";
 /// status it answers once the account IS opted in and the store is empty — the
 /// operation's own outcome, which the gate is what stands in front of.
 ///
-/// This is every implemented operation of the service except
-/// `GetEnrollmentConfiguration` and `UpdateEnrollmentConfiguration`; the
-/// still-scaffolded ones answer 501 whether or not the account is enrolled, so
-/// they are not listed (see the `SCAFFOLDED, NOT IMPLEMENTED` headers in
-/// `src/ops/`).
+/// This is every operation of the service except
+/// `GetEnrollmentConfiguration` and `UpdateEnrollmentConfiguration`, the two the
+/// gate does not cover.
 fn gated_calls() -> Vec<(&'static str, Value, u16)> {
     let arn = absent_rule_arn();
     vec![
@@ -109,6 +107,11 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
         ),
         (
             "AssociateAccounts",
+            json!({"accountIds": [GATE_MEMBER_ACCOUNT_ID]}),
+            200,
+        ),
+        (
+            "DisassociateAccounts",
             json!({"accountIds": [GATE_MEMBER_ACCOUNT_ID]}),
             200,
         ),
