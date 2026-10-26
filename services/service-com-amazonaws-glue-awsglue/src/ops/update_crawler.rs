@@ -238,10 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service can run, so it is refused rather than stored and reported back.
         if let Some(schedule) = input.schedule.as_deref() {
             if !crate::state::is_cron_expression(schedule) {
-                return Err(invalid_input(format!(
-                    "Schedule {schedule} is not a cron expression of the form \
-                     cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
-                )));
+                return Err(invalid_input(
+                    crate::state::messages::schedule_not_a_cron_expression(schedule),
+                ));
             }
         }
 

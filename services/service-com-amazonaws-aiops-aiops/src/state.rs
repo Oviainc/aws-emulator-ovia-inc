@@ -721,6 +721,32 @@ pub fn cross_account_configurations_rejection(
         })
 }
 
+/// Why the configuration a write would store is unacceptable, or `None` when every
+/// rule accepts it — the WHOLE chain a request that stores an investigation group's
+/// configuration passes, in one place.
+///
+/// The individual rules are single-homed above; so is their composition, because the
+/// chain is itself part of the contract: the rules are applied in the order
+/// [`encryption_configuration_rejection`], [`cross_account_configurations_rejection`],
+/// [`collection_bounds_rejection`], and the FIRST one with something to say is what
+/// the request is refused with, so a request violating more than one of them is
+/// refused identically whichever operation carried it. Every operation that stores
+/// any of these members applies this one chain — each rendering the returned sentence
+/// as its own modelled `ValidationException` — so a create and an update can neither
+/// disagree about which input is refused nor about which rule reports it.
+///
+/// Pass `None` for a member the operation does not accept.
+pub fn write_configuration_rejection(
+    encryption_configuration: Option<&EncryptionConfiguration>,
+    cross_account_configurations: Option<&[CrossAccountConfiguration]>,
+    tag_key_boundaries: Option<&[String]>,
+    chatbot_notification_channel: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Option<String> {
+    encryption_configuration_rejection(encryption_configuration)
+        .or_else(|| cross_account_configurations_rejection(cross_account_configurations))
+        .or_else(|| collection_bounds_rejection(tag_key_boundaries, chatbot_notification_channel))
+}
+
 /// Why a resource policy document is unacceptable, or `None` when it is one this
 /// service will attach.
 ///

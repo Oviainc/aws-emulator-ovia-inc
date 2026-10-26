@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveAllBackends
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveAllBackends`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveAllBackends::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes EVERY backend environment of the Amplify project — and with each environment
+//! the auth, API and storage resources created inside it — and records one app-wide async
+//! job for the call, which is what the answer reports.
+//!
+//! The app this operation addresses is the Amplify PROJECT, not this service's backend
+//! record: a project that exists with no backend here has nothing to remove and is still
+//! answered with a job, leaving the store as it was, while an `AppId` no app exists under
+//! at all — in Amplify's registry or this service's — is refused with this service's
+//! app-identity refusal, HTTP 400 `ValidationException`
+//! ([`crate::state::require_known_app`]), before anything is removed.
+//!
+//! `CleanAmplifyApp` is what decides whether the APP itself survives the call: without it
+//! the app keeps its record (so a later `GetBackend` reports an app with no environments),
+//! with it the Amplify Console app is cleaned up — this service's record for the app and
+//! the Amplify control plane's own app record both go, exactly as Amplify's `DeleteApp`
+//! leaves them.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveAllBackends` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveAllBackendsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveAllBackends"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveAllBackendsError::from(RemoveAllBackendsErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        // The Amplify Console app is cleaned up only when the request ASKS for it: the
+        // member is optional, and a request that omits it removes the environments and
+        // leaves the app itself in place.
+        let clean_amplify_app = input.clean_amplify_app.unwrap_or(false);
+
+        // Who the app IS: an `AppId` is minted by the Amplify control plane, so the
+        // identity question is asked of BOTH registries — Amplify's app store and this
+        // service's backend records — before this service's store is locked at all (see
+        // the gate's lock order). A project can exist there with no backend here, and this
+        // operation answers for the project; an id neither holds is refused as the invalid
+        // app id it is, before anything is removed.
+        crate::state::require_known_app(&*self.engine, &input.app_id)?;
+
+        let now = std::time::SystemTime::now();
+        // The store guard is scoped so it is released before the cross-service clean-up
+        // below takes the Amplify control plane's lock.
+        let job = {
+            let mut store = state.lock();
+
+            // Minted BEFORE the app lookup borrows the store: the id a project with no
+            // backend record is answered with comes from the store's own sequence, since
+            // there is no app record to retain a receipt on (`mint_app_wide_job_id`). It
+            // is a sequence number, so taking one and not using it costs nothing.
+            let app_wide_job_id = store.mint_app_wide_job_id(now);
+
+            let reported = match store.app_mut(&input.app_id) {
+                Some(app) => {
+                    // Every environment goes, whatever the app held — and with each one
+                    // the auth, API and storage resources created inside it, which are
+                    // held INSIDE the environment record rather than in a map beside it.
+                    app.environments.clear();
+
+                    // The job records what the call DID, app-wide: `RemoveAllBackends`
+                    // names no environment, so neither does its job
+                    // (`JOB_ENVIRONMENT_APP_WIDE`). The job map is bounded here, before
+                    // the record is added: `reclaim_job_capacity` reclaims the app's
+                    // OLDEST jobs until there is room for one more, so the map holds at
+                    // most `MAX_RETAINED_JOBS_PER_APP` records however often this is
+                    // called.
+                    app.reclaim_job_capacity();
+                    let recorded = app.record_job(
+                        crate::state::JOB_ENVIRONMENT_APP_WIDE,
+                        crate::state::OPERATION_REMOVE_ALL_BACKENDS,
+                        now,
+                    );
+                    // Read off the STORED record, so the answer reports the job this call
+                    // recorded and not a second description of it.
+                    RemoveAllBackendsOutput {
+                        app_id: Some(recorded.app_id.clone()),
+                        error: recorded.error.clone(),
+                        job_id: Some(recorded.job_id.clone()),
+                        operation: Some(recorded.operation.clone()),
+                        status: Some(recorded.status.clone()),
+                    }
+                }
+                // The project exists and holds no backend here: there is nothing to
+                // remove, so the call is answered and the store is left exactly as it was
+                // — no backend record is brought into being for a project that has none,
+                // and a later read answers about the project as it did before.
+                //
+                // This receipt is ASSEMBLED rather than read back from a record, because
+                // there is no record: nothing was removed, so nothing is retained, and the
+                // job is unaddressable by `GetBackendJob` by construction. The members are
+                // the same ones the stored arm above reports, from the same constants.
+                None => RemoveAllBackendsOutput {
+                    app_id: Some(input.app_id.clone()),
+                    // Nothing failed: the project simply had no backend.
+                    error: None,
+                    job_id: Some(app_wide_job_id),
+                    operation: Some(crate::state::OPERATION_REMOVE_ALL_BACKENDS.to_string()),
+                    // A mutation of this service is asynchronous, so the job a call hands
+                    // back is never already finished — the same status a recorded job
+                    // starts in.
+                    status: Some(crate::state::JOB_STATUS_IN_PROGRESS.to_string()),
+                },
+            };
+
+            if clean_amplify_app {
+                // The app is being cleaned up, so this service keeps nothing keyed by it:
+                // its backend record, its job history and the live challenge tokens minted
+                // for it all go, whether or not it held a backend. The receipt above is
+                // the caller's only record of the call, which is what a cleaned-up app
+                // leaves behind.
+                store.remove_app(&input.app_id);
+            }
+            reported
+        };
+
+        if clean_amplify_app {
+            crate::state::remove_amplify_console_app(&*self.engine, &input.app_id);
+        }
+
+        Ok(job)
     }
 }
