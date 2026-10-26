@@ -2009,6 +2009,26 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
             .count()
     }
 
+    /// The resume point a `NextToken` carries, resolved against the WorkSpace
+    /// Instances Region `region`'s listing pages: `Some` only when `candidate` names
+    /// a record that Region holds.
+    ///
+    /// A page's token is minted from the id of the record the next page starts at, so
+    /// a held record of the Region the request is signed for is the only resume point
+    /// this service ever hands out. A decoded value naming no such record is therefore
+    /// a token this service did not issue — fabricated, truncated, re-encoded, or
+    /// minted for another Region's list — and its caller is refused with
+    /// [`invalid_next_token`] rather than seeked to a guessed-at place in the store.
+    ///
+    /// Settle the store ([`Self::settle_all`]) before asking, so a record the clock
+    /// has already made due for removal cannot resolve.
+    pub fn instance_resume_point(&self, region: &str, candidate: &str) -> Option<String> {
+        self.instances
+            .get(candidate)
+            .filter(|record| record.region == region)
+            .map(|record| record.id.clone())
+    }
+
     /// Whether another instance fits inside BOTH bounds this service keeps for Region
     /// `region`: the running-instance quota [`MAX_INSTANCES`], and
     /// [`MAX_HELD_INSTANCES`] on the records held in total, so a create/delete burst
@@ -2112,20 +2132,6 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
                 })
         })
     }
-}
-
-/// Whether `candidate` is shaped like a `WorkspaceInstanceId`: `len 15..70` and
-/// `^wsinst-[0-9a-zA-Z]{8,63}$` (`smithy_query(query="shape",shape="WorkspaceInstanceId")`).
-///
-/// The boundary validator already enforces this on every modelled member; this is for
-/// a value the service decodes itself, such as the resume point inside a `NextToken`.
-pub fn is_workspace_instance_id(candidate: &str) -> bool {
-    let Some(suffix) = candidate.strip_prefix("wsinst-") else {
-        return false;
-    };
-    (15..=70).contains(&candidate.len())
-        && (8..=63).contains(&suffix.len())
-        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would

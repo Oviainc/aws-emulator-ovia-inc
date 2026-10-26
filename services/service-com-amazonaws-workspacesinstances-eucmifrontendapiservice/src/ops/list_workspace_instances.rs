@@ -155,16 +155,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `MaxResults` is modelled `range 1..25`, already enforced at the boundary; a
+        // caller that sends none gets that modelled maximum as the page size.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::DEFAULT_MAX_RESULTS, |n| n as usize);
+
+        let mut state = state.lock();
+        // The moves the clock already owes (`ALLOCATING -> ALLOCATED`,
+        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record past its
+        // retention), materialised before the page is read so the listing reports the
+        // same state a `Get` would — and before the resume point below is resolved, so
+        // a record the clock has already dropped cannot resolve one.
+        state.settle_all(std::time::Instant::now());
+
         // The `NextToken` this operation mints carries the `WorkspaceInstanceId` the
         // next page resumes at, in this service's one token encoding
-        // ([`crate::state::decode_next_token`]): a token must decode to a value shaped
-        // like an instance id, so one this service did not issue is refused rather than
-        // guessed at.
+        // ([`crate::state::decode_next_token`]): a token must decode to a resume point
+        // THIS listing can name — a record this Region holds, which is what
+        // `instance_resume_point` answers — so one this service did not issue is
+        // refused rather than guessed at, just as the sibling paginated operation
+        // resolves its own resume point against the catalog it pages.
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
                 let decoded = crate::state::decode_next_token(token)
-                    .filter(|id| crate::state::is_workspace_instance_id(id));
+                    .and_then(|id| state.instance_resume_point(&region, &id));
                 match decoded {
                     Some(id) => Some(id),
                     None => {
@@ -177,23 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `range 1..25`, already enforced at the boundary; a
-        // caller that sends none gets that modelled maximum as the page size.
-        let page_size = input
-            .max_results
-            .map_or(crate::state::DEFAULT_MAX_RESULTS, |n| n as usize);
-
-        let mut state = state.lock();
-        // The moves the clock already owes (`ALLOCATING -> ALLOCATED`,
-        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record past its
-        // retention), materialised before the page is read so the listing reports the
-        // same state a `Get` would.
-        state.settle_all(std::time::Instant::now());
-
         // Iteration is in id order (the store is a `BTreeMap`), which is creation
-        // order, so a token resumes at a well-defined place even across a create or
-        // delete between pages. `range` seeks straight to the resume point rather than
-        // scanning the ids before it.
+        // order, so a resolved resume point names a well-defined place to continue
+        // from even across a create or a delete between pages. `range` seeks straight
+        // to it rather than scanning the ids before it.
         let from_resume = match &resume_from {
             Some(resume) => state.instances.range::<String, _>(resume..),
             None => state.instances.range::<String, _>(..),

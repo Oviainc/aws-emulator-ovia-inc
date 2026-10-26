@@ -27,6 +27,8 @@ mod instance_deletion_lifecycle;
 mod instance_token_parameter_mismatch;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
+#[path = "all/list_pagination_resume_points.rs"]
+mod list_pagination_resume_points;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/regional_scoping.rs"]
