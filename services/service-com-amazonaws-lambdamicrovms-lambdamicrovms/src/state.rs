@@ -125,6 +125,24 @@ pub const IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// store without bound.
 pub const MAX_IDEMPOTENCY_RECORDS: usize = 10_000;
 
+/// The most tags one resource may carry.
+///
+/// 50 tags per resource is the maximum AWS publishes for a taggable resource, and the
+/// model declares `InvalidParameterValueException` — "One of the parameters in the
+/// request is not valid" — on `TagResource`, so a request that would take a resource
+/// past it is refused rather than growing the stored tag set without bound.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The `message` of the 400 a tagging call answers when the tag set it would leave on
+/// the resource is larger than [`MAX_TAGS_PER_RESOURCE`].
+///
+/// AWS publishes no wording for this condition on this service, so — like the message
+/// `CreateMicrovmImage` answers for the per-account image quota — the sentence states
+/// the rule and the limit it is built from, rather than echoing another service's.
+pub fn too_many_tags_message() -> String {
+    format!("a resource may carry at most {MAX_TAGS_PER_RESOURCE} tags")
+}
+
 /// `stateReason` the service records for a caller-requested termination.
 ///
 /// `NonBlankString` has pattern `^[^\s]+$`, so the reason is a single token.

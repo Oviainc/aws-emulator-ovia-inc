@@ -436,12 +436,21 @@ async fn an_update_applies_each_member_and_entry_as_the_request_names_it() {
             ],
         ),
         (
+            // `DELETE` takes away the property declaration the ENTITY made. The
+            // component type's own definition of the same name is not the
+            // entity's to delete, so the property is still one the component
+            // has — now reported as the type's, inherited and carrying no
+            // value.
             "property.deleted",
             json!({"componentUpdates": {"Sensor": {"propertyUpdates": {"Serial": {
                 "updateType": "DELETE",
             }}}}}),
             vec![
-                ("/components/Sensor/properties/Serial", None),
+                ("/components/Sensor/properties/Serial/value", None),
+                (
+                    "/components/Sensor/properties/Serial/definition/isInherited",
+                    Some(json!(true)),
+                ),
                 (
                     "/components/Sensor/description",
                     Some(json!("the component the create persisted")),

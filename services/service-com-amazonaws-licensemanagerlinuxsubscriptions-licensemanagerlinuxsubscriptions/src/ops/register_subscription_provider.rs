@@ -8,16 +8,34 @@
 //! through `GetRegisteredSubscriptionProvider`, `ListRegisteredSubscriptionProviders`,
 //! `ListTagsForResource`, `TagResource`/`UntagResource` and `DeregisterSubscriptionProvider`.
 //!
-//! Validating the access token held in that secret is work that happens BEHIND this call:
-//! the registration answers `SubscriptionProviderStatus: PENDING` and the verdict lands on
-//! the resource afterwards (which is why `GetRegisteredSubscriptionProvider`, and not this
-//! operation, reports a `SubscriptionProviderStatusMessage`). A registration this call
-//! took then becomes usable: once `crate::state::TOKEN_VALIDATION_DELAY` has passed it
-//! reports `ACTIVE` with the subscription data retrieval that status reports on, which is
-//! the status a client polls for before it expects third-party subscription data.
+//! The resource is created only for a registration whose CREDENTIAL this service can
+//! actually use: the secret the `SecretArn` names is read from Secrets Manager and its
+//! value has to be an access token of the form the named `SubscriptionProviderSource`
+//! issues, or the call is refused with the modelled `ValidationException` (HTTP 400)
+//! before anything is written — so a caller that registers to check a BYOL credential
+//! learns here that it is unusable, and a refused registration leaves the provider store
+//! exactly as it was however many such calls arrive at once.
+//!
+//! Whether a token OF THAT FORM is one the provider still honours is the only part of the
+//! verdict that happens BEHIND this call: the registration answers
+//! `SubscriptionProviderStatus: PENDING` and the verdict lands on the resource afterwards
+//! (which is why `GetRegisteredSubscriptionProvider`, and not this operation, reports a
+//! `SubscriptionProviderStatusMessage`). A registration this call took then becomes
+//! usable: once `crate::state::TOKEN_VALIDATION_DELAY` has passed it reports `ACTIVE` with
+//! the subscription data retrieval that status reports on, which is the status a client
+//! polls for before it expects third-party subscription data.
 //!
 //! The operation is `@idempotent`: a repeat naming a (source, secret) pair this account
-//! already registered answers THAT registration rather than minting a second resource.
+//! already registered answers THAT registration rather than minting a second resource. The
+//! credential is checked on EVERY call, ahead of that repeat path, because the check is
+//! about the request's own credential rather than about what the store holds: a repeat made
+//! after the secret was deleted or rotated to a value that is not an access token no longer
+//! names a credential this service can use, and is refused like any other such call.
+//!
+//! The refusal's TEXT is this emulator's own wording: the recorded evidence for this
+//! behaviour carries the HTTP status and the error code only, so there is no AWS sentence to
+//! reproduce here, and a later recording that captures one should correct it. The status
+//! (400) and the code (`ValidationException`) are the model's.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -164,6 +182,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The ARN is minted in the Region the request was signed for, so the resource the
+        // tag APIs and the read side address is the one this Region's caller created.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // `SubscriptionProviderSource` and `SecretArn` are both `@required` and the
+        // boundary already held the request to the modelled enum, the `SecretArn` pattern
+        // and the `Tags` size — but neither says anything about what the SECRET holds, and
+        // a registration is only worth creating for a credential this service can use. The
+        // credential is resolved and checked FIRST, so a refusal happens before the store
+        // is touched at all.
+        if let CredentialLookup::Unusable(refusal) = resolve_credential(
+            ctx,
+            &region,
+            &input.subscription_provider_source,
+            &input.secret_arn,
+        )
+        .await
+        {
+            return Err(RegisterSubscriptionProviderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             RegisterSubscriptionProviderErrorModeled::InternalServerException(
                 InternalServerException {
@@ -171,14 +215,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-
-        // The ARN is minted in the Region the request was signed for, so the resource the
-        // tag APIs and the read side address is the one this Region's caller created.
-        let region = crate::state::request_region(&ctx.parts().headers);
-
-        // `SubscriptionProviderSource` and `SecretArn` are both `@required` and the
-        // boundary already held the request to the modelled enum, the `SecretArn` pattern
-        // and the `Tags` size, so what reaches here is a registration to persist.
         let mut state = state.lock();
         let record = state
             .register_provider(
@@ -210,6 +246,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?;
 
+        // The access record for a call that CREATED a resource: which registration this
+        // call left behind, attributable without reading the store. Identifiers only — the
+        // secret is named by its ARN, never by what it holds, and the registration's
+        // `Tags` (which the model marks sensitive) are not recorded.
+        ::tracing::info!(
+            operation = Self::NAME,
+            region = %region,
+            subscription_provider_arn = %record.arn,
+            subscription_provider_source = %record.source,
+            secret_arn = %input.secret_arn,
+            subscription_provider_status = %record.status,
+            "registered a Linux subscription provider"
+        );
+
         // Answer from the stored record, so this call and every later read of the same
         // registration cannot disagree about its ARN, its source or its status.
         Ok(RegisterSubscriptionProviderOutput {
@@ -225,4 +275,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 // to the condition (`crate::state::RegisterRefusal`), and one it may take is created and
 // becomes usable on the clock, rather than being answered with a refusal that erased the
 // resource.
+
+/// What the secret a registration named holds, as far as this call can establish it.
+#[derive(Debug, PartialEq, Eq)]
+enum CredentialLookup {
+    /// The secret was read and its value is an access token of the form the registered
+    /// `SubscriptionProviderSource` issues, so the registration can be taken.
+    Usable,
+    /// A definite negative about the credential: the secret cannot be read at all, or its
+    /// value is not an access token of that form. Carries the refusal's text.
+    Unusable(String),
+    /// Nothing was established about the secret — Secrets Manager answered about itself
+    /// (a fault, a throttle) or did not answer at all. Not a negative, so not a refusal:
+    /// a registration is never refused on a credential nobody reported anything about.
+    Indeterminate,
+}
+
+/// A Secrets Manager client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no network client is configured here and this service names no
+/// other service's crate. `region` is where the secret lives, so the lookup is addressed
+/// where the `SecretArn` says the credential is stored.
+fn secrets_manager_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_secretsmanager::Client {
+    let config = ::aws_sdk_secretsmanager::Config::builder()
+        .behavior_version(::aws_sdk_secretsmanager::config::BehaviorVersion::latest())
+        .region(::aws_sdk_secretsmanager::config::Region::new(
+            region.to_string(),
+        ))
+        .endpoint_url(format!("https://secretsmanager.{region}.amazonaws.com"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials the
+        // callback hands over are used directly.
+        .retry_config(::aws_sdk_secretsmanager::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_secretsmanager::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_secretsmanager::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_secretsmanager::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_secretsmanager::Client::from_conf(config)
+}
+
+/// The Region the secret `secret_arn` names lives in: the Region segment of the ARN
+/// itself, which the modelled `SecretArn` pattern allows to be empty — and then the
+/// Region the request was signed for, the only other place the secret could be.
+fn secret_region(secret_arn: &str, request_region: &str) -> String {
+    secret_arn
+        .split(':')
+        .nth(3)
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(request_region)
+        .to_string()
+}
+
+/// Read the secret `secret_arn` names and say whether it holds an access token `source`
+/// could be registered with.
+///
+/// `GetSecretValue` is the read the registration needs: the provider's access token is
+/// what this service will present to the provider, so the registration is only worth
+/// taking if that token is there and has the form the provider issues.
+async fn resolve_credential(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    request_region: &str,
+    source: &str,
+    secret_arn: &str,
+) -> CredentialLookup {
+    let region = secret_region(secret_arn, request_region);
+    let value = match secrets_manager_client(ctx, &region)
+        .get_secret_value()
+        .secret_id(secret_arn)
+        .send()
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => return unreadable_secret(&err),
+    };
+    // The access token is text, so a secret that holds only a binary value holds no token
+    // (`GetSecretValue` reports one of `SecretString` / `SecretBinary`, whichever the
+    // version carries).
+    let Some(credential) = value.secret_string() else {
+        return CredentialLookup::Unusable(NO_SECRET_STRING_MESSAGE.to_string());
+    };
+    match credential_defect(source, credential) {
+        Some(refusal) => CredentialLookup::Unusable(refusal),
+        None => CredentialLookup::Usable,
+    }
+}
+
+/// Classify a failed `GetSecretValue`.
+///
+/// A definite negative only when Secrets Manager answered a client error naming one of
+/// [`SECRET_NEGATIVE_ERROR_CODES`]: those say the secret's value cannot be read at all —
+/// no such secret, a secret on its way out, a value that cannot be decrypted, a caller
+/// that may not read it — and a credential that cannot be read cannot be registered.
+/// Anything else says something about Secrets Manager rather than about this secret (a
+/// server fault, a throttle, a reply carrying no error code at all because nothing routed
+/// to Secrets Manager beside this service), so the lookup is
+/// [`CredentialLookup::Indeterminate`] and the registration proceeds rather than being
+/// refused on a credential nobody reported anything about.
+fn unreadable_secret(
+    err: &::aws_sdk_secretsmanager::error::SdkError<
+        ::aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError,
+    >,
+) -> CredentialLookup {
+    // The status Secrets Manager answered with, when it answered at all: a 5xx is about
+    // Secrets Manager, not about the secret, whatever code travels with it.
+    let client_error = err
+        .raw_response()
+        .is_some_and(|response| response.status().is_client_error());
+    let code = ::aws_sdk_secretsmanager::error::ProvideErrorMetadata::code(err).unwrap_or_default();
+    let about_the_secret = SECRET_NEGATIVE_ERROR_CODES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(code));
+    if client_error && about_the_secret {
+        return CredentialLookup::Unusable(UNREADABLE_SECRET_MESSAGE.to_string());
+    }
+    // Visible to an operator: an indeterminate lookup admits the registration, so without
+    // this line it would be indistinguishable from a credential that was read and checked.
+    ::tracing::warn!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(err),
+        "Secrets Manager gave no answer about this registration's SecretArn; admitting it"
+    );
+    CredentialLookup::Indeterminate
+}
+
+/// The Secrets Manager error codes that say the secret's VALUE cannot be read at all,
+/// rather than something about the call or about Secrets Manager itself: the codes
+/// `GetSecretValue` models for an identifier it cannot resolve or a request it cannot
+/// serve (`ResourceNotFoundException`, `InvalidParameterException`,
+/// `InvalidRequestException` — which is what a secret scheduled for deletion answers —
+/// and `DecryptionFailure`), plus the authorization refusal for a secret this caller may
+/// not read.
+///
+/// Deliberately NOT `InternalServiceError` or a throttle: those describe Secrets Manager,
+/// not the secret, and must not turn into a refusal of the registration.
+const SECRET_NEGATIVE_ERROR_CODES: &[&str] = &[
+    "AccessDeniedException",
+    "DecryptionFailure",
+    "InvalidParameterException",
+    "InvalidRequestException",
+    "ResourceNotFoundException",
+];
+
+/// The refusal for a secret whose value this service could not read.
+const UNREADABLE_SECRET_MESSAGE: &str =
+    "The secret referenced by SecretArn could not be read, so the subscription provider's \
+     access token is not available. Store the access token in a secret this account can \
+     read and try your request again.";
+
+/// The refusal for a secret that carries no text value: an access token is text, so a
+/// secret holding only a binary value holds no token.
+const NO_SECRET_STRING_MESSAGE: &str =
+    "The secret referenced by SecretArn holds no SecretString, so it does not contain the \
+     subscription provider's access token. Store the access token as the secret's string \
+     value and try your request again.";
+
+/// The `SubscriptionProviderSource` whose access token is a Red Hat Subscription Manager
+/// OFFLINE TOKEN (model: `SubscriptionProviderSource`, one of: `RedHat`; `SecretArn`:
+/// "For RHEL subscriptions managed through the Red Hat Subscription Manager (RHSM), the
+/// secret contains your Red Hat Offline token").
+const SOURCE_RED_HAT: &str = "RedHat";
+
+/// Why `credential` is not an access token the provider `source` issues, or `None` when it
+/// has that token's form.
+///
+/// One arm per modelled `SubscriptionProviderSource`: the credential a registration needs
+/// is whatever the named provider issues, so the check belongs to the source rather than
+/// to the operation. A source outside the modelled enum never reaches here — the request
+/// boundary holds `SubscriptionProviderSource` to the enum — and is left unchecked rather
+/// than refused on a form nothing has stated.
+fn credential_defect(source: &str, credential: &str) -> Option<String> {
+    match source {
+        SOURCE_RED_HAT => offline_token_defect(credential),
+        _ => None,
+    }
+}
+
+/// The claim an OIDC token's payload carries its type in.
+const TOKEN_TYPE_CLAIM: &str = "typ";
+
+/// The token type an offline token declares: it is the OFFLINE refresh token the
+/// provider's single sign-on issues, which is what lets this service retrieve subscription
+/// data without the account holder present.
+const OFFLINE_TOKEN_TYPE: &str = "Offline";
+
+/// Why `credential` is not a Red Hat offline token, or `None` when it has that token's
+/// form.
+///
+/// An RHSM offline token is the offline refresh token Red Hat's single sign-on issues, so
+/// it is a JSON Web Token whose claim set declares the OFFLINE token type. The token's form
+/// is read by the shared reader every service handed a token uses
+/// (`service_common::jwt`), which also bounds the work a caller-supplied value can ask
+/// for; what belongs to THIS registration is the claim that makes the token an offline one.
+///
+/// Whether a token OF that form is still one the provider honours is a question only the
+/// provider can answer — that is the validation that runs behind an admitted registration
+/// and lands on the resource's `SubscriptionProviderStatus`. What is decided here is
+/// whether the stored credential is an offline token at all.
+fn offline_token_defect(credential: &str) -> Option<String> {
+    let defect = |reason: &dyn ::std::fmt::Display| {
+        Some(format!(
+            "The secret referenced by SecretArn does not contain a Red Hat offline token: \
+             {reason}. Store your Red Hat offline token in that secret and try your \
+             request again."
+        ))
+    };
+    let token = match ::service_common::jwt::read(credential) {
+        Ok(token) => token,
+        Err(form) => return defect(&form),
+    };
+    match token.claim_str(TOKEN_TYPE_CLAIM) {
+        Some(token_type) if token_type.eq_ignore_ascii_case(OFFLINE_TOKEN_TYPE) => None,
+        // The reason names the claim that is wrong, never the VALUE read out of the
+        // secret: a refusal is answered to a caller whose own authorization to read that
+        // secret this service never established, so no part of the stored credential
+        // travels in it.
+        _ => defect(&format!(
+            "its payload does not declare the {OFFLINE_TOKEN_TYPE:?} token type"
+        )),
+    }
+}
 

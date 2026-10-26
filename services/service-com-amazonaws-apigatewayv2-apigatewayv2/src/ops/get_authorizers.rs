@@ -163,8 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(api) = store.apis.get(&input.api_id) else {
             return Err(GetAuthorizersErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        "API",
+                    message: Some(crate::state::invalid_api_identifier_message(
                         &input.api_id,
                     )),
                     resource_type: ::std::option::Option::None,

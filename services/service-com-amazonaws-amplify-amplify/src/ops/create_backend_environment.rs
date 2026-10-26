@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackendEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackendEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackendEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +145,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackendEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackendEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackendEnvironment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBackendEnvironmentErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the Amplify emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // One instant for both stamps: an environment Amplify has only just created
+        // has not been updated since, so `createTime` and `updateTime` are equal.
+        let created = crate::state::now();
+        let mut store = state.lock();
+
+        // A backend environment only exists as part of an app, so an unknown `appId`
+        // is a 404 rather than an app created on the way.
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            CreateBackendEnvironmentErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+
+        // `environmentName` identifies a backend environment within its app, so a
+        // second create under the same name is refused rather than silently replacing
+        // the first environment — the same rule, through the same formatter, as every
+        // other create of a named resource under an app in this service.
+        if app.backend_environments.contains_key(&input.environment_name) {
+            return Err(CreateBackendEnvironmentErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::BACKEND_ENVIRONMENT_ENTITY,
+                        &input.environment_name,
+                        &input.app_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The quota is enforced BEFORE the environment is built or stored, so a
+        // refused create leaves the app exactly as it was and one app's backend
+        // environment map cannot grow without limit.
+        if app.backend_environments.len() >= MAX_BACKEND_ENVIRONMENTS_PER_APP {
+            return Err(CreateBackendEnvironmentErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Number of backend environments exceeds the limit of \
+                         {MAX_BACKEND_ENVIRONMENTS_PER_APP} for app {}",
+                        input.app_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let environment = BackendEnvironment {
+            // A backend environment is addressed under its app by its own name, so
+            // its ARN is the app's ARN extended by the resource path the request
+            // used — the same construction a branch's ARN uses.
+            backend_environment_arn: format!(
+                "{}/backendenvironments/{}",
+                app.app.app_arn, input.environment_name
+            ),
+            environment_name: input.environment_name,
+            // Both are OPTIONAL on `BackendEnvironment` and name artefacts the caller
+            // provisions (a CloudFormation stack, a deployment bundle), so the record
+            // carries exactly what the request supplied and nothing invented for it.
+            stack_name: input.stack_name,
+            deployment_artifacts: input.deployment_artifacts,
+            create_time: created,
+            update_time: created,
+        };
+
+        app.backend_environments
+            .insert(environment.environment_name.clone(), environment.clone());
+
+        Ok(CreateBackendEnvironmentOutput {
+            backend_environment: environment,
+        })
     }
 }
+
+/// How many backend environments one app may hold at once, past which
+/// `CreateBackendEnvironment` answers the modelled `LimitExceededException` (HTTP 429,
+/// "A resource could not be created because service quotas were exceeded").
+///
+/// CHOSEN, not a published quota: the bound is `ListBackendEnvironments`' modelled
+/// `maxResults` maximum (`range 0..50`, from
+/// `smithy_query(query="operation",operation="ListBackendEnvironments")`), which is the
+/// largest page that operation can serve. It keeps one app's environment map from
+/// growing without limit, and the refusal is the modelled one a real account past its
+/// quota gets.
+const MAX_BACKEND_ENVIRONMENTS_PER_APP: usize = 50;

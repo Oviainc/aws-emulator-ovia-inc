@@ -235,6 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date: now,
             last_update_date: now,
             tags: input.tags.clone().unwrap_or_default(),
+            // A project is created empty: `BatchAssociateProjectAssets` is what puts
+            // an asset in a project, and this call names none.
+            asset_ids: ::std::collections::BTreeSet::new(),
         };
 
         let output = CreateProjectOutput {

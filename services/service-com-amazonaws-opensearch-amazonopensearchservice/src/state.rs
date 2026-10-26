@@ -16,10 +16,11 @@
 //! shape is how two operations end up reading two different records.
 //!
 //! Another resource this store holds is the cross-cluster [`Connection`]:
-//! `CreateOutboundConnection` mints one and `DescribeOutboundConnections` reports
-//! it. One record carries both views of a connection — the source domain owner's
-//! outbound one and the destination owner's inbound one — because they are one
-//! resource sharing a `ConnectionId`.
+//! `CreateOutboundConnection` mints one, `DescribeOutboundConnections` reports it
+//! to the source domain's owner and `DescribeInboundConnections` reports it to the
+//! destination domain's owner. One record carries both views of a connection — the
+//! source domain owner's outbound one and the destination owner's inbound one —
+//! because they are one resource sharing a `ConnectionId`.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -43,7 +44,8 @@ use crate::ops::types::{
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, Insight, InsightEntity, InsightField,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
+    InboundConnectionStatus, Insight, InsightEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails,
     InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
@@ -62,6 +64,7 @@ use crate::ops::types::{
     StorageTypeLimit, Tag, UpgradeHistory, UpgradeStepItem, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
     VpcEndpoint, VpcEndpointError, VpcEndpointSummary,
+    INBOUND_CONNECTION_STATUS_CODE_VALUES,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
     VOLUME_TYPE_VALUES,
 };
@@ -1148,9 +1151,10 @@ pub struct OwedStatus {
 /// A cross-cluster connection is ONE resource with two views: the source domain
 /// owner's OUTBOUND connection and the destination owner's INBOUND connection, which
 /// share a `ConnectionId` and move through the lifecycle together. This is the single
-/// record behind both views — `CreateOutboundConnection` mints it and
-/// `DescribeOutboundConnections` reports it — so no two operations can report the
-/// same connection differently.
+/// record behind both views — `CreateOutboundConnection` mints it,
+/// `DescribeOutboundConnections` reports it as [`Connection::to_outbound`] and
+/// `DescribeInboundConnections` reports it as [`Connection::to_inbound`] — so no two
+/// operations can report the same connection differently.
 #[derive(Debug, Clone)]
 pub struct Connection {
     /// `OutboundConnection$ConnectionId`, which is also the inbound view's. Unique
@@ -1217,6 +1221,45 @@ impl Connection {
             }),
             connection_mode: Some(self.connection_mode.clone()),
             connection_properties: self.connection_properties.clone(),
+        }
+    }
+
+    /// Whether this connection has an INBOUND view at all — whether the destination
+    /// domain's owner has anything to see or decide about it yet.
+    ///
+    /// The two views of one connection share a lifecycle, but not every status the
+    /// source owner's outbound view reports is one the destination owner's inbound
+    /// view can be in: `InboundConnectionStatusCode` carries neither
+    /// [`CONNECTION_STATUS_VALIDATING`] nor [`CONNECTION_STATUS_VALIDATION_FAILED`],
+    /// while `OutboundConnectionStatusCode` carries both. A request that is still
+    /// being validated, or whose validation failed, therefore has no inbound view —
+    /// it is reported to the source owner only, and the status set the inbound shape
+    /// models is what says so.
+    pub fn has_inbound_view(&self) -> bool {
+        INBOUND_CONNECTION_STATUS_CODE_VALUES.contains(&self.status.as_str())
+    }
+
+    /// This record as `InboundConnection` — the element shape
+    /// `DescribeInboundConnections` reports, and the projection every operation on
+    /// the destination owner's view of a connection answers with.
+    ///
+    /// The same stored record [`Connection::to_outbound`] projects, so the two views
+    /// of one connection cannot disagree about its id, its endpoints, its mode or
+    /// where it is in its lifecycle. The inbound shape models no `ConnectionAlias`
+    /// and no `ConnectionProperties`: the alias is how the SOURCE domain names the
+    /// remote cluster, so it is the source owner's view that carries it.
+    pub fn to_inbound(&self) -> InboundConnection {
+        InboundConnection {
+            local_domain_info: Some(domain_information(&self.local_domain)),
+            remote_domain_info: Some(domain_information(&self.remote_domain)),
+            connection_id: Some(self.connection_id.clone()),
+            connection_status: Some(InboundConnectionStatus {
+                status_code: Some(self.status.clone()),
+                // "Information about the connection": carried only where the status
+                // has something to say the code itself does not.
+                message: self.status_message.clone(),
+            }),
+            connection_mode: Some(self.connection_mode.clone()),
         }
     }
 }

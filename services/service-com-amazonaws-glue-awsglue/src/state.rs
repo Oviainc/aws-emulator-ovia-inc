@@ -80,6 +80,11 @@
 //! — `GetResourcePolicyRequest$ResourceArn`), which is therefore keyed by the Data
 //! Catalog's own ARN ([`catalog_arn`]).
 //!
+//! USAGE PROFILES — the job and session parameter sets an admin registers with
+//! `CreateUsageProfile` — sit beside the catalog tree in another per-account namespace
+//! keyed by profile name ([`ComAmazonawsGlueAwsglueState::usage_profiles`]), because every
+//! operation that addresses a profile names it by `Name` alone and carries no `CatalogId`.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -98,8 +103,10 @@ use crate::ops::types::{
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateJobInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput,
     EncryptionAtRest, ErrorDetail, ExecutionProperty, FederatedDatabase, FederatedTable, Job,
+    CreateUsageProfileInput,
     JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
-    NotificationProperty, Partition, PartitionInput, PrincipalPermissions, RLSProperties,
+    NotificationProperty, Partition, PartitionInput, PrincipalPermissions, ProfileConfiguration,
+    RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaId, SourceControlDetails, StartColumnStatisticsTaskRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput, TableVersion,
@@ -240,6 +247,13 @@ pub const MAX_ASSET_TYPES: usize = 1_000;
 /// rather than stored; `CreateGlossary` models no limit error, so the refusal is the
 /// closest client error it does model (`InvalidInputException`).
 pub const MAX_GLOSSARIES: usize = 1_000;
+
+/// Ceiling on the usage profiles this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]: `CreateUsageProfile` writes a record any caller can reach, each one
+/// carrying two configuration maps, so the number of records one process will hold is
+/// bounded here. A create past the ceiling is refused with `CreateUsageProfile`'s own
+/// modelled `ResourceNumberLimitExceededException`.
+pub const MAX_USAGE_PROFILES: usize = 1_000;
 
 /// Ceiling on the resource policies this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `PutResourcePolicy` writes a record any caller can reach, and each
@@ -560,6 +574,14 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// [`Self::glossary_by_name`] is that resolution, and `CreateGlossary`'s modelled
     /// `AlreadyExistsException` is what a second create under a stored name gets.
     pub glossaries: BTreeMap<String, GlossaryEntry>,
+    /// Every usage profile this emulator holds, keyed by its name, in name order.
+    ///
+    /// Per account, like crawlers and custom entity types: `GetUsageProfile`,
+    /// `UpdateUsageProfile` and `DeleteUsageProfile` address a profile by `Name` alone,
+    /// with no `CatalogId` member. Ordered, so `ListUsageProfiles` has one deterministic
+    /// order to page over. The key is the name exactly as sent — the model documents no
+    /// case fold for a usage profile name.
+    pub usage_profiles: BTreeMap<String, UsageProfileEntry>,
     /// Every column statistics task run this emulator holds, oldest first.
     ///
     /// A run lives BESIDE the catalog tree rather than on the table it was started for,
@@ -978,6 +1000,12 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_CUSTOM_ENTITY_TYPES`].
     pub fn can_store_custom_entity_type(&self) -> bool {
         self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
+    }
+
+    /// Whether the store can hold another usage profile, i.e. is below
+    /// [`MAX_USAGE_PROFILES`].
+    pub fn can_store_usage_profile(&self) -> bool {
+        self.usage_profiles.len() < MAX_USAGE_PROFILES
     }
 
     /// Whether the store can hold another form type, i.e. is below [`MAX_FORM_TYPES`].
@@ -2210,6 +2238,54 @@ impl CustomEntityTypeEntry {
             name: self.name.clone(),
             regex_string: self.regex_string.clone(),
             context_words: self.context_words.clone(),
+        }
+    }
+}
+
+/// One usage profile: the job and session parameter set `CreateUsageProfile` registered
+/// under a name, plus the two instants the SERVER stamps on it.
+///
+/// Every member of the modelled `GetUsageProfileResponse` is held here, plus the create's
+/// `Tags`, which that shape does not carry — so a later read reports the profile the write
+/// stored and nothing invented on the way out.
+#[derive(Debug, Clone)]
+pub struct UsageProfileEntry {
+    /// The profile's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::usage_profiles`].
+    pub name: String,
+    /// "A description of the usage profile", or `None` when the write named none.
+    pub description: Option<String>,
+    /// "A `ProfileConfiguration` object specifying the job and session values for the
+    /// profile", stored exactly as the write sent it.
+    ///
+    /// Each of its two members is a map that is stored as sent, so an EMPTY map and an
+    /// ABSENT one stay different: an empty `JobConfiguration` is a profile that configures
+    /// no job parameter, while an absent one is a profile that does not speak about job
+    /// parameters at all, and a read reports back whichever the write carried.
+    pub configuration: ProfileConfiguration,
+    /// Server-set, written once at create so every later read reports the same instant.
+    pub created_on: SystemTime,
+    /// Server-set; moves with every write to this profile.
+    pub last_modified_on: SystemTime,
+    /// The create's `Tags`, which the `GetUsageProfile` response has no member for.
+    ///
+    /// Kept so the create does not discard what the client sent, but NOT yet reachable
+    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
+    /// gives: [`TaggedResourceKind`] carries no usage profile variant.
+    pub tags: HashMap<String, String>,
+}
+
+impl UsageProfileEntry {
+    /// Build a stored usage profile from a `CreateUsageProfile` request plus the instant
+    /// the create was served at, which is both its create and its last-modified instant.
+    pub fn from_create_input(input: &CreateUsageProfileInput, now: SystemTime) -> Self {
+        Self {
+            name: input.name.clone(),
+            description: input.description.clone(),
+            configuration: input.configuration.clone(),
+            created_on: now,
+            last_modified_on: now,
+            tags: input.tags.clone().unwrap_or_default(),
         }
     }
 }

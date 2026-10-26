@@ -53,6 +53,8 @@ mod number_canonicalization;
 mod on_demand_backups;
 #[path = "all/on_demand_throughput_capacity_mode.rs"]
 mod on_demand_throughput_capacity_mode;
+#[path = "all/paging_start_keys.rs"]
+mod paging_start_keys;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
@@ -67,6 +69,9 @@ mod resource_tags;
 
 #[path = "all/restore_table_from_backup.rs"]
 mod restore_table_from_backup;
+
+#[path = "all/restore_table_to_point_in_time.rs"]
+mod restore_table_to_point_in_time;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

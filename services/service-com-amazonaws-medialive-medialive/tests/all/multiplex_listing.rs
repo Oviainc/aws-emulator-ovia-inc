@@ -117,6 +117,12 @@ async fn every_page(
     (ids, pages)
 }
 
+/// A collection larger than the page size a client would ask for by hand, and
+/// within the store's own bound (`MAX_MULTIPLEXES`): what a row uses to assert
+/// that the service never cuts a page below the `MaxResults` the request asked
+/// for.
+const A_LARGE_COLLECTION: usize = 57;
+
 /// One row of the pagination table: how many multiplexes the account holds and
 /// the page size the request asks for.
 struct Paging {
@@ -138,8 +144,8 @@ struct Paging {
 ///
 /// The rows differ along the COUNT of stored multiplexes and the page size asked
 /// for — none, one, a size that divides the collection unevenly, no size at all,
-/// a size past the service's ceiling, and more multiplexes than one default page
-/// holds — because that is what the rule generalises over.
+/// a size past the service's ceiling, and more multiplexes than a hand-written
+/// page size would hold — because that is what the rule generalises over.
 #[tokio::test]
 async fn list_multiplexes_pages_through_every_multiplex_in_id_order() {
     let table = [
@@ -179,10 +185,11 @@ async fn list_multiplexes_pages_through_every_multiplex_in_id_order() {
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
         },
         Paging {
-            // More multiplexes than a single default page holds, so the default
-            // page size is itself a cut and not just a ceiling nobody reaches.
-            case: "more multiplexes than one default page holds",
-            multiplexes: MAX_LIST_PAGE_SIZE + 7,
+            // A collection far larger than any page a caller would ask for by
+            // hand: the service's ceiling is the published `MaxResults` bound,
+            // well above what the store can hold, so one page carries them all.
+            case: "a large collection, no page size",
+            multiplexes: A_LARGE_COLLECTION,
             page_size: None,
         },
     ];

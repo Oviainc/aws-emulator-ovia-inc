@@ -51,6 +51,8 @@ mod get_participant;
 mod get_stage_session;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
+#[path = "all/list_compositions.rs"]
+mod list_compositions;
 #[path = "all/list_participant_replicas_paging.rs"]
 mod list_participant_replicas_paging;
 #[path = "all/participant_events.rs"]

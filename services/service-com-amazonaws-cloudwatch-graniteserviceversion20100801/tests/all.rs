@@ -19,6 +19,8 @@ mod alarm_action_failures;
 mod alarm_actions_switch;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
+#[path = "all/alarm_delete_semantics.rs"]
+mod alarm_delete_semantics;
 #[path = "all/alarm_evaluation.rs"]
 mod alarm_evaluation;
 #[path = "all/alarm_history.rs"]

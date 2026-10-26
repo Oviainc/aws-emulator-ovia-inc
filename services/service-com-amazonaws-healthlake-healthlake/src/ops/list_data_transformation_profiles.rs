@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataTransformationProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataTransformationProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataTransformationProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every data transformation profile this service holds whose source data
+//! format is the one the request names — one entry per profile, at its latest
+//! version — a page at a time, in the stable order every other listing in this
+//! crate pages in. It writes nothing: a profile owes the clock no transition, so
+//! there is nothing to settle before its summary is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataTransformationProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataTransformationProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataTransformationProfiles"))
+        // This operation reports; the profiles it reports are the same for every
+        // caller, so `ctx` carries nothing it needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        // `SourceFormat` is a modelled enum, so the boundary validator has already
+        // refused anything else; this re-states the rule for the reason the create
+        // and the publish re-state it, because a format this service cannot convert
+        // from describes no profile and so can never select one.
+        if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
+            return Err(validation(format!(
+                "SourceFormat must be one of {}, got '{}'",
+                SOURCE_FORMAT_VALUES.join(", "),
+                input.source_format
+            )));
+        }
+
+        // A read: the handler only reads under the lock and writes nothing. A
+        // profile owes the clock no transition, so there is nothing to settle
+        // before the profiles are reported.
+        let store = state.lock();
+        // "Filters the results by source data format": a profile converts FROM
+        // exactly one format, so the filter selects the profiles whose own format
+        // is the one named and nothing else.
+        let mut matched: Vec<&crate::state::DataTransformationProfile> = store
+            .profiles
+            .values()
+            .filter(|profile| profile.source_format == input.source_format)
+            .collect();
+        // A stable total order is what makes paging resumable: oldest created
+        // first, identifier breaking a tie between two profiles created in one
+        // tick. The model documents no order, so this is the one every other
+        // listing in this crate pages in.
+        matched.sort_by(|a, b| {
+            crate::state::epoch_nanos(&a.created_at)
+                .cmp(&crate::state::epoch_nanos(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        // `NextToken` is the identifier of the first entry the next page returns,
+        // so resuming is a lookup in this same order. A token that names no entry
+        // of this listing resumes nothing, which is a bad request rather than an
+        // empty page.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matched
+                .iter()
+                .position(|profile| profile.id == token)
+                .ok_or_else(|| {
+                    validation(
+                        "NextToken does not resume a ListDataTransformationProfiles page"
+                            .to_string(),
+                    )
+                })?,
+        };
+
+        // `MaxResults` is modelled 1..100, and the model documents that a request
+        // naming none returns "up to 100 results", so an absent value pages at
+        // that maximum. The boundary validator has already refused a value outside
+        // the range, so the conversion below is a defensive floor rather than a
+        // silent re-reading of the request.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(0)
+            .clamp(1, usize::try_from(MAX_PAGE_SIZE).unwrap_or(usize::MAX));
+
+        // "Returning the latest version summary for each": one entry per profile,
+        // carrying its latest version number, rather than a version apiece —
+        // `ListDataTransformationProfileVersions` is the listing that reports a
+        // profile's versions one by one.
+        let page: Vec<DataTransformationProfileSummary> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|profile| profile.summary())
+            .collect();
+        // A token is emitted ONLY when profiles remain after this page: "If this
+        // value is null, there are no more results."
+        let next_token = matched
+            .get(start + page.len())
+            .map(|profile| profile.id.clone());
+
+        Ok(ListDataTransformationProfilesOutput {
+            items: page,
+            next_token,
+        })
     }
 }
+
+/// The largest page `MaxResults` allows (modelled range 1..100), which is also
+/// the page size a request that names none gets — "If you don't specify a
+/// value, the service returns up to 100 results."
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it
+/// declares.
+fn validation(message: String) -> ListDataTransformationProfilesError {
+    ListDataTransformationProfilesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> ListDataTransformationProfilesError {
+    ListDataTransformationProfilesErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+

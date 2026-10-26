@@ -318,7 +318,8 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
 
     // While the deletion the call scheduled is still owed, the association is being
     // destroyed: that is a modification in progress, so a merge initiated on it is
-    // refused with the status and the text the model gives that error.
+    // refused with the status the model gives that error and the text that scopes the
+    // conflict to the Merged API whose associations are being updated.
     let refused = call(
         &router,
         "POST",
@@ -337,11 +338,8 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
     );
     assert_eq!(
         refused.body["message"].as_str(),
-        Some(
-            "Another modification is in progress at this time and it must complete before you \
-             can make your change."
-        ),
-        "case deleting: expected the modelled concurrent-modification text, got {:?}",
+        Some(state::associations_being_updated_message(&merged_api_id).as_str()),
+        "case deleting: expected the association-scoped concurrent-modification text, got {:?}",
         refused.body["message"]
     );
 

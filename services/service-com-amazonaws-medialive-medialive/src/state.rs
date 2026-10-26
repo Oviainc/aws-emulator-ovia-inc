@@ -970,11 +970,15 @@ pub fn reserved_tag_key_message(key: &str) -> String {
     )
 }
 
-/// The page size a list operation (`ListChannels`, `ListSdiSources`) uses when
-/// the request names no `MaxResults`, and the ceiling it clamps a larger
-/// `MaxResults` to. Finite, so one request cannot ask the service to project an
-/// unbounded number of resources in one response.
-pub const MAX_LIST_PAGE_SIZE: usize = 50;
+/// The largest page a list operation (`ListChannels`, `ListSdiSources`,
+/// `DescribeSchedule`, …) answers with: the upper bound of the `MaxResults`
+/// range AWS publishes for this service's list operations (1 to 1000). A
+/// `MaxResults` within that range is the page size verbatim, a larger one is
+/// clamped here, and a request that names none uses this bound — so a caller
+/// that asks for more items than this emulator's stores can hold is never
+/// handed a short page plus a continuation token. Finite, so one request cannot
+/// ask the service to project an unbounded number of resources in one response.
+pub const MAX_LIST_PAGE_SIZE: usize = 1000;
 
 /// The most resource ids ONE `BatchDelete` call may name, counting its
 /// `ChannelIds`, `InputIds`, `InputSecurityGroupIds` and `MultiplexIds`

@@ -5,7 +5,8 @@
 //! This module owns the records the handlers in `src/ops/` share — the directories
 //! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
 //! `CreateAlias` assigns, the computer accounts `CreateComputer` creates in them, the
-//! Amazon SNS topics `RegisterEventTopic` associates, the trust relationships
+//! Amazon SNS topics `RegisterEventTopic` associates, the log subscriptions
+//! `CreateLogSubscription` creates, the trust relationships
 //! `CreateTrust` establishes, the directory shares `ShareDirectory` creates, the
 //! assessments
 //! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
@@ -25,12 +26,15 @@
 //!   modelled `DirectoryDescription`, so every operation that reports a directory
 //!   reports the same derived values (`Alias`, `AccessUrl`), and
 //!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`] /
+//!   [`LogSubscriptionRecord::to_log_subscription`] /
 //!   [`TrustRecord::to_trust`] / [`SharedDirectoryRecord::to_shared_directory`], the
-//!   same for a stored snapshot, a stored topic association, a stored trust and a stored
+//!   same for a stored snapshot, a stored topic association, a stored log subscription, a
+//!   stored trust and a stored
 //!   directory share.
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
-//!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListTagsForResource`) issue and
+//!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListLogSubscriptions`,
+//!   `ListTagsForResource`) issue and
 //!   resolve.
 //! * [`refusal`], the one place a modelled refusal of this service is built: every error
 //!   shape the model declares carries a `Message` and a UUID-shaped `RequestId`, and this
@@ -50,8 +54,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, Certificate, ClientAuthenticationSettingInfo,
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
-    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, SharedDirectory,
-    Snapshot, SnapshotLimits, Tag, Trust,
+    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, LogSubscription,
+    SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -957,6 +961,38 @@ impl EventTopicRegistration {
     }
 }
 
+/// One stored log subscription of a directory: what `CreateLogSubscription` persisted,
+/// `ListLogSubscriptions` reports and `DeleteLogSubscription` removes.
+///
+/// A directory forwards its domain controller security logs to ONE log group at a time —
+/// `DeleteLogSubscription` identifies the subscription to remove by `DirectoryId` alone,
+/// and `ListLogSubscriptions$DirectoryId`'s documentation calls what a directory id
+/// narrows the listing to "the log subscription associated with that directory" — so this
+/// record hangs off the directory as an `Option` rather than as an index of many.
+#[derive(Debug, Clone)]
+pub struct LogSubscriptionRecord {
+    /// The CloudWatch log group the directory's logs are forwarded to, as the request
+    /// spelled it.
+    pub log_group_name: String,
+    /// When the subscription was created — the `SubscriptionCreatedDateTime` member's
+    /// "the date and time that the log subscription was created".
+    pub created_at: SystemTime,
+}
+
+impl LogSubscriptionRecord {
+    /// This subscription as the modelled `LogSubscription`, reported for `directory_id`.
+    ///
+    /// The one place a stored subscription is rendered, so every operation that reports
+    /// one reports exactly what was persisted.
+    pub fn to_log_subscription(&self, directory_id: &str) -> LogSubscription {
+        LogSubscription {
+            directory_id: Some(directory_id.to_string()),
+            log_group_name: Some(self.log_group_name.clone()),
+            subscription_created_date_time: Some(as_timestamp(self.created_at)),
+        }
+    }
+}
+
 /// One stored conditional forwarder of a directory: what `CreateConditionalForwarder`
 /// persisted and `DescribeConditionalForwarders` reports.
 ///
@@ -1059,6 +1095,11 @@ pub struct Directory {
     /// associations live on the directory record, so deleting the directory takes its
     /// associations with it.
     pub event_topics: BTreeMap<String, EventTopicRegistration>,
+    /// The log subscription `CreateLogSubscription` created for this directory, if any:
+    /// a directory forwards its logs to at most one log group, and the subscription lives
+    /// on the directory record, so deleting the directory takes it with it.
+    /// `DeleteLogSubscription` is what puts this back to `None`.
+    pub log_subscription: Option<LogSubscriptionRecord>,
     /// The conditional forwarders `CreateConditionalForwarder` created on this directory,
     /// keyed by [`Directory::conditional_forwarder_key`] — a directory points at a given
     /// remote domain at most once. The forwarders live on the directory record, so
@@ -2267,6 +2308,27 @@ pub fn directory_not_shared(directory_id: &str, shared_account_id: &str) -> Stri
 /// to fix, and nothing else. [`refusal`] appends the request id, once.
 pub fn no_such_conditional_forwarder(remote_domain_name: &str) -> String {
     format!("Conditional forwarder: '{remote_domain_name}' does not exist.")
+}
+
+/// The `EntityDoesNotExistException` message for a directory that forwards its logs
+/// nowhere. Shared so `DeleteLogSubscription` and any later operation that resolves a
+/// stored log subscription say the same thing about the same failure.
+///
+/// A log subscription is identified by the directory it belongs to, so the wording follows
+/// Directory Service's own for this failure: the entity that could not be resolved, then
+/// the id the request asked for. [`refusal`] appends the request id, once.
+pub fn no_such_log_subscription(directory_id: &str) -> String {
+    format!("Log subscription does not exist for directory: {directory_id}.")
+}
+
+/// The `EntityAlreadyExistsException` message for a directory that already forwards its
+/// logs to a log group.
+///
+/// The mirror of [`no_such_log_subscription`], worded from the request the same way: a
+/// directory holds one log subscription, so a second create names the directory whose
+/// subscription already exists. [`refusal`] appends the request id, once.
+pub fn log_subscription_exists(directory_id: &str) -> String {
+    format!("Log subscription already exists for directory: {directory_id}.")
 }
 
 /// The `EntityDoesNotExistException` the tag API answers for a `ResourceId` that names

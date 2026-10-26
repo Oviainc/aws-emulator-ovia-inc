@@ -170,6 +170,9 @@ mod input_security_group_listing;
 #[path = "all/input_update.rs"]
 mod input_update;
 
+#[path = "all/list_page_size.rs"]
+mod list_page_size;
+
 #[path = "all/monitor_deployment.rs"]
 mod monitor_deployment;
 

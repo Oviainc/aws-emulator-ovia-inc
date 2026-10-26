@@ -2347,6 +2347,26 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         all_in_region(&self.outposts, region)
     }
 
+    /// Every capacity task of `region`, in no particular order — what
+    /// `ListCapacityTasks` pages through.
+    ///
+    /// A capacity task carries no region of its own: it is a task OF an Outpost, so
+    /// the Outpost's region scopes it (see [`RegionalRecord`]), and a task whose
+    /// Outpost this region does not hold is none of this region's inventory. Every
+    /// stored task has a live parent, because an Outpost going away takes its tasks
+    /// with it.
+    pub fn capacity_tasks_in<'a>(
+        &'a self,
+        region: &str,
+    ) -> impl Iterator<Item = &'a CapacityTaskRecord> + 'a {
+        // The region is copied into the filter for the reason [`all_in_region`]
+        // copies it: the iterator then borrows only the store.
+        let region = region.to_string();
+        self.capacity_tasks
+            .values()
+            .filter(move |task| self.outpost(region.as_str(), &task.outpost_id).is_some())
+    }
+
     /// The quote `quote_id` names in `region`. See [`Self::site`].
     pub fn quote(&self, region: &str, quote_id: &str) -> Option<&QuoteRecord> {
         in_region(&self.quotes, region, quote_id)
@@ -3890,6 +3910,12 @@ pub const QUOTE_IDENTIFIER_MEMBER: &str = "quoteIdentifier";
 /// it. See [`SITE_ID_MEMBER`].
 pub const OUTPOST_IDENTIFIER_MEMBER: &str = "outpostIdentifier";
 
+/// The validation-path name of the `OutpostIdentifierFilter` input member a list
+/// narrows its results to one Outpost by: a DIFFERENT member from the
+/// `OutpostIdentifier` an operation addressed to one Outpost binds, so a refusal
+/// about it names it as the request spelled it. See [`SITE_ID_MEMBER`].
+pub const OUTPOST_IDENTIFIER_FILTER_MEMBER: &str = "outpostIdentifierFilter";
+
 /// The validation-path name of the `ResourceArn` input member every tagging
 /// operation names a resource by. See [`SITE_ID_MEMBER`].
 pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
@@ -4197,6 +4223,19 @@ pub fn outpost_identifier_pattern_report() -> String {
     )
 }
 
+/// The report an `OutpostIdentifierFilter` that is neither an Outpost id nor an
+/// Outpost ARN states.
+///
+/// The boundary refuses such a value first — the member carries the same modelled
+/// pattern as every other Outpost identifier — so this is the modelled fallback for
+/// a handler that resolves the filter itself. See [`outpost_identifier_pattern_report`].
+pub fn outpost_identifier_filter_pattern_report() -> String {
+    constraint_report(
+        OUTPOST_IDENTIFIER_FILTER_MEMBER,
+        ViolationKind::Pattern(OUTPOST_IDENTIFIER_PATTERN.to_string()),
+    )
+}
+
 /// The report an order that names neither the line items that make it up nor a quote
 /// to take them from states.
 ///
@@ -4337,6 +4376,14 @@ pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";
 /// ([`ORDERABLE_INSTANCE_TYPE_PAGE`]), so a token issued for one of them is not a
 /// boundary of the other. See [`OUTPOST_PAGE`].
 pub const CATALOG_ITEM_PAGE: &str = "catalogItems";
+
+/// The stamp a `ListCapacityTasks` page token carries.
+///
+/// What it pages through is every capacity task of one region, narrowed by its own
+/// two filters, and a task carries a creation sequence of its own — so the boundary
+/// such a token names is a position in the store's creation order. See
+/// [`OUTPOST_PAGE`].
+pub const CAPACITY_TASK_PAGE: &str = "capacityTasks";
 
 /// The stamp a `ListAssets` page token carries.
 ///

@@ -268,7 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::QueueRecord {
             name,
-            description: input.description,
+            // `Description` is the queue's optional free text ("Optional. A description of
+            // the queue that you are creating"), stored by the one rule every such member
+            // in this service follows: a value that carries no characters is stored as
+            // absent. See `crate::state::optional_free_text`.
+            description: crate::state::optional_free_text(input.description),
             pricing_plan,
             // "Initial state of the queue" — ACTIVE unless the caller paused it.
             status: input

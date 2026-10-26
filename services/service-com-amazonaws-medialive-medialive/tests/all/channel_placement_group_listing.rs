@@ -140,6 +140,12 @@ struct Paging {
     page_size: Option<i32>,
 }
 
+/// A collection larger than the page size a client would ask for by hand, and
+/// within the store's own bound (`MAX_CHANNEL_PLACEMENT_GROUPS`): what a row uses
+/// to assert that the service never cuts a page below the `MaxResults` the
+/// request asked for.
+const A_LARGE_COLLECTION: usize = 53;
+
 /// Rule 1: the listing reports the groups the store holds for the cluster the path
 /// names, each exactly once, in the order their ids were minted, cut into pages of
 /// at most `MaxResults` (bounded by the service's own ceiling) whose `NextToken`
@@ -209,17 +215,18 @@ async fn the_listing_pages_through_every_group_of_the_cluster_in_mint_order() {
             bystanders: 2,
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 + 500),
         },
-        // More groups than one page can carry whatever the request asks for, so
-        // the ceiling itself is what cuts the pages.
+        // A collection far larger than any page a caller would ask for by hand:
+        // the service's ceiling is the published `MaxResults` bound, well above
+        // what the store can hold, so these are reported in ONE page.
         Paging {
-            case: "past the ceiling, no page size",
-            groups: MAX_LIST_PAGE_SIZE + 3,
+            case: "a large collection, no page size",
+            groups: A_LARGE_COLLECTION,
             bystanders: 0,
             page_size: None,
         },
         Paging {
-            case: "past the ceiling, page size past the ceiling",
-            groups: MAX_LIST_PAGE_SIZE + 3,
+            case: "a large collection, page size past the ceiling",
+            groups: A_LARGE_COLLECTION,
             bystanders: 2,
             page_size: Some(MAX_LIST_PAGE_SIZE as i32 * 2),
         },

@@ -43,6 +43,8 @@ mod job_template_settings_validation;
 mod job_templates;
 #[path = "all/jobs_query.rs"]
 mod jobs_query;
+#[path = "all/optional_free_text.rs"]
+mod optional_free_text;
 #[path = "all/policy_enforcement.rs"]
 mod policy_enforcement;
 #[path = "all/policy_lifecycle.rs"]

@@ -23,6 +23,8 @@ mod blocking_instances;
 mod capacity_task_dry_run;
 #[path = "all/capacity_task_lifecycle.rs"]
 mod capacity_task_lifecycle;
+#[path = "all/capacity_task_listing.rs"]
+mod capacity_task_listing;
 #[path = "all/catalog_items.rs"]
 mod catalog_items;
 #[path = "all/configured_instance_types.rs"]

@@ -306,6 +306,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certificates: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
+            // No log subscription until `CreateLogSubscription` creates one.
+            log_subscription: None,
             // No conditional forwarder until `CreateConditionalForwarder` points the
             // directory at a remote domain's DNS servers.
             conditional_forwarders: ::std::collections::BTreeMap::new(),

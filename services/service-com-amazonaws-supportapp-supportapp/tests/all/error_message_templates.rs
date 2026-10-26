@@ -348,31 +348,51 @@ async fn the_none_severity_rule_is_stated_in_the_same_service_prose() {
         assert_service_prose(label, "CreateSlackChannelConfiguration", &message);
     }
 
-    // And on update, where the offending flag is the one the record already HOLDS.
-    let label = "severity to none while a stored flag is true";
-    let emulator = Emulator::new();
-    assert_eq!(
-        emulator
-            .create_in_registered_workspace(valid_create())
-            .await
-            .status,
-        200,
-        "case {label:?}: the fixture configuration must be created"
-    );
-    let reply = emulator
-        .update(json!({
-            "teamId": "T012ABCDEFG",
-            "channelId": "C01234A5BCD",
-            "notifyOnCaseSeverity": "none",
-        }))
-        .await;
-    let message = refusal(label, &reply, 400, "ValidationException");
+    // And on update, where the offending flag is one the REQUEST carries true beside
+    // the `none` severity — the scope that request's wording gives the clause. Rows
+    // differ in which flag it is: the one the record already holds true, one the
+    // record holds false, and all three at once.
+    let update_rows: [(&str, Value); 3] = [
+        (
+            "severity to none with the stored flag restated true",
+            json!({ "notifyOnCaseSeverity": "none", "notifyOnCreateOrReopenCase": true }),
+        ),
+        (
+            "severity to none with another flag turned on",
+            json!({ "notifyOnCaseSeverity": "none", "notifyOnResolveCase": true }),
+        ),
+        (
+            "severity to none with every flag turned on",
+            json!({
+                "notifyOnCaseSeverity": "none",
+                "notifyOnCreateOrReopenCase": true,
+                "notifyOnAddCorrespondenceToCase": true,
+                "notifyOnResolveCase": true,
+            }),
+        ),
+    ];
     let expected = invalid_request("UpdateSlackChannelConfiguration", NONE_RULE);
-    assert_eq!(
-        message, expected,
-        "case {label:?}: expected {expected:?}, got {message:?}"
-    );
-    assert_service_prose(label, "UpdateSlackChannelConfiguration", &message);
+    for (label, patch) in update_rows {
+        let emulator = Emulator::new();
+        assert_eq!(
+            emulator
+                .create_in_registered_workspace(valid_create())
+                .await
+                .status,
+            200,
+            "case {label:?}: the fixture configuration must be created"
+        );
+        let mut body = patch;
+        body["teamId"] = json!("T012ABCDEFG");
+        body["channelId"] = json!("C01234A5BCD");
+        let reply = emulator.update(body).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_service_prose(label, "UpdateSlackChannelConfiguration", &message);
+    }
 }
 
 #[tokio::test]
