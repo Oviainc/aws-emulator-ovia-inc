@@ -14,6 +14,10 @@
 //!   `InvalidParameterException` and one that names the wrong version is
 //!   `InvalidRequestException`, and neither changes anything — which is what
 //!   makes two concurrent moves of one label resolve with a single winner;
+//! * `AWSCURRENT` names the version a secret's current value lives on, so it is
+//!   only ever MOVED between versions: a call that asks to take it off the
+//!   version holding it, naming no version to move it to, is refused and leaves
+//!   every label where it was, while any other label does come off;
 //! * one version carries a bounded number of the caller's own staging labels, and
 //!   the labels the service moves itself do not take a slot;
 //! * `UpdateSecret` applies the metadata a call names, stores a value as a new
@@ -155,6 +159,13 @@ async fn stages(router: &MultiServiceRouter, secret_id: &str, case: &str) -> Vec
         .collect();
     rows.sort();
     rows
+}
+
+/// The version id carrying `label` in a staging map, if any version does.
+fn holder_of(rows: &[(String, Vec<String>)], label: &str) -> Option<String> {
+    rows.iter()
+        .find(|(_, labels)| labels.iter().any(|held| held == label))
+        .map(|(version, _)| version.clone())
 }
 
 /// Create a secret with one version, and report its ARN and that version's id.
@@ -1206,6 +1217,199 @@ async fn a_mutation_addressed_to_a_secret_this_service_does_not_hold_is_not_foun
         assert_eq!(
             message, SECRET_NOT_FOUND,
             "case {case:?}: expected the constant sentence {SECRET_NOT_FOUND:?}, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn awscurrent_moves_between_versions_and_never_comes_off_the_secret() {
+    // `AWSCURRENT` names the version a `GetSecretValue` that asks for no version
+    // answers with, so every secret has exactly one version carrying it for as
+    // long as the secret exists. A call that names `RemoveFromVersionId` and no
+    // `MoveToVersionId` asks to take a label off that version, which for this
+    // label would leave the secret with no current value: it is refused and no
+    // label moves. Moving it to another version is the same call WITH
+    // `MoveToVersionId`, and that still works. The rows run over how many
+    // versions the secret holds, whether the label sits on the version the
+    // secret was created with or on one a later put promoted, and the form of
+    // the `SecretId`.
+    const EXPECTED: &str = "You can only move staging label AWSCURRENT to a different secret \
+                            version. It can't be completely removed.";
+    // (versions stored beside the first, whether a later put promotes AWSCURRENT,
+    //  whether the call addresses the secret by ARN)
+    let rows = [
+        (0usize, false, false),
+        (1, false, true),
+        (1, true, false),
+        (3, true, true),
+    ];
+    for (extra_versions, promote, by_arn) in rows {
+        let case = format!(
+            "{extra_versions} extra version(s), promoted={promote}, addressed by \
+             {}",
+            if by_arn { "ARN" } else { "name" }
+        );
+        let router = emulator();
+        let name = "stage-current-removal";
+        let (arn, _) = create(&router, name, &case).await;
+        for index in 0..extra_versions {
+            let token = version_id(&format!("side{index}"));
+            put(&router, name, &token, json!([format!("side-{index}")]), &case).await;
+        }
+        if promote {
+            put(
+                &router,
+                name,
+                &version_id("promoted"),
+                json!(["AWSCURRENT"]),
+                &case,
+            )
+            .await;
+        }
+        let secret_id = if by_arn { arn.clone() } else { name.to_string() };
+
+        let before = stages(&router, &secret_id, &case).await;
+        let current = holder_of(&before, "AWSCURRENT")
+            .unwrap_or_else(|| panic!("case {case:?}: no version holds AWSCURRENT in {before:?}"));
+
+        let (code, message) = err(
+            &router,
+            "UpdateSecretVersionStage",
+            json!({
+                "SecretId": secret_id.clone(),
+                "VersionStage": "AWSCURRENT",
+                "RemoveFromVersionId": current.clone(),
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException for a removal of AWSCURRENT, got \
+             {code:?} with message {message:?}"
+        );
+        assert_eq!(
+            message, EXPECTED,
+            "case {case:?}: expected {EXPECTED:?}, got {message:?}"
+        );
+
+        let after = stages(&router, &secret_id, &case).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused removal to change no label, got {after:?} after \
+             {before:?}"
+        );
+
+        // The same label DOES move: the call that names a version to move it to
+        // is accepted, and the secret's current value follows the label.
+        let target = put(
+            &router,
+            name,
+            &version_id("next"),
+            json!(["staged"]),
+            &case,
+        )
+        .await;
+        ok(
+            &router,
+            "UpdateSecretVersionStage",
+            json!({
+                "SecretId": secret_id.clone(),
+                "VersionStage": "AWSCURRENT",
+                "MoveToVersionId": target.clone(),
+                "RemoveFromVersionId": current.clone(),
+            }),
+            &case,
+        )
+        .await;
+        let read = ok(
+            &router,
+            "GetSecretValue",
+            json!({"SecretId": secret_id.clone()}),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            text(&read, "VersionId", &case),
+            target,
+            "case {case:?}: expected the current value to follow the moved label, got {read}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_staging_label_other_than_awscurrent_comes_off_the_version_holding_it() {
+    // Removing a label is what a call with no `MoveToVersionId` does — "to
+    // remove a label from a version, then do not specify this parameter"
+    // (`UpdateSecretVersionStageRequest$MoveToVersionId`, this service's Smithy
+    // model) — and only the label naming the secret's current value is exempt.
+    // The rows run over the label removed: the two reserved ones the service
+    // also moves itself, and labels a caller named.
+    for label in ["AWSPREVIOUS", "AWSPENDING", "blue", "rotation-candidate"] {
+        let case = format!("removing {label:?}");
+        let router = emulator();
+        let name = "stage-other-removal";
+        create(&router, name, &case).await;
+        // `AWSPREVIOUS` lands on the version `AWSCURRENT` left, so it is staged
+        // by promoting a second version rather than by naming it directly.
+        let held_by = if label == "AWSPREVIOUS" {
+            let first = holder_of(&stages(&router, name, &case).await, "AWSCURRENT")
+                .unwrap_or_else(|| panic!("case {case:?}: the new secret has a current version"));
+            put(
+                &router,
+                name,
+                &version_id("promoted"),
+                json!(["AWSCURRENT"]),
+                &case,
+            )
+            .await;
+            first
+        } else {
+            put(&router, name, &version_id("staged"), json!([label]), &case).await
+        };
+        let before = stages(&router, name, &case).await;
+        assert_eq!(
+            holder_of(&before, label).as_deref(),
+            Some(held_by.as_str()),
+            "case {case:?}: expected {label} to start on version {held_by}, got {before:?}"
+        );
+
+        ok(
+            &router,
+            "UpdateSecretVersionStage",
+            json!({
+                "SecretId": name,
+                "VersionStage": label,
+                "RemoveFromVersionId": held_by.clone(),
+            }),
+            &case,
+        )
+        .await;
+
+        let after = stages(&router, name, &case).await;
+        assert_eq!(
+            holder_of(&after, label),
+            None,
+            "case {case:?}: expected no version to hold {label} after the removal, got {after:?}"
+        );
+        // The secret still has a current value: taking another label off never
+        // touches the one that names it.
+        assert!(
+            holder_of(&after, "AWSCURRENT").is_some(),
+            "case {case:?}: expected AWSCURRENT to survive the removal, got {after:?}"
+        );
+        // The version is still addressable by its id, label or no label.
+        let read = ok(
+            &router,
+            "GetSecretValue",
+            json!({"SecretId": name, "VersionId": held_by.clone()}),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            text(&read, "VersionId", &case),
+            held_by,
+            "case {case:?}: expected the version to stay readable by id, got {read}"
         );
     }
 }

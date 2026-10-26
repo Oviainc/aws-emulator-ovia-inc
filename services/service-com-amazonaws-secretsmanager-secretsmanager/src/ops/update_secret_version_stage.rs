@@ -3,7 +3,9 @@
 //! @op UpdateSecretVersionStage
 //! Moves a staging label between the versions of a secret, and takes one off the
 //! version that holds it — the label moves one version at a time, and moving
-//! `AWSCURRENT` leaves `AWSPREVIOUS` on the version it came from.
+//! `AWSCURRENT` leaves `AWSPREVIOUS` on the version it came from. `AWSCURRENT`
+//! itself only ever MOVES: it names the secret's current value, so it is never
+//! taken off the secret altogether.
 //!
 //! ## Shape of an operation
 //!
@@ -292,6 +294,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the version it names; a call naming neither is refused above, so this
         // is every remaining request.
         } else if let Some(remove_from) = remove_from {
+            // `AWSCURRENT` names the version a `GetSecretValue` that asks for no
+            // version answers with, so every secret has exactly one version
+            // carrying it for as long as the secret exists. That label can
+            // therefore only be MOVED to another version; a call that names no
+            // `MoveToVersionId` asks to take it off the secret, which would
+            // leave the secret with no current value, so it is refused and
+            // nothing changes.
+            if stage == crate::state::STAGE_CURRENT {
+                return Err(invalid_parameter(format!(
+                    "You can only move staging label {stage} to a different secret version. It \
+                     can't be completely removed."
+                )));
+            }
             if holder.as_deref() != Some(remove_from.as_str()) {
                 return Err(stale_remove_from(&stage, holder.as_deref(), &remove_from));
             }
