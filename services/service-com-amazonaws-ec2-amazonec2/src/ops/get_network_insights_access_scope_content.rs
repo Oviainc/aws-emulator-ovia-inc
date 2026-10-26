@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkInsightsAccessScopeContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkInsightsAccessScopeContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkInsightsAccessScopeContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the content stored for the Network Access Scope the request names — the paths
+//! `CreateNetworkInsightsAccessScope` stored with it — and writes nothing. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkInsightsAccessScopeContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkInsightsAccessScopeContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkInsightsAccessScopeContent"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and nothing a content reports is a fact of
+        // the Region, so this operation reads none of it. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // EC2 asks one question about this operation's id: can it be resolved to a scope of
+        // the account? The store is reached through a guard this operation only READS
+        // through: "gets the content for the specified Network Access Scope" reports, so it
+        // writes nothing. Taken before the dry-run branch below, because whether the named
+        // scope exists is one of the things a dry run has to answer.
+        let service_state = state::require_service_state(&*self.engine)?;
+        let store = service_state.lock();
+
+        // "The ID of the Network Access Scope" (`NetworkInsightsAccessScopeId`): an id that
+        // resolves to no scope of the account is refused — whatever its form — rather than
+        // answered with an empty content. The code and wording are a fact of the operation
+        // rather than of the id, so they live in the one place beside the store.
+        if !store
+            .network_insights_access_scopes
+            .contains_key(&input.network_insights_access_scope_id)
+        {
+            return Err(state::invalid_network_insights_access_scope_id_value(
+                &input.network_insights_access_scope_id,
+            ));
+        }
+
+        // DryRun sits AFTER the id has been resolved: the flag asks whether the request
+        // WOULD have worked, so one naming a scope the account does not hold is refused with
+        // that reason instead, and one that would have succeeded reports no content, having
+        // changed nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The content stored for that scope. The one writer stores the two together, so a
+        // scope without a content is a broken store rather than a scope with no paths.
+        let content = store
+            .network_insights_access_scope_contents
+            .get(&input.network_insights_access_scope_id)
+            .cloned()
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "Network Access Scope '{scope_id}' is stored without its content",
+                    scope_id = input.network_insights_access_scope_id,
+                ))
+            })?;
+
+        Ok(GetNetworkInsightsAccessScopeContentOutput {
+            network_insights_access_scope_content: Some(content),
+        })
     }
 }

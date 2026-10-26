@@ -291,8 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Block Public Access: with `BlockPublicAcls` on, S3 "causes the following
         // behavior: PUT Bucket ACL and PUT Object ACL calls fail if the specified ACL is
         // public" (`PublicAccessBlockConfiguration$BlockPublicAcls`). The refusal is
-        // `AccessDenied` — the guardrail denies the call — and the stored ACL is left
-        // exactly as it was.
+        // `AccessDenied` — the guardrail denies the call, naming the principal, the action,
+        // the resource and the setting that prevented it, the way the object half of the
+        // same guardrail words it — and the stored ACL is left exactly as it was.
         if bucket
             .public_access_block()
             .is_some_and(|settings| settings.block_public_acls)
@@ -301,7 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,
-                ACCESS_DENIED_MESSAGE,
+                crate::state::block_public_acls_denial(
+                    PUT_BUCKET_ACL_ACTION,
+                    &crate::state::bucket_arn(&input.bucket),
+                ),
             ));
         }
 
@@ -478,65 +482,36 @@ fn requested_grants(
 
 /// The wire code and status S3 answers one broken published ACL rule with.
 ///
-/// The store reports WHICH rule an ACL breaks ([`crate::state::AclRejection`]) and this is
-/// the one place that turns each into a response, so the code a client branches on is
-/// chosen once for the body form and the header form of the same request alike.
+/// The store reports WHICH rule an ACL breaks ([`crate::state::AclRejection`]) and owns the
+/// code and status each one carries ([`crate::state::AclRejection::code`]), so the code a
+/// client branches on is the same for the body form and the header form of the same
+/// request, and the same for a bucket's ACL and an object's; this turns that answer into
+/// this operation's error channel.
 fn refusal(rejection: crate::state::AclRejection) -> PutBucketAclError {
-    use crate::state::AclRejection;
-
-    let message = rejection.to_string();
-    match rejection {
-        // The grantee's own identity is the parameter that is not valid, which is what
-        // `InvalidArgument` reports ("Invalid Argument", HTTP 400).
-        AclRejection::UnknownGroupUri { .. } => crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::INVALID_ARGUMENT_CODE,
-            crate::state::INVALID_ARGUMENT_STATUS,
-            message,
-        ),
-        // "As of October 1, 2025, Amazon S3 has discontinued support for Email Grantee
-        // Access Control Lists … the request will receive an HTTP 405 (Method Not Allowed)
-        // error", in the Regions that change affects.
-        AclRejection::EmailGranteeDiscontinued { .. } => {
-            crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METHOD_NOT_ALLOWED_CODE,
-                crate::state::METHOD_NOT_ALLOWED_STATUS,
-                message,
-            )
-        }
-        // Everywhere else an email grantee is still taken by the API and then resolved
-        // against the accounts on record, of which this emulator has exactly one and no
-        // email address for it.
-        AclRejection::EmailGranteeUnresolvable { .. } => {
-            crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::UNRESOLVABLE_GRANT_BY_EMAIL_CODE,
-                ACL_REFUSAL_STATUS,
-                message,
-            )
-        }
-        // The rest are ACLs that do not validate against the schema the API publishes for
-        // one: too many grants, a value outside a published set, or a grantee whose `Type`
-        // and members disagree.
-        AclRejection::TooManyGrants { .. }
-        | AclRejection::UnknownPermission { .. }
-        | AclRejection::UnknownGranteeType { .. }
-        | AclRejection::GranteeMemberMissing { .. } => crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::MALFORMED_ACL_CODE,
-            ACL_REFUSAL_STATUS,
-            message,
-        ),
-    }
+    crate::scaffolded::Scaffolded::unmodeled(
+        rejection.code(),
+        rejection.status(),
+        rejection.to_string(),
+    )
 }
 
-/// The HTTP status every ACL refusal above is rendered with except the discontinued-email
-/// one: 400, the status S3's error-responses list carries for `MalformedACLError`,
-/// `MissingRequestBodyError`, `AccessControlListNotSupported` and
-/// `UnresolvableGrantByEmailAddress` alike.
-const ACL_REFUSAL_STATUS: u16 = 400;
+/// The HTTP status every ACL refusal of this operation that is not one of
+/// [`crate::state::AclRejection`]'s is rendered with: 400, the status S3's error-responses
+/// list carries for `MalformedACLError`, `MissingRequestBodyError`,
+/// `AccessControlListNotSupported` and `UnresolvableGrantByEmailAddress` alike.
+const ACL_REFUSAL_STATUS: u16 = crate::state::ACL_REFUSAL_STATUS;
 
 /// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the bucket's
-/// owner with, and the status and message its error-responses list carries for it.
+/// owner with, and the status and message its error-responses list carries for it — also
+/// the code and status the Block Public Access guardrail denies a public ACL with, whose
+/// message is the guardrail's own ([`crate::state::block_public_acls_denial`]).
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The IAM action this operation is performed under — `s3:<OperationName>`, as the IAM
+/// Service Authorization Reference names the actions of Amazon S3 — which is what a refusal
+/// of this call names.
+const PUT_BUCKET_ACL_ACTION: &str = "s3:PutBucketAcl";

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_partitions.rs"]
 mod arn_partitions;
+#[path = "all/endpoint_commitment_conflict.rs"]
+mod endpoint_commitment_conflict;
 #[path = "all/endpoint_lifecycle.rs"]
 mod endpoint_lifecycle;
 #[path = "all/endpoint_paging.rs"]

@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -185,6 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = st::caller_account_id();
         let collaboration_id = input.collaboration_identifier;
         let change_request_id = input.change_request_identifier;
+        // The collaboration this operation addresses, as the resource an authorization
+        // failure names: the identifier is a URI label of this operation.
+        let collaboration_resource =
+            st::collaboration_arn(&st::request_region(ctx.parts()), &collaboration_id);
         let mut store = state.lock();
 
         // The collaboration is resolved exactly as every other operation that takes a
@@ -197,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(st::collaboration_access_denied_message(
-                            &collaboration_id,
-                            caller,
+                        message: Some(st::authorization_denied_message(
+                            Self::NAME,
+                            &collaboration_resource,
                         )),
                         reason: Some(
                             st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
@@ -264,6 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(
                             AccessDeniedException {
+                                // NOT the authorization-failure wording: the caller IS
+                                // authorized to this collaboration, and what refuses the
+                                // action is that it has no vote on this request. The
+                                // message therefore states that reason, as the pass-role
+                                // and state refusals of this service state theirs.
                                 message: Some(format!(
                                     "Account {caller} is not an approver of change request \
                                      {change_request_id}"
@@ -378,6 +387,10 @@ fn conflict(message: String) -> UpdateCollaborationChangeRequestError {
 
 /// An `AccessDeniedException` (HTTP 403) for an action only the collaboration owner may
 /// take: "The collaboration owner can manually CANCEL or COMMIT a change request."
+///
+/// NOT the authorization-failure wording either: the caller is authorized to the
+/// collaboration, and what refuses the action is the role it holds in it, so the message
+/// states that reason.
 fn owner_only(action: &str, caller: &str) -> UpdateCollaborationChangeRequestError {
     UpdateCollaborationChangeRequestErrorModeled::AccessDeniedException(AccessDeniedException {
         message: Some(format!(

@@ -1716,6 +1716,50 @@ pub fn configured_actions(actions: Option<&[String]>) -> Option<Vec<String>> {
     Some(actions.unwrap_or_default().to_vec())
 }
 
+/// The Region segment of `value` when it is an ARN that names a Region, else `None`.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, the resource taken
+/// last so a resource containing `:` stays whole. A value that is not an ARN names no Region,
+/// and neither does an ARN whose Region segment is EMPTY: a resource that is not Region-scoped
+/// is named that way, which is why the action values this operation documents include
+/// `arn:aws:ssm-incidents::<account-id>:responseplan/<response-plan-name>`
+/// (`PutMetricAlarmInput$AlarmActions`).
+fn arn_region(value: &str) -> Option<&str> {
+    let mut segments = value.splitn(6, ':');
+    if segments.next() != Some("arn") {
+        return None;
+    }
+    // Partition and service, neither of which decides the Region.
+    segments.next()?;
+    segments.next()?;
+    let region = segments.next()?;
+    // The account and resource segments: a value carrying fewer than six is not an ARN.
+    segments.next()?;
+    segments.next()?;
+    (!region.is_empty()).then_some(region)
+}
+
+/// Why one of the actions in `actions` names a Region other than `region`, or `None` when none
+/// of them does.
+///
+/// CloudWatch executes an alarm's actions in the Region the alarm itself lives in, so an
+/// action naming another Region is one the alarm could never carry out: the whole request is
+/// refused rather than stored, and the refusal names the Region the request asked for and the
+/// one this endpoint acts in. Shared by the alarm writers, whose `OKActions`, `AlarmActions`
+/// and `InsufficientDataActions` carry the same action values.
+pub fn foreign_action_region_error(
+    actions: [Option<&[String]>; 3],
+    region: &str,
+) -> Option<String> {
+    actions
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|action| arn_region(action))
+        .find(|named| *named != region)
+        .map(|named| format!("Invalid region {named} specified. Only {region} is supported."))
+}
+
 /// The largest number of history items retained per alarm. Reaching it evicts the OLDEST,
 /// so repeated configuration or state updates cannot grow memory without limit.
 pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;

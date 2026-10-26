@@ -9,10 +9,10 @@
 //!   members (`membershipId`/`membershipArn`, `collaborationId`/`collaborationArn`)
 //!   copied from the stored membership and the required `autoRefresh` materialized at
 //!   the cadence in force, and `GetPrivacyBudgetTemplate` reports exactly that record;
-//! * "each collaboration can have only one privacy budget template"
-//!   (`CreatePrivacyBudgetTemplate`'s own doc), so a second create in the same
-//!   collaboration is refused with `ConflictException` and changes nothing, while
-//!   another collaboration still accepts its own;
+//! * a collaboration holds at most one privacy budget template PER
+//!   `PrivacyBudgetType`, so a second create of the SAME budget type is refused with
+//!   `ConflictException` and changes nothing, while a second create of ANOTHER budget
+//!   type, and another collaboration's own template, are accepted;
 //! * a request that names a resource the store does not hold, or a `privacyBudgetType`
 //!   that does not match the `parameters` union it carries, is refused with the
 //!   modelled error for that failure rather than accepted;
@@ -30,8 +30,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cleanrooms_awsbastioncontrolplaneservicelambda::state as cleanrooms_state;
 
 use super::cleanrooms_collaboration_lifecycle::{
-    account_id, error_code, is_model_uuid, minimal_collaboration, Emulator, ALL_LOG_STATUSES,
-    REGION,
+    account_id, error_code, error_message, is_model_uuid, minimal_collaboration, Emulator,
+    ALL_LOG_STATUSES, REGION,
 };
 
 /// Every `PrivacyBudgetType` the model declares (shape `PrivacyBudgetType`).
@@ -357,19 +357,23 @@ async fn create_privacy_budget_template_persists_and_get_returns_it_unchanged() 
     }
 }
 
-/// One row of the one-per-collaboration table: what the SECOND create asks for,
-/// built from the membership ARN the access-budget row needs.
+/// One row of the one-per-budget-type table: what the SECOND create asks for, built from
+/// the membership ARN the access-budget row needs, and whether that create collides with
+/// the template already stored.
 struct SecondCreate {
     label: &'static str,
     body: fn(&str) -> Value,
+    /// Whether this second create asks for the budget type the first one took, which is
+    /// the uniqueness key: only then is it a conflict.
+    conflicts: bool,
 }
 
 #[tokio::test]
-async fn a_collaboration_holds_one_privacy_budget_template() {
+async fn a_collaboration_holds_one_privacy_budget_template_per_budget_type() {
     // Rows vary what the SECOND create asks for: the same type and parameters, the
-    // same type with different parameters, and the other type entirely. The rule is
-    // about the collaboration already having a template, not about what the second
-    // request says.
+    // same type with different parameters, and the other type entirely. The key the rule
+    // is about is the (collaboration, privacyBudgetType) pair, not what else the second
+    // request says, so the first two collide and the third does not.
     let first = || {
         json!({
             "privacyBudgetType": ALL_PRIVACY_BUDGET_TYPES[0],
@@ -385,6 +389,7 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
                     "parameters": differential_privacy(5, 20),
                 })
             },
+            conflicts: true,
         },
         SecondCreate {
             label: "the same type with other parameters",
@@ -395,6 +400,7 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
                     "parameters": differential_privacy(EPSILON_MAX, USERS_NOISE_MAX),
                 })
             },
+            conflicts: true,
         },
         SecondCreate {
             label: "the other privacy budget type",
@@ -407,6 +413,7 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
                     ),
                 })
             },
+            conflicts: false,
         },
     ];
 
@@ -427,31 +434,45 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
         let template = created["privacyBudgetTemplate"].clone();
         let id = template["id"].as_str().expect("template.id").to_string();
 
-        let (status, refused) =
+        let (status, answer) =
             create_template(&emulator, &membership_id, second_body(&membership_arn)).await;
-        assert_eq!(
-            status, 409,
-            "case {label:?}: expected the second create to answer 409, got {status} with {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ConflictException",
-            "case {label:?}: expected ConflictException, got {refused}"
-        );
-        assert_eq!(
-            refused["reason"].as_str(),
-            Some("ALREADY_EXISTS"),
-            "case {label:?}: expected reason ALREADY_EXISTS, got {:?}",
-            refused["reason"]
-        );
-        assert_eq!(
-            refused["resourceId"].as_str(),
-            Some(id.as_str()),
-            "case {label:?}: the conflict must name the existing template {id}, got {:?}",
-            refused["resourceId"]
-        );
+        if case.conflicts {
+            assert_eq!(
+                status, 409,
+                "case {label:?}: expected the second create to answer 409, got {status} with {answer}"
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ConflictException",
+                "case {label:?}: expected ConflictException, got {answer}"
+            );
+            assert_eq!(
+                answer["reason"].as_str(),
+                Some("ALREADY_EXISTS"),
+                "case {label:?}: expected reason ALREADY_EXISTS, got {:?}",
+                answer["reason"]
+            );
+            assert_eq!(
+                answer["resourceId"].as_str(),
+                Some(id.as_str()),
+                "case {label:?}: the conflict must name the existing template {id}, got {:?}",
+                answer["resourceId"]
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {label:?}: a template of another budget type must be accepted, got {status} \
+                 with {answer}"
+            );
+            assert_ne!(
+                answer["privacyBudgetTemplate"]["id"], template["id"],
+                "case {label:?}: the second budget type must get its own template, got {:?} twice",
+                template["id"]
+            );
+        }
 
-        // The refusal changed nothing: the stored template is still the first one.
+        // Either way the FIRST template is untouched: a refused create changes nothing,
+        // and a template of another budget type does not replace it.
         let (status, fetched) = get_template(&emulator, &membership_id, &id).await;
         assert_eq!(
             status, 200,
@@ -459,7 +480,7 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
         );
         assert_eq!(
             fetched["privacyBudgetTemplate"], template,
-            "case {label:?}: the refused create must not change the stored template, got {:?}",
+            "case {label:?}: the second create must not change the stored template, got {:?}",
             fetched["privacyBudgetTemplate"]
         );
 
@@ -500,6 +521,127 @@ async fn a_collaboration_holds_one_privacy_budget_template() {
             error_code(&not_found),
             "ResourceNotFoundException",
             "case {label:?}: expected ResourceNotFoundException, got {not_found}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_budget_type_holds_its_own_template_and_a_delete_frees_its_slot() {
+    // The uniqueness key is (collaboration, privacyBudgetType), so a collaboration holds
+    // one template of EACH type at once, the conflict message names the type and the
+    // collaboration, and deleting a template frees that type's slot. The rows walk every
+    // `PrivacyBudgetType` the model declares, so neither type is privileged.
+    let emulator = Emulator::new();
+    let (collaboration_id, membership) =
+        collaboration_with_membership(&emulator, "per-budget-type").await;
+    let membership_id = membership["id"].as_str().expect("membership.id").to_string();
+    let membership_arn = membership["arn"].as_str().expect("membership.arn").to_string();
+
+    // How each type's template is asked for, and how its type reads in a message.
+    let bodies: Vec<(&str, Value, &str)> = vec![
+        (
+            ALL_PRIVACY_BUDGET_TYPES[0],
+            json!({
+                "privacyBudgetType": ALL_PRIVACY_BUDGET_TYPES[0],
+                "parameters": differential_privacy(EPSILON_MIN, USERS_NOISE_MIN),
+            }),
+            "Differential Privacy",
+        ),
+        (
+            ALL_PRIVACY_BUDGET_TYPES[1],
+            json!({
+                "privacyBudgetType": ALL_PRIVACY_BUDGET_TYPES[1],
+                "parameters": access_budget(
+                    &membership_arn,
+                    json!([{ "type": ALL_ACCESS_BUDGET_TYPES[0], "budget": BUDGET_MAX }]),
+                ),
+            }),
+            "Access Budget",
+        ),
+    ];
+
+    // Every type is accepted alongside the others.
+    let mut created_ids: Vec<(String, String)> = Vec::new();
+    for (budget_type, body, _) in &bodies {
+        let (status, created) = create_template(&emulator, &membership_id, body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {budget_type:?}: a template of its own budget type must be accepted, got \
+             {status} with {created}"
+        );
+        assert_eq!(
+            created["privacyBudgetTemplate"]["privacyBudgetType"].as_str(),
+            Some(*budget_type),
+            "case {budget_type:?}: expected privacyBudgetType {budget_type}, got {:?}",
+            created["privacyBudgetTemplate"]["privacyBudgetType"]
+        );
+        created_ids.push((
+            (*budget_type).to_string(),
+            created["privacyBudgetTemplate"]["id"]
+                .as_str()
+                .expect("template.id")
+                .to_string(),
+        ));
+    }
+
+    // A second one of either type now collides, and the message names the TYPE and the
+    // collaboration — what tells a caller which slot is taken.
+    for (budget_type, body, type_in_prose) in &bodies {
+        let (status, refused) = create_template(&emulator, &membership_id, body.clone()).await;
+        assert_eq!(
+            status, 409,
+            "case {budget_type:?}: a second template of one type must be refused, got {status} \
+             with {refused}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            format!(
+                "A Privacy Budget Template for {type_in_prose} already exists in collaboration \
+                 {collaboration_id}."
+            ),
+            "case {budget_type:?}: expected the per-type conflict wording, got {:?}",
+            error_message(&refused)
+        );
+    }
+
+    // Deleting one frees exactly that type's slot: the create is accepted again, the
+    // other type's template is untouched, and the deleted one is gone.
+    for (budget_type, id) in created_ids {
+        let body = bodies
+            .iter()
+            .find(|(candidate, _, _)| *candidate == budget_type)
+            .map(|(_, body, _)| body.clone())
+            .expect("the body for this budget type");
+
+        let (status, deleted) = emulator
+            .call(
+                "DELETE",
+                &format!("/memberships/{membership_id}/privacybudgettemplates/{id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 204,
+            "case {budget_type:?}: expected DeletePrivacyBudgetTemplate 204, got {status} \
+             with {deleted}"
+        );
+        let (status, gone) = get_template(&emulator, &membership_id, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {budget_type:?}: the deleted template must not be readable, got {status} \
+             with {gone}"
+        );
+
+        let (status, recreated) = create_template(&emulator, &membership_id, body).await;
+        assert_eq!(
+            status, 200,
+            "case {budget_type:?}: the freed slot must accept a new template, got {status} \
+             with {recreated}"
+        );
+        assert_ne!(
+            recreated["privacyBudgetTemplate"]["id"].as_str(),
+            Some(id.as_str()),
+            "case {budget_type:?}: the new template must have its own id, got {id} again"
         );
     }
 }
@@ -685,7 +827,8 @@ async fn a_template_does_not_outlive_the_collaboration_it_belongs_to() {
             assert!(
                 !store
                     .privacy_budget_template_by_collaboration
-                    .contains_key(&collaboration_id),
+                    .keys()
+                    .any(|(collaboration, _)| collaboration == &collaboration_id),
                 "case {label:?}: the collaboration index must not keep the template"
             );
             assert!(

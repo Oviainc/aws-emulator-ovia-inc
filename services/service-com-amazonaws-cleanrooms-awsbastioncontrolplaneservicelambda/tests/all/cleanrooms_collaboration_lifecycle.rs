@@ -205,6 +205,61 @@ pub(crate) fn minimal_collaboration(name: &str) -> Value {
     })
 }
 
+/// An account id that is not the caller's, twelve digits as `AccountId` declares, used as
+/// the creator of a collaboration this account only PARTICIPATES in.
+pub(crate) const OTHER_CREATOR_ACCOUNT: &str = "210987654321";
+
+/// A stored collaboration whose creator is another account: the id of that collaboration.
+///
+/// Every emulated caller presents one account, so a collaboration created over the wire is
+/// always this account's own. The record is re-owned in the store afterwards — the creator
+/// becomes [`OTHER_CREATOR_ACCOUNT`] — which is the only way to exercise the rules that
+/// distinguish a collaboration's CREATOR from its other parties, and the rules about a
+/// collaboration the caller is no party to at all.
+///
+/// `abilities` is `Some(..)` to leave this account among the declared `members` holding
+/// them (a participant), and `None` to leave it out entirely (not a party).
+pub(crate) async fn collaboration_owned_elsewhere(
+    emulator: &Emulator,
+    name: &str,
+    abilities: Option<&[&str]>,
+) -> String {
+    let (status, created) = emulator
+        .create_collaboration(minimal_collaboration(name))
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup {name:?}: expected CreateCollaboration 200, got {status} with {created}"
+    );
+    let id = created["collaboration"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup {name:?}: no collaboration.id in {created}"))
+        .to_string();
+    {
+        let store = emulator.store();
+        let mut store = store.lock();
+        let record = store
+            .collaborations
+            .get_mut(&id)
+            .expect("the collaboration just created");
+        record.creator_account_id = OTHER_CREATOR_ACCOUNT.to_string();
+        record.creator_display_name = "other-creator".to_string();
+        record.members = match abilities {
+            Some(abilities) => vec![
+                service_com_amazonaws_cleanrooms_awsbastioncontrolplaneservicelambda::ops::types::MemberSpecification {
+                    account_id: account_id().to_string(),
+                    member_abilities: abilities.iter().map(|a| a.to_string()).collect(),
+                    ml_member_abilities: None,
+                    display_name: "participant".to_string(),
+                    payment_configuration: None,
+                },
+            ],
+            None => Vec::new(),
+        };
+    }
+    id
+}
+
 /// One row of the create/read round-trip table.
 struct CollaborationCase {
     label: &'static str,
@@ -1152,7 +1207,8 @@ async fn deleting_a_collaboration_hides_it_and_marks_its_memberships() {
             "case {index}: ListMemberships must show {membership_id} as COLLABORATION_DELETED, got {marked:?}"
         );
 
-        // @idempotent with no 404 declared: deleting it again is the same 204.
+        // `@idempotent` with no 404 declared: deleting it again is the same 204 — with
+        // nothing stored under the id there is no owner to refuse on behalf of.
         let (status, body) = emulator.delete_collaboration(&collaboration_id).await;
         assert_eq!(
             status, 204,
@@ -1164,10 +1220,11 @@ async fn deleting_a_collaboration_hides_it_and_marks_its_memberships() {
 #[tokio::test]
 async fn deleting_a_membership_frees_the_account_to_join_again() {
     let emulator = Emulator::new();
-    let (_, created) = emulator
-        .create_collaboration(minimal_collaboration("rejoin"))
-        .await;
-    let collaboration_id = created["collaboration"]["id"].as_str().unwrap().to_string();
+    // A collaboration this account PARTICIPATES in rather than created: a member may
+    // leave at any time, while the creator's own membership is removed only by deleting
+    // the collaboration (see `the_creator_cannot_leave_its_own_live_collaboration`).
+    let collaboration_id =
+        collaboration_owned_elsewhere(&emulator, "rejoin", Some(&[ALL_MEMBER_ABILITIES[0]])).await;
     let join = json!({
         "collaborationIdentifier": collaboration_id,
         "queryLogStatus": "ENABLED",

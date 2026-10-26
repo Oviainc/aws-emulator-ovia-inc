@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkInsightsAccessScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkInsightsAccessScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkInsightsAccessScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one Network Access Scope out of the paths the request names, stores it with its
+//! content and answers both; `GetNetworkInsightsAccessScopeContent` reports that content and
+//! `DescribeNetworkInsightsAccessScopes` that scope. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkInsightsAccessScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkInsightsAccessScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkInsightsAccessScope"))
+        use crate::state;
+
+        // "The tags to apply" (`TagSpecifications`) — "you must specify the resource type to
+        // tag, otherwise the request will fail" (`TagSpecification`), and the only type this
+        // action tags is the scope it creates. The tag payload's own bounds (the count per
+        // resource, each key and value's length, no key twice, nothing in the reserved
+        // namespace) are applied by the one shared reader every writer holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`): the model puts no `@length` on it and the token is
+        // retained for the life of the store, so its length is bounded the way every other
+        // client token of this crate is.
+        if input.client_token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The paths to match" and "The paths to exclude" (`MatchPaths` / `ExcludePaths`):
+        // the paths a scope IS. Each list is bounded before any work proportional to it is
+        // done, then taken as the modelled response shape the store holds, so what is stored
+        // is what every reader of this scope's content answers with.
+        let paths = state::AccessScopePaths {
+            match_paths: requested_paths("matchPaths", input.match_paths.as_deref())?,
+            exclude_paths: requested_paths("excludePaths", input.exclude_paths.as_deref())?,
+        };
+
+        // The caller-chosen bytes this create would retain, counted by the ONE definition of
+        // that charge: the tags, the paths, and the client token the token map keeps.
+        let payload_bytes = state::network_insights_access_scope_payload_bytes(
+            &tags,
+            Some(input.client_token.as_str()),
+            &paths,
+        );
+
+        // The Region the request was signed for, which the scope's ARN names; `ctx` carries
+        // no other fact this operation reads.
+        let region = state::request_region(ctx.parts());
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // Idempotency: one token names the one scope it created, so a replay of the SAME
+        // request reports that scope and creates no second one. Read here and answered below
+        // the DryRun check, because a replay stores nothing and so passes the ceilings a
+        // fresh create has to clear.
+        let replayed = match store
+            .network_insights_access_scope_client_tokens
+            .get(&input.client_token)
+            .cloned()
+        {
+            None => None,
+            Some(scope_id) => {
+                let scope = store
+                    .network_insights_access_scopes
+                    .get(&scope_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names Network Access Scope '{scope_id}', which is \
+                             not stored"
+                        ))
+                    })?;
+                let content = store
+                    .network_insights_access_scope_contents
+                    .get(&scope_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "Network Access Scope '{scope_id}' is stored without its content"
+                        ))
+                    })?;
+                // A token names ONE request: "do not reuse a client token with different
+                // requests, unless the requests are identical"
+                // (`IdempotentParameterMismatch`), so a token replayed with different paths
+                // or different tags is refused rather than answered with a scope the caller
+                // did not ask for. Refused before the DryRun check below, because a dry run
+                // of a request that would have been refused is refused with that reason.
+                if !same_request(&scope, &content, &paths, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some((scope, content))
+            }
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        // Neither is charged to a replay, which stores nothing.
+        if replayed.is_none() && !store.has_network_insights_access_scope_capacity() {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {max} Network Access Scopes, which is as many as it \
+                 stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_count_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The scope that token already created, exactly as it is stored now.
+        if let Some((scope, content)) = replayed {
+            return Ok(CreateNetworkInsightsAccessScopeOutput {
+                network_insights_access_scope: Some(scope),
+                network_insights_access_scope_content: Some(content),
+            });
+        }
+
+        // The scope itself, stored the one way this crate stores one — the id, the ARN, the
+        // dates and the content record beside it all come from the store, never from the
+        // request. The store refuses the write itself when it is full, so the ceiling holds
+        // even if the gate above is ever moved.
+        let scope_id = store
+            .insert_network_insights_access_scope(
+                &region,
+                tags,
+                paths,
+                Some(input.client_token.as_str()),
+            )
+            .ok_or_else(|| {
+                state::resource_count_exceeded(format!(
+                    "This emulator holds {max} Network Access Scopes, which is as many as it \
+                     stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ))
+            })?;
+
+        // The answer is the pair as it was stored, so this create, the describe and
+        // `GetNetworkInsightsAccessScopeContent` cannot drift apart.
+        let scope = store
+            .network_insights_access_scopes
+            .get(&scope_id)
+            .cloned()
+            .ok_or_else(|| {
+                state::internal_error(
+                    "the Network Access Scope just created could not be read back",
+                )
+            })?;
+        let content = store
+            .network_insights_access_scope_contents
+            .get(&scope_id)
+            .cloned()
+            .ok_or_else(|| {
+                state::internal_error(
+                    "the Network Access Scope content just stored could not be read back",
+                )
+            })?;
+        Ok(CreateNetworkInsightsAccessScopeOutput {
+            network_insights_access_scope: Some(scope),
+            network_insights_access_scope_content: Some(content),
+        })
     }
+}
+
+/// One `MatchPaths` or `ExcludePaths` list as the modelled `AccessScopePath`s the store
+/// holds, having first held the list to [`crate::state::MAX_ACCESS_SCOPE_PATHS`].
+///
+/// `member` is the request member being read, so a refusal names the list it refused.
+fn requested_paths(
+    member: &str,
+    requested: Option<&[AccessScopePathRequest]>,
+) -> Result<Vec<AccessScopePath>, CreateNetworkInsightsAccessScopeError> {
+    let requested = requested.unwrap_or_default();
+    if requested.len() > crate::state::MAX_ACCESS_SCOPE_PATHS {
+        return Err(crate::state::invalid_parameter_value(format!(
+            "{member} carries {count} paths, above the maximum of {max}",
+            count = requested.len(),
+            max = crate::state::MAX_ACCESS_SCOPE_PATHS,
+        )));
+    }
+    Ok(requested.iter().map(access_scope_path).collect())
+}
+
+/// One requested path as the `AccessScopePath` every reader of this scope's content answers
+/// with: the same statements, in the response shapes.
+fn access_scope_path(requested: &AccessScopePathRequest) -> AccessScopePath {
+    AccessScopePath {
+        source: requested.source.as_ref().map(path_statement),
+        destination: requested.destination.as_ref().map(path_statement),
+        through_resources: requested.through_resources.as_deref().map(|statements| {
+            statements
+                .iter()
+                .map(|statement| ThroughResourcesStatement {
+                    resource_statement: statement
+                        .resource_statement
+                        .as_ref()
+                        .map(resource_statement),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// One requested path statement as the modelled `PathStatement`.
+fn path_statement(requested: &PathStatementRequest) -> PathStatement {
+    PathStatement {
+        packet_header_statement: requested
+            .packet_header_statement
+            .as_ref()
+            .map(packet_header_statement),
+        resource_statement: requested.resource_statement.as_ref().map(resource_statement),
+    }
+}
+
+/// One requested packet-header statement as the modelled `PacketHeaderStatement`.
+fn packet_header_statement(requested: &PacketHeaderStatementRequest) -> PacketHeaderStatement {
+    PacketHeaderStatement {
+        source_addresses: requested.source_addresses.clone(),
+        destination_addresses: requested.destination_addresses.clone(),
+        source_ports: requested.source_ports.clone(),
+        destination_ports: requested.destination_ports.clone(),
+        source_prefix_lists: requested.source_prefix_lists.clone(),
+        destination_prefix_lists: requested.destination_prefix_lists.clone(),
+        protocols: requested.protocols.clone(),
+    }
+}
+
+/// One requested resource statement as the modelled `ResourceStatement`.
+fn resource_statement(requested: &ResourceStatementRequest) -> ResourceStatement {
+    ResourceStatement {
+        resources: requested.resources.clone(),
+        resource_types: requested.resource_types.clone(),
+    }
+}
+
+/// Does the scope a replayed `ClientToken` names hold what THIS request asks for?
+///
+/// Every member the request decides is compared — the two path lists, which are the content
+/// itself, and the tags — so a token replayed with any different parameter is refused with
+/// `IdempotentParameterMismatch` rather than answered with a scope the caller did not ask
+/// for. The members this service derives (the id, the ARN and the dates) are not compared:
+/// they follow from the ones that are. Tags are a SET, so the order a request names them in
+/// is not a difference; a path list is ORDERED, so its order is part of the request.
+fn same_request(
+    scope: &NetworkInsightsAccessScope,
+    content: &NetworkInsightsAccessScopeContent,
+    paths: &crate::state::AccessScopePaths,
+    tags: &[Tag],
+) -> bool {
+    let mut stored_tags = crate::state::tag_pairs(scope.tags.as_deref().unwrap_or_default());
+    stored_tags.sort();
+    let mut requested_tags = crate::state::tag_pairs(tags);
+    requested_tags.sort();
+    stored_tags == requested_tags
+        && same_paths(
+            content.match_paths.as_deref().unwrap_or_default(),
+            &paths.match_paths,
+        )
+        && same_paths(
+            content.exclude_paths.as_deref().unwrap_or_default(),
+            &paths.exclude_paths,
+        )
+}
+
+/// Are two path lists the same request?
+///
+/// A path is a nested structure of optional statements the model gives no equality, so the
+/// two are compared through their rendered form — which distinguishes exactly the members a
+/// request can set, the way `create_launch_template` compares the template data a request
+/// carries.
+fn same_paths(stored: &[AccessScopePath], requested: &[AccessScopePath]) -> bool {
+    format!("{stored:?}") == format!("{requested:?}")
 }

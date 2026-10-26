@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportKeyMaterial
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportKeyMaterial`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: imports the key material a caller wrapped under the public key
+//! `GetParametersForImport` handed out, making the KMS key a `KeyId` names usable. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportKeyMaterial::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The material is really UNWRAPPED, with the private half of the wrapping key pair
+//! this store kept against the import token ([`crate::state::unwrap_key_material`]), so
+//! what the key ends up holding is exactly the material the caller supplied — and a
+//! blob wrapped under some other key, or under a key pair whose token has expired,
+//! cannot be imported.
+//!
+//! Importing applies only to a key created with no key material, so this operation's
+//! precondition is the key's ORIGIN, the same gate `GetParametersForImport` and
+//! `DeleteImportedKeyMaterial` apply.
+//!
+//! What this emulator cannot import is an asymmetric key pair: it holds no private key
+//! for one (see [`crate::state::KeyMaterial::KeyPairNotGenerated`]), and the `RSA_AES`
+//! wrapping algorithms such a key calls for wrap an AES key that wraps the material
+//! rather than wrapping it directly, so those requests are answered as not implemented
+//! rather than with a key whose material is not what was sent.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +203,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ImportType` of material that has not been in this KMS key before: "if no key
+/// material has ever been imported into the KMS key, and this parameter is omitted, the
+/// parameter defaults to NEW_KEY_MATERIAL"
+/// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ImportType")`).
+const IMPORT_TYPE_NEW_KEY_MATERIAL: &str = "NEW_KEY_MATERIAL";
+
+/// The `ImportType` of material this KMS key has held before. See
+/// [`IMPORT_TYPE_NEW_KEY_MATERIAL`].
+const IMPORT_TYPE_EXISTING_KEY_MATERIAL: &str = "EXISTING_KEY_MATERIAL";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -270,18 +290,312 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportKeyMaterial` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportKeyMaterialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportKeyMaterial"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key" (the `KeyId` member's
+        // documentation): an alias is not an identifier this operation accepts, which is
+        // what its modelled `InvalidArnException` reports — as it does for an ARN that
+        // is not a KMS ARN at all.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(invalid_arn(&input.key_id));
+        }
+        // Everything about the key this request is judged against: read once, so the
+        // checks below do not hold a borrow of the store while it is being written.
+        // `state_message` is how every operation in this service words a refusal caused
+        // by the key's own key state ([`crate::state::invalid_state_message`]).
+        let (key_id, key_arn, origin, key_state, state_message, key_spec, held_material_id) =
+            match state.resolve(&region, &input.key_id) {
+                crate::state::KeyRef::Found(key) => (
+                    key.key_id.clone(),
+                    key.arn.clone(),
+                    key.origin.clone(),
+                    key.reported_key_state().to_string(),
+                    crate::state::invalid_state_message(key),
+                    key.key_spec.clone(),
+                    key.current_key_material_id.clone(),
+                ),
+                crate::state::KeyRef::UnauthorizedAccount => {
+                    return Err(crate::state::unauthorized_account(
+                        Self::NAME,
+                        &input.key_id,
+                    ));
+                }
+                crate::state::KeyRef::MalformedArn => {
+                    return Err(invalid_arn(&input.key_id));
+                }
+                crate::state::KeyRef::NotFound => {
+                    return Err(ImportKeyMaterialErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: Some(crate::state::key_not_found_message(
+                                &region,
+                                &input.key_id,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            };
+
+        // "The Origin of the KMS key must be EXTERNAL" (the `KeyId` member's
+        // documentation): a key whose material KMS generated cannot be given material by
+        // a caller, so it is "a specified resource [that] is not valid for this
+        // operation" — worded exactly as `GetParametersForImport` and
+        // `DeleteImportedKeyMaterial` word the same refusal.
+        if origin != crate::state::ORIGIN_EXTERNAL {
+            return Err(ImportKeyMaterialErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(format!(
+                        "{key_arn} origin is {origin} which is not valid for this operation."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state": a key whose deletion is scheduled is not, and stays as it is until
+        // `CancelKeyDeletion` restores it. Every other state this key can be in —
+        // waiting for its first material, or holding material that is being replaced —
+        // accepts an import.
+        if key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(ImportKeyMaterialErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(state_message),
+                },
+            )
+            .into());
+        }
+
+        // "The import token that you received in the response to a previous
+        // GetParametersForImport request": a token this service did not mint names no
+        // wrapping key pair at all, and one minted for ANOTHER key cannot be used here,
+        // because "the public key and its import token are permanently linked and must
+        // be used together" with the key they were issued for. Both are the modelled
+        // `InvalidImportTokenException`.
+        let token = ::hex::encode(&input.import_token);
+        let Some(parameters) = state
+            .import_parameters
+            .get(&token)
+            .filter(|parameters| parameters.key_id == key_id)
+            .cloned()
+        else {
+            return Err(ImportKeyMaterialErrorModeled::InvalidImportTokenException(
+                InvalidImportTokenException {
+                    message: Some(format!(
+                        "The import token is not valid for {key_arn}. Call \
+                         GetParametersForImport for a public key and import token to use \
+                         with it."
+                    )),
+                },
+            )
+            .into());
+        };
+        // "You cannot use an expired public key or import token in an ImportKeyMaterial
+        // request. If your key and token expire, send another GetParametersForImport
+        // request" — the modelled `ExpiredImportTokenException`.
+        if !parameters.usable_at(::std::time::SystemTime::now()) {
+            return Err(ImportKeyMaterialErrorModeled::ExpiredImportTokenException(
+                ExpiredImportTokenException {
+                    message: Some(
+                        "The import token has expired. Call GetParametersForImport for a \
+                         new public key and import token."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "When the value of ExpirationModel is KEY_MATERIAL_EXPIRES, you must specify a
+        // value for the ValidTo parameter. When value is KEY_MATERIAL_DOES_NOT_EXPIRE,
+        // you must omit the ValidTo parameter" (that member's documentation), and "the
+        // value of this parameter must be a future date and time. The maximum value is
+        // 365 days from the request date". Neither case is modelled as an error of this
+        // operation, so a request that states its expiry inconsistently is refused as
+        // invalid and nothing is imported.
+        let expiration_model = input
+            .expiration_model
+            .clone()
+            .unwrap_or_else(|| crate::state::EXPIRATION_MODEL_EXPIRES.to_string());
+        let expires = expiration_model == crate::state::EXPIRATION_MODEL_EXPIRES;
+        let valid_to = match (expires, input.valid_to) {
+            (true, Some(requested)) => {
+                // Every step from the request's timestamp to an instant is CHECKED: a
+                // caller-chosen millisecond count can be negative or far past anything
+                // `SystemTime` can represent, and `SystemTime`'s `+` panics on
+                // overflow. A value that is not an instant at most the documented
+                // window ahead is refused, which is the same answer as one outside the
+                // window.
+                let millis = u64::try_from(requested.to_millis().unwrap_or_default()).ok();
+                let valid_to = millis
+                    .map(::std::time::Duration::from_millis)
+                    .and_then(|since_epoch| {
+                        ::std::time::SystemTime::UNIX_EPOCH.checked_add(since_epoch)
+                    });
+                let now = ::std::time::SystemTime::now();
+                let longest = now.checked_add(::std::time::Duration::from_secs(
+                    crate::state::MAX_IMPORTED_MATERIAL_VALIDITY_DAYS * 24 * 60 * 60,
+                ));
+                let within = match (valid_to, longest) {
+                    (Some(valid_to), Some(longest)) => valid_to > now && valid_to <= longest,
+                    _ => false,
+                };
+                if !within {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ValidTo must be a future date and time, at most {} days from the \
+                         request date.",
+                        crate::state::MAX_IMPORTED_MATERIAL_VALIDITY_DAYS
+                    )));
+                }
+                valid_to
+            }
+            (true, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ValidTo is required when ExpirationModel is {}.",
+                    crate::state::EXPIRATION_MODEL_EXPIRES
+                )));
+            }
+            (false, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ValidTo is not valid when ExpirationModel is {}.",
+                    crate::state::EXPIRATION_MODEL_DOES_NOT_EXPIRE
+                )));
+            }
+            (false, None) => None,
+        };
+
+        // "Indicates whether the key material being imported is previously associated
+        // with this KMS key or not"; "you cannot specify a key material ID with
+        // ImportType set to NEW_KEY_MATERIAL", and after the first import the parameter
+        // "defaults to EXISTING_KEY_MATERIAL".
+        let import_type = input.import_type.clone().unwrap_or_else(|| {
+            if held_material_id.is_some() {
+                IMPORT_TYPE_EXISTING_KEY_MATERIAL.to_string()
+            } else {
+                IMPORT_TYPE_NEW_KEY_MATERIAL.to_string()
+            }
+        });
+        if import_type == IMPORT_TYPE_NEW_KEY_MATERIAL && input.key_material_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "KeyMaterialId is not valid when ImportType is \
+                 {IMPORT_TYPE_NEW_KEY_MATERIAL}."
+            )));
+        }
+
+        // The key material a key of this spec holds, which is what the imported bytes
+        // have to be. An asymmetric key pair is material this service does not hold the
+        // bytes of, so such a key is answered as not implemented rather than given
+        // material it cannot use.
+        let Some(profile) = crate::state::key_spec_profile(&key_spec) else {
+            return Err(internal("the key spec of the KMS key is not supported"));
+        };
+        if profile.material.material_len().is_none() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "ImportKeyMaterial for a {key_spec} KMS key"
+            )));
+        }
+        // "The key material must be encrypted under the public wrapping key that
+        // GetParametersForImport returned, using the wrapping algorithm that you
+        // specified in the same GetParametersForImport request." The `RSA_AES` wrapping
+        // algorithms wrap an AES key that wraps the material, and `SM2PKE` is not RSA at
+        // all; neither is unwrapped here, so such a request is answered as not
+        // implemented rather than with material that was never opened.
+        if !crate::state::unwraps_wrapping_algorithm(&parameters.wrapping_algorithm) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "ImportKeyMaterial with key material wrapped using {}",
+                parameters.wrapping_algorithm
+            )));
+        }
+        // A blob that does not open under the private half of the wrapping key pair is
+        // not the key material this import was prepared for: "the ciphertext ... is
+        // corrupted, missing, or otherwise invalid" is what `InvalidCiphertextException`
+        // reports.
+        let Some(opened) = crate::state::unwrap_key_material(&parameters, &input.encrypted_key_material)
+        else {
+            return Err(ImportKeyMaterialErrorModeled::InvalidCiphertextException(
+                InvalidCiphertextException { message: None },
+            )
+            .into());
+        };
+        // Material that opened but is not material of the kind this key holds "does not
+        // meet the requirements" of the key — the modelled
+        // `IncorrectKeyMaterialException`.
+        let Some(material) = crate::state::KeyMaterial::from_bytes(profile.material, &opened) else {
+            return Err(incorrect_key_material(&key_arn));
+        };
+
+        // "Whenever you import key material into a symmetric encryption key, KMS assigns
+        // a unique identifier to the key material based on the KMS key ID and the
+        // imported key material. When you re-import key material with a specified key
+        // material ID, KMS: computes the identifier for the key material, matches the
+        // computed identifier against the specified key material ID, verifies that the
+        // key material ID is already associated with the KMS key" — so a request naming
+        // one is refused unless the material it supplied is that material, already this
+        // key's.
+        if let Some(named) = input.key_material_id.as_deref() {
+            let computed = material.id();
+            let matches = computed.as_deref() == Some(named)
+                && (held_material_id.as_deref() == Some(named));
+            if !matches {
+                return Err(incorrect_key_material(&key_arn));
+            }
+        }
+
+        let crate::state::KeyRefMut::Found(key) = state.resolve_mut(&region, &input.key_id) else {
+            return Err(internal("the KMS key is no longer held"));
+        };
+        // "Without its key material, the KMS key is unusable": the key now has some, so
+        // a key that was waiting for it becomes usable, and what the caller stated about
+        // the material is kept for `DescribeKey` to report and for the material to
+        // expire by.
+        let key_material_id = key.import_key_material(
+            material,
+            crate::state::ImportedKeyMaterial {
+                expiration_model,
+                valid_to,
+                // "If you do not specify a key material description, KMS retains the
+                // value you specified when you last imported the same key material into
+                // this KMS key."
+                description: input.key_material_description.clone(),
+            },
+        );
+
+        Ok(ImportKeyMaterialOutput {
+            // KMS answers with the key ARN, not the identifier the request used.
+            key_id: Some(key_arn),
+            key_material_id,
+        })
     }
+}
+
+/// Refuse an identifier this operation cannot resolve to a key: `InvalidArnException`
+/// names the identifier the request gave.
+fn invalid_arn(requested: &str) -> ImportKeyMaterialError {
+    ImportKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::invalid_arn_message(requested)),
+    })
+    .into()
+}
+
+/// Refuse key material that is not what the key it is imported into needs.
+fn incorrect_key_material(key_arn: &str) -> ImportKeyMaterialError {
+    ImportKeyMaterialErrorModeled::IncorrectKeyMaterialException(IncorrectKeyMaterialException {
+        message: Some(format!(
+            "The key material does not meet the requirements of {key_arn}."
+        )),
+    })
+    .into()
+}
+
+/// Answer a failure of this emulator itself, never a malformed request.
+fn internal(message: impl Into<String>) -> ImportKeyMaterialError {
+    ImportKeyMaterialErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

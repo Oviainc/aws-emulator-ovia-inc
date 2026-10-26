@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKeyLastUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKeyLastUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports when the KMS key a `KeyId` names was last used in a
+//! successful cryptographic operation. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKeyLastUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it reads the key record and writes nothing, so two calls
+//! with no cryptographic operation between them answer the same. What it reports is
+//! written by the cryptographic operations themselves
+//! ([`crate::state::Cmk::record_last_usage`]), so a key that has had none answers with
+//! `KeyLastUsage` absent — which is what "the key has not been used for a successful
+//! cryptographic operation since it was created" is reported as.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +182,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKeyLastUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyLastUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKeyLastUsage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetKeyLastUsageErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // A REPORTING operation: it reads one key record and writes nothing, so asking
+        // when a key was last used is not itself a use of it.
+        let state = state.lock();
+
+        // "To specify a KMS key, use its key ID or key ARN. Alias names are not
+        // supported"
+        // (`smithy_query(query="doc",shape="GetKeyLastUsageRequest",member="KeyId")`),
+        // so an identifier that names an alias is not an identifier this operation
+        // accepts, however well formed it is — which is what its modelled
+        // `InvalidArnException` reports.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(GetKeyLastUsageErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                },
+            )
+            .into());
+        }
+
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
+            // An identifier that is an ARN this endpoint cannot resolve is answered
+            // the same way as one that resolves to no key: the key was not found, and
+            // the message names the ARN rather than a resource of this endpoint (see
+            // [`crate::state::key_not_found_message`]). The recorded behaviour of this
+            // operation is `NotFoundException: Invalid arn <the identifier>` for an
+            // ARN-shaped `KeyId` with a mangled body, not the `InvalidArnException`
+            // the key-management operations answer for one.
+            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                return Err(GetKeyLastUsageErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(GetKeyLastUsageOutput {
+            // KMS answers with the key ARN, not the identifier the request used — the
+            // way every other operation in this service reports the key it read.
+            key_id: Some(key.arn.clone()),
+            // "Contains usage information about the last time the KMS key was used for
+            // a successful cryptographic operation. If the key has not been used since
+            // tracking began, this response element is empty" — so the member is absent
+            // for a key with no recorded use, never an empty record.
+            key_last_usage: key
+                .last_usage
+                .as_ref()
+                .map(crate::state::KeyUsage::last_usage_data),
+            // "The date from which KMS began recording cryptographic activity for this
+            // key, or the date the KMS key was created, whichever is later."
+            tracking_start_date: Some(crate::state::date_time(key.tracking_start_date())),
+            key_creation_date: Some(crate::state::date_time(key.creation_date)),
+        })
     }
 }

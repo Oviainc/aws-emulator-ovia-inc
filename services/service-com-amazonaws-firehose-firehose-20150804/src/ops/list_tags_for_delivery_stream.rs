@@ -79,6 +79,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The dotted member path a constraint violation is reported at, spelled by the framework's
+// own path builder so a refusal this handler states names a member exactly as a refusal
+// the request boundary states does.
+use ::aws_smithy_schema_server::constraints::path;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,6 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let _ = ctx;
+
+        // `ExclusiveStartTagKey` is a tag key, so it is judged against the modelled
+        // `TagKey` pattern before the listing runs, the way the request boundary would
+        // have judged it had it been able to compile that pattern
+        // (`crate::service::check_tag_keys`).
+        if let Some(start) = input.exclusive_start_tag_key.as_deref() {
+            crate::service::check_tag_keys([(
+                path::member("ExclusiveStartTagKey"),
+                start,
+            )])
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
 
         let mut store = state.lock();
         // Reporting only: this applies the transitions the clock has ALREADY made due

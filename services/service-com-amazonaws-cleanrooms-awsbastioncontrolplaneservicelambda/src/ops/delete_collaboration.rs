@@ -6,10 +6,16 @@
 //! longer sees it, and moves every membership of that collaboration to
 //! `COLLABORATION_DELETED`.
 //!
-//! `@idempotent` with no 404 in its declared error set, so deleting a collaboration
-//! that is already gone is the same 204 as deleting it the first time: the only client
-//! error this operation models is `ValidationException`, which is about the request,
-//! not about the resource's existence.
+//! "It can only be called by the collaboration owner", so an identifier that resolves to
+//! a collaboration ANOTHER account created is the authorization failure the operation
+//! models (`AccessDeniedException`, HTTP 403), stated the way every authorization failure
+//! of this service is stated.
+//!
+//! `@idempotent` with no 404 in its declared error set, so deleting a collaboration that
+//! is already gone — or an id no collaboration was ever stored under — is the same 204 as
+//! deleting it the first time: with nothing stored there is no owner to refuse on behalf
+//! of, and the only other client error this operation models is `ValidationException`,
+//! which is about the request rather than about the resource's existence.
 //!
 //! ## Shape of an operation
 //!
@@ -137,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -151,7 +157,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let collaboration_id = input.collaboration_identifier;
+        let caller = st::caller_account_id();
         let mut store = state.lock();
+
+        // "It can only be called by the collaboration owner": a collaboration STORED under
+        // this id that another account created is not this caller's to delete, which is the
+        // authorization failure the operation models. An id nothing is stored under has no
+        // owner to refuse on behalf of, and the operation declares no 404, so the
+        // `@idempotent` delete answers its success there.
+        let owned_elsewhere = store
+            .collaborations
+            .get(&collaboration_id)
+            .is_some_and(|record| record.creator_account_id != caller);
+        if owned_elsewhere {
+            return Err(DeleteCollaborationErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::authorization_denied_message(
+                        Self::NAME,
+                        &st::collaboration_arn(&st::request_region(ctx.parts()), &collaboration_id),
+                    )),
+                    reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
+                },
+            )
+            .into());
+        }
+
         if let Some(removed) = store.collaborations.remove(&collaboration_id) {
             store
                 .collaboration_order
@@ -169,22 +199,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .membership_by_collaboration
                 .retain(|(collaboration, _), _| collaboration != &collaboration_id);
-            // The privacy budget template does NOT survive: it is a resource OF the
-            // collaboration ("creates a privacy budget template for a specified
+            // The privacy budget templates do NOT survive: a template is a resource OF
+            // the collaboration ("creates a privacy budget template for a specified
             // collaboration"), reachable only through a membership of that
-            // collaboration, so the collaboration's disappearance takes it — and its
-            // tags — with it, and the collaboration can hold a new one if it is
-            // recreated.
-            if let Some(template_id) = store
+            // collaboration, so the collaboration's disappearance takes every one of
+            // them — and their tags — with it, and the collaboration can hold new ones
+            // if it is recreated.
+            let template_ids: Vec<String> = store
                 .privacy_budget_template_by_collaboration
-                .remove(&collaboration_id)
-            {
+                .iter()
+                .filter(|((collaboration, _), _)| collaboration == &collaboration_id)
+                .map(|(_, template_id)| template_id.clone())
+                .collect();
+            store
+                .privacy_budget_template_by_collaboration
+                .retain(|(collaboration, _), _| collaboration != &collaboration_id);
+            for template_id in template_ids {
                 if let Some(template) = store.privacy_budget_templates.remove(&template_id) {
                     store.tags.remove(&template.arn);
                 }
                 store
                     .privacy_budget_template_order
                     .retain(|id| id != &template_id);
+            }
+            // Neither do the configured table associations of this collaboration's
+            // memberships: an association "links a configured table with a
+            // collaboration", so the collaboration's disappearance takes it — and its
+            // tags — with it, even though the membership itself survives.
+            let membership_ids: Vec<String> = store
+                .memberships
+                .values()
+                .filter(|membership| membership.collaboration_id == collaboration_id)
+                .map(|membership| membership.id.clone())
+                .collect();
+            for membership_id in membership_ids {
+                store.remove_configured_table_associations_of(&membership_id);
             }
         }
         Ok(DeleteCollaborationOutput {})

@@ -979,6 +979,61 @@ impl DefaultPolicyOnlyParameters {
     }
 }
 
+/// A request that may state the `[Default policies only]` parameters in its
+/// request BODY, as against inside its `PolicyDetails` structure.
+///
+/// `CreateLifecyclePolicyRequest` and `UpdateLifecyclePolicyRequest` declare the
+/// same body members as the alternative to that structure, so WHICH members they
+/// are is one rule for both: this is the ONE place the request-body half of
+/// [`DefaultPolicyOnlyParameters`] is read, beside
+/// [`DefaultPolicyOnlyParameters::in_policy_details`] for the structure half.
+/// Every refusal built from either half — a default-only parameter stated for a
+/// policy that is not a default policy, and the configuration stated both in the
+/// body and in the structure — therefore names the same set on every operation
+/// that takes it.
+pub trait DefaultPolicyOnlyBody {
+    /// Which of the `[Default policies only]` parameters this request states in
+    /// the request body.
+    fn default_policy_only_body_parameters(&self) -> DefaultPolicyOnlyParameters;
+}
+
+/// Writes the [`DefaultPolicyOnlyBody`] mapping ONCE, as one impl per request
+/// shape that declares those members in its body under the model's own names.
+///
+/// The mapping is per-field on two distinct structures, so a generic function
+/// cannot express it; this keeps the member list in a single place all the same.
+///
+/// `PolicyDetails$ResourceType` is not among them: it has no same-named body
+/// member to read. A create states the resource type in the body as
+/// `CreateLifecyclePolicyRequest$DefaultPolicy` — also the member that MAKES the
+/// request a default-policy request, so it is read where that name belongs — and
+/// an update may not change it at all ([`resource_type_cannot_be_updated`]), so
+/// a body set leaves it unset.
+macro_rules! default_policy_only_body {
+    ($($request:ty),+ $(,)?) => {
+        $(
+            impl DefaultPolicyOnlyBody for $request {
+                fn default_policy_only_body_parameters(&self) -> DefaultPolicyOnlyParameters {
+                    DefaultPolicyOnlyParameters {
+                        resource_type: false,
+                        create_interval: self.create_interval.is_some(),
+                        retain_interval: self.retain_interval.is_some(),
+                        copy_tags: self.copy_tags.is_some(),
+                        cross_region_copy_targets: self.cross_region_copy_targets.is_some(),
+                        extend_deletion: self.extend_deletion.is_some(),
+                        exclusions: self.exclusions.is_some(),
+                    }
+                }
+            }
+        )+
+    };
+}
+
+default_policy_only_body!(
+    crate::ops::types::CreateLifecyclePolicyInput,
+    crate::ops::types::UpdateLifecyclePolicyInput,
+);
+
 /// The `InvalidRequestException` for a DEFAULT policy request that states its
 /// configuration in the request body AND as a `PolicyDetails` structure.
 ///

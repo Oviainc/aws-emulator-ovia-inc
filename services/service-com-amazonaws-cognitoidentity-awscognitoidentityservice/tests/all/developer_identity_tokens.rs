@@ -125,8 +125,9 @@ fn decode_base64url(case: &str, segment: &str) -> Vec<u8> {
 
 /// The header and the claims of a token in JWS compact serialization, with the form of the
 /// serialization itself asserted: three segments, the third one EMPTY, as RFC 7515 §6
-/// defines for a JWS that carries no signature.
-fn jws_header_and_claims(case: &str, token: &str) -> (Value, Value) {
+/// defines for a JWS that carries no signature. `pub(crate)` so every suite in this target
+/// reads an issued token the same way.
+pub(crate) fn jws_header_and_claims(case: &str, token: &str) -> (Value, Value) {
     let segments: Vec<&str> = token.split('.').collect();
     assert_eq!(
         segments.len(),
@@ -146,7 +147,12 @@ fn jws_header_and_claims(case: &str, token: &str) -> (Value, Value) {
 }
 
 /// The `Logins` provider names `ListIdentities` reports for one identity of a pool.
-async fn listed_logins(emulator: &Emulator, pool_id: &str, identity_id: &str) -> Vec<String> {
+/// `pub(crate)` for the same reason as [`jws_header_and_claims`].
+pub(crate) async fn listed_logins(
+    emulator: &Emulator,
+    pool_id: &str,
+    identity_id: &str,
+) -> Vec<String> {
     let listed = emulator
         .ok(
             "ListIdentities",

@@ -286,6 +286,22 @@ pub const COUNTER_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const DEFAULT_WARM_READ_UNITS_PER_SECOND: i64 = 12_000;
 pub const DEFAULT_WARM_WRITE_UNITS_PER_SECOND: i64 = 4_000;
 
+/// The provisioned-capacity quotas an account holds in one Region BEFORE it asks for an
+/// increase, in capacity units.
+///
+/// "Per account – 80,000 read request units and 80,000 write request units" and "Per
+/// table – 40,000 read request units and 40,000 write request units" ("Service, Account,
+/// and Table Quotas in Amazon DynamoDB", "Throughput default quotas"). The per-table pair
+/// restricts "the sum of the provisioned capacity of the new table itself and all its
+/// global secondary indexes", and the per-account pair the "aggregate provisioned capacity
+/// over all your tables and GSIs" (the `DescribeLimits` doc) — which is what
+/// [`ComAmazonawsDynamodbDynamodb20120810State::capacity_quotas_in`] measures against what
+/// a Region has already provisioned.
+pub const DEFAULT_ACCOUNT_MAX_READ_CAPACITY_UNITS: i64 = 80_000;
+pub const DEFAULT_ACCOUNT_MAX_WRITE_CAPACITY_UNITS: i64 = 80_000;
+pub const DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS: i64 = 40_000;
+pub const DEFAULT_TABLE_MAX_WRITE_CAPACITY_UNITS: i64 = 40_000;
+
 /// How much unused capacity a provisioned table keeps for a burst: "DynamoDB currently
 /// retains up to 300 seconds (5 minutes) of unused read and write capacity" (DynamoDB
 /// Developer Guide, "Using burst capacity effectively"). It is the CEILING on what the
@@ -2612,6 +2628,33 @@ impl Table {
         self.removed_at.is_some_and(|due| now >= due)
     }
 
+    /// The read and write capacity units this table has PROVISIONED: its own, plus that
+    /// of every global secondary index on it.
+    ///
+    /// That sum is the unit both documented throughput quotas are stated in — the
+    /// per-table one restricts "the sum of the provisioned capacity of the new table
+    /// itself and all its global secondary indexes" (the `DescribeLimits` doc) — so one
+    /// function answers it and every reader measures the same thing. A local secondary
+    /// index shares the table's own capacity and so is already counted; a table in
+    /// `PAY_PER_REQUEST` mode provisions no capacity at all ("you don't need to specify
+    /// how much read and write throughput you expect" — `BillingMode`), and contributes
+    /// nothing.
+    pub fn provisioned_capacity(&self) -> (i64, i64) {
+        ::std::iter::once(self.provisioned_throughput.as_ref())
+            .chain(
+                self.global_secondary_indexes
+                    .iter()
+                    .map(|index| index.provisioned_throughput.as_ref()),
+            )
+            .flatten()
+            .fold((0_i64, 0_i64), |(read, write), throughput| {
+                (
+                    read.saturating_add(throughput.read_capacity_units),
+                    write.saturating_add(throughput.write_capacity_units),
+                )
+            })
+    }
+
     /// The ARN of the stream this table currently publishes to, for a table whose
     /// stream is ON.
     ///
@@ -3515,6 +3558,28 @@ pub fn page_by_name<T>(
         .flatten()
 }
 
+/// What one region has provisioned, counted two ways: the aggregate over every table and
+/// global secondary index in it, and the largest single table's own plus its indexes'
+/// capacity — the two figures [`ComAmazonawsDynamodbDynamodb20120810State::capacity_quotas_in`]
+/// measures the per-account and the per-table throughput quotas against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvisionedCapacity {
+    pub aggregate_read: i64,
+    pub aggregate_write: i64,
+    pub largest_table_read: i64,
+    pub largest_table_write: i64,
+}
+
+/// The provisioned-capacity quotas in force for one account in one region: the four
+/// figures `DescribeLimits` reports, in capacity units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityQuotas {
+    pub account_max_read_capacity_units: i64,
+    pub account_max_write_capacity_units: i64,
+    pub table_max_read_capacity_units: i64,
+    pub table_max_write_capacity_units: i64,
+}
+
 /// Per-service state for com-amazonaws-dynamodb-dynamodb-20120810. A handler reaches it through [`service_state`].
 ///
 /// Tables are keyed by REGION and then by name, because that is the scope a DynamoDB
@@ -3647,6 +3712,65 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     pub fn contains_table(&self, region: &str, name: &str) -> bool {
         self.tables_in(region)
             .is_some_and(|tables| tables.contains_key(name))
+    }
+
+    /// What one region has already PROVISIONED, in capacity units — the two figures the
+    /// documented throughput quotas are measured against.
+    ///
+    /// Region-scoped because a throughput quota is: it bounds what an account provisions
+    /// "across all of your DynamoDB tables in a given Region"
+    /// (`DescribeLimits$AccountMaxReadCapacityUnits`). Every table the region holds counts
+    /// from the moment it is created, whatever status it is in, because its capacity is
+    /// provisioned for it from then on; a table whose deletion the clock has already made
+    /// due is gone from the store before this walk sees it
+    /// ([`Self::apply_due_transitions`]).
+    pub fn provisioned_capacity_in(&self, region: &str) -> ProvisionedCapacity {
+        self.tables_in(region)
+            .map(|tables| {
+                tables
+                    .values()
+                    .fold(ProvisionedCapacity::default(), |totals, table| {
+                        let (read, write) = table.provisioned_capacity();
+                        ProvisionedCapacity {
+                            aggregate_read: totals.aggregate_read.saturating_add(read),
+                            aggregate_write: totals.aggregate_write.saturating_add(write),
+                            largest_table_read: totals.largest_table_read.max(read),
+                            largest_table_write: totals.largest_table_write.max(write),
+                        }
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    /// The four provisioned-capacity quotas this account holds in one region, as
+    /// `DescribeLimits` reports them.
+    ///
+    /// Each is the documented default ([`DEFAULT_ACCOUNT_MAX_READ_CAPACITY_UNITS`] and
+    /// its three siblings) RAISED to what the region has already provisioned: capacity an
+    /// account holds was accepted under a quota at least that large, so a quota below it
+    /// could never have been the one in force. The per-account pair is therefore at least
+    /// the region's aggregate and the per-table pair at least its largest single table's
+    /// own plus its indexes' capacity, which keeps the report consistent with the
+    /// descriptions of the very tables the `DescribeLimits` doc has a client sum up.
+    ///
+    /// The per-table quota never exceeds the per-account one, because one table's
+    /// capacity is part of the account's aggregate.
+    pub fn capacity_quotas_in(&self, region: &str) -> CapacityQuotas {
+        let provisioned = self.provisioned_capacity_in(region);
+        let account_max_read =
+            DEFAULT_ACCOUNT_MAX_READ_CAPACITY_UNITS.max(provisioned.aggregate_read);
+        let account_max_write =
+            DEFAULT_ACCOUNT_MAX_WRITE_CAPACITY_UNITS.max(provisioned.aggregate_write);
+        CapacityQuotas {
+            account_max_read_capacity_units: account_max_read,
+            account_max_write_capacity_units: account_max_write,
+            table_max_read_capacity_units: DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS
+                .max(provisioned.largest_table_read)
+                .min(account_max_read),
+            table_max_write_capacity_units: DEFAULT_TABLE_MAX_WRITE_CAPACITY_UNITS
+                .max(provisioned.largest_table_write)
+                .min(account_max_write),
+        }
     }
 
     /// Whether storing a table in `region` would open a new per-region bucket beyond

@@ -373,20 +373,23 @@ async fn member_status_is_invited_until_the_caller_holds_a_membership() {
             fetched["collaboration"]["memberStatus"]
         );
 
-        // 3. Left: the membership is gone, so the status falls back to INVITED — the
-        //    status is derived from state, not latched by the create.
+        // 3. The creator cannot leave its own live collaboration: DeleteMembership is
+        //    refused with the ConflictException it models, and the derived status is
+        //    unchanged by a refusal. (A participant's leave-and-rejoin is covered by
+        //    `deleting_a_membership_frees_the_account_to_join_again`.)
         let (status, body) = emulator
             .call("DELETE", &format!("/memberships/{membership_id}"), None)
             .await;
         assert_eq!(
-            status, 204,
-            "case {label:?}: expected DeleteMembership 204, got {status} with {body}"
+            status, 409,
+            "case {label:?}: expected DeleteMembership 409 for the creator's own \
+             membership, got {status} with {body}"
         );
         let (_, fetched) = emulator.get_collaboration(&id).await;
         assert_eq!(
             fetched["collaboration"]["memberStatus"].as_str(),
-            Some("INVITED"),
-            "case {label:?}: with no membership the caller is INVITED again, got {:?}",
+            Some("ACTIVE"),
+            "case {label:?}: the refused delete must leave the caller ACTIVE, got {:?}",
             fetched["collaboration"]["memberStatus"]
         );
     }

@@ -15,6 +15,8 @@
 //! * a report that names no stored configuration records nothing and comes back in
 //!   `UnprocessedStatusEvents`, while the rest of the batch is still recorded;
 //! * the operation is `@idempotent`: re-reporting one event records one event;
+//! * an event is held at the MINUTE its report named, so the instant a read reports is a
+//!   whole minute (the rounding itself is tabled in `instrumentation_status_minute`);
 //! * a status read reports the events of ONE status (the requested one, else `ACTIVE`) that
 //!   fall in the requested window (else the last hour), most recent first, a page at a time;
 //! * a status read of an identity that names no stored configuration is the modelled
@@ -48,23 +50,23 @@ const REGION: &str = "eu-west-2";
 
 /// The only `DynamicInstrumentationSignalType` the model declares
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` -> `["SNAPSHOT"]`).
-const SNAPSHOT: &str = "SNAPSHOT";
+pub(crate) const SNAPSHOT: &str = "SNAPSHOT";
 
 /// The two `InstrumentationType` values
 /// (`smithy_query(query="shape",shape="InstrumentationType")` -> `["BREAKPOINT", "PROBE"]`).
-const BREAKPOINT: &str = "BREAKPOINT";
-const PROBE: &str = "PROBE";
+pub(crate) const BREAKPOINT: &str = "BREAKPOINT";
+pub(crate) const PROBE: &str = "PROBE";
 
 /// The whole modelled `InstrumentationConfigurationStatus` catalogue
 /// (`smithy_query(query="shape",shape="InstrumentationConfigurationStatus")` -> `["READY",
 /// "ERROR", "ACTIVE", "DISABLED"]`).
-const STATUSES: [&str; 4] = ["READY", "ERROR", "ACTIVE", "DISABLED"];
+pub(crate) const STATUSES: [&str; 4] = ["READY", "ERROR", "ACTIVE", "DISABLED"];
 
 /// The whole modelled `InstrumentationErrorCause` catalogue
 /// (`smithy_query(query="shape",shape="InstrumentationErrorCause")` -> `["FILE_NOT_FOUND",
 /// "METHOD_NOT_FOUND", "LINE_NOT_EXECUTABLE", "OVERLOADED_METHODS", "LANGUAGE_MISMATCH",
 /// "RUNTIME_ERROR"]`).
-const ERROR_CAUSES: [&str; 6] = [
+pub(crate) const ERROR_CAUSES: [&str; 6] = [
     "FILE_NOT_FOUND",
     "METHOD_NOT_FOUND",
     "LINE_NOT_EXECUTABLE",
@@ -97,12 +99,12 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// [`router_with_engine`] when the test only drives the wire surface.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` when empty).
-async fn call(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16, Value) {
     let payload = serde_json::to_vec(body).expect("serialize the request body");
     let request = http::Request::builder()
         .method("POST")
@@ -135,7 +137,7 @@ async fn delete(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
 }
 
 /// `POST /report-instrumentation-configuration-status`.
-async fn report(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+pub(crate) async fn report(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(
         router,
         "/report-instrumentation-configuration-status",
@@ -145,15 +147,31 @@ async fn report(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
 }
 
 /// `POST /get-instrumentation-configuration-status`.
-async fn get_status(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+pub(crate) async fn get_status(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(router, "/get-instrumentation-configuration-status", request).await
 }
 
-/// Whole seconds since the epoch, the form `restJson1` puts a `Timestamp` on the wire in.
-fn now_seconds() -> f64 {
-    DateTime::from(std::time::SystemTime::now())
+/// The whole MINUTE at or before now, in the epoch seconds `restJson1` puts a `Timestamp` on
+/// the wire as.
+///
+/// A minute boundary rather than the current second, because an event is held at the minute
+/// nearest the instant its report named (see [`nearest_minute`]): an instant this answer plus
+/// or minus whole minutes is then a recorded instant of its own, whichever second of the
+/// minute the suite happens to run in.
+pub(crate) fn now_minute() -> f64 {
+    let seconds = DateTime::from(std::time::SystemTime::now())
         .as_secs_f64()
-        .trunc()
+        .trunc();
+    (seconds / 60.0).floor() * 60.0
+}
+
+/// The instant a read reports for an event whose report named `time`.
+///
+/// `InstrumentationStatusEvent.Time` is "The time when the status was reported, rounded to the
+/// nearest minute" (`smithy_query(query="shape",shape="InstrumentationStatusEvent")`), so it is
+/// the whole minute nearest `time`, half a minute going to the later boundary.
+pub(crate) fn nearest_minute(time: f64) -> f64 {
+    ((time + 30.0) / 60.0).floor() * 60.0
 }
 
 /// A `CaptureConfiguration` with only its `@required` members, whose own members are all
@@ -163,7 +181,12 @@ fn minimal_capture() -> Value {
 }
 
 /// A create request for one configuration of `instrumentation_type` at `file_path`.
-fn create_request(service: &str, environment: &str, kind: &str, file_path: &str) -> Value {
+pub(crate) fn create_request(
+    service: &str,
+    environment: &str,
+    kind: &str,
+    file_path: &str,
+) -> Value {
     json!({
         "Service": service,
         "Environment": environment,
@@ -179,7 +202,10 @@ fn create_request(service: &str, environment: &str, kind: &str, file_path: &str)
 }
 
 /// Create one configuration and answer its `LocationHash`.
-async fn create_configuration(router: &MultiServiceRouter, request: &Value) -> String {
+pub(crate) async fn create_configuration(
+    router: &MultiServiceRouter,
+    request: &Value,
+) -> String {
     let (status, created) = create(router, request).await;
     assert_eq!(
         status, 200,
@@ -192,7 +218,13 @@ async fn create_configuration(router: &MultiServiceRouter, request: &Value) -> S
 }
 
 /// One entry of a report batch.
-fn report_entry(kind: &str, hash: &str, status: &str, time: f64, error_cause: Option<&str>) -> Value {
+pub(crate) fn report_entry(
+    kind: &str,
+    hash: &str,
+    status: &str,
+    time: f64,
+    error_cause: Option<&str>,
+) -> Value {
     let mut entry = json!({
         "InstrumentationType": kind,
         "SignalType": SNAPSHOT,
@@ -209,15 +241,15 @@ fn report_entry(kind: &str, hash: &str, status: &str, time: f64, error_cause: Op
 /// What a status read asks for beyond the configuration it names: the rows of the tables
 /// below differ in these members, so they travel together.
 #[derive(Debug, Clone, Default)]
-struct Query<'a> {
-    status: Option<&'a str>,
-    window: Option<(f64, f64)>,
-    max_results: Option<i64>,
-    next_token: Option<&'a str>,
+pub(crate) struct Query<'a> {
+    pub(crate) status: Option<&'a str>,
+    pub(crate) window: Option<(f64, f64)>,
+    pub(crate) max_results: Option<i64>,
+    pub(crate) next_token: Option<&'a str>,
 }
 
 /// A status read of the configuration `identifier` names, asking what `query` asks.
-fn status_request(
+pub(crate) fn status_request(
     service: &str,
     environment: &str,
     kind: &str,
@@ -251,7 +283,7 @@ fn status_request(
 ///
 /// `Time` is read as a number rather than compared as JSON: an epoch-second timestamp is on
 /// the wire as a number whose JSON spelling (`1.0` against `1`) is not part of the value.
-fn events_of(body: &Value) -> Vec<(f64, Option<String>)> {
+pub(crate) fn events_of(body: &Value) -> Vec<(f64, Option<String>)> {
     body["Events"]
         .as_array()
         .map(|events| {
@@ -269,7 +301,7 @@ fn events_of(body: &Value) -> Vec<(f64, Option<String>)> {
 }
 
 /// The `Time` of each event a read reported, in the order it reported them.
-fn event_times(body: &Value) -> Vec<f64> {
+pub(crate) fn event_times(body: &Value) -> Vec<f64> {
     events_of(body).into_iter().map(|(time, _)| time).collect()
 }
 
@@ -296,7 +328,7 @@ fn retagged_token(token: &str, payload: &str) -> String {
 async fn a_reported_event_is_read_back_for_every_status_and_error_cause() {
     let service = "checkout";
     let environment = "eks:cluster-prod/namespace";
-    let now = now_seconds();
+    let now = now_minute();
 
     // One row per status; the ERROR rows walk the whole error-cause catalogue, and each row
     // is reported at its own instant inside the default window.
@@ -390,8 +422,8 @@ async fn a_reported_event_is_read_back_for_every_status_and_error_cause() {
                     );
                     assert_eq!(
                         events_of(&body),
-                        vec![(time, cause.map(ToString::to_string))],
-                        "case {label:?} by {form} attempt {attempt}: expected the reported event, got {:?}",
+                        vec![(nearest_minute(time), cause.map(ToString::to_string))],
+                        "case {label:?} by {form} attempt {attempt}: expected the reported event at the minute nearest {time}, got {:?}",
                         body["Events"]
                     );
                     assert!(
@@ -440,7 +472,7 @@ async fn a_reported_event_is_read_back_for_every_status_and_error_cause() {
 async fn reports_of_unknown_identities_are_unprocessed_and_the_rest_are_recorded() {
     let service = "checkout";
     let environment = "ec2:production";
-    let now = now_seconds();
+    let now = now_minute();
     let router = router();
 
     // Two stored configurations, one per instrumentation type, at different locations.
@@ -561,8 +593,8 @@ async fn reports_of_unknown_identities_are_unprocessed_and_the_rest_are_recorded
         );
         assert_eq!(
             event_times(&body),
-            vec![time],
-            "case {label:?}: expected the recorded event, got {:?}",
+            vec![nearest_minute(time)],
+            "case {label:?}: expected the recorded event at the minute nearest {time}, got {:?}",
             body["Events"]
         );
     }
@@ -604,7 +636,7 @@ async fn reports_of_unknown_identities_are_unprocessed_and_the_rest_are_recorded
 async fn re_reporting_one_event_records_one_event() {
     let service = "pricing";
     let environment = "ec2:staging";
-    let now = now_seconds();
+    let now = now_minute();
     let router = router();
     let request = create_request(service, environment, BREAKPOINT, "src/Quote.java");
     let hash = create_configuration(&router, &request).await;
@@ -641,9 +673,9 @@ async fn re_reporting_one_event_records_one_event() {
     for (status, expected) in [
         (
             "ERROR",
-            vec![(now - 30.0, Some("FILE_NOT_FOUND".to_string()))],
+            vec![(nearest_minute(now - 30.0), Some("FILE_NOT_FOUND".to_string()))],
         ),
-        ("ACTIVE", vec![(now - 30.0, None)]),
+        ("ACTIVE", vec![(nearest_minute(now - 30.0), None)]),
     ] {
         let (code, body) = get_status(
             &router,
@@ -712,7 +744,10 @@ async fn re_reporting_one_event_records_one_event() {
     );
     assert_eq!(
         events_of(&body),
-        vec![(now - 30.0, Some("LANGUAGE_MISMATCH".to_string()))],
+        vec![(
+            nearest_minute(now - 30.0),
+            Some("LANGUAGE_MISMATCH".to_string())
+        )],
         "expected the corrected cause on the single event, got {:?}",
         body["Events"]
     );
@@ -725,13 +760,14 @@ async fn re_reporting_one_event_records_one_event() {
 async fn a_read_reports_the_events_of_its_window_most_recent_first() {
     let service = "fulfilment";
     let environment = "eks:cluster-prod/orders";
-    let now = now_seconds();
+    let now = now_minute();
     let router = router();
     let request = create_request(service, environment, PROBE, "app/orders.py");
     let hash = create_configuration(&router, &request).await;
 
     // Instants spanning the default window and well outside it, reported out of order so the
-    // ordering a read reports is the store's and not the request's.
+    // ordering a read reports is the store's and not the request's. The newest is named a few
+    // seconds into a minute, so the window selects it by the minute it is HELD at.
     let two_hours_ago = now - 2.0 * 60.0 * 60.0;
     let instants = [now - 10.0, now - 1800.0, two_hours_ago, now - 300.0];
     let (code, body) = report(
@@ -761,12 +797,17 @@ async fn a_read_reports_the_events_of_its_window_most_recent_first() {
         WindowCase {
             label: "the documented default window of the last hour",
             window: None,
-            expected: vec![now - 10.0, now - 300.0, now - 1800.0],
+            expected: vec![nearest_minute(now - 10.0), now - 300.0, now - 1800.0],
         },
         WindowCase {
             label: "a window covering every event",
             window: Some((two_hours_ago, now)),
-            expected: vec![now - 10.0, now - 300.0, now - 1800.0, two_hours_ago],
+            expected: vec![
+                nearest_minute(now - 10.0),
+                now - 300.0,
+                now - 1800.0,
+                two_hours_ago,
+            ],
         },
         WindowCase {
             label: "a window whose bounds are two recorded instants, inclusive at both ends",
@@ -840,7 +881,7 @@ async fn a_read_reports_the_events_of_its_window_most_recent_first() {
 async fn a_read_pages_over_its_events() {
     let service = "checkout";
     let environment = "ec2:production";
-    let now = now_seconds();
+    let now = now_minute();
     let router = router();
     let request = create_request(service, environment, BREAKPOINT, "src/Cart.java");
     let hash = create_configuration(&router, &request).await;
@@ -1052,7 +1093,7 @@ async fn a_read_pages_over_its_events() {
 async fn a_half_stated_window_is_refused() {
     let service = "checkout";
     let environment = "ec2:production";
-    let now = now_seconds();
+    let now = now_minute();
     let router = router();
     let request = create_request(service, environment, PROBE, "src/Cart.java");
     let hash = create_configuration(&router, &request).await;
@@ -1096,7 +1137,7 @@ async fn a_half_stated_window_is_refused() {
 async fn a_deleted_configuration_takes_its_history_with_it() {
     let service = "checkout";
     let environment = "ec2:production";
-    let now = now_seconds();
+    let now = now_minute();
     let (router, engine) = router_with_engine();
     let request = create_request(service, environment, PROBE, "src/Cart.java");
     let hash = create_configuration(&router, &request).await;
@@ -1192,19 +1233,29 @@ async fn a_deleted_configuration_takes_its_history_with_it() {
 async fn a_history_is_bounded_and_keeps_its_newest_events() {
     let service = "checkout";
     let environment = "ec2:production";
-    let now = now_seconds();
+    let now = now_minute();
     let (router, engine) = router_with_engine();
     let request = create_request(service, environment, BREAKPOINT, "src/Cart.java");
     let hash = create_configuration(&router, &request).await;
 
-    // One event per second, over more instants than the cap holds. `Configurations` is
-    // modelled `length 1..100`, so the reports go in batches of a hundred.
+    // One event per MINUTE — the granularity an event is held at, so each report is an event
+    // of its own — over more instants than the cap holds. `Configurations` is modelled
+    // `length 1..100`, so the reports go in batches of a hundred.
     let total = MAX_STATUS_EVENTS_PER_CONFIGURATION + 100;
-    let oldest = now - total as f64;
+    let oldest = now - 60.0 * total as f64;
+    let newest = oldest + 60.0 * (total - 1) as f64;
     let mut reported = 0;
     while reported < total {
         let batch: Vec<Value> = (reported..(reported + 100).min(total))
-            .map(|step| report_entry(BREAKPOINT, &hash, "ACTIVE", oldest + step as f64, None))
+            .map(|step| {
+                report_entry(
+                    BREAKPOINT,
+                    &hash,
+                    "ACTIVE",
+                    oldest + 60.0 * step as f64,
+                    None,
+                )
+            })
             .collect();
         reported += batch.len();
         let (code, body) = report(
@@ -1240,8 +1291,8 @@ async fn a_history_is_bounded_and_keeps_its_newest_events() {
     for (label, window, expected) in [
         (
             "the newest reported instant",
-            (now - 1.0, now),
-            vec![now - 1.0],
+            (newest, now),
+            vec![newest],
         ),
         ("the oldest reported instant", (oldest, oldest), vec![]),
     ] {
@@ -1286,7 +1337,7 @@ async fn a_history_is_bounded_and_keeps_its_newest_events() {
 async fn a_lapsed_configuration_serves_no_status_history() {
     let service = "checkout";
     let environment = "eks:cluster-prod/namespace";
-    let now = now_seconds();
+    let now = now_minute();
     let (router, engine) = router_with_engine();
 
     // One configuration of each type, at locations of their own so the two records are
@@ -1350,7 +1401,7 @@ async fn a_lapsed_configuration_serves_no_status_history() {
         );
         assert_eq!(
             event_times(&body),
-            vec![reported_at],
+            vec![nearest_minute(reported_at)],
             "case {label:?}: expected the reported event, got {:?}",
             body["Events"]
         );
@@ -1435,7 +1486,7 @@ async fn a_lapsed_configuration_serves_no_status_history() {
     );
     assert_eq!(
         event_times(&body),
-        vec![reported_at],
+        vec![nearest_minute(reported_at)],
         "expected the reported event to still be served, got {:?}",
         body["Events"]
     );

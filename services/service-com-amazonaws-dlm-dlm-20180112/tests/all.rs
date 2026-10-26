@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/default_policy_configuration_precedence.rs"]
 mod default_policy_configuration_precedence;
+#[path = "all/default_policy_only_body_parameter_set.rs"]
+mod default_policy_only_body_parameter_set;
 #[path = "all/default_policy_only_parameters.rs"]
 mod default_policy_only_parameters;
 #[path = "all/default_policy_resource_type.rs"]

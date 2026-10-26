@@ -283,6 +283,249 @@ fn listed_ids(answer: &Answer) -> Vec<String> {
         .collect()
 }
 
+/// One request built from the per-type surface, the generic one, or both, and the
+/// entities every page of it must serve.
+#[derive(Default)]
+struct Composition {
+    case: &'static str,
+    entity_type: &'static str,
+    entity_type_filters: Option<Value>,
+    entity_type_sort: Option<Value>,
+    filter_list: Option<Value>,
+    sort: Option<Value>,
+    /// The page size each page asks for; every case walks `NextToken` to the end.
+    max_results: i64,
+    /// Fixture indices, in the order the pages must serve them when `ordered`.
+    expected: Vec<usize>,
+    /// Whether the case asked for an ordering, so the order served is asserted too.
+    ordered: bool,
+}
+
+/// Walk every page of `request`, and answer the ids served in order and how many pages it
+/// took. A page is asked for with the `NextToken` the one before it answered, so the walk
+/// is the one a paginating client performs.
+async fn paged_ids(
+    router: &MultiServiceRouter,
+    request: &Value,
+    case: &str,
+) -> (Vec<String>, usize) {
+    let mut served: Vec<String> = Vec::new();
+    let mut pages = 0_usize;
+    let mut token: Option<String> = None;
+    loop {
+        let mut page = request.clone();
+        if let Some(held) = token.as_deref() {
+            page["NextToken"] = json!(held);
+        }
+        let answer = list_entities(router, page).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: every page must be served, got {} with {:?}",
+            answer.status, answer.body
+        );
+        pages += 1;
+        served.extend(listed_ids(&answer));
+        let next = answer.text("/NextToken");
+        if next.is_empty() {
+            return (served, pages);
+        }
+        assert!(
+            pages < 16,
+            "case {case:?}: the walk must reach a page carrying no NextToken, got {served:?}"
+        );
+        token = Some(next);
+    }
+}
+
+/// The per-type filter and sort surfaces compose: with each other, with the generic
+/// `FilterList` and `Sort`, and with `MaxResults`/`NextToken` paging — the selection is
+/// the conjunction of every filter asked for, the ordering is the one asked for, and the
+/// pages of one walk serve exactly the selected entities once each.
+///
+/// A sub-member of the listed type that no stored entity carries selects nothing and
+/// orders nothing, which is a served page rather than a refusal.
+#[tokio::test]
+async fn the_per_type_surfaces_compose_with_the_generic_ones_and_with_paging() {
+    let router = emulator();
+    let ids = created_entities(&router, &fixtures()).await;
+
+    let cases: Vec<Composition> = vec![
+        Composition {
+            case: "a per-type filter and sort, one entity a page",
+            entity_type: "AmiProduct",
+            entity_type_filters: Some(
+                json!({"AmiProductFilters": {"Visibility": {"ValueList": ["Limited", "Public"]}}}),
+            ),
+            entity_type_sort: Some(
+                json!({"AmiProductSort": {"SortBy": "ProductTitle", "SortOrder": "ASCENDING"}}),
+            ),
+            max_results: 1,
+            expected: vec![0, 1],
+            ordered: true,
+            ..Composition::default()
+        },
+        Composition {
+            case: "the same filter and sort on one page",
+            entity_type: "AmiProduct",
+            entity_type_filters: Some(
+                json!({"AmiProductFilters": {"Visibility": {"ValueList": ["Limited", "Public"]}}}),
+            ),
+            entity_type_sort: Some(
+                json!({"AmiProductSort": {"SortBy": "ProductTitle", "SortOrder": "ASCENDING"}}),
+            ),
+            max_results: 50,
+            expected: vec![0, 1],
+            ordered: true,
+            ..Composition::default()
+        },
+        Composition {
+            case: "a per-type filter conjoined with the generic FilterList",
+            entity_type: "AmiProduct",
+            entity_type_filters: Some(
+                json!({"AmiProductFilters": {"Visibility": {"ValueList": ["Limited", "Public"]}}}),
+            ),
+            filter_list: Some(json!([{"Name": "EntityId", "ValueList": [ids[0].clone()]}])),
+            max_results: 50,
+            expected: vec![0],
+            ..Composition::default()
+        },
+        Composition {
+            case: "a generic FilterList naming the entity the per-type filter excludes",
+            entity_type: "AmiProduct",
+            entity_type_filters: Some(
+                json!({"AmiProductFilters": {"Visibility": {"ValueList": ["Public"]}}}),
+            ),
+            filter_list: Some(json!([{"Name": "EntityId", "ValueList": [ids[0].clone()]}])),
+            max_results: 50,
+            expected: vec![],
+            ..Composition::default()
+        },
+        Composition {
+            case: "a per-type filter with the generic Sort ordering the pages",
+            entity_type: "AmiProduct",
+            entity_type_filters: Some(
+                json!({"AmiProductFilters": {"ProductTitle": {"WildCardValue": "ami"}}}),
+            ),
+            sort: Some(json!({"SortBy": "ProductTitle", "SortOrder": "DESCENDING"})),
+            max_results: 1,
+            expected: vec![1, 0],
+            ordered: true,
+            ..Composition::default()
+        },
+        Composition {
+            case: "offers ordered by a per-type field, one a page",
+            entity_type: "Offer",
+            entity_type_sort: Some(
+                json!({"OfferSort": {"SortBy": "Name", "SortOrder": "DESCENDING"}}),
+            ),
+            max_results: 1,
+            expected: vec![3, 2],
+            ordered: true,
+            ..Composition::default()
+        },
+        Composition {
+            case: "a per-type filter on a sub-member no stored offer carries",
+            entity_type: "Offer",
+            entity_type_filters: Some(
+                json!({"OfferFilters": {"TargetAgreementId": {"ValueList": ["agreement-absent"]}}}),
+            ),
+            max_results: 50,
+            expected: vec![],
+            ..Composition::default()
+        },
+        Composition {
+            case: "a per-type sort by a field no stored offer carries",
+            entity_type: "Offer",
+            entity_type_sort: Some(json!({"OfferSort": {"SortBy": "TargetAgreementIntent"}})),
+            max_results: 50,
+            expected: vec![2, 3],
+            ..Composition::default()
+        },
+        Composition {
+            case: "a per-type filter, a per-type sort and the generic FilterList together",
+            entity_type: "Offer",
+            entity_type_filters: Some(
+                json!({"OfferFilters": {"State": {"ValueList": ["Draft", "Released"]}}}),
+            ),
+            entity_type_sort: Some(
+                json!({"OfferSort": {"SortBy": "ReleaseDate", "SortOrder": "ASCENDING"}}),
+            ),
+            filter_list: Some(
+                json!([{"Name": "EntityId", "ValueList": [ids[2].clone(), ids[3].clone()]}]),
+            ),
+            max_results: 1,
+            expected: vec![2, 3],
+            ordered: true,
+            ..Composition::default()
+        },
+        Composition {
+            case: "a resale authorization filtered and sorted by its own fields",
+            entity_type: "ResaleAuthorization",
+            entity_type_filters: Some(
+                json!({"ResaleAuthorizationFilters": {"Status": {"ValueList": ["Active"]}}}),
+            ),
+            entity_type_sort: Some(
+                json!({"ResaleAuthorizationSort": {"SortBy": "Name", "SortOrder": "ASCENDING"}}),
+            ),
+            max_results: 50,
+            expected: vec![4],
+            ordered: true,
+            ..Composition::default()
+        },
+    ];
+
+    for spec in cases {
+        let case = spec.case;
+        let mut request = json!({
+            "Catalog": CATALOG,
+            "EntityType": spec.entity_type,
+            "MaxResults": spec.max_results,
+        });
+        for (member, value) in [
+            ("EntityTypeFilters", spec.entity_type_filters),
+            ("EntityTypeSort", spec.entity_type_sort),
+            ("FilterList", spec.filter_list),
+            ("Sort", spec.sort),
+        ] {
+            if let Some(value) = value {
+                request[member] = value;
+            }
+        }
+
+        let (served, pages) = paged_ids(&router, &request, case).await;
+        let wanted: Vec<String> = spec
+            .expected
+            .iter()
+            .map(|index| ids[*index].clone())
+            .collect();
+        if spec.ordered {
+            assert_eq!(
+                served, wanted,
+                "case {case:?}: the pages must serve the selected entities in the order asked \
+                 for, got {served:?}"
+            );
+        } else {
+            let mut sorted = served.clone();
+            sorted.sort();
+            let mut sorted_wanted = wanted.clone();
+            sorted_wanted.sort();
+            assert_eq!(
+                sorted, sorted_wanted,
+                "case {case:?}: the pages must serve exactly the selected entities, \
+                 got {served:?}"
+            );
+        }
+        let page_size = usize::try_from(spec.max_results).expect("the page size is positive");
+        let expected_pages = wanted.len().div_ceil(page_size).max(1);
+        assert_eq!(
+            pages, expected_pages,
+            "case {case:?}: {} entities must be served {page_size} a page, got {pages} pages \
+             of {served:?}",
+            wanted.len()
+        );
+    }
+}
+
 /// `EntityTypeFilters` selects on the fields of the entity type being listed, over a
 /// value list, a wildcard substring, a date range, a list-valued field and two fields at
 /// once — each row a different way the one filter surface is asked.

@@ -47,6 +47,8 @@ mod contact_method_notifications;
 mod contact_method_verification;
 #[path = "all/container_api_metadata.rs"]
 mod container_api_metadata;
+#[path = "all/container_image_push_and_register.rs"]
+mod container_image_push_and_register;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
 #[path = "all/container_image_registry_login.rs"]

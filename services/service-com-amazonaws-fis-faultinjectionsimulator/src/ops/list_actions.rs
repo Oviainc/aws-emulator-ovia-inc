@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the built-in FIS actions, as a paginated list over the service's own catalog
+//! ([`crate::state::ACTION_CATALOG`]): an action is service-owned data — no API creates,
+//! updates or deletes one — so this is a REPORTING operation that writes nothing, and two
+//! reads at any two instants report the same actions in the same order.
+//!
+//! Each page reports `ActionSummary`, which the model gives `id`, `arn`, `description`,
+//! `targets` and `tags` and no `parameters`: an action's parameter contract is what
+//! `GetAction` adds. Both read the same table, which is what makes the two agree.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +143,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActions"))
+        // The action catalog is the SERVICE's own constant data, so this handler needs no
+        // store: the engine is bound here only to keep the constructor seam honest.
+        let _ = &self.engine;
+
+        // The token is the action the next page starts at, behind this operation's marker;
+        // a value without that marker, or one naming no published action, was never issued
+        // by this operation.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::action_page_token_id(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListActionsErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // An action's ARN names the region the request was signed for, as every ARN this
+        // service reports does.
+        let region = crate::state::request_region(ctx.parts());
+
+        let page_size = crate::state::page_size(input.max_results);
+        let mut actions = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for entry in crate::state::ACTION_CATALOG {
+            // Resume at the first id at or after the one the token named, which is the
+            // order the catalog is kept in.
+            if resume_at.is_some_and(|from| entry.id < from) {
+                continue;
+            }
+            if actions.len() >= page_size {
+                next_token = Some(crate::state::action_page_token(entry.id));
+                break;
+            }
+            actions.push(entry.to_summary(&region));
+        }
+
+        // Reporting only: nothing above writes, so a later caller sees exactly what this
+        // one saw.
+        Ok(ListActionsOutput {
+            actions: Some(actions),
+            next_token,
+        })
     }
 }
