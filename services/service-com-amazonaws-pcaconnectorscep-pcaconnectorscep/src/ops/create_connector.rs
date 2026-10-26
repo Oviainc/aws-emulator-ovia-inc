@@ -229,10 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already created rather than minting another one. If that connector has since been
         // deleted — gone, or accepted for teardown and reporting `DELETING` — there is
         // nothing to answer with, so the call falls through and creates one.
-        if let Some(existing) = store.connector_for_token(input.client_token.as_deref()) {
+        if let Some(existing) = store.connector_for_token(&region, input.client_token.as_deref()) {
             if store
-                .connectors
-                .get(&existing.arn)
+                .connector(&region, &existing.arn)
                 .is_some_and(|connector| !connector.is_deleting())
             {
                 // Same token, different request: the caller is not retrying the call this
@@ -256,9 +255,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The emulator's own ceiling, which the real service expresses as a service quota
-        // and this operation models `ServiceQuotaExceededException` for.
-        if store.connectors.len() >= crate::state::MAX_CONNECTORS {
+        // Two ceilings, both the emulator's own and both answered with the error this
+        // operation models for a quota: the per-Region one, which is how the real service's
+        // quota is scoped, and the ceiling on everything this process holds, which is what
+        // keeps the memory a create loop can claim finite even though the Region it files a
+        // record under is the request's to choose.
+        if store.connectors.len() >= crate::state::MAX_CONNECTORS_TOTAL {
+            return Err(CreateConnectorErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of connectors ({}) for this account has been reached",
+                        crate::state::MAX_CONNECTORS_TOTAL
+                    ),
+                    resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_CONNECTORS.to_string(),
+                },
+            )
+            .into());
+        }
+        if store.connectors_in(&region).count() >= crate::state::MAX_CONNECTORS {
             return Err(CreateConnectorErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -332,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token {
             store.connector_tokens.insert(
-                token,
+                crate::state::token_key(&region, &token),
                 crate::state::IdempotencyRecord {
                     arn: arn.clone(),
                     created_at: now,
@@ -341,8 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `arn` is the key the record was just stored under, so this answers exactly what a
-        // later GetConnector / ListConnectors reads.
+        // `arn` is the key the record was just stored under, and it carries the Region this
+        // call was signed for, so this answers exactly what a later GetConnector /
+        // ListConnectors addressed at that Region reads.
         Ok(CreateConnectorOutput {
             connector_arn: Some(arn),
         })
