@@ -2,6 +2,7 @@
 
 //! @op GetObjectLockConfiguration
 //!
+//!
 //! Reports the Object Lock configuration `PutObjectLockConfiguration` placed on the
 //! addressed bucket, or the one `CreateBucket` enabled Object Lock with: the
 //! `ObjectLockEnabled` value the bucket carries, and the `Rule` whose `DefaultRetention`

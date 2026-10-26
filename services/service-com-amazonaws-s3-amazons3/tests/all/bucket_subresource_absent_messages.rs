@@ -11,7 +11,8 @@
 //! though the code and status are right.
 //!
 //! The table spans what the rule generalises over: the bucket SUBRESOURCE being read
-//! (tag set, policy, cors, website, replication, ownership controls, public access block),
+//! (tag set, policy, cors, website, replication, ownership controls, public access block,
+//! Object Lock configuration),
 //! and — for the tag set — how the bucket came to have none (never tagged, the tag set
 //! deleted, the tag set replaced by an empty one) and which bucket is being read while
 //! another bucket holds tags. One row reads a bucket this emulator does not hold at all,
@@ -227,6 +228,14 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
             status: 404,
             code: "NoSuchPublicAccessBlockConfiguration",
             message: "The public access block configuration was not found",
+        },
+        Row {
+            case: "a bucket with no Object Lock configuration",
+            bucket: "subresource-absent",
+            subresource: "object-lock",
+            status: 404,
+            code: "ObjectLockConfigurationNotFoundError",
+            message: "Object Lock configuration does not exist for this bucket",
         },
         Row {
             case: "a tag set read on a bucket this emulator does not hold",
