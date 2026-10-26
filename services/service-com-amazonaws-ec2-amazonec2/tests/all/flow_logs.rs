@@ -25,6 +25,13 @@
 //! * An authorized `DryRun` is answered with `DryRunOperation` and performs nothing,
 //!   whether or not the resources the request names exist — the rule
 //!   `dry_run_and_unknown_ids` asserts over the rest of this service's surface.
+//! * The id list a delete names is held to the bound its member documents, BEFORE any id is
+//!   resolved: no id at all is refused, the maximum itself is served, one past it is refused.
+//!   The rows differ in how many ids the batch names and whether they are stored or absent.
+//! * The batch is a SET and a delete is NOT idempotent: one flow log gets ONE answer however
+//!   many times the batch names it, and a flow log already deleted is unknown to the next
+//!   delete. The steps differ in how often an id repeats and in whether it is stored, absent
+//!   or already deleted.
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, DEFAULT_FLOW_LOG_FORMAT,
@@ -719,18 +726,9 @@ async fn deleting_one_flow_log_reports_nothing_unsuccessful_and_removes_it() {
     let vpc_id = create_vpc(&router, "10.219.0.0/16").await;
     let flow_log_id = create_one(&router, "lone delete", "VPC", &vpc_id, "lone-group").await;
 
-    let (status, body) = delete_flow_logs(&router, &indexed("FlowLogId", &[&flow_log_id])).await;
-    assert_eq!(
-        status, 200,
-        "lone delete: expected HTTP 200, got {status} with body {body}"
-    );
-    // `UnsuccessfulItem$ResourceId` is the member a reported failure carries, so none of
-    // them means nothing failed.
-    let failed = elements(&body, "resourceId");
-    assert!(
-        failed.is_empty(),
-        "lone delete: expected an empty Unsuccessful, got {failed:?} in {body}"
-    );
+    // `delete_served` is where the served shape is asserted once for every suite row: HTTP
+    // 200 with an empty `Unsuccessful`.
+    delete_served(&router, "lone delete", &[&flow_log_id]).await;
 
     let reported = described_ids(&router, "after the delete", &[]).await;
     assert!(
@@ -785,22 +783,8 @@ async fn an_unknown_id_anywhere_in_the_batch_refuses_the_whole_delete() {
     ];
 
     for (case, named, unknown) in &cases {
-        let (status, body) = delete_flow_logs(&router, &indexed("FlowLogId", named)).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400, got {status} with body {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "InvalidFlowLogId.NotFound",
-            "case {case:?}: expected InvalidFlowLogId.NotFound, got {body}"
-        );
-        let message = error_message(&body);
-        let expected = format!(
-            "These flow log ids in the input list are not found: [TotalCount: {count}] {ids}",
-            count = unknown.len(),
-            ids = unknown.join(" "),
-        );
+        let message = delete_refused(&router, case, named, "InvalidFlowLogId.NotFound").await;
+        let expected = not_found_message(unknown);
         assert_eq!(
             message, expected,
             "case {case:?}: expected the message {expected:?}, got {message:?}"
@@ -1194,5 +1178,278 @@ async fn a_repeated_client_token_answers_the_flow_logs_it_already_minted() {
     assert_eq!(
         reported, first_ids,
         "after the repeat: expected only the flow logs the first call minted, got {reported:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The id list a delete names: its documented bounds, and the batch as a SET
+// ---------------------------------------------------------------------------
+
+/// The most flow log ids one delete may name: "Constraint: Maximum of 1000 flow log IDs"
+/// (`DeleteFlowLogsRequest$FlowLogIds` —
+/// `smithy_query(query="doc",shape="DeleteFlowLogsRequest",member="FlowLogIds")`). Written
+/// out here as the DOCUMENTED number rather than read from the crate: comparing against the
+/// implementation's own constant could not catch a wrong bound.
+const DOCUMENTED_MAX_FLOW_LOG_IDS: usize = 1000;
+
+/// The code this service answers a request that leaves a `@required` member out with: the
+/// request never reaches the handler, because the boundary validator refuses it first — the
+/// answer every operation of this crate gives for a member the request does not carry.
+const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
+
+/// `count` DISTINCT well-formed flow log ids this account holds no flow log for.
+///
+/// 17 lowercase hex digits after the `fl-` prefix, the form `next_id` mints, each starting
+/// with `f` — far above any value this store's monotonic id counter reaches, so none of them
+/// can collide with an id a create really minted.
+fn absent_ids(count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|index| format!("{FLOW_LOG_ID_PREFIX}-f{index:016x}"))
+        .collect()
+}
+
+/// Delete the batch `ids` names, asserting it is SERVED with an empty `Unsuccessful`.
+async fn delete_served(router: &MultiServiceRouter, case: &str, ids: &[&str]) {
+    let (status, body) = delete_flow_logs(router, &indexed("FlowLogId", ids)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    // `UnsuccessfulItem$ResourceId` is the member a reported failure carries, so none of
+    // them means nothing failed.
+    let failed = elements(&body, "resourceId");
+    assert!(
+        failed.is_empty(),
+        "case {case:?}: expected an empty Unsuccessful, got {failed:?} in {body}"
+    );
+}
+
+/// Delete the batch `ids` names, asserting it is refused with HTTP 400 and `code`, and
+/// answer the refusal's message.
+async fn delete_refused(
+    router: &MultiServiceRouter,
+    case: &str,
+    ids: &[&str],
+    code: &str,
+) -> String {
+    let (status, body) = delete_flow_logs(router, &indexed("FlowLogId", ids)).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with body {body}"
+    );
+    let reported = error_code(&body);
+    assert_eq!(
+        reported, code,
+        "case {case:?}: expected the code {code:?}, got {reported:?} in {body}"
+    );
+    error_message(&body)
+}
+
+/// The refusal a batch naming `unknown` flow logs carries, as the message enumerating their
+/// count and then the ids themselves.
+fn not_found_message(unknown: &[&str]) -> String {
+    format!(
+        "These flow log ids in the input list are not found: [TotalCount: {count}] {ids}",
+        count = unknown.len(),
+        ids = unknown.join(" "),
+    )
+}
+
+/// The `FlowLogIds` list is held to the bound the member documents, and that bound is
+/// checked BEFORE any id is resolved: a request naming no id at all never reaches the
+/// handler (ec2Query carries no `FlowLogId.N` field, so the `@required` member is absent and
+/// the request boundary refuses it — which is why the handler's own empty-list branch cannot
+/// be reached over the wire), a list AT the documented maximum is served, and one id past
+/// the maximum is refused with `InvalidParameterValue` whether or not the flow logs it names
+/// exist. The rows differ in how many ids the batch names — none, one, the bound itself and
+/// one past it — and in whether those ids name a stored flow log or ones this account holds
+/// no flow log for.
+#[tokio::test]
+async fn the_flow_log_id_list_is_held_to_its_documented_bounds() {
+    // Each row: how many ids the batch names, whether they all name the stored flow log
+    // (`true`) or are all absent (`false`), and the code the refusal carries — `None` for a
+    // row that is served, which is HTTP 200, every refusal here being HTTP 400. A batch of
+    // NO ids does not carry the member at all, so it is refused at the request boundary
+    // rather than by the handler.
+    let cases: Vec<(&str, usize, bool, Option<&str>)> = vec![
+        ("no id at all", 0, true, Some(BOUNDARY_MISSING_MEMBER)),
+        ("one stored id", 1, true, None),
+        (
+            "the documented maximum, every id the stored flow log",
+            DOCUMENTED_MAX_FLOW_LOG_IDS,
+            true,
+            None,
+        ),
+        (
+            "the documented maximum, every id absent",
+            DOCUMENTED_MAX_FLOW_LOG_IDS,
+            false,
+            Some("InvalidFlowLogId.NotFound"),
+        ),
+        (
+            "one id past the documented maximum, every id the stored flow log",
+            DOCUMENTED_MAX_FLOW_LOG_IDS + 1,
+            true,
+            Some("InvalidParameterValue"),
+        ),
+        (
+            "one id past the documented maximum, every id absent",
+            DOCUMENTED_MAX_FLOW_LOG_IDS + 1,
+            false,
+            Some("InvalidParameterValue"),
+        ),
+    ];
+
+    for (case, count, name_the_stored_one, expected_code) in cases {
+        // One emulator per row: a row that is served deletes, and the rows must not see
+        // each other's store.
+        let (router, engine) = super::ec2_query::emulator();
+        let vpc_id = create_vpc(&router, "10.226.0.0/16").await;
+        let flow_log_id = create_one(&router, case, "VPC", &vpc_id, "bounds-group").await;
+
+        let ids: Vec<String> = if name_the_stored_one {
+            vec![flow_log_id.clone(); count]
+        } else {
+            absent_ids(count)
+        };
+        let named: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+        match expected_code {
+            None => {
+                delete_served(&router, case, &named).await;
+                // A served batch removed the flow log it named, however many times it
+                // named it.
+                assert!(
+                    engine.state::<Ec2State>().lock().flow_logs.is_empty(),
+                    "case {case:?}: expected the flow log gone from the store, got {:?}",
+                    engine.state::<Ec2State>().lock().flow_logs.keys()
+                );
+            }
+            Some(code) => {
+                let message = delete_refused(&router, case, &named, code).await;
+                match code {
+                    BOUNDARY_MISSING_MEMBER => assert!(
+                        message.contains("flowLogIds"),
+                        "case {case:?}: expected a message naming the member left out, got \
+                         {message:?}"
+                    ),
+                    "InvalidParameterValue" => {
+                        // The refusal reports what was asked for and the maximum allowed.
+                        for expected in [count.to_string(), DOCUMENTED_MAX_FLOW_LOG_IDS.to_string()]
+                        {
+                            assert!(
+                                message.contains(&expected),
+                                "case {case:?}: expected a message naming {expected:?}, got \
+                                 {message:?}"
+                            );
+                        }
+                    }
+                    _ => assert_eq!(
+                        message,
+                        not_found_message(&named),
+                        "case {case:?}: expected the not-found message enumerating every id \
+                         named, got {message:?}"
+                    ),
+                }
+                // A refused batch deleted nothing.
+                let reported = described_ids(&router, case, &[]).await;
+                assert_eq!(
+                    reported,
+                    vec![flow_log_id.clone()],
+                    "case {case:?}: a refused batch must delete nothing, but the store now \
+                     holds {reported:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A delete batch is a SET, and a delete is NOT idempotent: one flow log gets ONE answer
+/// however many times the batch names it, and once a flow log is deleted the next batch
+/// naming it is refused exactly like one naming an id this account never held. The steps
+/// differ in how often the batch repeats an id, and in whether that id is stored, absent, or
+/// one an earlier step already deleted.
+#[tokio::test]
+async fn a_repeated_id_gets_one_answer_and_a_deleted_flow_log_stays_deleted() {
+    let (router, engine) = super::ec2_query::emulator();
+    let vpc_id = create_vpc(&router, "10.227.0.0/16").await;
+    let first = create_one(&router, "seed first", "VPC", &vpc_id, "set-group").await;
+    let second = create_one(&router, "seed second", "VPC", &vpc_id, "set-group").await;
+    let stored = vec![first.clone(), second.clone()];
+
+    // One absent id named twice is ONE unknown id: the refusal counts it once and names it
+    // once, rather than reporting the repeat as a second failure.
+    let case = "one absent id named twice";
+    let message = delete_refused(
+        &router,
+        case,
+        &[ABSENT_FLOW_LOG_ID, ABSENT_FLOW_LOG_ID],
+        "InvalidFlowLogId.NotFound",
+    )
+    .await;
+    assert_eq!(
+        message,
+        not_found_message(&[ABSENT_FLOW_LOG_ID]),
+        "case {case:?}: expected the unknown id counted once, got {message:?}"
+    );
+
+    // A stored id repeated beside a repeated absent one: still one unknown id, and the whole
+    // batch is still refused.
+    let case = "stored and absent ids each named twice";
+    let message = delete_refused(
+        &router,
+        case,
+        &[&first, ABSENT_FLOW_LOG_ID, &first, ABSENT_FLOW_LOG_ID],
+        "InvalidFlowLogId.NotFound",
+    )
+    .await;
+    assert_eq!(
+        message,
+        not_found_message(&[ABSENT_FLOW_LOG_ID]),
+        "case {case:?}: expected the unknown id counted once and no stored id named, got \
+         {message:?}"
+    );
+    let reported = described_ids(&router, case, &[]).await;
+    assert_eq!(
+        reported, stored,
+        "case {case:?}: a refused batch must delete nothing, but the store now holds \
+         {reported:?}"
+    );
+
+    // The same stored id three times deletes it ONCE and reports nothing unsuccessful — a
+    // repeat is not a second, failing delete.
+    let case = "one stored id named three times";
+    delete_served(&router, case, &[&first, &first, &first]).await;
+    let reported = described_ids(&router, case, &[]).await;
+    assert_eq!(
+        reported,
+        vec![second.clone()],
+        "case {case:?}: expected only the flow log the batch did not name, got {reported:?}"
+    );
+
+    // Deleting is not idempotent: a second delete of that id is refused like any id this
+    // account holds no flow log for, and the flow log it did not name is untouched.
+    let case = "a second delete of the same id";
+    let message = delete_refused(&router, case, &[&first], "InvalidFlowLogId.NotFound").await;
+    assert_eq!(
+        message,
+        not_found_message(&[&first]),
+        "case {case:?}: expected a deleted id to be refused as unknown, got {message:?}"
+    );
+    let reported = described_ids(&router, case, &[]).await;
+    assert_eq!(
+        reported,
+        vec![second.clone()],
+        "case {case:?}: a refused batch must delete nothing, but the store now holds \
+         {reported:?}"
+    );
+
+    // And the last flow log goes the same way, leaving the store empty.
+    let case = "the last stored flow log";
+    delete_served(&router, case, &[&second]).await;
+    assert!(
+        engine.state::<Ec2State>().lock().flow_logs.is_empty(),
+        "case {case:?}: expected an empty flow log store, got {:?}",
+        engine.state::<Ec2State>().lock().flow_logs.keys()
     );
 }
