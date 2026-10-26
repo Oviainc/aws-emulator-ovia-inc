@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_resource_kinds.rs"]
 mod arn_resource_kinds;
+#[path = "all/date_layout_walk.rs"]
+mod date_layout_walk;
 #[path = "all/forecast_not_active.rs"]
 mod forecast_not_active;
 #[path = "all/forecastquery.rs"]

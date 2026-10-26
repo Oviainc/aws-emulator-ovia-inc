@@ -662,6 +662,53 @@ pub fn statistic_for_forecast_type(forecast_type: &str) -> String {
     }
 }
 
+/// Length of the documented date layout through the MINUTES — `yyyy-MM-dd`, the date/time
+/// separator, `HH:mm`.
+const LAYOUT_THROUGH_MINUTES: usize = 16;
+
+/// Length of the documented date layout through the SECONDS — [`LAYOUT_THROUGH_MINUTES`]
+/// plus `:ss`.
+const LAYOUT_THROUGH_SECONDS: usize = 19;
+
+/// Whether the first `length` bytes of `bytes` walk the documented date layout:
+/// `yyyy-MM-dd`, a date/time separator, then `HH:mm[:ss]`.
+///
+/// The ONE place this crate states that layout positionally — `-` at index 4 and 7, the
+/// date/time separator at index 10, `:` at index 13 and, when `length` reaches it, 16, and
+/// an ASCII digit at every other position. Both layers that judge a date read it through
+/// here ([`parse_date_time`] for the instant a date names, and
+/// [`matches_date_time_pattern`] for the shape layer's pattern), so a change to how this
+/// crate reads the layout — a separator, a field width, the ASCII-only decision — is made
+/// once and both layers agree.
+///
+/// The two parameters are the only places the layers differ:
+///
+/// * `length` is how far the layout must reach. `LAYOUT_THROUGH_SECONDS` requires the
+///   seconds field; `LAYOUT_THROUGH_MINUTES` stops after the minutes, leaving whatever
+///   follows to the caller (a trailing character class, or nothing). A longer value is not
+///   refused here — only a shorter one is.
+/// * `admit_lowercase_separator` admits a lowercase `t` at index 10 beside `T`, which the
+///   shape layer's pattern does and the stricter instant layout does not.
+///
+/// Walked position by position rather than through a regex engine because the layout is
+/// FIXED: reading each position IS the pattern. It is also ASCII-only, as `\d` is: a value
+/// spelled with non-ASCII digits is not a date this service can place on a timeline.
+fn walks_date_time_layout(bytes: &[u8], length: usize, admit_lowercase_separator: bool) -> bool {
+    if bytes.len() < length {
+        return false;
+    }
+    bytes
+        .iter()
+        .take(length)
+        .enumerate()
+        .all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T' || (admit_lowercase_separator && *byte == b't'),
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
 /// The instant a `yyyy-MM-dd'T'HH:mm:ss` date names, as seconds on one scale, or `None`
 /// when `value` is not in that format.
 ///
@@ -669,8 +716,10 @@ pub fn statistic_for_forecast_type(forecast_type: &str) -> String {
 /// `DataPoint`'s `Timestamp`. It is checked in two parts, neither of them hand-rolled
 /// arithmetic:
 ///
-/// 1. the LAYOUT must be exactly the documented one, so a value carrying a zone or offset,
-///    a space instead of `T`, fractional seconds, or a missing field is refused;
+/// 1. the LAYOUT must be exactly the documented one — read through
+///    [`walks_date_time_layout`], the crate's one statement of it — so a value carrying a
+///    zone or offset, a space instead of `T`, fractional seconds, or a missing field is
+///    refused;
 /// 2. the CALENDAR is then checked by the AWS date type this crate already depends on
 ///    (`aws_smithy_types::DateTime`): RFC 3339 is this very layout plus a zone designator,
 ///    so appending the UTC one hands that parser exactly what it expects, and it is what
@@ -681,21 +730,11 @@ pub fn statistic_for_forecast_type(forecast_type: &str) -> String {
 /// the parsed seconds is what a clip needs.
 pub fn parse_date_time(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
-    if bytes.len() != 19 {
+    if bytes.len() != LAYOUT_THROUGH_SECONDS {
         return None;
     }
-    for (index, byte) in bytes.iter().enumerate() {
-        let separator = match index {
-            4 | 7 => Some(b'-'),
-            10 => Some(b'T'),
-            13 | 16 => Some(b':'),
-            _ => None,
-        };
-        match separator {
-            Some(expected) if *byte != expected => return None,
-            None if !byte.is_ascii_digit() => return None,
-            _ => {}
-        }
+    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_SECONDS, false) {
+        return None;
     }
 
     aws_smithy_types::DateTime::from_str(
@@ -761,35 +800,19 @@ const MAX_ECHOED_VALUE: usize = 256;
 
 /// Whether `value` satisfies [`DATE_TIME_PATTERN`].
 ///
-/// Read position by position rather than through a regex engine, for the same reason
-/// [`parse_date_time`] is: the pattern is a FIXED LAYOUT — `yyyy-MM-dd`, then `T` or `t`,
-/// then `HH:mm` — followed by one character class, so walking it IS the pattern, and the
-/// place this crate already judges a date does it exactly this way. It also keeps the
-/// check ASCII-only, as the pattern's `\d` and its trailing class are: a value spelled
-/// with non-ASCII digits is not a date this service can place on a timeline.
+/// The pattern is a FIXED LAYOUT — `yyyy-MM-dd`, then `T` or `t`, then `HH:mm` — followed
+/// by one character class, so the layout is read through [`walks_date_time_layout`], the
+/// one place this crate states it, admitting the lowercase separator the pattern's `[Tt]`
+/// does and stopping where the fixed part ends.
 ///
 /// Every character after the layout must be one the trailing class admits: ASCII
 /// alphanumeric, or one of `:`, `+`, `-`, `[`, `]`, `.`, `/`.
 fn matches_date_time_pattern(value: &str) -> bool {
-    /// Length of the fixed layout the pattern opens with, up to and including the minutes.
-    const LAYOUT: usize = 16;
-
     let bytes = value.as_bytes();
-    if bytes.len() < LAYOUT {
+    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_MINUTES, true) {
         return false;
     }
-    for (index, byte) in bytes.iter().enumerate().take(LAYOUT) {
-        let satisfied = match index {
-            4 | 7 => *byte == b'-',
-            10 => *byte == b'T' || *byte == b't',
-            13 => *byte == b':',
-            _ => byte.is_ascii_digit(),
-        };
-        if !satisfied {
-            return false;
-        }
-    }
-    bytes[LAYOUT..].iter().all(|byte| {
+    bytes[LAYOUT_THROUGH_MINUTES..].iter().all(|byte| {
         byte.is_ascii_alphanumeric()
             || matches!(byte, b':' | b'+' | b'-' | b'[' | b']' | b'.' | b'/')
     })
