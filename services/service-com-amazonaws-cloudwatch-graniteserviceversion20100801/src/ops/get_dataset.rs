@@ -170,14 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         if !crate::state::names_default_dataset(&input.dataset_identifier, &region) {
             return Err(GetDatasetErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    resource_type: Some("Dataset".to_string()),
-                    resource_id: Some(input.dataset_identifier.clone()),
-                    message: Some(format!(
-                        "the dataset {} does not exist",
-                        input.dataset_identifier
-                    )),
-                },
+                crate::state::unknown_dataset(&input.dataset_identifier),
             )
             .into());
         }

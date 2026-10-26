@@ -36,7 +36,7 @@
 //!   `UpdateOTelEnrichment` and `StopOTelEnrichment` and read back by `GetOTelEnrichment`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dataset_kms_keys`] — the
 //!   customer managed KMS key each Region's default dataset is encrypted with, read back by
-//!   `GetDataset`.
+//!   `GetDataset` and removed by `DisassociateDatasetKmsKey`.
 //!
 //! An alarm is stored as the modelled [`MetricAlarm`] shape itself rather than a parallel
 //! record, so every member `PutMetricAlarm` accepts round-trips through `DescribeAlarms`
@@ -1603,6 +1603,22 @@ pub fn dataset_arn(region: &str, dataset_id: &str) -> String {
 /// does not serve, so it names no dataset the caller can reach here.
 pub fn names_default_dataset(identifier: &str, region: &str) -> bool {
     identifier == DEFAULT_DATASET_ID || identifier == dataset_arn(region, DEFAULT_DATASET_ID)
+}
+
+/// What a dataset is called in the `ResourceType` member of a refusal that names one.
+pub const DATASET_RESOURCE_TYPE: &str = "Dataset";
+
+/// The `ResourceNotFoundException` body every dataset operation refuses an identifier naming
+/// no dataset this endpoint serves with ([`names_default_dataset`]).
+///
+/// Built here once so the readers and the writers of a dataset's key association cannot
+/// disagree about what a dataset that is not there is reported as.
+pub fn unknown_dataset(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        resource_type: Some(DATASET_RESOURCE_TYPE.to_string()),
+        resource_id: Some(identifier.to_string()),
+        message: Some(format!("the dataset {identifier} does not exist")),
+    }
 }
 
 /// Why `value` is not the ARN of an IAM role, or `None` when it is one.
