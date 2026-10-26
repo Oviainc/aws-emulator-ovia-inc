@@ -3,8 +3,9 @@
 //! @op UntagDeliveryStream
 //!
 //! Deletes EXACTLY the tag keys the request names from the stream's tag register in
-//! [`crate::state`], leaving every other tag of that stream in place and ignoring a named
-//! key the stream does not carry (so a repeated removal is a no-op).
+//! [`crate::state`], leaving every other tag of that stream in place, ignoring a named
+//! key the stream does not carry (so a repeated removal is a no-op) and refusing a key the
+//! modelled `TagKey` pattern does not admit as a constraint violation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let _ = ctx;
+
+        // Every named key is judged against the modelled `TagKey` pattern BEFORE anything
+        // is looked up or removed, the way the request boundary would have judged it had
+        // it been able to compile that pattern (`crate::service::check_tag_key_list`).
+        crate::service::check_tag_key_list(&input.tag_keys)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

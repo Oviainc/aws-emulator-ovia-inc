@@ -17,6 +17,8 @@ mod destination_service_limit;
 mod limit_refusals;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/rotate_refusal_error_contract.rs"]
+mod rotate_refusal_error_contract;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_count.rs"]

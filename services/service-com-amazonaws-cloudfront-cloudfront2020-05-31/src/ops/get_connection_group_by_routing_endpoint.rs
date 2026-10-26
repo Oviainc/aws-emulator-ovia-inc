@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnectionGroupByRoutingEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnectionGroupByRoutingEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnectionGroupByRoutingEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads ONE connection group, addressed by the routing endpoint this service assigned to
+//! it. A reporting operation: it answers from the stored record and writes nothing beyond
+//! the propagation transition the clock already owes.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +67,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +139,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnectionGroupByRoutingEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionGroupByRoutingEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnectionGroupByRoutingEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes, so the status this read reports is
+        // the one the group has at this instant. The transition was owed at the same
+        // instant whether or not anybody called, so this read changes nothing a later
+        // caller sees.
+        store.settle(SystemTime::now());
+
+        // "The routing endpoint for the target connection group": the endpoint submitted
+        // is matched against the one STORED on each group — the value this service
+        // assigned at creation — never re-derived from the request.
+        let Some(stored) = store.connection_group_by_routing_endpoint(&input.routing_endpoint)
+        else {
+            return Err(GetConnectionGroupByRoutingEndpointErrorModeled::EntityNotFound(
+                crate::state::connection_group_not_found(&input.routing_endpoint),
+            )
+            .into());
+        };
+
+        Ok(GetConnectionGroupByRoutingEndpointOutput {
+            // The stored record — the same one `GetConnectionGroup` and
+            // `ListConnectionGroups` answer from, so no two reads of one group disagree.
+            connection_group: Some(stored.to_connection_group()),
+            // "The current version of the connection group" — the token the last mutation
+            // handed back, which is what an `If-Match` is checked against.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

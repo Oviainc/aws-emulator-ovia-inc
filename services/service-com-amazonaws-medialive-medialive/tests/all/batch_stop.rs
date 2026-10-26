@@ -261,9 +261,10 @@ async fn every_running_resource_is_stopped_and_reported_in_the_state_it_reached(
 
 /// Rule: a resource `BatchStop` cannot stop is reported in `Failed` with the
 /// error code the single-resource stop of that resource answers with — an id the
-/// account does not hold is `NotFoundException`, and a channel whose state is
-/// not the `RUNNING` a stop acts from is `ConflictException` — and the resource
-/// is left exactly as it was.
+/// account does not hold and one whose delete it has accepted are both
+/// `NotFoundException`, and a channel that still exists whose state is not the
+/// `RUNNING` a stop acts from is `ConflictException` — and the resource is left
+/// exactly as it was.
 ///
 /// The rows span the states this service can put a channel in other than
 /// `RUNNING`, both request members, and the two shapes an entry takes: with the
@@ -311,9 +312,9 @@ async fn every_resource_a_stop_cannot_touch_is_reported_as_its_own_failure() {
             "deleting channel",
             "channelIds",
             "deleting channel",
-            "ConflictException",
+            "NotFoundException",
             Some("DELETING"),
-            "Channel {id} is in state DELETING and can only be stopped from RUNNING",
+            "Channel {id} already deleted",
         ),
         (
             "unknown multiplex",

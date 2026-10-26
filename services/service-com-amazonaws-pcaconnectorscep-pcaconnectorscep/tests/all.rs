@@ -29,6 +29,8 @@ mod connector_oidc_parameters;
 mod connector_vpc_endpoint;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/resource_arn_validation.rs"]
+mod resource_arn_validation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

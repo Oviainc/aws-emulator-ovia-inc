@@ -8,7 +8,8 @@
 //! and the only thing that refuses one is a fault in the string itself. The rows span what
 //! the rule generalises over: which commands the pipeline is built from, whether a `|`
 //! appears inside a regular expression or a quoted string, which form a `parse` pattern takes
-//! (regular expression or glob), whether a stage aliases fields with `as`, and whether a
+//! (regular expression or glob), whether a stage aliases fields with `as`, whether a `lookup`
+//! stage carries an `OUTPUT` list, and whether a
 //! metric is aggregated, sorted or limited.
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::query_compile::compile;
@@ -54,6 +55,18 @@ fn every_query_the_language_defines_compiles() {    // Each row is one realistic
         (
             r"parse @message /(?<srcaddr>[\d.]+)/ | stats sum(bytes) as totalBytes by srcaddr",
             2,
+        ),
+        // The `lookup` command, which joins reference data onto each record: with an OUTPUT
+        // list naming columns the pipeline already names, without one, and with an output
+        // column renamed for a later command.
+        (
+            "fields user_id, action, name, department | lookup users user_id OUTPUT name, department",
+            2,
+        ),
+        ("fields @message | lookup users user_id", 2),
+        (
+            "fields @message | lookup users user_id OUTPUT name AS who | display who",
+            3,
         ),
         // A quoted string carrying a word that looks like a command is part of the string.
         (r#"fields @message | filter @message = "limit 5" | limit 1"#, 3),

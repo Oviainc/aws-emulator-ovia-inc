@@ -172,36 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
 
         let filters = input.filters.unwrap_or_default();
-        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
-        // re-stated before any filtering runs so the work this request does is bounded by
-        // a check in this crate rather than by request size.
-        crate::state::filters_within_bounds(&filters)
-            .map_err(ListOperationEventsErrorModeled::ValidationException)?;
-        for filter in &filters {
-            // This operation documents ONE operator for every filter it takes, so any
-            // other is refused rather than silently applied as a comparison this listing
-            // does not offer.
-            if filter.operator != crate::state::FILTER_OPERATOR_EQUALS {
-                return Err(ListOperationEventsErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "Filter Operator must be {}, but was {}",
-                        crate::state::FILTER_OPERATOR_EQUALS,
-                        filter.operator
-                    )),
-                )
-                .into());
-            }
-            if !crate::state::OPERATION_EVENT_FILTER_NAMES.contains(&filter.name.as_str()) {
-                return Err(ListOperationEventsErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "Filter Name must be one of {}, but was {}",
-                        crate::state::OPERATION_EVENT_FILTER_NAMES.join(", "),
-                        filter.name
-                    )),
-                )
-                .into());
-            }
-        }
+        // The validation every filtered listing of this service shares: the bounds the
+        // model declares on `FilterList`, `FilterName` and `FilterValue` — re-stated
+        // before any filtering runs so the work this request does is bounded by a check
+        // in this crate rather than by request size — then an operator this listing
+        // offers and a `Name` it documents. This operation documents ONE operator for
+        // every filter it takes, so any other is refused rather than silently applied as
+        // a comparison this listing does not offer.
+        crate::state::validate_filters(
+            &filters,
+            crate::state::FilterOperators::Only(crate::state::FILTER_OPERATOR_EQUALS),
+            crate::state::OPERATION_EVENT_FILTER_NAMES,
+        )
+        .map_err(ListOperationEventsErrorModeled::ValidationException)?;
 
         let Some(operation) = state.region(&region).operations.get(&input.operation_id) else {
             // This operation models no `ResourceNotFoundException`, so an id that names

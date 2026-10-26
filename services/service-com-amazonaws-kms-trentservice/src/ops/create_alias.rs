@@ -262,6 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 key.key_id.clone()
             }
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.target_key_id,
+                ));
+            }
             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                 return Err(CreateAliasErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::key_not_found_message(

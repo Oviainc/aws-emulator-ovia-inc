@@ -167,7 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // MediaPackage is regional: this read resolves only the endpoints of the Region
+        // its own request is served in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeOriginEndpointErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -177,7 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        let Some(record) = state.origin_endpoints.get(&input.id) else {
+        // An id this Region holds no endpoint under — including one only another Region
+        // holds — is the addressed resource missing: 404.
+        let Some(record) = state.origin_endpoint(&region, &input.id) else {
             return Err(crate::state::origin_endpoint_not_found(&input.id).into());
         };
 

@@ -12,8 +12,9 @@
 //! This module also owns the rules every handler shares, so none is written twice:
 //! resolving a presented access token to a usable session
 //! ([`ComAmazonawsSsoSwbportalserviceState::session`]), wording the refusal when it
-//! resolves to nothing ([`unauthorized_session`]), and cutting a sorted listing into a
-//! page with an opaque cursor ([`page_of`]).
+//! resolves to nothing ([`unauthorized_session`], and [`unauthorized_response`] for the
+//! gate in [`crate::service`] that runs before any handler), and cutting a sorted
+//! listing into a page with an opaque cursor ([`page_of`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -66,6 +67,42 @@ pub fn unauthorized_session() -> crate::ops::types::UnauthorizedException {
     crate::ops::types::UnauthorizedException {
         message: Some(INVALID_SESSION_MESSAGE.to_string()),
     }
+}
+
+/// The SAME refusal as [`unauthorized_session`], already rendered as a wire response in
+/// this service's own protocol envelope.
+///
+/// A request that presents no bearer credential at all never reaches a handler: the REST
+/// router selects a route only when every `@required` http-bound member is on the
+/// request, so the absent credential ends the request before any handler's gate could
+/// run. `crate::service` answers that case through here, so the authentication refusal a
+/// caller sees is the same one whether the credential was absent or merely named no
+/// usable session.
+///
+/// The status and the `__type` come from the model, not from a literal here:
+/// `UnauthorizedException` carries its own `@httpError` and is a common error of all four
+/// bound operations, so one modeled value states the refusal for every route and
+/// [`smithy_server_runtime::OperationError`] reads both off that shape.
+///
+/// `None` only if the protocol cannot serialize the error, which it cannot fail to do for
+/// a shape of this service's own model; the caller then leaves the framework's answer in
+/// place rather than inventing one.
+pub fn unauthorized_response(
+    protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    use smithy_server_runtime::OperationError;
+
+    let refusal = crate::ops::list_accounts::ListAccountsErrorModeled::UnauthorizedException(
+        unauthorized_session(),
+    );
+    protocol
+        .serialize_error(
+            refusal.as_serializable(),
+            refusal.variant_schema(),
+            refusal.shape_name(),
+            refusal.http_status(),
+        )
+        .ok()
 }
 
 /// An AWS account the portal can report, with the roles assigned in it.

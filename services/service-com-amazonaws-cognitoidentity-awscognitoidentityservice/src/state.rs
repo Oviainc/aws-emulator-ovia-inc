@@ -320,11 +320,11 @@ pub struct Identity {
 
 /// The most OpenID Connect tokens this emulator holds outstanding at once. Not an AWS
 /// quota: THIS emulator's own ceiling on a store that grows by one record per successful
-/// `GetOpenIdTokenForDeveloperIdentity` call — including the calls that resolve an
-/// identity the pool already has — and whose records live as long as the window the
-/// caller asked for, up to the modelled `TokenDuration` maximum of 24 hours. Expiry alone
-/// would bound only how long a record lives, not how many exist, so the count is capped
-/// too: see
+/// `GetOpenIdToken` / `GetOpenIdTokenForDeveloperIdentity` call — including the calls that
+/// resolve an identity the pool already has — and whose records live as long as the window
+/// the caller asked for, up to the modelled `TokenDuration` maximum of 24 hours. Expiry
+/// alone would bound only how long a record lives, not how many exist, so the count is
+/// capped too: see
 /// [`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::record_open_id_token`],
 /// which forgets the oldest issuances to stay inside it.
 pub const MAX_OUTSTANDING_OPEN_ID_TOKENS: usize = 10_000;
@@ -401,8 +401,8 @@ pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     pub login_index: HashMap<(String, String, String), String>,
     /// The credentials outstanding for an identity, by `IdentityId`.
     pub credentials: HashMap<String, IssuedCredentials>,
-    /// The OpenID Connect tokens outstanding, by the token itself, as
-    /// `GetOpenIdTokenForDeveloperIdentity` minted them. A token is a bearer of the
+    /// The OpenID Connect tokens outstanding, by the token itself, as `GetOpenIdToken`
+    /// and `GetOpenIdTokenForDeveloperIdentity` minted them. A token is a bearer of the
     /// identity it names, so the record is what tells this service which identity and
     /// pool a token presented later belongs to, and whether its window is still open.
     pub open_id_tokens: HashMap<String, IssuedOpenIdToken>,
@@ -881,9 +881,8 @@ pub fn decode_pagination_token(scope: &str, token: &str) -> Option<String> {
 /// The claims are the OIDC registered ones (RFC 7519 §4.1) an Amazon Cognito Identity
 /// token carries: the service's own `iss`, the identity pool as the audience, the
 /// identity as the subject, the validity window, the `amr` authentication-methods
-/// reference — `authenticated`, the Cognito service principal and each provider that
-/// authenticated the user — and a `jti` that makes every issued token distinct, so two
-/// calls in the same second never produce one token.
+/// reference ([`authentication_methods`]) and a `jti` that makes every issued token
+/// distinct, so two calls in the same second never produce one token.
 pub fn open_id_token(
     identity_pool_id: &str,
     identity_id: &str,
@@ -891,15 +890,10 @@ pub fn open_id_token(
     issued_at: SystemTime,
     expiration: SystemTime,
 ) -> String {
-    let mut amr: Vec<::serde_json::Value> = vec![
-        ::serde_json::Value::from("authenticated"),
-        ::serde_json::Value::from(COGNITO_IDENTITY_PRINCIPAL),
-    ];
-    amr.extend(
-        authenticated_by
-            .iter()
-            .map(|provider| ::serde_json::Value::from(provider.as_str())),
-    );
+    let amr: Vec<::serde_json::Value> = authentication_methods(authenticated_by)
+        .iter()
+        .map(|method| ::serde_json::Value::from(method.as_str()))
+        .collect();
     let claims = ::serde_json::json!({
         "iss": OIDC_TOKEN_ISSUER,
         "aud": identity_pool_id,
@@ -1075,35 +1069,42 @@ pub fn web_identity_condition_context(
     identity_id: &str,
     providers: &[String],
 ) -> Vec<(String, String)> {
-    let authenticated = !providers.is_empty();
     let mut context = vec![
         (
             AUDIENCE_CONDITION_KEY.to_string(),
             identity_pool_id.to_string(),
         ),
         (SUBJECT_CONDITION_KEY.to_string(), identity_id.to_string()),
-        (
-            AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
-            if authenticated {
-                AUTHENTICATED_ROLE_TYPE.to_string()
-            } else {
-                UNAUTHENTICATED_ROLE_TYPE.to_string()
-            },
-        ),
     ];
-    if authenticated {
-        context.push((
-            AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
-            COGNITO_IDENTITY_PRINCIPAL.to_string(),
-        ));
-        for provider in providers {
-            context.push((
-                AUTHENTICATION_METHODS_CONDITION_KEY.to_string(),
-                provider.clone(),
-            ));
-        }
-    }
+    context.extend(
+        authentication_methods(providers)
+            .into_iter()
+            .map(|method| (AUTHENTICATION_METHODS_CONDITION_KEY.to_string(), method)),
+    );
     context
+}
+
+/// The authentication methods an exchange made with `providers` — the `Logins` provider
+/// names the call presented — was performed under.
+///
+/// A call that presented at least one login is an AUTHENTICATED one, and names
+/// `authenticated`, this service (every token is minted by it, whatever provider
+/// authenticated the user) and each of those providers; a call that presented none is
+/// UNAUTHENTICATED and names that alone. One function, because these are the values a
+/// minted token carries in its `amr` claim ([`open_id_token`]) AND the ones the
+/// `...:amr` condition key publishes to a trust policy
+/// ([`web_identity_condition_context`]): a policy clause written against the token a
+/// caller holds has to decide the same way as the exchange that token is made with.
+pub fn authentication_methods(providers: &[String]) -> Vec<String> {
+    if providers.is_empty() {
+        return vec![UNAUTHENTICATED_ROLE_TYPE.to_string()];
+    }
+    let mut methods = vec![
+        AUTHENTICATED_ROLE_TYPE.to_string(),
+        COGNITO_IDENTITY_PRINCIPAL.to_string(),
+    ];
+    methods.extend(providers.iter().cloned());
+    methods
 }
 
 /// Whether `role`'s trust policy admits the web-identity assume `context` describes.

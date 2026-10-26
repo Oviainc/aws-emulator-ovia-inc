@@ -112,6 +112,18 @@ pub const TABLE_STATUS_DELETING: &str = "DELETING";
 /// `CREATING` or `UPDATING` states, then Amazon Keyspaces returns a
 /// `ResourceInUseException`" — only an update can put a table in `UPDATING`.
 pub const TABLE_STATUS_UPDATING: &str = "UPDATING";
+/// `TableStatus` = `RESTORING`: what `RestoreTable` puts the table it is creating in
+/// until the restore completes, after which it is [`TABLE_STATUS_ACTIVE`] like any
+/// other table.
+///
+/// A member of the model's `TableStatus` value set
+/// (`crate::ops::types::TABLE_STATUS_VALUES`) beside `CREATING`, and restoring is the
+/// one way a table of this service comes into being that the plain create does not
+/// cover — so this is the status a caller watching a restore through `GetTable$status`
+/// observes while it runs, and the one that says a restore of this account is still
+/// running
+/// ([`restores_in_progress`][ComAmazonawsKeyspacesKeyspacesserviceState::restores_in_progress]).
+pub const TABLE_STATUS_RESTORING: &str = "RESTORING";
 
 /// `TypeStatus` = `CREATING`: what `CreateType` puts a new user-defined type in.
 ///
@@ -133,8 +145,9 @@ pub const TYPE_STATUS_DELETING: &str = "DELETING";
 
 /// How long a resource stays in a transient status before the clock owes it the
 /// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `CreateKeyspace` or
-/// `CreateType`, `UPDATING` -> `ACTIVE` after `UpdateTable` or `UpdateKeyspace`,
-/// and `DELETING` -> gone after `DeleteTable`, `DeleteType` or `DeleteKeyspace`.
+/// `CreateType`, `RESTORING` -> `ACTIVE` after `RestoreTable`, `UPDATING` ->
+/// `ACTIVE` after `UpdateTable` or `UpdateKeyspace`, and `DELETING` -> gone after
+/// `DeleteTable`, `DeleteType` or `DeleteKeyspace`.
 ///
 /// CHOSEN, not documented: Amazon Keyspaces publishes no duration for any of
 /// these transitions, only that they happen (`CreateTable`: "the status of the
@@ -206,7 +219,7 @@ pub const POINT_IN_TIME_RECOVERY_WINDOW: Duration = Duration::from_secs(35 * 24 
 /// How many restores may run in this account at once: "Any number of users can execute
 /// up to 4 concurrent restores (any type of restore) in a given account"
 /// (`RestoreTable`). A restore is running while the table it is creating is still
-/// `CREATING`; see
+/// `RESTORING`; see
 /// [`restores_in_progress`][ComAmazonawsKeyspacesKeyspacesserviceState::restores_in_progress].
 pub const MAX_CONCURRENT_RESTORES: usize = 4;
 
@@ -363,9 +376,16 @@ pub fn keyspace_deleting_rejection(keyspace_name: &str) -> String {
 /// settled nor on its way out, so the clock still owes it a transition.
 ///
 /// `CREATING` and `UPDATING` have the same spelling in the model's `KeyspaceStatus`,
-/// `TableStatus` and `TypeStatus` value sets, so one predicate answers for all three.
+/// `TableStatus` and `TypeStatus` value sets, so one predicate answers for all three;
+/// `RESTORING` is in the `TableStatus` and `TypeStatus` sets only, and no keyspace is
+/// ever in it, so naming it here costs nothing and makes a table whose restore is still
+/// running count as in flight exactly as one still being created does.
 pub fn is_in_flight_status(status: &str) -> bool {
-    status == KEYSPACE_STATUS_CREATING || status == KEYSPACE_STATUS_UPDATING
+    status == KEYSPACE_STATUS_CREATING
+        || status == KEYSPACE_STATUS_UPDATING
+        // Spelled with the table constant because only a table is ever in it; the
+        // comparison is still against the status STRING, as the two above are.
+        || status == TABLE_STATUS_RESTORING
 }
 
 /// The most keyspaces this emulator holds in one Amazon Web Services Region, and — with
@@ -1615,8 +1635,8 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     }
 
     /// Materialise every status transition the clock already owes at `now`: a keyspace
-    /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
-    /// `UPDATING` span has elapsed becomes `ACTIVE`, a table's warm throughput
+    /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING`,
+    /// `RESTORING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table's warm throughput
     /// configuration whose span has elapsed becomes `AVAILABLE`, a type whose `CREATING` span has
     /// elapsed becomes `ACTIVE`, and a keyspace, table or type whose
     /// `DELETING` span has elapsed is gone.
@@ -1678,9 +1698,11 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                     }
                     table.status_due_at = None;
                     match table.status.as_str() {
-                        // The creation, or the setting change, the clock owed has
-                        // completed, so the table is usable again.
-                        TABLE_STATUS_CREATING | TABLE_STATUS_UPDATING => {
+                        // The creation, the restore, or the setting change, the clock
+                        // owed has completed, so the table is usable again.
+                        TABLE_STATUS_CREATING
+                        | TABLE_STATUS_RESTORING
+                        | TABLE_STATUS_UPDATING => {
                             table.status = TABLE_STATUS_ACTIVE.to_string();
                             true
                         }
@@ -1773,7 +1795,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// How many restores are running in this account: "Any number of users can execute up
     /// to 4 concurrent restores (any type of restore) in a given account"
     /// ([`MAX_CONCURRENT_RESTORES`]), and a restore is running exactly while the table it
-    /// is creating is still `CREATING` — which [`Self::settle`] materialises out of that
+    /// is creating is still `RESTORING` — which [`Self::settle`] materialises out of that
     /// status when the clock owes it, so a finished restore stops counting without anybody
     /// having to clear a flag.
     ///
@@ -1785,7 +1807,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
             .flat_map(|keyspaces| keyspaces.values())
             .flat_map(|keyspace| keyspace.tables.values())
             .filter(|table| {
-                table.restored_from.is_some() && table.status == TABLE_STATUS_CREATING
+                table.restored_from.is_some() && table.status == TABLE_STATUS_RESTORING
             })
             .count()
     }

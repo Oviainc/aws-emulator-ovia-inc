@@ -51,10 +51,10 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
 }
 
 /// A SigV4 `Authorization` whose credential scope routes the request to `mediapackage`
-/// in [`REGION`]; the signature is never verified here.
-fn authorization() -> String {
+/// in `region`; the signature is never verified here.
+fn authorization(region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/mediapackage/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/mediapackage/aws4_request, \
          SignedHeaders=host, Signature=abc"
     )
 }
@@ -71,11 +71,27 @@ pub(crate) async fn dispatch(
     uri: &str,
     body: Option<&Value>,
 ) -> http::Response<Bytes> {
+    dispatch_in(router, REGION, method, uri, body).await
+}
+
+/// [`dispatch`] for a request served in `region` rather than in [`REGION`]: the host and
+/// the SigV4 credential scope both name it.
+///
+/// Every suite but one signs for a single Region, so [`dispatch`] is the form they use;
+/// this is the one whose SUBJECT is the Region a request is served in
+/// (`tests/all/region_isolation.rs`), and both go through the one request builder.
+pub(crate) async fn dispatch_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Response<Bytes> {
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://mediapackage.{REGION}.amazonaws.com{uri}"))
-        .header("authorization", authorization())
+        .uri(format!("https://mediapackage.{region}.amazonaws.com{uri}"))
+        .header("authorization", authorization(region))
         .header("content-type", "application/json")
         .body(Bytes::from(payload))
         .expect("a well-formed request");
@@ -90,7 +106,18 @@ pub(crate) async fn call(
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = dispatch(router, method, uri, body).await;
+    call_in(router, REGION, method, uri, body).await
+}
+
+/// [`call`] for a request served in `region`; see [`dispatch_in`].
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    let response = dispatch_in(router, region, method, uri, body).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);

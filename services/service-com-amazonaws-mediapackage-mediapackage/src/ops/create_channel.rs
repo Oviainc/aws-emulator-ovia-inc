@@ -171,17 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         crate::state::bound_tags(&input.tags)?;
 
-        // The ID must be unique within the region: a second CreateChannel with an id
-        // already in use is refused, never an overwrite of the stored channel. The
+        // MediaPackage is regional: this channel belongs to the Region this request is
+        // served in, which is the only Region it will resolve, list, mutate or delete in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The ID must be unique within the region": a second CreateChannel with an id
+        // already in use IN THIS REGION is refused, never an overwrite of the stored
+        // channel, while the same id in another Region is another channel entirely. The
         // refusal names the resource type that is in the way and why.
-        if state.channels.contains_key(&input.id) {
+        if state.has_channel(&region, &input.id) {
             return Err(
                 crate::state::resource_already_exists(crate::state::CHANNEL_KIND, &input.id).into(),
             );
         }
 
         // The store lives for the life of the process and only a create adds to it, so
-        // it is capped by entry count; past the cap the resource limit is reported.
+        // it is capped by entry count — across every Region, because the memory the
+        // process holds is the sum of them; past the cap the resource limit is reported.
         if state.channels.len() >= crate::state::MAX_CHANNELS {
             return Err(crate::state::resource_limit_reached(
                 crate::state::CHANNEL_KIND,
@@ -190,9 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let ingest_endpoints = state.mint_ingest_endpoints(&region, &input.id);
         let record = crate::state::ChannelRecord {
+            region: region.clone(),
             arn: crate::state::channel_arn(&region, &input.id),
             description: input.description.clone(),
             created_at: crate::state::now_iso8601(),
@@ -205,11 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `insert` + the read back below: the record returned is always the STORED one,
         // and the id is free (refused as a duplicate above), so nothing is replaced.
         let id = input.id.clone();
-        state.channels.insert(id.clone(), record);
+        state.insert_channel(record);
         let stored = state
-            .channels
-            .get(&id)
-            .expect("the record just inserted under this id");
+            .channel(&region, &id)
+            .expect("the record just inserted under this region and id");
 
         // Rendered from the STORED record, so the create response and every later
         // DescribeChannel/ListChannels are the same bytes.

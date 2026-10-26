@@ -259,7 +259,10 @@ async fn a_component_type_reads_back_exactly_what_was_created() {
         );
 
         // The property definitions: every name the create declared, each with
-        // the dataType it declared and the resolved value of each flag.
+        // the dataType it declared and the resolved value of each flag. A row
+        // that extends another type also reports what it INHERITS, which is its
+        // own suite (`component_type_inherited_schema.rs`), so a row with an
+        // `extendsFrom` is only held to reporting its own declarations here.
         let declared = request["propertyDefinitions"]
             .as_object()
             .cloned()
@@ -269,11 +272,22 @@ async fn a_component_type_reads_back_exactly_what_was_created() {
             .as_object()
             .cloned()
             .unwrap_or_default();
-        assert_eq!(
-            reported.keys().collect::<BTreeSet<_>>(),
-            declared.keys().collect::<BTreeSet<_>>(),
-            "case {component_type_id:?}: expected the created property names, got {read:?}"
-        );
+        if request["extendsFrom"]
+            .as_array()
+            .is_none_or(|parents| parents.is_empty())
+        {
+            assert_eq!(
+                reported.keys().collect::<BTreeSet<_>>(),
+                declared.keys().collect::<BTreeSet<_>>(),
+                "case {component_type_id:?}: expected the created property names, got {read:?}"
+            );
+        } else {
+            assert!(
+                declared.keys().all(|name| reported.contains_key(name)),
+                "case {component_type_id:?}: expected every created property name among the \
+                 reported ones, got {read:?}"
+            );
+        }
         for (property_name, definition) in &declared {
             let response = &reported[property_name];
             assert_eq!(
@@ -294,12 +308,26 @@ async fn a_component_type_reads_back_exactly_what_was_created() {
                      got {response:?}"
                 );
             }
-            for inherited in ["isImported", "isFinal", "isInherited"] {
+            for imported in ["isImported", "isFinal"] {
                 assert_eq!(
-                    response[inherited].as_bool(),
+                    response[imported].as_bool(),
                     Some(false),
                     "case {component_type_id:?}/{property_name}: a definition written by this \
-                     create came from nowhere else, got {response:?}"
+                     create is neither imported nor final, got {response:?}"
+                );
+            }
+            // Nothing is inherited where there is no parent to inherit from; a
+            // row that extends another type is held to the inheritance rule by
+            // `component_type_inherited_schema.rs`.
+            if request["extendsFrom"]
+                .as_array()
+                .is_none_or(|parents| parents.is_empty())
+            {
+                assert_eq!(
+                    response["isInherited"].as_bool(),
+                    Some(false),
+                    "case {component_type_id:?}/{property_name}: this type extends nothing, so \
+                     its definition came from nowhere else, got {response:?}"
                 );
             }
             assert_eq!(

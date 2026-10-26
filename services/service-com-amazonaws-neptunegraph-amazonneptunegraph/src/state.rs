@@ -2114,6 +2114,32 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// From the modelled `TagValue`: `@length(0..256)`.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
+/// The pagination token that resumes a listing after `last_returned_key` — the id, or
+/// other stable key, of the last entry the page just returned.
+///
+/// ONE token format for every listing of this service, so a client that pages one
+/// listing and then another sees one token grammar: hex keeps the token opaque to a
+/// client and within `PaginationToken`'s 1..8192 length.
+pub fn encode_page_token(last_returned_key: &str) -> String {
+    hex::encode(last_returned_key)
+}
+
+/// The position a token resumes after, or `None` when it is not a token
+/// [`encode_page_token`] minted for the id space `in_id_space` accepts.
+///
+/// `in_id_space` is the listing's own id-space predicate, one of the `is_*_id`
+/// predicates below: a decoded value naming no position in it is refused rather than
+/// treated as the start of the list, which is also what stops one listing's token from
+/// paging another's id space.
+///
+/// Membership in the store is deliberately NOT required: a resource deleted between two
+/// pages must still leave its successors reachable, which is what resuming from a
+/// position — rather than from a row — gives.
+pub fn decode_page_token(token: &str, in_id_space: impl Fn(&str) -> bool) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    in_id_space(&decoded).then_some(decoded)
+}
+
 /// Whether `value` matches the modelled `GraphId` pattern `^g-[a-z0-9]{10}$`.
 ///
 /// Shared by the id generator's own test and by `ListGraphs`, which refuses a

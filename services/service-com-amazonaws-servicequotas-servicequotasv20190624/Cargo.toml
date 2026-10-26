@@ -27,6 +27,12 @@ base64 = "0.22"
 # Request ids are derived (counter + clock) rather than echoed or random-unstored.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): a quota utilization report's numerator is the account's
+# own consumption, and a VPC and the vCPUs of a running instance are EC2's resources, so
+# `src/state/usage.rs` counts them by asking EC2 rather than keeping a count of its own.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -35,5 +41,10 @@ emulator-core-build-support = { workspace = true }
 # `tokio::time::sleep` in tests/all/quota_workflow.rs, to wait past the span a
 # quota increase request takes to be decided.
 tokio = { workspace = true, features = ["time"] }
+# The EC2 service, mounted beside this one in tests/all/quota_utilization_usage.rs: a
+# utilization report's usage comes from the services that own the resources, so the rule
+# can only be driven end to end with the owner of those resources on the same engine.
+# DEV-ONLY: this crate takes no dependency on EC2 outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 [lints]
 workspace = true

@@ -138,39 +138,21 @@ impl From<DescribeOrganizationOverviewErrorModeled> for DescribeOrganizationOver
 /// that is not an instant this service can represent.
 ///
 /// The span itself is [`crate::state::DayRange`], which every day-granular read of this
-/// store shares; this function is only the per-operation translation of the two modelled
-/// members into it.
+/// store shares — including its translation of the two modelled members and its refusal
+/// of an unrepresentable bound ([`crate::state::DayRange::requested`]); this function is
+/// only the lift of that refusal into THIS operation's modelled error.
 fn requested_range(
     input: &DescribeOrganizationOverviewInput,
 ) -> Result<crate::state::DayRange, DescribeOrganizationOverviewError> {
-    let from = bound(&input.from_time, "FromTime")?;
-    // An absent `ToTime` is "the current day", which `DayRange::of_days` substitutes.
-    let to = match input.to_time.as_ref() {
-        Some(to_time) => Some(bound(to_time, "ToTime")?),
-        None => None,
-    };
-    Ok(crate::state::DayRange::of_days(from, to))
-}
-
-/// A submitted `Timestamp` in the milliseconds the store keeps, or the
-/// `ValidationException` naming `member` when the instant is not one this service can
-/// represent.
-fn bound(
-    at: &::aws_smithy_types::DateTime,
-    member: &str,
-) -> Result<i64, DescribeOrganizationOverviewError> {
-    crate::state::millis_of(at).ok_or_else(|| {
-        DescribeOrganizationOverviewErrorModeled::ValidationException(ValidationException {
-            message: format!("{member} is not an instant this service can represent"),
-            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-            fields: Some(vec![ValidationExceptionField {
-                name: member.to_string(),
-                message: "must be an instant representable in milliseconds since the epoch"
-                    .to_string(),
-            }]),
-        })
-        .into()
-    })
+    // An absent `ToTime` is "the current day", which `DayRange::requested` substitutes.
+    crate::state::DayRange::requested(&input.from_time, input.to_time.as_ref()).map_err(
+        |rejection| -> DescribeOrganizationOverviewError {
+            DescribeOrganizationOverviewErrorModeled::ValidationException(
+                rejection.validation_exception(),
+            )
+            .into()
+        },
+    )
 }
 
 /// The `DescribeOrganizationOverview` operation.

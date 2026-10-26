@@ -20,6 +20,13 @@
 //!   (`earliestRestorableTimestamp` to the current time), so a table point-in-time
 //!   recovery is not enabled on has no window and cannot be restored at all.
 //!
+//! The restore is asynchronous, so the table it creates is not usable the instant this
+//! call is accepted: it reports `TableStatus = RESTORING` — the member of the modelled
+//! value set that names a table whose restore is still running — until the clock owes it
+//! `ACTIVE`, and a caller polling `GetTable` to watch the restore sees exactly that.
+//! While it is in that status the restore counts towards the account's concurrent-restore
+//! quota, and the table takes no change of its own.
+//!
 //! `replicaSpecifications` IS served: the per-Region settings of a multi-Region table
 //! are resolved against the TARGET keyspace's replication group, exactly as
 //! `CreateTable` resolves them against the keyspace a table is created in, and reported
@@ -529,10 +536,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.target_keyspace_name,
             &input.target_table_name,
         );
-        // A restore creates a table, so the created table is `CREATING` until the clock owes
-        // it `ACTIVE` one span from now, exactly as a `CreateTable` leaves one; `settle`
-        // materialises that, and nothing sleeps for it. Until then this restore is one of
-        // the account's concurrent restores.
+        // A restore is asynchronous, and the model's `TableStatus` value set holds the
+        // status that names exactly this in-flight state: the table this restore is
+        // building reports `RESTORING` — not the `CREATING` of a plain create — until the
+        // clock owes it `ACTIVE` one span from now, which is what a caller polling
+        // `GetTable$status` to watch the restore sees. `settle` materialises that
+        // transition, and nothing sleeps for it. Until then this restore is one of the
+        // account's concurrent restores.
         let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
         target_keyspace.tables.insert(
             input.target_table_name.clone(),
@@ -541,7 +551,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 table_name: input.target_table_name.clone(),
                 resource_arn: restored_table_arn.clone(),
                 creation_timestamp: Some(now),
-                status: crate::state::TABLE_STATUS_CREATING.to_string(),
+                status: crate::state::TABLE_STATUS_RESTORING.to_string(),
                 status_due_at: Some(settles_at),
                 schema_definition: restored.schema_definition,
                 capacity_specification,

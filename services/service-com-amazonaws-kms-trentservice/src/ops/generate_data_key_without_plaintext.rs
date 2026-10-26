@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let state = state.lock();
+        let mut state = state.lock();
 
         // Permission a request draws from a grant is judged below, once the key is
         // known and its key state has been judged.
@@ -282,6 +282,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // found.
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(
+                    Self::NAME,
+                    &input.key_id,
+                ));
+            }
             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                 return Err(GenerateDataKeyWithoutPlaintextErrorModeled::NotFoundException(
                     NotFoundException {
@@ -444,15 +450,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(internal("the data key could not be encrypted"));
         };
+        // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
+        // data key" — the key ARN, not the identifier the request used — and "the
+        // identifier of the key material used to encrypt the data key": the version of
+        // the key's material that sealed it, which is the current one.
+        let key_arn = key.arn.clone();
+        let key_material_id = key.current_key_material_id.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, which is what
+        // `GetKeyLastUsage` reports.
+        state.record_last_usage(&key_id, Self::NAME);
 
         Ok(GenerateDataKeyWithoutPlaintextOutput {
             ciphertext_blob: Some(ciphertext_blob),
-            // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
-            // data key" — the key ARN, not the identifier the request used.
-            key_id: Some(key.arn.clone()),
-            // "The identifier of the key material used to encrypt the data key": the
-            // version of the key's material that sealed it, which is the current one.
-            key_material_id: key.current_key_material_id.clone(),
+            key_id: Some(key_arn),
+            key_material_id,
         })
     }
 }

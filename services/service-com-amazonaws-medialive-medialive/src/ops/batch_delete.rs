@@ -245,10 +245,12 @@ enum Outcome {
 /// resource answers with, which on this service is the modelled exception's
 /// shape name (`smithy_query(query="operation", operation="DeleteChannel")`).
 mod failure_code {
-    /// No resource of that kind has that id — `NotFoundException` (404), which
-    /// every single-resource delete in this service models.
+    /// Neither an existing resource nor one a caller may still act on —
+    /// `NotFoundException` (404), which every single-resource delete in this
+    /// service models: no resource of that kind has that id, or the one it had
+    /// has been deleted.
     pub const NOT_FOUND: &str = "NotFoundException";
-    /// The resource exists but its current state does not allow a delete —
+    /// The resource still exists but its current state does not allow a delete —
     /// `ConflictException` (409), modelled by `DeleteChannel` and `DeleteInput`.
     pub const CONFLICT: &str = "ConflictException";
     /// The resource exists and is still in use by another one —
@@ -270,11 +272,11 @@ fn not_found(resource_type: &str, id: &str) -> Outcome {
     })
 }
 
-/// A failed entry for a resource that exists: it carries the resource's own ARN
-/// beside the code and the message of the refusal.
-fn refused(id: &str, arn: &str, code: &str, message: String) -> Outcome {
+/// A failed entry for a resource whose record the account still holds: it
+/// carries that record's own ARN beside the code and the message of the refusal.
+fn refused(id: &str, arn: Option<String>, code: &str, message: String) -> Outcome {
     Outcome::Failed(BatchFailedResultModel {
-        arn: Some(arn.to_string()),
+        arn,
         code: Some(code.to_string()),
         id: Some(id.to_string()),
         message: Some(message),
@@ -299,21 +301,30 @@ fn accepted(
     }))
 }
 
-/// One channel's delete, under exactly `DeleteChannel`'s rule: a channel is
-/// deletable once it has stopped, and an accepted delete puts it in `DELETING`,
-/// owing the terminal `DELETED` state the clock then makes due.
+/// One channel's delete, under exactly `DeleteChannel`'s rule: an id whose
+/// delete has already been accepted names no channel left to delete and is
+/// reported NOT FOUND, a channel that still exists is deletable once it has
+/// stopped, and an accepted delete puts it in `DELETING`, owing the terminal
+/// `DELETED` state the clock then makes due.
 fn delete_channel(
     state: &mut State,
     id: &str,
     now: ::std::time::SystemTime,
 ) -> Result<Outcome, BatchDeleteError> {
-    let Some(channel) = state.channels.get_mut(id) else {
-        return Ok(not_found("Channel", id));
+    // The id is resolved through the shared channel guard FIRST, so a channel
+    // whose delete has been accepted is reported with the NOT-FOUND code
+    // `DeleteChannel` answers for it rather than with a state conflict. The
+    // guard hands back the tombstone's own ARN for the entry to name.
+    let channel = match state.mutable_channel(id) {
+        Ok(channel) => channel,
+        Err(dead) => {
+            return Ok(refused(id, dead.arn, failure_code::NOT_FOUND, dead.message));
+        }
     };
     if !channel.is_deletable() {
         return Ok(refused(
             id,
-            &channel.arn,
+            Some(channel.arn.clone()),
             failure_code::CONFLICT,
             crate::state::CHANNEL_NOT_STOPPED_MESSAGE.to_string(),
         ));
@@ -349,7 +360,7 @@ fn delete_input(
     if !attached.is_empty() {
         return Ok(refused(
             id,
-            &arn,
+            Some(arn),
             failure_code::CONFLICT,
             crate::state::busy_input_message(id),
         ));
@@ -393,7 +404,7 @@ fn delete_input_security_group(
         let users: Vec<String> = inputs.into_iter().chain(channels).collect();
         return Ok(refused(
             id,
-            &arn,
+            Some(arn),
             failure_code::BAD_REQUEST,
             format!(
                 "Input security group {id} is in use by {} and cannot be deleted",
@@ -435,7 +446,7 @@ fn delete_multiplex(
     if !multiplex.is_deletable() {
         return Ok(refused(
             id,
-            &multiplex.arn,
+            Some(multiplex.arn.clone()),
             failure_code::CONFLICT,
             crate::state::not_idle_message("Multiplex", id, multiplex.state()),
         ));

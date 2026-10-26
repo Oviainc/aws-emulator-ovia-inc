@@ -4,8 +4,9 @@
 //!
 //! Adds or replaces tags on the named stream's tag register in [`crate::state`]: a key the
 //! stream already carries takes the value this request gives it, every other tag it holds
-//! is left alone, and a request that would push the stream past the documented ceiling of
-//! fifty tags is refused as `LimitExceededException` without writing anything.
+//! is left alone, a key the modelled `TagKey` pattern does not admit is refused as a
+//! constraint violation, and a request that would push the stream past the documented
+//! ceiling of fifty tags is refused as `LimitExceededException` without writing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +74,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The dotted member path a constraint violation is reported at, spelled by the framework's
+// own path builder so a refusal this handler states names a member exactly as a refusal
+// the request boundary states does.
+use ::aws_smithy_schema_server::constraints::path;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,6 +160,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let _ = ctx;
+
+        // Every key is judged against the modelled `TagKey` pattern BEFORE anything is
+        // looked up or written, the way the request boundary would have judged it had it
+        // been able to compile that pattern (`crate::service::check_tag_keys`).
+        crate::service::check_tag_keys(input.tags.iter().enumerate().map(|(index, tag)| {
+            (
+                path::join(&[
+                    path::member("Tags"),
+                    path::element(index + 1),
+                    path::member("Key"),
+                ]),
+                tag.key.as_str(),
+            )
+        }))
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

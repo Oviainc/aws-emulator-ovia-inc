@@ -22,9 +22,10 @@
 //!   token keeps meaning the same position;
 //! * the **quota utilization reports** (`StartQuotaUtilizationReport`,
 //!   `GetQuotaUtilizationReport`) — each one a FROZEN snapshot of the quota values in
-//!   force when it was initiated, published once the clock has made its generation
-//!   due and deleted once its retention has passed; a start while one is still live
-//!   reuses it rather than minting a second;
+//!   force when it was initiated and of the account's usage of them at that moment
+//!   (which [`usage`] reads out of the services that own the resources), published once
+//!   the clock has made its generation due and deleted once its retention has passed; a
+//!   start while one is still live reuses it rather than minting a second;
 //! * the **tags on an applied quota** (`TagResource`, `ListTagsForResource`,
 //!   `UntagResource`) — keyed by the quota's own ARN, the only thing a tagging
 //!   operation names its resource by, so one quota has exactly one tag set however
@@ -49,10 +50,17 @@
 //! model allows (`MaxResults` 1..100) they genuinely run to many
 //! `NextToken`-chained pages.
 
+/// How much of each quota the account is USING, read out of the services that own the
+/// resources a quota is counted in. The numerator of the utilization formula; the value
+/// in force, which this module owns, is its denominator.
+pub mod usage;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
+
+use usage::QuotaUsage;
 
 use crate::ops::types::{
     MetricInfo, QuotaContextInfo, QuotaInfo, QuotaPeriod, QuotaUtilizationInfo,
@@ -327,13 +335,15 @@ pub const REPORT_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 /// minting a second, and that one leaves the store on its own when this passes.
 pub const REPORT_RETENTION: Duration = Duration::from_secs(15 * 60);
 
-/// The usage this service's state has recorded against a quota.
+/// The `Class` dimension token of the vCPU usage metric of instances bought ON DEMAND.
 ///
-/// Zero: nothing in this emulator consumes a quota, so no consumption has ever been
-/// recorded against one. It is named rather than inlined because it is the `usage`
-/// term of the utilization formula in [`utilization_pct`], not a placeholder for a
-/// percentage.
-const RECORDED_QUOTA_USAGE: f64 = 0.0;
+/// A vCPU quota group's usage metric carries the group's own token and the purchase
+/// model it meters (`Standard/OnDemand`), which is what keeps the On-Demand and the
+/// Spot quota of one group two separate usage sources.
+pub(crate) const PURCHASE_MODEL_ON_DEMAND: &str = "OnDemand";
+/// The `Class` dimension token of the vCPU usage metric of SPOT instances. See
+/// [`PURCHASE_MODEL_ON_DEMAND`].
+pub(crate) const PURCHASE_MODEL_SPOT: &str = "Spot";
 
 /// The page size `GetQuotaUtilizationReport` uses when the caller names no
 /// `MaxResults`, and the most records it puts on one page: the maximum the model's
@@ -1217,7 +1227,12 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// deletion come due at, and with the snapshot of the quota values in force NOW:
     /// that is the state the report analyses, so what it publishes does not depend on
     /// when anybody polls it.
-    pub fn start_utilization_report(&mut self, region: &str, now: SystemTime) -> ReportStart {
+    pub fn start_utilization_report(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+        usage: &QuotaUsage,
+    ) -> ReportStart {
         // Settling first is what makes a reused report carry the status a read of it
         // at this same instant reports, and what deletes one whose retention passed —
         // both owed by the clock whether or not anybody called.
@@ -1225,7 +1240,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         if let Some(live) = self.live_utilization_report(region) {
             return ReportStart::Reused(live.clone());
         }
-        let quotas = self.utilization_snapshot(region);
+        let quotas = self.utilization_snapshot(region, usage);
         let state = self.regions.entry(region.to_string()).or_default();
         state.reports_minted += 1;
         let id = report_id(region, state.reports_minted, now);
@@ -1295,11 +1310,20 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// Every quota's utilization, as a report records it.
     ///
     /// One record per quota in the catalog, carrying the AWS default, the value in
-    /// force in `region` and the namespace of the metric Service Quotas tracks that
-    /// quota's usage with. Sorted by utilization DESCENDING, the quotas whose
-    /// utilization is unknown last, and then by service and quota code \u2014 a total order,
-    /// so a page boundary in one report always falls in the same place.
-    fn utilization_snapshot(&self, region: &str) -> Vec<QuotaUtilizationInfo> {
+    /// force in `region`, the namespace of the metric Service Quotas tracks that
+    /// quota's usage with, and the utilization that usage reading gives against the
+    /// value in force. Sorted by utilization DESCENDING, the quotas whose utilization is
+    /// unknown last, and then by service and quota code \u2014 a total order, so a page
+    /// boundary in one report always falls in the same place.
+    ///
+    /// `usage` is the account's consumption as [`usage::measure`] read it out of the
+    /// services that own the resources: the report analyses the account, so a quota's
+    /// numerator comes from there and never from this service's own state.
+    fn utilization_snapshot(
+        &self,
+        region: &str,
+        usage: &QuotaUsage,
+    ) -> Vec<QuotaUtilizationInfo> {
         let mut records: Vec<QuotaUtilizationInfo> = self
             .default_quotas
             .iter()
@@ -1316,7 +1340,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                         .usage_metric
                         .as_ref()
                         .and_then(|metric| metric.metric_namespace.clone()),
-                    utilization: utilization_pct(default, applied),
+                    utilization: utilization_pct(default, applied, usage),
                     default_value: Some(default.value),
                     applied_value: Some(applied),
                     service_name: self.service_name(service_code).map(str::to_string),
@@ -1772,25 +1796,25 @@ fn derive_id(seed: &str, now: SystemTime) -> String {
     hex::encode(&digest[..16])
 }
 
-/// A quota's `Utilization`: recorded usage / the value in force * 100, the formula the
-/// model's `UtilizationPct` documents.
+/// A quota's `Utilization`: the account's current usage / the value in force * 100, the
+/// formula the model's `UtilizationPct` documents.
 ///
 /// Service Quotas tracks a quota's usage through the CloudWatch usage metric that
-/// quota publishes, so a quota publishing NO usage metric has no usage source and its
-/// record carries no `Utilization` at all rather than a zero. For a quota that does
-/// publish one, the usage is what this service's state has recorded against it —
-/// nothing in this emulator consumes a quota, so that is zero — and the percentage is
-/// that usage over the value in force.
+/// quota publishes, so there are two reasons a record carries no `Utilization` at all
+/// rather than a number: the quota publishes NO usage metric, so there is nothing to
+/// count it by, or it publishes one no reader of [`usage`] can count, so this emulator
+/// holds no source for it. A reading of zero, on the other hand, is a measurement —
+/// the account holds none of what the quota permits — and is reported as 0 %.
 ///
 /// A value in force of zero (AWS publishes several, e.g. an opt-in instance family
-/// whose default is 0) is no denominator to divide by: with no usage recorded against
-/// it, none of what it permits is used, so its utilization is 0 %. Usage ABOVE a zero
-/// value in force would have no finite percentage, and nothing here can record usage,
-/// so that case reports nothing rather than an invented number.
-fn utilization_pct(default: &DefaultQuota, applied: f64) -> Option<f64> {
-    // No usage metric, no usage source, no percentage to report.
-    default.usage_metric.as_ref()?;
-    let usage = RECORDED_QUOTA_USAGE;
+/// whose default is 0) is no denominator to divide by: with nothing in use, none of
+/// what it permits is used, so its utilization is 0 %. Usage ABOVE a zero value in
+/// force has no finite percentage, so that case reports nothing rather than an invented
+/// number.
+fn utilization_pct(default: &DefaultQuota, applied: f64, usage: &QuotaUsage) -> Option<f64> {
+    // No usage metric, no usage source, no percentage to report — and the same for a
+    // metric nothing in this emulator can count.
+    let usage = usage.reading(default.usage_metric.as_ref()?)?;
     if applied <= 0.0 {
         return (usage <= 0.0).then_some(0.0);
     }
@@ -3431,20 +3455,16 @@ fn ec2_quotas() -> Vec<QuotaRow> {
     let mut rows = Vec::new();
 
     for group in VCPU_GROUPS {
-        // The `Class` dimension of the usage metric CloudWatch publishes for a vCPU
-        // quota is the group's token plus the purchase model it meters.
-        let on_demand_class = format!("{}/OnDemand", group.class);
-        let spot_class = format!("{}/Spot", group.class);
         let mut on_demand = quota(
             format!("Running On-Demand {} instances", group.group),
             group.default_vcpus,
         )
-        .metric(vcpu_usage_metric(&on_demand_class));
+        .metric(vcpu_usage_metric_for(group.class, PURCHASE_MODEL_ON_DEMAND));
         let mut spot = quota(
             format!("All {} Spot Instance Requests", group.group),
             group.default_vcpus,
         )
-        .metric(vcpu_usage_metric(&spot_class));
+        .metric(vcpu_usage_metric_for(group.class, PURCHASE_MODEL_SPOT));
         if let Some(code) = group.on_demand_code {
             on_demand = on_demand.code(code);
         }
@@ -3476,6 +3496,22 @@ fn vcpu_usage_metric(class: &str) -> MetricInfo {
         "EC2",
         &[("Class", class), ("Resource", "vCPU"), ("Type", "Resource")],
     )
+}
+
+/// The `AWS/Usage` metric of ONE vCPU quota group under ONE purchase model: the
+/// `Class` dimension of such a metric is the group's token plus the purchase model it
+/// meters.
+///
+/// It is the one construction of that metric, so the catalog row and the usage reading
+/// that fills it in ([`usage::measure`]) cannot disagree about which metric meters
+/// which group.
+pub(crate) fn vcpu_usage_metric_for(group_class: &str, purchase_model: &str) -> MetricInfo {
+    vcpu_usage_metric(&format!("{group_class}/{purchase_model}"))
+}
+
+/// The `Class` dimension token of every vCPU quota group this catalog meters.
+pub(crate) fn vcpu_group_classes() -> impl Iterator<Item = &'static str> {
+    VCPU_GROUPS.iter().map(|group| group.class)
 }
 /// The service catalog `ListServices` enumerates: every `(ServiceCode,
 /// ServiceName)` pair this emulator knows, and therefore every code
@@ -3851,19 +3887,7 @@ fn vpc_quotas() -> Vec<QuotaRow> {
         // metric, and a `Period`.
         quota("VPCs per Region", 5.0)
             .code("L-F678F1CE")
-            // The VPC resource counts CloudWatch publishes sit under the EC2 service
-            // dimension — VPC is served by the EC2 API — which is the dimension the
-            // recorded response for this quota carries. `Resource` is the dimension
-            // VALUE a client queries usage with, so it is the one CloudWatch
-            // publishes the count under (`VPCsPerRegion`), not the resource type.
-            .metric(usage_metric(
-                "EC2",
-                &[
-                    ("Class", "None"),
-                    ("Resource", "VPCsPerRegion"),
-                    ("Type", "Resource"),
-                ],
-            ))
+            .metric(vpcs_per_region_usage_metric())
             .period(5, "MINUTE")
             .describe(
                 "The maximum number of VPCs per Region. This quota is directly tied to the \
@@ -3946,6 +3970,28 @@ fn aws_usage_metric(
 /// statistic recommended for it.
 fn usage_metric(service: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
     aws_usage_metric("ResourceCount", "Maximum", service, dimensions)
+}
+
+/// The `AWS/Usage` metric CloudWatch publishes the account's VPC count under, which is
+/// the usage metric of the `VPCs per Region` quota.
+///
+/// The VPC resource counts CloudWatch publishes sit under the EC2 service dimension —
+/// VPC is served by the EC2 API — which is the dimension the recorded response for that
+/// quota carries. `Resource` is the dimension VALUE a client queries usage with, so it
+/// is the one CloudWatch publishes the count under (`VPCsPerRegion`), not the resource
+/// type.
+///
+/// It is the one construction of that metric, so the catalog row and the usage reading
+/// that fills it in ([`usage::measure`]) cannot disagree about it.
+pub(crate) fn vpcs_per_region_usage_metric() -> MetricInfo {
+    usage_metric(
+        "EC2",
+        &[
+            ("Class", "None"),
+            ("Resource", "VPCsPerRegion"),
+            ("Type", "Resource"),
+        ],
+    )
 }
 
 /// The `UsageMetric` of an API REQUEST-RATE quota: the `AWS/Usage` `CallCount`

@@ -88,8 +88,8 @@ use std::collections::BTreeSet;
 use std::time::SystemTime;
 
 use crate::state::{
-    domain_does_not_exist, domain_not_found, package_named_twice, AssociationRefusal,
-    AssociationRequest, Package,
+    domain_does_not_exist, domain_not_found, package_named_twice, package_not_found,
+    AssociationRefusal, AssociationRequest, Package,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -193,16 +193,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `PackageList` carries no length constraint, so how many entries it holds is
+        // the caller's: each is checked as it is READ and the pass refuses at the first
+        // entry it cannot serve, so nothing here walks or is sized by the whole list.
+        // Every entry the pass admits names a DISTINCT package the store holds, so the
+        // work and the records kept are bounded by the store — a request naming more
+        // than the account holds is refused by the entry that repeats a package or
+        // names one that does not exist, which is the same refusal the per-package
+        // decision below makes.
+        //
         // A domain holds ONE association per package, so the same package cannot be
         // named twice by one call: that request asks for two states of one
         // association. The set is also what satisfies a prerequisite the call
-        // associates "simultaneously with the package association".
+        // associates "simultaneously with the package association", which is why the
+        // whole request is read before any entry is planned.
         let mut requested: BTreeSet<String> = BTreeSet::new();
-        let mut asked: Vec<AssociationRequest> = Vec::with_capacity(input.package_list.len());
+        let mut asked: Vec<AssociationRequest> = Vec::new();
         for entry in &input.package_list {
             if !requested.insert(entry.package_id.clone()) {
                 return Err(AssociatePackagesErrorModeled::ValidationException(
                     package_named_twice("PackageList", &entry.package_id),
+                )
+                .into());
+            }
+            if !store.packages.contains_key(&entry.package_id) {
+                return Err(AssociatePackagesErrorModeled::ResourceNotFoundException(
+                    package_not_found(&entry.package_id),
                 )
                 .into());
             }
@@ -218,15 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // NOTHING is written until every package the call names can be associated, so
         // a refused request leaves the domain's associations as they were. The plan is
-        // bounded without a limit of its own: every entry must name a DISTINCT package
-        // the store holds, so a request can plan at most as many associations as the
-        // package store's own quota allows, and one that names more is refused at the
-        // first entry that repeats or resolves to nothing.
+        // bounded by the pass above — at most one entry per package the store holds —
+        // so neither this allocation nor the pass over the entries is sized by the
+        // request body.
         //
         // Each entry is decided by the one shared decision this service makes about
         // linking a package to a domain, so this call and the one that links a single
         // package cannot refuse the same request differently.
-        let mut planned: Vec<Package> = Vec::with_capacity(asked.len());
+        let mut planned: Vec<Package> = Vec::new();
         for request in &asked {
             planned.push(
                 store

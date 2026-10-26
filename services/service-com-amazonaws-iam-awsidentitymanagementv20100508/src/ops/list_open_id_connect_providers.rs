@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOpenIDConnectProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOpenIDConnectProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOpenIDConnectProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every IAM OpenID Connect provider resource object the account holds, each as
+//! the subset of its attributes `OpenIDConnectProviderListEntry` carries: the ARN that
+//! names it. A pure read — the records `CreateOpenIDConnectProvider` persisted are what it
+//! reports, and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOpenIDConnectProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOpenIDConnectProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The request carries no members at all, so the whole answer is read out of the
+        // account's state: the model declares an empty input for this operation
+        // (`smithy_query(query="operation", operation="ListOpenIDConnectProviders")`), so
+        // there is nothing to filter or page by. `ctx` carries the request metadata the
+        // authorization decision below resolves the calling principal from.
+        let _ = &input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListOpenIDConnectProvidersErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A read: it reports the providers the account persists and writes nothing, so a
+        // later caller sees exactly what this one did.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any provider is reported, so a caller that may not make this
+        // call learns that rather than learning which providers the account holds. The
+        // request names no provider, so the resource the decision is made on — and the one
+        // the refusal names — is EVERY provider in the account: the `oidc-provider` ARN
+        // with its name a wildcard.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_OPEN_ID_CONNECT_PROVIDERS,
+            &crate::state::open_id_connect_provider_arn(
+                crate::state::ANY_OPEN_ID_CONNECT_PROVIDER,
+            ),
+        )?;
+
+        // The providers are keyed by the ARN `CreateOpenIDConnectProvider` derived from
+        // each URL, so enumerating the map reports every held provider exactly once in a
+        // total, stable order.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOpenIDConnectProviders"))
+        // "IAM resource-listing operations return a subset of the available attributes for
+        // the resource. For example, this operation does not return tags": the subset is
+        // what `OpenIDConnectProviderListEntry` declares (`smithy_query(query="shape",
+        // shape="OpenIDConnectProviderListEntry")`) — the ARN alone — taken from the key
+        // the record is held under, which is the handle `GetOpenIDConnectProvider` reads
+        // the same provider back by.
+        let open_id_connect_provider_list: Vec<OpenIDConnectProviderListEntry> = store
+            .open_id_connect_providers
+            .keys()
+            .map(|arn| OpenIDConnectProviderListEntry {
+                arn: Some(arn.clone()),
+            })
+            .collect();
+
+        // The list is this operation's whole answer, so an account holding no provider is
+        // reported as an EMPTY list rather than an absent member.
+        Ok(ListOpenIDConnectProvidersOutput {
+            open_id_connect_provider_list: Some(open_id_connect_provider_list),
+        })
     }
 }

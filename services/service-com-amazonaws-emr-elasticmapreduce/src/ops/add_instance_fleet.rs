@@ -163,14 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Everything the refusals below turn on, read once off the resolved cluster;
         // `cluster_mut` also materialises the transitions the clock already made due.
+        //
+        // `AddInstanceFleet` reaches the cluster as a JOB FLOW — "The unique identifier
+        // of the cluster", which `AddInstanceGroups` and the other legacy operations
+        // call a job flow id — and that surface words its unknown-id refusal without
+        // naming the id.
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(format!(
-                        "Cluster id '{}' is not valid or does not exist.",
-                        input.cluster_id
-                    )),
+                    message: Some(crate::state::unknown_job_flow_message()),
                 },
             )
             .into());

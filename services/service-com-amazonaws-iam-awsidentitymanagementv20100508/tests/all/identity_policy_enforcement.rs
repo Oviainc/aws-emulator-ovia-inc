@@ -62,7 +62,10 @@ fn allow_all_three() -> String {
 }
 
 /// A one-statement document with `effect` on `action` over `resource`.
-fn statement(effect: &str, action: &str, resource: &str) -> String {
+///
+/// `pub(crate)` because every suite that drives a signed call against this service's
+/// authorization builds its documents one way.
+pub(crate) fn statement(effect: &str, action: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Action":"{action}","Resource":"{resource}"}}]}}"#
     )
@@ -288,7 +291,10 @@ fn cases() -> Vec<Case> {
 
 /// Create a user holding `policies`, and answer the access key id a request signs with
 /// to speak for it.
-async fn principal(
+///
+/// `pub(crate)` because every suite that drives a signed call needs the same fixture
+/// principal.
+pub(crate) async fn principal(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,

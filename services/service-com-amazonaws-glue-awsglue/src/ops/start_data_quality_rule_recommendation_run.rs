@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDataQualityRuleRecommendationRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDataQualityRuleRecommendationRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDataQualityRuleRecommendationRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a rule recommendation run over one data source (a catalog table): the run is
+//! recorded in [`crate::state`] under a freshly minted `RunId`, and that id is what this
+//! answers with. `GetDataQualityRuleRecommendationRun` then reports the run until it
+//! reaches a terminal `TaskStatusType`.
+//!
+//! The run is recorded in `STARTING`, and the clock owes it its terminal status one span
+//! later ([`crate::state::DATA_QUALITY_RULE_RECOMMENDATION_RUN_SETTLES_AFTER`]) — so a
+//! caller that reads the run straight after this call still sees it in flight, and a
+//! second start for the same data source while that run is in flight is refused with the
+//! operation's modelled `ConflictException`. A `ClientToken` stands for ONE
+//! start, so a start repeating one an earlier start already used is refused as the
+//! duplicate it is and records no second run, which is what that member is "used for
+//! idempotency" for.
+//!
+//! What the run's `CreatedRulesetName` names is recorded on the run and reported with it;
+//! REGISTERING that ruleset belongs with the ruleset surface itself
+//! (`CreateDataQualityRuleset`, still a scaffold with its own open issue), so nothing here
+//! refuses a name on the strength of a ruleset store that does not exist yet.
+//!
+//! The covered table is NOT required to exist for the run to be accepted: this operation
+//! models no `EntityNotFoundException` (unlike `StartDataQualityRulesetEvaluationRun`,
+//! which models one for its rulesets), so a data source the catalog holds nothing for is
+//! recorded and the run FAILS when the clock settles it, carrying the catalog's own miss
+//! as its `ErrorString`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +183,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDataQualityRuleRecommendationRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDataQualityRuleRecommendationRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDataQualityRuleRecommendationRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server-side store fault of its own, so an
+            // unreachable store is reported as its timeout error, the way the catalog's
+            // other handlers report it.
+            return Err(StartDataQualityRuleRecommendationRunErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `DataSource` and `Role` are `@required` and every modelled constraint is refused
+        // at the boundary, so the only question about the input here is whether its
+        // `DataSource` addresses a table at all: both of its members are optional.
+        let Some(table) = crate::state::data_source_table(&input.data_source) else {
+            return Err(
+                StartDataQualityRuleRecommendationRunErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::DATA_SOURCE_REQUIRES_A_TABLE.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let catalog_id = crate::state::resolve_catalog_id(table.catalog_id.as_ref());
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock already owed the stored runs is materialised before they
+        // are consulted, so a run the clock has already finished does not count as one in
+        // flight and does not hold a ruleset name it never created.
+        store.settle_due_data_quality_rule_recommendation_runs(now);
+
+        // A `ClientToken` stands for ONE start: "used for idempotency and is recommended to
+        // be set to a random ID (such as a UUID) to avoid creating or starting multiple
+        // instances of the same resource". So a start carrying a token an earlier start
+        // already used is answered as the duplicate it is, before anything else is
+        // considered, and starts no second run.
+        if let Some(token) = input.client_token.as_deref() {
+            if store
+                .data_quality_rule_recommendation_run_of_client_token(token)
+                .is_some()
+            {
+                return Err(conflict(
+                    crate::state::messages::idempotent_start_with_token(token),
+                ));
+            }
+        }
+
+        // One recommendation run per data source at a time: the recommendations of ONE
+        // table are what a run computes, so a run in flight for this table is what blocks
+        // another, and a run for any other table does not. The refusal names the table as
+        // THIS request spelled it, not as the catalog folded the run that blocks it.
+        if store
+            .running_data_quality_rule_recommendation_run(
+                &catalog_id,
+                &table.database_name,
+                &table.table_name,
+            )
+            .is_some()
+        {
+            return Err(conflict(
+                crate::state::messages::data_quality_run_already_running(
+                    &table.database_name,
+                    &table.table_name,
+                ),
+            ));
+        }
+
+        // The id is minted only once the request is going to be served, so a refusal above
+        // hands out none.
+        let run_id = crate::state::new_data_quality_rule_recommendation_run_id();
+        let run = crate::state::DataQualityRuleRecommendationRunEntry::start(
+            &input,
+            &table,
+            &catalog_id,
+            run_id.clone(),
+            now,
+        );
+        store.record_data_quality_rule_recommendation_run(run);
+        ::tracing::info!(
+            operation = "StartDataQualityRuleRecommendationRun",
+            database = %table.database_name,
+            table = %table.table_name,
+            run = %run_id,
+            "started a Glue data quality rule recommendation run"
+        );
+
+        Ok(StartDataQualityRuleRecommendationRunOutput {
+            // "The unique run identifier associated with this run."
+            run_id: Some(run_id),
+        })
     }
+}
+
+/// This operation's modelled refusal of a start the store cannot take another run for.
+fn conflict(message: String) -> StartDataQualityRuleRecommendationRunError {
+    StartDataQualityRuleRecommendationRunErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+    })
+    .into()
 }

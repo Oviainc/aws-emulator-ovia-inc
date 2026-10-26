@@ -52,7 +52,7 @@ pub mod request_id_header;
 
 use request_id_header::RequestIdHeaderOperation;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -81,7 +81,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
-    fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
+    fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.

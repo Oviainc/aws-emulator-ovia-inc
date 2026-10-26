@@ -51,6 +51,8 @@ mod compliance_status;
 mod discovered_resources;
 #[path = "all/error_message_members.rs"]
 mod error_message_members;
+#[path = "all/get_admin_scope_lifecycle_status.rs"]
+mod get_admin_scope_lifecycle_status;
 #[path = "all/list_tags_across_administrator_states.rs"]
 mod list_tags_across_administrator_states;
 #[path = "all/managed_list_deletion.rs"]

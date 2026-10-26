@@ -493,6 +493,16 @@ pub const CAPACITY_TASK_COMPLETED: &str = "COMPLETED";
 /// The terminal `CapacityTaskStatus` of a task that could not be completed.
 pub const CAPACITY_TASK_FAILED: &str = "FAILED";
 
+/// The `CapacityTaskStatus` a cancelled capacity task holds while the service
+/// cleans up after it — the model's "the capacity task has been cancelled and is in
+/// the process of cleaning up resources".
+///
+/// It is NOT terminal: the task is one Amazon Web Services Outposts is still working
+/// through, so it is still ACTIVE on its Outpost, and it settles in
+/// [`CAPACITY_TASK_CANCELLED`] one [`CAPACITY_TASK_STEP`] later
+/// ([`capacity_task_cancellation`]).
+pub const CAPACITY_TASK_CANCELLATION_IN_PROGRESS: &str = "CANCELLATION_IN_PROGRESS";
+
 /// The terminal `CapacityTaskStatus` of a cancelled task.
 pub const CAPACITY_TASK_CANCELLED: &str = "CANCELLED";
 
@@ -520,8 +530,9 @@ pub const CAPACITY_TASK_TERMINAL: &[&str] = &[
 //   started, so `Failed` stays absent rather than carrying an invented reason. The
 //   one verdict this service does reach is the DRY RUN's, which is not a task at all
 //   ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
-// * `CANCELLATION_IN_PROGRESS` and `CANCELLED` belong to `CancelCapacityTask`,
-//   which is still a scaffold stub.
+// * `CANCELLATION_IN_PROGRESS` and `CANCELLED` are reached only by CANCELLING a
+//   task ([`CapacityTaskRecord::cancel`]), never by the progression a start owes
+//   the clock ([`capacity_task_progression`]).
 
 /// The `CapacityTaskFailureType` of a capacity configuration the hardware it is
 /// asked of cannot be configured with, from the modelled value set
@@ -606,6 +617,37 @@ impl CapacityTaskRecord {
     pub fn is_active(&self) -> bool {
         !CAPACITY_TASK_TERMINAL.contains(&self.status.as_str())
     }
+
+    /// Whether this task can still be CANCELLED.
+    ///
+    /// A cancellation takes effect while Amazon Web Services Outposts has neither
+    /// begun carrying the task out nor finished with it, which is what the modelled
+    /// `CapacityTaskStatus` values say of themselves: `IN_PROGRESS` is "the capacity
+    /// task is running and cannot be cancelled", a task in a terminal status
+    /// ([`CAPACITY_TASK_TERMINAL`]) has nothing left to cancel, and one already
+    /// cancelled is being cleaned up
+    /// ([`CAPACITY_TASK_CANCELLATION_IN_PROGRESS`]) so there is nothing a second
+    /// cancellation would change. Every other status is one the task is still
+    /// awaiting a step in, and a cancellation is what it answers.
+    pub fn is_cancellable(&self) -> bool {
+        self.is_active()
+            && self.status != CAPACITY_TASK_IN_PROGRESS
+            && self.status != CAPACITY_TASK_CANCELLATION_IN_PROGRESS
+    }
+
+    /// Cancel this task: what `CancelCapacityTask` leaves behind.
+    ///
+    /// The task moves to [`CAPACITY_TASK_CANCELLATION_IN_PROGRESS`] — cancelled, and
+    /// being cleaned up — and the progression the clock still owed it is REPLACED by
+    /// the one a cancellation owes ([`capacity_task_cancellation`]), so a cancelled
+    /// task never goes on to complete and settles in [`CAPACITY_TASK_CANCELLED`]
+    /// instead. `CompletionDate` is "the date the capacity task ran successfully", so
+    /// a cancellation leaves it exactly as it was: nothing ran.
+    pub fn cancel(&mut self, now: std::time::SystemTime) {
+        self.status = CAPACITY_TASK_CANCELLATION_IN_PROGRESS.to_string();
+        self.last_modified_at = now;
+        self.pending = capacity_task_cancellation(now);
+    }
 }
 
 /// The transitions a capacity task started at `now` owes the clock: one
@@ -615,16 +657,42 @@ impl CapacityTaskRecord {
 /// the one the task holds at the instant it is asked for — the same answer whether
 /// or not anybody polled in between.
 pub fn capacity_task_progression(now: std::time::SystemTime) -> VecDeque<CapacityTaskTransition> {
+    capacity_task_steps(now, &[CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_COMPLETED])
+}
+
+/// The transitions a capacity task cancelled at `now` owes the clock: one
+/// [`CAPACITY_TASK_STEP`] of cleaning up, and then `CANCELLED`.
+///
+/// The same rule [`capacity_task_progression`] follows, for the other course a task
+/// can take: a cancelled task is cleaning up resources
+/// ([`CAPACITY_TASK_CANCELLATION_IN_PROGRESS`]) and settles in
+/// [`CAPACITY_TASK_CANCELLED`] when that step falls due, so a caller reading straight
+/// after the cancellation still observes the transient status.
+pub fn capacity_task_cancellation(now: std::time::SystemTime) -> VecDeque<CapacityTaskTransition> {
+    capacity_task_steps(now, &[CAPACITY_TASK_CANCELLED])
+}
+
+/// The transitions through `statuses`, each one [`CAPACITY_TASK_STEP`] after the
+/// last, counted from `now`.
+///
+/// Both courses a task can take are built here, so neither can disagree with the
+/// other about when a step falls due or about the two clocks a transition carries:
+/// the monotonic instant nothing ever sleeps for, and the wall clock the change is
+/// dated at.
+fn capacity_task_steps(
+    now: std::time::SystemTime,
+    statuses: &[&str],
+) -> VecDeque<CapacityTaskTransition> {
     let started = std::time::Instant::now();
-    [CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_COMPLETED]
-        .into_iter()
+    statuses
+        .iter()
         .enumerate()
         .map(|(step, status)| {
             let elapsed = CAPACITY_TASK_STEP * (u32::try_from(step).unwrap_or(0) + 1);
             CapacityTaskTransition {
                 due: started + elapsed,
                 at: now + elapsed,
-                status: status.to_string(),
+                status: (*status).to_string(),
             }
         })
         .collect()
@@ -4437,6 +4505,22 @@ pub fn quote_status_conflict(quote_id: &str, status: &str) -> String {
 /// ran to its end.
 pub fn order_status_conflict(order_id: &str, status: &str) -> String {
     format!("order {order_id} cannot be cancelled, which is {status}")
+}
+
+/// How this service states that a capacity task cannot be cancelled, because of the
+/// status it is in.
+///
+/// A task is cancelled while Amazon Web Services Outposts has not begun carrying it
+/// out and has not finished with it ([`CapacityTaskRecord::is_cancellable`]); in any
+/// other status there is nothing a cancellation would change, and reporting a success
+/// would say the call changed something it did not. AWS publishes no wording for the
+/// refusal, so the sentence is the emulator's own, worded by the same rule as
+/// [`order_status_conflict`]: what a caller branches on is the modelled
+/// `ConflictException` code (HTTP 409) and the `ResourceId` / `ResourceType` naming
+/// the resource the task belongs to, while the message names the task and the status
+/// it is in, so the caller can tell a running task from one already finished.
+pub fn capacity_task_status_conflict(capacity_task_id: &str, status: &str) -> String {
+    format!("capacity task {capacity_task_id} cannot be cancelled, which is {status}")
 }
 
 /// The report a `ResourceArn` that is not an Outposts resource ARN states for a

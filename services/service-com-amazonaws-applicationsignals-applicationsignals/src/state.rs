@@ -3155,13 +3155,13 @@ impl InstrumentationConfigurationSet {
     }
 }
 
-/// A status event's key within one configuration's history: the instant it was reported for,
-/// then the status reported at that instant.
+/// A status event's key within one configuration's history: the MINUTE it was reported for
+/// ([`status_event_minute`]), then the status reported in that minute.
 ///
 /// Time first, so the ordered map is a chronology a read walks backwards ("sorted with the
 /// most recent first") and the oldest event is the one the cap drops. The status is part of
-/// the key because one instant can carry one event per status, and because a repeated report
-/// of the SAME status at the SAME instant is the same event: the operation is `@idempotent`,
+/// the key because one minute can carry one event per status, and because a repeated report
+/// of the SAME status for the SAME minute is the same event: the operation is `@idempotent`,
 /// so re-reporting one must not add a second event.
 type StatusEventKey = (i64, u32, String);
 
@@ -3179,9 +3179,11 @@ impl InstrumentationStatusHistory {
     /// Record that this configuration was in `status` at `at`, with the `error_cause` the
     /// report carried.
     ///
-    /// Recording the same status at the same instant again REPLACES the event rather than
-    /// adding one, which is what makes a repeated report of one event a no-op. Once the
-    /// history is at its cap the oldest event it holds is dropped.
+    /// The event is recorded for the MINUTE the report names ([`status_event_minute`]), so
+    /// recording the same status for the same minute again REPLACES the event rather than
+    /// adding one: that is what makes a repeated report of one event a no-op, and what makes
+    /// two reports of one status inside a minute one event. Once the history is at its cap the
+    /// oldest event it holds is dropped.
     fn record(&mut self, status: &str, at: &DateTime, error_cause: Option<&str>) {
         self.events.insert(
             status_event_key(status, at),
@@ -3205,6 +3207,10 @@ impl InstrumentationStatusHistory {
     /// One page of the events [`StatusEventQuery`] asks for, most recent first, together with
     /// the instant of the last event it reported when a further page remains (`None` once the
     /// page is the last one).
+    ///
+    /// An event is held — and so reported — at the minute it was recorded for, which is the
+    /// instant the window selects it by: the bounds the request names are its own exact
+    /// instants, so a window answers for the events whose recorded minute falls inside it.
     ///
     /// The window is inclusive at both ends: an event is reported for an instant, and an
     /// instant the caller names as a bound is part of the range it asks about. At most
@@ -3264,9 +3270,35 @@ pub struct StatusEventQuery {
     pub page_size: usize,
 }
 
-/// The [`StatusEventKey`] of `status` at `at`.
+/// The [`StatusEventKey`] of `status` reported for `at`, which is the key of the MINUTE `at`
+/// falls on ([`status_event_minute`]).
 fn status_event_key(status: &str, at: &DateTime) -> StatusEventKey {
-    (at.secs(), at.subsec_nanos(), status.to_string())
+    let (secs, subsec_nanos) = status_event_minute(at);
+    (secs, subsec_nanos, status.to_string())
+}
+
+/// How many seconds make a minute, the granularity a reported status event is recorded at.
+const SECONDS_PER_MINUTE: i64 = 60;
+
+/// The minute `at` belongs to: the whole minute NEAREST it, carrying no subsecond part.
+///
+/// `InstrumentationStatusEvent.Time` is "The time when the status was reported, rounded to the
+/// nearest minute", so the instant an event is HELD at is a minute boundary rather than the
+/// instant the report carried — which is also why two reports of one status inside a minute
+/// are one event (see [`InstrumentationStatusHistory::record`]).
+///
+/// An instant exactly half a minute from both neighbouring boundaries is a tie, and goes to
+/// the LATER one; the subsecond part can only move an instant further from the earlier
+/// boundary, so it never decides which boundary is nearest except at that tie.
+fn status_event_minute(at: &DateTime) -> StatusEventInstant {
+    let (secs, _) = status_event_instant(at);
+    let shifted = secs.saturating_add(SECONDS_PER_MINUTE / 2);
+    (
+        shifted
+            .div_euclid(SECONDS_PER_MINUTE)
+            .saturating_mul(SECONDS_PER_MINUTE),
+        0,
+    )
 }
 
 /// One instant of a status chronology, to the precision a `Timestamp` carries: whole seconds
@@ -3609,9 +3641,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     ///
     /// `false` — and nothing recorded — when the scope holds no configuration at that
     /// location: a status event is reported AGAINST a configuration, so there is nothing for
-    /// one naming no configuration to be recorded against. Recording the same status at the
-    /// same instant again replaces the event rather than adding one, so repeating a report
-    /// changes nothing further.
+    /// one naming no configuration to be recorded against. The event is recorded for the
+    /// MINUTE `at` falls on ([`status_event_minute`]), so recording the same status for that
+    /// minute again replaces the event rather than adding one — repeating a report changes
+    /// nothing further, and two reports of one status inside a minute are one event.
     pub fn record_instrumentation_status(
         &mut self,
         scope: &InstrumentationScope,

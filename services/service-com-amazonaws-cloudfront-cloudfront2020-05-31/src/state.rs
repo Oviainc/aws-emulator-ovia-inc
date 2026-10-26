@@ -3452,11 +3452,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// multi-tenant distribution reports in place of an edge domain, not a name that
     /// resolves anywhere.
     pub fn resolved_cloudfront_endpoint(&self, name: &str) -> Option<String> {
-        if let Some(group) = self
-            .connection_groups
-            .values()
-            .find(|group| same_domain(&group.routing_endpoint, name))
-        {
+        if let Some(group) = self.connection_group_by_routing_endpoint(name) {
             return Some(group.routing_endpoint.clone());
         }
         if let Some(distribution) = self.distributions.values().find(|distribution| {
@@ -3579,6 +3575,23 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.connection_groups
             .values()
             .find(|group| group.name == name)
+    }
+
+    /// The connection group whose STORED routing endpoint is `endpoint`, or `None` when
+    /// none is.
+    ///
+    /// `ConnectionGroup$RoutingEndpoint` is "the routing endpoint (also known as the DNS
+    /// name) that is assigned to the connection group", and this service assigns a fresh
+    /// one to each group, so at most one group answers. The comparison is the one every
+    /// DNS name in this store is compared by ([`same_domain`]): a name is the same name in
+    /// any case.
+    pub fn connection_group_by_routing_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> Option<&StoredConnectionGroup> {
+        self.connection_groups
+            .values()
+            .find(|group| same_domain(&group.routing_endpoint, endpoint))
     }
 
     /// The response headers policy `id` names, or `None` when the store holds none.
