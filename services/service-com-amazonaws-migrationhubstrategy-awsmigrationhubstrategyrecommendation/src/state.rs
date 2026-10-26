@@ -335,6 +335,24 @@ pub struct ImportTaskPage {
 /// is taken.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
+/// How many records the page a `maxResults` asks for holds, as [`MAX_LIST_PAGE_SIZE`]'s rule
+/// decides it — the ONE place this service decides it, for every list it serves.
+///
+/// An absent `maxResults` takes the documented maximum; a value inside
+/// `1..=`[`MAX_LIST_PAGE_SIZE`] is taken as asked; anything else is refused with
+/// [`invalid_request_body`] rather than silently clamped, so a caller that asked for more
+/// than the service gives has to learn it cannot have it. Each operation lifts that
+/// `ValidationException` into its own error channel.
+pub fn page_size(max_results: Option<i32>) -> Result<usize, ValidationException> {
+    let requested = max_results.unwrap_or(MAX_LIST_PAGE_SIZE);
+    if !(1..=MAX_LIST_PAGE_SIZE).contains(&requested) {
+        return Err(invalid_request_body());
+    }
+    // An accepted value is inside 1..=MAX_LIST_PAGE_SIZE, so the conversion is infallible
+    // here; refusing the impossible case keeps it from inventing a page size of its own.
+    usize::try_from(requested).map_err(|_| invalid_request_body())
+}
+
 /// The marker a `ListImportFileTask` cursor carries, so a token minted elsewhere (or
 /// invented by a caller) is recognised as foreign rather than resolved against this
 /// store.
@@ -489,30 +507,19 @@ pub struct ListPage {
     pub resume_at: Option<String>,
 }
 
-/// Hold `maxResults` to the documented maximum and `nextToken` to a token the list owning
-/// `marker` issued for THIS selection.
-///
-/// Every `maxResults` of this service is documented "The maximum number of items to include
-/// in the response. The maximum value is 100" ([`MAX_LIST_PAGE_SIZE`]) and its target shape
-/// carries no `@range`, so a request past that bound (or one asking for a page of nothing)
-/// is refused here rather than silently clamped: a caller that asked for more than the
-/// service gives has to learn it cannot have it. An absent `maxResults` takes the documented
-/// maximum.
+/// Hold `maxResults` to the documented maximum, through the service's one [`page_size`]
+/// decision, and `nextToken` to a token the list owning `marker` issued for THIS selection.
 ///
 /// The refusals are this service's two `ValidationException` sentences — an unusable value
-/// ([`invalid_request_body`]) and an unresolvable one ([`page_token_not_accepted`]) — which
-/// each operation lifts into its own error channel.
+/// ([`invalid_request_body`], through [`page_size`]) and an unresolvable one
+/// ([`page_token_not_accepted`]) — which each operation lifts into its own error channel.
 pub fn list_page(
     max_results: Option<i32>,
     next_token: Option<String>,
     marker: &str,
     selection: &str,
 ) -> Result<ListPage, ValidationException> {
-    let size = match max_results {
-        None => MAX_LIST_PAGE_SIZE,
-        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-        Some(_) => return Err(invalid_request_body()),
-    };
+    let size = page_size(max_results)?;
     let resume_at = match next_token {
         None => None,
         Some(token) => {
@@ -524,10 +531,7 @@ pub fn list_page(
             Some(cursor.resume_at)
         }
     };
-    Ok(ListPage {
-        size: usize::try_from(size).unwrap_or(0),
-        resume_at,
-    })
+    Ok(ListPage { size, resume_at })
 }
 
 /// The (criteria, value) pair a list request filters on, or `None` when it filters nothing.
@@ -1886,12 +1890,7 @@ impl RegionState {
         max_results: Option<i32>,
         now: SystemTime,
     ) -> Result<ImportTaskPage, ValidationException> {
-        let limit = match max_results {
-            None => MAX_LIST_PAGE_SIZE,
-            Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-            Some(_) => return Err(invalid_request_body()),
-        };
-        let limit = usize::try_from(limit).unwrap_or(1);
+        let limit = page_size(max_results)?;
 
         let after = match next_token {
             Some(token) => {
@@ -1940,12 +1939,7 @@ impl RegionState {
         next_token: Option<&str>,
         max_results: Option<i32>,
     ) -> Result<CollectorPage, ValidationException> {
-        let limit = match max_results {
-            None => MAX_LIST_PAGE_SIZE,
-            Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-            Some(_) => return Err(invalid_request_body()),
-        };
-        let limit = usize::try_from(limit).unwrap_or(1);
+        let limit = page_size(max_results)?;
 
         let after = match next_token {
             Some(token) => {

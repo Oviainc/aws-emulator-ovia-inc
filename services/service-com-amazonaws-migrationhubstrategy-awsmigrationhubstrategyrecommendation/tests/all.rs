@@ -62,6 +62,9 @@ mod import_status_report;
 #[path = "all/input_less_reads.rs"]
 mod input_less_reads;
 
+#[path = "all/page_size_bound.rs"]
+mod page_size_bound;
+
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 

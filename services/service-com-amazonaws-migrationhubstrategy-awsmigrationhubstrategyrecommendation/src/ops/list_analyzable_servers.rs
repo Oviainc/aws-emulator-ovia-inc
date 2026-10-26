@@ -81,8 +81,8 @@
 use super::types::*;
 
 use crate::state::{
-    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
-    ANALYZABLE_SERVER_PAGE_MARKER, MAX_LIST_PAGE_SIZE, SORT_ASCENDING, SORT_DESCENDING,
+    decode_page_token, encode_page_token, invalid_request_body, page_size,
+    page_token_not_accepted, ANALYZABLE_SERVER_PAGE_MARKER, SORT_ASCENDING, SORT_DESCENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -187,21 +187,16 @@ fn descending(sort: Option<&str>) -> Result<bool, ListAnalyzableServersError> {
 /// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
 /// issued for THIS order.
 ///
-/// `maxResults` is documented "The maximum number of items to include in the response. The
-/// maximum value is 100" and its target shape carries no `@range`, so a request past that
-/// bound (or one asking for a page of nothing) is refused here rather than silently
-/// clamped: a caller that asked for more than the service gives has to learn it cannot
-/// have it. An absent `maxResults` takes the documented maximum.
+/// The page size is the service's one [`crate::state::page_size`] decision — every
+/// `maxResults` this service takes documents the same bound — with its
+/// `ValidationException` lifted into this operation's error channel.
 fn page_of(
     max_results: Option<i32>,
     next_token: Option<String>,
     order: &str,
 ) -> Result<Page, ListAnalyzableServersError> {
-    let size = match max_results {
-        None => MAX_LIST_PAGE_SIZE,
-        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-        Some(_) => return Err(refused()),
-    };
+    let size =
+        page_size(max_results).map_err(ListAnalyzableServersErrorModeled::ValidationException)?;
     let resume_at = match next_token {
         None => None,
         Some(token) => {
@@ -212,10 +207,7 @@ fn page_of(
             Some(resume_at)
         }
     };
-    Ok(Page {
-        size: usize::try_from(size).unwrap_or(0),
-        resume_at,
-    })
+    Ok(Page { size, resume_at })
 }
 
 /// The `ListAnalyzableServers` operation.

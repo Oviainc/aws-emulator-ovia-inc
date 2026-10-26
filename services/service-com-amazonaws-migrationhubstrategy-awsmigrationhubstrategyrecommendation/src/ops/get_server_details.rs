@@ -89,8 +89,8 @@
 use super::types::*;
 
 use crate::state::{
-    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
-    server_not_found, MAX_LIST_PAGE_SIZE, SERVER_DETAIL_PAGE_MARKER,
+    decode_page_token, encode_page_token, page_size, page_token_not_accepted, server_not_found,
+    SERVER_DETAIL_PAGE_MARKER,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -166,12 +166,6 @@ impl Cursor {
     }
 }
 
-/// This operation's refusal of a request the model admits member by member but that it
-/// cannot act on, in the service's own wording.
-fn refused() -> GetServerDetailsError {
-    GetServerDetailsErrorModeled::ValidationException(invalid_request_body()).into()
-}
-
 /// This operation's refusal of a `nextToken` it cannot resolve, worded the way the service
 /// words any unresolvable parameter — the same refusal its sibling lists answer for a
 /// cursor of their own that resolves to nothing.
@@ -188,21 +182,15 @@ struct Page {
 /// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
 /// issued for THIS server.
 ///
-/// `maxResults` is documented "The maximum number of items to include in the response. The
-/// maximum value is 100" and its target shape carries no `@range`, so a request past that
-/// bound (or one asking for a page of nothing) is refused rather than silently clamped: a
-/// caller that asked for more than the service gives has to learn it cannot have it. An
-/// absent `maxResults` takes the documented maximum.
+/// The page size is the service's one [`crate::state::page_size`] decision — every
+/// `maxResults` this service takes documents the same bound — with its
+/// `ValidationException` lifted into this operation's error channel.
 fn page_of(
     max_results: Option<i32>,
     next_token: Option<&str>,
     server_id: &str,
 ) -> Result<Page, GetServerDetailsError> {
-    let size = match max_results {
-        None => MAX_LIST_PAGE_SIZE,
-        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
-        Some(_) => return Err(refused()),
-    };
+    let size = page_size(max_results).map_err(GetServerDetailsErrorModeled::ValidationException)?;
     let start = match next_token {
         None => 0,
         Some(token) => {
@@ -213,10 +201,7 @@ fn page_of(
             cursor.resume_at
         }
     };
-    Ok(Page {
-        size: usize::try_from(size).unwrap_or(0),
-        start,
-    })
+    Ok(Page { size, start })
 }
 
 /// The `GetServerDetails` operation.
