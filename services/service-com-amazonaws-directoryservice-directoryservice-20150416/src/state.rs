@@ -36,8 +36,8 @@
 //!   directory share and a stored schema extension.
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
-//!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListLogSubscriptions`,
-//!   `ListSchemaExtensions`,
+//!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListCertificates`,
+//!   `ListLogSubscriptions`, `ListSchemaExtensions`,
 //!   `ListTagsForResource`) issue and
 //!   resolve.
 //! * [`refusal`], the one place a modelled refusal of this service is built: every error
@@ -56,7 +56,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Assessment, AssessmentSummary, Attribute, Certificate, ClientAuthenticationSettingInfo,
+    Assessment, AssessmentSummary, Attribute, Certificate, CertificateInfo,
+    ClientAuthenticationSettingInfo,
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
     DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, LogSubscription,
     SchemaExtensionInfo, SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
@@ -807,6 +808,20 @@ impl CertificateRecord {
             client_cert_auth_settings: self.client_cert_auth_settings.clone(),
         }
     }
+
+    /// This registration as the modelled `CertificateInfo` structure: the "general
+    /// information about a certificate" a listing reports, which is this same stored
+    /// record narrowed to the members that shape declares — so a listed entry and a
+    /// described one can never disagree.
+    pub fn to_certificate_info(&self) -> CertificateInfo {
+        CertificateInfo {
+            certificate_id: Some(self.certificate_id.clone()),
+            common_name: self.common_name.clone(),
+            state: Some(self.state.clone()),
+            expiry_date_time: Some(as_timestamp(self.expires_at)),
+            r#type: Some(self.certificate_type.clone()),
+        }
+    }
 }
 
 /// What a registered certificate itself states: the values a handler must read out of
@@ -1112,7 +1127,8 @@ pub struct Directory {
     /// `ClientAuthenticationType`; `DescribeClientAuthenticationSettings` reports it.
     pub client_authentication_settings: BTreeMap<String, ClientAuthenticationSetting>,
     /// The certificates `RegisterCertificate` registered with this directory, keyed by
-    /// `CertificateId`; `DescribeCertificate` reports one. A certificate is registered
+    /// `CertificateId`; `DescribeCertificate` reports one and `ListCertificates` pages
+    /// over them all. A certificate is registered
     /// FOR a directory, so the registrations live on the directory record and deleting
     /// the directory takes them with it.
     pub certificates: BTreeMap<String, CertificateRecord>,
@@ -1205,6 +1221,15 @@ impl Directory {
     pub fn schema_extensions_in_creation_order(&self) -> Vec<&SchemaExtensionRecord> {
         let mut ordered: Vec<&SchemaExtensionRecord> = self.schema_extensions.values().collect();
         ordered.sort_by_key(|extension| extension.seq);
+        ordered
+    }
+
+    /// This directory's certificates in the order they were registered — the order
+    /// `ListCertificates` pages over, which the records' registration rank gives, since
+    /// they are keyed by id rather than by rank.
+    pub fn certificates_in_registration_order(&self) -> Vec<&CertificateRecord> {
+        let mut ordered: Vec<&CertificateRecord> = self.certificates.values().collect();
+        ordered.sort_by_key(|certificate| certificate.seq);
         ordered
     }
 

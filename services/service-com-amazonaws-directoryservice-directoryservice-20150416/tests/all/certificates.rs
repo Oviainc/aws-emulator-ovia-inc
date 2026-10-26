@@ -34,23 +34,26 @@ use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 /// `CertificateState` enum (`smithy_query(query="shape",shape="CertificateState")` lists
 /// `Registering`, `Registered`, `RegisterFailed`, `Deregistering`, `Deregistered`,
 /// `DeregisterFailed`).
-const STATE_REGISTERING: &str = "Registering";
-const STATE_REGISTERED: &str = "Registered";
+pub(crate) const STATE_REGISTERING: &str = "Registering";
+pub(crate) const STATE_REGISTERED: &str = "Registered";
 
 /// The values of the modelled `CertificateType` enum
 /// (`smithy_query(query="shape",shape="CertificateType")`), and the one a request that
 /// names none performs: "The default value is ClientLDAPS."
-const TYPE_CLIENT_LDAPS: &str = "ClientLDAPS";
-const TYPE_CLIENT_CERT_AUTH: &str = "ClientCertAuth";
+pub(crate) const TYPE_CLIENT_LDAPS: &str = "ClientLDAPS";
+pub(crate) const TYPE_CLIENT_CERT_AUTH: &str = "ClientCertAuth";
 
 /// This emulator's documented per-directory registration guard
 /// (`state::MAX_CERTIFICATES_PER_DIRECTORY`).
-const CERTIFICATE_GUARD: usize = 10;
+pub(crate) const CERTIFICATE_GUARD: usize = 10;
 
 /// A self-signed certificate, PEM-encoded, with `common_name` as its subject's common
 /// name (none at all when `common_name` is `None`) and `(year, month, day)` midnight UTC
 /// as its `notAfter` bound.
-fn certificate_pem(common_name: Option<&str>, not_after: (i32, u8, u8)) -> (String, i64) {
+pub(crate) fn certificate_pem(
+    common_name: Option<&str>,
+    not_after: (i32, u8, u8),
+) -> (String, i64) {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
         .expect("the certificate parameters are well formed");
     let mut subject = rcgen::DistinguishedName::new();
@@ -68,7 +71,7 @@ fn certificate_pem(common_name: Option<&str>, not_after: (i32, u8, u8)) -> (Stri
 }
 
 /// The modelled `CertificateId` pattern, `^c-[0-9a-f]{10}$`, as an assertion.
-fn assert_certificate_id(id: &str, case: &str) {
+pub(crate) fn assert_certificate_id(id: &str, case: &str) {
     let suffix = id.strip_prefix("c-").unwrap_or_default();
     assert!(
         suffix.len() == 10
@@ -80,7 +83,7 @@ fn assert_certificate_id(id: &str, case: &str) {
 }
 
 /// `RegisterCertificate` with `body`, asserting it was accepted and returning the id.
-async fn register(router: &MultiServiceRouter, body: Value, case: &str) -> String {
+pub(crate) async fn register(router: &MultiServiceRouter, body: Value, case: &str) -> String {
     let answer = ok(router, "RegisterCertificate", body, case).await;
     let id = string(&answer, "CertificateId", case);
     assert_certificate_id(&id, case);
@@ -88,7 +91,7 @@ async fn register(router: &MultiServiceRouter, body: Value, case: &str) -> Strin
 }
 
 /// The `Certificate` a `DescribeCertificate` answer reports.
-async fn describe(
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     directory_id: &str,
     certificate_id: &str,
@@ -113,7 +116,11 @@ fn epoch_seconds(at: SystemTime) -> f64 {
 
 /// A directory that is past the stage transition its create owes, so it is in service
 /// for the registrations the cases make.
-async fn directory_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+pub(crate) async fn directory_in_service(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) -> String {
     let id = create_directory(router, minimal_create(name), case).await;
     tokio::time::sleep(PAST_ONE_SPAN).await;
     id
