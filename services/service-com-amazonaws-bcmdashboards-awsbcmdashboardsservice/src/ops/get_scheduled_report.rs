@@ -12,8 +12,7 @@
 //! answers).
 //!
 //! Implemented alongside `CreateScheduledReport` so a create can be proved by reading
-//! the resource back; `UpdateScheduledReport` and `DeleteScheduledReport` remain
-//! scaffolds with their own issues.
+//! the resource back; `UpdateScheduledReport` remains a scaffold with its own issue.
 //!
 //! ## Shape of an operation
 //!

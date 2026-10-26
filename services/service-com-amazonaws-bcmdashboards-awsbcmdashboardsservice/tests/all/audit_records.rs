@@ -466,6 +466,53 @@ async fn scheduled_report_create_retries_are_audited_by_what_they_change() {
     );
 }
 
+/// `DeleteScheduledReport` accounts for itself the way every state-changing operation of
+/// this service does: the delete that removed a report leaves one record naming it with a
+/// SUCCESS outcome, and the refusal of an ARN no report is stored under leaves one naming
+/// the requested ARN with the modelled error as its outcome — including the repeat of a
+/// delete that already succeeded, which this operation refuses rather than replaying.
+#[tokio::test]
+async fn scheduled_report_deletes_are_audited() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "AuditDeleteSource").await;
+    let doomed = create_report(&router, &dashboard_arn, "Audited Doomed", None, None).await;
+
+    {
+        let (capture, _guard) = capture_events();
+        ok_call(
+            &router,
+            "DeleteScheduledReport",
+            &json!({"arn": doomed}),
+        )
+        .await;
+        assert_record(
+            &capture.record_for("DeleteScheduledReport"),
+            "DeleteScheduledReport",
+            &doomed,
+            "SUCCESS",
+        );
+    }
+
+    let absent = "arn:aws:bcm-dashboards::000000000000:scheduled-report/never-created";
+    for (label, arn) in [
+        ("the repeat of a delete that succeeded", doomed.as_str()),
+        ("an arn no report was ever stored under", absent),
+    ] {
+        let (capture, _guard) = capture_events();
+        let (status, body) = call(&router, "DeleteScheduledReport", &json!({"arn": arn})).await;
+        assert_eq!(
+            status, 400,
+            "case {label}: expected 400, got {status}: {body}"
+        );
+        assert_record(
+            &capture.record_for("DeleteScheduledReport"),
+            "DeleteScheduledReport",
+            arn,
+            "ResourceNotFoundException",
+        );
+    }
+}
+
 /// `ExecuteScheduledReport` accounts for itself: the execution it triggers and each
 /// refusal it answers leave one record naming the report and the outcome, while the two
 /// calls that change nothing — the dry run and the idempotent retry — leave none.

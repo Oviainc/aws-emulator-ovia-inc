@@ -36,11 +36,11 @@ use super::scheduled_report_lifecycle::EXECUTION_ROLE_ARN;
 /// The wire error code every not-found answer of this service carries, on every operation
 /// — the same code the modelled `com.amazonaws.bcmdashboards#ResourceNotFoundException`
 /// puts on the wire.
-const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+pub(crate) const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// The HTTP status the recorded service answers a not-found with (the model says 404; the
 /// wire record says 400, and the wire record is what a client sees).
-const NOT_FOUND_STATUS: u16 = 400;
+pub(crate) const NOT_FOUND_STATUS: u16 = 400;
 
 /// One operation that resolves an ARN against the stored resources, and how a request to
 /// it is built.
@@ -60,7 +60,9 @@ struct Reader {
 /// Every operation of this service whose handler resolves an ARN against stored state.
 /// `DeleteDashboard` is absent because it models no not-found error at all: it reports the
 /// post-condition and answers an absent ARN with a 200 no-op (pinned by
-/// `dashboard_lifecycle` and `delete_dashboard_idempotency`).
+/// `dashboard_lifecycle` and `delete_dashboard_idempotency`). `DeleteScheduledReport` does
+/// model it, and its own table of the same refusal is in `delete_scheduled_report` — kept
+/// there because every row of it would otherwise remove a resource the rows below read.
 const READERS: &[Reader] = &[
     Reader {
         operation: "GetDashboard",
@@ -168,8 +170,9 @@ fn absent_arns(kind: &str) -> Vec<(String, String)> {
 }
 
 /// Assert the one rule on one answer: HTTP 400, the not-found code, and `resourceId`
-/// echoing the ARN the request addressed.
-fn assert_not_found(label: &str, arn: &str, status: u16, body: &Value) {
+/// echoing the ARN the request addressed. Shared with the sibling suites, so no two of
+/// them can drift on what this service's not-found answer looks like.
+pub(crate) fn assert_not_found(label: &str, arn: &str, status: u16, body: &Value) {
     assert_eq!(
         status, NOT_FOUND_STATUS,
         "case {label}: expected HTTP {NOT_FOUND_STATUS}, got {status}: {body}"

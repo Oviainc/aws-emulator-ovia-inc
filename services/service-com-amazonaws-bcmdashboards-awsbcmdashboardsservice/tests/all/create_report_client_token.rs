@@ -402,9 +402,10 @@ async fn a_duplicate_racing_the_create_is_refused_and_the_later_retry_is_replaye
 /// A token whose report this service no longer stores has no outcome left to replay, so
 /// the same request under it creates a report again and records its own ARN — a retry is
 /// never answered with an ARN that resolves to nothing, and the token records do not
-/// outlive the reports they describe. `DeleteScheduledReport` is still a 501 stub, so the
-/// removal is made in the store the router serves, which is exactly what that operation
-/// will do to it.
+/// outlive the reports they describe. The removal here is made in the store the router
+/// serves, so what is under test is the CREATE path's own sweep rather than the one
+/// `DeleteScheduledReport` runs (that one is pinned by
+/// `tests/all/delete_scheduled_report.rs`).
 #[tokio::test]
 async fn a_token_whose_report_is_gone_creates_again_instead_of_replaying_it() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScheduledReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScheduledReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScheduledReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored scheduled report the requested ARN is the key of — the record and
+//! everything stored on it, including its tags — and returns the ARN it removed, so a
+//! following `GetScheduledReport` answers this service's not-found answer and
+//! `ListScheduledReports` no longer lists it.
+//!
+//! An ARN no report is stored under is REFUSED, not answered as a no-op: this operation
+//! declares `ResourceNotFoundException` among its errors, while `DeleteDashboard` declares
+//! none (`smithy_query(query="operation",operation="DeleteScheduledReport")`), which is
+//! what tells the two deletes apart. The refusal is this service's one not-found answer,
+//! [`crate::scaffolded::Scaffolded::resource_not_found`] — HTTP 400 with the error code
+//! `ResourceNotFoundException` and a `resourceId` member carrying the requested ARN — worded
+//! by this operation. An ARN outside `ScheduledReportArn`'s modelled constraints never
+//! reaches this handler: boundary validation refuses it with the modelled
+//! `ValidationException` (400).
+//!
+//! Being state-changing — and irreversible — it emits the audit record
+//! [`crate::state::record_state_change`] writes, and it drops the create-idempotency record
+//! the removal leaves without a report, so no `CreateScheduledReport` retry is answered
+//! with an ARN that resolves to nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +163,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScheduledReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScheduledReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScheduledReport"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteScheduledReportErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        // Every write this call makes happens under the one lock, and the lock is released
+        // before anything is reported: removing the record removes the tags and everything
+        // else stored on it, since they all live on the one record.
+        let removed = {
+            let mut state = state.lock();
+            let removed = state.scheduled_reports.remove(&input.arn).is_some();
+            if removed {
+                // The create-idempotency record this removal just left without a report:
+                // the ARN it holds resolves to nothing, so it is no outcome to answer a
+                // retry with. The execution-idempotency records are keyed by the report's
+                // ARN and expire on the clock, and an `ExecuteScheduledReport` naming a
+                // removed report is refused before any of them is read, so those are left
+                // to their own window.
+                state.forget_creations_of_removed_reports();
+            }
+            removed
+        };
+
+        // An ARN keyed by no record is refused — this operation declares the not-found
+        // error — and nothing was written on that path.
+        if !removed {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.arn,
+                crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
+            );
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &input.arn,
+                // The request-derived template this operation words its refusal with, the
+                // same one the other readers of a scheduled report use.
+                format!("Scheduled report not found: {}", input.arn),
+            ));
+        }
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &input.arn, "SUCCESS");
+
+        Ok(DeleteScheduledReportOutput { arn: input.arn })
     }
 }
