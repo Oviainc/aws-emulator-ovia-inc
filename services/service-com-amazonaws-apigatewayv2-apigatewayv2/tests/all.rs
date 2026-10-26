@@ -43,6 +43,8 @@ mod deployment_lifecycle;
 mod deployment_pagination;
 #[path = "all/deployment_stage_release.rs"]
 mod deployment_stage_release;
+#[path = "all/domain_name_deletion.rs"]
+mod domain_name_deletion;
 #[path = "all/domain_name_endpoint_required.rs"]
 mod domain_name_endpoint_required;
 #[path = "all/domain_name_lifecycle.rs"]
@@ -101,6 +103,8 @@ mod product_rest_endpoint_page_lifecycle;
 mod product_rest_endpoint_page_update;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
+#[path = "all/quick_create_is_http_only.rs"]
+mod quick_create_is_http_only;
 #[path = "all/quick_create_servable_set.rs"]
 mod quick_create_servable_set;
 #[path = "all/refusal_message_text.rs"]

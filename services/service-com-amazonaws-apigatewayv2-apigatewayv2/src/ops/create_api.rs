@@ -9,7 +9,10 @@
 //! alongside the api — "an integration, a default catch-all route, and a default stage
 //! which is configured to automatically deploy changes" (`CreateApi$Target`) — each of
 //! them the resource API Gateway manages, with the route wired to that integration and
-//! the stage serving the deployment the service released to it.
+//! the stage serving the deployment the service released to it. It is what quick create
+//! produces for an HTTP api; an api of the other protocol has no quick create, so the
+//! members that drive it are accepted and apply to nothing (see the note on the gate
+//! below).
 //!
 //! ## Shape of an operation
 //!
@@ -279,43 +282,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Quick create (`Target`/`RouteKey`) and `CorsConfiguration` and the quick-create
-        // `CredentialsArn` are each documented "Supported only for HTTP APIs", so each
-        // names a setting an api of another protocol could never apply. The protocol this
+        // `CorsConfiguration` is documented "Supported only for HTTP APIs", so it names a
+        // setting an api of another protocol could never apply, and the protocol this
         // request asks for is its OWN `ProtocolType`, there being no parent api.
-        // `RouteKey` only names the route quick create mints, so it means nothing without
-        // a `Target`.
         //
-        // `ApiKeySelectionExpression` and `DisableSchemaValidation` carry the same clause
-        // but are deliberately NOT gated: the modelled `Api` shape reports both members
-        // for an api of EITHER protocol (and this service, like API Gateway, answers an
-        // HTTP api's CreateApi with the default `ApiKeySelectionExpression`), so a value
-        // a caller supplies for one is a value the resource reports back whatever its
-        // protocol — there is nothing the api could not apply.
-        let restricted = [
-            crate::state::ProtocolRestrictedMember::http_only("Target", input.target.is_some()),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "RouteKey",
-                input.route_key.is_some(),
-            ),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "CorsConfiguration",
-                input.cors_configuration.is_some(),
-            ),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "CredentialsArn",
-                input.credentials_arn.is_some(),
-            ),
-        ];
+        // The three QUICK CREATE members — `Target`, `RouteKey` and the quick-create
+        // `CredentialsArn` — carry the same clause in their documentation and are
+        // deliberately NOT gated: API Gateway accepts them on an api of either protocol
+        // and quick create itself is what is HTTP-only, so on a WEBSOCKET api they
+        // configure nothing (no integration, route or stage is synthesized below, and
+        // none of them is a member of the modelled api, so nothing is echoed back). A
+        // refusal here would reject a request the service answers 201 to.
+        //
+        // `ApiKeySelectionExpression` and `DisableSchemaValidation` are not gated either:
+        // the modelled `Api` shape reports both members for an api of EITHER protocol
+        // (and this service, like API Gateway, answers an HTTP api's CreateApi with the
+        // default `ApiKeySelectionExpression`), so a value a caller supplies for one is a
+        // value the resource reports back whatever its protocol.
+        let restricted = [crate::state::ProtocolRestrictedMember::http_only(
+            "CorsConfiguration",
+            input.cors_configuration.is_some(),
+        )];
         if let Err(message) =
             crate::state::validate_protocol_restricted_members(&input.protocol_type, &restricted)
         {
             return Err(bad_request(&message));
         }
+        // `RouteKey` only names the route quick create mints, so a request that carries it
+        // without a `Target` asks for a route of no integration — the precondition API
+        // Gateway states in the request's own terms ("Target is a required property in
+        // this context"). It is a property of the REQUEST, so it holds whatever protocol
+        // the api speaks.
         if input.route_key.is_some() && input.target.is_none() {
             return Err(bad_request(
-                "RouteKey is part of quick create and requires a Target.",
+                "Target is a required property in this context",
             ));
+        }
+        // And a `Target` quick create will BUILD from names ONE of the two backends it
+        // proxies to: a fully qualified URL or a Lambda function ARN
+        // ([`crate::state::target_selects_a_proxy`]). A value of any other form selects
+        // neither integration type, so there is nothing to build from it. The form is
+        // weighed only where quick create runs — on an api of the other protocol the
+        // member configures nothing at all, so there is no integration for it to be the
+        // wrong form for.
+        if is_http
+            && input
+                .target
+                .as_deref()
+                .is_some_and(|target| !crate::state::target_selects_a_proxy(target))
+        {
+            return Err(bad_request(crate::state::TARGET_IS_NOT_A_PROXY));
         }
         // A CORS document the api could never serve is refused rather than stored (see
         // `crate::state::validate_cors_configuration`).
@@ -411,14 +427,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ONE clock reading for the whole set: the api and the resources quick create
         // mints with it came into being at the same instant, so no two of them can
         // disagree about when that was.
-        if let Some(target) = input.target.as_ref() {
+        //
+        // Quick create is HTTP-only ("Supported only for HTTP APIs", `CreateApi$Target`),
+        // so a `Target` on an api of the other protocol synthesizes nothing: that api
+        // comes back with no integration, no route and no stage.
+        if let Some(target) = input.target.as_ref().filter(|_| is_http) {
             let now = stored.created_date;
 
             // "For HTTP integrations, specify a fully qualified URL. For Lambda
             // integrations, specify a function ARN. The type of the integration will be
-            // HTTP_PROXY or AWS_PROXY, respectively" (`CreateApi$Target`) — an ARN is
-            // what carries the `arn:` scheme, a fully qualified URL does not.
-            let is_function_arn = target.starts_with(ARN_SCHEME_PREFIX);
+            // HTTP_PROXY or AWS_PROXY, respectively" (`CreateApi$Target`) — told apart by
+            // the same rule that admitted the target above
+            // ([`crate::state::target_names_a_function`]), so the form this builds from is
+            // the form that was accepted.
+            let is_function_arn = crate::state::target_names_a_function(target);
             let integration_id = stored.mint_integration_id();
             stored.integrations.insert(
                 integration_id.clone(),
@@ -554,10 +576,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`CreateApi$RouteKey`: "If you don't specify a routeKey, a default route of
 /// $default is created").
 const DEFAULT_ROUTE_KEY: &str = "$default";
-
-/// What every Amazon Resource Name begins with, and what a fully qualified URL does
-/// not: the one thing that tells quick create's two documented forms of `Target`
-/// apart ("For HTTP integrations, specify a fully qualified URL. For Lambda
-/// integrations, specify a function ARN", `CreateApi$Target`).
-pub(crate) const ARN_SCHEME_PREFIX: &str = "arn:";
 

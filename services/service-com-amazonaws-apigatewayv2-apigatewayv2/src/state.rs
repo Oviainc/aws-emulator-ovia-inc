@@ -1788,6 +1788,71 @@ pub fn target_integration_id(target: &str) -> Option<&str> {
     target.strip_prefix(INTEGRATION_TARGET_PREFIX)
 }
 
+/// The sentence this service refuses a quick-create `Target` that names neither of the
+/// two backends quick create can proxy to.
+///
+/// Quick create builds ONE integration, and its type follows the form of the target: "For
+/// HTTP integrations, specify a fully qualified URL. For Lambda integrations, specify a
+/// function ARN. The type of the integration will be HTTP_PROXY or AWS_PROXY,
+/// respectively" (`CreateApi$Target`). A value of any other form selects neither, so
+/// there is no integration to build and the request is refused rather than stored with a
+/// backend nothing could call.
+pub const TARGET_IS_NOT_A_PROXY: &str = "Target only supports HTTP Proxy or Lambda Proxy";
+
+/// The two schemes a quick-create `Target` names an HTTP proxy upstream with: a fully
+/// qualified URL of the protocol an `HTTP_PROXY` integration speaks.
+const HTTP_TARGET_SCHEMES: &[&str] = &["http://", "https://"];
+
+/// The ARN namespace of AWS Lambda, whose FUNCTION a quick-create `Target` names to select
+/// an `AWS_PROXY` integration.
+const LAMBDA_ARN_VENDOR: &str = "lambda";
+
+/// The resource portion of a Lambda FUNCTION ARN
+/// (`arn:<partition>:lambda:<region>:<account>:function:<name>[:<qualifier>]`), which is
+/// the only Lambda resource an integration invokes.
+const LAMBDA_FUNCTION_RESOURCE_PREFIX: &str = "function:";
+
+/// Does `target` name one of the two backends quick create proxies to
+/// ([`TARGET_IS_NOT_A_PROXY`])?
+///
+/// The two forms are the ones [`target_names_a_function`] and
+/// [`target_names_an_http_upstream`] decide, so the refusal and the integration TYPE a
+/// target selects are read off one rule: a target this answers `true` for is one the
+/// writers can build an `AWS_PROXY` or an `HTTP_PROXY` integration from, and no other
+/// value is stored.
+pub fn target_selects_a_proxy(target: &str) -> bool {
+    target_names_an_http_upstream(target) || target_names_a_function(target)
+}
+
+/// Does `target` name a fully qualified URL, the form that selects an `HTTP_PROXY`
+/// integration ("For HTTP integrations, specify a fully qualified URL … HTTP_PROXY",
+/// `CreateApi$Target`)?
+///
+/// One carrying one of [`HTTP_TARGET_SCHEMES`] and a host after it; a scheme with nothing
+/// after it addresses no upstream.
+pub fn target_names_an_http_upstream(target: &str) -> bool {
+    HTTP_TARGET_SCHEMES
+        .iter()
+        .find_map(|scheme| target.strip_prefix(scheme))
+        .is_some_and(|host| !host.is_empty() && !host.starts_with('/'))
+}
+
+/// Does `target` name a Lambda FUNCTION, the form that selects an `AWS_PROXY` integration
+/// ("For Lambda integrations, specify a function ARN … AWS_PROXY", `CreateApi$Target`)?
+///
+/// A well-formed ARN of AWS Lambda naming a `function:<name>` resource, read through
+/// [`::service_common::arn::parse_of`], the tree's one caller-supplied-ARN parse. Every
+/// writer of a quick-create target asks this both to admit the value and to pick the
+/// integration type it builds, so the two cannot disagree about which form a target is.
+pub fn target_names_a_function(target: &str) -> bool {
+    ::service_common::arn::parse_of(target, LAMBDA_ARN_VENDOR).is_some_and(|parsed| {
+        parsed
+            .resource
+            .strip_prefix(LAMBDA_FUNCTION_RESOURCE_PREFIX)
+            .is_some_and(|name| !name.is_empty())
+    })
+}
+
 /// One request member the model restricts to APIs of a single `ProtocolType`.
 ///
 /// API Gateway v2 serves two protocols from one control plane, and a member's own

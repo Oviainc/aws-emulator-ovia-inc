@@ -376,21 +376,15 @@ async fn create_api_refuses_a_request_the_protocol_type_does_not_allow() {
 
     // Each row is refused by a rule the model's own docs state, with the member that
     // breaks it. `RouteSelectionExpression` "is required for WebSocket APIs";
-    // `Target` and `CorsConfiguration` are "Supported only for HTTP APIs"; `RouteKey`
-    // "is part of quick create", which needs a `Target`.
+    // `CorsConfiguration` is "Supported only for HTTP APIs"; `RouteKey` "is part of quick
+    // create", which needs a `Target`.
+    //
+    // A quick-create `Target` on a WEBSOCKET api is NOT here: API Gateway accepts it and
+    // quick-creates nothing for such an api, which `quick_create_is_http_only` holds.
     let cases = [
         (
             "websocket without RouteSelectionExpression",
             json!({ "name": "no-selection", "protocolType": "WEBSOCKET" }),
-        ),
-        (
-            "websocket with a quick-create Target",
-            json!({
-                "name": "socket-quick-create",
-                "protocolType": "WEBSOCKET",
-                "routeSelectionExpression": "$request.body.action",
-                "target": "https://example.com/upstream"
-            }),
         ),
         (
             "websocket with a CorsConfiguration",

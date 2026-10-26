@@ -69,6 +69,11 @@ mod redshift_cluster_iam_role_poll_lifecycle;
 // cloudformation suites land, and the appended tail is where every concurrent suite does.
 #[path = "all/cloudformation_updates_iam_roles.rs"]
 mod cloudformation_updates_iam_roles;
+// At the head for the same reason as the entry above: the `c…` span of the sorted list is
+// where the cloudformation suites land, and the appended tail is where every concurrent
+// suite does.
+#[path = "all/cloudformation_apigatewayv2_resources.rs"]
+mod cloudformation_apigatewayv2_resources;
 #[path = "all/amplifybackend_app_registration.rs"]
 mod amplifybackend_app_registration;
 #[path = "all/apigateway_signing_name_routing.rs"]

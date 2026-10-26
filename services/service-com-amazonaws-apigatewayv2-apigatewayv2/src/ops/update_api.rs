@@ -227,30 +227,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let protocol_type = existing.protocol_type.clone();
 
-        // The same members `CreateApi` gates, over the members THIS request configures:
-        // quick create (`Target`/`RouteKey`/`CredentialsArn`) and `CorsConfiguration`
-        // are each documented "Supported only for HTTP APIs", so a patch cannot put one
-        // on an api of another protocol. Checked BEFORE anything is written, so a
-        // refused patch leaves the api exactly as it was.
-        let restricted = [
-            crate::state::ProtocolRestrictedMember::http_only("Target", input.target.is_some()),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "RouteKey",
-                input.route_key.is_some(),
-            ),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "CorsConfiguration",
-                input.cors_configuration.is_some(),
-            ),
-            crate::state::ProtocolRestrictedMember::http_only(
-                "CredentialsArn",
-                input.credentials_arn.is_some(),
-            ),
-        ];
+        // The same member `CreateApi` gates, over the members THIS request configures:
+        // `CorsConfiguration` is documented "Supported only for HTTP APIs", so a patch
+        // cannot put one on an api of another protocol. Checked BEFORE anything is
+        // written, so a refused patch leaves the api exactly as it was.
+        //
+        // Quick create's members (`Target`, `RouteKey`, `CredentialsArn`) are NOT gated by
+        // protocol, for the reason `create_api` records: API Gateway accepts them on an
+        // api of either protocol. What refuses them on an api quick create never ran for
+        // is the quick-create precondition below — there is no managed integration or
+        // route to patch — which is the reason such a request is really refused.
+        let restricted = [crate::state::ProtocolRestrictedMember::http_only(
+            "CorsConfiguration",
+            input.cors_configuration.is_some(),
+        )];
         if let Err(message) =
             crate::state::validate_protocol_restricted_members(&protocol_type, &restricted)
         {
             return Err(bad_request(&message));
+        }
+        // A `Target` that patches the integration quick create minted names ONE of the two
+        // backends it proxies to, on a patch as on a create
+        // ([`crate::state::target_selects_a_proxy`]).
+        if protocol_type == crate::state::HTTP_PROTOCOL_TYPE
+            && input
+                .target
+                .as_deref()
+                .is_some_and(|target| !crate::state::target_selects_a_proxy(target))
+        {
+            return Err(bad_request(crate::state::TARGET_IS_NOT_A_PROXY));
         }
 
         // The same windows `CreateApi` holds a new api's string members to, over the
@@ -352,10 +357,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(target) = input.target {
                 // "For HTTP integrations, specify a fully qualified URL. For Lambda
                 // integrations, specify a function ARN. The type of the integration will
-                // be HTTP_PROXY or AWS_PROXY, respectively" (`UpdateApi$Target`) — the
-                // same two forms `CreateApi$Target` tells apart, told apart the same way.
-                let is_function_arn =
-                    target.starts_with(crate::ops::create_api::ARN_SCHEME_PREFIX);
+                // be HTTP_PROXY or AWS_PROXY, respectively" (`UpdateApi$Target`) — told
+                // apart by the same rule that admitted the target above, as
+                // `CreateApi$Target`'s two forms are.
+                let is_function_arn = crate::state::target_names_a_function(&target);
                 integration.integration_type = if is_function_arn {
                     crate::state::AWS_PROXY_INTEGRATION_TYPE
                 } else {

@@ -565,7 +565,10 @@ async fn an_http_api_takes_exactly_the_integration_types_that_are_not_websocket_
 /// `ApiKeySelectionExpression` and `DisableSchemaValidation` carry the same clause and
 /// are deliberately absent: the modelled `Api` shape reports both for an api of either
 /// protocol, so neither names something an api could not apply (see the note in
-/// `create_api.rs`).
+/// `create_api.rs`). So are the quick-create members (`Target`, `RouteKey`,
+/// `CredentialsArn`), which API Gateway accepts on an api of either protocol and applies
+/// only where quick create runs — the table in `quick_create_is_http_only.rs` holds that
+/// rule.
 #[tokio::test]
 async fn an_api_s_own_protocol_restricted_members_are_gated_by_its_protocol_type() {
     // (case, member, value, the ProtocolType that supports it)
@@ -574,18 +577,6 @@ async fn an_api_s_own_protocol_restricted_members_are_gated_by_its_protocol_type
             "CreateApi$CorsConfiguration, supported only for HTTP APIs",
             "corsConfiguration",
             json!({ "allowOrigins": ["https://example.com"] }),
-            HTTP_PROTOCOL_TYPE,
-        ),
-        (
-            "CreateApi$Target, quick create, supported only for HTTP APIs",
-            "target",
-            json!("https://example.com/upstream"),
-            HTTP_PROTOCOL_TYPE,
-        ),
-        (
-            "CreateApi$CredentialsArn, supported only for HTTP APIs",
-            "credentialsArn",
-            json!("arn:aws:iam::000000000000:role/apigw"),
             HTTP_PROTOCOL_TYPE,
         ),
     ];

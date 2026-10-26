@@ -2593,6 +2593,10 @@ fn database_port(
 fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        // API Gateway v2's `CreateDomainName` takes the `DomainName` the resource IS, and
+        // that name is what this type's `Ref` returns — the type's last segment is
+        // `DomainName`, so neither `DomainNameName` nor `Name` finds it.
+        APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
         // Amazon Cognito's `CreateGroup` takes `GroupName`, so the type publishes
         // `GroupName` — the type's last segment is `UserPoolGroup`, so neither
@@ -2693,6 +2697,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAY_DEPLOYMENT,
     APIGATEWAY_RESOURCE,
     APIGATEWAY_REST_API,
+    APIGATEWAYV2_API,
+    APIGATEWAYV2_API_MAPPING,
+    APIGATEWAYV2_DOMAIN_NAME,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,
     BATCH_SERVICE_ENVIRONMENT,
@@ -2976,6 +2983,54 @@ fn return_values(
             let id = api_gateway_assigned_id(APIGATEWAY_DEPLOYMENT_ID_SALT, name);
             attributes.insert("DeploymentId".to_string(), id.clone());
             (id, attributes)
+        }
+        // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
+        // API"). API Gateway v2 ASSIGNS the id — a template names the api but not its
+        // identifier — so the id is of the form [`api_gateway_assigned_id`] describes and
+        // the endpoint is the `{api-id}.execute-api.{region}.amazonaws.com` host
+        // `Api$ApiEndpoint` documents, under the scheme the declared `ProtocolType`
+        // speaks. Both are REPLACED by the ones that service really minted once the
+        // resource is created there ([`super::provisioner`]), which is what
+        // [`identity_is_service_assigned`] names this type for.
+        APIGATEWAYV2_API => {
+            let id = api_gateway_assigned_id(APIGATEWAYV2_API_ID_SALT, name);
+            attributes.insert(
+                "ApiEndpoint".to_string(),
+                apigatewayv2_api_endpoint(&id, region, properties, scope, budget),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the API mapping ID"; Fn::GetAtt: ApiMappingId. The same
+        // service-assigned shape, replaced by the id `CreateApiMapping` mints.
+        APIGATEWAYV2_API_MAPPING => {
+            let id = api_gateway_assigned_id(APIGATEWAYV2_API_MAPPING_ID_SALT, name);
+            attributes.insert("ApiMappingId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the domain name"; Fn::GetAtt: DomainNameArn, RegionalDomainName,
+        // RegionalHostedZoneId. The physical id is the domain name the template states
+        // (the type's own identifier, read through [`declared_name_property`]); the ARN is
+        // the one API Gateway names a custom domain by (its own REST path,
+        // `/domainnames/{name}`, under the `apigateway` ARN namespace that service's model
+        // declares), and the regional domain name is the
+        // `d-{id}.execute-api.{region}.amazonaws.com` host a caller aliases their DNS
+        // record to. `RegionalHostedZoneId` is NOT carried: it names a Route 53 zone this
+        // emulator neither owns nor can look up, and an invented zone id is one a caller
+        // could put in a real alias record.
+        APIGATEWAYV2_DOMAIN_NAME => {
+            attributes.insert(
+                "DomainNameArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    APIGATEWAYV2_ARN_NAMESPACE,
+                    region,
+                    &format!("/domainnames/{name}"),
+                ),
+            );
+            attributes.insert(
+                "RegionalDomainName".to_string(),
+                apigatewayv2_regional_domain_name(name, region),
+            );
+            (name.to_string(), attributes)
         }
         // "Ref returns the table name"; Fn::GetAtt: Arn.
         "AWS::DynamoDB::Table" => {
@@ -3805,6 +3860,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
         APIGATEWAY_RESOURCE => &["ResourceId"],
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
+        APIGATEWAYV2_API => &["ApiEndpoint"],
+        APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
+        APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
         GUARDDUTY_DETECTOR => &["Id"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
         EVENTS_RULE => &["Arn"],
@@ -3844,6 +3902,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// takes one, and each type's `Ref` returns that id — the `Name` such a type declares is
 /// only "a friendly name that lets you easily find [it] in the Resolver dashboard".
 ///
+/// An API Gateway v2 api and an api mapping are two more: `CreateApi` and
+/// `CreateApiMapping` take no identifier and answer the `ApiId` / `ApiMappingId` that
+/// service assigned, and each type's `Ref` returns that id — the `Name` an api declares is
+/// only what the api is called, and a mapping declares no name at all. (A custom
+/// `AWS::ApiGatewayV2::DomainName` is NOT one of them: its identifier is the domain name
+/// the template states.)
+///
 /// An AWS Transfer Family server is one more: `CreateServer` takes no identifier and
 /// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
 /// which carries that id — so neither the id nor the ARN can be recomputed from the
@@ -3853,7 +3918,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// create answers an `Id` that service minted, and the entity's ARN carries it, so a
 /// deployment can recompute neither.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
-    resource_type == FIS_EXPERIMENT_TEMPLATE
+    resource_type == APIGATEWAYV2_API
+        || resource_type == APIGATEWAYV2_API_MAPPING
+        || resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == WAFV2_WEB_ACL
         || resource_type == WAFV2_RULE_GROUP
@@ -4266,6 +4333,25 @@ pub const APIGATEWAY_REST_API: &str = "AWS::ApiGateway::RestApi";
 pub const APIGATEWAY_RESOURCE: &str = "AWS::ApiGateway::Resource";
 pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
 
+/// The Amazon API Gateway v2 resource types a stack creates in that service.
+///
+/// `AWS::ApiGatewayV2::Api`: "Ref returns the API ID", and `Fn::GetAtt` reads
+/// `ApiEndpoint` — the API Gateway v2 service MINTS both (`CreateApi` takes no identifier
+/// and answers the `ApiId` it assigned together with the endpoint it serves the api on),
+/// which is why [`identity_is_service_assigned`] names this type.
+///
+/// `AWS::ApiGatewayV2::ApiMapping`: "Ref returns the API mapping ID", which
+/// `CreateApiMapping` mints the same way, and which is also this type's one published
+/// `Fn::GetAtt` attribute.
+///
+/// `AWS::ApiGatewayV2::DomainName`: "Ref returns the domain name" — the name the template
+/// states, which is this type's own identifier — and `Fn::GetAtt` reads
+/// `RegionalDomainName` and `RegionalHostedZoneId`, the two values that service resolves
+/// for the regional endpoint it serves the domain on.
+pub const APIGATEWAYV2_API: &str = "AWS::ApiGatewayV2::Api";
+pub const APIGATEWAYV2_API_MAPPING: &str = "AWS::ApiGatewayV2::ApiMapping";
+pub const APIGATEWAYV2_DOMAIN_NAME: &str = "AWS::ApiGatewayV2::DomainName";
+
 /// How many characters follow the `E` of a CloudFront-assigned identifier.
 ///
 /// CloudFront mints a distribution id, an origin access control id and an origin access
@@ -4295,6 +4381,9 @@ const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
 const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
 const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
 const APIGATEWAY_DEPLOYMENT_ID_SALT: &str = "apigateway/deployment-id";
+const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
+const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";
+const APIGATEWAYV2_DOMAIN_LABEL_SALT: &str = "apigatewayv2/regional-domain-label";
 
 /// An identifier of the shape CloudFront ASSIGNS one in: `E` followed by
 /// [`CLOUDFRONT_ID_BODY_LEN`] uppercase characters.
@@ -4335,6 +4424,50 @@ const CLOUDFRONT_DOMAIN_SUFFIX: &str = "cloudfront.net";
 /// characters, drawn from the same derivation as every other identifier here.
 fn api_gateway_assigned_id(salt: &str, name: &str) -> String {
     derived_digits(salt, name, APIGATEWAY_ID_LEN, Alphabet::Lower)
+}
+
+/// The URI an API Gateway v2 api is invoked on: "The URI of the API, of the form
+/// `{api-id}.execute-api.{region}.amazonaws.com`" (`Api$ApiEndpoint`), under the scheme
+/// the api's protocol speaks — a WEBSOCKET api is reached over `wss`, an HTTP api over
+/// `https`.
+///
+/// The protocol comes from the resource's own declared `ProtocolType`, evaluated through
+/// the template's intrinsics like any other property, and an api whose declaration names
+/// none is an HTTP one, that being the only other value of the modelled enum.
+fn apigatewayv2_api_endpoint(
+    api_id: &str,
+    region: &str,
+    properties: &Value,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> String {
+    let websocket = properties
+        .get("ProtocolType")
+        .and_then(|value| text(value, scope, 0, budget))
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case(APIGATEWAYV2_WEBSOCKET_PROTOCOL));
+    let scheme = if websocket { "wss" } else { "https" };
+    format!("{scheme}://{api_id}.execute-api.{region}.{URL_SUFFIX}")
+}
+
+/// The `ProtocolType` whose apis are reached over the WebSocket scheme, out of the
+/// `HTTP | WEBSOCKET` enum API Gateway v2's model declares.
+const APIGATEWAYV2_WEBSOCKET_PROTOCOL: &str = "WEBSOCKET";
+
+/// The ARN namespace API Gateway v2's resources live in, which is that model's own
+/// `awsService.arnNamespace` (`apigateway`) rather than the `ApiGatewayV2` its resource
+/// types are spelled with.
+const APIGATEWAYV2_ARN_NAMESPACE: &str = "apigateway";
+
+/// The regional host API Gateway serves a custom domain name on
+/// (`DomainNameConfiguration$ApiGatewayDomainName`): the
+/// `d-{id}.execute-api.{region}.amazonaws.com` form a caller aliases their own DNS record
+/// to, with the id derived here for the reason [`derived_digits`] gives and replaced by
+/// the one API Gateway v2 really assigned once the domain is created there.
+fn apigatewayv2_regional_domain_name(name: &str, region: &str) -> String {
+    format!(
+        "d-{}.execute-api.{region}.{URL_SUFFIX}",
+        api_gateway_assigned_id(APIGATEWAYV2_DOMAIN_LABEL_SALT, name)
+    )
 }
 
 /// The revision a task definition registered for a family the account does not hold yet
