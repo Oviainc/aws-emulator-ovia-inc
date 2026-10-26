@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-ses-simpleemailservice service.
 //!
-//! One store per emulator: the identity list SES keys every send against (with
-//! the sending-authorization policies each identity carries), the send log the
-//! sending quota is derived from, the account's sending limits, and the
-//! configuration sets a send may name.
+//! One store per emulator: the identity list SES keys every send against — each
+//! identity carrying the sending-authorization policies it holds and where its
+//! notifications go ([`NotificationSettings`]) — the send log the sending quota
+//! is derived from, the account's sending limits, and the configuration sets a
+//! send may name.
 //!
 //! Nothing here is a counter that a reader bumps: `SentLast24Hours` is COMPUTED
 //! from the send log (see [`ComAmazonawsSesSimpleemailserviceState::sent_last_24_hours`]),
@@ -185,6 +186,149 @@ impl VerificationStatus {
     }
 }
 
+/// The class of notification an identity publishes, as SES's `NotificationType`
+/// enum names it (wire spellings published as
+/// `crate::ops::types::NOTIFICATION_TYPE_VALUES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationType {
+    /// A message that could not be delivered.
+    Bounce,
+    /// A recipient's complaint about a delivered message.
+    Complaint,
+    /// A successful delivery.
+    Delivery,
+}
+
+impl NotificationType {
+    /// The wire value for this class.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Bounce => "Bounce",
+            Self::Complaint => "Complaint",
+            Self::Delivery => "Delivery",
+        }
+    }
+
+    /// Parse a wire `NotificationType`; `None` for a value the model does not
+    /// declare.
+    ///
+    /// The value set this accepts is pinned against the model's own published
+    /// one: `tests/all/identity_notification_topics.rs` drives EVERY entry of
+    /// `crate::ops::types::NOTIFICATION_TYPE_VALUES` through an operation that
+    /// parses it here, and refuses values outside it, so a model that gained or
+    /// renamed a value fails there rather than diverging quietly.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "Bounce" => Some(Self::Bounce),
+            "Complaint" => Some(Self::Complaint),
+            "Delivery" => Some(Self::Delivery),
+            _ => None,
+        }
+    }
+}
+
+/// Where one identity's notifications go, as
+/// `GetIdentityNotificationAttributes` reports it.
+///
+/// A topic is `None` when none is set, which is what SES calls publishing
+/// DISABLED for that class: `SetIdentityNotificationTopicRequest$SnsTopic` is
+/// documented as "If the parameter is omitted from the request or a null value is
+/// passed, `SnsTopic` is cleared and publishing is disabled."
+#[derive(Debug, Clone)]
+pub struct NotificationSettings {
+    /// The topic bounce notifications are published to.
+    pub bounce_topic: Option<String>,
+    /// The topic complaint notifications are published to.
+    pub complaint_topic: Option<String>,
+    /// The topic delivery notifications are published to.
+    pub delivery_topic: Option<String>,
+    /// Whether bounce and complaint notifications are also forwarded as email
+    /// (`SetIdentityFeedbackForwardingEnabled`).
+    pub forwarding_enabled: bool,
+    /// Whether the original email headers travel with a bounce notification
+    /// (`SetIdentityHeadersInNotificationsEnabled`).
+    pub headers_in_bounce_notifications_enabled: bool,
+    /// The same, for a complaint notification.
+    pub headers_in_complaint_notifications_enabled: bool,
+    /// The same, for a delivery notification.
+    pub headers_in_delivery_notifications_enabled: bool,
+}
+
+impl Default for NotificationSettings {
+    /// A freshly recorded identity publishes nowhere and forwards feedback as
+    /// email.
+    ///
+    /// `ForwardingEnabled` starts TRUE because SES cannot be asked for anything
+    /// else yet: `SetIdentityFeedbackForwardingEnabledRequest$ForwardingEnabled`
+    /// is documented as "This value can only be set to `false` when Amazon SNS
+    /// topics are set for both `Bounce` and `Complaint` notification types", and
+    /// an identity with no topics has neither. The header flags start false —
+    /// the model's own `@default` for each of them.
+    fn default() -> Self {
+        Self {
+            bounce_topic: None,
+            complaint_topic: None,
+            delivery_topic: None,
+            forwarding_enabled: true,
+            headers_in_bounce_notifications_enabled: false,
+            headers_in_complaint_notifications_enabled: false,
+            headers_in_delivery_notifications_enabled: false,
+        }
+    }
+}
+
+impl NotificationSettings {
+    /// The topic `kind` notifications are published to, when one is set.
+    pub fn topic(&self, kind: NotificationType) -> Option<&str> {
+        match kind {
+            NotificationType::Bounce => self.bounce_topic.as_deref(),
+            NotificationType::Complaint => self.complaint_topic.as_deref(),
+            NotificationType::Delivery => self.delivery_topic.as_deref(),
+        }
+    }
+
+    /// Publish `kind` notifications to `topic`, or clear the topic (and so
+    /// disable publishing for that class) with `None`.
+    pub fn set_topic(&mut self, kind: NotificationType, topic: Option<String>) {
+        let slot = match kind {
+            NotificationType::Bounce => &mut self.bounce_topic,
+            NotificationType::Complaint => &mut self.complaint_topic,
+            NotificationType::Delivery => &mut self.delivery_topic,
+        };
+        *slot = topic;
+    }
+
+    /// Whether the original email headers travel with a `kind` notification.
+    pub fn headers_enabled(&self, kind: NotificationType) -> bool {
+        match kind {
+            NotificationType::Bounce => self.headers_in_bounce_notifications_enabled,
+            NotificationType::Complaint => self.headers_in_complaint_notifications_enabled,
+            NotificationType::Delivery => self.headers_in_delivery_notifications_enabled,
+        }
+    }
+
+    /// Include (or stop including) the original email headers in a `kind`
+    /// notification.
+    pub fn set_headers_enabled(&mut self, kind: NotificationType, enabled: bool) {
+        let slot = match kind {
+            NotificationType::Bounce => &mut self.headers_in_bounce_notifications_enabled,
+            NotificationType::Complaint => &mut self.headers_in_complaint_notifications_enabled,
+            NotificationType::Delivery => &mut self.headers_in_delivery_notifications_enabled,
+        };
+        *slot = enabled;
+    }
+
+    /// Whether a topic is set for both `Bounce` and `Complaint`, which is the
+    /// condition `SetIdentityFeedbackForwardingEnabled` documents for turning
+    /// feedback forwarding OFF: "This value can only be set to `false` when
+    /// Amazon SNS topics are set for both `Bounce` and `Complaint` notification
+    /// types."
+    pub fn publishes_bounces_and_complaints(&self) -> bool {
+        self.topic(NotificationType::Bounce).is_some()
+            && self.topic(NotificationType::Complaint).is_some()
+    }
+}
+
 /// One identity in the account's identity list.
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -201,6 +345,10 @@ pub struct Identity {
     pub verification_token: Option<String>,
     /// The Easy DKIM tokens, set by `VerifyDomainDkim` (still a stub, so empty).
     pub dkim_tokens: Vec<String>,
+    /// Where this identity's notifications go, as
+    /// `SetIdentityNotificationTopic` writes it and
+    /// `GetIdentityNotificationAttributes` reports it.
+    pub notifications: NotificationSettings,
     /// The sending-authorization policies attached to this identity, keyed by
     /// policy name.
     ///
@@ -396,6 +544,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     verification_status: VerificationStatus::Success,
                     verification_token,
                     dkim_tokens: Vec::new(),
+                    notifications: NotificationSettings::default(),
                     policies: BTreeMap::new(),
                     verified_at: SystemTime::now(),
                 }),
@@ -772,6 +921,23 @@ pub fn addr_spec(value: &str) -> &str {
     }
 }
 
+/// The identity an ARN of this service names, when it names one: the ARN's
+/// `identity` resource, read down to the identity's own name and keyed by its
+/// addr-spec. `None` for a value that is not an ARN of this service, names
+/// another resource of it, or names no identity at all.
+///
+/// The ONE reading of the identity-ARN form in this service, so
+/// [`identity_key`] and [`resolve_identity`] cannot disagree about what an
+/// identity ARN names; the ARN itself is read by `service_common::arn`, the one
+/// caller-supplied-ARN parse in this tree.
+fn identity_named_by_arn(value: &str) -> Option<&str> {
+    ::service_common::arn::is_resource_arn_of(value, SES_ARN_VENDOR)
+        .then(|| ::service_common::arn::resource_id_of_type(value, IDENTITY_RESOURCE_TYPE))
+        .flatten()
+        .filter(|name| !name.is_empty())
+        .map(addr_spec)
+}
+
 /// The key an identity is stored under, for a caller value that may name the
 /// identity either way the policy operations document.
 ///
@@ -779,22 +945,13 @@ pub fn addr_spec(value: &str) -> &str {
 /// using its name or by using its Amazon Resource Name (ARN). Examples:
 /// user@example.com, example.com,
 /// arn:aws:ses:us-east-1:123456789012:identity/example.com." So an ARN of this
-/// service naming an `identity` resource is read down to the identity it names,
-/// and anything else is the identity itself; either way the value is keyed by
-/// its addr-spec, the way the writers key it ([`addr_spec`]).
-///
-/// The ARN is read through the ONE caller-supplied-ARN parse
-/// (`service_common::arn`) rather than by splitting the value here, so this
-/// service cannot disagree with another about what an ARN is.
+/// service naming an `identity` resource is read down to the identity it names
+/// ([`identity_named_by_arn`]), and anything else is the identity itself; either
+/// way the value is keyed by its addr-spec, the way the writers key it
+/// ([`addr_spec`]).
 pub fn identity_key(value: &str) -> &str {
     let trimmed = value.trim();
-    if let Some(named) = ::service_common::arn::is_resource_arn_of(trimmed, SES_ARN_VENDOR)
-        .then(|| ::service_common::arn::resource_id_of_type(trimmed, IDENTITY_RESOURCE_TYPE))
-        .flatten()
-    {
-        return addr_spec(named);
-    }
-    addr_spec(trimmed)
+    identity_named_by_arn(trimmed).unwrap_or_else(|| addr_spec(trimmed))
 }
 
 /// The vendor field of this service's own ARNs, which is its signing name.
@@ -831,6 +988,161 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
 /// name ([`is_domain_name`]).
 pub fn is_email_address(value: &str) -> bool {
     ::service_common::email_address::is_email_address(value)
+}
+
+/// The vendor field of an Amazon SNS ARN (`aws.api#service$arnNamespace`): the
+/// third field of a topic ARN.
+const SNS_ARN_VENDOR: &str = "sns";
+
+/// The partition every ARN this emulator mints and serves carries
+/// (`engine::emulator_arn` writes `arn:aws:…`), so an ARN of another partition
+/// names a resource in a partition this emulator does not serve.
+const ARN_PARTITION: &str = "aws";
+
+/// The Region an operation serves a request that carries no SigV4 credential
+/// scope in, which is the Region AWS's own `email` endpoint resolves to without
+/// one.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The longest Region LABEL this service reads: every `*Arn` pattern in the AWS
+/// models bounds the Region field at `[a-z0-9-]{1,20}`, so longer text is no
+/// Region any AWS endpoint has.
+const MAX_REGION_LENGTH: usize = 20;
+
+/// Whether `value` is a Region LABEL, under the grammar those patterns state.
+///
+/// Read on the way IN ([`region_from_request`]) so the Region every later
+/// comparison and message uses is bounded, whatever a caller's credential scope
+/// carries.
+fn is_region_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REGION_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The Region the caller's request is scoped to: the Region of its SigV4
+/// credential scope, or [`DEFAULT_REGION`] when it carries none — or carries text
+/// that is no Region label ([`is_region_label`]).
+///
+/// The scope is parsed by `emulator_server::sigv4_credential_scope`, the single
+/// source of SigV4-scope parsing, so a header that is not a well-formed SigV4
+/// `Authorization` yields the default rather than a bogus Region.
+pub fn region_from_request(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_region_label(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The identities ONE call may ask about, shared by the two operations that
+/// report per-identity attributes: each is documented as being able to "only
+/// get … attributes for up to 100 identities at a time"
+/// (`GetIdentityNotificationAttributes` and
+/// `GetIdentityVerificationAttributes`). The model carries no `@length` for
+/// either list, so the boundary validator passes a longer one and the operation
+/// refuses it itself.
+pub const MAX_IDENTITIES_PER_CALL: usize = 100;
+
+/// The characters an Amazon SNS topic name is made of, and the length it may
+/// reach: "Topic names must be made up of only uppercase and lowercase ASCII
+/// letters, numbers, underscores, and hyphens, and must be between 1 and 256
+/// characters long" (the Amazon SNS documentation of a topic name, which is the
+/// resource field of a topic ARN).
+const MAX_TOPIC_NAME_LENGTH: usize = 256;
+
+/// Whether `value` is an Amazon SNS topic NAME, as Amazon SNS documents one (see
+/// [`MAX_TOPIC_NAME_LENGTH`]).
+fn is_sns_topic_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOPIC_NAME_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Whether the ARN `value`, of `vendor`, names a resource of the one account this
+/// emulator serves, in the partition it serves and in the Region the caller's
+/// request is scoped to.
+///
+/// An ARN names ONE account's resource in ONE Region, and this emulator serves a
+/// single account ([`::engine::EMULATOR_ACCOUNT_ID`]) — so an ARN of another
+/// account, partition or Region names nothing it holds. The six fields come from
+/// ONE `arn::parse_of`; the Region needs no second reading, because the Region it
+/// is compared against is already a label ([`region_from_request`]).
+fn names_a_resource_here(value: &str, vendor: &str, region: &str) -> bool {
+    ::service_common::arn::parse_of(value, vendor).is_some_and(|arn| {
+        arn.partition == ARN_PARTITION
+            && arn.account == ::engine::EMULATOR_ACCOUNT_ID
+            && arn.region == region
+    })
+}
+
+/// The Amazon SNS topic ARN a request names, or the reason the value names no
+/// topic SES could publish to for this caller.
+///
+/// What a member the model documents as "the Amazon Resource Name (ARN) of the
+/// Amazon SNS topic" has to carry. The six fields come from
+/// `service_common::arn`, the one caller-supplied-ARN parse in this tree; what is
+/// decided here is the rest of the published form of a topic ARN,
+/// `arn:<partition>:sns:<region>:<account-id>:<topic-name>` — the vendor is
+/// Amazon SNS's, the resource field is the topic NAME alone
+/// ([`is_sns_topic_name`]), since a topic ARN names no subresource while a
+/// subscription ARN carries a further `:<subscription-id>` segment — and that the
+/// topic is one this caller could have: in its own account, partition and Region
+/// ([`names_a_resource_here`]), as a notification topic of an identity is.
+///
+/// Read on the ARN alone: whether the topic EXISTS is Amazon SNS's own state,
+/// which this service does not hold.
+pub fn resolve_sns_topic<'value>(value: &'value str, region: &str) -> Result<&'value str, String> {
+    let trimmed = value.trim();
+    let names_a_topic = names_a_resource_here(trimmed, SNS_ARN_VENDOR, region)
+        && ::service_common::arn::resource(trimmed).is_some_and(is_sns_topic_name);
+    if names_a_topic {
+        Ok(trimmed)
+    } else {
+        Err(format!(
+            "Invalid SnsTopic {trimmed:?}: SnsTopic must be the ARN of an Amazon SNS topic of \
+             account {} in {region}",
+            ::engine::EMULATOR_ACCOUNT_ID
+        ))
+    }
+}
+
+/// The identity-list key for an identity a request names, or the reason the
+/// value names no identity this emulator holds.
+///
+/// [`identity_key`] reads the two forms the `Identity` member documents — the
+/// identity's own name, and an ARN of this service naming an `identity`
+/// resource. This COMPOSES with that one reading ([`identity_named_by_arn`]) and
+/// adds what an ARN has to satisfy to name an identity HERE: an ARN names one
+/// account's resource in one Region, and this emulator serves a single account
+/// ([`names_a_resource_here`]), so an ARN of another account, partition or
+/// Region names nothing — as does an ARN that names no identity at all (another
+/// vendor's resource, or another resource of this service). The operations that
+/// also read an Amazon SNS topic ARN ([`resolve_sns_topic`]) read BOTH their ARN
+/// members this way, so one request is not held to two different readings of
+/// what an ARN names; a value that is not an ARN at all is keyed exactly as
+/// [`identity_key`] keys it.
+///
+/// `Err` carries the reason, for a caller that refuses the request with it.
+pub fn resolve_identity<'value>(value: &'value str, region: &str) -> Result<&'value str, String> {
+    let trimmed = value.trim();
+    // A value that is not an ARN at all is the identity's own name.
+    if ::service_common::arn::parse(trimmed).is_none() {
+        return Ok(identity_key(trimmed));
+    }
+    match identity_named_by_arn(trimmed)
+        .filter(|_| names_a_resource_here(trimmed, SES_ARN_VENDOR, region))
+    {
+        Some(name) => Ok(name),
+        None => Err(format!(
+            "Invalid Identity {trimmed:?}: an identity ARN must name an identity of account {} \
+             in {region}",
+            ::engine::EMULATOR_ACCOUNT_ID
+        )),
+    }
 }
 
 /// Whether `value` is a domain name with at least two non-empty labels, the

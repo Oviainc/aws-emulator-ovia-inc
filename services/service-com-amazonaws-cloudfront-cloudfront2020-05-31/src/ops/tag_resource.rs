@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `NoSuchResource`, not an invalid argument.
         let Some(tags) = store.tags_for_resource_mut(&input.resource) else {
             return Err(TagResourceErrorModeled::NoSuchResource(
-                crate::state::no_such_resource(&input.resource),
+                crate::state::no_such_resource(),
             )
             .into());
         };

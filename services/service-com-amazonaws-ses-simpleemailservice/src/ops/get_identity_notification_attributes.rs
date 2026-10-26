@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdentityNotificationAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdentityNotificationAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdentityNotificationAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports where each named identity's notifications go, from this account's
+//! identity list — the records `SetIdentityNotificationTopic` writes.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +131,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdentityNotificationAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdentityNotificationAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdentityNotificationAttributes"))
+        // `ctx` carries the request's Region, which is the Region an identity ARN
+        // this request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+        // "Can only get notification attributes for up to 100 identities at a
+        // time" (this operation's own documentation), read from the one bound
+        // both per-identity reporting operations share.
+        if input.identities.len() > crate::state::MAX_IDENTITIES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Identities may name at most {} identities per call, got {}",
+                    crate::state::MAX_IDENTITIES_PER_CALL,
+                    input.identities.len()
+                ),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIdentityNotificationAttributes",
+            ));
+        };
+        let state = state.lock();
+
+        // Only identities that are actually in the list get an entry — the
+        // operation is documented over "a list of verified identities" — so an
+        // identity this account has not verified is ABSENT from the map rather
+        // than reported with invented attributes.
+        let mut notification_attributes = std::collections::HashMap::new();
+        for requested in &input.identities {
+            // Keyed the way the writers key it, with the ARN form this member
+            // documents resolved to the identity it names.
+            //
+            // A value that names no identity of this account — an ARN of another
+            // account or Region among them — gets no entry rather than a
+            // refusal, which is the one reading the model supports: the output
+            // is a MAP keyed by identity, `NotificationAttributes` is documented
+            // as "a map of Identity to IdentityNotificationAttributes" with no
+            // per-identity failure member and this operation models no error at
+            // all, so "this account has no such identity" can only be said by
+            // leaving the entry out — exactly as it is said for an identity that
+            // was never verified. Each of the writers answers a REFUSAL instead,
+            // because a write has to name the one record it changes.
+            let Ok(key) = crate::state::resolve_identity(requested, &region) else {
+                continue;
+            };
+            let Some(identity) = state.identities.get(key) else {
+                continue;
+            };
+            let notifications = &identity.notifications;
+            notification_attributes.insert(
+                identity.name.clone(),
+                IdentityNotificationAttributes {
+                    // A topic that is not set reads back EMPTY: the three topic
+                    // members are `@required`, and no topic is what SES calls
+                    // publishing disabled for that class.
+                    bounce_topic: notifications
+                        .topic(crate::state::NotificationType::Bounce)
+                        .unwrap_or_default()
+                        .to_string(),
+                    complaint_topic: notifications
+                        .topic(crate::state::NotificationType::Complaint)
+                        .unwrap_or_default()
+                        .to_string(),
+                    delivery_topic: notifications
+                        .topic(crate::state::NotificationType::Delivery)
+                        .unwrap_or_default()
+                        .to_string(),
+                    forwarding_enabled: notifications.forwarding_enabled,
+                    headers_in_bounce_notifications_enabled: notifications
+                        .headers_in_bounce_notifications_enabled,
+                    headers_in_complaint_notifications_enabled: notifications
+                        .headers_in_complaint_notifications_enabled,
+                    headers_in_delivery_notifications_enabled: notifications
+                        .headers_in_delivery_notifications_enabled,
+                },
+            );
+        }
+
+        Ok(GetIdentityNotificationAttributesOutput {
+            notification_attributes,
+        })
     }
 }

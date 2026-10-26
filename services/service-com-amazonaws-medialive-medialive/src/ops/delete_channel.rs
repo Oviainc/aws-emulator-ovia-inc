@@ -187,15 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+        let channel = state.mutable_channel(&input.channel_id).map_err(|dead| {
             DeleteChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+                message: Some(dead.message),
             })
         })?;
 
         // A channel is deleted once it has stopped: deleting a creating,
-        // starting, running, stopping or already-deleting channel is a conflict,
-        // reported with the fixed message that class carries.
+        // starting, running or stopping channel is a conflict, reported with the
+        // fixed message that class carries. A channel whose delete has already
+        // been accepted never reaches here — the guard above answers it as not
+        // found — so this conflict is about a channel that still exists.
         if !channel.is_deletable() {
             return Err(DeleteChannelErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::CHANNEL_NOT_STOPPED_MESSAGE.to_string()),

@@ -180,7 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // REPLACE, never merge: the stored record is overwritten whole, so a member the
-        // new configuration leaves out is gone rather than inherited from the old one.
+        // new configuration leaves out is gone rather than inherited from the old one —
+        // and the exception list it leaves out is stored as the empty list, the one
+        // representation of "no public-port exception" a later `Get` reports.
         // "Each time a configuration for block public access is updated, Amazon EMR
         // updates this metadata." (`BlockPublicAccessConfigurationMetadata` doc.)
         state.lock().block_public_access =

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecurityConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecurityConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the security configurations this account holds — "their creation dates and
+//! times, and their names" — from
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::security_configurations`], a
+//! page at a time on `Marker`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecurityConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: the listing is a projection of what `CreateSecurityConfiguration`
+//! stored and `DeleteSecurityConfiguration` removed, so this handler writes nothing and
+//! two calls with the same `Marker` answer the same page. The work one call costs is
+//! bounded twice over: the store holds at most
+//! [`crate::state::MAX_SECURITY_CONFIGURATIONS`] configurations, and the page it answers
+//! is at most [`crate::state::LIST_PAGE_SIZE`] entries whatever the request asks for.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +149,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecurityConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecurityConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecurityConfigurations"))
+        // Nothing in the response depends on the request beyond its `Marker`, and a
+        // listing attributes no change: it only reports.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListSecurityConfigurationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the EMR security configuration store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = state.lock();
+
+        // The name IS the identity of a security configuration, and the store is keyed
+        // by it, so the listing is in name order and holds exactly one entry per stored
+        // name — the same order on every call, which is what makes a `Marker` walk
+        // repeatable.
+        let held: Vec<&crate::state::SecurityConfigurationRecord> =
+            store.security_configurations.values().collect();
+
+        // The marker is the name of the first configuration the previous page did not
+        // report — the marker contract every listing of this service follows.
+        let start = match input.marker.as_ref() {
+            Some(marker) => match held.iter().position(|record| record.name == *marker) {
+                Some(at) => at,
+                None => {
+                    return Err(invalid_request(format!("Marker '{marker}' is not valid.")));
+                }
+            },
+            None => 0,
+        };
+        let end = held.len().min(start + crate::state::LIST_PAGE_SIZE);
+        let security_configurations: Vec<SecurityConfigurationSummary> = held[start..end]
+            .iter()
+            .map(|record| SecurityConfigurationSummary {
+                name: Some(record.name.clone()),
+                creation_date_time: Some(crate::state::timestamp(record.creation_date_time)),
+            })
+            .collect();
+        let marker = held.get(end).map(|record| record.name.clone());
+
+        Ok(ListSecurityConfigurationsOutput {
+            security_configurations: Some(security_configurations),
+            marker,
+        })
     }
+}
+
+/// Refuse the request with this operation's modeled client error (HTTP 400).
+fn invalid_request(message: String) -> ListSecurityConfigurationsError {
+    ListSecurityConfigurationsErrorModeled::InvalidRequestException(InvalidRequestException {
+        error_code: None,
+        message: Some(message),
+    })
+    .into()
 }

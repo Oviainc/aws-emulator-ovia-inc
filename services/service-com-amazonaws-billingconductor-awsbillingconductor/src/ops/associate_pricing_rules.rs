@@ -295,7 +295,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `LastModifiedTime` moves because the plan changed. Nothing else about the
         // plan — its name, its description, its tags, its creation time — is this
         // operation's to touch.
-        let Some(plan) = state.pricing_plans.get_mut(&plan_arn) else {
+        // The write goes through the state method that keeps the generation it
+        // supersedes, because moving `LastModifiedTime` moves the billing period the
+        // plan's current generation is in force FROM: a read scoped to a period the
+        // previous generation held must still report the plan as it stood then
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_pricing_plan`).
+        let Some(mut updated) = state.pricing_plans.get(&plan_arn).cloned() else {
             return Err(AssociatePricingRulesErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the pricing plan disappeared while it was being updated"
@@ -305,12 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        plan.pricing_rule_associations.extend(
+        updated.pricing_rule_associations.extend(
             requested
                 .iter()
                 .map(|arn| crate::state::PricingRuleAssociationRecord::started_now(arn)),
         );
-        plan.last_modified_time_millis = crate::state::now_millis();
+        updated.last_modified_time_millis = crate::state::now_millis();
+        state.put_pricing_plan(updated);
 
         // The audit record for a state-changing call: who asked, what changed and that
         // it succeeded. No `@sensitive` member of the plan, only the access key id the

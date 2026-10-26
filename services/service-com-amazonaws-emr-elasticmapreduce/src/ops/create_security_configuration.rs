@@ -178,15 +178,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // The name IS the identity of a security configuration, so a second create
-        // under a taken name is refused and leaves the stored document and its creation
-        // instant untouched — whether or not the new document is identical.
-        if store.security_configurations.contains_key(&input.name) {
-            crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::Conflict);
-            return Err(invalid_request(format!(
-                "Security configuration with name '{}' already exists.",
-                input.name
-            )));
+        // The name IS the identity of a security configuration, so a create under a
+        // taken name stores nothing. Re-submitting the SAME document under that name is
+        // the create the caller already made — it is answered with the stored
+        // configuration's own creation instant, which is what makes a converge or retry
+        // loop safely re-runnable — while a DIFFERENT document under that name is the
+        // conflict, refused with the stored document left untouched.
+        if let Some(existing) = store.security_configurations.get(&input.name) {
+            if existing.security_configuration != input.security_configuration {
+                crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::Conflict);
+                return Err(invalid_request(format!(
+                    "Security configuration with name '{}' already exists.",
+                    input.name
+                )));
+            }
+            // Nothing changed, so the record attributes a call that stored nothing
+            // rather than a second create.
+            crate::state::audit(
+                Self::NAME,
+                &input.name,
+                ctx,
+                AuditOutcome::SecurityConfigurationUnchanged,
+            );
+            return Ok(CreateSecurityConfigurationOutput {
+                name: existing.name.clone(),
+                creation_date_time: crate::state::timestamp(existing.creation_date_time),
+            });
         }
 
         // A create that would take the store past the account's quota is refused, the

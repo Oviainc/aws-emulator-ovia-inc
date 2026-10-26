@@ -386,3 +386,9 @@ mod application_delete;
 #[path = "all/project_assets.rs"]
 mod project_assets;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/workspace_delete.rs"]
+mod workspace_delete;
+

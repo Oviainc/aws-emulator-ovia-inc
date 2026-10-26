@@ -69,7 +69,10 @@ pub(crate) async fn tag_resource(
 ///
 /// `KeyValueStoreName`'s pattern is `^[a-zA-Z0-9-_]{1,64}$`, so the name is not a place
 /// to vary characters — the tag set is what each row varies.
-async fn create_key_value_store(
+///
+/// `pub(crate)` so the sibling suite that removes tags from a resource kind of its own
+/// creates one the same way rather than growing a copy of this.
+pub(crate) async fn create_key_value_store(
     router: &MultiServiceRouter,
     name: &str,
     submitted: Option<&[SubmittedTag]>,

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetIdentityNotificationTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetIdentityNotificationTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetIdentityNotificationTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Points one class of an identity's notifications at an Amazon SNS topic, or
+//! clears it: the topic it writes onto the identity's record is what
+//! `GetIdentityNotificationAttributes` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetIdentityNotificationTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetIdentityNotificationTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetIdentityNotificationTopic"))
+        // `ctx` carries the request's Region, which is the Region an ARN this
+        // request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+        // Which class of notification this call is about. The model declares the
+        // value set, so the boundary validator normally refuses anything else;
+        // this operation reads the value rather than trusting the spelling, and
+        // names the admitted set if one gets through.
+        let Some(notification_type) =
+            crate::state::NotificationType::from_wire(&input.notification_type)
+        else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Invalid NotificationType {:?}: NotificationType must be one of {}",
+                    input.notification_type,
+                    NOTIFICATION_TYPE_VALUES.join(", ")
+                ),
+            ));
+        };
+
+        // "If the parameter is omitted from the request or a null value is passed,
+        // `SnsTopic` is cleared and publishing is disabled" (the member's own
+        // documentation). On this wire a null value arrives as an EMPTY field, so
+        // an absent member and an empty one both clear the topic.
+        let requested_topic = input
+            .sns_topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty());
+        // A topic that is set has to name an Amazon SNS topic this caller could
+        // publish to: `SnsTopic` is documented as "The Amazon Resource Name (ARN)
+        // of the Amazon SNS topic", and the model targets it at a bare string, so
+        // the ARN is read here. A value that names no such topic names nothing to
+        // publish to, which is a bad request rather than a topic that happens to
+        // be missing.
+        let stored_topic = match requested_topic {
+            Some(topic) => Some(
+                crate::state::resolve_sns_topic(topic, &region)
+                    .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetIdentityNotificationTopic",
+            ));
+        };
+        let mut state = state.lock();
+
+        // "You can only specify a verified identity for this parameter" (the
+        // `Identity` member's own documentation), so an identity this account has
+        // not verified is refused and nothing is stored. Keyed the way the
+        // writers key it, with the ARN form the member documents resolved to the
+        // identity it names — and an ARN naming no identity of this account in
+        // this Region names nothing to set a topic on.
+        let identity = crate::state::resolve_identity(&input.identity, &region)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?
+            .to_string();
+        let Some(record) = state.identities.get_mut(&identity) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!("Identity {identity} is not verified"),
+            ));
+        };
+        record
+            .notifications
+            .set_topic(notification_type, stored_topic);
+
+        // `SetIdentityNotificationTopicResponse` has no members: what the call
+        // produced is the state it wrote, which
+        // `GetIdentityNotificationAttributes` reports.
+        Ok(SetIdentityNotificationTopicOutput {})
     }
 }

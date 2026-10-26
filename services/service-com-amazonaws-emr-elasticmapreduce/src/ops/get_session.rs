@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetSessionErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     error_code: None,
-                    message: Some(format!(
-                        "Cluster id '{}' is not valid or does not exist.",
-                        input.cluster_id
-                    )),
+                    message: Some(crate::state::unknown_cluster_message(&input.cluster_id)),
                 },
             )
             .into());

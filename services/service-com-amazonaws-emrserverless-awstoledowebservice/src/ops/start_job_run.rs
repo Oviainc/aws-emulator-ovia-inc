@@ -226,11 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !record.auto_start_enabled() {
                 return Err(StartJobRunErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "Application is in {} state and does not start automatically on \
-                             job submission; call StartApplication first",
-                            record.application.state
-                        ),
+                        message: crate::state::auto_start_disabled_message("Job run"),
                     },
                 )
                 .into());

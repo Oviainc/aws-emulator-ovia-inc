@@ -102,12 +102,6 @@ impl From<GetIdentityVerificationAttributesErrorModeled> for GetIdentityVerifica
     }
 }
 
-/// The number of identities one call may ask about, from this operation's own
-/// documentation: it "can only get verification attributes for up to 100
-/// identities at a time". The model carries no `@length` for it, so the
-/// boundary validator passes a longer list and this operation refuses it itself.
-const MAX_IDENTITIES_PER_CALL: usize = 100;
-
 /// The `GetIdentityVerificationAttributes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,11 +140,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation needs none of it.
         let _ = ctx;
-        if input.identities.len() > MAX_IDENTITIES_PER_CALL {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Identities may name at most {MAX_IDENTITIES_PER_CALL} identities per call, got {}",
-                input.identities.len()
-            )));
+        // "Can only get verification attributes for up to 100 identities at a
+        // time" (this operation's own documentation), read from the one bound
+        // both per-identity reporting operations share. Refused with the code
+        // the query API answers a parameter value it does not accept, which is
+        // the same code its sibling `GetIdentityNotificationAttributes` answers
+        // this same refusal with.
+        if input.identities.len() > crate::state::MAX_IDENTITIES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Identities may name at most {} identities per call, got {}",
+                    crate::state::MAX_IDENTITIES_PER_CALL,
+                    input.identities.len()
+                ),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

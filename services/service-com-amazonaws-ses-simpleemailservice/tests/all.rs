@@ -15,6 +15,8 @@
 mod configuration_set_tracking_options;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/identity_notification_topics.rs"]
+mod identity_notification_topics;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]
@@ -29,7 +31,9 @@ mod ses_store_bounds;
 mod ses_template_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
-// The `zz_` prefix keeps this service-wide suite sorted after the per-operation
-// ones; `tests/all.rs` lists suites in file order.
+// The `z`-prefixed service-wide suites sort after the per-operation ones;
+// `tests/all.rs` lists suites in file order.
+#[path = "all/zprobe.rs"]
+mod zprobe;
 #[path = "all/zz_dump.rs"]
 mod zz_dump;

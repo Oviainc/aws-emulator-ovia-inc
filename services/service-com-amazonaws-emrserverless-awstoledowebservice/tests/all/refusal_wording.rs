@@ -7,7 +7,7 @@
 //! validator, this service's refusal wording and serialization — the same path an SDK
 //! client takes.
 //!
-//! Three rules are under test, each asserted over a SET of inputs rather than one
+//! Four rules are under test, each asserted over a SET of inputs rather than one
 //! recorded request:
 //!
 //! 1. A refusal states the condition it refuses on; it never echoes the value the
@@ -20,6 +20,9 @@
 //!    that check, naming the vendor that was expected rather than the caller's ARN or
 //!    the member's regex, and carrying the front door's generic bad-request identity
 //!    rather than one of this service's modelled error shapes.
+//! 4. The auto-start gate states the GATE — the application is not running and will not
+//!    start itself — in the fixed sentence for the work that was submitted, naming
+//!    neither the application's current state nor a remedy call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -539,6 +542,150 @@ async fn a_range_violation_names_the_member_and_the_bound_but_not_the_submitted_
             "case {case:?}: expected {expected}, got {} with {:?}",
             answer.status, answer.body
         );
+    }
+}
+
+/// Rule 4: the auto-start gate states the gate itself — the application is not in
+/// `STARTED` state and will not start itself — in the service's fixed sentence for the
+/// work that could not be started, naming no application id, no current state and no
+/// remedy call.
+///
+/// The rows span what the rule generalises over: the state the application is NOT started
+/// in (`CREATED`, `STOPPED`), and the work the submit asked for (a job run, an
+/// interactive session). An application with auto-start enabled is admitted in each row,
+/// so the refusal is the gate and not the operation.
+#[tokio::test]
+async fn the_auto_start_gate_states_the_gate_rather_than_the_current_state() {
+    /// "This operation is supported for EMR release 7.13.0 and later"
+    /// (`smithy_query(query="doc",shape="StartSession")`), so a session case runs on it.
+    const SESSION_RELEASE: &str = "emr-7.13.0";
+
+    /// One submission the gate stops: what is being started, the collection it is
+    /// submitted to, the request body for a client token, and the sentence the refusal
+    /// carries.
+    struct Submission {
+        work: &'static str,
+        path: &'static str,
+        body: fn(&str) -> Value,
+        expected: &'static str,
+    }
+
+    let submissions = [
+        Submission {
+            work: "a job run",
+            path: "jobruns",
+            body: |token| job_run_body(token, json!({})),
+            expected: "Job run cannot be started as Application is not in STARTED state and \
+                       auto-start is disabled",
+        },
+        Submission {
+            work: "an interactive session",
+            path: "sessions",
+            body: |token| {
+                json!({
+                    "clientToken": token,
+                    "executionRoleArn": EXECUTION_ROLE,
+                })
+            },
+            expected: "Session cannot be started as Application is not in STARTED state and \
+                       auto-start is disabled",
+        },
+    ];
+
+    for Submission {
+        work,
+        path,
+        body,
+        expected,
+    } in submissions
+    {
+        for (state, stop_first) in [("CREATED", false), ("STOPPED", true)] {
+            for auto_start in [false, true] {
+                let case = format!("{work} on a {state} application, auto-start {auto_start}");
+                let router = emulator();
+                let created = call(
+                    &router,
+                    "POST",
+                    "/applications",
+                    Some(json!({
+                        "clientToken": format!("tok-gate-{path}-{state}-{auto_start}"),
+                        "releaseLabel": SESSION_RELEASE,
+                        "type": "SPARK",
+                        "autoStartConfiguration": { "enabled": auto_start },
+                        "interactiveConfiguration": { "sessionEnabled": true },
+                    })),
+                )
+                .await;
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?}: CreateApplication expected 200, got {} with {:?}",
+                    created.status, created.body
+                );
+                let id = created
+                    .at("/applicationId")
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                wait_for_transition();
+
+                if stop_first {
+                    // Started and stopped again, so the application reaches STOPPED
+                    // rather than the CREATED it was minted in.
+                    for action in ["start", "stop"] {
+                        let moved =
+                            call(&router, "POST", &format!("/applications/{id}/{action}"), None)
+                                .await;
+                        assert_eq!(
+                            moved.status, 200,
+                            "case {case:?}: {action} expected 200, got {} with {:?}",
+                            moved.status, moved.body
+                        );
+                        wait_for_transition();
+                    }
+                }
+
+                let answer = call(
+                    &router,
+                    "POST",
+                    &format!("/applications/{id}/{path}"),
+                    Some(body(&format!("tok-work-{path}-{state}-{auto_start}"))),
+                )
+                .await;
+                if auto_start {
+                    assert_eq!(
+                        answer.status, 200,
+                        "case {case:?}: auto-start admits the submit, got {} with {:?}",
+                        answer.status, answer.body
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: expected 400, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    "ValidationException",
+                    "case {case:?}: expected ValidationException, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.message(),
+                    expected,
+                    "case {case:?}: expected {expected:?}, got {:?}",
+                    answer.message()
+                );
+                assert!(
+                    !answer.body.to_string().contains(&id)
+                        && !answer.message().contains(state)
+                        && !answer.message().contains("StartApplication"),
+                    "case {case:?}: the refusal names no id, current state or remedy call, \
+                     got {:?}",
+                    answer.body
+                );
+            }
+        }
     }
 }
 

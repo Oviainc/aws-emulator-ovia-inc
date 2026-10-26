@@ -44,6 +44,7 @@ use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// This service's modeled endpoint prefix (`portal.sso`), as `OPERATIONS.md` and the
 /// model's `awsService` trait give it. Used by [`EmulatedService::can_handle`] to claim
@@ -119,10 +120,13 @@ const ROLE_NAME: RequiredMember = RequiredMember {
 /// the model declares them (`OPERATIONS.md` lists the same four).
 ///
 /// `restJson1` selects a route only when every one of those members is on the request,
-/// so a request that omits one matches no operation at all. This table is what lets
-/// [`Service::override_routing_error`] tell that case — a readable request missing a
-/// required parameter — from a path this service does not serve, and it is also the
-/// request SIGNATURE [`serves_route`] claims an anonymous portal request by.
+/// so a request that omits one matches no operation at all — including the one that
+/// omits the bearer credential, which is why the portal's authentication gate has to be
+/// answered in [`Service::override_routing_error`] as well as in every handler. This
+/// table is what lets that seam tell a request addressed to one of these routes — one
+/// presenting no session, or a readable request missing a required parameter — from a
+/// path this service does not serve, and it is also the request SIGNATURE
+/// [`serves_route`] claims an anonymous portal request by.
 ///
 /// DRIFT: this is model-derived data held by hand, because the generated
 /// `ServiceDefinition`'s routing table exposes no required-member set to read it from.
@@ -216,6 +220,14 @@ fn absent_required_members(req: &aws_smithy_runtime_api::http::Request) -> Optio
     )
 }
 
+/// The bearer credential `req` presents: the value of the header [`ACCESS_TOKEN`] names,
+/// the one the model binds the access token to. `None` when the request does not carry
+/// that header at all — a request presenting NO credential.
+fn presented_access_token(req: &aws_smithy_runtime_api::http::Request) -> Option<&str> {
+    debug_assert!(matches!(ACCESS_TOKEN.bound_in, BoundIn::Header));
+    req.headers().get(ACCESS_TOKEN.name)
+}
+
 /// The `com-amazonaws-sso-swbportalservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -223,6 +235,11 @@ fn absent_required_members(req: &aws_smithy_runtime_api::http::Request) -> Optio
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threaded into every operation, kept
+    /// here too because this file's authentication gate has to resolve a presented token
+    /// against the one store the handlers read (see [`Self::presents_a_usable_session`]).
+    /// Never a store of its own: it is the `Arc` the router handed to `new`.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -231,8 +248,32 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
+    }
+
+    /// Whether `req` presents a sign-in session this service still serves at the moment
+    /// it is asked.
+    ///
+    /// `false` covers every way a request can fail to present one — no access-token
+    /// header at all, or one naming a session that is unknown, logged out or expired —
+    /// because the portal authenticates a caller by that session and distinguishes none
+    /// of them. It is the same question [`crate::state::ComAmazonawsSsoSwbportalserviceState::session`]
+    /// answers for a handler, asked of a request that has not reached one.
+    fn presents_a_usable_session(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
+        let Some(token) = presented_access_token(req) else {
+            return false;
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts (see the note in
+            // `ops/list_accounts.rs`): with no store to resolve the token against there
+            // is nothing to authenticate it with, so the gate claims nothing here and
+            // the framework's own answer stands.
+            return true;
+        };
+        let state = state.lock();
+        state.session(token, SystemTime::now()).is_some()
     }
 }
 
@@ -316,11 +357,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // A request that named no operation but DOES name one of this service's routes
         // got there by omitting a required, http-bound member: the REST router selects a
-        // route only when every one of them is present. That is a missing required
-        // parameter, which this service's model has an error for
-        // (`InvalidRequestException`, "a required parameter might be missing or out of
-        // range"), so it is stated as that rather than as "not implemented".
+        // route only when every one of them is present.
         let absent = absent_required_members(req)?;
+
+        // AUTHENTICATION FIRST. The portal has no other caller identity: everything it
+        // answers comes out of the sign-in session the request's bearer token names, so
+        // a request presenting no usable session is an unauthenticated request and is
+        // refused as one — `UnauthorizedException`, with the status its model carries —
+        // whatever else the request did or did not carry. That covers the request whose
+        // absent member IS the credential: an absent credential is not a malformed
+        // parameter, and it is exactly the case no handler's own gate can answer,
+        // because the router never selects a route without it.
+        if !self.presents_a_usable_session(req) {
+            return crate::state::unauthorized_response(self.entry.protocol());
+        }
+
+        // The caller is authenticated, so what is left is a missing required parameter,
+        // which this service's model has an error for (`InvalidRequestException`, "a
+        // required parameter might be missing or out of range"), so it is stated as that
+        // rather than as "not implemented".
         let violations: Vec<aws_smithy_schema_server::Violation> = absent
             .into_iter()
             .map(|member| aws_smithy_schema_server::Violation {

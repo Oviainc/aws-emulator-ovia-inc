@@ -557,39 +557,22 @@ async fn a_request_for_another_service_or_an_unmodelled_route_is_not_claimed() {
 }
 
 /// RULE: claiming by the route's (method, path) — not by the bearer-token header — keeps
-/// the modelled answer for a request that omits a `@required` http-bound member on an
-/// endpoint that names no service: one row per (route, required member) the model
-/// declares.
+/// the modelled answer for an AUTHENTICATED request that omits a `@required` http-bound
+/// PARAMETER on an endpoint that names no service: one row per (route, required
+/// parameter) the model declares. The access-token header is the caller's credential
+/// rather than a parameter, so its absence is the 401 in `bearer_token_gate.rs`.
 #[tokio::test]
 async fn an_absent_required_member_is_an_invalid_request_on_any_endpoint() {
     let portal = Portal::new();
     portal.sign_in("tok-live");
 
-    // `(case, method, path, token)`: each row drops exactly one required member.
+    // `(case, method, path, token)`: each row drops exactly one required parameter.
     let cases: &[(&str, Method, &str, Option<&str>)] = &[
-        (
-            "ListAccounts without accessToken",
-            Method::GET,
-            "/assignment/accounts",
-            None,
-        ),
-        (
-            "ListAccountRoles without accessToken",
-            Method::GET,
-            "/assignment/roles?account_id=111111111111",
-            None,
-        ),
         (
             "ListAccountRoles without accountId",
             Method::GET,
             "/assignment/roles",
             Some("tok-live"),
-        ),
-        (
-            "GetRoleCredentials without accessToken",
-            Method::GET,
-            "/federation/credentials?account_id=111111111111&role_name=AdministratorAccess",
-            None,
         ),
         (
             "GetRoleCredentials without accountId",
@@ -603,7 +586,6 @@ async fn an_absent_required_member_is_an_invalid_request_on_any_endpoint() {
             "/federation/credentials?account_id=111111111111",
             Some("tok-live"),
         ),
-        ("Logout without accessToken", Method::POST, "/logout", None),
     ];
 
     for (case, method, path, token) in cases {
