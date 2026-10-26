@@ -11,7 +11,7 @@
 //! One engine's store stands for ONE account in ONE Region, so the quotas Config
 //! documents per account per Region are enforced over the whole store.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -872,6 +872,17 @@ pub const DISCOVERED_RESOURCES_MAX_RESOURCE_IDS: usize = 20;
 /// That operation models no `Limit` member either, and it pages over the same rules
 /// `DescribeConfigRules` does, so it serves them at the same page size.
 pub const DESCRIBE_COMPLIANCE_BY_CONFIG_RULE_PAGE_SIZE: usize = DESCRIBE_CONFIG_RULES_PAGE_SIZE;
+
+/// How many resources one `DescribeComplianceByResource` page carries when the request
+/// leaves `Limit` at its modelled default of 0
+/// (`DescribeComplianceByResourceRequest$Limit`: "The maximum number of evaluation
+/// results returned on each page. The default is 10. … If you specify 0, Config uses
+/// the default").
+///
+/// The same ten the API's evaluation-details reads default to
+/// ([`GET_COMPLIANCE_DETAILS_PAGE_SIZE`]), which their own `Limit` documents with the
+/// same sentence, so the default is written once.
+pub const DESCRIBE_COMPLIANCE_BY_RESOURCE_PAGE_SIZE: usize = GET_COMPLIANCE_DETAILS_PAGE_SIZE;
 
 /// The most tags one Config resource can carry, after which `TagResource` refuses
 /// the request with `TooManyTagsException` ("You have reached the limit of the number
@@ -4445,24 +4456,88 @@ pub fn summarise_compliance<'a>(
 pub fn resource_compliance<'a>(
     rules: impl Iterator<Item = &'a ConfigRuleEntry>,
 ) -> BTreeMap<(String, String), &'static str> {
-    let mut recorded: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
+    verdicts_by_resource(rules)
+        .into_iter()
+        .map(|(resource, verdicts)| {
+            (
+                resource,
+                resource_evaluation::roll_up_compliance(
+                    verdicts.into_iter().map(|(_, verdict)| verdict),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The modelled `Compliance` every RESOURCE the account's `rules` have evaluated rolls
+/// up to, keyed the way [`resource_compliance`] keys it.
+///
+/// The `ComplianceType` is that same roll-up. `Compliance$ComplianceContributorCount` is
+/// "the number of Amazon Web Services resources or Config rules that cause a result of
+/// NON_COMPLIANT", and what contributes to a RESOURCE's result is the rules that placed
+/// it there ("If a resource is noncompliant, this operation returns the number of Config
+/// rules that the resource does not comply with", `DescribeComplianceByResource`) — so
+/// the count is of RULES — one rule that placed the resource noncompliant in more than
+/// one evaluation mode contributes once, because what the member counts is rules and not
+/// results — reported only where such rules exist and counted up to the cap a count of
+/// rules is reported to ([`COMPLIANCE_SUMMARY_RULE_CAP`]). That mirrors a rule's own
+/// `Compliance` ([`ConfigRuleEntry::compliance_shape`]), where the contributors are
+/// resources and the resource cap applies instead.
+pub fn resource_compliance_shapes<'a>(
+    rules: impl Iterator<Item = &'a ConfigRuleEntry>,
+) -> BTreeMap<(String, String), Compliance> {
+    verdicts_by_resource(rules)
+        .into_iter()
+        .map(|(resource, verdicts)| {
+            let contributors: BTreeSet<&str> = verdicts
+                .iter()
+                .filter(|(_, verdict)| *verdict == COMPLIANCE_TYPE_NON_COMPLIANT)
+                .map(|(rule_name, _)| *rule_name)
+                .collect();
+            let contributors = contributors.len();
+            let compliance = Compliance {
+                compliance_type: Some(
+                    resource_evaluation::roll_up_compliance(
+                        verdicts.into_iter().map(|(_, verdict)| verdict),
+                    )
+                    .to_string(),
+                ),
+                compliance_contributor_count: (contributors > 0).then(|| {
+                    capped_count(
+                        i64::try_from(contributors).unwrap_or(i64::MAX),
+                        COMPLIANCE_SUMMARY_RULE_CAP,
+                    )
+                }),
+            };
+            (resource, compliance)
+        })
+        .collect()
+}
+
+/// Every verdict the account's `rules` recorded for each RESOURCE they evaluated — the
+/// name of the rule that recorded it and the `ComplianceType` it placed the resource at —
+/// keyed by the `(resourceType, resourceId)` pair that identifies a resource in Config.
+///
+/// The rule's NAME travels with its verdict because a rule holds one result per
+/// evaluation mode ([`EvaluationResultKey`]), so counting results would count one rule
+/// that placed the same resource in both modes twice.
+///
+/// The ONE place a resource's verdicts are gathered out of the rules that recorded them,
+/// so what a resource rolls up to ([`resource_compliance`]) and how many rules put it
+/// there ([`resource_compliance_shapes`]) are read off the same grouping.
+fn verdicts_by_resource<'a>(
+    rules: impl Iterator<Item = &'a ConfigRuleEntry>,
+) -> BTreeMap<(String, String), Vec<(&'a str, &'a str)>> {
+    let mut recorded: BTreeMap<(String, String), Vec<(&str, &str)>> = BTreeMap::new();
     for rule in rules {
         for result in rule.evaluation_results.values() {
             recorded
                 .entry((result.resource_type.clone(), result.resource_id.clone()))
                 .or_default()
-                .push(result.compliance_type.as_str());
+                .push((rule.name.as_str(), result.compliance_type.as_str()));
         }
     }
     recorded
-        .into_iter()
-        .map(|(resource, verdicts)| {
-            (
-                resource,
-                resource_evaluation::roll_up_compliance(verdicts.into_iter()),
-            )
-        })
-        .collect()
 }
 
 /// `count` contributors reported as a `ComplianceContributorCount` against `cap`: the
@@ -4876,6 +4951,25 @@ pub fn decode_resource_compliance_detail_token(
     Some((fields.next()?, fields.next()?))
 }
 
+/// What identifies one resource in a report ABOUT resources: the
+/// `(resourceType, resourceId)` pair that identifies a resource in Config, which is
+/// also the key [`resource_compliance`] reports a resource under and therefore the
+/// ordering a `DescribeComplianceByResource` page resumes at.
+pub type ComplianceByResourceKey = (String, String);
+
+/// Encode the [`ComplianceByResourceKey`] a `DescribeComplianceByResource` page should
+/// resume at as an opaque `NextToken`.
+pub fn encode_compliance_by_resource_token(key: &ComplianceByResourceKey) -> String {
+    encode_length_prefixed_token(&[&key.0, &key.1])
+}
+
+/// The [`ComplianceByResourceKey`] a `NextToken` resumes at, or `None` when the token is
+/// malformed — i.e. not something [`encode_compliance_by_resource_token`] produced.
+pub fn decode_compliance_by_resource_token(token: &str) -> Option<ComplianceByResourceKey> {
+    let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
+    Some((fields.next()?, fields.next()?))
+}
+
 /// Encode the resource key a `DescribeRemediationExecutionStatus` page should resume at
 /// as an opaque `NextToken`.
 pub fn encode_remediation_execution_token(resume_at: &(String, String)) -> String {
@@ -4979,6 +5073,19 @@ pub fn unfilterable_compliance_type_message(member: &str, value: &str) -> String
 /// and ResourceType", `GetComplianceDetailsByResourceRequest$ResourceEvaluationId`).
 pub const RESOURCE_NOT_IDENTIFIED_MESSAGE: &str =
     "Either ResourceEvaluationId or both ResourceType and ResourceId must be provided.";
+
+/// How a compliance report words `InvalidParameterValueException` for a request that
+/// named a resource id without the resource type that completes it.
+///
+/// A resource is identified by its type AND its id, so an id on its own names no
+/// resource. AWS publishes no text for this refusal, so the sentence is the REQUIREMENT
+/// as the member that carries the id states it ("You can specify only one resource ID.
+/// If you specify a resource ID, you must also specify a type for ResourceType",
+/// `DescribeComplianceByResourceRequest$ResourceId`), which names both members a caller
+/// has to fix. FIXED, and it carries no part of the request: the id it was sent with is
+/// already in the caller's hand.
+pub const RESOURCE_TYPE_REQUIRED_MESSAGE: &str =
+    "If you specify a resource ID, you must also specify a type for ResourceType.";
 
 /// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
 /// this account does not hold, through a single-name member (`ConfigRuleName`).

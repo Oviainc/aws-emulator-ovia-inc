@@ -27,7 +27,8 @@ use crate::ops::types::{
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
-    PermissionSet, PermissionSetProvisioningStatus, PermissionsBoundary, PortalOptions,
+    PermissionSet, PermissionSetProvisioningStatus, PermissionSetProvisioningStatusMetadata,
+    PermissionsBoundary, PortalOptions,
     RegionMetadata, ResourceServerConfig, ResourceServerScopeDetails, ScopeDetails, Tag,
     TrustedTokenIssuerConfiguration,
 };
@@ -2317,6 +2318,41 @@ impl PermissionSetProvisioningRecord {
             created_date: Some(self.created_date),
         }
     }
+
+    /// The TRACKING view of this record, as of `now`: the status the provisioning is in,
+    /// the `RequestId` — "the identifier for tracking the request operation" — to poll it
+    /// by, and the date it was created, and none of the provisioning's detail.
+    ///
+    /// Those three members are exactly the ones the model's own
+    /// `PermissionSetProvisioningStatusMetadata` carries, the member type of the list an
+    /// enumeration of this history answers with: what a caller that has not described a
+    /// tracked provisioning yet is told, so it can describe the ones it cares about.
+    pub fn to_metadata_shape(&self, now: SystemTime) -> PermissionSetProvisioningStatusMetadata {
+        PermissionSetProvisioningStatusMetadata {
+            status: Some(self.status(now).to_string()),
+            request_id: Some(self.request_id.clone()),
+            created_date: Some(self.created_date),
+        }
+    }
+
+    /// The record's sort/pagination key within one enumeration of this history: the
+    /// instant it was created, then the `RequestId`.
+    ///
+    /// The instant comes first so the enumeration walks the history in the order it
+    /// happened, and it is rendered at a FIXED width (`created_date` is the instant a
+    /// `ProvisionPermissionSet` call was accepted, so its epoch seconds are positive) so
+    /// the text order of the key is the order of the instant. The `RequestId` breaks the
+    /// tie between two provisionings accepted at the same instant, and is unique across
+    /// the history, so no two records share a key and a cursor resumes after exactly one
+    /// of them.
+    pub fn page_key(&self) -> String {
+        format!(
+            "{:020}.{:09}#{}",
+            self.created_date.secs(),
+            self.created_date.subsec_nanos(),
+            self.request_id
+        )
+    }
 }
 
 /// Per-service state for com-amazonaws-ssoadmin-swbexternalservice. A handler reaches it through [`service_state`].
@@ -2588,6 +2624,26 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 self.permission_set(instance_arn, &record.permission_set_arn)
                     .is_some()
             })
+    }
+
+    /// Every permission-set provisioning this instance TRACKS, in the order the history
+    /// happened ([`PermissionSetProvisioningRecord::page_key`] is that same order).
+    ///
+    /// A record is tracked under exactly the condition
+    /// [`Self::permission_set_provisioning`] resolves one under — it is delegated to, so
+    /// there is ONE rule — hence an enumeration of this history and a describe of one of
+    /// its ids cannot disagree about which ids exist.
+    pub fn tracked_permission_set_provisionings(
+        &self,
+        instance_arn: &str,
+    ) -> Vec<&PermissionSetProvisioningRecord> {
+        self.permission_set_provisionings
+            .iter()
+            .filter(|record| {
+                self.permission_set_provisioning(instance_arn, &record.request_id)
+                    .is_some()
+            })
+            .collect()
     }
 
     /// Whether any stored permission-set provisioning already carries `request_id`, so a
@@ -3870,6 +3926,20 @@ pub fn cursor_permission_sets_provisioned_to_account(
     format!(
         "permissionSetsProvisionedToAccount|{instance_arn}|{account_id}|{}",
         provisioning_status.unwrap_or_default()
+    )
+}
+
+/// Cursor scope of a `ListPermissionSetProvisioningStatus` enumeration: the operation and
+/// the whole filter that selected the rows — the instance whose provisioning history it
+/// walks and the `StatusValues` it was filtered by, since the key only distinguishes rows
+/// within one such filter.
+pub fn cursor_permission_set_provisioning_status(
+    instance_arn: &str,
+    status: Option<&str>,
+) -> String {
+    format!(
+        "permissionSetProvisioningStatus|{instance_arn}|{}",
+        status.unwrap_or_default()
     )
 }
 

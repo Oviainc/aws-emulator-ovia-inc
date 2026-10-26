@@ -527,6 +527,27 @@ where
     })
 }
 
+/// The noun a cluster is named by in a not-found diagnosis ([`not_found_message`]).
+pub const CLUSTER_NOUN: &str = "cluster";
+
+/// The noun a control panel is named by in a not-found diagnosis.
+pub const CONTROL_PANEL_NOUN: &str = "control panel";
+
+/// The noun a routing control is named by in a not-found diagnosis.
+pub const ROUTING_CONTROL_NOUN: &str = "routing control";
+
+/// The `ResourceNotFoundException$Message` for a request whose ARN resolves to no
+/// resource of this service.
+///
+/// Route 53 ARC words every such refusal as the one fixed sentence
+/// `No record corresponding to <noun> Arn(<arn>)`: the kind of resource that was looked
+/// up, and the ARN the request asked for, echoed unchanged. Nothing else in it varies,
+/// so every lookup in this crate builds its 404 message here rather than phrasing its
+/// own.
+pub fn not_found_message(noun: &str, arn: &str) -> String {
+    format!("No record corresponding to {noun} Arn({arn})")
+}
+
 /// A request's `Tags` map as a deterministic string, for an idempotency fingerprint.
 pub fn tags_fingerprint(tags: Option<&std::collections::HashMap<String, String>>) -> String {
     let mut pairs: Vec<(&str, &str)> = tags
