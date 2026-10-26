@@ -27,7 +27,7 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, emulator, error_code, opt_in, ACCOUNT};
+use crate::harness::{call, call_in_region, create_bucket, emulator, error_code, opt_in, ACCOUNT};
 
 /// The destination bucket these fixtures export to. Compute Optimizer does not create it;
 /// the request just names it.
@@ -40,6 +40,7 @@ const SLACK: Duration = Duration::from_millis(120);
 /// An emulator with the account opted in, which every export call requires.
 async fn enrolled_emulator() -> MultiServiceRouter {
     let router = emulator();
+    create_bucket(&router, BUCKET).await;
     opt_in(&router).await;
     router
 }
@@ -537,6 +538,7 @@ async fn an_invalid_export_request_is_refused() {
 #[tokio::test]
 async fn an_export_is_refused_while_the_account_is_not_opted_in() {
     let router = emulator();
+    create_bucket(&router, BUCKET).await;
     let request = json!({"s3DestinationConfig": {"bucket": BUCKET}});
 
     for case in ["before enrolling", "after opting back out"] {

@@ -147,3 +147,8 @@ mod lake_query_listing;
 mod event_data_store_listing;
 #[path = "all/resource_policy_delete.rs"]
 mod resource_policy_delete;
+// `insight_selectors_api_state` reads Insights selectors back over state built only
+// through this API (`CreateTrail` / `CreateEventDataStore`), beside the older
+// `insight_selectors` suite that seeds the store registry directly.
+#[path = "all/insight_selectors_api_state.rs"]
+mod insight_selectors_api_state;

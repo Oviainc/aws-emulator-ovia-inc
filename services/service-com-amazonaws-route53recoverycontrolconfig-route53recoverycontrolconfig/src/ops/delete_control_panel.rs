@@ -160,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(panel) = guard.control_panels.get(&input.control_panel_arn) else {
             return Err(DeleteControlPanelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no control panel is stored under {}",
-                        input.control_panel_arn
+                    message: crate::state::not_found_message(
+                        crate::state::CONTROL_PANEL_NOUN,
+                        &input.control_panel_arn,
                     ),
                 },
             )

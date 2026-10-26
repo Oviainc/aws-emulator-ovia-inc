@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the connection definitions the addressed Data Catalog actually
+//! holds, in name order, one bounded page at a time — the same projection
+//! [`crate::ops::get_connection`] serves for a single connection, element by element, so a
+//! client that works from the listing is never less informed than one that re-reads each
+//! connection.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Filter` "[f]ilters the connection definitions that are returned": a connection is
+//! returned when it satisfies EVERY member the filter sets, and a filter that sets none
+//! selects every stored connection. `ConnectionType` is "[t]he type of connections to
+//! return" and `ConnectionSchemaVersion` "[d]enotes if the connection was created with
+//! schema version 1 or 2", so each selects the connections whose own recorded value equals
+//! it; `MatchCriteria` is "[a] criteria string that must match the criteria recorded in the
+//! connection definition for that connection definition to be returned", so every
+//! criterion it lists must appear among the connection's own recorded match criteria (an
+//! empty list names no criterion and so excludes nothing).
+//!
+//! `HidePassword` withholds the password properties from every element exactly as it does
+//! on a single read; this operation has no per-compute-environment override member, so no
+//! environment's property map overlays an element here.
+//!
+//! `MaxResults` truncates the page and the returned `NextToken` is the last name on it, so
+//! the next call resumes at the first stored name strictly after it — which stays correct
+//! across connections created or deleted between two calls.
+//!
+//! A read: it reports what is stored and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -79,9 +95,18 @@
 //! * `GlueEncryptionException` (HTTP 400) — An encryption operation failed.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any connection is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `PageSize`, whose range
+/// is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -94,9 +119,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetConnectionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetConnections")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetConnections",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetConnectionsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     GlueEncryptionException(GlueEncryptionException),
     InvalidInputException(InvalidInputException),
@@ -154,18 +183,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnections"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetConnectionsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may read this catalog at all is decided BEFORE any connection
+        // is looked up: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(GetConnectionsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`PageSize`, range 1..1000). The clamp re-states that range in the handler so the
+        // page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Read-only: the stored definitions are projected out and nothing is written.
+        let store = state.lock();
+        // A catalog this account holds but nothing has written a connection into yet holds
+        // none, which is an empty listing and not a miss.
+        let matching: Vec<&crate::state::ConnectionEntry> = store
+            .catalogs
+            .get(&catalog_id)
+            // `Catalog::connections` is keyed by name in a `BTreeMap`, so the walk is
+            // already in name order: one page follows another deterministically.
+            .map(|catalog| catalog.connections.values())
+            .into_iter()
+            .flatten()
+            .filter(|connection| selects(input.filter.as_ref(), connection))
+            .collect();
+
+        // The token is the last name of the previous page, so the page resumes at the first
+        // stored name strictly after it.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => {
+                matching.partition_point(|connection| connection.name.as_str() <= cursor)
+            }
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        // The same projection the single-connection read serves, element by element. This
+        // operation models no compute-environment override, so nothing overlays an element.
+        let connection_list: Vec<Connection> = page
+            .iter()
+            .map(|connection| connection.to_connection(input.hide_password, None))
+            .collect();
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page, and is absent once the page
+        // reaches the end of the listing.
+        let next_token = if end < matching.len() {
+            page.last().map(|connection| connection.name.clone())
+        } else {
+            None
+        };
+
+        Ok(GetConnectionsOutput {
+            connection_list: Some(connection_list),
+            next_token,
+        })
     }
+}
+
+/// Whether `connection` is one of the definitions `filter` asks for.
+///
+/// Every member the filter sets must be satisfied, and a filter that sets none (or no
+/// filter at all) selects every stored connection — the filter "[f]ilters the connection
+/// definitions that are returned", so a member it leaves unset narrows nothing.
+fn selects(
+    filter: Option<&GetConnectionsFilter>,
+    connection: &crate::state::ConnectionEntry,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let definition = &connection.definition;
+    // "The type of connections to return": the connection's own recorded type must be it.
+    if let Some(connection_type) = filter.connection_type.as_deref() {
+        if definition.connection_type.as_deref() != Some(connection_type) {
+            return false;
+        }
+    }
+    // "Denotes if the connection was created with schema version 1 or 2": the version
+    // recorded on the connection must be it.
+    if let Some(schema_version) = filter.connection_schema_version {
+        if definition.connection_schema_version != Some(schema_version) {
+            return false;
+        }
+    }
+    // "A criteria string that must match the criteria recorded in the connection
+    // definition": every criterion the filter lists must be among the connection's own,
+    // so a filter listing none excludes nothing.
+    if let Some(wanted) = filter.match_criteria.as_ref() {
+        let recorded = definition.match_criteria.as_deref().unwrap_or(&[]);
+        if !wanted.iter().all(|criterion| recorded.contains(criterion)) {
+            return false;
+        }
+    }
+    true
 }

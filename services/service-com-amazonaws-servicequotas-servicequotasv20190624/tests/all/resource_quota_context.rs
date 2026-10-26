@@ -52,7 +52,14 @@ const OTHER_ACCOUNT_QUOTA_NAME: &str = "VPCs per Region";
 ///
 /// Looked up through the listing rather than written down, so the table does not pin a
 /// code the catalog derives.
-async fn quota_code_for(caller: &Client, service_code: &str, quota_name: &str) -> String {
+///
+/// `pub(crate)` so the other suites in this target share this lookup instead of each
+/// growing a copy of it.
+pub(crate) async fn quota_code_for(
+    caller: &Client,
+    service_code: &str,
+    quota_name: &str,
+) -> String {
     let listed = walk_pages(
         caller,
         "ListServiceQuotas",

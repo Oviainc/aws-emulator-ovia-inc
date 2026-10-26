@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|function| function.stage(stage))
         else {
             return Err(GetFunctionErrorModeled::NoSuchFunctionExists(
-                crate::state::no_such_function_exists(&input.name, stage),
+                crate::state::no_such_function_exists(),
             )
             .into());
         };

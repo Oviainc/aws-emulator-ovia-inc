@@ -63,6 +63,8 @@ mod rds_database_recommendations;
 mod rds_database_recommendations_export;
 #[path = "all/recommendation_export_jobs.rs"]
 mod recommendation_export_jobs;
+#[path = "all/recommendation_export_objects.rs"]
+mod recommendation_export_objects;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/reported_defaults_and_preference_validation.rs"]

@@ -215,15 +215,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let reported: Vec<BudgetNotificationsForAccount> = page
             .into_iter()
-            .map(|stored| BudgetNotificationsForAccount {
-                budget_name: Some(stored.budget.budget_name.clone()),
-                notifications: Some(
-                    stored
-                        .notifications
-                        .iter()
-                        .map(|held| held.notification.clone())
-                        .collect(),
-                ),
+            .map(|stored| {
+                // The alarm state a notification is reported in is the SERVICE's own
+                // reading of the spend behind the budget that owns it, so it is computed
+                // from that budget as a read reports it — the same projection
+                // `DescribeNotificationsForBudget` reports, so the two listings cannot
+                // disagree. Nothing is written.
+                let budget = crate::state::project_budget(stored, now);
+                BudgetNotificationsForAccount {
+                    budget_name: Some(stored.budget.budget_name.clone()),
+                    notifications: Some(
+                        stored
+                            .notifications
+                            .iter()
+                            .map(|held| {
+                                crate::state::project_notification(&budget, &held.notification)
+                            })
+                            .collect(),
+                    ),
+                }
             })
             .collect();
 
