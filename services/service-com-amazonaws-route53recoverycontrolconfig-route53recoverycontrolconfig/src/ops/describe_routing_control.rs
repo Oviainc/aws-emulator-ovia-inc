@@ -168,9 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = guard.routing_controls.get(&input.routing_control_arn) else {
             return Err(DescribeRoutingControlErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no routing control is stored under {}",
-                        input.routing_control_arn
+                    message: crate::state::not_found_message(
+                        crate::state::ROUTING_CONTROL_NOUN,
+                        &input.routing_control_arn,
                     ),
                 },
             )
