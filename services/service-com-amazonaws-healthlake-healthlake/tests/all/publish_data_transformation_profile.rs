@@ -40,7 +40,10 @@ use crate::data_transformation_profile::{
 use crate::fhir_datastore_lifecycle::string_at;
 
 /// The `ProfileMapping` of an `UpdateDataTransformationProfile` request body.
-fn request_mapping(content: &BTreeMap<String, String>) -> Value {
+///
+/// `pub(crate)` so the sibling profile suites write a DRAFT through this one
+/// helper rather than each growing its own copy.
+pub(crate) fn request_mapping(content: &BTreeMap<String, String>) -> Value {
     let entries: Map<String, Value> = content
         .iter()
         .map(|(path, entry)| (path.clone(), Value::String(entry.clone())))
