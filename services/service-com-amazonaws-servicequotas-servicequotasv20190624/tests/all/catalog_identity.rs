@@ -64,8 +64,20 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("s3", "L-DC2B2D3D"),
     ("vpc", "L-045E6E9C"),
     ("vpc", "L-085A6257"),
+    ("vpc", "L-0EA8095F"),
+    ("vpc", "L-1B52E74A"),
+    ("vpc", "L-29B6F2EB"),
+    ("vpc", "L-2AEEBF1A"),
+    ("vpc", "L-2AFB9258"),
+    ("vpc", "L-407747CB"),
+    ("vpc", "L-45FE3B85"),
+    ("vpc", "L-589F43AA"),
+    ("vpc", "L-7E9ECCDB"),
+    ("vpc", "L-93826ACB"),
     ("vpc", "L-A4707A72"),
+    ("vpc", "L-B4A6D682"),
     ("vpc", "L-F678F1CE"),
+    ("vpc", "L-FE5A380F"),
 ];
 
 /// The `(ServiceCode, QuotaCode)` pairs this catalog cites from a SERVICE'S OWN API
@@ -555,7 +567,7 @@ async fn a_minted_code_this_catalog_does_not_cite_resolves_nothing() {
     for (service_code, quota_code, quota_name) in [
         ("athena", "WorkgroupsPerRegion", "Workgroups per Region"),
         ("monitoring", "AlarmsPerRegion", "Alarms per Region"),
-        ("vpc", "SubnetsPerVPC", "Subnets per VPC"),
+        ("vpc", "PrefixListsPerRegion", "Prefix lists per Region"),
         // The one row whose code the SERVICE's own refusal publishes.
         ("b2bi", "ProfilesPerAccount", "Customer profiles per account"),
     ] {

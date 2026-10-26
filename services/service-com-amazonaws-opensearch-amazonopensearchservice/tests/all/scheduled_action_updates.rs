@@ -295,7 +295,7 @@ async fn a_reschedule_moves_the_change_to_the_instant_the_request_names() {
         .create({
             let mut request = baseline_create(toggled_off);
             request["OffPeakWindowOptions"] = json!({
-                "Enabled": false,
+                "Enabled": true,
                 "OffPeakWindow": { "WindowStartTime": { "Hours": 17, "Minutes": 0 } },
             });
             request
@@ -306,6 +306,20 @@ async fn a_reschedule_moves_the_change_to_the_instant_the_request_names() {
         "case CreateDomain({toggled_off:?}): expected 200, got {} with {:?}",
         created.status, created.body
     );
+    // The legacy toggle OFF is a state no call can leave a domain in — "all domains
+    // created after [February 16, 2023] have the off-peak window enabled by default"
+    // and it "can't be disabled after it's enabled" — so it is written into the store
+    // directly, the same way this suite seeds the changes it reschedules.
+    emulator
+        .store()
+        .lock()
+        .domains
+        .get_mut(toggled_off)
+        .expect("the domain just created is in the store")
+        .off_peak_window_options
+        .as_mut()
+        .expect("the create carried off-peak window options")
+        .enabled = Some(false);
     let plain = PLAIN;
     create_baseline(&emulator, plain).await;
 

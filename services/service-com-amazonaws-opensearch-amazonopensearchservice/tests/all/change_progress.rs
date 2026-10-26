@@ -217,13 +217,15 @@ async fn the_change_a_create_starts_reports_every_option_the_create_set() {
             "bare-create",
             json!({ "DomainName": "bare-create" }),
             // Nothing but the members every domain holds: the engine version and
-            // cluster configuration a domain always has, the advanced options map
-            // that is empty rather than absent, and the two defaulted members.
+            // cluster configuration a domain always has, the advanced options and
+            // log-publishing options maps that are empty rather than absent, and the
+            // two defaulted members.
             vec![
                 "AdvancedOptions".to_string(),
                 "ClusterConfig".to_string(),
                 "EngineMode".to_string(),
                 "EngineVersion".to_string(),
+                "LogPublishingOptions".to_string(),
                 "UseCase".to_string(),
             ],
         ),
@@ -240,6 +242,7 @@ async fn the_change_a_create_starts_reports_every_option_the_create_set() {
                 "ClusterConfig".to_string(),
                 "EngineMode".to_string(),
                 "EngineVersion".to_string(),
+                "LogPublishingOptions".to_string(),
                 "UseCase".to_string(),
             ],
         ),

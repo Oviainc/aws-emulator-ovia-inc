@@ -415,6 +415,9 @@ fn cases() -> Vec<Case> {
             cluster: json!({
                 "InstanceType": "m6g.large.search",
                 "InstanceCount": 2,
+                "DedicatedMasterEnabled": true,
+                "DedicatedMasterType": "c5.large.search",
+                "DedicatedMasterCount": 3,
                 "WarmEnabled": true,
                 "WarmType": "ultrawarm1.medium.search",
                 "WarmCount": 2,
@@ -423,6 +426,7 @@ fn cases() -> Vec<Case> {
             standby_zones: 0,
             roles: vec![
                 on_instance_storage("Data", "m6g.large.search", Placement::Zones(&[2])),
+                on_instance_storage("Master", "c5.large.search", Placement::Zones(&[3])),
                 on_instance_storage(
                     "Ultrawarm",
                     "ultrawarm1.medium.search",
@@ -537,16 +541,18 @@ fn cases() -> Vec<Case> {
             cluster: json!({
                 "InstanceType": "t3.large.search",
                 "InstanceCount": 1,
+                "DedicatedMasterEnabled": true,
+                "DedicatedMasterType": "c5.large.search",
+                "DedicatedMasterCount": 3,
                 "WarmEnabled": true,
                 "WarmType": "ultrawarm1.large.search",
             }),
             ebs: Value::Null,
             standby_zones: 0,
-            roles: vec![on_instance_storage(
-                "Data",
-                "t3.large.search",
-                Placement::Zones(&[1]),
-            )],
+            roles: vec![
+                on_instance_storage("Data", "t3.large.search", Placement::Zones(&[1])),
+                on_instance_storage("Master", "c5.large.search", Placement::Zones(&[3])),
+            ],
         },
         Case {
             // A data-node count of zero is a count, so the cluster has no data node.

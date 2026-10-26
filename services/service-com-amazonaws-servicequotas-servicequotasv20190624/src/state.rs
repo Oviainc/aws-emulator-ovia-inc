@@ -4026,19 +4026,22 @@ fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Network interfaces per Region", 5000.0).code("L-045E6E9C"),
         // AWS publishes this one as not adjustable.
         quota("IPv6 CIDR blocks per VPC", 1.0).code("L-085A6257").fixed(),
-        quota("Subnets per VPC", 200.0),
+        // The rows below carry the codes AWS publishes these quotas under ("Amazon VPC
+        // quotas", Amazon VPC User Guide), so a client holding a code read out of AWS's
+        // catalog resolves the quota it names here too.
+        quota("Subnets per VPC", 200.0).code("L-407747CB"),
         quota("Security groups per VPC", 2500.0),
-        quota("Inbound or outbound rules per security group", 60.0),
-        quota("Security groups per network interface", 5.0),
-        quota("Route tables per VPC", 200.0),
-        quota("Routes per route table", 50.0),
-        quota("Network ACLs per VPC", 200.0),
-        quota("Rules per network ACL", 20.0),
-        quota("NAT gateways per Availability Zone", 5.0),
-        quota("Egress-only internet gateways per Region", 5.0),
-        quota("Active VPC peering connections per VPC", 50.0),
-        quota("Gateway VPC endpoints per Region", 20.0),
-        quota("Interface VPC endpoints per VPC", 50.0),
+        quota("Inbound or outbound rules per security group", 60.0).code("L-0EA8095F"),
+        quota("Security groups per network interface", 5.0).code("L-2AFB9258"),
+        quota("Route tables per VPC", 200.0).code("L-589F43AA"),
+        quota("Routes per route table", 50.0).code("L-93826ACB"),
+        quota("Network ACLs per VPC", 200.0).code("L-B4A6D682"),
+        quota("Rules per network ACL", 20.0).code("L-2AEEBF1A"),
+        quota("NAT gateways per Availability Zone", 5.0).code("L-FE5A380F"),
+        quota("Egress-only internet gateways per Region", 5.0).code("L-45FE3B85"),
+        quota("Active VPC peering connections per VPC", 50.0).code("L-7E9ECCDB"),
+        quota("Gateway VPC endpoints per Region", 20.0).code("L-1B52E74A"),
+        quota("Interface VPC endpoints per VPC", 50.0).code("L-29B6F2EB"),
         quota("Prefix lists per Region", 100.0),
     ]
 }

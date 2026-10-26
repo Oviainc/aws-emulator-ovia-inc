@@ -34,7 +34,7 @@ use crate::ops::types::{
     AutoTune, AutoTuneDetails,
     AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
-    AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
+    AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions, BaseException,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceDetails, DataSourceType,
@@ -1829,6 +1829,27 @@ pub fn no_software_update_available(
     }
 }
 
+/// The `ValidationException` payload for a service software update a domain has none
+/// of to call off: nothing is scheduled on it, or the deployment it scheduled has
+/// already begun — and a deployment under way is past the point a cancel can reach.
+///
+/// `CancelServiceSoftwareUpdate` is documented "you can only perform this operation
+/// before the `AutomatedUpdateDate` and when the domain's `UpdateStatus` is
+/// `PENDING_UPDATE`", so outside that state there is nothing to cancel and the call is
+/// refused with the operation's modelled `ValidationException`, naming which part of
+/// the rule the record fails.
+pub fn no_software_update_to_cancel(domain_name: &str, deploying: bool) -> ValidationException {
+    let named = format!("domain {domain_name}");
+    let message = if deploying {
+        deployment_in_progress_sentence(&named)
+    } else {
+        format!("There is no scheduled service software update to cancel on {named}.")
+    };
+    ValidationException {
+        message: Some(message),
+    }
+}
+
 /// A service software update a caller asked to start LATER: the release it will move
 /// the domain onto, and the instant the schedule the caller named puts it at.
 ///
@@ -1997,6 +2018,20 @@ impl ServiceSoftware {
                 starts_at,
             });
         }
+        Some(self.to_options())
+    }
+
+    /// Call off the update this domain has scheduled and not begun, or answer `None`
+    /// when there is none to call off — which is the whole eligibility test, so a
+    /// caller cannot cancel a deployment the record does not allow cancelling.
+    ///
+    /// Only an update that has been REQUESTED and has not begun is cancellable (see
+    /// [`Self::to_options`]); cancelling it leaves the release it was going to move the
+    /// domain onto available to update to again, which is the state the domain was in
+    /// before the update was scheduled.
+    pub fn cancel_update(&mut self) -> Option<ServiceSoftwareOptions> {
+        let pending = self.pending_update.take()?;
+        self.available_version = Some(pending.target_version);
         Some(self.to_options())
     }
 
@@ -3328,12 +3363,18 @@ impl Domain {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            log_publishing_options: Some(
+            // "Log publishing options for the domain": the member reports the log
+            // types the domain publishes, so a domain that publishes none omits it
+            // rather than reporting an empty map — presence is how a caller tells a
+            // domain with log publishing from one without. The CONFIGURATION container
+            // `to_config` reports is a different thing: every domain has one, empty or
+            // not.
+            log_publishing_options: (!self.log_publishing_options.is_empty()).then(|| {
                 self.log_publishing_options
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+                    .collect()
+            }),
             // The same record `RollbackServiceSoftwareUpdate` answers about, read
             // through its own projection.
             service_software_options: Some(self.service_software.to_options()),
@@ -3437,16 +3478,18 @@ impl Domain {
                     status,
                 }
             }),
-            log_publishing_options: self.option_status(OPT_LOG_PUBLISHING_OPTIONS).map(|status| {
-                LogPublishingOptionsStatus {
-                    options: Some(
-                        self.log_publishing_options
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect(),
-                    ),
-                    status: Some(status),
-                }
+            // Every domain has a log-publishing CONFIGURATION, which is empty until a
+            // call puts a log type in it: the container is reported with the map the
+            // domain holds — empty rather than absent — beside the option's own status,
+            // which every container of this descriptor carries.
+            log_publishing_options: Some(LogPublishingOptionsStatus {
+                options: Some(
+                    self.log_publishing_options
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+                status: self.option_status(OPT_LOG_PUBLISHING_OPTIONS),
             }),
             domain_endpoint_options: self
                 .domain_endpoint_options
@@ -4561,6 +4604,166 @@ pub fn region_availability_zones(region: &str) -> Vec<String> {
     (0..CATALOG_AVAILABILITY_ZONES)
         .filter_map(|index| zone_name(region, index))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Domain configuration a domain cannot be created or updated with
+//
+// A configuration the SERVICE does not provision is refused rather than stored:
+// each check below reads one documented dependency between members of a domain's
+// configuration and states the refusal the create and the update paths share, so
+// neither path can accept a configuration the other refuses.
+// ---------------------------------------------------------------------------
+
+/// The shortest master password the service takes: `MasterUserPassword`'s own
+/// `@length` floor, refused at the boundary before any handler runs.
+pub const MASTER_USER_PASSWORD_MINIMUM: usize = 8;
+
+/// The character classes a master password has to draw on, stated as the service
+/// states them: the sentence a refusal carries, and the list the checks below walk.
+///
+/// The LENGTH floor is the model's own (`MasterUserPassword` has `@length` min 8), so
+/// it is refused at the boundary before any handler runs and is not restated here.
+const MASTER_USER_PASSWORD_REQUIREMENT: &str =
+    "The master user password must contain at least one uppercase letter, one lowercase letter, \
+     one number, and one special character.";
+
+/// Whether `options` carries a master password that meets the service's published
+/// complexity requirement, and the refusal stating that requirement otherwise.
+///
+/// A master user password is the credential of the internal user database, and the
+/// service publishes what one has to draw on: an uppercase letter, a lowercase letter,
+/// a digit and one character that is none of those — so a password missing any of them
+/// is a credential the service would not have accepted, and the request is refused
+/// rather than a domain being created or changed around it. A request that carries no
+/// password asks for none, so there is nothing to check.
+///
+/// The refusal states the REQUIREMENT and never the value: `MasterUserPassword` is
+/// `@sensitive`, so neither the password nor any part of it is echoed.
+pub fn master_user_password_refusal(
+    options: Option<&AdvancedSecurityOptionsInput>,
+) -> Option<ValidationException> {
+    let password = options?
+        .master_user_options
+        .as_ref()?
+        .master_user_password
+        .as_deref()?;
+    let met = password.chars().any(char::is_uppercase)
+        && password.chars().any(char::is_lowercase)
+        && password.chars().any(|character| character.is_ascii_digit())
+        && password.chars().any(|character| !character.is_alphanumeric());
+    if met {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(MASTER_USER_PASSWORD_REQUIREMENT.to_string()),
+    })
+}
+
+/// Whether `cluster` rests its cold tier on a warm one, and the refusal stating that
+/// link otherwise.
+///
+/// The tiers of a domain form a chain, each level resting on the one below it:
+/// `ColdStorageOptions$Enabled` is documented "you must enable UltraWarm storage to
+/// enable cold storage". A cluster that asks for the cold tier without the warm one
+/// describes a tiering the service cannot provision, so it is refused rather than
+/// stored, and the refusal names the link that is missing rather than the chain as a
+/// whole: a caller fixes the level it actually left out.
+///
+/// This link is refused with the operation's `BaseException` ("an error occurred while
+/// processing the request", HTTP 400) — the error the service answers it with — and
+/// the warm link below with the operation's `ValidationException`, so a caller tells
+/// the two apart by code as well as by sentence.
+pub fn cold_storage_refusal(cluster: Option<&ClusterConfig>) -> Option<BaseException> {
+    let cluster = cluster?;
+    let cold = cluster
+        .cold_storage_options
+        .as_ref()
+        .is_some_and(|cold| cold.enabled);
+    if !cold || cluster.warm_enabled.unwrap_or(false) {
+        return None;
+    }
+    Some(BaseException {
+        message: Some("To use cold storage, you must have UltraWarm enabled.".to_string()),
+    })
+}
+
+/// Whether `cluster` rests its warm tier on the master nodes that manage it, and the
+/// refusal stating that link otherwise.
+///
+/// The warm nodes of a domain are managed by the cluster's master nodes, so the warm
+/// tier is offered only on a cluster whose masters are DEDICATED: a cluster that asks
+/// for warm storage without them is refused rather than stored. The next link up is
+/// [`cold_storage_refusal`].
+pub fn warm_storage_refusal(cluster: Option<&ClusterConfig>) -> Option<ValidationException> {
+    let cluster = cluster?;
+    if !cluster.warm_enabled.unwrap_or(false) || cluster.dedicated_master_enabled.unwrap_or(false) {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(
+            "To use warm storage, your domain must have dedicated master nodes.".to_string(),
+        ),
+    })
+}
+
+/// Whether every log-publishing option in `options` names the destination its logs go
+/// to, and the refusal naming the first log type that does not otherwise.
+///
+/// A `LogPublishingOption` is "whether the log should be published" plus "the ARN of
+/// the CloudWatch Logs group to publish logs to": an option that is enabled and names
+/// no group publishes to nowhere, so it is refused rather than stored as a
+/// configuration that silently does nothing. A disabled option publishes nothing and
+/// needs no destination.
+///
+/// The log types are stated in order, so one request with two offending options is
+/// refused with the same sentence however the map was iterated.
+pub fn log_publishing_refusal<'a>(
+    options: impl IntoIterator<Item = (&'a String, &'a LogPublishingOption)>,
+) -> Option<ValidationException> {
+    let mut offending: Vec<&str> = options
+        .into_iter()
+        .filter(|(_, option)| {
+            option.enabled.unwrap_or(false)
+                && option
+                    .cloud_watch_logs_log_group_arn
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+        })
+        .map(|(log_type, _)| log_type.as_str())
+        .collect();
+    offending.sort_unstable();
+    let log_type = offending.first()?;
+    Some(ValidationException {
+        message: Some(format!(
+            "Log publishing option is misconfigured. Enter valid CloudWatch Logs Arn and Enable \
+             flag for LogType \"{log_type}\""
+        )),
+    })
+}
+
+/// Whether `options` leaves the domain's off-peak window enabled, and the refusal
+/// naming the restriction otherwise.
+///
+/// `OffPeakWindowOptions$Enabled` is documented "only available when modifying a
+/// domain created prior to February 16, 2023, not when creating a new domain. All
+/// domains created after this date have the off-peak window enabled by default. You
+/// can't disable the off-peak window after it's enabled for a domain." Every domain
+/// this emulator holds is created now, so its window is enabled from the create on and
+/// a request that asks for it disabled — at create or at update — is refused rather
+/// than leaving a domain with no window for the service's mandatory configuration
+/// changes.
+pub fn off_peak_window_refusal(
+    options: Option<&OffPeakWindowOptions>,
+) -> Option<ValidationException> {
+    if options?.enabled != Some(false) {
+        return None;
+    }
+    Some(ValidationException {
+        message: Some(
+            "An off-peak window is required for a domain and cannot be disabled.".to_string(),
+        ),
+    })
 }
 
 /// The `ValidationException` payload for a member that must carry an engine version

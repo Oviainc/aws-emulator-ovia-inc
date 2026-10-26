@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelServiceSoftwareUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelServiceSoftwareUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelServiceSoftwareUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: calls off the service software update the named domain has scheduled
+//! and not begun, and answers with the `ServiceSoftwareOptions` projection of the
+//! stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +70,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::{domain_not_found, no_software_update_to_cancel};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +146,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelServiceSoftwareUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelServiceSoftwareUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelServiceSoftwareUpdate"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // "Name of the OpenSearch Service domain that you want to cancel the service
+        // software update on": the cancel is a change to THAT domain, so a name the
+        // store holds no domain under names nothing to cancel. `settled_mut` first
+        // materialises whatever the clock already owed the record — including the start
+        // of an update whose scheduled instant has passed, which is what decides
+        // whether this call still has anything to call off.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            CancelServiceSoftwareUpdateErrorModeled::ResourceNotFoundException(domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // "You can only perform this operation before the AutomatedUpdateDate and when
+        // the domain's UpdateStatus is PENDING_UPDATE": the eligibility test lives on
+        // the record, so outside that state there is no update to call off and the call
+        // is REFUSED with the operation's modelled `ValidationException` — naming which
+        // part of the rule it failed — leaving the record exactly as it was.
+        let software = &mut domain.service_software;
+        let deploying = software.deploying();
+        let options = software.cancel_update().ok_or_else(|| {
+            CancelServiceSoftwareUpdateErrorModeled::ValidationException(
+                no_software_update_to_cancel(&input.domain_name, deploying),
+            )
+        })?;
+
+        // Answered from the STORED record, through the one `ServiceSoftwareOptions`
+        // projection every operation that reports a domain's service software uses, so
+        // this answer and a later `DescribeDomain` cannot disagree.
+        Ok(CancelServiceSoftwareUpdateOutput {
+            service_software_options: Some(options),
+        })
     }
 }

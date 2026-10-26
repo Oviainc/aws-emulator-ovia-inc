@@ -280,6 +280,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
         }
 
+        // The rest of the configuration is checked the same way, and against the same
+        // rules the update path applies: a request whose options the service does not
+        // provision together is refused and NO domain is created — the master
+        // credential of the internal user database has to meet the published
+        // complexity requirement, an enabled log-publishing option has to name the
+        // group it publishes to, and the off-peak window cannot be asked for disabled.
+        if let Some(refusal) = [
+            crate::state::master_user_password_refusal(input.advanced_security_options.as_ref()),
+            crate::state::warm_storage_refusal(input.cluster_config.as_ref()),
+            crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
+            crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(CreateDomainErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The storage tiers rest on each other, and the service answers a cold tier
+        // with no warm one under it with its `BaseException` rather than with the
+        // validation refusal above.
+        if let Some(refusal) = crate::state::cold_storage_refusal(input.cluster_config.as_ref()) {
+            return Err(CreateDomainErrorModeled::BaseException(refusal).into());
+        }
+
         // "Domain names are unique across the domains owned by an account within an
         // Amazon Web Services Region" (`CreateDomainRequest$DomainName`), so a second
         // create of the same name is the modelled already-exists refusal, not a second
@@ -414,14 +440,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update bumps it from there. An option the request carried no value for gets
         // no revision, and no `DomainConfig` container either.
         //
-        // The five unconditional ones always have a value: the engine version, the use
+        // The six unconditional ones always have a value: the engine version, the use
         // case and the engine mode default when omitted, the cluster configuration is
-        // `DomainStatus`'s required container, and the advanced options are a map that
-        // is empty rather than absent.
+        // `DomainStatus`'s required container, and the advanced options and the
+        // log-publishing options are maps that are empty rather than absent.
         let mut touched: Vec<&str> = vec![
             OPT_ENGINE_VERSION,
             OPT_CLUSTER_CONFIG,
             OPT_ADVANCED_OPTIONS,
+            OPT_LOG_PUBLISHING_OPTIONS,
             OPT_USE_CASE,
             OPT_ENGINE_MODE,
         ];
@@ -439,10 +466,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (
                 OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS,
                 domain.node_to_node_encryption_options.is_some(),
-            ),
-            (
-                OPT_LOG_PUBLISHING_OPTIONS,
-                !domain.log_publishing_options.is_empty(),
             ),
             (
                 OPT_DOMAIN_ENDPOINT_OPTIONS,

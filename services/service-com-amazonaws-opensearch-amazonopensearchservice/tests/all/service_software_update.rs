@@ -43,7 +43,7 @@ use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PRE
 
 /// `POST /2021-01-01/opensearch/serviceSoftwareUpdate/start`, with the schedule
 /// members a row sends (none for a request that sends only the domain name).
-async fn start(emulator: &Emulator, name: &str, schedule: Value) -> Answer {
+pub(crate) async fn start(emulator: &Emulator, name: &str, schedule: Value) -> Answer {
     let mut body = json!({ "DomainName": name });
     if let Some(members) = schedule.as_object() {
         for (member, value) in members {
@@ -103,7 +103,7 @@ fn cancellable(options: &Value) -> Option<bool> {
 }
 
 /// The error message of a refused answer, with the case named on failure.
-fn message(answer: &Answer, case: &str) -> String {
+pub(crate) fn message(answer: &Answer, case: &str) -> String {
     answer.body["message"]
         .as_str()
         .or_else(|| answer.body["Message"].as_str())
@@ -112,7 +112,7 @@ fn message(answer: &Answer, case: &str) -> String {
 }
 
 /// Put `name`'s service software record into the state a case is about.
-fn seed(emulator: &Emulator, name: &str, software: ServiceSoftware) {
+pub(crate) fn seed(emulator: &Emulator, name: &str, software: ServiceSoftware) {
     let store = emulator.store();
     let mut guard = store.lock();
     let domain = guard
@@ -124,7 +124,7 @@ fn seed(emulator: &Emulator, name: &str, software: ServiceSoftware) {
 
 /// The record a domain carries when a release is available for it to move onto: it
 /// runs `current`, `available` is waiting, and nothing is deploying.
-fn with_update_available(current: &str, available: &str) -> ServiceSoftware {
+pub(crate) fn with_update_available(current: &str, available: &str) -> ServiceSoftware {
     ServiceSoftware {
         current_version: current.to_string(),
         available_version: Some(available.to_string()),
@@ -138,7 +138,7 @@ fn with_update_available(current: &str, available: &str) -> ServiceSoftware {
 
 /// `CreateDomain` for `name` and then wait out the provisioning span, so the only
 /// thing in flight on the record afterwards is whatever a case puts there.
-async fn settled_domain(emulator: &Emulator, name: &str) {
+pub(crate) async fn settled_domain(emulator: &Emulator, name: &str) {
     create_baseline(emulator, name).await;
     tokio::time::sleep(SETTLE_WAIT).await;
 }

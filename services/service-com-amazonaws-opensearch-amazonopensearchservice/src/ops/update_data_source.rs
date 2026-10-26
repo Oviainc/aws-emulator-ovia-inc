@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's members to the [`crate::state::DataSource`] the
+//! named domain holds and answers with the sentence naming what it updated.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataSource"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+
+        // "The name of the domain": a data source belongs to one domain, so a name the
+        // store holds no domain under holds no data source either.
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            UpdateDataSourceErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // "The name of the data source to modify": the domain exists, so a name it
+        // holds no data source under is a bad request rather than a missing resource —
+        // the same refusal the read path answers such a name with, so one reads like
+        // the other.
+        let data_source = domain.data_sources.get_mut(&input.name).ok_or_else(|| {
+            UpdateDataSourceErrorModeled::ValidationException(crate::state::data_source_absent(
+                &input.name,
+            ))
+        })?;
+
+        // A member the request carries REPLACES the stored one; a member it omits
+        // leaves the stored value where it was. `DataSourceType` is required, so every
+        // update states the type; `Description` is "a new description of the data
+        // source" and `Status` "the status of the data source update", both optional.
+        data_source.data_source_type = input.data_source_type;
+        if let Some(description) = input.description {
+            data_source.description = Some(description);
+        }
+        if let Some(status) = input.status {
+            data_source.status = status;
+        }
+
+        Ok(UpdateDataSourceOutput {
+            message: Some(format!(
+                "Successfully updated a data source named {} for domain {}",
+                input.name, input.domain_name
+            )),
+        })
     }
 }

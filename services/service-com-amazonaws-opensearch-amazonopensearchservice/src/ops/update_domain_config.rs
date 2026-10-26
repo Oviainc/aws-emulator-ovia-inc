@@ -426,6 +426,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
             .clone();
 
+        // The master credential of the internal user database has to meet the
+        // published complexity requirement, whichever call sets it. It is checked on
+        // the REQUEST rather than on the merged record, because what a domain stores
+        // of its fine-grained access control never includes the password.
+        if let Some(refusal) =
+            crate::state::master_user_password_refusal(input.advanced_security_options.as_ref())
+        {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
         let touched = merge(&mut merged, input, now);
         let deployment = deployment_type(&merged, &touched);
 
@@ -454,6 +464,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             merged.cluster_config.instance_type.as_deref(),
         ) {
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The configuration the change would leave the domain with is judged by the
+        // same rules the create path applies, and on the MERGED record for the same
+        // reason: a request that enables the cold tier is checked against the warm
+        // setting the domain keeps. A dry run is refused too — it reports what applying
+        // the change would do, and this change cannot be applied.
+        if let Some(refusal) = [
+            crate::state::warm_storage_refusal(Some(&merged.cluster_config)),
+            crate::state::log_publishing_refusal(merged.log_publishing_options.iter()),
+            crate::state::off_peak_window_refusal(merged.off_peak_window_options.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::cold_storage_refusal(Some(&merged.cluster_config)) {
+            return Err(UpdateDomainConfigErrorModeled::BaseException(refusal).into());
         }
 
         if dry_run {
