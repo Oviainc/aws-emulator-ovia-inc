@@ -6,6 +6,10 @@
 //! — it moves to `Revoked`, reports the request's `reason` as its `statusReason`,
 //! and carries the revocation record every later `GetSigningProfile` reports.
 //!
+//! A repeat revoke of a profile that is ALREADY revoked still answers success and
+//! leaves the first record standing: the revocation is a fact about trust that
+//! has already ended, so it is recorded once.
+//!
 //! The success answer is `204 No Content` with no body: the output is `Unit`, and
 //! the recorded AWS answer to this `PUT` is 204, not the 200 the model's `@http`
 //! code states (the two disagree; the wire is what a client reads).
@@ -241,6 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Recording is idempotent: a profile already revoked keeps the instant,
+        // reason and identity of the revocation that ended trust in its
+        // signatures, so this answers success without restating them.
         profile.revoke(&input.reason, input.effective_time, revoked_by, now);
 
         Ok(RevokeSigningProfileOutput)

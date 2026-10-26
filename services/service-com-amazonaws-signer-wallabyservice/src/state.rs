@@ -270,6 +270,13 @@ impl SigningProfileRecord {
     /// `revocation_effective_from` is the caller's `effectiveTime` — the instant
     /// signatures stop being trusted — while `revoked_at` is when this call
     /// happened, which is why the two are stored separately.
+    ///
+    /// A revocation is a fact about trust that has already ended, so it is
+    /// recorded ONCE: revoking an already-revoked profile leaves the first record
+    /// standing rather than restating when, from which instant, why and by whom
+    /// trust ended. Moving `revocation_effective_from` forward would otherwise
+    /// restore trust in signatures the first revocation had already placed after
+    /// it.
     pub fn revoke(
         &mut self,
         reason: &str,
@@ -277,6 +284,9 @@ impl SigningProfileRecord {
         revoked_by: Option<String>,
         now: SystemTime,
     ) {
+        if self.is_revoked() {
+            return;
+        }
         self.status = PROFILE_STATUS_REVOKED.to_string();
         self.status_reason = Some(reason.to_string());
         self.revocation_record = Some(SigningProfileRevocationRecord {
