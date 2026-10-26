@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EstimateTemplateCost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EstimateTemplateCost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! What this operation answers is computed from the template the request carries: it READS
+//! that body (CloudFormation reads a template as JSON or, failing that, as YAML) and
+//! reports the Simple Monthly Calculator URL of the estimate it saves for what the body
+//! declares. Nothing of this service's own is written — "returns the estimated monthly cost
+//! of a template" names no resource this service holds, so no caller sees a different
+//! answer to any other read because an estimate was taken.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EstimateTemplateCost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The URL's `id` query parameter is what addresses that saved estimate on the calculator,
+//! and it is minted per call the way every other identifier this service hands out is:
+//! every call saves its OWN estimate, so two calls name two of them even when they estimate
+//! the same template. Its seed is what the estimate is OF — the resources the template
+//! requires (each declared resource's logical id, type and properties), the parameter values
+//! in force (what the request supplied, plus the template's own `Default` for every declared
+//! parameter it did not) and the Region the call was signed for, which are the three things
+//! the monthly cost of a template depends on.
+//!
+//! What it refuses is a matter of FORM, the same rules every operation that takes a
+//! template body is held to: a body past the documented `TemplateBody` maximum or past a
+//! documented per-template quota, one this service's reader will read as neither JSON nor
+//! YAML (refused at the line and column the reader stopped at), and one declaring no
+//! resource at all — there is nothing to estimate the cost of.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +85,79 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{template, StoredParameter};
+
+/// The calculator page an estimate is read on, with the estimate itself named by the `id`
+/// query parameter [`estimate_id`] builds.
+const CALCULATOR_ESTIMATE_PAGE: &str = "https://calculator.aws/#/estimate";
+
+/// The producer segment a CloudFormation-generated estimate's id carries, which is what
+/// separates it from an estimate saved on the calculator by anything else.
+const ESTIMATE_ID_PREFIX: &str = "cloudformation/";
+
+/// How many hexadecimal characters the estimate's own id carries.
+const ESTIMATE_ID_DIGITS: usize = 40;
+
+/// Keeps this id apart from every other identifier this service mints, so the id of an
+/// estimate and the id of a resource of the same name are never the same digits (the
+/// `seed` [`crate::state::new_identifier_digits`] takes).
+const ESTIMATE_SALT: &str = "estimate-template-cost";
+
+/// What the estimate is OF, as one canonical text: the Region, the parameter values in
+/// force and the resources the template requires.
+///
+/// Every part is read off the request and the template it carries, so this is what the
+/// estimate the call saves is an estimate of — and the seed [`estimate_id`] mints that
+/// estimate's id from. It is a seed and not an address: the minter mixes a per-call counter
+/// and the instant into it, so two calls estimating one template still name two saved
+/// estimates. The parameters are keyed and the resources carry their logical ids so the
+/// text reads as the estimate rather than as the body's spelling.
+fn estimated(
+    region: &str,
+    declared: &template::Template,
+    parameters: &[StoredParameter],
+) -> String {
+    let mut description = format!("region={region}\n");
+    let mut in_force: Vec<&StoredParameter> = parameters.iter().collect();
+    in_force.sort_by(|left, right| left.key.cmp(&right.key));
+    for parameter in in_force {
+        description.push_str("parameter=");
+        description.push_str(&parameter.key);
+        description.push('=');
+        description.push_str(&parameter.value);
+        description.push('\n');
+    }
+    // `crate::state::declared_template` hands the resources back sorted by logical id, so
+    // the text does not depend on the order the reader walked the section in.
+    for resource in &declared.resources {
+        description.push_str("resource=");
+        description.push_str(&resource.logical_id);
+        description.push('=');
+        description.push_str(&resource.resource_type);
+        description.push('=');
+        description
+            .push_str(&template::properties_blob(&resource.properties).unwrap_or_default());
+        description.push('\n');
+    }
+    description
+}
+
+/// The id of the estimate this call saves: the producer segment and
+/// [`ESTIMATE_ID_DIGITS`] lowercase hexadecimal characters.
+///
+/// Minted per call, the way every other identifier this service hands out is, because every
+/// call saves its OWN estimate on the calculator: two calls name two saved estimates, even
+/// when they estimate the same template. `described` is the seed, so the id is derived from
+/// what was estimated as well as from the instant it was estimated at.
+fn estimate_id(described: &str) -> String {
+    format!(
+        "{ESTIMATE_ID_PREFIX}{}",
+        crate::state::new_identifier_digits(
+            &format!("{ESTIMATE_SALT}/{described}"),
+            ESTIMATE_ID_DIGITS
+        )
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +226,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EstimateTemplateCost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EstimateTemplateCostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EstimateTemplateCost"))
+        // A report on the REQUEST's own template: this operation names no resource this
+        // service holds, so it reads no stored record and writes none — the same standing
+        // `ValidateTemplate` and `GetTemplateSummary` have when they are handed a body.
+        let _ = &self.engine;
+        // "Conditional: You must pass TemplateBody or TemplateURL. If both are passed,
+        // only TemplateBody is used" (`EstimateTemplateCostInput$TemplateBody`).
+        // Borrowed, never copied: the body may be 51,200 bytes and nothing below needs to
+        // own it.
+        let template_body: &str = match (&input.template_body, &input.template_url) {
+            (Some(body), _) => body.as_str(),
+            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
+            // document, which would have to be fetched over the network — this emulator
+            // makes no outbound connections. Answered 501 rather than with an estimate of a
+            // template nobody read, exactly as the other operations that take a body do.
+            (None, Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "EstimateTemplateCost with TemplateURL (fetching a template from Amazon S3)",
+                ))
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "Either TemplateBody or TemplateURL must be specified",
+                ))
+            }
+        };
+        // The documented `TemplateBody` maximum and the documented per-template quotas,
+        // which the model carries no constraint for — the same rules every operation that
+        // takes a body is held to, each refused for the bound it is past.
+        crate::state::validate_template_body(template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        crate::state::validate_template_quotas(template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // Read by the SAME reader every other operation reads a template with, so an
+        // estimate and a deployment cannot disagree about what a body declares, and a body
+        // it will not read is refused with the one wording every such operation gives it.
+        let Some(declared) = crate::state::declared_template(template_body) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                template::not_well_formed(template_body),
+            ));
+        };
+        // "Resources (required): Specifies the stack resources and their properties" — a
+        // body whose `Resources` section is missing or empty declares nothing to estimate
+        // the monthly cost of, and one carrying an entry with no `Type` is refused for that
+        // entry. Both wordings come from the one place that owns them.
+        if let Some(refusal) = template::resources_refusal(&declared) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+        // "A list of Parameter structures that specify input parameters": resolved through
+        // the crate's one resolution of that member, against no previous values — there is
+        // no stack here whose values an entry could ask to keep.
+        let supplied = crate::state::merged_parameters(&[], input.parameters.as_deref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // What a deployment of this template would run with: the supplied values plus the
+        // template's own `Default` for every declared parameter the request passed none
+        // for, which is what the resources' properties resolve against.
+        let in_force = crate::state::parameters_in_force(template_body, supplied);
+        // Cost is Regional, so the Region the call was signed for is part of the estimate.
+        let region = crate::state::request_region(ctx.parts());
+        let described = estimated(&region, &declared, &in_force);
+        Ok(EstimateTemplateCostOutput {
+            // "An Amazon Web Services Simple Monthly Calculator URL with a query string
+            // that describes the resources required to run the template": the calculator's
+            // estimate page, with the estimate named by the id derived from those
+            // resources.
+            url: Some(format!(
+                "{CALCULATOR_ESTIMATE_PAGE}?id={}",
+                estimate_id(&described)
+            )),
+        })
     }
 }

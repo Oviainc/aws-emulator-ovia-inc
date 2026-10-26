@@ -582,15 +582,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(body) => {
                 let Some(submitted) = crate::state::declared_template(body) else {
                     return Err(crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::template::NOT_WELL_FORMED,
+                        crate::state::template::not_well_formed(body),
                     ));
                 };
-                if submitted.resources.is_empty() {
-                    // A change set is a plan over resources, so a template that declares
-                    // none has nothing to plan.
-                    return Err(crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::template::NO_RESOURCES_DECLARED,
-                    ));
+                // A change set is a plan over resources, so a template that declares none
+                // has nothing to plan — and one carrying an entry with no `Type` is refused
+                // for that entry, in the wording the one place that owns it gives.
+                if let Some(refusal) =
+                    crate::state::template::resources_refusal(&submitted)
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
                 }
                 submitted
             }

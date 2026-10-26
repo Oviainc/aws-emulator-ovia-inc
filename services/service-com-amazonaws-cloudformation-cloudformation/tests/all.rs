@@ -51,6 +51,8 @@ mod ecs_elbv2_stack_identifiers;
 mod ecs_elbv2_stack_outputs;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/estimate_template_cost.rs"]
+mod estimate_template_cost;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
 #[path = "all/failed_create_rollback.rs"]

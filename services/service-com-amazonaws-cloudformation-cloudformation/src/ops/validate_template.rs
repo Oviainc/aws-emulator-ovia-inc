@@ -194,17 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every operation that reads a body gives it.
         let Some(template) = template::parse(template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                template::NOT_WELL_FORMED,
+                template::not_well_formed(template_body),
             ));
         };
         // "Resources (required): Specifies the stack resources and their properties" is
         // the one section a template cannot leave out, and an entry carrying no `Type`
         // ("Type: required") declares no resource — so a body whose `Resources` section
-        // is missing, empty or untyped is refused rather than reported as valid.
-        if template.resources.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                template::NO_RESOURCES_DECLARED,
-            ));
+        // is missing or empty is refused rather than reported as valid, and one carrying an
+        // untyped entry is refused for that entry. Both are worded in the one place that
+        // owns them.
+        if let Some(refusal) = template::resources_refusal(&template) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
         if template
             .description

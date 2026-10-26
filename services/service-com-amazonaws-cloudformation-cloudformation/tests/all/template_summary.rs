@@ -815,7 +815,24 @@ async fn get_template_summary_refuses_a_request_it_cannot_summarise() {
             )],
             status: 400,
             code: "ValidationError",
-            message: "At least one Resources member must be defined".to_string(),
+            // The entry is named by its own path: "Type: required" is a rule about THAT
+            // entry, not about the section.
+            message: "[/Resources/Bucket] Every Resources object must contain a Type member."
+                .to_string(),
+        },
+        RefusalCase {
+            case: "a template declaring one resource beside an untyped sibling",
+            members: vec![member(
+                "TemplateBody",
+                r#"{"Resources": {
+                    "Bucket": {"Type": "AWS::S3::Bucket"},
+                    "Untyped": {"Properties": {}}
+                }}"#,
+            )],
+            status: 400,
+            code: "ValidationError",
+            message: "[/Resources/Untyped] Every Resources object must contain a Type member."
+                .to_string(),
         },
     ];
 

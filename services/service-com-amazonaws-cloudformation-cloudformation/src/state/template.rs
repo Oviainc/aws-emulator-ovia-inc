@@ -491,6 +491,13 @@ pub struct Template {
     /// `Condition` are evaluated against.
     pub conditions: Value,
     pub resources: Vec<DeclaredResource>,
+    /// The logical ids of the `Resources` entries that declare NO resource, because they
+    /// carry no string `Type` ("Type: required") — the entries this reader skipped.
+    ///
+    /// Kept because a template carrying one is refused for THAT entry rather than for the
+    /// section ([`resources_refusal`]): CloudFormation names the entry it could not read,
+    /// and an entry this reader dropped silently is one no operation could name.
+    pub untyped_resources: Vec<String>,
     pub outputs: Vec<DeclaredOutput>,
 }
 
@@ -694,7 +701,7 @@ pub fn insufficient_capabilities_message(missing: &[String]) -> String {
 /// [`guard_yaml_body`] puts on an untrusted document, and for one past a documented
 /// per-template quota — a caller may put anything in `TemplateBody`, and a body this
 /// reader will not read declares no resources and no outputs rather than a subset of them.
-/// [`NOT_WELL_FORMED`] is how every operation refuses such a body.
+/// [`not_well_formed`] is how every operation refuses such a body.
 pub fn parse(body: &str) -> Option<Template> {
     let mut document = document(body)?;
     super::sam::expand(&mut document);
@@ -712,14 +719,112 @@ pub fn parse(body: &str) -> Option<Template> {
 /// it will not read is not a template it read part of.
 pub const NOT_WELL_FORMED: &str = "Template format error: not well-formed.";
 
+/// How a body [`parse`] will not read is refused, naming where the reader stopped when it
+/// can say so.
+///
+/// "CloudFormation first checks if the template is valid JSON. If it isn't, CloudFormation
+/// checks if the template is valid YAML" — so the verdict on a body that is neither is the
+/// YAML reader's, and the refusal reports the line and column that reader stopped at, which
+/// is what a caller needs to find the spot. A body refused for a reason that has no
+/// position — one past the bounds this reader puts on an untrusted document, or one holding
+/// a second document — falls back to [`NOT_WELL_FORMED`].
+pub fn not_well_formed(body: &str) -> String {
+    match yaml_failure_position(body) {
+        Some((line, column)) => format!(
+            "Template format error: YAML not well-formed. (line {line}, column {column})"
+        ),
+        None => NOT_WELL_FORMED.to_string(),
+    }
+}
+
+/// The line and column the YAML reader stopped at, both counted from 1 as a template
+/// format error reports them, or `None` when the body carries no YAML syntax error (it is
+/// refused for one of the bounds instead).
+fn yaml_failure_position(body: &str) -> Option<(usize, usize)> {
+    /// The event stream is not needed to find the position, so nothing is built from it:
+    /// this receiver drops every event, which is what keeps a second pass over a refused
+    /// body as cheap as a scan.
+    struct Discard;
+
+    impl ::yaml_rust2::parser::EventReceiver for Discard {
+        fn on_event(&mut self, _event: ::yaml_rust2::parser::Event) {}
+    }
+
+    // The same guard the reader itself applies, so a body refused for its nesting is not
+    // scanned a second time.
+    guard_yaml_body(body)?;
+    let error = ::yaml_rust2::parser::Parser::new_from_str(body)
+        .load(&mut Discard, true)
+        .err()?;
+    // Taken from the error's OFFSET into the body rather than from the line and column the
+    // scanner carries beside it: a body that ends mid-document is stopped at its end, and
+    // the position a caller has to look at is that end — not the start of a line the body
+    // does not have.
+    Some(position_of(body, error.marker().index()))
+}
+
+/// The 1-based line and column of the `index`th CHARACTER of `body`.
+///
+/// Counts characters, because the reader's marker is a character offset rather than a byte
+/// one — which is also why this is not the byte-offset reading
+/// [`service_common::json_parse_fault`] does of a JSON parser's own diagnostic. A position
+/// past the end of the body is its end, which is where a body that stops mid-document
+/// stops.
+fn position_of(body: &str, index: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for character in body.chars().take(index) {
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
 /// How a body that declares no resource is refused, likewise worded once.
 ///
 /// "Resources (required): Specifies the stack resources and their properties" is the one
-/// section a template cannot leave out, and an entry carrying no `Type` ("Type: required")
-/// declares no resource — so a body whose `Resources` section is missing, empty or untyped
-/// is refused rather than read as a template declaring nothing.
+/// section a template cannot leave out, so a body whose `Resources` section is missing or
+/// empty is refused rather than read as a template declaring nothing. An entry that IS
+/// there but carries no `Type` is refused for that entry instead — see
+/// [`untyped_resource`].
 pub const NO_RESOURCES_DECLARED: &str =
     "Template format error: At least one Resources member must be defined.";
+
+/// How an entry of the `Resources` section that carries no `Type` is refused: named by its
+/// own path in the template, since "Type: required" is a rule about THAT entry and the
+/// caller has to find it from this text alone.
+pub fn untyped_resource(logical_id: &str) -> String {
+    format!(
+        "Template format error: [/Resources/{logical_id}] Every Resources object must \
+         contain a Type member."
+    )
+}
+
+/// `Some(message)` for a template whose `Resources` section this service will not read as a
+/// set of declared resources, worded once for every operation that reads a body.
+///
+/// The two cases are distinct refusals: an entry carrying no `Type` is refused for that
+/// entry — and refuses the whole template, however many of its siblings are well-formed —
+/// while a section that is missing or holds nothing at all is refused for declaring no
+/// resource. A template with more than one untyped entry is refused for the first of them in
+/// logical-id order, so the refusal does not depend on the order the body happened to list
+/// them in.
+///
+/// `None` for a section declaring at least one resource and no untyped entry: there is a
+/// template to report on.
+pub fn resources_refusal(declared: &Template) -> Option<String> {
+    if let Some(logical_id) = declared.untyped_resources.iter().min() {
+        return Some(untyped_resource(logical_id));
+    }
+    declared
+        .resources
+        .is_empty()
+        .then(|| NO_RESOURCES_DECLARED.to_string())
+}
 
 /// The documented per-template quota this body is past, worded as the refusal, or `None`
 /// when it is within every one of them.
@@ -917,6 +1022,7 @@ fn template_of(document: &Value) -> Option<Template> {
             // in the stack … Type: required": an entry with no string `Type` declares no
             // resource.
             let Some(resource_type) = declaration.get("Type").and_then(Value::as_str) else {
+                template.untyped_resources.push(logical_id.clone());
                 continue;
             };
             template.resources.push(DeclaredResource {

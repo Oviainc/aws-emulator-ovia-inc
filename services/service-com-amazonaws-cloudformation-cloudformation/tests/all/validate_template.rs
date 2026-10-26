@@ -481,7 +481,24 @@ async fn validate_template_refuses_a_body_it_cannot_report_on() {
             )],
             status: 400,
             code: "ValidationError",
-            message: "At least one Resources member must be defined".to_string(),
+            // The entry is named by its own path: "Type: required" is a rule about THAT
+            // entry, not about the section, so the two refusals differ.
+            message: "[/Resources/Queue] Every Resources object must contain a Type member."
+                .to_string(),
+        },
+        RefusalCase {
+            case: "a template declaring one resource beside an untyped sibling",
+            members: vec![member(
+                "TemplateBody",
+                r#"{"Resources": {
+                    "Queue": {"Type": "AWS::SQS::Queue"},
+                    "Untyped": {"Properties": {}}
+                }}"#,
+            )],
+            status: 400,
+            code: "ValidationError",
+            message: "[/Resources/Untyped] Every Resources object must contain a Type member."
+                .to_string(),
         },
         RefusalCase {
             case: "a body one byte past the documented TemplateBody maximum",

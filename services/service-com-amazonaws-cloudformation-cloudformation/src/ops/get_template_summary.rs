@@ -432,13 +432,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it will not read is refused with the one wording every such operation gives it.
         let Some(declared) = crate::state::declared_template(&template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                template::NOT_WELL_FORMED,
+                template::not_well_formed(&template_body),
             ));
         };
-        if declared.resources.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                template::NO_RESOURCES_DECLARED,
-            ));
+        // A `Resources` section this reader declares no resource from, refused in the one
+        // wording every operation that reads a body gives it: for the untyped entry it
+        // names, or for the section declaring nothing at all.
+        if let Some(refusal) = template::resources_refusal(&declared) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
 
         // "If set to True, any unrecognized resource types generate warnings and not an

@@ -4602,6 +4602,25 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// sees. It is an identifier, never a secret — nothing authenticates with it, and the
 /// crate's existing `sha2`/`hex` dependencies are all it needs.
 fn new_identifier(seed: &str) -> String {
+    let digest = new_identifier_digits(seed, 32);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32]
+    )
+}
+
+/// The digest behind [`new_identifier`], as `digits` lowercase hexadecimal characters and
+/// without the 8-4-4-4-12 grouping — for an identifier whose published form is not a
+/// uuid's (the id of the saved Simple Monthly Calculator estimate `EstimateTemplateCost`
+/// names, which is 40 hexadecimal characters).
+///
+/// Never more than the digest's own 64 characters, so a caller cannot ask for digits
+/// nothing computed.
+pub fn new_identifier_digits(seed: &str, digits: usize) -> String {
     use ::sha2::{Digest, Sha256};
 
     static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
@@ -4616,15 +4635,7 @@ fn new_identifier(seed: &str) -> String {
     hasher.update(counter.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     let digest = ::hex::encode(hasher.finalize());
-
-    format!(
-        "{}-{}-{}-{}-{}",
-        &digest[0..8],
-        &digest[8..12],
-        &digest[12..16],
-        &digest[16..20],
-        &digest[20..32]
-    )
+    digest[..digits.min(digest.len())].to_string()
 }
 
 /// Mint a stack id: `arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>`,
