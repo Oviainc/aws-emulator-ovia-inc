@@ -3,8 +3,9 @@
 //! @op BatchGetTaxExemptions
 //!
 //! Reports the tax exemptions this service holds for each account the request
-//! names, and refuses the call when one of them names an account outside the
-//! caller's consolidated billing family
+//! names, and reports an account it holds no tax-settings resource for on the
+//! batch's own per-account failure channel (`failedAccounts`) rather than
+//! refusing the whole call
 //! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]).
 //!
 //! It is a report: nothing is written. The one thing it derives from the clock is
@@ -169,40 +170,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        // The request is judged before anything is reported: an account this
-        // service holds no tax-settings resource for is not one the caller may
-        // read exemptions for, so the CALL is refused rather than a partial map
-        // returned that silently drops it.
+        // The accounts are reported one by one, each on its own channel: an
+        // account this service holds no tax-settings resource for is one this
+        // call could not get exemptions for, which is exactly what
+        // `failedAccounts` reports, so it lands there and every other account
+        // named is still reported in the map. One such account does not spoil
+        // the batch — the modelled per-account failure channel is what the
+        // caller reads to learn which of the ids it named got no answer.
+        let mut tax_exemption_details_map: ::std::collections::HashMap<
+            String,
+            TaxExemptionDetails,
+        > = ::std::collections::HashMap::new();
+        let mut failed_accounts: Vec<String> = Vec::new();
         for account_id in &named {
             if !store.reports_exemptions_for(account_id) {
-                return Err(BatchGetTaxExemptionsErrorModeled::ResourceNotFoundException(
-                    crate::state::no_exemptions_for_account(account_id),
-                )
-                .into());
+                failed_accounts.push((*account_id).to_string());
+                continue;
+            }
+            // An account this service does hold something for but no exemption
+            // has nothing to report rather than a failure: it gets no entry in
+            // the map, as the single-account reads report it.
+            if let Some(details) = store.exemption_details(account_id, now) {
+                tax_exemption_details_map.insert((*account_id).to_string(), details);
             }
         }
-
-        let tax_exemption_details_map: ::std::collections::HashMap<String, TaxExemptionDetails> =
-            named
-                .iter()
-                .filter_map(|account_id| {
-                    store
-                        .exemption_details(account_id, now)
-                        .map(|details| ((*account_id).to_string(), details))
-                })
-                .collect();
         drop(store);
 
         Ok(BatchGetTaxExemptionsOutput {
             tax_exemption_details_map: Some(tax_exemption_details_map),
-            // `failedAccounts` is "the list of accounts that failed to get tax
-            // exemptions". Every account this call reports on was read from one
-            // store under one lock, so none of them can fail on its own: an
-            // account the caller may not read is refused above, and an account
-            // with no exemption is reported by having no entry in the map. The
-            // member is therefore present and empty rather than omitted — no
-            // account failed.
-            failed_accounts: Some(Vec::new()),
+            // Present and empty rather than omitted when every account named
+            // was reported on: the member answers "which accounts failed", and
+            // "none of them" is an answer this call always has.
+            failed_accounts: Some(failed_accounts),
         })
     }
 }
