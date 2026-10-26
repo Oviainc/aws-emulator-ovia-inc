@@ -471,6 +471,14 @@ where
 /// every account, as opposed to a report scoped to one customer.
 pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
 
+/// `AcceptanceType`'s `EXPLICIT`: downloading the report requires the explicit
+/// click-through acceptance of the term governing it.
+pub const ACCEPTANCE_TYPE_EXPLICIT: &str = "EXPLICIT";
+
+/// `AcceptanceType`'s `PASSTHROUGH`: downloading the report requires no explicit
+/// click-through acceptance of the term governing it.
+pub const ACCEPTANCE_TYPE_PASSTHROUGH: &str = "PASSTHROUGH";
+
 /// One version of one AWS Artifact report, as this emulator persists it.
 ///
 /// Every member of `ReportSummary` and `ReportDetail` that can differ between two
@@ -511,8 +519,10 @@ pub struct Report {
     pub category: String,
     pub company_name: String,
     pub product_name: String,
-    /// One of `AcceptanceType`'s values: `EXPLICIT` requires click-through acceptance
-    /// of the report's term, `PASSTHROUGH` does not.
+    /// One of `AcceptanceType`'s values: [`ACCEPTANCE_TYPE_EXPLICIT`] requires
+    /// click-through acceptance of the report's term,
+    /// [`ACCEPTANCE_TYPE_PASSTHROUGH`] does not — which is what
+    /// [`Report::requires_explicit_acceptance`] decides a download by.
     pub acceptance_type: String,
     /// The TERM document governing this report: the thing a caller accepts to download
     /// any version of it. One per report, not per version — which is why a term grant
@@ -544,6 +554,17 @@ impl Report {
             Some(version) => self.versions.get(&version),
             None => self.versions.values().next_back(),
         }
+    }
+
+    /// Whether downloading any version of this report requires the explicit
+    /// click-through acceptance of the term governing it — the distinction its stored
+    /// `AcceptanceType` is for.
+    ///
+    /// A value this emulator does not publish is read as requiring the acceptance: an
+    /// acceptance type is a requirement, and only the one that names itself as waiving
+    /// it waives it.
+    pub fn requires_explicit_acceptance(&self) -> bool {
+        self.acceptance_type != ACCEPTANCE_TYPE_PASSTHROUGH
     }
 
     /// The `ReportSummary` projection `ListReports` and `ListReportVersions` return for
@@ -1561,8 +1582,8 @@ impl ComAmazonawsArtifactArtifactState {
 
     /// Whether `token` is a grant this service issued that covers `report`'s term.
     ///
-    /// The one place the term-token rule is decided, so `GetReport` and the document
-    /// data plane cannot disagree about which token downloads which document. A term is
+    /// The one place the term-token rule is decided, so every path that decides a
+    /// download ([`Self::download_authorised`]) reads the same answer. A term is
     /// identified by its document's CONTENT digest: the same term text, published for two
     /// reports, is one term, and two different texts are two terms whatever they are
     /// named.
@@ -1570,6 +1591,18 @@ impl ComAmazonawsArtifactArtifactState {
         self.term_tokens
             .get(token)
             .is_some_and(|grant| grant.term_digest == report.term.digest)
+    }
+
+    /// Whether a download of `report` presenting `token` is authorised.
+    ///
+    /// The one place the download rule is decided, so `GetReport` and the document data
+    /// plane cannot disagree about which report downloads under which token. A report
+    /// whose acceptance type requires the explicit click-through acceptance of its term
+    /// downloads only under a grant covering that term ([`Self::grant_covers`]); a report
+    /// that requires no such acceptance downloads without one, because there is no
+    /// acceptance for a grant to be the receipt of.
+    pub fn download_authorised(&self, token: &str, report: &Report) -> bool {
+        !report.requires_explicit_acceptance() || self.grant_covers(token, report)
     }
 
     /// The stored document a data-plane path names, when this service holds it: the

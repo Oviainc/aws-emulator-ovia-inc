@@ -49,6 +49,8 @@ mod inquiry_tags_reporting;
 mod pagination_page_walk;
 #[path = "all/pagination_token_opacity.rs"]
 mod pagination_token_opacity;
+#[path = "all/report_acceptance_type.rs"]
+mod report_acceptance_type;
 #[path = "all/report_projection.rs"]
 mod report_projection;
 #[path = "all/report_workflow.rs"]

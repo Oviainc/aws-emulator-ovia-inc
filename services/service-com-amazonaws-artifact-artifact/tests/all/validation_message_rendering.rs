@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::ACCEPTANCE_EXPLICIT;
+
 /// A SigV4 credential scope naming this service, which is what routes the request.
 const SIGNED: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-1/artifact/aws4_request, \
@@ -108,6 +110,33 @@ async fn a_published_report_id(router: &MultiServiceRouter) -> String {
     listed.body["reports"][0]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the catalog must publish a report, got {:?}", listed.body))
+        .to_string()
+}
+
+/// The first report id the catalog publishes whose download requires the explicit
+/// click-through acceptance of the term governing it, read back through `ListReports`: a
+/// term token is the receipt for exactly that acceptance, so it is on those reports that
+/// a token this service never issued is refused.
+async fn a_report_requiring_acceptance_id(router: &MultiServiceRouter) -> String {
+    let listed = get(router, "/v1/report/list?maxResults=300").await;
+    assert_eq!(
+        listed.status, 200,
+        "ListReports must serve the catalog, got {} with {:?}",
+        listed.status, listed.body
+    );
+    let gated = listed.body["reports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|report| report["acceptanceType"].as_str() == Some(ACCEPTANCE_EXPLICIT));
+    gated
+        .and_then(|report| report["id"].as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "the catalog must publish a report requiring explicit acceptance, got {:?}",
+                listed.body
+            )
+        })
         .to_string()
 }
 
@@ -326,7 +355,7 @@ async fn a_body_the_gateway_refuses_is_not_worded_as_this_rule() {
 #[tokio::test]
 async fn a_token_this_service_never_issued_is_refused_with_one_fixed_text() {
     let router = emulator();
-    let report = a_published_report_id(&router).await;
+    let report = a_report_requiring_acceptance_id(&router).await;
 
     // Every row satisfies the member's modelled constraints, so each one reaches the
     // handler and is refused for what it IS rather than for how it is spelled: a token

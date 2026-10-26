@@ -13,9 +13,11 @@
 //! * a paginated report operation cuts a page at `maxResults`, hands back a `nextToken`
 //!   exactly when items remain, and resumes where the previous page ended — so walking
 //!   the pages at ANY admissible page size enumerates the whole collection once;
-//! * a report document is served only under a term grant this service issued for the
-//!   TERM governing that report, so a token nobody was given, or one accepted under
-//!   another term, yields a modelled failure rather than a URL.
+//! * a report whose `AcceptanceType` requires the explicit acceptance of its term is
+//!   served only under a term grant this service issued for the TERM governing that
+//!   report, so a token nobody was given, or one accepted under another term, yields a
+//!   modelled failure rather than a URL (what a report that requires no such acceptance
+//!   is served under is pinned in `report_acceptance_type.rs`).
 
 use std::collections::BTreeSet;
 
@@ -24,9 +26,9 @@ use service_com_amazonaws_artifact_artifact::state::TERM_GRANT_CAPACITY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    emulator, get_report, get_report_metadata, get_signed, get_term_for_report,
-    list_report_versions, list_reports, signed_for, CATALOG, FALLBACK_REGION, REGION,
-    SIGNED_FOR_A_MALFORMED_REGION,
+    a_report_requiring_acceptance, emulator, get_report, get_report_metadata, get_signed,
+    get_term_for_report, list_report_versions, list_reports, signed_for, CATALOG,
+    FALLBACK_REGION, REGION, SIGNED_FOR_A_MALFORMED_REGION,
 };
 
 /// The bounds `MaxResultsAttribute` declares (`@range(min: 1, max: 300)`), spelled out
@@ -539,7 +541,7 @@ async fn list_report_versions_returns_every_stored_version_of_one_report() {
 }
 
 #[tokio::test]
-async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
+async fn a_report_requiring_acceptance_downloads_only_under_a_term_grant_issued_for_it() {
     let router = emulator();
     let mut issued: Vec<(String, i64, String)> = Vec::new();
 
@@ -613,13 +615,12 @@ async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
         "every GetTermForReport call must mint its own token, got {issued:?}"
     );
 
-    // A token this service never issued is not a token: no URL, a modelled 400.
+    // A token this service never issued is not a token: for a report whose acceptance
+    // type requires the explicit acceptance of its term, no URL and a modelled 400.
+    let gated = a_report_requiring_acceptance();
     for bogus in ["bogus-token", "term-0000000000000000", "never_issued"] {
-        let refused = get_report(
-            &router,
-            &format!("?reportId={}&termToken={bogus}", CATALOG[0].id),
-        )
-        .await;
+        let refused =
+            get_report(&router, &format!("?reportId={}&termToken={bogus}", gated.id)).await;
         assert_eq!(
             refused.status, 400,
             "case {bogus:?}: an unissued termToken must be refused, got {} with {:?}",
@@ -640,8 +641,10 @@ async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
 
     // A grant covers the TERM it was accepted under, and one term document governs
     // every version of its report: so a token minted through ANY version of a report
-    // downloads ALL of them, and downloads no other report in the catalog — each of
-    // which is governed by its own term document.
+    // downloads ALL of them, and downloads no other report that requires an acceptance —
+    // each of which is governed by its own term document. (A report that requires no
+    // acceptance downloads whatever token is presented, which is this grant's business
+    // nowhere: `report_acceptance_type.rs` pins it.)
     for (report_id, version, token) in &issued {
         let expected = CATALOG
             .iter()
@@ -661,7 +664,10 @@ async fn a_report_downloads_only_under_a_term_grant_issued_for_it() {
                 served.status, served.body
             );
         }
-        for other in CATALOG.iter().filter(|row| row.id != report_id) {
+        for other in CATALOG
+            .iter()
+            .filter(|row| row.id != report_id && row.requires_explicit_acceptance())
+        {
             let case = format!("{} under the grant for {report_id} v{version}", other.id);
             let refused = get_report(
                 &router,
@@ -745,12 +751,11 @@ async fn a_report_id_naming_nothing_is_unauthorized_on_every_report_operation() 
     }
 
     // A refused GetTermForReport leaves no grant behind, so nothing it "minted" can be
-    // spent: the catalog's own report still needs a real acceptance.
-    let refused = get_report(
-        &router,
-        &format!("?reportId={}&termToken=anything", CATALOG[0].id),
-    )
-    .await;
+    // spent: a catalog report that requires the explicit acceptance of its term still
+    // needs a real acceptance.
+    let gated = a_report_requiring_acceptance();
+    let refused =
+        get_report(&router, &format!("?reportId={}&termToken=anything", gated.id)).await;
     assert_eq!(
         refused.status, 400,
         "a failed acceptance must leave no usable grant, got {} with {:?}",
@@ -984,7 +989,9 @@ async fn a_report_arn_names_the_region_the_request_was_signed_for() {
 #[tokio::test]
 async fn the_term_grant_store_stays_bounded_however_many_terms_are_accepted() {
     let router = emulator();
-    let report = CATALOG[0].id;
+    // A report that requires the explicit acceptance of its term, so whether a grant is
+    // still held is observable through `GetReport`.
+    let report = a_report_requiring_acceptance().id;
 
     // One acceptance past the emulator's own bound on the grant store.
     let mut first = String::new();

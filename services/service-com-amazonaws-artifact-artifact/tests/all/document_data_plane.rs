@@ -5,8 +5,9 @@
 //! One rule is pinned here, over a SET of documents rather than any one of them:
 //! **an announced document URL resolves.** The `documentPresignedUrl` `GetReport` and
 //! `GetTermForReport` answer with is fetchable over plain HTTP and serves the stored
-//! document, under the content type that document's file name implies — and only under
-//! a term grant covering the TERM governing that report. Fetching it changes nothing.
+//! document, under the content type that document's file name implies — and, where the
+//! report's `acceptanceType` requires the explicit acceptance of its term, only under a
+//! term grant covering the TERM governing that report. Fetching it changes nothing.
 //!
 //! Every assertion goes through the router, so each case exercises the same path a
 //! client takes: routing, the front door, the handler, the persisted state and
@@ -18,6 +19,8 @@ use bytes::Bytes;
 use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{ACCEPTANCE_EXPLICIT, ACCEPTANCE_PASSTHROUGH};
 
 /// A SigV4 credential scope naming this service: what routes a control-plane request to
 /// it.
@@ -200,6 +203,19 @@ async fn catalog(router: &MultiServiceRouter) -> Vec<(String, Vec<i64>)> {
     rows
 }
 
+/// The `acceptanceType` the catalog reports for one report — what decides whether
+/// downloading it requires the explicit click-through acceptance of its term — read from
+/// the API rather than assumed.
+async fn acceptance_type(router: &MultiServiceRouter, id: &str) -> String {
+    let metadata = get(router, &format!("/v1/report/getMetadata?reportId={id}")).await;
+    metadata.body["reportDetails"]["acceptanceType"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("every report reports its acceptanceType, got {:?}", metadata.body)
+        })
+        .to_string()
+}
+
 #[tokio::test]
 async fn every_announced_document_url_serves_its_stored_document() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -339,7 +355,19 @@ async fn every_announced_document_url_serves_its_stored_document() {
 async fn a_document_is_served_only_under_a_grant_for_its_term() {
     let router = emulator();
     let rows = catalog(&router).await;
-    let (id, versions) = rows.first().expect("the catalog publishes a report");
+    // The gate this test pins is the one a report requiring the explicit acceptance of
+    // its term is served under, so the row is such a report; what a report that requires
+    // no acceptance is served under is pinned by the test below.
+    let mut gated = None;
+    for (candidate, versions) in &rows {
+        if acceptance_type(&router, candidate).await == ACCEPTANCE_EXPLICIT {
+            gated = Some((candidate.clone(), versions.clone()));
+            break;
+        }
+    }
+    let (id, versions) =
+        gated.expect("the catalog publishes a report requiring explicit acceptance");
+    let id = &id;
     let version = versions.first().copied().unwrap_or(1);
 
     let term = get(
@@ -434,6 +462,78 @@ async fn a_document_is_served_only_under_a_grant_for_its_term() {
         "an authorised fetch must still be served, got {} with {:?}",
         served.status,
         String::from_utf8_lossy(&served.bytes)
+    );
+}
+
+#[tokio::test]
+async fn a_report_requiring_no_acceptance_serves_its_document_without_a_grant() {
+    let router = emulator();
+
+    // The rule generalises over the report, so the rows are every (report, version) the
+    // catalog publishes whose `acceptanceType` requires no explicit acceptance of its
+    // term — reports with one version and reports with several. Nothing here accepts a
+    // term: `GetTermForReport` is never called, so this emulator holds no grant at all.
+    let mut covered = 0usize;
+    for (id, versions) in catalog(&router).await {
+        if acceptance_type(&router, &id).await != ACCEPTANCE_PASSTHROUGH {
+            continue;
+        }
+        for version in versions {
+            let case = format!("{id} v{version}");
+            let download = get(
+                &router,
+                &format!("/v1/report/get?reportId={id}&reportVersion={version}&termToken=unaccepted"),
+            )
+            .await;
+            assert_eq!(
+                download.status, 200,
+                "case {case:?}: a report requiring no acceptance must be served, got {} \
+                 with {:?}",
+                download.status, download.body
+            );
+            let url = fetchable(
+                download.body["documentPresignedUrl"]
+                    .as_str()
+                    .unwrap_or_default(),
+            );
+
+            // The URL it announces resolves, which is what announcing one is for.
+            let document = get_unsigned(&router, &url).await;
+            assert_eq!(
+                document.status, 200,
+                "case {case:?}: the announced URL must serve its document, got {} with {:?}",
+                document.status,
+                String::from_utf8_lossy(&document.bytes)
+            );
+            assert!(
+                document.bytes.starts_with(b"%PDF-"),
+                "case {case:?}: expected the report document, got {:?}",
+                String::from_utf8_lossy(&document.bytes[..document.bytes.len().min(16)])
+            );
+
+            // Including with no term token on it at all: there is no acceptance for one
+            // to be the receipt of.
+            let path = url
+                .split_once('?')
+                .map_or(url.as_str(), |(path, _)| path)
+                .to_string();
+            let bare = get_unsigned(&router, &path).await;
+            assert_eq!(
+                bare.status, 200,
+                "case {case:?}: an ungated document needs no token to fetch, got {} with {:?}",
+                bare.status,
+                String::from_utf8_lossy(&bare.bytes)
+            );
+            assert_eq!(
+                bare.bytes, document.bytes,
+                "case {case:?}: both fetches must serve the same document"
+            );
+            covered += 1;
+        }
+    }
+    assert!(
+        covered > 0,
+        "the catalog must publish a report requiring no explicit acceptance of its term"
     );
 }
 

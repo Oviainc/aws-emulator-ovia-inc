@@ -52,6 +52,15 @@ pub fn signed_for(region: &str) -> String {
     )
 }
 
+/// `AcceptanceType$EXPLICIT`, whose member doc in this service's Smithy model
+/// (`smithy_query` shape=AcceptanceType) is "Require explicit click-through acceptance of
+/// the Term associated with this Report."
+pub const ACCEPTANCE_EXPLICIT: &str = "EXPLICIT";
+
+/// `AcceptanceType$PASSTHROUGH`, whose member doc in the same model is "Do not require
+/// explicit click-through acceptance of the Term associated with this Report".
+pub const ACCEPTANCE_PASSTHROUGH: &str = "PASSTHROUGH";
+
 /// One row of the service-owned catalog this emulator publishes.
 pub struct Expected {
     pub id: &'static str,
@@ -73,6 +82,22 @@ impl Expected {
             .next_back()
             .expect("every catalog row publishes a version")
     }
+
+    /// Whether downloading this report requires the explicit click-through acceptance of
+    /// the term governing it — what its `AcceptanceType` says
+    /// ([`ACCEPTANCE_EXPLICIT`] / [`ACCEPTANCE_PASSTHROUGH`]).
+    pub fn requires_explicit_acceptance(&self) -> bool {
+        self.acceptance_type == ACCEPTANCE_EXPLICIT
+    }
+}
+
+/// A catalog row whose download requires the explicit acceptance of its term: the reports
+/// a term grant is the receipt for, which is what a suite asserting that gate names.
+pub fn a_report_requiring_acceptance() -> &'static Expected {
+    CATALOG
+        .iter()
+        .find(|row| row.requires_explicit_acceptance())
+        .expect("the catalog publishes a report requiring explicit acceptance")
 }
 
 /// The catalog the emulator serves, in the ascending report-id order `ListReports` uses.

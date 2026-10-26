@@ -415,33 +415,23 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Documents<Eng> {
                 );
             };
             let store = state.lock();
-            // The term grant is what authorises a download, so it is checked first and
-            // by the SAME rule `GetReport` applies: one rule, one place. A fetch
-            // carrying NO token carries no grant, so it is refused before the catalog
-            // is consulted rather than looked up as the empty token.
-            let Some(token) = query_param(&query, "termToken").filter(|token| !token.is_empty())
-            else {
-                ::tracing::info!(
-                    operation = "GetReportDocument",
-                    report_id = ?wanted.report_id,
-                    report_version = wanted.version,
-                    document_kind = ?wanted.kind,
-                    outcome = "denied",
-                    reason = "no termToken",
-                    "refused a document fetch"
-                );
-                return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
-            };
+            // A download is authorised by the SAME rule `GetReport` applies: one rule,
+            // one place. Where the report's acceptance type requires the explicit
+            // acceptance of its term, only a grant covering that term authorises the
+            // fetch — and a fetch carrying NO token carries no grant, so the empty token
+            // is what that rule is asked about.
+            //
             // DELIBERATE ORDERING: authorization answers first, so a path naming a
             // report this service does not hold is refused as unauthorised (403) rather
             // than reported as absent — a document URL is handed to one caller, and a
-            // 404 here would let anyone probe which report ids exist. Only a path whose
-            // grant DOES cover the report can be answered `404`, for the version or the
-            // object the report does not publish.
+            // 404 here would let anyone probe which report ids exist. Only a path this
+            // rule authorises can be answered `404`, for the version or the object the
+            // report does not publish.
+            let token = query_param(&query, "termToken").unwrap_or_default();
             let authorised = store
                 .reports
                 .get(&wanted.report_id)
-                .is_some_and(|report| store.grant_covers(&token, report));
+                .is_some_and(|report| store.download_authorised(&token, report));
             if !authorised {
                 ::tracing::info!(
                     operation = "GetReportDocument",
@@ -449,7 +439,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Documents<Eng> {
                     report_version = wanted.version,
                     document_kind = ?wanted.kind,
                     outcome = "denied",
-                    reason = "termToken does not cover this report's term",
+                    reason = "no term grant covers this report's term",
                     "refused a document fetch"
                 );
                 return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReport
-//! Serves the report document for one report version, but ONLY under a term grant this
-//! service issued for the TERM governing that report: the `termToken` is checked against
+//! Serves the report document for one report version. A report whose `AcceptanceType`
+//! requires the explicit click-through acceptance of its term is served ONLY under a term
+//! grant this service issued for the TERM governing it: its `termToken` is checked against
 //! the grants [`crate::state`] holds, so a token nobody was ever given and a token
 //! accepted under another term are both refused with the modelled `ValidationException`.
+//! A report whose acceptance type requires no such acceptance is served whatever token the
+//! request carries, because no acceptance exists for a grant to be the receipt of.
 //! The grant is not consumed — this handler only READS.
 //!
 //! A `reportId` the catalog does not hold is refused by the front door's 401
@@ -12,7 +15,7 @@
 //! looking it up; `ResourceNotFoundException` is left for a VERSION a reachable report
 //! never published.
 //!
-//! The grant is the ONLY authorisation this handler applies. The emulator verifies every
+//! The acceptance rule is the ONLY authorisation this handler applies. The emulator verifies every
 //! request signature before a handler runs, but it models no IAM, so the modelled
 //! `AccessDeniedException` is never raised here: a call the real service would refuse for
 //! lack of `artifact:GetReport` succeeds against this emulator, and a pass here is not a
@@ -196,11 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetReportErrorModeled::ResourceNotFoundException(missing).into());
         };
 
-        // The term token is the acceptance receipt, and it is bound to the TERM: a token
-        // that was never issued is not a token at all, and one accepted under a
-        // different term document does not authorise this download. Either way no URL is
-        // served, and the refusal names neither the token nor the term it covers.
-        if !store.grant_covers(&input.term_token, report) {
+        // The term token is the receipt of the acceptance a report's `AcceptanceType`
+        // REQUIRES, and it is bound to the TERM: where the report requires that
+        // acceptance, a token that was never issued is not a token at all, and one
+        // accepted under a different term document does not authorise this download.
+        // Either way no URL is served, and the refusal names neither the token nor the
+        // term it covers.
+        if !store.download_authorised(&input.term_token, report) {
             ::tracing::info!(
                 operation = "GetReport",
                 report_id = %input.report_id,
