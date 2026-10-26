@@ -5424,6 +5424,32 @@ impl StoredAutoSnapshots {
     }
 }
 
+/// What a request to delete ONE automatic snapshot of a resource found.
+///
+/// A deletion addresses a copy by the resource it was taken of plus the date it
+/// was taken on, so there are three outcomes and the caller answers each
+/// differently: no such resource (the absent value of the
+/// [`Option`](ComAmazonawsLightsailLightsail20161128State::delete_auto_snapshot)
+/// this is wrapped in), a resource holding no copy for that date, and the copy
+/// removed.
+#[derive(Debug)]
+pub enum AutoSnapshotDeletion {
+    /// The copy was removed. Carries what an operation-log entry for the
+    /// deletion needs: the kind of resource the copy was taken of, and where
+    /// that resource is.
+    Deleted {
+        /// The `ResourceType` the resource the copy was taken of reports.
+        resource_type: &'static str,
+        /// Where that resource is.
+        location: StoredLocation,
+    },
+    /// The resource exists and holds no copy taken on the requested date.
+    NoCopyForDate {
+        /// The `ResourceType` that resource reports, for the refusal's message.
+        resource_type: &'static str,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Export snapshot records
 // ---------------------------------------------------------------------------
@@ -11354,6 +11380,60 @@ impl ComAmazonawsLightsailLightsail20161128State {
         Some((resource_type, reported))
     }
 
+    /// Remove the automatic snapshot of the resource `name` names that was taken
+    /// on `date`. `None` when this account holds no instance or disk of that
+    /// name.
+    ///
+    /// A copy is addressed by the resource it was taken of plus its DATE — it
+    /// has no name and no ARN of its own — and the add-on takes one copy a day,
+    /// so the date identifies exactly one of a resource's copies. The resource is
+    /// resolved from the same two maps, in the same order, as every other
+    /// operation that addresses an automatic snapshot
+    /// ([`Self::auto_snapshots_of`]).
+    ///
+    /// Removing a copy takes nothing else with it: the other copies stay, and
+    /// the schedule keeps the instant its next copy falls due, so a deletion
+    /// neither stops the add-on nor makes it take a replacement. A resource left
+    /// holding no copy and owed none — its add-on is disabled — holds no
+    /// schedule either, exactly as it did before the add-on was ever enabled.
+    pub fn delete_auto_snapshot(
+        &mut self,
+        name: &str,
+        date: &str,
+    ) -> Option<AutoSnapshotDeletion> {
+        let (resource_type, location) = if let Some(instance) = self.instances.get(name) {
+            (RESOURCE_TYPE_INSTANCE, instance.location.clone())
+        } else if let Some(disk) = self.disks.get(name) {
+            (RESOURCE_TYPE_DISK, disk.location.clone())
+        } else {
+            return None;
+        };
+        let key = (resource_type, name.to_string());
+        let found = self
+            .auto_snapshots
+            .get_mut(&key)
+            .and_then(|schedule| {
+                let at = schedule
+                    .taken
+                    .iter()
+                    .position(|taken| taken.date == date)?;
+                schedule.taken.remove(at);
+                Some(schedule.taken.is_empty() && schedule.due_at_ms.is_none())
+            });
+        match found {
+            Some(emptied) => {
+                if emptied {
+                    self.auto_snapshots.remove(&key);
+                }
+                Some(AutoSnapshotDeletion::Deleted {
+                    resource_type,
+                    location,
+                })
+            }
+            None => Some(AutoSnapshotDeletion::NoCopyForDate { resource_type }),
+        }
+    }
+
     /// Bring the automatic snapshot schedule of the resource `name` of kind
     /// `resource_type` into line with its add-ons at `now_ms`, where `hour` is
     /// the daily hour its enabled `AutoSnapshot` add-on carries and `None` says
@@ -12520,13 +12600,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Build and record a TERMINAL operation against `resource_name` that
     /// reports no `operationType`.
     ///
-    /// The modelled `OperationType` enum declares a member for each call that
-    /// writes this log and none for a change to a resource's tags, so an entry
-    /// for one leaves `Operation$operationType` — an optional member — absent
-    /// rather than reporting a value the model does not define. The entry is
-    /// terminal because a tag change is complete when the call returns: the
-    /// tags the next read reports are already the new ones, so the clock owes
-    /// the entry nothing.
+    /// The modelled `OperationType` enum declares a member for most calls that
+    /// write this log and none for a change to a resource's tags or for the
+    /// deletion of one automatic snapshot, so an entry for either leaves
+    /// `Operation$operationType` — an optional member — absent rather than
+    /// reporting a value the model does not define. The entry is terminal
+    /// because such a change is complete when the call returns: what the next
+    /// read reports is already the new tags, or a resource whose copy is gone,
+    /// so the clock owes the entry nothing.
     pub fn record_untyped_operation(
         &mut self,
         now_ms: i64,

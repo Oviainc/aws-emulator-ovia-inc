@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLogAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLogAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLogAnomalyDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the ONE log anomaly detector the account holds under the ARN the
+//! request names, together with the anomalies it had reported and the suppressions placed on
+//! those findings — refusing an ARN no stored detector answers under, so a detector deleted
+//! once is gone from every later read of it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLogAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLogAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The engine is reachable from `&self` (constructor-injected); `ctx` carries request
+        // metadata, which this operation needs none of: the ARN the request names identifies
+        // the detector on its own, the Region and the account it was created in included.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteLogAnomalyDetectorError::from(
+                DeleteLogAnomalyDetectorErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "Deletes the specified CloudWatch Logs anomaly detector": the detector deleted is
+        // the one the account holds under the ARN the request names, resolved the way every
+        // other operation that identifies this resource by `anomalyDetectorArn` resolves one
+        // — by whether a detector is stored under that ARN. So an ARN nothing minted, another
+        // Region's or another account's detector, an ARN naming another kind of resource, and
+        // a detector a previous call already deleted all name a resource that is not there,
+        // rather than being a silent success.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLogAnomalyDetector"))
+        // Removing the record is what removes the detector: the configuration it was created
+        // and last updated with, the anomalies it had reported and the suppressions placed on
+        // those findings all live on that one record, so they go with it and no later read
+        // reports any of them. The ARN identifies this detector alone and the create mints a
+        // fresh one per detector, so nothing answers under it again; the detector also stops
+        // counting against the account's detector ceiling.
+        if store
+            .anomaly_detectors
+            .remove(&input.anomaly_detector_arn)
+            .is_none()
+        {
+            return Err(
+                DeleteLogAnomalyDetectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "anomaly detector",
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteLogAnomalyDetectorOutput)
     }
 }

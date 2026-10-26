@@ -216,6 +216,17 @@ async fn a_temporary_password_expires_only_once_the_window_is_past() {
             now: set_at + 1000 * DAY,
             expired: false,
         },
+        ExpiryCase {
+            // A window so long that its end is not a representable instant: the
+            // deadline never arrives, so the password is not expired — and the
+            // question is answered rather than bringing the process down.
+            case: "a window whose end is past representable time",
+            permanent: false,
+            password_set_at: Some(set_at),
+            validity: Duration::MAX,
+            now: set_at + 1000 * DAY,
+            expired: false,
+        },
     ];
 
     for row in cases {

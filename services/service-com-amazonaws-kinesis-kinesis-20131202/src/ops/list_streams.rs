@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the streams `crate::state`'s store holds for the region the request was signed
+//! for, in name order, one page at a time: the page the request's `Limit` asks for, resumed
+//! at the stream its `ExclusiveStartStreamName` or its `NextToken` names, with
+//! `HasMoreStreams` and the next cursor computed from what the store holds beyond the page.
+//! Reporting only — the cursor travels inside the token, so a listing writes nothing. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -102,12 +100,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListStreamsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListStreams")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListStreams",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListStreamsErrorModeled {
     ExpiredNextTokenException(ExpiredNextTokenException),
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -133,6 +139,15 @@ impl From<ListStreamsErrorModeled> for ListStreamsError {
 /// concrete engine where it mounts the service, not here.
 pub struct ListStreams<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> ListStreamsError {
+    ListStreamsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
 }
 
 impl<Eng> ListStreams<Eng> {
@@ -161,18 +176,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreams"))
+        // "The stream name identifies the stream... It is also scoped by Amazon Web
+        // Services Region" (`CreateStream`), so a listing reports the streams of the region
+        // the request was signed for.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListStreamsError::from(ListStreamsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // "The maximum number of streams to list. The default value is 100. If you specify
+        // a value greater than 100, at most 100 results are returned"
+        // (`ListStreamsInput$Limit`) — a caller-chosen page size is clamped server-side
+        // before it sizes anything.
+        let page_size = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::DEFAULT_LIST_STREAMS_LIMIT)
+                .clamp(1, crate::state::MAX_LIST_STREAMS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+
+        // Where the page starts. "If there are more streams available, you can request
+        // more streams by using the name of the last stream returned by the ListStreams
+        // request in the ExclusiveStartStreamName parameter" (`ListStreams`), and a
+        // `NextToken` names that same place itself — so a request carrying the token names
+        // no starting stream of its own, and a token this service never issued, one past
+        // its lifetime or one minted for another region names no page of this listing.
+        let resume_after = match input.next_token.as_deref() {
+            None => input.exclusive_start_stream_name.clone(),
+            Some(token) => {
+                if input.exclusive_start_stream_name.is_some() {
+                    return Err(invalid_argument(
+                        crate::state::next_token_conflict_message("ExclusiveStartStreamName"),
+                    ));
+                }
+                let resume = crate::state::StreamPageToken::decode(token)
+                    .filter(|resume| !resume.is_expired(now) && resume.region == region)
+                    .ok_or_else(|| {
+                        ListStreamsError::from(
+                            ListStreamsErrorModeled::ExpiredNextTokenException(
+                                ExpiredNextTokenException {
+                                    message: Some(crate::state::next_token_expired_message()),
+                                },
+                            ),
+                        )
+                    })?;
+                // The token names the first stream the earlier page did NOT return, so the
+                // page that resumes it starts AT that stream rather than after it.
+                Some(resume.next_stream_name)
+            }
+        };
+        let resumes_at_token = input.next_token.is_some();
+
+        let store = state.lock();
+        let mut beyond_cursor = store
+            .streams_ordered_in(now, &region)
+            .into_iter()
+            .filter(|stream| {
+                resume_after.as_deref().is_none_or(|start| {
+                    if resumes_at_token {
+                        stream.name.as_str() >= start
+                    } else {
+                        stream.name.as_str() > start
+                    }
+                })
+            });
+        let page: Vec<&crate::state::Stream> = beyond_cursor.by_ref().take(page_size).collect();
+        let next = beyond_cursor.next();
+
+        Ok(ListStreamsOutput {
+            stream_names: page.iter().map(|stream| stream.name.clone()).collect(),
+            stream_summaries: Some(
+                page.iter()
+                    .map(|stream| stream.to_stream_summary(now))
+                    .collect(),
+            ),
+            // "If set to true, there are more streams available to list"
+            // (`ListStreamsOutput$HasMoreStreams`): true exactly when this region holds a
+            // stream past this page, which is also when a cursor to resume at is handed
+            // back.
+            has_more_streams: next.is_some(),
+            next_token: next.map(|stream| {
+                crate::state::StreamPageToken::new(&region, &stream.name, now).encode()
+            }),
+        })
     }
 }

@@ -1124,6 +1124,30 @@ pub fn manual_retention_admitted(period: i32) -> bool {
         || (MANUAL_RETENTION_BOUNDS.0..=MANUAL_RETENTION_BOUNDS.1).contains(&period)
 }
 
+/// How many days automated snapshots copied to another Region are retained
+/// there when the call that enables the copy names no retention period.
+///
+/// Source: `smithy_query(query="doc", shape="EnableSnapshotCopyMessage",
+/// member="RetentionPeriod")` — "Default: 7."
+pub const DEFAULT_SNAPSHOT_COPY_RETENTION: i32 = 7;
+
+/// Inclusive bounds on the automated-snapshot retention period of a cross-Region
+/// snapshot copy configuration, from the same doc sentence as
+/// [`DEFAULT_SNAPSHOT_COPY_RETENTION`] — "Constraints: Must be at least 1 and no
+/// more than 35."
+///
+/// Narrower than [`AUTOMATED_RETENTION_BOUNDS`], which admits 0 (a cluster that
+/// takes no automated snapshots at all): a copy configuration is a standing
+/// instruction to keep copies, so it keeps them for at least a day.
+pub const SNAPSHOT_COPY_RETENTION_BOUNDS: (i32, i32) = (1, 35);
+
+/// Whether the retention period of a cross-Region snapshot copy configuration is
+/// one this service admits: a day count inside
+/// [`SNAPSHOT_COPY_RETENTION_BOUNDS`].
+pub fn snapshot_copy_retention_admitted(period: i32) -> bool {
+    (SNAPSHOT_COPY_RETENTION_BOUNDS.0..=SNAPSHOT_COPY_RETENTION_BOUNDS.1).contains(&period)
+}
+
 /// The number of seconds in one day: a manual retention period is a count of
 /// days, and every instant this service derives from one is measured in seconds.
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
@@ -4141,6 +4165,67 @@ pub const REGION_ZONE_COUNTS: [(&str, usize); 4] = [
     ("us-west-2", 4),
     ("ap-northeast-1", 4),
     ("ap-northeast-2", 4),
+];
+
+/// Whether `value` has the form of an Amazon Web Services Region code, which is
+/// what makes it the name of a Region at all.
+///
+/// A Region code is an AREA code ([`REGION_AREA_CODES`]), then — in the
+/// partitions that have one — a partition qualifier, then the LOCATION within
+/// the area ([`REGION_LOCATIONS`]), then the Region's number, counting from 1:
+/// `us-east-1`, `eu-west-3`, `ap-southeast-4`, `us-gov-west-1`, `cn-north-1`,
+/// `us-iso-east-1`.
+///
+/// Source: the Amazon Web Services General Reference's Region code list (the
+/// "Regions and Endpoints" reference that
+/// `smithy_query(query="doc", shape="EnableSnapshotCopyMessage",
+/// member="DestinationRegion")` points at for "Must be the name of a valid
+/// Amazon Web Services Region").
+///
+/// Decided from the form and those two published vocabularies rather than from a
+/// closed list of today's Region codes, for the same reason
+/// [`region_zone_count`] derives a Region's zones from its name: AWS adds
+/// Regions, and one added after this emulator was built is still a Region. A
+/// value outside the form names no Region at all.
+pub fn names_a_region(value: &str) -> bool {
+    let segments: ::std::vec::Vec<&str> = value.split('-').collect();
+    let [area, qualifiers @ .., location, number] = segments.as_slice() else {
+        return false;
+    };
+    REGION_AREA_CODES.contains(area)
+        // At most one qualifier, and a qualifier is a partition name: letters.
+        && qualifiers.len() <= 1
+        && qualifiers.iter().all(|qualifier| {
+            !qualifier.is_empty() && qualifier.bytes().all(|byte| byte.is_ascii_lowercase())
+        })
+        && REGION_LOCATIONS.contains(location)
+        // The Region number is a decimal count from 1, so neither an empty
+        // segment, a signed one, a zero nor a zero-padded one is one.
+        && !number.starts_with('0')
+        && number.parse::<u32>().is_ok_and(|ordinal| ordinal >= 1)
+}
+
+/// The area codes an Amazon Web Services Region code starts with.
+///
+/// Source: as [`names_a_region`] — the published Region code list, reduced to
+/// the distinct area codes it uses.
+pub const REGION_AREA_CODES: [&str; 10] = [
+    "af", "ap", "ca", "cn", "eu", "il", "me", "mx", "sa", "us",
+];
+
+/// The location words an Amazon Web Services Region code names inside its area.
+///
+/// Source: as [`REGION_AREA_CODES`].
+pub const REGION_LOCATIONS: [&str; 9] = [
+    "central",
+    "east",
+    "north",
+    "northeast",
+    "northwest",
+    "south",
+    "southeast",
+    "southwest",
+    "west",
 ];
 
 /// The only platform a cluster can be launched on today.

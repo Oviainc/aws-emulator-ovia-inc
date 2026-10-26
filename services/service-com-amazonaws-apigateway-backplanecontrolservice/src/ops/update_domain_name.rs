@@ -145,7 +145,7 @@
 use super::types::*;
 
 use crate::state::{
-    edge_distribution_domain_name, invalid_patch_path, patch_enum_string, patch_optional_string,
+    edge_distribution_domain_name, patch_enum_string, patch_optional_string,
     patch_string_set, regional_endpoint_domain_name, DomainNameEntry, Patch, PatchFailure,
     PatchOpKind, DOMAIN_NAME_MIGRATION_SPAN, DOMAIN_NAME_UPDATING, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
     MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE,
@@ -329,7 +329,7 @@ fn apply_endpoint_type_patch(
     // type being migrated FROM, so it must be the one the record is served by.
     if let Some(migrated_from) = nested.tokens.get(1) {
         if !held.iter().any(|kind| kind == migrated_from) {
-            return Err(PatchFailure::BadRequest(invalid_patch_path(&patch.path)));
+            return Err(patch.unsupported_path());
         }
     }
     let value = patch.require_value()?;

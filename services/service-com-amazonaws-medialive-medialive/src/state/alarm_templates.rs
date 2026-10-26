@@ -411,6 +411,30 @@ impl ComAmazonawsMedialiveMedialiveState {
             .find(|template| template.region == region && template.name == name)
     }
 
+    /// The cloudwatch alarm templates stored in `region`, in the order their ids
+    /// were minted, beginning at the template `start` names when a `NextToken`
+    /// carried a resume point.
+    ///
+    /// The store itself is private, so this is how a listing reads it: a
+    /// `BTreeMap` range scan from the resume point, which is why a token naming a
+    /// template deleted since the previous page resumes at the next surviving id
+    /// instead of failing. Templates of other regions are invisible, for the
+    /// reason [`Self::alarm_template`] states.
+    pub fn alarm_templates_in<'a>(
+        &'a self,
+        region: &'a str,
+        start: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a CloudWatchAlarmTemplateRecord> + 'a {
+        let first = match start {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.alarm_templates
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .map(|(_, template)| template)
+            .filter(move |template| template.region == region)
+    }
+
     /// The ids of the templates stored in the cloudwatch alarm template group
     /// `group_id` — the templates `DeleteCloudWatchAlarmTemplateGroup` documents
     /// must be "moved to another group or deleted" before the group goes.
@@ -527,3 +551,88 @@ macro_rules! alarm_template_output {
 }
 
 pub(crate) use alarm_template_output;
+
+/// Project a stored [`CloudWatchAlarmTemplateRecord`] onto the
+/// `CloudWatchAlarmTemplateSummary` a listing reports.
+///
+/// The summary is the same stored template the flat shape above reports, read
+/// through the list shape: `CloudWatchAlarmTemplateSummary` declares exactly the
+/// members that shape declares, so every one of them carries the stored value
+/// and a listing cannot disagree with the `GetCloudWatchAlarmTemplate` beside it
+/// about one template. `Tags` and `DatapointsToAlarm` keep the rules the flat
+/// shape states, and `Description` stays absent on a template created without
+/// one.
+pub fn alarm_template_summary(
+    template: &CloudWatchAlarmTemplateRecord,
+) -> crate::ops::types::CloudWatchAlarmTemplateSummary {
+    crate::ops::types::CloudWatchAlarmTemplateSummary {
+        arn: template.arn.clone(),
+        comparison_operator: template.comparison_operator.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(template.created_at),
+        datapoints_to_alarm: template.datapoints_to_alarm,
+        description: template.description.clone(),
+        evaluation_periods: template.evaluation_periods,
+        group_id: template.group_id.clone(),
+        id: template.id.clone(),
+        metric_name: template.metric_name.clone(),
+        modified_at: Some(::aws_smithy_types::DateTime::from(template.modified_at)),
+        name: template.name.clone(),
+        period: template.period,
+        statistic: template.statistic.clone(),
+        tags: Some(template.tags.clone()),
+        target_resource_type: template.target_resource_type.clone(),
+        threshold: template.threshold,
+        treat_missing_data: template.treat_missing_data.clone(),
+    }
+}
+
+/// The provenance a monitor-template listing's `Scope` filter narrows to.
+///
+/// `Scope` is documented "Represents the scope of a resource, with options for
+/// all scopes, AWS provided resources, or local resources"
+/// (`smithy_query(query="doc", shape="ListCloudWatchAlarmTemplatesRequest",
+/// member="Scope")`). The member targets `__string` rather than an enum, so the
+/// model constrains nothing and the service is what reads the three options the
+/// documentation names — hence [`VALUES`], the one list of the options, which
+/// both the refusal's wording and the filter read. Because the model fixes no
+/// spelling, [`parse`] matches an option by its word WITHOUT regard to case, so
+/// only a value that names none of the three options at all is refused.
+///
+/// What tells the two provenances apart is the id: `CloudWatchAlarmTemplateSummary$Id`
+/// documents that "AWS provided templates have ids that start with `aws-`", so a
+/// resource whose id carries that prefix is AWS-provided and every other one is
+/// local to the account. Nothing here invents an AWS-provided resource: a
+/// template this emulator mints is caller-created, so the AWS scope reports the
+/// AWS-provided templates the store holds, which is none until one is stored.
+pub mod template_scope {
+    /// Every scope: the filter narrows nothing.
+    pub const ALL: &str = "ALL";
+    /// The AWS-provided resources only.
+    pub const AWS: &str = "AWS";
+    /// The resources local to this account only.
+    pub const LOCAL: &str = "LOCAL";
+
+    /// Every option the member documents, in the order it documents them.
+    pub const VALUES: [&str; 3] = [ALL, AWS, LOCAL];
+
+    /// The prefix an AWS-provided monitor template or template group carries on
+    /// its id.
+    pub const AWS_PROVIDED_ID_PREFIX: &str = "aws-";
+
+    /// The option `scope` names, or `None` when it names none of them.
+    pub fn parse(scope: &str) -> Option<&'static str> {
+        VALUES
+            .into_iter()
+            .find(|option| option.eq_ignore_ascii_case(scope))
+    }
+
+    /// Whether `scope` admits the resource whose id is `id`.
+    pub fn admits(scope: &str, id: &str) -> bool {
+        let aws_provided = id.starts_with(AWS_PROVIDED_ID_PREFIX);
+        match scope {
+            AWS => aws_provided,
+            LOCAL => !aws_provided,
+            _ => true,
+        }
+    }
+}

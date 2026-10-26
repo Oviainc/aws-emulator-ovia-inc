@@ -49,7 +49,7 @@ const REMEDIATION_TYPE: &str = "AWS::Config::RemediationConfiguration";
 ///
 /// The `Source` is what CloudFormation requires of an `AWS::Config::ConfigRule`, and
 /// `S3_BUCKET_VERSIONING_ENABLED` is a Config managed rule identifier.
-fn rule_template(rule_name: &str) -> String {
+pub(crate) fn rule_template(rule_name: &str) -> String {
     format!(
         "Resources:\n  OnlyRule:\n    Type: {CONFIG_RULE_TYPE}\n    Properties:\n      \
          ConfigRuleName: {rule_name}\n      Source:\n        Owner: AWS\n        \
@@ -75,7 +75,7 @@ fn rule_and_remediation_template(rule_name: &str) -> String {
 }
 
 /// The `PutConformancePack` body for `name` deployed from `template_body`.
-fn pack_from_body(name: &str, template_body: &str) -> Value {
+pub(crate) fn pack_from_body(name: &str, template_body: &str) -> Value {
     json!({ "ConformancePackName": name, "TemplateBody": template_body })
 }
 

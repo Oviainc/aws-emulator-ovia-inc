@@ -232,12 +232,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(now);
 
         // `clientToken` carries `@idempotencyToken`: replaying a token that already
-        // created a scraper answers with THAT scraper instead of a second one.
+        // created a scraper answers with THAT scraper instead of a second one — as long as
+        // the scraper is still the record that create left. One whose removal the clock
+        // already owes is not: `materialize_due` drops it once its due instant has passed,
+        // so answering from it would accept the call (202) and persist nothing, and the
+        // replay gives way to a fresh create.
         if let Some(existing) = input
             .client_token
             .as_deref()
             .and_then(|token| store.scraper_tokens.get(token))
             .and_then(|scraper_id| store.scrapers.get(scraper_id))
+            .filter(|scraper| scraper.status_code != crate::state::STATUS_DELETING)
         {
             return Ok(response_for(existing));
         }

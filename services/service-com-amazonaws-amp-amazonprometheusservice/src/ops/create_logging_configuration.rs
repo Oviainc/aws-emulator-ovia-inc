@@ -4,7 +4,8 @@
 //! IMPLEMENTED: persists the workspace's rules-and-alerting logging configuration and
 //! answers from the PERSISTED record. The configuration starts in `CREATING` and the
 //! clock owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken`
-//! makes the call idempotent.
+//! makes the call idempotent, and a stored configuration whose removal the clock already
+//! owes is refused rather than answered as a replay of the create that made it.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -187,6 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(existing) = workspace.logging_configuration.as_ref() {
+            // A record whose removal the clock already owes is NOT the record the create
+            // that made it left: `crate::state::materialize_due` drops it once its due
+            // instant has passed, so answering a create from it would accept the call
+            // (202) and leave the workspace holding no configuration at all. The record
+            // is still held until then, and its own deletion is what a second create
+            // runs into, so the call is refused — this operation models no
+            // `ConflictException`, so the refusal is the modelled `ValidationException`
+            // (400), request-level because no single member is at fault.
+            if existing.status_code == crate::state::LOGGING_STATUS_DELETING {
+                return Err(CreateLoggingConfigurationErrorModeled::ValidationException(
+                    crate::state::request_validation_failed(
+                        crate::state::LOGGING_CONFIGURATION_DELETING_MESSAGE,
+                    ),
+                )
+                .into());
+            }
             // `CreateLoggingConfiguration` carries `@idempotent` and its `clientToken`
             // carries `@idempotencyToken`: re-sending the call that created the stored
             // configuration — the same token, or the same `logGroupArn`, which leaves

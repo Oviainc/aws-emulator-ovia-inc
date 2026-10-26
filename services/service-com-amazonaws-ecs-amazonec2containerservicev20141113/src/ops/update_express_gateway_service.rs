@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExpressGatewayService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExpressGatewayService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExpressGatewayService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates an Express service by rolling out a NEW service revision — the operation's
+//! own doc: "Amazon ECS creates a new service revision with updated configuration and
+//! performs a rolling deployment to replace existing tasks". A member the request leaves
+//! out keeps what the service already ran ("If you don't specify a value, the service
+//! keeps its current architecture"), so the revision this call stores is the merge of the
+//! request onto the configuration the service is running. Both revisions are ACTIVE until
+//! the rollout is due — the CLOCK owes that, not whoever reads next — after which only
+//! the one this call rolled out is.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +197,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExpressGatewayService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExpressGatewayServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExpressGatewayService"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateExpressGatewayServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // The configuration members this call shares with `CreateExpressGatewayService`.
+        let requested = crate::state::ExpressGatewayConfigurationRequest {
+            execution_role_arn: input.execution_role_arn.clone(),
+            task_role_arn: input.task_role_arn.clone(),
+            task_definition_arn: input.task_definition_arn.clone(),
+            cpu: input.cpu.clone(),
+            memory: input.memory.clone(),
+            cpu_architecture: input.cpu_architecture.clone(),
+            network_configuration: input.network_configuration.clone(),
+            health_check_path: input.health_check_path.clone(),
+            primary_container: input.primary_container.clone(),
+            scaling_target: input.scaling_target.clone(),
+        };
+
+        // "If you provide a task definition ARN, you cannot also specify
+        // primaryContainer, executionRoleArn, taskRoleArn, cpu, memory, or
+        // cpuArchitecture."
+        if let Some(message) = requested.task_definition_conflict() {
+            return Err(
+                UpdateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The health check path must start with a forward slash and can include query
+        // parameters."
+        if let Some(path) = input
+            .health_check_path
+            .as_deref()
+            .filter(|path| !path.starts_with('/'))
+        {
+            return Err(
+                UpdateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::express_health_check_path_message(path)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // The recorded refusal for an update of a service that is not there: the
+        // identifier it could not resolve, reported as the bad parameter it is.
+        let unresolved = || {
+            UpdateExpressGatewayServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::express_resource_not_found_message(
+                        &input.service_arn,
+                    )),
+                },
+            )
+        };
+        let key = guard
+            .express_gateway_key(&input.service_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::ExpressGatewayRefusal::ClusterNotFound => {
+                    UpdateExpressGatewayServiceErrorModeled::ClusterNotFoundException(
+                        ClusterNotFoundException {
+                            message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                }
+                crate::state::ExpressGatewayRefusal::NotFound => unresolved(),
+            })?;
+
+        // "The specified service isn't active. You can't update a service that's
+        // inactive": a draining service is on its way out, and nothing is deployed onto
+        // it.
+        let Some(stored) = guard.express_gateway_services.get(&key) else {
+            return Err(unresolved().into());
+        };
+        if !stored.is_active() {
+            let message =
+                crate::state::express_gateway_not_active_message(&stored.name, &stored.status_code);
+            return Err(
+                UpdateExpressGatewayServiceErrorModeled::ServiceNotActiveException(
+                    ServiceNotActiveException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        let current = stored.target_configuration().cloned();
+
+        let updated_at = crate::state::now();
+        // The deployment this update starts, and the revision it rolls out, are minted
+        // with the call that starts it.
+        let current_deployment = guard.next_deployment_id();
+        let service_revision_arn = guard.next_service_revision_arn(&region, &key.0, &key.1);
+        let configuration = requested.resolve(current.as_ref(), service_revision_arn, updated_at);
+
+        let Some(stored) = guard.express_gateway_services.get_mut(&key) else {
+            return Err(unresolved().into());
+        };
+        // "each service can have multiple active configurations, enabling blue-green
+        // deployments and gradual rollouts": the revision being rolled out is active
+        // beside the one it replaces, until the rollout falls due.
+        stored.configurations.insert(0, configuration);
+        stored.configurations.truncate(
+            crate::state::ExpressGatewayServiceRecord::MAX_ACTIVE_CONFIGURATIONS,
+        );
+        stored.current_deployment = current_deployment;
+        stored.updated_at = updated_at;
+        stored.rollout_due_at = Some(now + crate::state::TRANSITION_SPAN);
+
+        Ok(UpdateExpressGatewayServiceOutput {
+            service: Some(stored.updated_view()),
+        })
     }
 }

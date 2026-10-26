@@ -11,6 +11,11 @@
 //! `GetCompatibleVersions` publishes, so a target that table does not offer is refused
 //! rather than started.
 //!
+//! A check performs nothing, so performing it again records nothing: the domain holds
+//! at most one eligibility-check run per engine version it runs, and a repeat check
+//! reports that run ([`crate::state::Domain::eligibility_check`]) rather than growing
+//! the history.
+//!
 //! An upgrade is a configuration change of the domain: it goes
 //! `UpgradingEngineVersion` with its `EngineVersion` option `Processing`, and reports
 //! the version it was upgraded to only once the clock makes the run due.
@@ -240,6 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // performed": a request that omits it asks for the upgrade itself.
         let perform_check_only = input.perform_check_only.unwrap_or(false);
 
+        // A check records nothing a check already recorded: the record this call
+        // answers about is the one the domain already holds for the version it runs,
+        // so a repeat check hands back that run's identity rather than minting a
+        // second one.
         let run = domain.begin_upgrade(
             &input.target_version,
             perform_check_only,
@@ -250,8 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpgradeDomainOutput {
             upgrade_id: Some(run.upgrade_id),
             domain_name: Some(domain.domain_name.clone()),
-            target_version: Some(run.target_version),
-            perform_check_only: Some(run.perform_check_only),
+            // The versions the request named, echoed: what the call asked for, whether
+            // or not it recorded a run of its own.
+            target_version: Some(input.target_version.clone()),
+            perform_check_only: Some(perform_check_only),
             advanced_options: input.advanced_options,
             // "Container for information about a configuration change happening on a
             // domain": the change this upgrade started, the same record

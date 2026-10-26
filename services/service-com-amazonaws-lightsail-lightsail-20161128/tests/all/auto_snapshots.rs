@@ -48,7 +48,7 @@ const WAIT: Duration = Duration::from_secs(5);
 
 /// How long a case waits before concluding that NO copy is owed at all — more
 /// than the store's own span, so a copy that was going to be taken has been.
-const NO_COPY_WAIT: Duration = Duration::from_millis(1_500);
+pub(crate) const NO_COPY_WAIT: Duration = Duration::from_millis(1_500);
 
 /// The modelled `AutoSnapshotStatus` values a copy of this store reports: the
 /// one a copy the service is still taking is in, and the one it settles into.
@@ -61,14 +61,14 @@ const SUCCESS: &str = "Success";
 /// or disk"), which is also the pair `GetAutoSnapshots$resourceName` describes
 /// ("the source instance or disk").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Instance,
     Disk,
 }
 
 impl Kind {
     /// The modelled `ResourceType` value a resource of this kind reports.
-    fn resource_type(self) -> &'static str {
+    pub(crate) fn resource_type(self) -> &'static str {
         match self {
             Self::Instance => "Instance",
             Self::Disk => "Disk",
@@ -86,14 +86,14 @@ struct Attached {
 }
 
 /// The `GetAutoSnapshots` answer for `name`, requiring success.
-async fn report(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn report(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok("GetAutoSnapshots", json!({"resourceName": name}))
         .await
 }
 
 /// The `autoSnapshots` of that answer, in the order it reports them.
-async fn copies(emulator: &Emulator, name: &str) -> Vec<Value> {
+pub(crate) async fn copies(emulator: &Emulator, name: &str) -> Vec<Value> {
     report(emulator, name).await["autoSnapshots"]
         .as_array()
         .cloned()
@@ -120,7 +120,7 @@ fn assert_names_the_resource(case: &str, answered: &Value, kind: Kind, name: &st
 ///
 /// The copy is owed by the clock, not by the poll: it arrives without anyone
 /// asking more than once.
-async fn wait_for_a_copy(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
+pub(crate) async fn wait_for_a_copy(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
     let deadline = Instant::now() + WAIT;
     loop {
         let reported = copies(emulator, name).await;
@@ -137,7 +137,7 @@ async fn wait_for_a_copy(emulator: &Emulator, case: &str, name: &str) -> Vec<Val
 }
 
 /// Poll until the one copy of `name` reports `Success`, answering it.
-async fn wait_for_success(emulator: &Emulator, case: &str, name: &str) -> Value {
+pub(crate) async fn wait_for_success(emulator: &Emulator, case: &str, name: &str) -> Value {
     let deadline = Instant::now() + WAIT;
     loop {
         let reported = copies(emulator, name).await;
@@ -168,7 +168,7 @@ fn now_secs() -> f64 {
 /// library rendering (`DateTime::fmt(Format::DateTime)` is RFC 3339 in UTC), so
 /// the case asserts the RELATION the rule states — a copy is dated by the UTC
 /// date of the instant it was taken — rather than re-deriving a calendar.
-fn utc_date_of(secs: f64) -> String {
+pub(crate) fn utc_date_of(secs: f64) -> String {
     ::aws_smithy_types::DateTime::from_secs_f64(secs)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()
@@ -178,7 +178,7 @@ fn utc_date_of(secs: f64) -> String {
 
 /// The `addOnRequest`/`addOns` entry for the automatic snapshot add-on, carrying
 /// `hour` when one is named.
-fn auto_snapshot_request(hour: Option<&str>) -> Value {
+pub(crate) fn auto_snapshot_request(hour: Option<&str>) -> Value {
     let mut request = json!({"addOnType": "AutoSnapshot"});
     if let Some(hour) = hour {
         request["autoSnapshotAddOnRequest"] = json!({"snapshotTimeOfDay": hour});
@@ -187,7 +187,13 @@ fn auto_snapshot_request(hour: Option<&str>) -> Value {
 }
 
 /// Create the resource `name` of `kind`, carrying `add_ons` at creation time.
-async fn create(emulator: &Emulator, kind: Kind, name: &str, add_ons: &[Value], size_in_gb: i64) {
+pub(crate) async fn create(
+    emulator: &Emulator,
+    kind: Kind,
+    name: &str,
+    add_ons: &[Value],
+    size_in_gb: i64,
+) {
     let mut body = match kind {
         Kind::Instance => json!({
             "instanceNames": [name],

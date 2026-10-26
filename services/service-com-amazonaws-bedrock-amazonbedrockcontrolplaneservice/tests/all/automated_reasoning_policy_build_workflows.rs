@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The Automated Reasoning policy BUILD WORKFLOW end-to-end:
-//! `StartAutomatedReasoningPolicyBuildWorkflow` starts it and
+//! `StartAutomatedReasoningPolicyBuildWorkflow` starts it,
+//! `CancelAutomatedReasoningPolicyBuildWorkflow` stops it and
 //! `GetAutomatedReasoningPolicyBuildWorkflow` reads it back, over the same
 //! `MultiServiceRouter` the emulator boots.
 //!
@@ -29,6 +30,14 @@
 //!    policy's workflow id names no workflow of another policy.
 //! 5. **A replayed `clientRequestToken` starts nothing new**, and two policies' starts are
 //!    two workflows.
+//! 6. **A cancel stops a workflow that is still working**: it is reported
+//!    `CANCEL_REQUESTED` from the cancel onwards, the clock owes it `CANCELLED` rather
+//!    than the completion the start owed it, and the policy it was building is free again
+//!    once it is terminal.
+//! 7. **A cancel with nothing left to stop changes nothing**: a workflow already winding
+//!    down, or already terminal, is accepted and keeps the status and the instants it had
+//!    — while a pair naming no stored workflow is refused with `ResourceNotFoundException`
+//!    carrying the service's wording for a missing build workflow.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="StartAutomatedReasoningPolicyBuildWorkflow,GetAutomatedReasoningPolicyBuildWorkflow")`
@@ -40,7 +49,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::support::{emulator, label, Emulator, Reply, REGION};
+use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 
 /// Every `AutomatedReasoningPolicyBuildWorkflowType` the model admits
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowType")`).
@@ -66,6 +75,15 @@ const SCHEDULED: &str = "SCHEDULED";
 /// (`AutomatedReasoningPolicyBuildWorkflowStatus$COMPLETED`).
 const COMPLETED: &str = "COMPLETED";
 
+/// The status a build workflow carries from the cancel that asked it to stop until the
+/// clock owes it the terminal one
+/// (`AutomatedReasoningPolicyBuildWorkflowStatus$CANCEL_REQUESTED`).
+const CANCEL_REQUESTED: &str = "CANCEL_REQUESTED";
+
+/// The terminal status the clock owes a workflow whose cancellation was asked for
+/// (`AutomatedReasoningPolicyBuildWorkflowStatus$CANCELLED`).
+const CANCELLED: &str = "CANCELLED";
+
 /// How many characters a hyphenated `AutomatedReasoningPolicyBuildWorkflowId` carries
 /// (`@length(max: 36)`, pattern
 /// `^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`).
@@ -80,6 +98,21 @@ const DOCUMENT_BLOB: &str = "cG9saWN5IHJ1bGVz";
 /// the emulator makes that transition due a fraction of a second after the start, so a
 /// caller that waits this long must see the terminal status.
 const PAST_THE_BUILD: Duration = Duration::from_millis(900);
+
+/// Long enough that a workflow a cancel took over is past the cancellation the clock owes
+/// it, for the same reason [`PAST_THE_BUILD`] is long enough for the completion.
+const PAST_THE_CANCELLATION: Duration = Duration::from_millis(900);
+
+/// The `ResourceNotFoundException` message a request addressing a build workflow nothing
+/// holds is answered with — the wording Amazon Bedrock answers for that error class, which
+/// names neither the policy nor the id the request carried, so it is a FIXED text with no
+/// variable part to fill.
+const WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build WorkflowExecution not found";
+
+/// The status a cancel answers with: `CancelAutomatedReasoningPolicyBuildWorkflow` carries
+/// no output members and is modelled `@http(code: 202)`
+/// (`smithy_query(query="operation",operation="CancelAutomatedReasoningPolicyBuildWorkflow")`).
+const CANCEL_ACCEPTED: u16 = 202;
 
 /// Create a policy and hand back the `policyArn` it minted.
 async fn policy(emu: &Emulator, name: &str) -> String {
@@ -125,6 +158,20 @@ async fn get_workflow(emu: &Emulator, policy_arn: &str, build_workflow_id: &str)
         "GET",
         &format!(
             "/automated-reasoning-policies/{}/build-workflows/{build_workflow_id}",
+            label(policy_arn)
+        ),
+        None,
+    )
+    .await
+}
+
+/// `CancelAutomatedReasoningPolicyBuildWorkflow`: the policy ARN and the workflow id are
+/// path labels, and the request carries no body at all.
+async fn cancel_workflow(emu: &Emulator, policy_arn: &str, build_workflow_id: &str) -> Reply {
+    emu.call(
+        "POST",
+        &format!(
+            "/automated-reasoning-policies/{}/build-workflows/{build_workflow_id}/cancel",
             label(policy_arn)
         ),
         None,
@@ -736,5 +783,337 @@ async fn a_replayed_client_request_token_starts_nothing_new() {
         "case all: {} distinct tokens must start {} workflows, got {started:?}",
         tokens.len(),
         tokens.len()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 6. A cancel stops a workflow that is still working.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cancel_stops_a_workflow_that_is_still_building() {
+    // Rows differ along the workflow type and the source form, so the cancellation is not
+    // keyed to one of either.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a document ingestion",
+            WORKFLOW_TYPES[0],
+            documents_source("cancel.txt", "txt", Some("the cancelled build")),
+        ),
+        ("a policy repair", WORKFLOW_TYPES[1], repair_source()),
+        (
+            "an ambiguity resolution",
+            WORKFLOW_TYPES[5],
+            definition_source(),
+        ),
+        (
+            "an iterative refinement",
+            WORKFLOW_TYPES[6],
+            iterative_refinement_source(&[("cancel.pdf", "pdf")], "stop here"),
+        ),
+    ];
+
+    let emu = emulator();
+    for (index, (case, workflow_type, source)) in rows.iter().enumerate() {
+        let policy_arn = policy(&emu, &format!("cancel policy {index}")).await;
+        let started = start(&emu, &policy_arn, workflow_type, source.clone()).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: the start must answer 200, got {} {:?}",
+            started.status, started.body
+        );
+        let id = started.text("buildWorkflowId");
+
+        let cancelled = cancel_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            cancelled.status, CANCEL_ACCEPTED,
+            "case {case:?}: the cancel of a workflow that is still working must answer \
+             {CANCEL_ACCEPTED}, got {} {:?}",
+            cancelled.status, cancelled.body
+        );
+
+        // The cancel is recorded, so a caller reading straight after it sees the status
+        // that cancel wrote rather than the one the start accepted.
+        let requested = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            requested.text("status"),
+            CANCEL_REQUESTED,
+            "case {case:?}: a cancelled workflow winds down from the cancel onwards, got \
+             {:?}",
+            requested.get("status")
+        );
+        let created_at = requested.instant("createdAt");
+        let requested_at = requested.instant("updatedAt");
+        assert!(
+            requested_at >= created_at,
+            "case {case:?}: the cancel must move updatedAt to the cancel, got \
+             createdAt={created_at} updatedAt={requested_at}"
+        );
+
+        tokio::time::sleep(PAST_THE_CANCELLATION).await;
+
+        // The completion the START owed this workflow was due BEFORE the cancellation is,
+        // so a workflow reported COMPLETED here would be one the cancel never stopped.
+        let after = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            after.text("status"),
+            CANCELLED,
+            "case {case:?}: the workflow is owed its cancellation, not the completion the \
+             start owed it, got {:?}",
+            after.get("status")
+        );
+        assert!(
+            (after.instant("createdAt") - created_at).abs() < f64::EPSILON,
+            "case {case:?}: the cancellation must not move createdAt, got {:?}",
+            after.get("createdAt")
+        );
+        let cancelled_at = after.instant("updatedAt");
+        assert!(
+            cancelled_at > requested_at,
+            "case {case:?}: the cancellation must move updatedAt past the cancel, got \
+             updatedAt={cancelled_at} cancel={requested_at}"
+        );
+
+        // A read reports; it must not move anything a later caller sees.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let again = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            again.text("status"),
+            CANCELLED,
+            "case {case:?}: a terminal workflow stays terminal, got {:?}",
+            again.get("status")
+        );
+        assert!(
+            (again.instant("updatedAt") - cancelled_at).abs() < f64::EPSILON,
+            "case {case:?}: a read must report the instant the cancellation was owed at, \
+             not the instant of the read, got {:?}",
+            again.get("updatedAt")
+        );
+
+        // A cancelled workflow is terminal, so the policy it was building is free again.
+        let next = start(
+            &emu,
+            &policy_arn,
+            workflow_type,
+            documents_source("after-the-cancel.txt", "txt", None),
+        )
+        .await;
+        assert_eq!(
+            next.status, 200,
+            "case {case:?}: a policy whose workflow was cancelled takes another, got {} \
+             {:?}",
+            next.status, next.body
+        );
+        assert_ne!(
+            next.text("buildWorkflowId"),
+            id,
+            "case {case:?}: the start after the cancel is a second workflow"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 7. A cancel with nothing left to stop.
+// ---------------------------------------------------------------------------------------
+
+/// What a cancel of a workflow that has nothing left to stop must leave untouched: the
+/// status it already carried and both instants it already reported.
+fn workflow_snapshot(read: &Reply) -> (String, f64, f64) {
+    (
+        read.text("status"),
+        read.instant("createdAt"),
+        read.instant("updatedAt"),
+    )
+}
+
+#[tokio::test]
+async fn a_cancel_with_nothing_left_to_stop_changes_nothing() {
+    /// How a row brings its workflow to the state the cancel finds it in.
+    #[derive(Clone, Copy)]
+    enum Reached {
+        /// The clock completed it before anything asked it to stop.
+        Completion,
+        /// A cancel already took it over and it is still winding down.
+        CancelRequested,
+        /// A cancel already took it over and the clock has wound it down.
+        Cancellation,
+    }
+
+    // Rows span every state a workflow a cancel can find with no work left to stop, and
+    // differ along the workflow type and the source form as well.
+    let rows: Vec<(&str, Reached, &str, Value)> = vec![
+        (
+            "a workflow the clock completed",
+            Reached::Completion,
+            WORKFLOW_TYPES[0],
+            documents_source("completed.txt", "txt", None),
+        ),
+        (
+            "a workflow already winding down",
+            Reached::CancelRequested,
+            WORKFLOW_TYPES[2],
+            definition_source(),
+        ),
+        (
+            "a workflow already cancelled",
+            Reached::Cancellation,
+            WORKFLOW_TYPES[4],
+            repair_source(),
+        ),
+    ];
+
+    let emu = emulator();
+    for (index, (case, reached, workflow_type, source)) in rows.iter().enumerate() {
+        let policy_arn = policy(&emu, &format!("noop cancel policy {index}")).await;
+        let started = start(&emu, &policy_arn, workflow_type, source.clone()).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: the start must answer 200, got {} {:?}",
+            started.status, started.body
+        );
+        let id = started.text("buildWorkflowId");
+
+        let expected_status = match reached {
+            Reached::Completion => {
+                tokio::time::sleep(PAST_THE_BUILD).await;
+                COMPLETED
+            }
+            Reached::CancelRequested => {
+                let first = cancel_workflow(&emu, &policy_arn, &id).await;
+                assert_eq!(
+                    first.status, CANCEL_ACCEPTED,
+                    "case {case:?}: the first cancel must answer {CANCEL_ACCEPTED}, got {} \
+                     {:?}",
+                    first.status, first.body
+                );
+                CANCEL_REQUESTED
+            }
+            Reached::Cancellation => {
+                let first = cancel_workflow(&emu, &policy_arn, &id).await;
+                assert_eq!(
+                    first.status, CANCEL_ACCEPTED,
+                    "case {case:?}: the first cancel must answer {CANCEL_ACCEPTED}, got {} \
+                     {:?}",
+                    first.status, first.body
+                );
+                tokio::time::sleep(PAST_THE_CANCELLATION).await;
+                CANCELLED
+            }
+        };
+
+        let before = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            before.text("status"),
+            expected_status,
+            "case {case:?}: the row must reach {expected_status}, got {:?}",
+            before.get("status")
+        );
+        let snapshot = workflow_snapshot(&before);
+
+        let again = cancel_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            again.status, CANCEL_ACCEPTED,
+            "case {case:?}: a cancel with nothing left to stop is accepted, got {} {:?}",
+            again.status, again.body
+        );
+
+        let after = get_workflow(&emu, &policy_arn, &id).await;
+        let after_snapshot = workflow_snapshot(&after);
+        assert_eq!(
+            after_snapshot.0, snapshot.0,
+            "case {case:?}: expected the status to stay {:?}, got {:?}",
+            snapshot.0, after_snapshot.0
+        );
+        assert!(
+            (after_snapshot.1 - snapshot.1).abs() < f64::EPSILON
+                && (after_snapshot.2 - snapshot.2).abs() < f64::EPSILON,
+            "case {case:?}: expected the instants to stay {:?}, got {after_snapshot:?}",
+            snapshot
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_of_a_pair_naming_no_stored_workflow_is_not_found() {
+    let emu = emulator();
+    let policy_arn = policy(&emu, "cancelled policy").await;
+    let other_arn = policy(&emu, "other cancelled policy").await;
+    let started = start(
+        &emu,
+        &policy_arn,
+        WORKFLOW_TYPES[0],
+        documents_source("addressed.txt", "txt", None),
+    )
+    .await;
+    assert_eq!(
+        started.status, 200,
+        "case setup: the start must answer 200, got {} {:?}",
+        started.status, started.body
+    );
+    let id = started.text("buildWorkflowId");
+    let unminted =
+        format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:automated-reasoning-policy/00000000000z");
+    let versioned = format!("{policy_arn}:1");
+
+    // Every row carries a well-formed `AutomatedReasoningPolicyBuildWorkflowId`, so the
+    // refusal is about the store rather than about the id's form.
+    for (case, cancel_arn, cancel_id) in [
+        (
+            "an id nothing started",
+            policy_arn.as_str(),
+            "00000000-0000-4000-8000-000000000000",
+        ),
+        (
+            "the workflow of another policy",
+            other_arn.as_str(),
+            id.as_str(),
+        ),
+        ("a policy nothing minted", unminted.as_str(), id.as_str()),
+        ("a version nothing minted", versioned.as_str(), id.as_str()),
+    ] {
+        let refused = cancel_workflow(&emu, cancel_arn, cancel_id).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: {cancel_arn:?}/{cancel_id:?} names no stored workflow, so the \
+             cancel must answer 404, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            refused.error
+        );
+        assert_eq!(
+            refused.text("message"),
+            WORKFLOW_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the message {WORKFLOW_NOT_FOUND_MESSAGE:?}, got {:?}",
+            refused.get("message")
+        );
+    }
+
+    // A read of a pair naming no stored workflow is refused the same way: the wording
+    // belongs to the resource, not to one operation.
+    let read = get_workflow(&emu, &policy_arn, "00000000-0000-4000-8000-000000000000").await;
+    assert_eq!(
+        read.status, 404,
+        "case a read of an id nothing started: expected 404, got {} {:?}",
+        read.status, read.body
+    );
+    assert_eq!(
+        read.text("message"),
+        WORKFLOW_NOT_FOUND_MESSAGE,
+        "case a read of an id nothing started: expected the message \
+         {WORKFLOW_NOT_FOUND_MESSAGE:?}, got {:?}",
+        read.get("message")
+    );
+
+    // The pair the start minted still cancels, so the rows above refused on the pair
+    // rather than on the store.
+    let accepted = cancel_workflow(&emu, &policy_arn, &id).await;
+    assert_eq!(
+        accepted.status, CANCEL_ACCEPTED,
+        "case the started pair: the cancel must answer {CANCEL_ACCEPTED}, got {} {:?}",
+        accepted.status, accepted.body
     );
 }

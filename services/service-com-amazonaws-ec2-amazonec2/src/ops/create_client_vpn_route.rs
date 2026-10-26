@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClientVpnRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClientVpnRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds one route to the route table of a stored Client VPN endpoint, from the
+//! destination range the request names and the target it names a path through, and answers
+//! it `creating` — the clock owes it `active` a transition span later, so a caller reading
+//! the route straight back still sees the transient state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClientVpnRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,247 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClientVpnRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClientVpnRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClientVpnRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — a Client VPN
+        // endpoint is named by id, and this store holds one set of them. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`CreateClientVpnRouteRequest$DryRun`). That is a PERMISSION check and nothing
+        // else: every caller of this emulator is permitted, so a dry run reports that
+        // outcome FIRST and neither reads nor writes anything — not the endpoint the request
+        // names and not the members it carries. It is answered here rather than beside the
+        // write for that reason, and because it is what the real service answers a dry run of
+        // this operation with for a request whose other members it never got to.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Both `ClientVpnEndpointId` and `DestinationCidrBlock` are modelled `@required` AND
+        // `@clientOptional`, so an EMPTY value reaches the handler rather than being refused
+        // at the boundary. Neither gets a check of its own: an empty endpoint id is a value
+        // this account holds no endpoint for, so the lookup below answers it exactly as it
+        // answers any other such value, and an empty destination is a value the CIDR reader
+        // cannot read as a block, so it is refused as the invalid parameter value it is
+        // rather than as a parameter the request left out.
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateClientVpnRouteRequest$ClientToken`). The model puts no
+        // `@length` on it and the store keeps it for the process's lifetime, so the bound
+        // this crate holds every client token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The IPv4 address range, in CIDR notation, of the route destination"
+        // (`CreateClientVpnRouteRequest$DestinationCidrBlock`): what a route carries is a
+        // RANGE, so the value has to be an IPv4 CIDR block that names its own range — a value
+        // that is not a block at all, and one whose host bits are set so that it names an
+        // ADDRESS INSIDE a range instead of the range, are both refused, and refused before
+        // anything is looked up. The block is then stored in the canonical spelling of that
+        // range, so the destination identifies ONE route of the endpoint however the request
+        // spelled it.
+        let destination_cidr = state::canonical_ipv4_cidr(&input.destination_cidr_block)
+            .ok()
+            // The range itself, asked of the addresses the block holds rather than of how it
+            // is spelled: only a block whose host bits are set names an address inside a
+            // range instead of the range.
+            .filter(|_| state::cidr_block_names_its_range(&input.destination_cidr_block))
+            .ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter destinationCidrBlock is invalid. \
+                     This is not a valid CIDR block.",
+                    requested = input.destination_cidr_block,
+                ))
+            })?;
+
+        // "The ID of the subnet through which you want to route traffic"
+        // (`CreateClientVpnRouteRequest$TargetVpcSubnetId`). An empty value is no value: the
+        // member is optional, so a request that sends it empty is read the same way as one
+        // that leaves it out, and refused below if the endpoint needs one.
+        let requested_target = input
+            .target_vpc_subnet_id
+            .as_deref()
+            .filter(|subnet_id| !subnet_id.is_empty());
+
+        // A target that is named by something which is not a subnet id AT ALL is refused
+        // before anything is looked up: `InvalidSubnetID.Malformed` is a refusal EC2's error
+        // catalogue documents for a subnet id of the wrong form, and refusing it first is the
+        // malformed-before-lookup order (`crate::state::require_well_formed_id`) every
+        // resource id of this crate whose kind HAS such a refusal is read in. `local` is the
+        // one target that is not a subnet id ("if you're adding a route for the local
+        // network, specify `local`"), so it is not read as one.
+        if let Some(subnet_id) = requested_target.filter(|subnet_id| {
+            *subnet_id != state::CLIENT_VPN_ROUTE_TARGET_LOCAL
+                && !state::prefixed_id_is_well_formed(state::SUBNET_ID_PREFIX, subnet_id)
+        }) {
+            return Err(state::invalid_subnet_id_malformed(subnet_id));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this call is allowed to apply: each was due at its instant
+        // whether or not anybody called, so a target network that has reached `associated`
+        // and a route that has reached `active` are read as such here too.
+        store.materialize_due_transitions();
+
+        // "Adds a route to a network to a Client VPN endpoint" (`CreateClientVpnRoute`): the
+        // endpoint whose route table takes the route is resolved by LOOKUP — a value this
+        // account holds no endpoint for is answered "that endpoint does not exist", whatever
+        // its form, which is the one refusal this surface documents for an endpoint id (see
+        // [`crate::state::require_client_vpn_endpoint`]). Only the attachment of a Transit
+        // Gateway-based endpoint is read off it, so that one member is taken here rather than
+        // a copy of the whole endpoint — and it is FLATTENED: an endpoint whose Transit
+        // Gateway configuration names no attachment offers no path either, so it reads the
+        // same as an endpoint with no configuration at all and the request has to name a
+        // target subnet.
+        let transit_gateway_attachment =
+            state::require_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?
+                .transit_gateway_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.transit_gateway_attachment_id.clone());
+
+        // "This parameter is required for VPC-based Client VPN endpoints. For Transit
+        // Gateway-based endpoints, this parameter is not required" — so whether the request
+        // had to name a target is decided by the endpoint's own stored configuration. A route
+        // carries ONE path: the subnet when the request named one, and otherwise the
+        // attachment of a Transit Gateway-based endpoint
+        // (`ClientVpnRoute$TransitGatewayAttachmentId`), never both.
+        let (target_subnet, transit_gateway_attachment_id) =
+            match (requested_target, transit_gateway_attachment) {
+                (None, None) => {
+                    return Err(state::missing_parameter(
+                        "The request must contain the parameter targetVpcSubnetId",
+                    ))
+                }
+                (None, Some(attachment)) => (None, Some(attachment)),
+                (Some(subnet_id), _) => {
+                    // "The specified subnet must be an existing target network of the Client
+                    // VPN endpoint. Alternatively, if you're adding a route for the local
+                    // network, specify `local`": `local` names the endpoint's own client
+                    // network, so it is the one target that is not resolved against the
+                    // association store.
+                    if subnet_id != state::CLIENT_VPN_ROUTE_TARGET_LOCAL
+                        && !store.client_vpn_endpoint_has_target_network(
+                            &input.client_vpn_endpoint_id,
+                            subnet_id,
+                        )
+                    {
+                        return Err(state::client_vpn_active_association_not_found(
+                            subnet_id,
+                            &input.client_vpn_endpoint_id,
+                        ));
+                    }
+                    (Some(subnet_id.to_string()), None)
+                }
+            };
+
+        // What names the route this request would add: the endpoint, the destination and the
+        // target it leaves through.
+        let key = state::ClientVpnRouteKey {
+            client_vpn_endpoint_id: input.client_vpn_endpoint_id.clone(),
+            destination_cidr: destination_cidr.clone(),
+            target: target_subnet.clone().unwrap_or_default(),
+        };
+        let description = input
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+            .map(str::to_string);
+
+        // Idempotency: one token names the one route it added, so a replay of the SAME
+        // request reports that route and adds nothing. Read before the duplicate check, which
+        // is what a replay would otherwise be refused by.
+        let replayed = match input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.client_vpn_route_client_tokens.get(token).cloned())
+        {
+            None => None,
+            Some(named) => {
+                let route = store.client_vpn_route(&named).map(|record| record.view.clone());
+                let Some(route) = route else {
+                    return Err(state::internal_error(
+                        "a client token names a Client VPN route that is not stored",
+                    ));
+                };
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different destination, target or description it names a
+                // route the caller did not ask for, which EC2 refuses rather than answers.
+                if named != key || route.description != description {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(route)
+            }
+        };
+
+        // "You can only delete routes that you manually added" (`DeleteClientVpnRoute`) reads
+        // the same identity this store is keyed by, so a second request for the same
+        // destination through the same target would make a SECOND route of one path: EC2
+        // refuses it rather than storing it twice.
+        if replayed.is_none() && store.client_vpn_route(&key).is_some() {
+            return Err(state::client_vpn_duplicate_route(
+                &destination_cidr,
+                &input.client_vpn_endpoint_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() && !store.has_client_vpn_route_capacity() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "This emulator holds {max} Client VPN routes, which is as many as it \
+                     stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ),
+            ));
+        }
+
+        // The route that token already added, with the status it has reached by now. Nothing
+        // is written for a replay, and the dry-run caller was answered at the top of this
+        // handler, so from here on the request is one that writes.
+        if let Some(route) = replayed {
+            return Ok(CreateClientVpnRouteOutput {
+                status: route.status,
+            });
+        }
+
+        let Some((stored_key, route)) = store.insert_client_vpn_route(state::ClientVpnRouteSpec {
+            client_vpn_endpoint_id: input.client_vpn_endpoint_id.clone(),
+            destination_cidr,
+            target_subnet,
+            transit_gateway_attachment_id,
+            description,
+        }) else {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                "This emulator cannot store another Client VPN route",
+            ));
+        };
+        // The token is recorded with the route it added, so a replay of this request reports
+        // that route instead of adding a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            store
+                .client_vpn_route_client_tokens
+                .insert(token.to_string(), stored_key);
+        }
+
+        // "The current state of the route" (`CreateClientVpnRouteResult$Status`) is the status
+        // the route was STORED with, so this call and `DescribeClientVpnRoutes` cannot drift
+        // apart.
+        Ok(CreateClientVpnRouteOutput {
+            status: route.status,
+        })
     }
 }

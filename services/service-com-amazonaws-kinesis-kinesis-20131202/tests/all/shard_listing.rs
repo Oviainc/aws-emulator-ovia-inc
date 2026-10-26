@@ -99,7 +99,7 @@ impl Emulator {
         let state = self.engine.state::<ComAmazonawsKinesisKinesis20131202State>();
         let store = state.lock();
         store
-            .stream_in(REGION, name)
+            .stream_in(SystemTime::now(), REGION, name)
             .unwrap_or_else(|| panic!("case {case}: the store holds no stream named {name}"))
             .created_at
     }
