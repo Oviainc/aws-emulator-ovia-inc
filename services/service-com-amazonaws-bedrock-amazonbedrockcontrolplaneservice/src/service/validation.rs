@@ -42,7 +42,9 @@
 //! 5. an enum clause states the admitted VALUE SET and the position —
 //!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
 //!    [ … ]` — never the value the member held, which is rule 2's second exception: what
-//!    such a caller acts on is the set it must choose from.
+//!    such a caller acts on is the set it must choose from. The set's MEMBERSHIP is the
+//!    model's; the ORDER it is listed in is the service's own listing of that enum's values
+//!    ([`VALUE_LISTINGS`], [`listed`]), which no order the model carries reproduces.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -142,10 +144,72 @@ fn pattern_requirement(pattern: &str) -> String {
     )
 }
 
-/// An enumerated value set, as a requirement reads.
+/// An enumerated value set, as a requirement reads: the MEMBERSHIP the model declares, in
+/// the order this service LISTS that enum's values ([`listed`]).
 fn enum_requirement<S: AsRef<str>>(values: &[S]) -> String {
     let values: Vec<&str> = values.iter().map(AsRef::as_ref).collect();
-    format!("Member must satisfy enum value set: [{}]", values.join(", "))
+    format!(
+        "Member must satisfy enum value set: [{}]",
+        listed(&values).join(", ")
+    )
+}
+
+/// The order this service states an enum's admitted values in, for the enums it is observed
+/// to publish a listing for.
+///
+/// An enum clause states a MEMBERSHIP and an ORDER. The membership is the model's, always.
+/// The order is not: this service lists `DataRetentionMode` as
+/// `default, provider_data_share, …` while the model declares `default, none, …`, and no
+/// order derivable from the model — declaration order, sorted, reversed, by length, by the
+/// bucket order of a hashed set — produces it. It is service metadata the public model does
+/// not carry, the way rule 4's requirement order is: the only source for either is what the
+/// service's refusals are recorded stating. So a listing is recorded per enum HERE, beside
+/// the one renderer every enum-constrained member of every operation goes through, rather
+/// than in an operation handler.
+///
+/// A listing is identified by the SET it orders — which is what a violation carries, the
+/// clause having no shape id — and is applied ONLY to an enum whose admitted set it is a
+/// permutation of. A listing can therefore neither add a value this model does not declare
+/// nor drop one it does, and an enum whose membership changes in the model stops matching a
+/// stale listing and states the model's order rather than an outdated set. An enum with no
+/// recorded listing keeps the order the member schema carries, which is the model's.
+const VALUE_LISTINGS: &[&[&str]] = &[
+    // `DataRetentionMode` (`PutAccountDataRetention.mode`), which the model declares
+    // `default, none, aws_review, provider_data_share, inherit`. The listing is the one
+    // both recorded refusals of that surface state
+    // (`bedrock.put-account-data-retention-invalid-period-out-of-range-rejected` and
+    // `bedrock.account-data-retention-ttl-enforced-on-logs`).
+    &[
+        "default",
+        "provider_data_share",
+        "none",
+        "aws_review",
+        "inherit",
+    ],
+];
+
+/// `values` in the order this service lists them, or in the order they arrived — the
+/// model's, off the member schema — when this service publishes no listing for that enum.
+fn listed<'v>(values: &[&'v str]) -> Vec<&'v str> {
+    match VALUE_LISTINGS
+        .iter()
+        .find(|listing| orders_the_same_set(listing, values))
+    {
+        Some(listing) => listing.to_vec(),
+        None => values.to_vec(),
+    }
+}
+
+/// Whether two value lists hold the same values, in whatever order each holds them.
+fn orders_the_same_set(one: &[&str], other: &[&str]) -> bool {
+    if one.len() != other.len() {
+        return false;
+    }
+    let mut one: Vec<&str> = one.to_vec();
+    let mut other: Vec<&str> = other.to_vec();
+    one.sort_unstable();
+    other.sort_unstable();
+    one == other
 }
 
 /// A `@range` bound as it displays: an integral value without a trailing `.0`, a
@@ -718,6 +782,123 @@ fn input_schemas() -> Vec<&'static Schema> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every enum value set this model declares on an input member, read off the generated
+    /// schemas the same way the element constraint catalog is.
+    fn declared_enum_sets() -> Vec<Vec<&'static str>> {
+        let mut sets: Vec<Vec<&'static str>> = Vec::new();
+        for schema in input_schemas() {
+            for member in schema.members() {
+                let Some(traits) = member.traits() else {
+                    continue;
+                };
+                if let Some(allowed) = constraint_trait::<EnumTrait>(traits, &EnumTrait::TRAIT_ID) {
+                    let set: Vec<&'static str> = allowed.values.to_vec();
+                    if !sets.contains(&set) {
+                        sets.push(set);
+                    }
+                }
+            }
+        }
+        sets
+    }
+
+    /// A listing orders a set this MODEL declares: it is a permutation of one of them, so
+    /// it can neither add a value the model does not admit nor drop one it does.
+    #[test]
+    fn every_listing_orders_a_value_set_this_model_declares() {
+        let declared = declared_enum_sets();
+        assert!(
+            !declared.is_empty(),
+            "this model declares enum-constrained input members, so the schemas must carry \
+             value sets"
+        );
+        for listing in VALUE_LISTINGS {
+            assert!(
+                declared
+                    .iter()
+                    .any(|set| orders_the_same_set(listing, set)),
+                "case {listing:?}: a listing must order a value set this model declares, \
+                 and none of {declared:?} holds those values"
+            );
+        }
+    }
+
+    /// A listing is resolved by the SET it orders, whatever order the set arrives in, and
+    /// an enum with no listing keeps the order it arrived in — the model's.
+    #[test]
+    fn a_listing_is_applied_only_to_the_enum_whose_set_it_orders() {
+        let retention_modes = ["default", "provider_data_share", "none", "aws_review", "inherit"];
+        // (case, the set as it arrives off a member schema, the order the clause states)
+        let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+            (
+                "the listed enum, arriving in the model's declaration order",
+                vec!["default", "none", "aws_review", "provider_data_share", "inherit"],
+                retention_modes.to_vec(),
+            ),
+            (
+                "the listed enum, arriving sorted",
+                vec!["aws_review", "default", "inherit", "none", "provider_data_share"],
+                retention_modes.to_vec(),
+            ),
+            (
+                "the listed enum, arriving already listed",
+                retention_modes.to_vec(),
+                retention_modes.to_vec(),
+            ),
+            (
+                "an enum of the same size with another membership",
+                vec!["one", "two", "three", "four", "five"],
+                vec!["one", "two", "three", "four", "five"],
+            ),
+            (
+                "a subset of a listed set: not that enum",
+                vec!["default", "none", "aws_review", "provider_data_share"],
+                vec!["default", "none", "aws_review", "provider_data_share"],
+            ),
+            (
+                "a listed set with one value more: not that enum either",
+                vec![
+                    "default",
+                    "none",
+                    "aws_review",
+                    "provider_data_share",
+                    "inherit",
+                    "grandfathered",
+                ],
+                vec![
+                    "default",
+                    "none",
+                    "aws_review",
+                    "provider_data_share",
+                    "inherit",
+                    "grandfathered",
+                ],
+            ),
+            (
+                "an enum with no listing",
+                vec!["TEXT", "IMAGE", "EMBEDDING"],
+                vec!["TEXT", "IMAGE", "EMBEDDING"],
+            ),
+            ("a single-valued enum", vec!["CreationTime"], vec!["CreationTime"]),
+        ];
+        for (case, arriving, expected) in rows {
+            let actual = listed(&arriving);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            let requirement = enum_requirement(&arriving);
+            let stated = format!(
+                "Member must satisfy enum value set: [{}]",
+                expected.join(", ")
+            );
+            assert_eq!(
+                requirement, stated,
+                "case {case:?}: expected the clause to state {stated:?}, got {requirement:?}"
+            );
+        }
+    }
 
     /// The anchors are stripped, and only the anchors: a `$` that is part of the
     /// expression stays. The forms this model reaches are covered end-to-end by

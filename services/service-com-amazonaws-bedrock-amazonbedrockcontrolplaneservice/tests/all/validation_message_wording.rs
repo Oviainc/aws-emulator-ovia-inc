@@ -293,9 +293,9 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
 /// the enum, whether the value travels in the BODY or in the QUERY string, and how many
 /// values the enum publishes (two, three and five). Each row's admitted set is the model's
 /// (`smithy_query(query="shape",shape=...)`), asserted member by member rather than as one
-/// ordered list, because the ORDER a Bedrock enum clause lists its set in is an open
-/// question recorded in
-/// `issues/things-that-do-not-work/20261024T033000Z-bedrock-enum-validation-message-wording.md`.
+/// ordered list: this suite's rule is that the VALUE is not echoed, and the ORDER the set is
+/// listed in is pinned clause-by-clause, over a superset of these enums, by
+/// `tests/all/enum_value_set_order.rs`.
 #[tokio::test]
 async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
     /// One enum-constrained member driven outside its set.
