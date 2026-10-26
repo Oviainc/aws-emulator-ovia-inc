@@ -7,6 +7,10 @@
 //! differ along what the rule generalises over (batch size and payload shape, checksum
 //! form, payload size at and past the documented limit, ARN form, id multiplicity,
 //! external id), not only over the one case the bootstrap issue cited.
+//!
+//! The harness below is this crate's one test client; a sibling suite that drives the
+//! same operation reaches it as `crate::put_audit_events::{Harness, ev, channel_arn}`
+//! rather than building a second one.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,11 +28,11 @@ const SIGV4_AUTH: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIAEMULATORTEST/20260101/us-east-1/cloudtrail-data/aws4_request, \
      SignedHeaders=host, Signature=0";
 
-const REGION: &str = "us-east-1";
+pub const REGION: &str = "us-east-1";
 
 /// A channel ARN in the emulator's own account, as the CloudTrail control plane would
 /// mint it: `arn:aws:cloudtrail:<region>:<account>:channel/<id>`.
-fn channel_arn(channel_id: &str) -> String {
+pub fn channel_arn(channel_id: &str) -> String {
     engine::emulator_arn("cloudtrail", REGION, &format!("channel/{channel_id}"))
 }
 
@@ -67,13 +71,13 @@ fn json_object_of_len(len: usize) -> String {
 
 /// One entry of an `auditEvents` batch.
 #[derive(Debug, Clone)]
-struct Ev {
+pub struct Ev {
     id: String,
     data: String,
     checksum: Option<String>,
 }
 
-fn ev(id: impl Into<String>, data: impl Into<String>) -> Ev {
+pub fn ev(id: impl Into<String>, data: impl Into<String>) -> Ev {
     Ev {
         id: id.into(),
         data: data.into(),
@@ -104,14 +108,14 @@ impl Ev {
 }
 
 /// The emulator's answer, as a client sees it.
-struct Reply {
-    status: u16,
-    body: serde_json::Value,
+pub struct Reply {
+    pub status: u16,
+    pub body: serde_json::Value,
 }
 
 impl Reply {
     /// The wire error code restJson1 carries in `__type` (empty on a success).
-    fn error_code(&self) -> String {
+    pub fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(serde_json::Value::as_str)
@@ -153,13 +157,13 @@ impl Reply {
     }
 }
 
-struct Harness {
+pub struct Harness {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -169,7 +173,7 @@ impl Harness {
 
     /// Seed a channel, the way the CloudTrail control plane's `CreateChannel` will once
     /// it is implemented: into this service's store in the SHARED engine.
-    fn register(&self, channel: Channel) {
+    pub fn register(&self, channel: Channel) {
         state::service_state(&*self.engine)
             .expect("the shared engine holds this service's state")
             .lock()
@@ -178,7 +182,7 @@ impl Harness {
 
     /// The channel's stored ingest log as `(source id, event id)` pairs, oldest first —
     /// the state a later caller reads, not the response just rendered.
-    fn ingest_log(&self, channel: &str) -> Vec<(String, String)> {
+    pub fn ingest_log(&self, channel: &str) -> Vec<(String, String)> {
         let reference = state::parse_channel_ref(channel).expect("a channel reference");
         state::service_state(&*self.engine)
             .expect("the shared engine holds this service's state")
@@ -203,7 +207,7 @@ impl Harness {
             .unwrap_or_default()
     }
 
-    async fn put(&self, channel: &str, external_id: Option<&str>, events: &[Ev]) -> Reply {
+    pub async fn put(&self, channel: &str, external_id: Option<&str>, events: &[Ev]) -> Reply {
         let mut uri = format!("/PutAuditEvents?channelArn={channel}");
         if let Some(external_id) = external_id {
             uri.push_str("&externalId=");
@@ -447,10 +451,10 @@ async fn per_event_defects_are_reported_per_event() {
     );
 }
 
-/// Resolving the channel: a channel ARN that is not registered is `ChannelNotFound`, an
-/// `arn:` value that is not a channel ARN at all is `InvalidChannelARN`, and a value the
-/// member's modelled `@pattern ^arn:.*$` rejects never reaches the handler (the
-/// boundary answers `ValidationException`).
+/// Resolving the channel: a channel ARN that is not registered is `ChannelNotFound`,
+/// and a value that is not a channel ARN is `InvalidChannelARN` — whether the member's
+/// modelled `@pattern ^arn:.*$` rejects it at the boundary or the handler finds it names
+/// no channel.
 #[tokio::test]
 async fn channel_resolution_answers_the_modelled_error_for_each_arn_form() {
     let harness = Harness::new();
@@ -531,11 +535,12 @@ async fn channel_resolution_answers_the_modelled_error_for_each_arn_form() {
             "InvalidChannelARN",
         ),
         (
-            // Refused by the member's modelled @pattern ^arn:.*$ before the handler runs.
+            // Refused by the member's modelled @pattern ^arn:.*$ at the boundary, and
+            // answered under the error this service models for that fault.
             "a value that is not an ARN at all",
             "not-an-arn".to_string(),
             400,
-            "ValidationException",
+            "InvalidChannelARN",
         ),
     ];
 
@@ -623,9 +628,11 @@ async fn repeated_event_ids_fail_the_whole_request() {
     }
 }
 
-/// Ownership and the channel's external id: the caller's account must be the channel
-/// owner's, and a channel whose resource policy includes an external id requires the
-/// request to carry exactly that value.
+/// Ownership and the channel's external id: a channel whose resource policy includes an
+/// external id requires the request to carry exactly that value, and a channel in
+/// another account is not the caller's to ingest into — which authorization decides on
+/// the ARN, before the registration is read at all (the table spanning that rule lives
+/// in `tests/all/channel_arn_refusals.rs`).
 #[tokio::test]
 async fn ownership_and_external_id_decide_permission() {
     let harness = Harness::new();
@@ -640,7 +647,8 @@ async fn ownership_and_external_id_decide_permission() {
             .requiring_external_id("secret-123"),
     );
 
-    // A channel owned by another account: the emulator's caller is its own account.
+    // A channel owned by another account. Naming it by ARN is refused by authorization,
+    // ahead of everything this service knows about the registration.
     let foreign = "arn:aws:cloudtrail:us-east-1:111122223333:channel/foreign-0001".to_string();
     harness.register(Channel::from_arn(&foreign, "Custom").expect("a channel ARN"));
 
@@ -676,18 +684,18 @@ async fn ownership_and_external_id_decide_permission() {
             "ChannelInsufficientPermission",
         ),
         (
-            "channel owned by another account",
+            "a channel in another account",
             &foreign,
             None,
-            400,
-            "ChannelInsufficientPermission",
+            403,
+            "AccessDeniedException",
         ),
         (
-            "channel owned by another account, external id sent",
+            "a channel in another account, external id sent",
             &foreign,
             Some("secret-123"),
-            400,
-            "ChannelInsufficientPermission",
+            403,
+            "AccessDeniedException",
         ),
     ];
 

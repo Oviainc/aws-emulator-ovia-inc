@@ -41,9 +41,28 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+use crate::ops::put_audit_events::{
+    CHANNEL_ARN_PATTERN, INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE,
+};
+
+/// Whether a boundary refusal is ABOUT a channel reference: one of its violations is a
+/// `@pattern` violation of the expression every `ChannelArn` member is constrained with
+/// ([`CHANNEL_ARN_PATTERN`]).
+///
+/// Keyed to that expression rather than to a member path, so the rule holds for
+/// whichever member of whichever operation carried the value. A refusal that ALSO
+/// carries other violations is still answered as the channel-ARN fault: the channel
+/// reference is what this service resolves the call against before it reads anything
+/// else, so that is the fault it reports.
+fn refused_channel_arn(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == CHANNEL_ARN_PATTERN)
+    })
+}
 
 /// The `com-amazonaws-cloudtraildata-cloudtraildataservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +116,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // A channel reference is validated by the SERVICE, not by the generic constraint
+        // walk: this service models an error for exactly that fault
+        // (`InvalidChannelARN`, HTTP 400), and it is one of the errors every operation
+        // that takes a channel reference declares — so a value the member's modelled
+        // `@pattern` rejects is answered under that code and its documented sentence,
+        // the same answer the handler gives a value that passes the pattern but names no
+        // channel. `ValidationException` is not modelled anywhere in this service, so a
+        // generated client has no handler for it at all.
+        //
+        // Every other refusal keeps the framework's wording: this service states nothing
+        // of its own about an absent member or an out-of-bounds batch.
+        match refusal {
+            Refusal::Invalid(violations) if refused_channel_arn(violations) => Some(Refused {
+                code: INVALID_CHANNEL_ARN_CODE.to_string(),
+                message: INVALID_CHANNEL_ARN_MESSAGE.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

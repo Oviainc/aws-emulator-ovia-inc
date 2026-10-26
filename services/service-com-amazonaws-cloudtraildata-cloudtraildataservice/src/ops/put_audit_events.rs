@@ -4,12 +4,19 @@
 //!
 //! Ingests a batch of audit events into a CloudTrail Lake channel held in this
 //! service's engine state (see [`crate::state`]): the channel is resolved from
-//! `channelArn` (full ARN or ARN suffix), the caller's account and the channel's
+//! `channelArn` (full ARN or ARN suffix), a channel ARN naming another account is
+//! denied before the channel is looked up, the caller's account and the channel's
 //! external-id requirement are checked, the batch is rejected as a whole when it
 //! repeats an event id, and every event that passes per-event validation is APPENDED to
 //! the channel's ingest log under a freshly minted `eventID` which is then echoed in
 //! `successful`. Events that fail validation are reported per event in `failed`, which
 //! is a partial failure, not an operation error.
+//!
+//! Each refusal states the message the service words for its class: the sentence the
+//! model documents for the error shape, which carries no caller value where that wording
+//! leaves no slot for one (`InvalidChannelARN`) and names the channel the request asked
+//! about where it does (`ChannelNotFound`). The authorization denial is built from the
+//! request too: it names the principal, the action and the resource ARN.
 //!
 //! The channel's ingest log is the emulator's own record of what it accepted, bounded by
 //! the retention limits in [`crate::state`] (oldest evicted first) so repeated calls
@@ -133,6 +140,70 @@ impl From<PutAuditEventsErrorModeled> for PutAuditEventsError {
 /// [`crate::state::MAX_EVENT_DATA_BYTES`] — exported there so this handler and the
 /// crate's tests cannot disagree about where the bound sits.
 use crate::state::MAX_EVENT_DATA_BYTES;
+
+/// The message of `InvalidChannelARN`.
+///
+/// The model documents the shape as "The specified channel ARN is not a valid channel
+/// ARN." (`smithy_query(query="shape", shape="InvalidChannelARN")`), so that sentence IS
+/// this refusal's message: it is stated verbatim, for every value that is not a channel
+/// ARN, and interpolates nothing from the request.
+pub const INVALID_CHANNEL_ARN_MESSAGE: &str =
+    "The specified channel ARN is not a valid channel ARN.";
+
+/// The message of `ChannelNotFound`: AWS's wording for that class names the channel the
+/// request asked about and then states the fact the model documents for the shape ("The
+/// channel could not be found."), so the reference comes from the request and the rest
+/// of the sentence is fixed.
+fn channel_not_found_message(reference: &str) -> String {
+    format!("The channel {reference} could not be found.")
+}
+
+/// The message of `ChannelInsufficientPermission` for a channel the caller's account
+/// does not own, as the model documents the shape: "The caller's account ID must be the
+/// same as the channel owner's account ID."
+const CHANNEL_NOT_OWNED_MESSAGE: &str =
+    "The caller's account ID must be the same as the channel owner's account ID.";
+
+/// The message of `DuplicatedAuditEventId`, as the model documents the shape: "Two or
+/// more entries in the request have the same event ID."
+const DUPLICATED_AUDIT_EVENT_ID_MESSAGE: &str =
+    "Two or more entries in the request have the same event ID.";
+
+/// The error code the wire carries for a channel reference that is not a channel ARN.
+/// Named here, beside the handler that answers it, so `crate::service`'s refusal
+/// override cannot name a different one for the same fault.
+pub const INVALID_CHANNEL_ARN_CODE: &str = "InvalidChannelARN";
+
+/// The expression the model constrains every `ChannelArn` member with
+/// (`@pattern ^arn:.*$`, from `smithy_query(query="shape", shape="ChannelArn")`).
+///
+/// A value outside it is refused by the SERVICE as `InvalidChannelARN` rather than by
+/// the generic constraint walk, which is why `crate::service` matches a boundary
+/// violation against this expression.
+pub const CHANNEL_ARN_PATTERN: &str = "^arn:.*$";
+
+/// The IAM action this operation is authorized under: the service's signing name
+/// (`sigv4Name` / `awsService.endpointPrefix` — `cloudtrail-data`) and the operation's
+/// own name, which is how an action is spelled in a policy and in a denial.
+const PUT_AUDIT_EVENTS_ACTION: &str = "cloudtrail-data:PutAuditEvents";
+
+/// The principal a request to this emulator speaks for: the single long-term identity it
+/// publishes, which is the one `sts:GetCallerIdentity` answers with.
+fn caller_principal() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The denial for a call the caller holds no grant for: who it spoke for, what it asked
+/// to do, and which resource it named — built from the request, and saying nothing about
+/// whether that resource exists.
+fn not_authorized_message(resource: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {PUT_AUDIT_EVENTS_ACTION} on resource: \
+         {resource} because no resource-based policy allows the \
+         {PUT_AUDIT_EVENTS_ACTION} action",
+        caller_principal()
+    )
+}
 
 /// The base64-SHA256 checksum of `event_data`, which is what
 /// `AuditEvent$eventDataChecksum` carries: the model documents it as the output of
@@ -275,23 +346,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `channelArn` is "The ARN or ID (the ARN suffix) of a channel"; a value that
-        // names neither is not a channel ARN. (A value that does not even start with
-        // `arn:` is refused before this handler by the member's modelled `@pattern`.)
+        // names neither is not a channel ARN. A value that does not even start with
+        // `arn:` fails the member's modelled `@pattern` at the boundary and is answered
+        // as this same refusal there (see `crate::service`'s refusal override), so the
+        // two spellings of "not a channel ARN" reach the caller as one error.
         let Some(channel_ref) = crate::state::parse_channel_ref(&input.channel_arn) else {
             record_access(
                 ctx,
                 &input.channel_arn,
-                "InvalidChannelARN",
+                INVALID_CHANNEL_ARN_CODE,
                 "channelArn names no channel",
             );
             return Err(PutAuditEventsErrorModeled::InvalidChannelARN(InvalidChannelARN {
-                message: Some(format!(
-                    "The specified channel ARN is not a valid channel ARN: {}",
-                    input.channel_arn
-                )),
+                message: Some(INVALID_CHANNEL_ARN_MESSAGE.to_string()),
             })
             .into());
         };
+
+        // Authorization is decided on the resource the request NAMES, ahead of anything
+        // this service knows about it: the emulator's caller speaks for the emulator's
+        // own account, so a channel ARN whose account segment is another account's is
+        // covered by no grant the caller holds and the call is denied. Taken BEFORE the
+        // channel is looked up, so the answer is the same whether or not such a channel
+        // is registered here — a denial that reported "not found" instead would tell
+        // another account's caller which of its channels exist.
+        if let crate::state::ChannelRef::Arn(arn) = &channel_ref {
+            if arn.account_id != ::engine::emulator_account_id() {
+                record_access(
+                    ctx,
+                    &input.channel_arn,
+                    crate::scaffolded::ACCESS_DENIED_CODE,
+                    "the channel ARN names another account",
+                );
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    not_authorized_message(&arn.arn),
+                ));
+            }
+        }
 
         // Per-event validation is PURE (it reads only the request), so it runs before
         // the state lock is taken: the digest and the JSON parse of a caller-sized
@@ -308,16 +399,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "no channel is registered under this reference",
             );
             return Err(PutAuditEventsErrorModeled::ChannelNotFound(ChannelNotFound {
-                message: Some(format!(
-                    "The channel could not be found: {}",
-                    input.channel_arn
-                )),
+                message: Some(channel_not_found_message(&input.channel_arn)),
             })
             .into());
         };
 
-        // Ownership: the emulator's caller is its own canonical account, so a channel
-        // owned by any other account is not the caller's to ingest into.
+        // Ownership, for a reference that carried no account of its own: `channelArn` is
+        // documented as "The ARN or ID (the ARN suffix) of a channel", and the bare-id
+        // form names no account for the authorization gate above to judge, so a
+        // registration owned by another account is refused here on what the store holds.
         if channel.owner_account_id != ::engine::emulator_account_id() {
             record_access(
                 ctx,
@@ -328,11 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutAuditEventsErrorModeled::ChannelInsufficientPermission(
                     ChannelInsufficientPermission {
-                        message: Some(
-                            "The caller's account ID must be the same as the channel owner's \
-                             account ID."
-                                .to_string(),
-                        ),
+                        message: Some(CHANNEL_NOT_OWNED_MESSAGE.to_string()),
                     },
                 )
                 .into(),
@@ -379,10 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 return Err(PutAuditEventsErrorModeled::DuplicatedAuditEventId(
                     DuplicatedAuditEventId {
-                        message: Some(format!(
-                            "Two or more entries in the request have the same event ID: {}",
-                            event.id
-                        )),
+                        message: Some(DUPLICATED_AUDIT_EVENT_ID_MESSAGE.to_string()),
                     },
                 )
                 .into());
