@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeElasticGpus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeElasticGpus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeElasticGpus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers, and why it answers nothing else
+//!
+//! The accelerator this operation reports on is gone: Amazon Elastic Graphics reached end
+//! of life, no endpoint offers it any more, and no operation of this API attaches, creates
+//! or stores one. EC2 therefore does not serve the report at all — it refuses every call
+//! with HTTP 400 `UnsupportedOperation` ([`crate::state::unsupported_operation`]) and its
+//! sentence for functionality the endpoint does not offer
+//! ([`FUNCTIONALITY_UNAVAILABLE_MESSAGE`]).
+//!
+//! That refusal IS the implementation, and the two alternatives are both wrong:
+//!
+//! * an empty `ElasticGpuSet` with HTTP 200 would tell a caller the feature still exists
+//!   and this account merely holds none of it, which is a different and false claim;
+//! * a 501 would say nobody has written the operation, where what is true is that EC2
+//!   itself does not serve it.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +120,20 @@ impl From<DescribeElasticGpusErrorModeled> for DescribeElasticGpusError {
     }
 }
 
+/// EC2's sentence for FUNCTIONALITY the endpoint does not offer at all, as opposed to an
+/// operation that cannot be applied to the resource a request named.
+///
+/// Fixed text with no variable part, and that is the rule rather than an accident: the
+/// refusal names no parameter and no resource, because nothing a caller could change about
+/// the request would make the feature appear. Recorded wording — EC2's model declares no
+/// error shapes at all ([`crate::scaffolded::ServiceError`]) — and it lives beside the ONE
+/// operation of this service whose whole subject is a feature no endpoint offers. A second
+/// such operation moves this constant next to
+/// [`crate::state::unsupported_operation`], which is where the code and the status it
+/// pairs with already live.
+const FUNCTIONALITY_UNAVAILABLE_MESSAGE: &str =
+    "The functionality you requested is not available in this region.";
+
 /// The `DescribeElasticGpus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeElasticGpus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeElasticGpusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing of the request, of the Region it was signed for, or of the store can make
+        // an Elastic Graphics accelerator reportable — the feature reached end of life and no
+        // operation of this API can bring one into being — so neither the input, nor `ctx`,
+        // nor the state behind the engine is read: the answer is the same for every call.
+        // This module's header says why that answer is the refusal and not an empty set.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeElasticGpus"))
+        // It is answered AHEAD of every parameter on purpose. `ElasticGpuIds`, `Filters`,
+        // `MaxResults` and `NextToken` only narrow a report that is not served, and `DryRun`
+        // asks whether the request WOULD have succeeded — which it cannot — so refusing for
+        // the absent feature, rather than for one parameter or with `DryRunOperation`, is
+        // what keeps the answer the same whatever the request carries.
+        let _ = (&input, ctx, &self.engine);
+        Err(crate::state::unsupported_operation(
+            FUNCTIONALITY_UNAVAILABLE_MESSAGE,
+        ))
     }
 }

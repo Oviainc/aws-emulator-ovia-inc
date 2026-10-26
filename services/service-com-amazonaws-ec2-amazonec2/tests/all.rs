@@ -201,6 +201,10 @@ mod ec2_query_envelope;
 // `ec2_query_error_envelope` owns.
 #[path = "all/ec2_query_error_request_id.rs"]
 mod ec2_query_error_request_id;
+// Why `DescribeElasticGpus` serves no report at all: the Elastic Graphics accelerator it
+// reports on reached end of life, so EC2 refuses the call for the absent functionality.
+#[path = "all/elastic_gpus.rs"]
+mod elastic_gpus;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
 // What `DescribeExportTasks` reports out of the export task store, and how `ExportTaskIds`
