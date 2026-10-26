@@ -331,7 +331,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .map(|supplied| {
                     let mut notification = supplied.notification;
-                    crate::state::stamp_notification(&mut notification);
+                    // The alarm state is the service's own reading of the spend behind
+                    // this budget, so nothing the request carried for it is stored.
+                    crate::state::drop_notification_derived(&mut notification);
                     crate::state::StoredNotification {
                         notification,
                         // The subscribers attached with a notification are a SET keyed by
@@ -342,10 +344,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 })
                 .collect();
-            // A notification attached in alarm has passed its threshold, so it owes its
-            // alert to the subscribers attached with it, exactly as one attached by
-            // `CreateNotification` does.
-            let source = crate::state::alerts::source(&input.account_id, &budget);
+            // A notification this write leaves in alarm has passed its threshold, so it
+            // owes its alert to the subscribers attached with it, exactly as one attached
+            // by `CreateNotification` does. Whether it is in alarm is the service's own
+            // reading of the budget as a read reports it, not a state the request named.
+            let source = crate::state::alerts::source(
+                &input.account_id,
+                &crate::state::budget_as_read(&budget, now),
+            );
             let alerts: Vec<crate::state::alerts::BudgetAlert> = notifications
                 .iter()
                 .flat_map(|held| {

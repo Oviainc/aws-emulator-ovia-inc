@@ -610,6 +610,13 @@ pub const REDUNDANT_INGEST_CREDENTIALS: usize = 1;
 /// state: "replication will continue to be `ACTIVE`".
 pub const REPLICATION_STATE_ACTIVE: &str = "ACTIVE";
 
+/// The replication state of a replica whose replication has been stopped.
+///
+/// The other value of that same list, and the one `StopParticipantReplication` leaves a
+/// replication in: the list carries no intermediate value, so a stopped replication is
+/// stopped from the moment the stop is accepted and a reader never sees it running again.
+pub const REPLICATION_STATE_STOPPED: &str = "STOPPED";
+
 /// The capability a participant token must grant for its participant to publish.
 ///
 /// From `ParticipantTokenCapability`'s value list (`PUBLISH` | `SUBSCRIBE`), the same
@@ -1945,6 +1952,11 @@ pub const EVENT_PUBLISH_STOPPED: &str = "PUBLISH_STOPPED";
 /// exactly this event.
 pub const EVENT_REPLICATION_STARTED: &str = "REPLICATION_STARTED";
 
+/// `EventName` of that replication ending, which is what `StopParticipantReplication`
+/// does — the counterpart of [`EVENT_REPLICATION_STARTED`] and the second name the two
+/// destination members apply to.
+pub const EVENT_REPLICATION_STOPPED: &str = "REPLICATION_STOPPED";
+
 /// One occurrence during one stage session, as the data-plane seam that observed it
 /// recorded it ([`record_participant_event`]) and `ListParticipantEvents` reports it.
 #[derive(Debug, Clone)]
@@ -2472,6 +2484,19 @@ pub fn leave_stage_session(
         }
         emptied
     };
+    // Every occurrence says whether the participant it happened to is a replica of a
+    // publisher in another stage, which is what `Event$replica` reports. That is a fact
+    // about the replications this store holds rather than about the departure, so it is
+    // read off them ([`session_participant_replications`]) exactly as every other report
+    // of it is — the same statement the join of that replica recorded.
+    let replica = session_participant_replications(state, stage_arn, session_id)
+        .get(participant_id)
+        .is_some_and(|replication| replication.replication_type == REPLICATION_TYPE_REPLICA);
+    let occurrence = |name: &str| {
+        let mut event = ParticipantEvent::new(name, participant_id);
+        event.replica = replica;
+        event
+    };
     // A participant that is publishing when it goes stops publishing first: the two
     // publish names alternate ([`StageSessionRecord::is_publishing`]), and the departure
     // is the last occurrence either way.
@@ -2483,15 +2508,10 @@ pub fn leave_stage_session(
             state,
             stage_arn,
             session_id,
-            ParticipantEvent::new(EVENT_PUBLISH_STOPPED, participant_id),
+            occurrence(EVENT_PUBLISH_STOPPED),
         );
     }
-    record_participant_event(
-        state,
-        stage_arn,
-        session_id,
-        ParticipantEvent::new(EVENT_LEFT, participant_id),
-    );
+    record_participant_event(state, stage_arn, session_id, occurrence(EVENT_LEFT));
     if session_ended {
         if let Some(stage) = state.stages.get_mut(stage_arn) {
             if stage.active_session_id.as_deref() == Some(session_id) {
@@ -3033,9 +3053,9 @@ macro_rules! impl_response_header_policy {
     };
 }
 
-// The two still-scaffolded operations of the four are implemented here as well: the policy
-// is the shape's, not the handler's, so implementing one of those operations is a call to
-// this trait rather than six more assignments.
+// The still-scaffolded operation of the four is implemented here as well: the policy is
+// the shape's, not the handler's, so implementing that operation is a call to this trait
+// rather than six more assignments.
 impl_response_header_policy!(
     CreateIngestConfigurationOutput,
     StartParticipantReplicationOutput,
@@ -3962,6 +3982,38 @@ pub fn replication_already_active_message(
     format!(
         "Resource: participant {participant_id} of {source_stage_arn} is already \
          replicated to {destination_stage_arn}"
+    )
+}
+
+/// How this service states a request whose two ends of a replication are one stage: it
+/// names the operation, the member that must differ and the stage the request sent, in the
+/// construction every other member refusal of this service uses ([`violation_clause`]).
+///
+/// One rule for both operations that take the two ends of a replication: replication is
+/// INTO another stage, and the model cannot say "these two members differ", so each
+/// operation refuses it here in the same words.
+pub fn same_stage_replication_message(operation: &str, destination_stage_arn: &str) -> String {
+    format!(
+        "{operation}.destinationStageArn is required to name a stage other than \
+         sourceStageArn, found {destination_stage_arn}"
+    )
+}
+
+/// How this service identifies ONE replication in a failure about it: the participant
+/// being replicated and the two stages it is replicated between, which is what a request
+/// names a replication by (this service stores no id for one).
+///
+/// Fed to [`resource_not_found`], so a stop of a replication this store does not hold
+/// answers the one not-found sentence of this service ([`resource_not_found_message`])
+/// rather than wording of its own.
+pub fn replication_identifier(
+    participant_id: &str,
+    source_stage_arn: &str,
+    destination_stage_arn: &str,
+) -> String {
+    format!(
+        "participant {participant_id} of {source_stage_arn} replicated to \
+         {destination_stage_arn}"
     )
 }
 

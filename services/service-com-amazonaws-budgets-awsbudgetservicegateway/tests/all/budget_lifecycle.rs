@@ -451,6 +451,12 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
         for (position, want) in expected.iter().enumerate() {
             let got = &actual[position];
             for (member, value) in want.as_object().expect("a notification object") {
+                // `NotificationState` is the service's own reading of the spend behind
+                // the budget, not a member a read echoes back from the request — the rule
+                // is asserted in `tests/all/notification_alarm_state.rs`.
+                if member == "NotificationState" {
+                    continue;
+                }
                 let seen = got.get(member).unwrap_or(&Value::Null);
                 assert!(
                     same(value, seen),

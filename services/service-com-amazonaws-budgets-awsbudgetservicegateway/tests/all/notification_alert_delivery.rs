@@ -15,21 +15,36 @@
 //! Services sends budget notifications to"). A notification that is not in alarm owes
 //! nothing, and an address that names no topic of this emulator is published to nothing.
 //!
+//! Whether a notification IS in alarm is the service's own reading of the spend behind
+//! the budget against the threshold it alerts on (the table in
+//! `tests/all/notification_alarm_state.rs`), never a state the request asked for — rows
+//! below name `NotificationState` on the request precisely to assert that it buys no
+//! alert.
+//!
 //! The table spans the class rather than one recorded request: its rows differ along the
 //! write that establishes the pairing (`CreateBudget`, `CreateNotification`,
-//! `CreateSubscriber`), the `NotificationState` (absent, `OK`, `ALARM`), the subscriber
-//! types in the set, the Region of the topic, the budget type and the limit the alert
-//! names, and what the notification alerts on — the notification type, the comparison
-//! operator, both published `Threshold` bounds and a fractional value in between, and
-//! whether `ThresholdType` was supplied.
+//! `CreateSubscriber`), the `NotificationState` the request named (absent, `OK`, `ALARM`),
+//! the subscriber types in the set, the Region of the topic, the budget type and the limit
+//! the alert names, and what the notification alerts on — the notification type, the
+//! comparison operator, both published `Threshold` bounds and a fractional value in
+//! between, and whether `ThresholdType` was supplied.
+//!
+//! The last test is the one assertion the delivery path cannot show: an alert is owed only
+//! on a topic of the account whose budget it names, and no topic of another account can
+//! exist here for a delivery to be observed on.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
+use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
+    Budget, Notification, Spend, Subscriber,
+};
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
-    PERCENTAGE_LIMIT_AMOUNT, PERCENTAGE_LIMIT_UNIT, THRESHOLD_TYPE_PERCENTAGE,
+    alerts, budget_as_read, PERCENTAGE_LIMIT_AMOUNT, PERCENTAGE_LIMIT_UNIT,
+    THRESHOLD_TYPE_PERCENTAGE,
 };
 use service_com_amazonaws_sns_amazonsimplenotificationservice::ComAmazonawsSnsAmazonsimplenotificationserviceState;
 
@@ -254,14 +269,14 @@ fn cost_budget() -> Value {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "a notification created in alarm by CreateNotification, with an SNS subscriber",
+            case: "a notification the service holds in alarm, created by \
+                   CreateNotification, with an SNS subscriber",
             attach: Attach::AfterBudget,
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 80,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 80
             }),
             subscribers: json!([sns_subscriber(&primary_topic())]),
             then_subscribe: None,
@@ -273,7 +288,7 @@ fn rows() -> Vec<Row> {
                     "MONTHLY",
                     Some(("100", "USD")),
                     "ACTUAL",
-                    "GREATER_THAN",
+                    "LESS_THAN",
                     80.0,
                     // Supplied by neither the row nor the budget: "thresholds are always
                     // a percentage", so a notification naming no `ThresholdType` alerts
@@ -292,11 +307,10 @@ fn rows() -> Vec<Row> {
                 "BudgetLimit": {"Amount": "2500.5", "Unit": "GB"}
             }),
             notification: json!({
-                "NotificationType": "FORECASTED",
+                "NotificationType": "ACTUAL",
                 "ComparisonOperator": "LESS_THAN",
                 "Threshold": 42.5,
-                "ThresholdType": "ABSOLUTE_VALUE",
-                "NotificationState": "ALARM"
+                "ThresholdType": "ABSOLUTE_VALUE"
             }),
             subscribers: json!([
                 email_subscriber(1),
@@ -311,7 +325,7 @@ fn rows() -> Vec<Row> {
                     "USAGE",
                     "ANNUALLY",
                     Some(("2500.5", "GB")),
-                    "FORECASTED",
+                    "ACTUAL",
                     "LESS_THAN",
                     42.5,
                     "ABSOLUTE_VALUE",
@@ -326,8 +340,7 @@ fn rows() -> Vec<Row> {
             notification: json!({
                 "NotificationType": "ACTUAL",
                 "ComparisonOperator": "EQUAL_TO",
-                "Threshold": 0,
-                "NotificationState": "ALARM"
+                "Threshold": 0
             }),
             subscribers: json!([email_subscriber(1)]),
             then_subscribe: Some(sns_subscriber(&primary_topic())),
@@ -350,11 +363,10 @@ fn rows() -> Vec<Row> {
             attach: Attach::AfterBudget,
             budget: cost_budget(),
             notification: json!({
-                "NotificationType": "FORECASTED",
-                "ComparisonOperator": "GREATER_THAN",
+                "NotificationType": "ACTUAL",
+                "ComparisonOperator": "LESS_THAN",
                 "Threshold": 15_000_000_000_000_i64,
-                "ThresholdType": "PERCENTAGE",
-                "NotificationState": "ALARM"
+                "ThresholdType": "PERCENTAGE"
             }),
             subscribers: json!([sns_subscriber(&other_topic())]),
             then_subscribe: None,
@@ -365,8 +377,8 @@ fn rows() -> Vec<Row> {
                     "COST",
                     "MONTHLY",
                     Some(("100", "USD")),
-                    "FORECASTED",
-                    "GREATER_THAN",
+                    "ACTUAL",
+                    "LESS_THAN",
                     15_000_000_000_000.0,
                     "PERCENTAGE",
                 ),
@@ -383,8 +395,7 @@ fn rows() -> Vec<Row> {
             notification: json!({
                 "NotificationType": "ACTUAL",
                 "ComparisonOperator": "LESS_THAN",
-                "Threshold": 75,
-                "NotificationState": "ALARM"
+                "Threshold": 75
             }),
             subscribers: json!([sns_subscriber(&primary_topic())]),
             then_subscribe: None,
@@ -408,16 +419,15 @@ fn rows() -> Vec<Row> {
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 80,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 80
             }),
             subscribers: json!([email_subscriber(1), email_subscriber(2)]),
             then_subscribe: None,
             expected: Vec::new(),
         },
         Row {
-            case: "a notification created with no NotificationState, so it is not in alarm",
+            case: "a notification whose threshold nothing has passed, so it is not in alarm",
             attach: Attach::AfterBudget,
             budget: cost_budget(),
             notification: json!({
@@ -430,28 +440,30 @@ fn rows() -> Vec<Row> {
             expected: Vec::new(),
         },
         Row {
-            case: "a notification created explicitly OK",
+            case: "a notification whose REQUEST named ALARM, which the service does not \
+                   hold in alarm",
             attach: Attach::AfterBudget,
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
                 "ComparisonOperator": "GREATER_THAN",
                 "Threshold": 80,
-                "NotificationState": "OK"
+                "NotificationState": "ALARM"
             }),
             subscribers: json!([sns_subscriber(&primary_topic())]),
             then_subscribe: None,
             expected: Vec::new(),
         },
         Row {
-            case: "a notification attached OK by CreateBudget",
+            case: "a forecasted notification attached by CreateBudget naming ALARM, with \
+                   no forecast to have passed its threshold",
             attach: Attach::WithBudget,
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "FORECASTED",
-                "ComparisonOperator": "GREATER_THAN",
+                "ComparisonOperator": "LESS_THAN",
                 "Threshold": 120,
-                "NotificationState": "OK"
+                "NotificationState": "ALARM"
             }),
             subscribers: json!([sns_subscriber(&primary_topic())]),
             then_subscribe: None,
@@ -463,9 +475,8 @@ fn rows() -> Vec<Row> {
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 90,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 90
             }),
             subscribers: json!([email_subscriber(1)]),
             then_subscribe: Some(email_subscriber(2)),
@@ -477,9 +488,8 @@ fn rows() -> Vec<Row> {
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 80,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 80
             }),
             subscribers: json!([sns_subscriber(
                 "arn:aws-cn:sns:cn-north-1:123456789012:budget-alerts"
@@ -493,9 +503,8 @@ fn rows() -> Vec<Row> {
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 80,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 80
             }),
             subscribers: json!([sns_subscriber(
                 "arn:aws:sns:us-east-1/evil:123456789012:budget-alerts"
@@ -509,9 +518,8 @@ fn rows() -> Vec<Row> {
             budget: cost_budget(),
             notification: json!({
                 "NotificationType": "ACTUAL",
-                "ComparisonOperator": "GREATER_THAN",
-                "Threshold": 80,
-                "NotificationState": "ALARM"
+                "ComparisonOperator": "LESS_THAN",
+                "Threshold": 80
             }),
             subscribers: json!([sns_subscriber(&topic_arn(REGION, "no-such-topic"))]),
             then_subscribe: None,
@@ -670,15 +678,15 @@ async fn alerts_are_owed_by_writes_only_and_one_per_notification_in_alarm() {
     .await;
     assert_eq!(status, 200, "setup: CreateBudget answered {status} {body}");
 
-    // Two notifications of the same budget, each in alarm with the same SNS subscriber:
-    // what a notification alerts on identifies it, so these are two notifications and
-    // each owes its own alert.
+    // Two notifications of the same budget, each one the service holds in alarm (nothing
+    // spent is below either threshold) with the same SNS subscriber: what a notification
+    // alerts on identifies it, so these are two notifications and each owes its own
+    // alert.
     for threshold in [50, 90] {
         let notification = json!({
             "NotificationType": "ACTUAL",
-            "ComparisonOperator": "GREATER_THAN",
-            "Threshold": threshold,
-            "NotificationState": "ALARM"
+            "ComparisonOperator": "LESS_THAN",
+            "Threshold": threshold
         });
         let (status, body) = call(
             &emulator.router,
@@ -729,9 +737,8 @@ async fn alerts_are_owed_by_writes_only_and_one_per_notification_in_alarm() {
                     "BudgetName": name,
                     "Notification": {
                         "NotificationType": "ACTUAL",
-                        "ComparisonOperator": "GREATER_THAN",
-                        "Threshold": 50,
-                        "NotificationState": "ALARM"
+                        "ComparisonOperator": "LESS_THAN",
+                        "Threshold": 50
                     }
                 }),
             ),
@@ -759,31 +766,55 @@ async fn alerts_are_owed_by_writes_only_and_one_per_notification_in_alarm() {
 /// Rule, on the write that REPLACES a notification: `UpdateNotification` leaves the
 /// budget holding the notification it was given, with the subscribers that were already
 /// attached, so the alert owed is decided from that state — one alert per `SNS`
-/// subscriber when the notification it leaves behind is in alarm (naming what the
-/// REPLACEMENT alerts on), and none when it leaves the notification out of alarm.
+/// subscriber when the notification it leaves behind is one the service holds in alarm
+/// (naming what the REPLACEMENT alerts on), and none when it leaves the notification out
+/// of alarm.
 ///
-/// The rows differ along the alarm state the update leaves the notification in, which is
-/// what the rule turns on: a replacement that names `ALARM`, one that names `OK`, and one
-/// that names no state at all over a notification already in alarm (the state the service
-/// owns is kept, so the alert is still owed).
+/// The rows differ along what the REPLACEMENT alerts on, which is what the rule turns on:
+/// with nothing spent behind the budget, an `ACTUAL` notification below an absolute
+/// threshold is in alarm, while the `FORECASTED` one is not (no forecast is reported for
+/// a budget here, so none of its thresholds was ever passed). Each is crossed with the
+/// `NotificationState` the replacement NAMED, which buys no alert and suppresses none.
 #[tokio::test]
 async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
-    for (case, created_state, new_state, alerts_expected) in [
-        ("the replacement names ALARM", "OK", Some("ALARM"), true),
-        ("the replacement names OK", "ALARM", Some("OK"), false),
-        ("the replacement names no state", "ALARM", None, true),
-        ("neither is in alarm", "OK", Some("OK"), false),
+    for (case, watches, new_state, alerts_expected) in [
+        ("the replacement is in alarm, naming no state", "ACTUAL", None, true),
+        (
+            "the replacement is in alarm although it names OK",
+            "ACTUAL",
+            Some("OK"),
+            true,
+        ),
+        (
+            "the replacement is in alarm and names ALARM",
+            "ACTUAL",
+            Some("ALARM"),
+            true,
+        ),
+        (
+            "the replacement is not in alarm although it names ALARM",
+            "FORECASTED",
+            Some("ALARM"),
+            false,
+        ),
+        (
+            "the replacement is not in alarm, naming no state",
+            "FORECASTED",
+            None,
+            false,
+        ),
     ] {
         let emulator = emulator();
         given_topic(&emulator, REGION, "budget-alerts").await;
         let topic = primary_topic();
         let name = "alert-update";
 
+        // The notification the update replaces: above a percentage threshold nothing has
+        // passed, so the creating write owes no alert of its own.
         let old = json!({
             "NotificationType": "ACTUAL",
             "ComparisonOperator": "GREATER_THAN",
-            "Threshold": 80,
-            "NotificationState": created_state
+            "Threshold": 80
         });
         let (status, body) = call(
             &emulator.router,
@@ -812,7 +843,7 @@ async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
         let before = delivered(&emulator);
 
         let mut new = json!({
-            "NotificationType": "FORECASTED",
+            "NotificationType": watches,
             "ComparisonOperator": "LESS_THAN",
             "Threshold": 42.5,
             "ThresholdType": "ABSOLUTE_VALUE"
@@ -850,7 +881,7 @@ async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
                 "COST",
                 "MONTHLY",
                 Some(("100", "USD")),
-                "FORECASTED",
+                watches,
                 "LESS_THAN",
                 42.5,
                 "ABSOLUTE_VALUE",
@@ -880,48 +911,51 @@ async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
 }
 
 /// Rule, on the write that REPLACES a subscriber: `UpdateSubscriber` attaches
-/// `NewSubscriber` to the notification in `OldSubscriber`'s place, so a notification
-/// already in alarm owes its alert to the subscriber that call ATTACHES — one alert on
-/// the topic a replacement `SNS` subscriber names, and none when the notification is not
-/// in alarm, when the replacement is an address no service here hosts a transport for, or
-/// when it names the subscriber the notification already held (which attaches nothing).
+/// `NewSubscriber` to the notification in `OldSubscriber`'s place, so a notification the
+/// service holds in alarm owes its alert to the subscriber that call ATTACHES — one alert
+/// on the topic a replacement `SNS` subscriber names, and none when the notification is
+/// not in alarm, when the replacement is an address no service here hosts a transport for,
+/// or when it names the subscriber the notification already held (which attaches
+/// nothing).
 ///
-/// The rows differ along the alarm state, along whether the replacement keeps or changes
-/// the subscription type, and along the Region of the topic it moves to.
+/// The rows differ along what the notification alerts on — below a percentage threshold,
+/// which nothing spent is, or above it, which nothing spent is not — along whether the
+/// replacement keeps or changes the subscription type, and along the Region of the topic
+/// it moves to.
 #[tokio::test]
 async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() {
-    for (case, state, held, new, expected) in [
+    for (case, operator, held, new, expected) in [
         (
             "an email replaced by an SNS subscriber",
-            "ALARM",
+            "LESS_THAN",
             email_subscriber(0),
             sns_subscriber(&primary_topic()),
             Some(primary_topic()),
         ),
         (
             "an SNS subscriber moved to a topic in another Region",
-            "ALARM",
+            "LESS_THAN",
             sns_subscriber(&primary_topic()),
             sns_subscriber(&other_topic()),
             Some(other_topic()),
         ),
         (
             "an email replaced by an SNS subscriber, the notification not in alarm",
-            "OK",
+            "GREATER_THAN",
             email_subscriber(0),
             sns_subscriber(&primary_topic()),
             None,
         ),
         (
             "an SNS subscriber replaced by an email address",
-            "ALARM",
+            "LESS_THAN",
             sns_subscriber(&primary_topic()),
             email_subscriber(1),
             None,
         ),
         (
             "a replacement naming the subscriber already held",
-            "ALARM",
+            "LESS_THAN",
             sns_subscriber(&primary_topic()),
             sns_subscriber(&primary_topic()),
             None,
@@ -934,9 +968,8 @@ async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() 
 
         let notification = json!({
             "NotificationType": "ACTUAL",
-            "ComparisonOperator": "GREATER_THAN",
-            "Threshold": 80,
-            "NotificationState": state
+            "ComparisonOperator": operator,
+            "Threshold": 80
         });
         let (status, body) = call(
             &emulator.router,
@@ -1007,7 +1040,7 @@ async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() 
                     "MONTHLY",
                     Some(("100", "USD")),
                     "ACTUAL",
-                    "GREATER_THAN",
+                    operator,
                     80.0,
                     THRESHOLD_TYPE_PERCENTAGE,
                 );
@@ -1032,5 +1065,75 @@ async fn updating_a_subscriber_of_a_notification_in_alarm_publishes_its_alert() 
                 "case {case:?}: expected the update to publish nothing, got {published:?}"
             ),
         }
+    }
+}
+
+/// Rule: an alert is owed only on a topic of the ACCOUNT whose budget it names. The alert
+/// carries that budget's own figures — the account, the budget, what it tracks, the limit
+/// the threshold is measured against — so a subscriber address naming a topic in any other
+/// account names no topic this alert goes to, however well-formed that address is.
+///
+/// Asserted where the write DECIDES the alert (`state::alerts::owed`) rather than through
+/// a delivery: every topic this emulator holds is minted under the one account it answers
+/// for, so a topic of another account cannot be stood up for a delivery to be observed on.
+/// The rows differ along the account and the partition the address names, and along the
+/// Region, which may differ from the budget's own requests.
+#[test]
+fn an_alert_is_owed_only_on_a_topic_of_the_budgets_own_account() {
+    let budget = Budget {
+        budget_name: "own-account".to_string(),
+        budget_type: "COST".to_string(),
+        time_unit: "MONTHLY".to_string(),
+        budget_limit: Some(Spend {
+            amount: "100".to_string(),
+            unit: "USD".to_string(),
+        }),
+        ..Budget::default()
+    };
+    let source = alerts::source(&account_id(), &budget_as_read(&budget, SystemTime::now()));
+    // A notification the service holds in alarm: nothing spent is below 80% of the limit,
+    // so every row below differs only in the address the alert would go to.
+    let notification = Notification {
+        notification_type: "ACTUAL".to_string(),
+        comparison_operator: "LESS_THAN".to_string(),
+        threshold: 80.0,
+        threshold_type: None,
+        notification_state: None,
+    };
+    // An account that is NOT the one this emulator answers for; 12 digits, as
+    // `AccountId`'s `^\d{12}$` requires.
+    let other_account = "123456789012";
+    for (case, address, expected) in [
+        (
+            "a topic of the budget's own account",
+            topic_arn(REGION, "budget-alerts"),
+            1,
+        ),
+        (
+            "a topic of the budget's own account in another Region",
+            topic_arn(OTHER_REGION, "budget-alerts"),
+            1,
+        ),
+        (
+            "a topic of another account",
+            format!("arn:aws:sns:{REGION}:{other_account}:budget-alerts"),
+            0,
+        ),
+        (
+            "a topic of another account in another partition",
+            format!("arn:aws-cn:sns:cn-north-1:{other_account}:budget-alerts"),
+            0,
+        ),
+    ] {
+        let subscribers = vec![Subscriber {
+            subscription_type: "SNS".to_string(),
+            address: address.clone(),
+        }];
+        let owed = alerts::owed(&source, &notification, &subscribers);
+        assert_eq!(
+            owed.len(),
+            expected,
+            "case {case:?}: expected {expected} alert(s) owed on {address}, got {owed:?}"
+        );
     }
 }
