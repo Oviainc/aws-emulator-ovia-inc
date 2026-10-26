@@ -55,6 +55,8 @@ mod queue_tags;
 mod receive_message_attribute_names;
 #[path = "all/refusal_taxonomy.rs"]
 mod refusal_taxonomy;
+#[path = "all/request_size_transport_bound.rs"]
+mod request_size_transport_bound;
 #[path = "all/scratch_probe.rs"]
 mod scratch_probe;
 #[path = "all/send_message_batch.rs"]
