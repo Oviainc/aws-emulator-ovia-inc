@@ -739,6 +739,10 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::SNS::TopicPolicy",
     // Amazon SQS
     "AWS::SQS::Queue",
+    // The two types that carry a queue's access policy: the one that applies a document to
+    // a list of queues, and the one that belongs to a single queue (`Queue` plus
+    // `PolicyDocument`), which the resource reference publishes beside it.
+    "AWS::SQS::QueueInlinePolicy",
     "AWS::SQS::QueuePolicy",
     // AWS Systems Manager
     "AWS::SSM::Association",

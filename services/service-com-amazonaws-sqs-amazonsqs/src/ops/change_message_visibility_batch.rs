@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangeMessageVisibilityBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ChangeMessageVisibilityBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ChangeMessageVisibilityBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation applies [`crate::state::Queue::change_visibility`] — the
+//! same change `ChangeMessageVisibility` makes — once per entry, and reports each entry
+//! under `Successful` or `Failed` with that entry's own refusal. The whole-request refusals
+//! (an empty batch, too many entries, a repeated or malformed entry id) are the ones every
+//! batch operation of this service shares. It is the ONLY file to touch for
+//! `ChangeMessageVisibilityBatch`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ChangeMessageVisibilityBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ChangeMessageVisibilityBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ChangeMessageVisibilityBatch"))
+        use crate::state as sqs;
+
+        // The whole-request refusals, before anything is changed: a batch that is not one
+        // AWS would act on changes nothing at all.
+        if input.entries.is_empty() {
+            return Err(ChangeMessageVisibilityBatchErrorModeled::EmptyBatchRequest(
+                EmptyBatchRequest {
+                    message: Some(sqs::empty_batch_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+        if input.entries.len() > sqs::MAX_BATCH_ENTRIES {
+            return Err(
+                ChangeMessageVisibilityBatchErrorModeled::TooManyEntriesInBatchRequest(
+                    TooManyEntriesInBatchRequest {
+                        message: Some(format!(
+                            "Maximum number of entries per request are {}. You have sent {}.",
+                            sqs::MAX_BATCH_ENTRIES,
+                            input.entries.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for entry in &input.entries {
+            if !sqs::is_valid_batch_entry_id(&entry.id) {
+                return Err(ChangeMessageVisibilityBatchErrorModeled::InvalidBatchEntryId(
+                    InvalidBatchEntryId {
+                        message: Some(format!(
+                            "A batch entry id can only contain alphanumeric characters, hyphens \
+                             and underscores. It can be at most {} letters long.",
+                            sqs::MAX_BATCH_ENTRY_ID_LEN
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !seen.insert(entry.id.as_str()) {
+                return Err(
+                    ChangeMessageVisibilityBatchErrorModeled::BatchEntryIdsNotDistinct(
+                        BatchEntryIdsNotDistinct {
+                            message: Some(format!("Id {} repeated.", entry.id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            ChangeMessageVisibilityBatchErrorModeled::UnsupportedOperation(
+                sqs::store_unavailable(),
+            )
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(ChangeMessageVisibilityBatchErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(),
+            )
+            .into());
+        };
+        queue.materialise_due(now);
+
+        // Whether this caller may change a message's visibility on this queue is decided
+        // against the queue's own policy and the caller's identity-based policies, before
+        // any entry is applied: the batch is refused as a whole, so nothing is changed.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
+
+        let (min, max) = sqs::integer_bounds(sqs::VISIBILITY_TIMEOUT);
+        let mut successful = Vec::with_capacity(input.entries.len());
+        let mut failed = Vec::new();
+        for entry in &input.entries {
+            // An entry's own value is that entry's fault alone: "the default visibility
+            // timeout for a message is 30 seconds" is the queue's value, which applies when
+            // the entry names none.
+            let requested = entry
+                .visibility_timeout
+                .map_or_else(|| queue.integer(sqs::VISIBILITY_TIMEOUT), i64::from);
+            if requested < min || requested > max {
+                failed.push(BatchResultErrorEntry {
+                    id: entry.id.clone(),
+                    sender_fault: true,
+                    code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
+                    message: Some(sqs::invalid_parameter_message(
+                        &requested.to_string(),
+                        sqs::VISIBILITY_TIMEOUT,
+                        &format!(
+                            "{} must be >= {min} and <= {max}.",
+                            sqs::VISIBILITY_TIMEOUT
+                        ),
+                    )),
+                });
+                continue;
+            }
+            match queue.change_visibility(&entry.receipt_handle, requested, now) {
+                Ok(()) => successful.push(ChangeMessageVisibilityBatchResultEntry {
+                    id: entry.id.clone(),
+                }),
+                Err(sqs::VisibilityRefusal::UnknownHandle) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        // The caller supplied the handle, so the fault is the sender's.
+                        sender_fault: true,
+                        code: RECEIPT_HANDLE_IS_INVALID.to_string(),
+                        message: sqs::receipt_handle_is_invalid(&entry.receipt_handle).message,
+                    })
+                }
+                Err(sqs::VisibilityRefusal::NotInFlight) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        sender_fault: true,
+                        code: MESSAGE_NOT_INFLIGHT.to_string(),
+                        message: Some(MESSAGE_NOT_INFLIGHT_MESSAGE.to_string()),
+                    })
+                }
+            }
+        }
+
+        Ok(ChangeMessageVisibilityBatchOutput { successful, failed })
     }
 }
+
+/// The per-entry error code for a receipt handle the queue does not hold: the name of the
+/// modelled error `ChangeMessageVisibility` answers for the same condition
+/// (`com.amazonaws.sqs#ReceiptHandleIsInvalid`), which is what AWS reports in a batch result
+/// entry's `Code`.
+const RECEIPT_HANDLE_IS_INVALID: &str = "ReceiptHandleIsInvalid";
+
+/// The per-entry error code for a message that is not in flight, named after the modelled
+/// error `ChangeMessageVisibility` answers for the same condition.
+const MESSAGE_NOT_INFLIGHT: &str = "MessageNotInflight";
+
+/// What that refusal states, in the words the model's own shape documents it with ("The
+/// specified message isn't in flight."). The single-message operation's modelled shape
+/// carries no `message` member at all, so this wording lives here, where a batch entry has
+/// one to fill.
+const MESSAGE_NOT_INFLIGHT_MESSAGE: &str = "The specified message isn't in flight.";

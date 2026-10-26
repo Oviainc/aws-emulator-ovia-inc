@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangeMessageVisibility
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ChangeMessageVisibility`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation gives the message a receipt handle names a new visibility
+//! timeout, counted from the instant of the call — "the 10 seconds begin to count from the
+//! time that you make the ChangeMessageVisibility call" — through
+//! [`crate::state::Queue::change_visibility`], which is the one place that change lives
+//! (`ChangeMessageVisibilityBatch` applies it per entry). It is the ONLY file to touch for
+//! `ChangeMessageVisibility`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ChangeMessageVisibility::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A message that is not in flight has no timeout to change, which is what the modelled
+//! `MessageNotInflight` reports; the change is applied to the message rather than to the
+//! queue, so the queue's own `VisibilityTimeout` attribute is untouched and "the visibility
+//! timeout for the message reverts to the original timeout value" the next time it is
+//! received.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +207,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ChangeMessageVisibility` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ChangeMessageVisibilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ChangeMessageVisibility"))
+        use crate::state as sqs;
+
+        // "Values range: 0 to 43200" (`ChangeMessageVisibilityRequest$VisibilityTimeout`),
+        // which is the range the queue's own attribute takes — the one place those bounds
+        // are written.
+        let (min, max) = sqs::integer_bounds(sqs::VISIBILITY_TIMEOUT);
+        let requested = i64::from(input.visibility_timeout);
+        if requested < min || requested > max {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                sqs::invalid_parameter_message(
+                    &requested.to_string(),
+                    sqs::VISIBILITY_TIMEOUT,
+                    &format!(
+                        "{} must be >= {min} and <= {max}.",
+                        sqs::VISIBILITY_TIMEOUT
+                    ),
+                ),
+            ));
+        }
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            ChangeMessageVisibilityErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(),
+            )
+            .into());
+        };
+        // Retention lapses and visibility timeouts are owed by the clock, not by this call:
+        // a message whose timeout has already lapsed is not in flight.
+        queue.materialise_due(now);
+
+        // Whether this caller may change a message's visibility on this queue is decided
+        // against the queue's own policy and the caller's identity-based policies, before
+        // anything is changed.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
+
+        match queue.change_visibility(&input.receipt_handle, requested, now) {
+            Ok(()) => Ok(ChangeMessageVisibilityOutput),
+            Err(sqs::VisibilityRefusal::UnknownHandle) => {
+                Err(ChangeMessageVisibilityErrorModeled::ReceiptHandleIsInvalid(
+                    sqs::receipt_handle_is_invalid(&input.receipt_handle),
+                )
+                .into())
+            }
+            Err(sqs::VisibilityRefusal::NotInFlight) => Err(
+                ChangeMessageVisibilityErrorModeled::MessageNotInflight(MessageNotInflight {})
+                    .into(),
+            ),
+        }
     }
 }

@@ -52,7 +52,7 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string and ARN operators below. A clause this CAN decide is
+//! `PutRumEvents`) and only for the string, ARN, boolean and existence operators below. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
 //! `Deny` whose condition demonstrably does not hold refuses nothing. A clause this CANNOT
 //! decide — an operator it does not implement, or a key the request context does not carry
@@ -70,9 +70,16 @@
 //! the context means this emulator does not model it and the clause stays undecided, the
 //! same fail-closed reading as everywhere else here. Under an UNqualified operator a
 //! multi-valued key is left undecided rather than compared against one of its values.
+//!
+//! IAM's `Null` operator asks about a key's PRESENCE rather than its value, so it is decided
+//! under that same declaration and nowhere else: a request that models a key can answer that
+//! it carries no value for it, and one that does not model the key cannot. A caller that
+//! knows every value of a key FAMILY publishes the family — `aws:PrincipalTag/`, a trailing
+//! `/` — which is what lets a statement conditioned on the absence of one principal tag be
+//! decided for a principal whose tags are all known.
 
 /// The string condition operators this evaluator decides. Everything else — the numeric,
-/// date, IP and `Null` operators — leaves the statement undecided (see the module
+/// date and IP operators — leaves the statement undecided (see the module
 /// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
     "StringEquals",
@@ -82,6 +89,16 @@ const STRING_OPERATORS: &[&str] = &[
     "StringLike",
     "StringNotLike",
 ];
+
+/// IAM's existence operator: "`Null` — check if a condition key is present at the time of
+/// authorization", where `true` holds when the request carries NO value for the key and
+/// `false` when it carries one.
+///
+/// It is decidable only for a key the request DECLARES it models ([`Request::published`]):
+/// for every other key, absence from the context means this emulator does not model the key
+/// rather than that the request carried no value for it, and reading the first as the second
+/// would turn an undecided clause into a decided one.
+const NULL_OPERATOR: &str = "Null";
 
 /// The ARN condition operators this evaluator decides, which is how a resource policy
 /// scopes a grant to the resource a request came FROM (`aws:SourceArn`). Like the string
@@ -99,6 +116,11 @@ const STRING_OPERATORS: &[&str] = &[
 /// per-component matching would need a wildcard per component. Every pattern that is exact,
 /// or wildcards only within one component, is decided identically either way.
 const ARN_OPERATORS: &[&str] = &["ArnEquals", "ArnNotEquals", "ArnLike", "ArnNotLike"];
+
+/// IAM's boolean operator: "`Bool` — lets you construct Condition elements that restrict
+/// access based on comparing a key to `true` or `false`". The two literals are compared
+/// case-insensitively, which is how a document may spell them.
+const BOOL_OPERATOR: &str = "Bool";
 
 /// The most bytes one policy document this evaluator reads may carry.
 ///
@@ -518,7 +540,12 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
     for (clause, keys) in clauses {
         let keys = keys.as_object()?;
         let (qualifier, operator) = split_set_qualifier(clause);
-        if !STRING_OPERATORS.contains(&operator) && !ARN_OPERATORS.contains(&operator) {
+        let existence = operator == NULL_OPERATOR;
+        if !existence
+            && operator != BOOL_OPERATOR
+            && !STRING_OPERATORS.contains(&operator)
+            && !ARN_OPERATORS.contains(&operator)
+        {
             return None;
         }
         for (key, expected) in keys {
@@ -529,25 +556,39 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
                 .map(|(_, value)| value.as_str())
                 .collect();
             let expected = super::iam_trust_policy::json_strings(expected);
+            // Whether the request MODELS this key at all, which is what makes an absent
+            // value mean "the request carries none" rather than "this emulator does not
+            // know".
+            let modelled = publishes(request, key);
+            if existence {
+                // `Null` asks about the key's PRESENCE, so a value is never compared: the
+                // clause holds when the request's answer agrees with what it asserts.
+                if !modelled {
+                    return None;
+                }
+                let asserted_absent = match expected[..] {
+                    [one] => one.eq_ignore_ascii_case("true"),
+                    _ => return None,
+                };
+                held = held && (asserted_absent == actual.is_empty());
+                continue;
+            }
             let decided = match qualifier {
                 // Unqualified: the key must carry exactly one value for the comparison
                 // to mean what IAM means by it.
                 None => match actual[..] {
                     [one] => clause_holds(operator, &expected, one),
+                    // A key the request MODELS and carries no value for is one the request
+                    // really does not carry, which IAM compares nothing against: "if the
+                    // key is not present … a negated condition operator returns true",
+                    // while a positive one does not hold.
+                    [] if modelled => is_negated(operator),
                     _ => return None,
                 },
                 // Under a qualifier, a key with no values is IAM's empty set — but only
                 // where the request DECLARES it models the key; otherwise its absence is
                 // this emulator not modelling it, which decides nothing.
-                Some(_)
-                    if actual.is_empty()
-                        && !request
-                            .published
-                            .iter()
-                            .any(|known| known.eq_ignore_ascii_case(key)) =>
-                {
-                    return None
-                }
+                Some(_) if actual.is_empty() && !modelled => return None,
                 Some(SetQualifier::ForAllValues) => actual
                     .iter()
                     .all(|value| clause_holds(operator, &expected, value)),
@@ -559,6 +600,27 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
         }
     }
     Some(held)
+}
+
+/// Whether the request DECLARES that it models `key`: its own name is published, or a
+/// published FAMILY covers it.
+///
+/// A published name ending in `/` is a whole key family — `aws:PrincipalTag/` covers
+/// `aws:PrincipalTag/team` and every other tag key — which is what a caller that knows ALL
+/// the values of a family publishes: it can answer for a key of that family whether the
+/// request carries a value for it, including answering that it carries none.
+fn publishes(request: &Request<'_>, key: &str) -> bool {
+    request.published.iter().any(|known| {
+        known.eq_ignore_ascii_case(key)
+            || (known.ends_with('/')
+                && key.len() > known.len()
+                // By `get`, never by a byte-index slice: the key is read verbatim out of a
+                // policy document, so a multi-byte character straddling the family's length
+                // must answer "not covered" rather than panic.
+                && key
+                    .get(..known.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(known)))
+    })
 }
 
 /// The set qualifier a condition clause's key may be written with, for a request key that
@@ -584,6 +646,13 @@ fn split_set_qualifier(clause: &str) -> (Option<SetQualifier>, &str) {
         }
     }
     (None, clause)
+}
+
+/// Whether an operator is a NEGATED one — the `…Not…` spelling of a comparison, which holds
+/// exactly where its positive sibling does not. It is the one thing a clause over a key the
+/// request carries NO value for can still be decided on.
+fn is_negated(operator: &str) -> bool {
+    operator.contains("Not")
 }
 
 /// Whether one decided clause holds: `expected` are the clause's values, `actual` the value
@@ -614,6 +683,8 @@ fn clause_holds(operator: &str, expected: &[&str], actual: &str) -> bool {
         // positive spellings are documented as doing the same comparison.
         "ArnEquals" | "ArnLike" => any_like(),
         "ArnNotEquals" | "ArnNotLike" => !any_like(),
+        // A boolean key carries one of the two literals, compared as such.
+        BOOL_OPERATOR => any_equals(false),
         // Unreachable: the caller checks the operator against the two operator tables
         // first.
         _ => false,
@@ -1093,6 +1164,62 @@ mod tests {
             "case 'ForAllValues:StringLike': expected the wildcards to cover both values, got \
              {reached:?}"
         );
+    }
+
+    /// A published key FAMILY covers the keys under it, and nothing else — including a key
+    /// whose multi-byte character straddles the family's own length, which the comparison
+    /// must answer rather than panic on.
+    #[test]
+    fn a_published_key_family_covers_the_keys_under_it() {
+        let statement = |condition: &str| {
+            identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"sqs:SendMessage\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ))
+        };
+        let family = ["aws:PrincipalTag/"];
+        let held = principals();
+        let tagged = [("aws:PrincipalTag/team".to_string(), "payments".to_string())];
+        // (case, the condition, what the document then states)
+        let rows: &[(&str, &str, Decision)] = &[
+            (
+                "a key of the family the request carries",
+                "{\"Null\":{\"aws:PrincipalTag/team\":\"false\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "a key of the family the request does not carry",
+                "{\"Null\":{\"aws:PrincipalTag/project\":\"true\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "the same key asserted present, which it is not",
+                "{\"Null\":{\"aws:PrincipalTag/project\":\"false\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "a key outside the family",
+                "{\"Null\":{\"aws:ResourceTag/team\":\"true\"}}",
+                Decision::NotStated,
+            ),
+            (
+                // Sixteen ASCII bytes then a two-byte character, so the key is longer than
+                // the family in bytes while the family's length falls inside a character.
+                "a key whose multi-byte character straddles the family's length",
+                "{\"Null\":{\"aws:PrincipalTagé\":\"true\"}}",
+                Decision::NotStated,
+            ),
+        ];
+        for (case, condition, expected) in rows {
+            let request = Request::new("sqs:SendMessage", RESOURCE, &held)
+                .with_context(&tagged)
+                .with_published_keys(&family);
+            let reached = identity_decision(&[statement(condition)], &request);
+            assert_eq!(
+                reached, *expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
     }
 
     #[test]

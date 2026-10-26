@@ -260,6 +260,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateQueueErrorModeled::InvalidAttributeValue(error)
             }
         })?;
+        // A policy document is judged when it is WRITTEN: one naming an action outside
+        // this service's action set, or a principal that does not exist, can never grant
+        // anything, so no queue is created carrying it.
+        if let Some(error) = supplied
+            .get(state::POLICY)
+            .and_then(|value| state::authorization::policy_refusal(&*self.engine, value))
+        {
+            return Err(CreateQueueErrorModeled::InvalidAttributeValue(error).into());
+        }
 
         // The documented defaults, overlaid with what this request supplied: the
         // attribute set the queue carries, and the one a re-create of the same name is
@@ -272,11 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map(|value| (spec.name.to_string(), value.to_string()))
                 })
                 .collect();
-        attributes.extend(
-            supplied
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
+        state::apply_attributes(&mut attributes, supplied.iter());
         // The two server-side encryption options are exclusive, and a request naming
         // one takes the queue off the other: the queue stores the option it is on and
         // never both at once. A request naming BOTH asks for something no queue can be.

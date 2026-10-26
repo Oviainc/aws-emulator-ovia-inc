@@ -166,11 +166,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             DeleteQueueErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
         let mut state = store.lock();
+
+        // Whether this caller may delete this queue is decided against the queue's own
+        // policy and the caller's identity-based policies, before it is removed: a delete
+        // no statement allows is refused and the queue survives.
+        if let Some(queue) = state.queue_by_url(&input.queue_url) {
+            let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+            if let Some(denied) = sqs::authorization::denied(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &queue_arn,
+                policy.as_deref(),
+            ) {
+                return Err(denied);
+            }
+        }
 
         // The queue and every message and receipt handle it held go away, so a later
         // call on that url cannot find it, and its NAME is remembered as deleted just

@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        let _ = ctx;
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             GetQueueAttributesErrorModeled::UnsupportedOperation(state::store_unavailable())
         })?;
@@ -188,6 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below the counts a caller would have seen at this instant anyway. Nothing
         // else about reporting a queue changes what a later caller sees.
         queue.materialise_due(now);
+
+        // Whether this caller may report this queue is decided against the queue's own
+        // policy and the caller's identity-based policies.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
 
         let requested = input.attribute_names.unwrap_or_default();
         if requested.is_empty() {

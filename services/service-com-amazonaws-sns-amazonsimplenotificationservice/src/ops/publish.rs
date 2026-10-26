@@ -1012,13 +1012,22 @@ fn delivery_is_authorized(policy: Option<&str>, queue_arn: &str, topic_arn: &str
         (SOURCE_ACCOUNT_CONDITION_KEY.to_string(), account.clone()),
         (SOURCE_OWNER_CONDITION_KEY.to_string(), account),
     ];
+    // The three keys are DECLARED as modelled, not only supplied: this delivery knows each
+    // of them exactly, so a statement that asks whether one is present — rather than what it
+    // equals — is decided rather than left undecided.
+    let published = [
+        SOURCE_ARN_CONDITION_KEY,
+        SOURCE_ACCOUNT_CONDITION_KEY,
+        SOURCE_OWNER_CONDITION_KEY,
+    ];
     let request =
         ::service_common::iam_authorization::Request::new(
             SEND_MESSAGE_ACTION,
             queue_arn,
             &principals,
         )
-        .with_context(&context);
+        .with_context(&context)
+        .with_published_keys(&published);
     let stated = ::service_common::iam_authorization::resource_decision(policy, &request);
     ::service_common::iam_authorization::is_allowed(
         // SNS holds no identity-based policies: a service principal's permission to reach

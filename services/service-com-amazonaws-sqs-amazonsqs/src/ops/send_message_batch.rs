@@ -320,6 +320,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let fifo = queue.is_fifo();
 
+        // Whether this caller may send to this queue is decided against the queue's own
+        // policy and the caller's identity-based policies, before anything is enqueued:
+        // the batch is refused as a whole, so nothing is sent.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
+
         // `MessageSystemAttributes` is honoured per entry, exactly as `SendMessage`
         // honours it, by `prepare` below.
         //

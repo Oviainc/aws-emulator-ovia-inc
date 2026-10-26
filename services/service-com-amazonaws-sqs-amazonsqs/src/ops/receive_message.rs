@@ -399,6 +399,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // also forgets the receive attempts whose retry window has run out.
                 queue.materialise_due(now);
 
+                // Whether this caller may receive from this queue is decided against the
+                // queue's own policy and the caller's identity-based policies, before any
+                // message is handed over or made invisible.
+                let (queue_arn, policy) =
+                    (queue.arn.clone(), queue.policy().map(str::to_string));
+                if let Some(denied) = sqs::authorization::denied(
+                    &*self.engine,
+                    ctx,
+                    Self::NAME,
+                    &queue_arn,
+                    policy.as_deref(),
+                ) {
+                    return Err(denied);
+                }
+
                 let visibility_timeout = input
                     .visibility_timeout
                     .map_or_else(|| queue.integer(sqs::VISIBILITY_TIMEOUT), i64::from);

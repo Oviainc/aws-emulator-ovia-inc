@@ -5,7 +5,8 @@
 //! "Revokes any permissions in the queue policy that matches the specified Label
 //! parameter": the statement whose `Sid` is that label goes out of the queue's `Policy`
 //! attribute and every other statement stays, through
-//! [`crate::state::Queue::revoke_permission`].
+//! [`crate::state::Queue::revoke_permission`] — once the policies in force let this
+//! caller change who may reach that queue ([`crate::state::authorization`]).
 //!
 //! A policy left with no statement at all is dropped rather than stored empty, so a
 //! queue whose last permission was revoked reports no `Policy` exactly as one that was
@@ -190,6 +191,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 RemovePermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
             })?;
+        // "Only the owner of a queue can remove permissions from it": whether this caller
+        // may is decided against the queue's own policy and the caller's identity-based
+        // policies, before the policy is changed.
+        let (queue_arn, in_force) = {
+            let queue = &store.queues[&name];
+            (queue.arn.clone(), queue.policy().map(str::to_string))
+        };
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            in_force.as_deref(),
+        ) {
+            return Err(denied);
+        }
         let queue = store
             .queues
             .get_mut(&name)

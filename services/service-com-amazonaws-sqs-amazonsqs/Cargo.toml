@@ -32,16 +32,17 @@ sha2 = { workspace = true }
 # MessageId / ReceiptHandle identifiers.
 uuid = { version = "1", features = ["v4"] }
 # `iam_authorization`: the shared evaluation of policy documents against
-# (action, resource, principal), which decides whether a caller may have a queue's
-# customer managed KMS key used for it. `arn`: the one parse of an ARN.
+# (action, resource, principal), which the queue-policy gate runs on every call that
+# acts on a queue, and which decides whether a caller may have a queue's customer
+# managed KMS key used for it. `arn`: the one parse of an ARN.
 service-common = { path = "../common" }
 # A queue on a customer managed key is encrypted with a key the KMS service holds: its
 # existence, its key state and its key policy are read from that service's OWN state
 # accessors rather than from a second copy of them here.
 service-com-amazonaws-kms-trentservice = { workspace = true }
 # The STS store resolves which principal a request speaks for, and the IAM store holds
-# that principal's identity-based policies: the two documents a KMS key policy
-# delegating to IAM is decided with.
+# that principal's identity-based policies: the documents the queue-policy gate decides
+# with, and the two a KMS key policy delegating to IAM is decided with.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 

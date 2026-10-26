@@ -268,6 +268,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether this caller may move the source queue's messages is decided against
+        // that queue's own policy and the caller's identity-based policies, before any
+        // task is recorded.
+        let (queue_arn, policy) = {
+            let queue = &state.queues[&source_name];
+            (queue.arn.clone(), queue.policy().map(str::to_string))
+        };
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
+
         // "This action is currently limited to supporting message redrive from queues
         // that are configured as dead-letter queues (DLQs) of other Amazon SQS queues
         // only": the source queue is a DLQ exactly when another queue's RedrivePolicy

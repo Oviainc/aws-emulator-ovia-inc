@@ -306,6 +306,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let fifo = queue.is_fifo();
 
+        // Whether this caller may send to this queue is decided against the queue's own
+        // policy and the caller's identity-based policies, before anything is enqueued:
+        // a send no statement allows is refused and the queue is left as it was.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
+
         // "The message system attribute to send ... Currently, the only supported message
         // system attribute is AWSTraceHeader": the one name the map's key shape publishes
         // is taken and carried on the message, and any other name — or a value that is not

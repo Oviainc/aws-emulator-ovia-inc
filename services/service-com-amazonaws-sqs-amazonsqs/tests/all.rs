@@ -31,6 +31,8 @@ mod message_lifecycle;
 mod message_move_task;
 #[path = "all/message_plane.rs"]
 mod message_plane;
+#[path = "all/message_visibility_changes.rs"]
+mod message_visibility_changes;
 #[path = "all/purge_queue.rs"]
 mod purge_queue;
 #[path = "all/queue_configuration.rs"]
@@ -43,6 +45,8 @@ mod queue_encryption;
 mod queue_lifecycle;
 #[path = "all/queue_permissions.rs"]
 mod queue_permissions;
+#[path = "all/queue_policy_authorization.rs"]
+mod queue_policy_authorization;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
 #[path = "all/receive_message_attribute_names.rs"]

@@ -94,6 +94,11 @@ use crate::ops::types::{
     MESSAGE_SYSTEM_ATTRIBUTE_NAME_FOR_SENDS_VALUES, QUEUE_ATTRIBUTE_NAME_VALUES,
 };
 
+/// Whether the policies in force let a request act on the queue it addresses — the gate
+/// every operation that acts on a queue runs before it reports or changes anything — and
+/// what a `Policy` attribute value has to look like to be stored at all.
+pub mod authorization;
+
 /// The region an ARN carries when the request names none (an unsigned call, which
 /// carries no SigV4 credential scope). Matches the region the emulator's own
 /// generated config defaults to.
@@ -693,6 +698,17 @@ pub enum Visibility {
     Visible,
 }
 
+/// Why a visibility change was refused. Each handler renders it as its own modelled error,
+/// so the wire code is the one that operation declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityRefusal {
+    /// The queue holds no message under that receipt handle.
+    UnknownHandle,
+    /// The message the handle names is not in flight, so it has no visibility timeout to
+    /// change.
+    NotInFlight,
+}
+
 /// One message a queue holds.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
@@ -924,6 +940,13 @@ impl Queue {
     /// attributes applicable to it.
     pub fn is_fifo(&self) -> bool {
         self.boolean(FIFO_QUEUE_ATTRIBUTE)
+    }
+
+    /// This queue's access policy — the document its `Policy` attribute carries — or
+    /// `None` when it carries none, which is a queue no resource-based statement is in
+    /// force for.
+    pub fn policy(&self) -> Option<&str> {
+        self.attributes.get(POLICY).map(String::as_str)
     }
 
     /// The customer master key this queue's messages are encrypted under, or `None` for
@@ -1215,6 +1238,41 @@ impl Queue {
         self.messages
             .retain(|message| message.message_id != message_id);
         self.handles.retain(|_, id| id != message_id);
+    }
+
+    /// Give the message a receipt handle names a new visibility timeout, counted from `now`:
+    /// "if you send a ChangeMessageVisibility call with VisibilityTimeout set to 10 seconds,
+    /// the 10 seconds begin to count from the time that you make the
+    /// ChangeMessageVisibility call."
+    ///
+    /// `Err` is why the change was refused, which each handler renders as its own modelled
+    /// error (or, in a batch, as that entry's own result): a handle this queue does not hold
+    /// names no message, and a message that is not IN FLIGHT has no visibility timeout to
+    /// change — "the specified message isn't in flight". The caller materialises what the
+    /// clock already owed first, so a message whose timeout has lapsed is not in flight here.
+    pub fn change_visibility(
+        &mut self,
+        receipt_handle: &str,
+        timeout: i64,
+        now: SystemTime,
+    ) -> Result<(), VisibilityRefusal> {
+        let message_id = self
+            .handles
+            .get(receipt_handle)
+            .cloned()
+            .ok_or(VisibilityRefusal::UnknownHandle)?;
+        let message = self
+            .messages
+            .iter_mut()
+            .find(|message| message.message_id == message_id)
+            .ok_or(VisibilityRefusal::UnknownHandle)?;
+        if message.visibility(now) != Visibility::InFlight {
+            return Err(VisibilityRefusal::NotInFlight);
+        }
+        // A timeout of zero makes the message visible at once, which is how a consumer hands
+        // one back; anything else holds it for that long from now.
+        message.invisible_until = Some(after(now, timeout));
+        Ok(())
     }
 
     /// Total bytes this queue holds, counting everything each message retains.
@@ -2674,6 +2732,45 @@ pub fn validate_attributes(
     Ok(())
 }
 
+/// Apply the attribute map a call supplied to a queue's stored attributes, with the two
+/// rules that are about the VALUE rather than about the attribute.
+///
+/// * An attribute whose form admits text of any length is REMOVED by a value holding no
+///   text ("You can remove the ... attribute by setting it to an empty string"), so a
+///   cleared policy leaves the queue carrying no `Policy` at all rather than one that is
+///   not a document.
+/// * A `Policy` is stored in its normalised form
+///   ([`authorization::normalised_policy`]), so every later read reports the principals
+///   in the spelling AWS canonicalises them to.
+///
+/// Both `CreateQueue` and `SetQueueAttributes` store through this, so the two cannot
+/// disagree about what a supplied value means.
+pub fn apply_attributes<'a>(
+    attributes: &mut BTreeMap<String, String>,
+    supplied: impl IntoIterator<Item = (&'a String, &'a String)>,
+) {
+    for (name, value) in supplied {
+        match stored_attribute(name, value) {
+            Some(stored) => attributes.insert(name.clone(), stored),
+            None => attributes.remove(name),
+        };
+    }
+}
+
+/// The form attribute `name` is STORED in when a call supplies `value` for it, or `None`
+/// when that value removes the attribute. See [`apply_attributes`].
+pub fn stored_attribute(name: &str, value: &str) -> Option<String> {
+    let removable = settable_attribute(name)
+        .is_some_and(|spec| matches!(spec.kind, AttributeKind::Json | AttributeKind::Text));
+    if value.is_empty() && removable {
+        return None;
+    }
+    if name == POLICY {
+        return Some(authorization::normalised_policy(value));
+    }
+    Some(value.to_string())
+}
+
 /// Why the attribute set a call would LEAVE a queue carrying cannot hold together, or
 /// `None` when it can.
 ///
@@ -2705,6 +2802,13 @@ pub fn attribute_combination_refusal(
 
 /// Check one attribute value against what its own documentation says it accepts.
 fn check_attribute_value(spec: &AttributeSpec, value: &str) -> Result<(), AttributeRefusal> {
+    // An attribute whose form admits text of any length is also the kind a caller REMOVES
+    // by supplying no text for it: "You can remove the ... attribute by setting it to an
+    // empty string", so the empty value is accepted and stored as the attribute's absence
+    // ([`stored_attribute`]) rather than refused as a malformed document.
+    if value.is_empty() && matches!(spec.kind, AttributeKind::Json | AttributeKind::Text) {
+        return Ok(());
+    }
     // Every attribute value is stored for the queue's lifetime, so the two kinds whose
     // form admits text of any length are bounded FIRST: a caller looping on
     // `CreateQueue`/`SetQueueAttributes` must not be able to grow this store without

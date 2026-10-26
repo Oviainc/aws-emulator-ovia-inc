@@ -148,7 +148,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        let _ = ctx;
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             ListQueueTagsErrorModeled::UnsupportedOperation(state::store_unavailable())
         })?;
@@ -161,6 +160,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
+
+        // Whether this caller may report this queue's tags is decided against the queue's
+        // own policy and the caller's identity-based policies.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
 
         // "The list of all tags added to the specified queue" is an OPTIONAL member, so
         // a queue carrying no tag reports no map at all rather than an empty one.

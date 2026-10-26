@@ -213,7 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        let _ = ctx;
         // "A map of attributes to set": a map that names none sets nothing, so the
         // parameter the call requires was not really supplied. The absent parameter is
         // named as the request carries it — one attribute's name and value per entry.
@@ -246,6 +245,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         )?;
+        // A policy document is judged when it is WRITTEN: one naming an action outside
+        // this service's action set, or a principal that does not exist, can never grant
+        // anything, so the attribute is left as it was.
+        if let Some(error) = input
+            .attributes
+            .get(state::POLICY)
+            .and_then(|value| state::authorization::policy_refusal(&*self.engine, value))
+        {
+            return Err(SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into());
+        }
+
+        // The queue's own policy decides whether this caller may change it, so the
+        // decision is taken against the document in force BEFORE this call.
+        let (queue_arn, policy) = {
+            let queue = &store.queues[&name];
+            (queue.arn.clone(), queue.policy().map(str::to_string))
+        };
+        if let Some(denied) = state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
 
         let queue = store
             .queues
@@ -254,9 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The pair rule is judged over the set this call would LEAVE the queue carrying:
         // either attribute of such a pair may come from this request or from the queue.
         let mut would_carry = queue.attributes.clone();
-        for (attribute, value) in &input.attributes {
-            would_carry.insert(attribute.clone(), value.clone());
-        }
+        state::apply_attributes(&mut would_carry, input.attributes.iter());
         // The two server-side encryption options are exclusive, and a request naming one
         // takes the queue off the other — including the empty `KmsMasterKeyId` that takes
         // it off its KMS key. A request naming BOTH asks for something no queue can be.

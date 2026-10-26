@@ -34,7 +34,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{as_map, error_code, REGION};
+use super::support::{as_map, error_code, form_encode, xml_element, REGION};
 
 // The sentence KMS itself words for a request addressing a resource through an ARN that
 // names no account, asked of the KMS crate so a test cannot re-word it.
@@ -217,6 +217,31 @@ impl Emulator {
             status, 200,
             "creating the role {role_name:?} must succeed, got {status} {body}"
         );
+        // Every role here is a CALLER of Amazon SQS as well as a principal of the key: a
+        // send or a receive is authorized against the queue's policies too, so each role
+        // carries the service permission its call needs, beside whatever the KEY grants it
+        // — which is what this suite varies.
+        let service_permission = json!({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}],
+        })
+        .to_string();
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "PutRolePolicy",
+                &[
+                    ("RoleName", role_name.to_string()),
+                    ("PolicyName", "sqs".to_string()),
+                    ("PolicyDocument", service_permission),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "putting the service permission of {role_name:?} must succeed, got {status} {body}"
+        );
         if let Some(policy) = policy {
             let (status, body) = self
                 .query(
@@ -281,6 +306,30 @@ impl Emulator {
         assert_eq!(
             status, 200,
             "creating the user {user_name:?} must succeed, got {status} {body}"
+        );
+        // The user is a CALLER of Amazon SQS as well as a principal of the key, exactly as
+        // every role here is: it carries the service permission its call needs beside
+        // whatever the KEY grants it ([`Self::assumed_role_key`]).
+        let service_permission = json!({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}],
+        })
+        .to_string();
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "PutUserPolicy",
+                &[
+                    ("UserName", user_name.to_string()),
+                    ("PolicyName", "sqs".to_string()),
+                    ("PolicyDocument", service_permission),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "putting the service permission of {user_name:?} must succeed, got {status} {body}"
         );
         if let Some(policy) = inline {
             let (status, body) = self
@@ -425,30 +474,6 @@ impl Emulator {
             .unwrap_or_default();
         (status, error_code(&parsed), bodies)
     }
-}
-
-/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
-/// 3986's unreserved characters literal — so a policy document's braces and quotes survive
-/// the round trip.
-fn form_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-/// The text of the first `<name>…</name>` element of an awsQuery response.
-fn xml_element(body: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(body[start..end].to_string())
 }
 
 /// A key policy granting `actions` to every principal: a document that grants the listed

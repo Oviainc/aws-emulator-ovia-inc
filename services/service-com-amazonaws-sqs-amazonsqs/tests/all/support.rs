@@ -69,6 +69,31 @@ pub fn expected_arn(name: &str) -> String {
     format!("arn:aws:sqs:{REGION}:{}:{name}", account())
 }
 
+/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
+/// 3986's unreserved characters literal — so a policy document's braces and quotes survive
+/// the round trip. Every suite here that drives IAM's or STS's awsQuery wire shares it.
+pub fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// The text of the first `<name>…</name>` element of an awsQuery response, which is how
+/// those suites read an answer's one member.
+pub fn xml_element(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
 /// Send one operation and return its HTTP status and parsed body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()

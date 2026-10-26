@@ -172,7 +172,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        let _ = ctx;
         // "The list of tags to be added to the specified queue": a map that names no tag
         // adds nothing, so the parameter the call requires was not really supplied.
         if input.tags.is_empty() {
@@ -191,6 +190,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
 
+        // Whether this caller may tag this queue is decided against the queue's own policy
+        // and the caller's identity-based policies, before anything is stored.
+        let (queue_arn, policy) = {
+            let queue = &store.queues[&name];
+            (queue.arn.clone(), queue.policy().map(str::to_string))
+        };
+        if let Some(denied) = state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
         let queue = store
             .queues
             .get_mut(&name)

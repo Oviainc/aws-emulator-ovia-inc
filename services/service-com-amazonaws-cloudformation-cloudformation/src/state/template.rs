@@ -3950,6 +3950,16 @@ const MSK_CLUSTER_ARN_ORDINAL: u32 = 1;
 /// `awsService.cloudFormationName: SQS`.
 pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
 
+/// The two resource types that carry a QUEUE's access policy: the one that applies a
+/// document to a list of queues, and the one that belongs to a single queue.
+///
+/// Neither is a resource of Amazon SQS's own — a queue's policy is its `Policy` ATTRIBUTE —
+/// so neither carries a [`return_values`] arm: the default applies and the physical
+/// resource id is the name CloudFormation generated for the resource, which is what "Ref
+/// returns the policy ID" for these types means here.
+pub const SQS_QUEUE_POLICY: &str = "AWS::SQS::QueuePolicy";
+pub const SQS_QUEUE_INLINE_POLICY: &str = "AWS::SQS::QueueInlinePolicy";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a SageMaker model package group —
 /// the model registry's container for the versioned model packages registered into it, and
 /// the carrier of the registry's resource policy. The middle segment is the SageMaker

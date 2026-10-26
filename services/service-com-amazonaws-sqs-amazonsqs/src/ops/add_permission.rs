@@ -3,7 +3,9 @@
 //! @op AddPermission
 //!
 //! Grants the principals a request names the actions it names on the queue its
-//! `QueueUrl` addresses, under the `Label` that identifies the permission.
+//! `QueueUrl` addresses, under the `Label` that identifies the permission — once the
+//! policies in force let this caller change who may reach that queue
+//! ([`crate::state::authorization`]).
 //!
 //! The permission is not a record of its own: "AddPermission generates a policy for
 //! you", so the grant becomes one statement of the queue's `Policy` attribute — the
@@ -229,6 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 AddPermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
             })?;
+        // "Only you, the owner of the queue, can grant or deny permissions to the queue":
+        // whether this caller may is decided against the queue's own policy and the
+        // caller's identity-based policies, before the policy is changed.
+        let (queue_arn, in_force) = {
+            let queue = &store.queues[&name];
+            (queue.arn.clone(), queue.policy().map(str::to_string))
+        };
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            in_force.as_deref(),
+        ) {
+            return Err(denied);
+        }
         let queue = store
             .queues
             .get_mut(&name)

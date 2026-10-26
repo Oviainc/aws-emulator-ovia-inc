@@ -182,7 +182,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             DeleteMessageBatchErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -244,6 +243,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         queue.materialise_due(now);
+
+        // Whether this caller may delete from this queue is decided against the queue's
+        // own policy and the caller's identity-based policies, before any entry is
+        // applied: the batch is refused as a whole, so nothing is deleted.
+        let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
+        if let Some(denied) = sqs::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &queue_arn,
+            policy.as_deref(),
+        ) {
+            return Err(denied);
+        }
 
         let mut successful = Vec::with_capacity(input.entries.len());
         let mut failed = Vec::new();

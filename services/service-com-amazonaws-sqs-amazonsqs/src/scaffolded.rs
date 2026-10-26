@@ -311,6 +311,77 @@ impl SerializableStruct for InvalidParameterValue {
     }
 }
 
+/// The wire error code Amazon SQS answers a request the policies in force do not
+/// permit, and the one a client branches on. Owned here, beside the variant that carries
+/// it.
+pub const ACCESS_DENIED: &str = "AccessDenied";
+
+/// The HTTP status that refusal carries: Amazon SQS reports an authorization failure as
+/// a 403, the status its own 403-class errors (`InvalidSecurity`, `RequestThrottled`)
+/// carry in this model.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The `message` member of the synthetic `AccessDenied` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `AccessDenied` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as the others above: this
+/// service's model declares NO `AccessDenied` shape — the refusal is the AWS-common one
+/// every service answers for a request its policies do not permit — so the shape must be
+/// declared here and must not collide with a modeled one. The wire code and the status
+/// travel beside it, from [`ACCESS_DENIED`] and [`ACCESS_DENIED_STATUS`].
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied",
+        "smithy.framework",
+        "AccessDenied",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
+/// The payload of an `AccessDenied` failure: which principal was refused which action on
+/// which resource, and why.
+#[derive(Debug, Clone)]
+pub struct AccessDenied {
+    pub message: String,
+}
+
+impl AccessDenied {
+    /// An `AccessDenied` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{ACCESS_DENIED}: {}", self.message)
+    }
+}
+
+impl std::error::Error for AccessDenied {}
+
+impl SerializableStruct for AccessDenied {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -338,6 +409,13 @@ pub enum Scaffolded<E> {
     /// model declares the shape for no operation, so this wrapper is the only channel
     /// that can carry it.
     InvalidParameterValue(InvalidParameterValue),
+    /// The policies in force do not permit this call. Renders as HTTP 403 with the error
+    /// code `AccessDenied`.
+    ///
+    /// Deliberately NOT a modeled variant: the authorization refusal is the AWS-common
+    /// one, and this model declares no shape for it, so this wrapper is the only channel
+    /// that can carry it.
+    AccessDenied(AccessDenied),
 }
 
 impl<E> Scaffolded<E> {
@@ -383,6 +461,13 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
         Self::InvalidParameterValue(InvalidParameterValue::new(message))
     }
+
+    /// Refuse the request with HTTP 403 `AccessDenied`, carrying the refusal the
+    /// authorization gate built from the principal, the action and the resource the
+    /// decision was made about (see [`Scaffolded::AccessDenied`]).
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(AccessDenied::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -393,6 +478,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::MissingParameter(e) => write!(f, "{e}"),
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -407,6 +493,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::ValidationException(e) => e.source(),
             Self::MissingParameter(e) => e.source(),
             Self::InvalidParameterValue(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
         }
     }
 }
@@ -423,6 +510,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(e) => e,
             Self::MissingParameter(e) => e,
             Self::InvalidParameterValue(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -433,6 +521,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::MissingParameter(_) => &MISSING_PARAMETER_SCHEMA,
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -450,6 +539,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // same pair.
             Self::MissingParameter(_) => MISSING_PARAMETER,
             Self::InvalidParameterValue(_) => INVALID_PARAMETER_VALUE,
+            Self::AccessDenied(_) => ACCESS_DENIED,
         }
     }
 
@@ -464,6 +554,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => 400,
             Self::MissingParameter(_) => 400,
             Self::InvalidParameterValue(_) => 400,
+            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
         }
     }
 
@@ -479,6 +570,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
             Self::MissingParameter(_) => None,
             Self::InvalidParameterValue(_) => None,
+            Self::AccessDenied(_) => None,
         }
     }
 }

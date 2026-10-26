@@ -269,7 +269,8 @@ use super::template::{
     ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
-    SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
+    SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SQS_QUEUE_INLINE_POLICY, SQS_QUEUE_POLICY,
+    SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER, WAFV2_IP_SET, WAFV2_REGEX_PATTERN_SET, WAFV2_RULE_GROUP, WAFV2_WEB_ACL,
     WAF_REGIONAL_IP_SET,
 };
@@ -333,6 +334,11 @@ pub(super) enum Provisioner {
     CodePipelinePipeline,
     EcsCluster,
     SqsQueue,
+    /// `AWS::SQS::QueuePolicy` and `AWS::SQS::QueueInlinePolicy`, which are not resources
+    /// of Amazon SQS's own: each is the `Policy` ATTRIBUTE of the queues it names, so both
+    /// are deployed through `SetQueueAttributes` and differ only in which property carries
+    /// the queue.
+    SqsQueuePolicy,
     SageMakerModelPackageGroup,
     SnsTopic,
     FisExperimentTemplate,
@@ -390,6 +396,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
+        SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
         SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
@@ -482,6 +489,10 @@ impl Provisioner {
             }
             Self::EcsCluster => create_cluster(ctx, region, resource, propagated).await,
             Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
+            // Neither policy type publishes a `Tags` property — a policy is an attribute of
+            // the queues it names, and those carry the tags — so no tags are propagated to
+            // one.
+            Self::SqsQueuePolicy => put_queue_policy(ctx, region, resource).await,
             Self::SageMakerModelPackageGroup => {
                 create_model_package_group(ctx, region, resource, propagated).await
             }
@@ -700,6 +711,12 @@ impl Provisioner {
     ) -> Result<Option<Created>, Refusal> {
         match self {
             Self::SqsQueue => update_queue(ctx, region, resource, declared).await.map(Some),
+            // The same attribute write the create made, against the queues the NEW
+            // declaration names: a queue it no longer names stops carrying the document,
+            // which is how an update revokes a grant.
+            Self::SqsQueuePolicy => update_queue_policy(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // CloudWatch's own `PutMetricStream` is documented "Creates or updates a metric
             // stream", so the call that created the stream is the call that applies a
             // changed declaration to it — under the name the stack gave it, with the
@@ -845,6 +862,7 @@ impl Provisioner {
             }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
+            Self::SqsQueuePolicy => delete_queue_policy(ctx, region, resource).await,
             Self::SageMakerModelPackageGroup => {
                 delete_model_package_group(ctx, region, physical_resource_id).await
             }
@@ -1012,6 +1030,10 @@ impl Provisioner {
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+            // A policy resource's configuration is the `Policy` attribute of the queues it
+            // names, which is read back from Amazon SQS as the document those queues carry
+            // now.
+            Self::SqsQueuePolicy => describe_queue_policy(ctx, region, resource).await,
             Self::OpenSearchServerlessCollection => {
                 describe_collection(ctx, region, physical_resource_id).await
             }
@@ -4294,6 +4316,202 @@ fn attribute_text(value: &Value) -> String {
 /// takes a map, which is the conversion [`declared_tags`] and [`tags_as_map`] do.
 fn queue_tags(properties: &Value) -> Map<String, Value> {
     tags_as_map(&declared_tags(properties))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SQS: AWS::SQS::QueuePolicy and AWS::SQS::QueueInlinePolicy
+// ---------------------------------------------------------------------------
+
+/// A queue's access policy is an ATTRIBUTE of the queue — `Policy`, "the queue's policy. A
+/// valid Amazon Web Services policy" — so both policy resource types are deployed through
+/// the one Amazon SQS call that writes an attribute of an existing queue, exactly as
+/// [`update_queue`] applies every other changed attribute.
+const SQS_SET_QUEUE_ATTRIBUTES: &str = "SetQueueAttributes";
+
+/// The value that REMOVES the attribute a policy resource wrote: Amazon SQS takes an empty
+/// string for an attribute whose form admits text of any length, which is how a queue
+/// stops carrying a policy at all. It is what a deleted policy resource — or one whose
+/// declaration no longer names a queue it used to — leaves the queue with.
+const NO_POLICY: &str = "";
+
+/// The queue urls a policy resource applies its document to.
+///
+/// `AWS::SQS::QueuePolicy` names them in `Queues`, "the URLs of the queues to which you
+/// want to add the policy"; `AWS::SQS::QueueInlinePolicy` names the one queue it belongs to
+/// in `Queue`. Both are read here, so the two types differ only in which property carries
+/// the queue and not in how the document reaches it.
+fn policy_queue_urls(properties: &Value) -> Vec<String> {
+    let mut urls: Vec<String> = properties
+        .get("Queues")
+        .and_then(Value::as_array)
+        .map(|declared| {
+            declared
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(queue) = properties.get("Queue").and_then(Value::as_str) {
+        urls.push(queue.to_string());
+    }
+    urls
+}
+
+/// The document a policy resource declares, as the `Policy` attribute carries it.
+///
+/// A template may spell it as an inline object or as the JSON text, which is
+/// [`document_text`]'s rule, shared with the IAM and S3 policy arms; a declaration carrying
+/// none describes no policy that could be applied, so it is refused here rather than with a
+/// request Amazon SQS would have to reject.
+fn declared_policy_document(properties: &Value, resource_type: &str) -> Result<String, Refusal> {
+    properties
+        .get("PolicyDocument")
+        .and_then(document_text)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{resource_type} declares no PolicyDocument"),
+        })
+}
+
+/// Write the policy a `AWS::SQS::QueuePolicy` / `AWS::SQS::QueueInlinePolicy` declares onto
+/// each queue it names.
+///
+/// The policy is not a resource of Amazon SQS's own: it is the `Policy` attribute of the
+/// queues the declaration names, so this resource's deployment IS that attribute write, and
+/// a later `GetQueueAttributes` reports the rendered document. CloudFormation decides this
+/// resource's physical id (its generated name), so nothing is reported back.
+async fn put_queue_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let document = declared_policy_document(&resource.properties, &resource.resource_type)?;
+    for url in policy_queue_urls(&resource.properties) {
+        set_queue_policy(ctx, region, &url, &document).await?;
+    }
+    Ok(Created::default())
+}
+
+/// Apply a CHANGED policy declaration: every queue the new declaration names carries the
+/// new document, and a queue it no longer names stops carrying one — which is how a stack
+/// update REVOKES a grant it used to make.
+async fn update_queue_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let document = declared_policy_document(declared, &resource.resource_type)?;
+    let named = policy_queue_urls(declared);
+    for url in policy_queue_urls(&resource.properties) {
+        if !named.contains(&url) {
+            set_queue_policy(ctx, region, &url, NO_POLICY).await?;
+        }
+    }
+    for url in &named {
+        set_queue_policy(ctx, region, url, &document).await?;
+    }
+    Ok(Created::default())
+}
+
+/// Remove the policy a deleted policy resource had written: the queues it named stop
+/// carrying a document, which is the state the delete asks for.
+async fn delete_queue_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    for url in policy_queue_urls(&resource.properties) {
+        set_queue_policy(ctx, region, &url, NO_POLICY).await?;
+    }
+    Ok(())
+}
+
+/// One `SetQueueAttributes` writing the `Policy` attribute of the queue at `url`.
+///
+/// A queue Amazon SQS no longer holds (`QueueDoesNotExist`) carries no attribute to write:
+/// a stack whose queue was deleted before the policy that named it is already in the state
+/// the deployment asks for.
+async fn set_queue_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    url: &str,
+    document: &str,
+) -> Result<(), Refusal> {
+    match call_json_rpc(
+        ctx,
+        SQS_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{SQS_TARGET_PREFIX}.{SQS_SET_QUEUE_ATTRIBUTES}"),
+        &serde_json::json!({ "QueueUrl": url, "Attributes": { "Policy": document } }),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == QUEUE_DOES_NOT_EXIST => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The policy the queues a policy resource names carry NOW, for drift detection.
+///
+/// The resource's configuration is the document those queues hold, so the actual
+/// configuration is read from Amazon SQS's own `Policy` attribute. No queue carrying one
+/// means the resource's effect is gone, which is the `DELETED` drift status; a document a
+/// queue carries is reported as the attribute's text, which [`super::drift`] compares
+/// against the declared object by parsing it.
+async fn describe_queue_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let urls = policy_queue_urls(&resource.properties);
+    let mut carried: Option<String> = None;
+    for url in &urls {
+        let request = serde_json::json!({ "QueueUrl": url, "AttributeNames": ["Policy"] });
+        let answer = match call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.GetQueueAttributes"),
+            &request,
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            // A queue that is gone carries no policy, which is what this read reports.
+            Err(refusal) if refusal.code == QUEUE_DOES_NOT_EXIST => continue,
+            Err(refusal) => return Err(refusal),
+        };
+        if let Some(document) = answer
+            .get("Attributes")
+            .and_then(|attributes| attributes.get("Policy"))
+            .and_then(Value::as_str)
+        {
+            carried = Some(document.to_string());
+            break;
+        }
+    }
+    let Some(document) = carried else {
+        return Ok(None);
+    };
+    // Reported under the same property names the declaration uses, so the comparison is
+    // between the declared document and the one the queues hold.
+    let mut reported = Map::new();
+    if resource.properties.get("Queues").is_some() {
+        reported.insert(
+            "Queues".to_string(),
+            Value::Array(urls.iter().map(|url| Value::String(url.clone())).collect()),
+        );
+    }
+    if let Some(queue) = resource.properties.get("Queue") {
+        reported.insert("Queue".to_string(), queue.clone());
+    }
+    reported.insert("PolicyDocument".to_string(), Value::String(document));
+    Ok(Some(Value::Object(reported)))
 }
 
 // ---------------------------------------------------------------------------
