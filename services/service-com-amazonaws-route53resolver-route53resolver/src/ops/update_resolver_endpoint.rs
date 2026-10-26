@@ -249,13 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|stored| stored.ip_id == update.ip_id)
             {
                 return Err(UpdateResolverEndpointErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Resolver endpoint '{}' has no IP address with ID '{}'",
-                            input.resolver_endpoint_id, update.ip_id
-                        )),
-                        resource_type: Some("IpAddressResponse".to_string()),
-                    },
+                    crate::state::endpoint_ip_address_not_found(
+                        &input.resolver_endpoint_id,
+                        &format!("with ID '{}'", update.ip_id),
+                    ),
                 )
                 .into());
             }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRedshiftIdcApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRedshiftIdcApplication`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: creates one Redshift IAM Identity Center application. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRedshiftIdcApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +170,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRedshiftIdcApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRedshiftIdcApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRedshiftIdcApplication"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateRedshiftIdcApplicationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request's own values first. Both required ARN-valued members are
+        // modelled only by length, so a value that is no ARN at all names no
+        // resource and is refused before anything is stored — the IAM Identity
+        // Center instance the managed application is created in, and the IAM
+        // role the application assumes to invoke the IAM Identity Center API.
+        // The application name and the display name carry modelled length and
+        // pattern constraints, which the boundary validator already refused by
+        // the time this handler runs.
+        for (member, value) in [
+            ("IdcInstanceArn", &input.idc_instance_arn),
+            ("IamRoleArn", &input.iam_role_arn),
+        ] {
+            if value.len() > st::MAX_ARN_LENGTH {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::arn_too_long_message(member, value.len()),
+                ));
+            }
+            if !st::is_arn(value) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::not_an_arn_message(member, value),
+                ));
+            }
+        }
+
+        // The authorized token issuers an application verifies connection
+        // tokens against are ARN-valued on the same terms, so each one the
+        // request names is held to the same rule.
+        if let Err(message) = st::check_authorized_token_issuers(
+            input.authorized_token_issuer_list.as_deref().unwrap_or_default(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+        }
+
+        // An application carries the tags the request gives it, under the
+        // documented per-resource limit and the documented tag restrictions.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                CreateRedshiftIdcApplicationErrorModeled::TagLimitExceededFault(
+                    TagLimitExceededFault {
+                        message: Some(st::tag_quota_message(tags.len())),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateRedshiftIdcApplicationErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let region = st::request_region(ctx);
+        let mut store = state.lock();
+
+        // Identity before capacity: the NAME is what an account's applications
+        // are unique on, so a second create under a registered name creates
+        // nothing and overwrites nothing, even when the store is at its bound.
+        if store
+            .redshift_idc_application_named(&input.redshift_idc_application_name)
+            .is_some()
+        {
+            return Err(
+                CreateRedshiftIdcApplicationErrorModeled::RedshiftIdcApplicationAlreadyExistsFault(
+                    RedshiftIdcApplicationAlreadyExistsFault {
+                        message: Some(st::redshift_idc_application_already_exists(
+                            &input.redshift_idc_application_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.redshift_idc_applications.len() >= st::REDSHIFT_IDC_APPLICATION_QUOTA {
+            return Err(
+                CreateRedshiftIdcApplicationErrorModeled::RedshiftIdcApplicationQuotaExceededFault(
+                    RedshiftIdcApplicationQuotaExceededFault {
+                        message: Some(st::redshift_idc_application_quota_exceeded()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record every later `DescribeRedshiftIdcApplications` reports
+        // verbatim: every member the request configured, the ARN this Region
+        // mints for that name, the IAM Identity Center managed application that
+        // backs it and the onboarding status it is registered with. A member the
+        // request left out is left out of the record too — it is not given a
+        // value the caller never asked for — except `Tags`, which is the empty
+        // list an untagged application carries.
+        let application = RedshiftIdcApplication {
+            idc_instance_arn: Some(input.idc_instance_arn.clone()),
+            redshift_idc_application_name: Some(input.redshift_idc_application_name.clone()),
+            redshift_idc_application_arn: Some(st::redshift_idc_application_arn(
+                &input.redshift_idc_application_name,
+                &region,
+            )),
+            identity_namespace: input.identity_namespace.clone(),
+            idc_display_name: Some(input.idc_display_name.clone()),
+            iam_role_arn: Some(input.iam_role_arn.clone()),
+            idc_managed_application_arn: Some(st::idc_managed_application_arn(
+                &input.idc_instance_arn,
+                &input.redshift_idc_application_name,
+            )),
+            idc_onboard_status: Some(st::REDSHIFT_IDC_ONBOARD_STATUS.to_string()),
+            authorized_token_issuer_list: input.authorized_token_issuer_list.clone(),
+            service_integrations: input.service_integrations.clone(),
+            application_type: input.application_type.clone(),
+            tags: Some(tags),
+            sso_tag_keys: input.sso_tag_keys.clone(),
+        };
+        store.redshift_idc_applications.push(application.clone());
+
+        Ok(CreateRedshiftIdcApplicationOutput {
+            redshift_idc_application: Some(application),
+        })
     }
 }

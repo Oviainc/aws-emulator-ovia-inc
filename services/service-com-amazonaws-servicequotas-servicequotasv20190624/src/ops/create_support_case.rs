@@ -16,6 +16,10 @@
 //! itself, because a case now reviews it. The response body is empty: the model's
 //! `CreateSupportCaseResponse` declares no members.
 //!
+//! This is how a case is opened on a request BEFORE Service Quotas takes it up: a
+//! request that allows one has its case opened by the service itself once it is taken
+//! up, and from then on it already carries a case.
+//!
 //! Refusals:
 //!
 //! * a `RequestId` this region holds no request for -> `NoSuchResourceException` (404);
@@ -26,9 +30,10 @@
 //! * a request still awaiting a decision that already has a support case ->
 //!   `ResourceAlreadyExistsException` (400): one request has at most one case.
 //!
-//! Every decision the clock has already made due is materialised before the request is
+//! Every step the clock has already made due is materialised before the request is
 //! read, so a request whose decision fell due before this call is refused on the status
-//! it had earned rather than having a case opened for it.
+//! it had earned rather than having a case opened for it, and one Service Quotas has
+//! already opened a case for is refused for carrying that case.
 //!
 //! ---
 //!

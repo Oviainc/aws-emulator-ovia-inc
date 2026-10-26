@@ -90,7 +90,10 @@ pub(crate) async fn get_object_tagging(
 }
 
 /// An object written at `key`, so a tagging call has something to tag.
-async fn object(router: &MultiServiceRouter, bucket_name: &str, key: &str) {
+///
+/// `pub(crate)`: the suite for the REMOVAL of an object's tag set
+/// ([`super::object_tag_set_removal`]) writes the objects it untags through this one.
+pub(crate) async fn object(router: &MultiServiceRouter, bucket_name: &str, key: &str) {
     let written = put_object(router, bucket_name, key, b"payload", &[]).await;
     assert_eq!(
         written.status, 200,

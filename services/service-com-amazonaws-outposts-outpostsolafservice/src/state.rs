@@ -16,7 +16,8 @@
 //! configurations this service publishes, the hardware an Outpost of a given form
 //! factor is installed with, the instance types an Outpost's EC2 capacity is
 //! configured with, pricing a renewal of the subscription an
-//! Outpost's orders hold, and
+//! Outpost's orders hold and recording the contract a renewal of it is bought
+//! under, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
@@ -438,6 +439,40 @@ pub struct OutpostRecord {
     /// `BlockingInstance` projection does, so the two lists read ONE record of an
     /// instance rather than two copies of it.
     pub instances: Vec<AssetInstance>,
+    /// The renewal contracts bought for this Outpost, in the order they were
+    /// created.
+    ///
+    /// Kept on the Outpost's own record for the reason
+    /// [`OutpostRecord::private_connectivity`] is: a renewal renews the
+    /// subscription of exactly ONE Outpost, so it has no identity outside it and
+    /// deleting the Outpost takes its renewals with it. Nothing else creates one:
+    /// `CreateOutpost` leaves this empty, and `CreateRenewal` is the call that
+    /// records a contract here.
+    pub renewals: Vec<RenewalRecord>,
+}
+
+/// A renewal contract recorded against an Outpost: the client token the request
+/// that bought it carried, and what it was bought at.
+#[derive(Debug, Clone)]
+pub struct RenewalRecord {
+    /// The `ClientToken` of the request that created this contract, or `None` for
+    /// one created by a request that carried no token.
+    ///
+    /// The member is modelled `@idempotencyToken`, so a repeat of the SAME request
+    /// — one naming a token this Outpost already holds a contract under — is that
+    /// one contract again rather than a second one. A request that names no token
+    /// is not identified as a repeat of anything.
+    pub client_token: Option<String>,
+    /// What this renewal was bought at: the payment option and term it covers, the
+    /// price that follows from the hardware under subscription at the instant it was
+    /// created ([`ComAmazonawsOutpostsOutpostsolafserviceState::renewal_price`]),
+    /// and the currency that price is quoted in.
+    ///
+    /// Held as the modelled [`SubscriptionPricingDetails`], which carries exactly
+    /// those five members, so the one record of a renewal's price serves both the
+    /// answer `CreateRenewal` gives and any later report of the subscription it
+    /// bought.
+    pub pricing: SubscriptionPricingDetails,
 }
 
 /// The `CapacityTaskStatus` a capacity task carries the moment `StartCapacityTask`
@@ -2332,6 +2367,20 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .sum()
     }
 
+    /// How many renewal contracts this store holds, across every Outpost of every
+    /// region.
+    ///
+    /// A renewal is never released — the Outpost it belongs to is what takes it away
+    /// — so what `CreateRenewal` grows is capped by the store's own entry ceiling
+    /// ([`MAX_RESOURCES`]), and that cap is on the whole store rather than on one
+    /// Outpost's share of it.
+    pub fn renewals_held(&self) -> usize {
+        self.outposts
+            .values()
+            .map(|record| record.renewals.len())
+            .sum()
+    }
+
     /// Every renewal pricing option for the Outpost `outpost_id` names in `region`:
     /// one priced SUBSCRIPTION option per (`PaymentOption`, `PaymentTerm`)
     /// combination the model declares — three of each, so the nine the modelled
@@ -2339,13 +2388,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Outpost with no subscribed hardware to renew.
     ///
     /// Each option is the one subscription on the Outpost's own hardware, quoted
-    /// under that combination: the term's months ([`PAYMENT_TERM_MONTHS`]) of the
-    /// monthly rate its capacity carries ([`RENEWAL_PRICE_PER_VCPU_MONTH`]) make up
-    /// the whole-term cost, of which the payment option's share
-    /// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal
-    /// monthly instalments. So every figure follows from what is persisted for the
-    /// Outpost — the capacity its orders subscribe to
-    /// ([`Self::subscribed_capacity_vcpus`]) — and a read answers the same figures
+    /// under that combination by [`Self::renewal_price`] — so every figure follows
+    /// from what is persisted for the Outpost, and a read answers the same figures
     /// as the next one.
     pub fn renewal_pricing(&self, region: &str, outpost_id: &str) -> Vec<PricingOption> {
         // The tables may only ever name values the model declares, and must name
@@ -2364,46 +2408,28 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             "every modelled PaymentOption has an upfront share and every modelled PaymentTerm a \
              length in months"
         );
-        let capacity = self.subscribed_capacity_vcpus(region, outpost_id);
-        if capacity <= 0 {
-            // Nothing is subscribed on this Outpost, so there is no subscription to
-            // quote a renewal of: the caller is answered no option, which is what
-            // makes the pricing request one the service could not price.
-            return Vec::new();
-        }
-        let monthly_rate = capacity as f32 * RENEWAL_PRICE_PER_VCPU_MONTH;
         // The combinations are walked in the order the model declares the two value
         // sets in, so one Outpost's options are reported in the same order on every
-        // read and in every process.
+        // read and in every process. Each one is priced by [`Self::renewal_price`],
+        // the ONE rule this service prices a renewal by — so what the pricing read
+        // reports and what a renewal is actually bought at cannot disagree.
         let options: Vec<PricingOption> = crate::ops::types::PAYMENT_OPTION_VALUES
             .iter()
-            .filter_map(|payment_option| {
-                let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
-                    .iter()
-                    .find(|(option, _)| option == payment_option)?;
-                Some((payment_option, *share))
-            })
-            .flat_map(|(payment_option, share)| {
+            .flat_map(|payment_option| {
                 crate::ops::types::PAYMENT_TERM_VALUES
                     .iter()
-                    .filter_map(move |payment_term| {
-                        let (_, months) = PAYMENT_TERM_MONTHS
-                            .iter()
-                            .find(|(term, _)| term == payment_term)?;
-                        let term = monthly_rate * *months as f32;
-                        Some(PricingOption {
-                            pricing_type: Some(QUOTE_PRICING_TYPE_SUBSCRIPTION.to_string()),
-                            subscription_pricing_details: Some(SubscriptionPricingDetails {
-                                payment_option: Some((*payment_option).to_string()),
-                                payment_term: Some((*payment_term).to_string()),
-                                upfront_price: Some(to_the_cent(term * share)),
-                                monthly_recurring_price: Some(to_the_cent(
-                                    monthly_rate * (1.0 - share),
-                                )),
-                                currency: Some(CURRENCY_USD.to_string()),
-                            }),
-                        })
-                    })
+                    .map(move |payment_term| (payment_option, payment_term))
+            })
+            .filter_map(|(payment_option, payment_term)| {
+                Some(PricingOption {
+                    pricing_type: Some(QUOTE_PRICING_TYPE_SUBSCRIPTION.to_string()),
+                    subscription_pricing_details: Some(self.renewal_price(
+                        region,
+                        outpost_id,
+                        payment_option,
+                        payment_term,
+                    )?),
+                })
             })
             .collect();
         debug_assert!(
@@ -2411,6 +2437,51 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             "a renewal is priced under at most the nine options PricingOptionList allows"
         );
         options
+    }
+
+    /// What a renewal of the subscription on the Outpost `outpost_id` names in
+    /// `region`, bought under `payment_option` and `payment_term`, costs — or `None`
+    /// when there is nothing to price: an Outpost with no subscribed hardware, or a
+    /// payment option or term this service holds no rule for.
+    ///
+    /// The ONE rule this service prices a renewal by, so the pricing read
+    /// ([`Self::renewal_pricing`]) and the renewal a caller actually buys quote the
+    /// same figures: the term's months ([`PAYMENT_TERM_MONTHS`]) of the monthly rate
+    /// the Outpost's capacity carries ([`RENEWAL_PRICE_PER_VCPU_MONTH`]) make up the
+    /// whole-term cost, of which the payment option's share
+    /// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal
+    /// monthly instalments. Every figure follows from what is persisted for the
+    /// Outpost — the capacity its orders subscribe to
+    /// ([`Self::subscribed_capacity_vcpus`]) — so one price is answered the same in
+    /// every process and on every call.
+    pub fn renewal_price(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        payment_option: &str,
+        payment_term: &str,
+    ) -> Option<SubscriptionPricingDetails> {
+        let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
+            .iter()
+            .find(|(option, _)| *option == payment_option)?;
+        let (_, months) = PAYMENT_TERM_MONTHS
+            .iter()
+            .find(|(term, _)| *term == payment_term)?;
+        let capacity = self.subscribed_capacity_vcpus(region, outpost_id);
+        if capacity <= 0 {
+            // Nothing is subscribed on this Outpost, so there is no subscription a
+            // renewal of could be priced at all.
+            return None;
+        }
+        let monthly_rate = capacity as f32 * RENEWAL_PRICE_PER_VCPU_MONTH;
+        let term = monthly_rate * *months as f32;
+        Some(SubscriptionPricingDetails {
+            payment_option: Some(payment_option.to_string()),
+            payment_term: Some(payment_term.to_string()),
+            upfront_price: Some(to_the_cent(term * share)),
+            monthly_recurring_price: Some(to_the_cent(monthly_rate * (1.0 - share))),
+            currency: Some(CURRENCY_USD.to_string()),
+        })
     }
 
     /// Materialise every Outpost lifecycle transition the clock has already made
@@ -3528,6 +3599,10 @@ pub const LINE_ITEMS_MEMBER: &str = "lineItems";
 /// an Outpost-server installation connection by. See [`SITE_ID_MEMBER`].
 pub const CONNECTION_ID_MEMBER: &str = "connectionId";
 
+/// The validation-path name of the `ClientToken` input member an operation takes
+/// an idempotency token in. See [`SITE_ID_MEMBER`].
+pub const CLIENT_TOKEN_MEMBER: &str = "clientToken";
+
 /// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
 ///
 /// It is the bound on a RESOURCE's tag map and not only on one request's: the
@@ -3770,6 +3845,42 @@ pub fn order_contents_report() -> String {
         LINE_ITEMS_MEMBER,
         "either the line items that make up the order or the quote to take them from \
          must be specified",
+    )])
+}
+
+/// The report a renewal of an Outpost with nothing under subscription states.
+///
+/// A renewal renews the subscription an Outpost's orders hold, so an Outpost that
+/// subscribes no hardware
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::subscribed_capacity_vcpus`])
+/// has no subscription a contract could renew and no price one could be bought at —
+/// which is also what makes the pricing read answer that it could not price the
+/// request. `CreateRenewal` has no such outcome to report, so the request is refused
+/// as the bad request it is (400 `ValidationException`). AWS publishes no wording for
+/// the refusal, so the sentence is the emulator's own, worded by the same rule as
+/// every other constraint this service reports — the member and the requirement,
+/// never the value.
+pub fn renewal_subscription_report() -> String {
+    validation_report(&[clause(
+        OUTPOST_IDENTIFIER_MEMBER,
+        "the Outpost must have a subscription that can be renewed",
+    )])
+}
+
+/// The report a request that reuses an idempotency token on different terms states.
+///
+/// A token is what identifies ONE request, so a later request naming a token an
+/// Outpost already holds a renewal under is a repeat of that request and is answered
+/// that same contract. One that names the token but asks for another payment option
+/// or term is not a repeat of it, and the operation models no idempotency-mismatch
+/// error, so it is refused as a bad request rather than answered a contract on terms
+/// the caller did not ask for. The wording follows [`renewal_subscription_report`],
+/// and names neither the token nor the terms.
+pub fn renewal_token_report() -> String {
+    validation_report(&[clause(
+        CLIENT_TOKEN_MEMBER,
+        "a client token already used for a renewal of the Outpost must name the same \
+         payment option and payment term",
     )])
 }
 

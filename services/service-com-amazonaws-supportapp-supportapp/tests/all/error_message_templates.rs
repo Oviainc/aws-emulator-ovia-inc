@@ -82,7 +82,10 @@ fn invalid_request(operation: &str, rule: &str) -> String {
 }
 
 /// The template a miss on a Slack channel configuration is reported with.
-fn not_found(team_id: &str, channel_id: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites in this test target assert the same template
+/// instead of each spelling it out.
+pub(crate) fn not_found(team_id: &str, channel_id: &str) -> String {
     format!("Slack channel configuration for team {team_id} and channel {channel_id} not found")
 }
 
@@ -103,7 +106,9 @@ fn message_of(case: &str, reply: &Reply) -> String {
 }
 
 /// Require `reply` to be `status` / `error_type` and return the message it carried.
-fn refusal(case: &str, reply: &Reply, status: u16, error_type: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites in this test target check a refusal the same way.
+pub(crate) fn refusal(case: &str, reply: &Reply, status: u16, error_type: &str) -> String {
     assert_eq!(
         reply.status, status,
         "case {case:?}: expected HTTP {status}, got {} / {}",
@@ -394,6 +399,17 @@ async fn a_configuration_this_account_does_not_hold_is_reported_with_one_templat
         ("punctuated ids", "T-0_1.2", "C#9/x"),
         ("the stored team, another channel", "T012ABCDEFG", "C-other"),
     ];
+    // A configuration can only be MISSING from a workspace the account holds: an
+    // unregistered `teamId` is the documented conflict instead (covered in
+    // [`crate::channel_configuration_workspace_precondition`]), so each row's workspace
+    // is registered first.
+    for (label, team_id, _) in rows {
+        assert_eq!(
+            emulator.register_workspace(team_id).await.status,
+            200,
+            "case {label:?}: the workspace the row looks a channel up in must be registered"
+        );
+    }
     for (label, team_id, channel_id) in rows {
         let expected = not_found(team_id, channel_id);
 

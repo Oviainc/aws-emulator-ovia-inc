@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The S3 object protocol in this emulator is served by the Amazon S3 service, so the
+# Amazon GameLift Servers-owned location a build's files are uploaded to is a bucket
+# provisioned in THAT store (`state::provision_build_upload_bucket`).
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

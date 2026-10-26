@@ -78,7 +78,8 @@ use crate::ops::types::{
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, LightsailDistribution, LoadBalancer,
     LoadBalancerTlsCertificateSummary,
-    MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PrivateRegistryAccess, Region,
+    MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PartnerInfo, PrivateRegistryAccess,
+    Region,
     RelationalDatabaseBundle, RelationalDatabaseParameter,
     ResourceLocation, ResourceReceivingAccess,
     StaticIp, Tag, REGION_NAME_VALUES,
@@ -9898,6 +9899,93 @@ impl StoredVpcPeering {
 }
 
 // ---------------------------------------------------------------------------
+// Account profile
+// ---------------------------------------------------------------------------
+
+/// The `ProfileType` of an account that is not enrolled in the Lightsail partner
+/// program, from that enum member's own documentation: "`Lightsailor` – The
+/// account is not enrolled in the Lightsail partner program."
+pub const PROFILE_TYPE_LIGHTSAILOR: &str = "Lightsailor";
+
+/// The `ProfileType` of an account that IS enrolled, from the other member of the
+/// same modelled enum: "`LightsailPartner` – The account is enrolled in the
+/// Lightsail partner program."
+pub const PROFILE_TYPE_LIGHTSAIL_PARTNER: &str = "LightsailPartner";
+
+/// The `PartnerStatus` of a membership whose tier benefits the account has, from
+/// that member's own documentation: "`Active` – The membership is active, and the
+/// benefits of the current tier are available to the account."
+pub const PARTNER_STATUS_ACTIVE: &str = "Active";
+
+/// The `PartnerStatus` of a membership whose tier benefits are withheld, from the
+/// other value the same member documents: "`Suspended` – The membership is
+/// suspended, and the benefits of the tier are not available to the account."
+pub const PARTNER_STATUS_SUSPENDED: &str = "Suspended";
+
+/// The Lightsail partner program membership of this account, held only while the
+/// account is enrolled in the program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPartnerMembership {
+    /// When the account was enrolled in the program — the instant
+    /// `PartnerInfo$enrolledAt` reports, and a required member of it.
+    pub enrolled_at_ms: i64,
+    /// The tier of the membership: one of the modelled `TierName` values.
+    /// Optional, because `PartnerInfo$tierName` is — a membership that is in no
+    /// tier reports none.
+    pub tier_name: Option<String>,
+    /// The status of the membership: one of the modelled `PartnerStatus` values
+    /// ([`PARTNER_STATUS_ACTIVE`], [`PARTNER_STATUS_SUSPENDED`]).
+    pub status: String,
+}
+
+impl StoredPartnerMembership {
+    /// This membership as the modelled `PartnerInfo`.
+    pub fn view(&self) -> PartnerInfo {
+        PartnerInfo {
+            enrolled_at: timestamp(self.enrolled_at_ms),
+            tier_name: self.tier_name.clone(),
+            status: self.status.clone(),
+        }
+    }
+}
+
+/// The profile of the account this emulator serves: the Lightsail partner program
+/// membership it holds, if any.
+///
+/// The membership is the whole of the record, because the profile TYPE follows
+/// from it — an account is a partner exactly while it holds a membership and a
+/// Lightsailor otherwise — so the type and the membership can never disagree.
+/// Nothing in this service's API enrols an account in the program (enrolment
+/// happens outside Lightsail), so a store nothing has seeded holds no
+/// membership, which is what makes the profile of a fresh account the
+/// not-enrolled one.
+#[derive(Debug, Clone, Default)]
+pub struct StoredAccountProfile {
+    /// The account's partner program membership, and `None` while it is not
+    /// enrolled.
+    pub partner: Option<StoredPartnerMembership>,
+}
+
+impl StoredAccountProfile {
+    /// The modelled `ProfileType` of this profile: an enrolled account is a
+    /// partner, every other account is a Lightsailor.
+    pub fn profile_type(&self) -> &'static str {
+        if self.partner.is_some() {
+            PROFILE_TYPE_LIGHTSAIL_PARTNER
+        } else {
+            PROFILE_TYPE_LIGHTSAILOR
+        }
+    }
+
+    /// The membership as the modelled `PartnerInfo`, which is reported "only for
+    /// accounts that have a `profileType` of `LightsailPartner`" — an account
+    /// holding no membership has none to report.
+    pub fn partner_view(&self) -> Option<PartnerInfo> {
+        self.partner.as_ref().map(StoredPartnerMembership::view)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -10038,6 +10126,13 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// `BTreeMap` so `GetCertificates` walks a stable, total order and a page
     /// token can name the next certificate.
     pub certificates: BTreeMap<String, StoredCertificate>,
+    /// The profile of the account this emulator serves — the Lightsail partner
+    /// program membership it holds — which `GetProfile` reports.
+    ///
+    /// ONE record rather than a map: a profile belongs to the ACCOUNT, and this
+    /// emulator serves one account (`engine::emulator_account_id`), so there is
+    /// one profile however many Regions a caller reaches it from.
+    pub account_profile: StoredAccountProfile,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,

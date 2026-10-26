@@ -36,7 +36,10 @@
 //!
 //! An approver the request keeps (same `PrimaryIdentityId` from the same identity source)
 //! keeps its `ApproverId` and its invitation response; one the request adds is newly
-//! invited, so it is `PENDING` until the clock owes its response.
+//! invited, so it is `PENDING` until the clock owes its response. Every refusal above is
+//! decided BEFORE anything is written — the ids the added approvers carry are minted, and
+//! the update session recorded, only once the request is accepted — so a refused request
+//! leaves the store exactly as it found it and consumes no `ApproverId`.
 //!
 //! Every `UpdateActions` entry is APPLIED to the team the update produces: the single
 //! modelled action ([`crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION`]) synchronizes the
@@ -279,34 +282,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Rebuild the approver set, carrying each retained approver's id and
-        // invitation response across and inviting the ones the request adds.
-        let new_approvers = match input.approvers.as_ref() {
-            None => None,
-            Some(requested) => {
-                let mut rebuilt = Vec::with_capacity(requested.len());
-                for approver in requested {
-                    let retained = existing_approvers.iter().find(|stored| {
-                        stored.primary_identity_id == approver.primary_identity_id
-                            && stored.primary_identity_source_arn
-                                == approver.primary_identity_source_arn
-                    });
-                    match retained {
-                        Some(stored) => rebuilt.push(stored.clone()),
-                        None => {
-                            let approver_id = state.mint_approver_id();
-                            rebuilt.push(crate::state::Approver::invited(
-                                approver_id,
-                                approver.primary_identity_id.clone(),
-                                approver.primary_identity_source_arn.clone(),
-                                now,
-                            ));
-                        }
-                    }
-                }
-                Some(rebuilt)
-            }
-        };
+        // Rebuilding the approver set MINTS an id for every approver the request adds,
+        // which advances the store's approver sequence: it is a write, so it waits until
+        // every refusal this request can earn has been decided. Until then the request is
+        // measured by the approver set it NAMES.
+        let requested_approver_count = input
+            .approvers
+            .as_ref()
+            .map_or(existing_approvers.len(), Vec::len);
 
         let new_strategy = input.approval_strategy.as_ref().map(|strategy| match strategy {
             ApprovalStrategy::MofN(mof_n) => crate::state::StoredApprovalStrategy::MofN {
@@ -315,10 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         // M of N is checked against the set the update PRODUCES, not the one it replaces.
-        let resulting_count = new_approvers
-            .as_ref()
-            .map_or(existing_approvers.len(), Vec::len);
-        let resulting_count = i32::try_from(resulting_count).unwrap_or(i32::MAX);
+        let resulting_count = i32::try_from(requested_approver_count).unwrap_or(i32::MAX);
         let resulting_min = new_strategy
             .unwrap_or(current_strategy)
             .min_approvals_required();
@@ -345,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // devices back off the identity source, which is not a change the team's approvers
         // have anything to approve.
         let changes_configuration =
-            input.description.is_some() || new_strategy.is_some() || new_approvers.is_some();
+            input.description.is_some() || new_strategy.is_some() || input.approvers.is_some();
 
         // A change to the configuration an ACTIVE team's approvers approved has to be
         // approved by them too, so it is REQUESTED here rather than applied: the team
@@ -400,17 +380,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     response_time: None,
                 })
                 .collect();
-            let seq = state.next_session_seq();
-            // The one constructor every session of this service is built by
-            // (`crate::state::Session::for_team`), so the update session and the baseline
-            // session differ only in their kind and their approvers.
-            let Some(session) = crate::state::Session::for_team(
+            // The one path every session of this service is recorded through
+            // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::start_session`),
+            // so the update session and the baseline session differ only in their kind and
+            // their approvers — and a session that cannot be built writes nothing.
+            let Some(session_arn) = state.start_session(
                 crate::state::SessionKind::Update,
                 &team_record,
                 session_approvers,
                 crate::state::request_region(ctx.parts()),
                 now,
-                seq,
             ) else {
                 return Err(UpdateApprovalTeamErrorModeled::InternalServerException(
                     InternalServerException {
@@ -420,10 +399,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            let session_arn = session.arn.clone();
-            state.insert_session(session);
 
-            let mut requested_approvers = new_approvers.unwrap_or(existing_approvers);
+            // Every refusal is behind us, so the approver set the change produces can be
+            // built: the ids it mints are consumed by a change that is really recorded.
+            let mut requested_approvers = requested_approver_set(
+                &mut state,
+                input.approvers.as_ref(),
+                &existing_approvers,
+                now,
+            )
+            .unwrap_or(existing_approvers);
             if synchronize_mfa_devices {
                 for approver in &mut requested_approvers {
                     approver.synchronize_mfa_devices();
@@ -455,6 +440,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A team whose configuration has never been activated — and one that is no longer
         // active — has no approved configuration to protect, so the change is applied
         // where it was asked for.
+        // Nothing can refuse this request now, so the approver set it produces — and the
+        // ids minting it consumes — is built here.
+        let new_approvers = requested_approver_set(
+            &mut state,
+            input.approvers.as_ref(),
+            &existing_approvers,
+            now,
+        );
         let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
         let mut applied = false;
         if let Some(description) = input.description.as_ref() {
@@ -481,4 +474,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_id: Some(team.version_id.clone()),
         })
     }
+}
+
+/// The approver set this request produces, or `None` when it names no `Approvers` and the
+/// team therefore keeps the set it has.
+///
+/// Built through the one store path that mints an approver id
+/// ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::invite_requested_approvers`]),
+/// which ADVANCES the store's approver sequence: this is called only once every refusal
+/// the request can earn has been decided, so a refused request consumes no id and the
+/// next accepted one mints the id that follows the last one really recorded.
+fn requested_approver_set(
+    state: &mut crate::state::ComAmazonawsMpaAwsfluffycoreserviceState,
+    requested: Option<&Vec<ApprovalTeamRequestApprover>>,
+    existing: &[crate::state::Approver],
+    now: ::std::time::SystemTime,
+) -> Option<Vec<crate::state::Approver>> {
+    let requested = requested?;
+    Some(state.invite_requested_approvers(
+        requested.iter().map(|approver| {
+            (
+                approver.primary_identity_id.as_str(),
+                approver.primary_identity_source_arn.as_str(),
+            )
+        }),
+        existing,
+        now,
+    ))
 }

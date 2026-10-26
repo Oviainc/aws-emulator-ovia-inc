@@ -156,11 +156,34 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// `RegisterSlackWorkspaceForOrganization`, removed by
     /// `DeleteSlackWorkspaceConfiguration` and bounded by
     /// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]. It is the account's workspace registry:
-    /// a Slack channel configuration lives INSIDE a registered workspace, so
-    /// `CreateSlackChannelConfiguration` refuses a channel whose `teamId` is absent
-    /// here (see [`workspace_not_registered_message`]) and deleting a workspace takes
-    /// that workspace's channel configurations with it.
+    /// a Slack channel configuration lives INSIDE a registered workspace, so every
+    /// operation that adds, updates or deletes a channel configuration refuses one
+    /// whose `teamId` is absent here (see
+    /// [`ComAmazonawsSupportappSupportappState::unregistered_workspace_conflict`]) and
+    /// deleting a workspace takes that workspace's channel configurations with it.
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
+}
+
+impl ComAmazonawsSupportappSupportappState {
+    /// Why a request that adds, updates or deletes a Slack channel configuration in the
+    /// workspace `team_id` names must be refused with the modelled `ConflictException`,
+    /// or `None` when that workspace is registered to this account.
+    ///
+    /// `ConflictException`'s documentation names this condition first — "Add, update, or
+    /// delete a Slack channel configuration before you add a Slack workspace to your
+    /// Amazon Web Services account" — so it holds for EVERY operation that writes a
+    /// channel configuration, not just the one that creates it. A channel configuration
+    /// lives inside a registered workspace, so a `teamId` absent from
+    /// [`Self::slack_workspace_configurations`] has no workspace to hold a channel
+    /// configuration at all: that is a different answer from a registered workspace in
+    /// which the named channel happens not to be configured, which is the
+    /// `ResourceNotFoundException` of the configuration itself. Each writing operation
+    /// therefore consults this BEFORE looking the configuration up, and they all read
+    /// the one registry through here so the three cannot drift apart.
+    pub fn unregistered_workspace_conflict(&self, team_id: &str) -> Option<String> {
+        (!self.slack_workspace_configurations.contains_key(team_id))
+            .then(|| workspace_not_registered_message(team_id))
+    }
 }
 
 /// The `ConflictException` message for a Slack channel configuration refused because

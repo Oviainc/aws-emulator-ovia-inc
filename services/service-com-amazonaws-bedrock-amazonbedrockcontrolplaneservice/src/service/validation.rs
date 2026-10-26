@@ -20,11 +20,12 @@
 //!    offending member, joined with `; `, in the order the walk found them
 //!    ([`envelope`]);
 //! 2. a clause states the value the member held, its dotted path and the requirement it
-//!    failed — EXCEPT for a value outside a `@range` bound, which this service states
-//!    WITHOUT the number that broke it ([`echoes_refused_value`]): a numeric member's
-//!    refusal advertises the bound the model declares, which is the whole of what a caller
-//!    needs to resubmit, and the rejected number is request content this API's refusals
-//!    keep out of the sentence;
+//!    failed — EXCEPT for the two classes whose clause states the REQUIREMENT alone
+//!    ([`echoes_refused_value`]): a value outside a `@range` bound, where the bound the
+//!    model declares is the whole of what a caller needs to resubmit, and a value outside
+//!    an enum's admitted set, where that set is. Both keep the rejected request content
+//!    out of the sentence, and both are decided by the violation's CLASS, so each holds
+//!    for every member of every operation that carries that constraint;
 //! 3. a reported `@pattern` is the expression WITHOUT the `^` / `$` anchors the model
 //!    spells it with ([`unanchored`]): the advertised constraint is the character grammar
 //!    a value must satisfy, and a caller that lifts the expression out of the message to
@@ -37,7 +38,11 @@
 //!    element's, not just the constraint that happened to fail: the clause tells a caller
 //!    what every element of that member has to satisfy. A violation on the collection
 //!    ITSELF (its own `@length`, its `@uniqueItems`) is not nested, and neither is one on
-//!    a member INSIDE a structure element, which keeps its own full path.
+//!    a member INSIDE a structure element, which keeps its own full path;
+//! 5. an enum clause states the admitted VALUE SET and the position —
+//!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
+//!    [ … ]` — never the value the member held, which is rule 2's second exception: what
+//!    such a caller acts on is the set it must choose from.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -160,15 +165,18 @@ fn render_bound(bound: f64) -> String {
 
 /// Whether a violation of this class states the value it refused.
 ///
-/// A `@range` violation does NOT: the clause names the member and the bound it broke and
-/// stops there, for every numeric member of every operation — a `@range` minimum as much
-/// as a maximum, an integer member as much as a fractional one, and whether the bound was
-/// declared on the member's target or inherited by it. Every other class this module words
-/// keeps the value (rule 2), and an absent member has none to state.
+/// Two classes do NOT. A `@range` violation names the member and the bound it broke and
+/// stops there, for every numeric member of every operation — a minimum as much as a
+/// maximum, an integer member as much as a fractional one, and whether the bound was
+/// declared on the member's target or inherited by it. An enum violation does the same with
+/// the admitted value set, for every enum-constrained member of every operation: the set is
+/// what a caller has to choose from, so the value it chose instead is not restated. Every
+/// other class this module words keeps the value (rule 2), and an absent member has none to
+/// state.
 fn echoes_refused_value(kind: &ViolationKind) -> bool {
     !matches!(
         kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) | ViolationKind::EnumValue(_)
     )
 }
 

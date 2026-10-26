@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the profile of the account this emulator serves, from the ONE profile
+//! record this service's store holds ([`crate::state::StoredAccountProfile`]): the
+//! account's profile type, and the partner program membership that type follows
+//! from when it holds one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The profile belongs to the ACCOUNT, not to a Region or a resource: the request
+//! carries no member, so the answer depends on nothing but what the store holds.
+//! The profile TYPE is derived from the membership rather than stored beside it, so
+//! the two can never disagree: an account holding a membership is a partner and
+//! reports it, an account holding none is a Lightsailor and reports no membership,
+//! which is what the modelled `partner` member asks for ("returned only for
+//! accounts that have a `profileType` of `LightsailPartner`").
+//!
+//! Reporting the profile is a READ: nothing in this service's API enrols an account
+//! in the partner program, so this operation writes nothing and a later caller sees
+//! exactly what it did.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +163,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProfile"))
+        // A reporting operation about the ACCOUNT: the input shape declares no
+        // member, and one account has one profile whichever Region's endpoint the
+        // request reached, so neither the request nor its metadata narrows the
+        // answer — only what the store holds does.
+        let _ = (&input, ctx);
+
+        crate::state::with_state(&*self.engine, |store| {
+            let profile = &store.account_profile;
+            GetProfileOutput {
+                profile_type: profile.profile_type().to_string(),
+                // Carried only while the account holds a membership, which is
+                // exactly when its profile type is the partner one.
+                partner: profile.partner_view(),
+            }
+        })
+        .ok_or_else(unavailable)
     }
 }
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetProfileError {
+    GetProfileErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail account profile store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+

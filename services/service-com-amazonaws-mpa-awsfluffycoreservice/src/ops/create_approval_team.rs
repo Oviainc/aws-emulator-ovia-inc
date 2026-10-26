@@ -368,19 +368,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let approvers: Vec<crate::state::Approver> = input
-            .approvers
-            .iter()
-            .map(|requested| {
-                let approver_id = state.mint_approver_id();
-                crate::state::Approver::invited(
-                    approver_id,
-                    requested.primary_identity_id.clone(),
-                    requested.primary_identity_source_arn.clone(),
-                    now,
+        // The approver set is built through the one store path that mints an approver id
+        // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::invite_requested_approvers`),
+        // reached only here, once every refusal this request can earn has been decided: a
+        // refused create consumes no id. The team has no approver yet, so every approver
+        // the request names is newly invited.
+        let approvers: Vec<crate::state::Approver> = state.invite_requested_approvers(
+            input.approvers.iter().map(|requested| {
+                (
+                    requested.primary_identity_id.as_str(),
+                    requested.primary_identity_source_arn.as_str(),
                 )
-            })
-            .collect();
+            }),
+            &[],
+            now,
+        );
 
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::team_arn(&region, &input.name);

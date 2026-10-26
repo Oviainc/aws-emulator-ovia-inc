@@ -21,6 +21,14 @@
 //! instants the Type reference lists on a flag definition and on a flag's values — which
 //! is why a version read back from a feature-flags profile carries metadata the caller
 //! never wrote. [`stamped_feature_flags_content`] is that rewrite.
+//!
+//! The document the helper stores is the AUTHORING document, and it is not what a
+//! configuration consumer receives: retrieving a feature-flag configuration returns the
+//! flag VALUES rather than the flag definitions, and a disabled flag comes back carrying
+//! nothing but its `enabled`. [`resolved_feature_flags_document`] is that projection,
+//! computed from the stored document every time it is served, so the bytes
+//! `GetHostedConfigurationVersion` reports and the bytes the data plane serves are two
+//! views of ONE stored version rather than two stored copies.
 
 use std::time::SystemTime;
 
@@ -30,10 +38,26 @@ use serde_json::Value;
 /// `version` as a required property with the single allowed value `"1"`.
 pub const FEATURE_FLAGS_SCHEMA_VERSION: &str = "1";
 
+/// The document's map of flag DEFINITIONS, keyed by flag key: the authoring half of the
+/// document, which the schema makes required.
+pub const FLAGS_PROPERTY: &str = "flags";
+
+/// The document's map of flag VALUES, keyed by flag key: what each declared flag is
+/// configured to, which the schema makes optional.
+pub const VALUES_PROPERTY: &str = "values";
+
+/// The document's schema version property; see [`FEATURE_FLAGS_SCHEMA_VERSION`].
+pub const VERSION_PROPERTY: &str = "version";
+
+/// One flag's own switch, inside its entry of [`VALUES_PROPERTY`]: a boolean the
+/// schema defaults to `false`, so an entry that names no `enabled` configures a flag
+/// that is off.
+pub const ENABLED_KEY: &str = "enabled";
+
 /// The top-level properties the schema declares, and the only ones it allows
 /// (`additionalProperties: false`): `flags` and `version` are required, `values`
 /// optional.
-const TOP_LEVEL_PROPERTIES: &[&str] = &["flags", "values", "version"];
+const TOP_LEVEL_PROPERTIES: &[&str] = &[FLAGS_PROPERTY, VALUES_PROPERTY, VERSION_PROPERTY];
 
 /// The `type` values an attribute's `constraints` object accepts, from the guide's
 /// attribute-constraints schema.
@@ -77,12 +101,13 @@ pub fn is_valid_feature_flags_content(content: &[u8]) -> bool {
     }
 
     // `version` is required and its only allowed value is "1".
-    if document.get("version").and_then(Value::as_str) != Some(FEATURE_FLAGS_SCHEMA_VERSION) {
+    if document.get(VERSION_PROPERTY).and_then(Value::as_str) != Some(FEATURE_FLAGS_SCHEMA_VERSION)
+    {
         return false;
     }
 
     // `flags` is required and is a map from flag key to flag definition.
-    let Some(flags) = document.get("flags").and_then(Value::as_object) else {
+    let Some(flags) = document.get(FLAGS_PROPERTY).and_then(Value::as_object) else {
         return false;
     };
     for (key, flag) in flags {
@@ -95,7 +120,7 @@ pub fn is_valid_feature_flags_content(content: &[u8]) -> bool {
     }
 
     // `values` is optional, and holds one entry per flag it configures.
-    match document.get("values") {
+    match document.get(VALUES_PROPERTY) {
         None => true,
         Some(values) => {
             let Some(values) = values.as_object() else {
@@ -161,7 +186,7 @@ fn is_valid_flag_value(value: &Value) -> bool {
     let Some(value) = value.as_object() else {
         return false;
     };
-    value.get("enabled").is_none_or(Value::is_boolean)
+    value.get(ENABLED_KEY).is_none_or(Value::is_boolean)
 }
 
 // =============================================================================
@@ -178,7 +203,7 @@ pub const UPDATED_AT_KEY: &str = "_updatedAt";
 /// `flags` (the flag's definition) and one per flag in `values` (that flag's values).
 /// Nothing else in the document is stamped — `version` is a scalar, and an attribute
 /// lives inside a flag definition rather than as an entry of a stamped map.
-pub const STAMPED_MAPS: &[&str] = &["flags", "values"];
+pub const STAMPED_MAPS: &[&str] = &[FLAGS_PROPERTY, VALUES_PROPERTY];
 
 /// `content` as the feature-flags helper would store it: the same document with
 /// `_createdAt` and `_updatedAt` on every entry of each map in [`STAMPED_MAPS`].
@@ -262,6 +287,70 @@ pub fn stamped_feature_flags_content(
     }
 
     serde_json::to_vec(&document).ok()
+}
+
+// =============================================================================
+// The helper's projection: the flag document a configuration consumer receives
+// =============================================================================
+
+/// The flag document AppConfig serves for `content`, the stored authoring document.
+///
+/// Retrieving a feature-flag configuration does not hand back the authoring document:
+/// what a consumer receives is the flag VALUES, keyed by flag key at the TOP level, so a
+/// feature-flag client reads `document[flagKey].enabled` and the flag's attribute values
+/// straight off it. Everything that belongs to authoring rather than to the served
+/// configuration is therefore absent: the [`FLAGS_PROPERTY`] definitions (the flag's
+/// name, description and attribute constraints), the [`VERSION_PROPERTY`] of the
+/// authoring schema, and the helper's own [`CREATED_AT_KEY`]/[`UPDATED_AT_KEY`]
+/// bookkeeping. A flag that is OFF is served as nothing but its `enabled`: its attribute
+/// values configure behaviour a disabled flag does not have, so resolution drops them.
+///
+/// Derived from the stored bytes on every serve rather than stored beside them, so the
+/// document a consumer receives follows the version currently deployed and the authoring
+/// document a `GetHostedConfigurationVersion` reports is left exactly as it is.
+///
+/// `None` when `content` is not a JSON object, which is the caller's signal to serve the
+/// stored bytes unchanged; [`is_valid_feature_flags_content`] has already refused such a
+/// document at write time, so a stored version never reaches this.
+pub fn resolved_feature_flags_document(content: &[u8]) -> Option<Vec<u8>> {
+    let document = serde_json::from_slice::<Value>(content).ok()?;
+    let document = document.as_object()?;
+
+    let mut resolved = serde_json::Map::new();
+    // The values half is what is served; it is the schema's optional property, so a
+    // document that configures no flag serves an empty document rather than failing.
+    let values = document
+        .get(VALUES_PROPERTY)
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten();
+    for (key, entry) in values {
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        // `enabled` is a boolean the schema defaults to `false`, so an entry that names
+        // none configures a flag that is off.
+        let enabled = entry
+            .get(ENABLED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut served = serde_json::Map::new();
+        served.insert(ENABLED_KEY.to_string(), Value::Bool(enabled));
+        if enabled {
+            // The flag's own attribute values, whatever they are and however deeply
+            // nested: everything in the entry except the switch itself and the helper's
+            // stamps is configuration the flag carries.
+            for (attribute, value) in entry {
+                if [ENABLED_KEY, CREATED_AT_KEY, UPDATED_AT_KEY].contains(&attribute.as_str()) {
+                    continue;
+                }
+                served.insert(attribute.clone(), value.clone());
+            }
+        }
+        resolved.insert(key.clone(), Value::Object(served));
+    }
+
+    serde_json::to_vec(&Value::Object(resolved)).ok()
 }
 
 /// `at` as the instant the stamps carry: an RFC 3339 UTC instant with a fixed

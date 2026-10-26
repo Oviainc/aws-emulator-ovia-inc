@@ -144,6 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::update_exclusion_windows`]),
     /// and a repeated id names one SLO, so it is applied once and reported once.
     ///
+    /// An added window is stored with its server-defaulted members settled: `StartTime`
+    /// "defaults to current time if not specified", so a window added without one starts at
+    /// the instant this call is served and a later read reports that instant.
+    ///
     /// A request whose EVERY id failed is answered with the modelled exception that id's
     /// failure earns on its own, rather than with an empty success: the output's `SloIds` is
     /// `@required` with a modelled minimum of 1 entry, so there is no such thing as a
@@ -169,7 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         // Both lists are optional: a request carrying neither adds and removes nothing, so it
         // reports which of the ids it names are SLOs this service holds.
-        let add = input.add_exclusion_windows.as_deref().unwrap_or_default();
+        //
+        // An addition is stored in the form the service keeps it, which settles the members it
+        // defaults server-side (`crate::state::stored_exclusion_window`) from the instant THIS
+        // call is served. The clock is read ONCE, before any id is applied, so every SLO the
+        // request names gains the same window and a later read reports one start time for it.
+        let served_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let add: Vec<ExclusionWindow> = input
+            .add_exclusion_windows
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|window| crate::state::stored_exclusion_window(window, served_at))
+            .collect();
         let remove = input.remove_exclusion_windows.as_deref().unwrap_or_default();
 
         let mut applied: Vec<String> = Vec::new();
@@ -183,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(crate::state::slo_name_of(id).to_string()) {
                 continue;
             }
-            match store.update_exclusion_windows(id, add, remove) {
+            match store.update_exclusion_windows(id, &add, remove) {
                 // The id is reported back as the CALLER spelled it: `SloIds` is "the list of
                 // SLO IDs that were successfully processed", which are the ids of the request.
                 Ok(()) => applied.push(id.clone()),

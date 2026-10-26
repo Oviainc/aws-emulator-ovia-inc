@@ -34,6 +34,10 @@
 //! the service prices by are the service's own published rule, named here through the
 //! constants that state it, so what each row asserts is the arithmetic over a set of
 //! subscriptions rather than one remembered figure.
+//!
+//! The helpers that place those orders and check those figures are shared with
+//! [`crate::renewal_contract`], which covers the renewal a caller BUYS: one rule
+//! prices the quote and the contract, so one set of helpers states it for both.
 
 use serde_json::{json, Value};
 
@@ -55,14 +59,14 @@ use crate::site_and_outpost_lifecycle::{
 /// A `SkuCode` of the modelled form (`^OR-[A-Z0-9]{7}$`) that this service publishes
 /// no configuration under — a catalog item id a line item may name and the catalog
 /// has no hardware facts for. The rows that use it assert it really is unpublished.
-const UNPUBLISHED_SKU: &str = "OR-0000001";
+pub(crate) const UNPUBLISHED_SKU: &str = "OR-0000001";
 
 /// How close a reported price has to be to the one the rule computes: the cent it is
 /// quoted to, which is also the precision the service rounds to.
-const CENT: f64 = 0.01;
+pub(crate) const CENT: f64 = 0.01;
 
 /// The route `GetRenewalPricing` binds, for one identifier form.
-fn route(identifier: &str) -> String {
+pub(crate) fn route(identifier: &str) -> String {
     format!("/outpost/{}/renewal-pricing", segment(identifier))
 }
 
@@ -70,7 +74,7 @@ fn route(identifier: &str) -> String {
 /// it carries, the payment option it was bought under, and whether it was cancelled
 /// after being placed.
 #[derive(Debug, Clone)]
-struct OrderSpec {
+pub(crate) struct OrderSpec {
     items: Vec<(String, i64)>,
     payment_option: &'static str,
     cancelled: bool,
@@ -79,7 +83,7 @@ struct OrderSpec {
 /// An order of `items`, live, bought under `payment_option` — which is the option
 /// THAT order was bought under and so says nothing about which options a renewal of
 /// it can be bought under.
-fn order(payment_option: &'static str, items: &[(String, i64)]) -> OrderSpec {
+pub(crate) fn order(payment_option: &'static str, items: &[(String, i64)]) -> OrderSpec {
     OrderSpec {
         items: items.to_vec(),
         payment_option,
@@ -88,7 +92,7 @@ fn order(payment_option: &'static str, items: &[(String, i64)]) -> OrderSpec {
 }
 
 /// The same order, cancelled after it was placed.
-fn cancelled(mut spec: OrderSpec) -> OrderSpec {
+pub(crate) fn cancelled(mut spec: OrderSpec) -> OrderSpec {
     spec.cancelled = true;
     spec
 }
@@ -101,7 +105,7 @@ fn cancelled(mut spec: OrderSpec) -> OrderSpec {
 /// because the modelled `CatalogItem` reports capacity per instance family rather
 /// than one total — it is the catalog's own published figure either way, never a
 /// number this suite picked.
-async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)> {
+pub(crate) async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)> {
     let listed = outposts
         .ok("GET", "/catalog/items?MaxResults=1000", None)
         .await;
@@ -191,7 +195,12 @@ fn finish_orders_on(outposts: &Outposts, outpost_id: &str, case: &str) {
 }
 
 /// Place every order a case describes on `outpost_id`, over the wire.
-async fn place_orders(outposts: &Outposts, outpost_id: &str, specs: &[OrderSpec], case: &str) {
+pub(crate) async fn place_orders(
+    outposts: &Outposts,
+    outpost_id: &str,
+    specs: &[OrderSpec],
+    case: &str,
+) {
     for spec in specs {
         let mut body = json!({
             "OutpostIdentifier": outpost_id,
@@ -229,7 +238,7 @@ async fn place_orders(outposts: &Outposts, outpost_id: &str, specs: &[OrderSpec]
 /// The capacity, in vCPUs, the orders a case placed subscribe on its Outpost: every
 /// live order's line items, each item's published capacity times the quantity
 /// ordered. A catalog item the service publishes nothing for subscribes nothing.
-fn subscribed_capacity(specs: &[OrderSpec], catalog: &[(String, i64)]) -> i64 {
+pub(crate) fn subscribed_capacity(specs: &[OrderSpec], catalog: &[(String, i64)]) -> i64 {
     specs
         .iter()
         .filter(|spec| !spec.cancelled)
@@ -245,7 +254,7 @@ fn subscribed_capacity(specs: &[OrderSpec], catalog: &[(String, i64)]) -> i64 {
 }
 
 /// How many months a term runs for, from the rule the service prices by.
-fn months(payment_term: &str) -> f64 {
+pub(crate) fn months(payment_term: &str) -> f64 {
     let (_, months) = PAYMENT_TERM_MONTHS
         .iter()
         .find(|(term, _)| *term == payment_term)
@@ -254,7 +263,7 @@ fn months(payment_term: &str) -> f64 {
 }
 
 /// The share of a term's cost a payment option pays up front, from the same rule.
-fn upfront_share(payment_option: &str) -> f64 {
+pub(crate) fn upfront_share(payment_option: &str) -> f64 {
     let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
         .iter()
         .find(|(option, _)| *option == payment_option)
@@ -263,7 +272,7 @@ fn upfront_share(payment_option: &str) -> f64 {
 }
 
 /// A price member of a reported option, as a number — `None` when the wire omits it.
-fn price(details: &Value, member: &str, case: &str) -> Option<f64> {
+pub(crate) fn price(details: &Value, member: &str, case: &str) -> Option<f64> {
     details.get(member).map(|value| {
         value
             .as_f64()
@@ -272,7 +281,7 @@ fn price(details: &Value, member: &str, case: &str) -> Option<f64> {
 }
 
 /// Require `actual` to be `expected` to the cent.
-fn assert_price(actual: Option<f64>, expected: f64, member: &str, case: &str) {
+pub(crate) fn assert_price(actual: Option<f64>, expected: f64, member: &str, case: &str) {
     let actual =
         actual.unwrap_or_else(|| panic!("case {case:?}: expected {member} {expected}, got none"));
     assert!(

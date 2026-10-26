@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateThirdPartyFirewall
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateThirdPartyFirewall`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateThirdPartyFirewall::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Designates the Firewall Manager administrator as a tenant administrator of a
+//! third-party firewall vendor. A MUTATING operation: it starts the designation,
+//! so the association's status becomes `ONBOARDING` and the CLOCK makes
+//! `ONBOARD_COMPLETE` due [`crate::state::ASSOCIATION_SETTLE`] later — a caller
+//! that reads the status immediately still sees `ONBOARDING`, and only
+//! `ONBOARD_COMPLETE` makes the vendor's tenant reachable (which is what
+//! `ListThirdPartyFirewallFirewallPolicies` enumerates).
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: a caller that is not the Firewall Manager default administrator of
+//! this account/Region is refused by [`crate::state::require_administrator`]
+//! BEFORE the vendor association is touched, so a refused call writes nothing.
+//!
+//! Calling it twice is idempotent: an association that is already onboarding or
+//! onboarded has nothing left to start, so the second call reports the status it
+//! already has and does not push the due instant back. An association that was
+//! torn down — or whose teardown is still in flight — is designated again,
+//! starting a fresh `ONBOARDING`: the mirror of `DisassociateThirdPartyFirewall`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +169,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateThirdPartyFirewall` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateThirdPartyFirewallErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateThirdPartyFirewall"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateThirdPartyFirewallErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the vendor association is touched.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        let record = store
+            .third_party_firewalls
+            .entry(input.third_party_firewall.clone())
+            .or_insert_with(|| crate::state::ThirdPartyFirewallRecord::onboarding(now));
+        // Materialise whatever the clock already made due, then start the
+        // designation from the status that is actually current.
+        record.settle(now);
+        record.start_onboarding(now);
+        Ok(AssociateThirdPartyFirewallOutput {
+            third_party_firewall_status: Some(record.status.clone()),
+        })
     }
 }
+

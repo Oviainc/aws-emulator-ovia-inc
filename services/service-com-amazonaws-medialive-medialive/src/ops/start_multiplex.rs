@@ -207,9 +207,11 @@ fn refused(refusal: crate::state::MultiplexStartRefusal, multiplex_id: &str) -> 
         }
         crate::state::MultiplexStartRefusal::NotStartable(state) => {
             StartMultiplexErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Multiplex {multiplex_id} is in state {state} and can only be started from {}",
-                    crate::state::multiplex_state::IDLE
+                // The wording lives in the state module, so this refusal and the
+                // one `BatchStart` makes for the same multiplex cannot drift apart.
+                message: Some(crate::state::multiplex_not_startable_message(
+                    multiplex_id,
+                    &state,
                 )),
             })
         }

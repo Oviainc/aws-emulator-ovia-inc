@@ -74,6 +74,17 @@ pub fn date_time_seconds(case: &str, text: &str) -> f64 {
     parsed.as_secs_f64()
 }
 
+/// The test's own wall clock in epoch seconds, beside [`date_time_seconds`] so a suite that
+/// bounds a response's instant against the clock reads it the same way every other suite
+/// does: a stamp the emulator reports for a write must fall between the clock before the
+/// call and the clock after it.
+pub fn wall_clock_seconds() -> f64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .expect("the test clock is after the epoch")
+        .as_secs_f64()
+}
+
 /// An identifier as an SDK writes it into a path label: an ARN carries `:` and `/`, and
 /// both are percent-encoded so the whole identifier stays ONE path segment.
 pub fn label(identifier: &str) -> String {
