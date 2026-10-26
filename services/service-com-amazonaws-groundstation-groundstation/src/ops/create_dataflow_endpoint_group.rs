@@ -336,8 +336,11 @@ fn invalid_parameter(parameter: &str, message: String) -> CreateDataflowEndpoint
 ///   (`INITIALIZING_DATAPLANE`), and becomes `created`/`HEALTHY` once the clock makes that
 ///   move due (`ComAmazonawsGroundstationGroundstationState::settle_due_endpoints`);
 /// * an AWS Ground Station Agent endpoint's stream is carried by an agent the customer
-///   registers with `RegisterAgent`, so until one has registered the endpoint reports
-///   `NO_REGISTERED_AGENT`, an `INACTIVE` agent and no audit result, none having run.
+///   registers with `RegisterAgent`, so what it reports is that agent's
+///   (`crate::state::apply_agent_endpoint_health`) — and at create time no agent can carry
+///   it, the ARN of the capability an agent registers for being minted by this very call,
+///   so it reports `NO_REGISTERED_AGENT`, an `INACTIVE` agent and no audit result, none
+///   having run.
 fn endpoint_as_created(
     details: &EndpointDetails,
     kind: crate::state::EndpointKind,
@@ -353,21 +356,7 @@ fn endpoint_as_created(
                 Some(vec![crate::state::REASON_INITIALIZING_DATAPLANE.to_string()]);
         }
         crate::state::EndpointKind::Agent => {
-            if let Some(endpoint) = stored.aws_ground_station_agent_endpoint.as_mut() {
-                endpoint.agent_status = Some(crate::state::AGENT_INACTIVE.to_string());
-                endpoint.audit_results = None;
-            }
-            if let Some(endpoint) = stored.uplink_aws_ground_station_agent_endpoint.as_mut() {
-                endpoint.agent_status = Some(crate::state::AGENT_INACTIVE.to_string());
-                endpoint.audit_results = None;
-            }
-            if let Some(endpoint) = stored.downlink_aws_ground_station_agent_endpoint.as_mut() {
-                endpoint.agent_status = Some(crate::state::AGENT_INACTIVE.to_string());
-                endpoint.audit_results = None;
-            }
-            stored.health_status = Some(crate::state::HEALTH_UNHEALTHY.to_string());
-            stored.health_reasons =
-                Some(vec![crate::state::REASON_NO_REGISTERED_AGENT.to_string()]);
+            crate::state::apply_agent_endpoint_health(&mut stored, None);
         }
     }
     stored

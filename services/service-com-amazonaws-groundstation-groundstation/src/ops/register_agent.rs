@@ -223,6 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A registered agent has reported no status yet: `AgentStatus` is what the AGENT
         // reports through `UpdateAgentStatus`, so the service holds the new agent inactive,
         // with no component status and no task, until the first report arrives.
+        //
+        // The `discoveryData` stored here is also what ASSOCIATES this agent with the
+        // capabilities it manages, so the dataflow endpoints those capabilities address
+        // carry this agent's status from now on (`crate::state::agent_for_capability`).
         let stored = crate::state::Agent {
             agent_id: agent_id.clone(),
             agent_arn: agent_arn.clone(),

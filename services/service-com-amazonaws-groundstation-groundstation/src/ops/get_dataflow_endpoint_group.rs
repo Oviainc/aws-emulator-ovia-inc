@@ -179,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetDataflowEndpointGroupOutput {
             dataflow_endpoint_group_id: Some(stored.dataflow_endpoint_group_id.clone()),
             dataflow_endpoint_group_arn: Some(stored.dataflow_endpoint_group_arn.clone()),
-            endpoints_details: Some(stored.endpoint_details.clone()),
+            // An agent endpoint reports the agent that carries its stream, which is the
+            // agent registered for this group rather than anything stored on the group, so
+            // the endpoints are read through the one reader that resolves it.
+            endpoints_details: Some(guard.reported_endpoint_details(stored)),
             tags: crate::state::response_tags(&stored.tags),
             contact_pre_pass_duration_seconds: stored.contact_pre_pass_duration_seconds,
             contact_post_pass_duration_seconds: stored.contact_post_pass_duration_seconds,

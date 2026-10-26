@@ -2089,6 +2089,8 @@ pub const REASON_INITIALIZING_DATAPLANE: &str = "INITIALIZING_DATAPLANE";
 pub const REASON_HEALTHY: &str = "HEALTHY";
 /// See [`REASON_INITIALIZING_DATAPLANE`].
 pub const REASON_NO_REGISTERED_AGENT: &str = "NO_REGISTERED_AGENT";
+/// See [`REASON_INITIALIZING_DATAPLANE`].
+pub const REASON_DATAPLANE_FAILURE: &str = "DATAPLANE_FAILURE";
 
 /// The `AgentStatus` an AWS Ground Station Agent endpoint carries while no agent has
 /// registered itself for that endpoint (`smithy_query(query="shape",
@@ -2099,6 +2101,104 @@ pub const REASON_NO_REGISTERED_AGENT: &str = "NO_REGISTERED_AGENT";
 /// reported one the service holds it inactive rather than claiming a status nothing
 /// observed.
 pub const AGENT_INACTIVE: &str = "INACTIVE";
+
+/// The other `AgentStatus` values an agent reports of itself through `UpdateAgentStatus`
+/// (`smithy_query(query="shape", shape="AgentStatus")` — `SUCCESS`, `FAILED`, `ACTIVE`,
+/// `INACTIVE`): the two that say its components are running, and the one that says they
+/// failed.
+pub const AGENT_ACTIVE: &str = "ACTIVE";
+/// See [`AGENT_ACTIVE`].
+pub const AGENT_SUCCESS: &str = "SUCCESS";
+/// See [`AGENT_ACTIVE`].
+pub const AGENT_FAILED: &str = "FAILED";
+
+/// The `AuditResults` an AWS Ground Station Agent endpoint reports once an agent carries
+/// it (`smithy_query(query="shape", shape="AuditResults")` — `HEALTHY`, `UNHEALTHY`).
+pub const AUDIT_HEALTHY: &str = "HEALTHY";
+/// See [`AUDIT_HEALTHY`].
+pub const AUDIT_UNHEALTHY: &str = "UNHEALTHY";
+
+/// Stamp on `details` the members an AWS Ground Station Agent endpoint's own AGENT decides
+/// rather than the request: `agentStatus`, `auditResults`, `healthStatus` and
+/// `healthReasons`. `carrier` is the registered agent that carries the endpoint's stream,
+/// `None` when no registered agent carries it.
+///
+/// `details` that describes no agent endpoint is left exactly as it is, so one reader can
+/// walk every endpoint of a group whatever kind each one is.
+///
+/// An agent endpoint's stream is carried by an agent the customer registers with
+/// `RegisterAgent` ([`ComAmazonawsGroundstationGroundstationState::agent_for_capability`]),
+/// and the endpoint reports the agent that carries it:
+///
+/// * until one has registered for it there is no agent to report, so the endpoint reports
+///   `NO_REGISTERED_AGENT`, an `INACTIVE` agent and no audit result, none having run;
+/// * once one has, `agentStatus` is "the status of AgentEndpoint"
+///   (`smithy_query(query="doc", shape="AwsGroundStationAgentEndpoint",
+///   member="agentStatus")`), which is the status that agent last reported of itself
+///   through `UpdateAgentStatus`, and the endpoint's health is what that status implies: an
+///   agent whose components are running is the endpoint's stream flowing, an agent that
+///   reported a failure is a failed dataplane, and an agent that has reported nothing yet
+///   is a dataplane still coming up — the same reason this service reports for a dataflow
+///   endpoint it has not finished attaching.
+pub fn apply_agent_endpoint_health(details: &mut EndpointDetails, carrier: Option<&Agent>) {
+    if !endpoint_members(details)
+        .iter()
+        .any(|(_, kind)| *kind == EndpointKind::Agent)
+    {
+        return;
+    }
+
+    let (agent_status, audit_results, health_status, health_reason) = match carrier {
+        None => (
+            AGENT_INACTIVE,
+            None,
+            HEALTH_UNHEALTHY,
+            REASON_NO_REGISTERED_AGENT,
+        ),
+        Some(agent) => match agent.aggregate_status.status.as_str() {
+            reported @ (AGENT_ACTIVE | AGENT_SUCCESS) => (
+                reported,
+                Some(AUDIT_HEALTHY),
+                HEALTH_HEALTHY,
+                REASON_HEALTHY,
+            ),
+            reported @ AGENT_FAILED => (
+                reported,
+                Some(AUDIT_UNHEALTHY),
+                HEALTH_UNHEALTHY,
+                REASON_DATAPLANE_FAILURE,
+            ),
+            reported => (
+                reported,
+                None,
+                HEALTH_UNHEALTHY,
+                REASON_INITIALIZING_DATAPLANE,
+            ),
+        },
+    };
+
+    // The three agent members `EndpointDetails` declares each carry their own `agentStatus`
+    // and `auditResults` (`smithy_query(query="shape", shape="EndpointDetails")`), and an
+    // item sets exactly one of them ([`endpoint_members`]), so all three are stamped from
+    // the one answer rather than each kind deciding its own.
+    let agent_status = Some(agent_status.to_string());
+    let audit_results = audit_results.map(str::to_string);
+    if let Some(endpoint) = details.aws_ground_station_agent_endpoint.as_mut() {
+        endpoint.agent_status = agent_status.clone();
+        endpoint.audit_results = audit_results.clone();
+    }
+    if let Some(endpoint) = details.uplink_aws_ground_station_agent_endpoint.as_mut() {
+        endpoint.agent_status = agent_status.clone();
+        endpoint.audit_results = audit_results.clone();
+    }
+    if let Some(endpoint) = details.downlink_aws_ground_station_agent_endpoint.as_mut() {
+        endpoint.agent_status = agent_status;
+        endpoint.audit_results = audit_results;
+    }
+
+    details.health_status = Some(health_status.to_string());
+    details.health_reasons = Some(vec![health_reason.to_string()]);
+}
 
 /// A dataflow endpoint group as `CreateDataflowEndpointGroup` stored it.
 #[derive(Debug, Clone)]
@@ -3166,7 +3266,6 @@ fn dataflow_end(
     let config_details = match config_data {
         Some(ConfigTypeData::dataflowEndpointConfig(endpoint_config)) => state
             .dataflow_endpoint(&endpoint_config.dataflow_endpoint_name)
-            .cloned()
             .map(ConfigDetails::endpointDetails),
         Some(ConfigTypeData::antennaDownlinkDemodDecodeConfig(_)) => {
             config_arn_node(arn).map(|output_node| {
@@ -3438,22 +3537,98 @@ impl ComAmazonawsGroundstationGroundstationState {
         }
     }
 
-    /// The dataflow endpoint of this account named `name`, as the group that holds it
-    /// stored it; `None` when no group of this account holds one by that name.
+    /// The dataflow endpoint of this account named `name`, as a read of the group that
+    /// holds it reports it ([`Self::reported_endpoint`]); `None` when no group of this
+    /// account holds one by that name.
     ///
     /// A `dataflowEndpointConfig` names an endpoint by `dataflowEndpointName` rather than
     /// by the group it belongs to, so the lookup is over every group's endpoints
     /// ([`endpoint_name`] reads the name whichever member describes the endpoint). Groups
     /// are taken in id order, so two endpoints sharing a name resolve to the same one on
     /// every call whatever order the map iterates in.
-    pub fn dataflow_endpoint(&self, name: &str) -> Option<&EndpointDetails> {
+    pub fn dataflow_endpoint(&self, name: &str) -> Option<EndpointDetails> {
         let mut group_ids: Vec<&String> = self.dataflow_endpoint_groups.keys().collect();
         group_ids.sort();
         group_ids
             .into_iter()
             .filter_map(|id| self.dataflow_endpoint_groups.get(id))
-            .flat_map(|group| group.endpoint_details.iter())
-            .find(|details| endpoint_name(details) == Some(name))
+            .find_map(|group| {
+                group
+                    .endpoint_details
+                    .iter()
+                    .find(|details| endpoint_name(details) == Some(name))
+                    .map(|details| self.reported_endpoint(details, group))
+            })
+    }
+
+    /// The endpoints of `group` as a read of it REPORTS them: what the create stored, with
+    /// every member the endpoint's own agent decides taken from that agent
+    /// ([`apply_agent_endpoint_health`]).
+    ///
+    /// Derived on read rather than copied into the group, so one record of an agent answers
+    /// every endpoint it carries: an agent registers for its capabilities and then reports
+    /// its status against the agent resource, and both are visible in the endpoints that
+    /// agent carries without either call having to walk the groups.
+    ///
+    /// Shared by every read that reports an endpoint, so two readers of one stored endpoint
+    /// cannot describe its health differently.
+    pub fn reported_endpoint_details(&self, group: &DataflowEndpointGroup) -> Vec<EndpointDetails> {
+        group
+            .endpoint_details
+            .iter()
+            .map(|details| self.reported_endpoint(details, group))
+            .collect()
+    }
+
+    /// One endpoint of `group` as a read of it reports it. See
+    /// [`Self::reported_endpoint_details`].
+    pub fn reported_endpoint(
+        &self,
+        details: &EndpointDetails,
+        group: &DataflowEndpointGroup,
+    ) -> EndpointDetails {
+        let mut reported = details.clone();
+        apply_agent_endpoint_health(
+            &mut reported,
+            self.agent_for_capability(&group.dataflow_endpoint_group_arn),
+        );
+        reported
+    }
+
+    /// The registered agent that carries the capability `capability_arn` addresses, when
+    /// one has registered for it.
+    ///
+    /// A registration carries "data for associating an agent with the capabilities it is
+    /// managing" (`smithy_query(query="shape", shape="DiscoveryData")`), whose
+    /// `capabilityArns` is the only thing in it that names what the agent manages, and the
+    /// capability an agent-carried endpoint belongs to is the dataflow endpoint group that
+    /// holds it — addressed, like every other resource of this service, by the ARN its
+    /// create minted. So an agent carries a group's agent endpoints exactly when its
+    /// registration named that group's ARN.
+    ///
+    /// Two agents may name one capability — an agent registering for a capability another
+    /// already named takes it over, the way a customer replacing the instance their agent
+    /// runs on does — so the LATEST registration carries it, ties broken by agent id, which
+    /// is what makes the answer the same on every call whatever order the map iterates in.
+    pub fn agent_for_capability(&self, capability_arn: &str) -> Option<&Agent> {
+        let mut carrying: Vec<&Agent> = self
+            .agents
+            .values()
+            .filter(|agent| {
+                agent
+                    .discovery_data
+                    .capability_arns
+                    .iter()
+                    .any(|arn| arn == capability_arn)
+            })
+            .collect();
+        carrying.sort_by(|left, right| {
+            left.registered
+                .as_secs_f64()
+                .total_cmp(&right.registered.as_secs_f64())
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        carrying.pop()
     }
 
     /// The dataflows of a contact's pass, as a `DataflowList`: one entry per dataflow edge
@@ -3662,8 +3837,8 @@ impl ComAmazonawsGroundstationGroundstationState {
     ///
     /// An endpoint that is `created` is attached, so its health is the dataplane's own:
     /// `HEALTHY`. An AWS Ground Station Agent endpoint carries no `status` of its own and
-    /// keeps the health it was stored with, which stays `NO_REGISTERED_AGENT` until an
-    /// agent registers for it.
+    /// owes no move here: the health it reports is its AGENT's, derived on every read from
+    /// the agent that carries it ([`apply_agent_endpoint_health`]).
     pub fn settle_due_endpoints(&mut self) {
         let now = SystemTime::now();
         for group in self.dataflow_endpoint_groups.values_mut() {
