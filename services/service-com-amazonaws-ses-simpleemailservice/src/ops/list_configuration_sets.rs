@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the names of this account's configuration sets in one stable order, a
+//! page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +99,16 @@ impl From<ListConfigurationSetsErrorModeled> for ListConfigurationSetsError {
     }
 }
 
+/// The page sizes this operation serves, from the operation's own documentation:
+/// "This operation returns up to 1,000 configuration sets each time it is run. If
+/// your Amazon SES account has more than 1,000 configuration sets, this operation
+/// also returns NextToken." `MaxItems` is only an integer in the model — it
+/// carries no `@range` — so a value outside this window reaches the handler, and
+/// the two ends are not symmetric: a request for more than the operation ever
+/// returns is served the largest page it serves (the ceiling), while a page of no
+/// entries is not a page at all and is refused.
+const MAX_ITEMS_RANGE: std::ops::RangeInclusive<i32> = 1..=1_000;
+
 /// The `ListConfigurationSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +145,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationSets"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let page_size = match input.max_items {
+            // Absent `MaxItems`: the largest page the operation serves, which is
+            // what "returns up to 1,000 configuration sets each time it is run"
+            // documents for a request that names no page size.
+            None => *MAX_ITEMS_RANGE.end() as usize,
+            // At or above the floor, the ceiling is applied by clamping rather
+            // than refusing: a caller asking for more than the operation ever
+            // returns gets the page it does return, plus a `NextToken`.
+            Some(max_items) if max_items >= *MAX_ITEMS_RANGE.start() => {
+                max_items.min(*MAX_ITEMS_RANGE.end()) as usize
+            }
+            Some(max_items) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    format!("Invalid MaxItems <{max_items}>."),
+                ))
+            }
+        };
+
+        // A page token is OPAQUE and self-verifying: only a cursor this listing
+        // issued names a position in it, so anything else is refused instead of
+        // being read as some arbitrary position. Checked before the store is
+        // reached, because the answer does not depend on it. The refusal quotes
+        // the rejected value in angle brackets, as this service words it.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::LISTING_CONFIGURATION_SETS, token)
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                            "Invalid PageToken <{token}>."
+                        ))
+                    })?,
+            ),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListConfigurationSets",
+            ));
+        };
+        // A read: the stored records are projected, never written.
+        let state = state.lock();
+
+        // The store is keyed by the configuration set name, so iteration is in one
+        // stable (lexicographic) order for every caller — which is what makes a
+        // `NextToken` resumable at all. The cursor names the set the next page
+        // starts at, so a page boundary never repeats or skips an entry even when
+        // sets are created or deleted between calls.
+        let page = match resume_from.as_deref() {
+            Some(resume_from) => (
+                std::ops::Bound::Included(resume_from),
+                std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        let mut configuration_sets: Vec<ConfigurationSet> = Vec::new();
+        let mut next_token = None;
+        for (name, configuration_set) in state.configuration_sets.range::<str, _>(page) {
+            if configuration_sets.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::LISTING_CONFIGURATION_SETS,
+                    name,
+                ));
+                break;
+            }
+            // `ConfigurationSet` carries only the set's name; the sending state
+            // and the tracking options a set holds are what
+            // `DescribeConfigurationSet` reports.
+            configuration_sets.push(ConfigurationSet {
+                name: configuration_set.name.clone(),
+            });
+        }
+
+        Ok(ListConfigurationSetsOutput {
+            // Present even when empty: an account with no configuration sets has
+            // an empty list, which is a different answer from an absent member.
+            configuration_sets: Some(configuration_sets),
+            next_token,
+        })
     }
 }

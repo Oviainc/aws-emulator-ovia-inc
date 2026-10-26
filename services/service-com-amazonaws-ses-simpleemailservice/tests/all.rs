@@ -19,6 +19,8 @@ mod configuration_set_tracking_options;
 mod harness;
 #[path = "all/identity_notification_topics.rs"]
 mod identity_notification_topics;
+#[path = "all/ses_configuration_set_listing.rs"]
+mod ses_configuration_set_listing;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]
