@@ -44,7 +44,7 @@ use crate::distribution_lifecycle::{
     call, emulator, is_version_token, past_propagation, Answer, Node, API_VERSION,
 };
 use crate::distribution_tenant_lifecycle::{
-    create_distribution_tenant, escape, multi_tenant_distribution,
+    create_distribution_tenant, escape, managed_certificate_request, multi_tenant_distribution,
 };
 use crate::web_acl_association::{Stated, WEB_ACLS};
 
@@ -232,9 +232,10 @@ pub(crate) async fn create_tenant(
          <DistributionId>{}</DistributionId><Name>{slug}</Name>\
          <Domains><member><Domain>{slug}.example.com</Domain></member></Domains>\
          <Parameters><member><Name>tenantName</Name><Value>{slug}</Value></member></Parameters>\
-         {}</CreateDistributionTenantRequest>",
+         {}{}</CreateDistributionTenantRequest>",
         escape(distribution_id),
-        start.customizations.unwrap_or_default()
+        start.customizations.unwrap_or_default(),
+        managed_certificate_request()
     );
     let created = create_distribution_tenant(router, &body).await;
     assert_eq!(

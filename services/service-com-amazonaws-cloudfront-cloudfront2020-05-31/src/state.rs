@@ -3492,23 +3492,48 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if request.validation_token_host != VALIDATION_TOKEN_HOST_CLOUDFRONT {
             return None;
         }
-        domains
-            .iter()
-            .map(String::as_str)
-            .chain(
+        self.unproven_domain(
+            domains.iter().map(String::as_str).chain(
                 request
                     .primary_domain_name
                     .as_deref()
                     .filter(|domain| !domain.is_empty()),
-            )
-            .find(|domain| self.resolved_cloudfront_endpoint(domain).is_none())
-            .map(str::to_string)
+            ),
+        )
+        .map(str::to_string)
     }
 
     /// Whether `id` names a connection group this store holds — an id no connection group
     /// carries names no entity.
     pub fn holds_connection_group(&self, id: &str) -> bool {
         self.connection_groups.contains_key(id)
+    }
+
+    /// The first of `domains` this service has no proof the account controls, or `None`
+    /// when every one of them is proven.
+    ///
+    /// A domain is where a distribution tenant's viewers reach it, so CloudFront binds one
+    /// only to a domain the account's control of which it can see established. The one
+    /// proof this service can read is its own DNS view
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::resolved_cloudfront_endpoint`]):
+    /// a domain that already resolves to a CloudFront resource in this account is a domain
+    /// whose DNS the account steers. A name in a customer's zone is published by DNS this
+    /// emulator neither runs nor reaches, so nothing here proves it — and an ACM
+    /// certificate the caller names by ARN proves nothing either, since a certificate
+    /// imported into ACM carries no domain validation at all. The remaining way to bind
+    /// such a domain is to ask CloudFront to validate it, which is what a
+    /// `ManagedCertificateRequest` on the call does.
+    ///
+    /// ONE rule for every call that binds a domain to a tenant, and the ONE place the DNS
+    /// view is consulted per domain — the certificate-request check above answers from it
+    /// too — so an admission and a later association cannot drift apart.
+    pub fn unproven_domain<'a, I>(&self, domains: I) -> Option<&'a str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        domains
+            .into_iter()
+            .find(|domain| self.resolved_cloudfront_endpoint(domain).is_none())
     }
 
     /// Whether `id` names an Anycast static IP list this store holds.
@@ -6968,6 +6993,22 @@ pub const DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE: &str =
 pub fn domain_ownership_unverified() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
         message: Some(DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses a domain whose control by this account it has no proof
+/// of with: the condition is that nothing proves the domain, which is a property of what
+/// the account has validated rather than of any value the caller sent, so the sentence
+/// names none of them — no domain, no certificate ARN and no tenant name appears in it.
+/// Recorded behaviour.
+pub const INVALID_DOMAIN_NAME_MESSAGE: &str = "The request contains an invalid domain name.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a domain the account has not proven its
+/// control of to CloudFront
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unproven_domain`]).
+pub fn invalid_domain_name() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_DOMAIN_NAME_MESSAGE.to_string()),
     }
 }
 

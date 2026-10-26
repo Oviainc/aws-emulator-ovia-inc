@@ -15,6 +15,10 @@
 //!   refuses, synchronously, with `InvalidArgument` (HTTP 400). For `self-hosted`, "you
 //!   serve the validation token from your existing infrastructure", so the mode demands
 //!   nothing of DNS and is admitted whatever the domain is.
+//! * A create that asks for NO certificate asks CloudFront to validate nothing, so it is
+//!   admitted only for a domain this service already resolves to a CloudFront resource:
+//!   with no proof of the account's control of the domain, the create is refused with
+//!   `InvalidArgument` (HTTP 400) too, worded with the sentence that condition carries.
 //! * A refusal persists NOTHING: neither the tenant, nor its domains, nor a certificate —
 //!   so the domain is still unclaimed afterwards and the same request with the other token
 //!   host is accepted.
@@ -39,7 +43,7 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CERTIFICATE_STATUS_PENDING_VALIDATION, DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE,
-    MAX_DOMAINS_PER_TENANT, VALIDATION_TOKEN_HOST_CLOUDFRONT,
+    INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAINS_PER_TENANT, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -133,7 +137,10 @@ pub(crate) async fn resolvable_domains(
 /// The edge `DomainName` this service minted for a STANDARD distribution: another name it
 /// is authoritative for, and so a domain that resolves to a CloudFront resource without
 /// being any connection group's routing endpoint.
-async fn distribution_domain_name(router: &MultiServiceRouter, reference: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that needs the other kind of resolvable name reaches it
+/// the same way rather than growing a copy of this.
+pub(crate) async fn distribution_domain_name(router: &MultiServiceRouter, reference: &str) -> String {
     let created = create_distribution(router, &config("standard", reference).xml()).await;
     assert_eq!(
         created.status, 201,
@@ -211,6 +218,17 @@ impl Case {
         out.push_str("</CreateDistributionTenantRequest>");
         out
     }
+
+    /// The sentence this row's refusal carries: a create that asks CloudFront to serve the
+    /// validation token names the condition that the domain does not point at a CloudFront
+    /// resource, while a create that asks CloudFront to validate NOTHING names the
+    /// condition that nothing proves the domain at all.
+    fn refusal_message(&self) -> &'static str {
+        match self.validation_token_host {
+            Some(_) => DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE,
+            None => INVALID_DOMAIN_NAME_MESSAGE,
+        }
+    }
 }
 
 /// The table the rule is asserted over, built against the names this service resolves.
@@ -218,7 +236,7 @@ async fn case_table(router: &MultiServiceRouter) -> Vec<Case> {
     // Enough minted routing endpoints for every row that needs a resolvable domain, plus
     // a distribution's own edge domain: two CloudFront resource kinds a domain can resolve
     // to.
-    let endpoints = resolvable_domains(router, "ownership", 10).await;
+    let endpoints = resolvable_domains(router, "ownership", 11).await;
     let edge_domain = distribution_domain_name(router, "ref-ownership-standard").await;
     let unresolvable = |slot: usize| format!("unresolvable{slot}.example.com");
 
@@ -311,6 +329,14 @@ async fn case_table(router: &MultiServiceRouter) -> Vec<Case> {
             domains: vec![unresolvable(4)],
             validation_token_host: None,
             primary_domain_name: None,
+            admitted: false,
+        },
+        Case {
+            case: "no managed certificate request, a routing endpoint that resolves",
+            name: "ownership-no-certificate-resolvable".to_string(),
+            domains: vec![endpoints[10].clone()],
+            validation_token_host: None,
+            primary_domain_name: None,
             admitted: true,
         },
         Case {
@@ -339,12 +365,13 @@ fn other_validation_token_host() -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// A create that asks CloudFront to serve the HTTP validation token is admitted only for
-/// domains this service resolves to a CloudFront resource; the other token host, and a
-/// create that asks for no certificate, are admitted whatever the domain is. An admitted
-/// create is readable back by every domain it claims; a refused one persists NOTHING — no
-/// tenant under its name, no claim on any of its domains — and the identical request with
-/// the other token host is then accepted, which is what keys the refusal on the token host
-/// rather than on the domain string.
+/// domains this service resolves to a CloudFront resource, and so is a create that asks for
+/// no certificate at all; the other token host asks CloudFront to validate the domain
+/// itself, and is admitted whatever the domain is. An admitted create is readable back by
+/// every domain it claims; a refused one persists NOTHING — no tenant under its name, no
+/// claim on any of its domains — and the identical request with the other token host is
+/// then accepted, which is what keys the refusal on who validates the domain rather than on
+/// the domain string.
 #[tokio::test]
 async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfront() {
     let router = emulator();
@@ -450,8 +477,9 @@ async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfro
         );
         let message = created.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE,
-            "case {case}: expected the ownership-verification message, got {message:?}"
+            message,
+            row.refusal_message(),
+            "case {case}: expected the sentence this condition carries, got {message:?}"
         );
 
         // Nothing was persisted: no tenant under that name, and no claim on any domain.
