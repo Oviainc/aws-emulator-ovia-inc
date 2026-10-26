@@ -49,7 +49,7 @@ const NO_CONTENT: u16 = 204;
 
 /// A tag map of `count` distinct, well-formed entries — the count dimension of the
 /// rule, with nothing else about the map at fault.
-fn numbered_tags(count: usize) -> Value {
+pub(crate) fn numbered_tags(count: usize) -> Value {
     let map: serde_json::Map<String, Value> = (0..count)
         .map(|index| (format!("key{index}"), Value::String(format!("value{index}"))))
         .collect();
@@ -59,13 +59,13 @@ fn numbered_tags(count: usize) -> Value {
 /// `text` repeated until it is `count` CHARACTERS long. `text` is one character, so a
 /// multi-byte one gives a string whose byte length is a multiple of its char length —
 /// which is what separates counting characters from counting bytes.
-fn repeated(text: &str, count: usize) -> String {
+pub(crate) fn repeated(text: &str, count: usize) -> String {
     text.repeat(count)
 }
 
 /// A tag map built from `(key, value)` pairs, so a row can name a key the `json!`
 /// macro could not take as a literal.
-fn tags_of(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tags_of(pairs: &[(String, String)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -75,7 +75,7 @@ fn tags_of(pairs: &[(String, String)]) -> Value {
 }
 
 /// A one-entry tag map with the given key and value.
-fn one_tag(key: String, value: String) -> Value {
+pub(crate) fn one_tag(key: String, value: String) -> Value {
     tags_of(&[(key, value)])
 }
 
@@ -210,7 +210,7 @@ fn accepted_rows() -> Vec<(String, Value)> {
 }
 
 /// The `errors` attribution of a refusal body, as the member-keyed map it is.
-fn errors_of(body: &Value) -> BTreeMap<String, Vec<String>> {
+pub(crate) fn errors_of(body: &Value) -> BTreeMap<String, Vec<String>> {
     body.get("errors")
         .and_then(Value::as_object)
         .map(|errors| {

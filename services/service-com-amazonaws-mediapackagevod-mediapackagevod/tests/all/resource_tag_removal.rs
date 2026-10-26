@@ -89,7 +89,7 @@ async fn untag(
 
 /// The tag map `ListTagsForResource` reports for `arn` in `region`, asserting the read
 /// itself succeeded.
-async fn listed_tags(
+pub(crate) async fn listed_tags(
     router: &MultiServiceRouter,
     region: &str,
     arn: &str,

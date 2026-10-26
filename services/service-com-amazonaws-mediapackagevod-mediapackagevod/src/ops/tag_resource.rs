@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. ADDS to the resource its `ResourceArn` names the tags `Tags` names,
+//! leaving every other tag of that resource in place, and answers the modelled 204 with
+//! no body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The map is MERGED into what the resource already carries, which is what "Adds tags to
+//! the specified resource" means: a key the resource does not carry yet becomes a new
+//! tag, a key it already carries takes the request's value (a tag key is unique per
+//! resource, so a second value for one key would not be a second tag), and a key the
+//! request does not name is untouched. Replacing the whole map instead would delete tags
+//! the caller never named. An empty map therefore adds nothing and still answers 204.
+//!
+//! The tags are written to the ONE tag store (`tags_by_arn`) every operation of this
+//! service reads and writes, so the next `ListTagsForResource`, describe or listing of
+//! that resource reports the merged map, and nothing else about the resource changes.
+//! The same request repeated writes the same tags again, so the call is idempotent.
+//!
+//! A `Tags` map that breaks AWS's resource-tagging restrictions is refused with
+//! `UnprocessableEntityException` (HTTP 422) attributed to that member
+//! ([`crate::state::check_tags`]) and nothing is stored - the same check, with the same
+//! wording, the creates of this service judge a tag map by. How many tags a resource may
+//! carry is a restriction on the RESOURCE, so it is judged against the map the merge
+//! would leave behind rather than against the request's map alone
+//! ([`crate::state::check_tag_total`]): an addition that would take the resource past the
+//! limit is refused and adds nothing.
+//!
+//! `ResourceArn` is resolved the way every other operation of this REGIONAL control
+//! plane resolves a resource: only a resource held in the Region the request is served
+//! in exists, so the ARN has to be exactly the one this service issued for a resource it
+//! still holds there
+//! ([`crate::state::ComAmazonawsMediapackagevodMediapackagevodState::holds_arn_resource`]).
+//! An ARN that resolves to nothing - another Region's, another account's, an id this
+//! service never created, or a value that is not an ARN of this service at all - is
+//! answered with the modelled `NotFoundException` (HTTP 404) rather than with a 204 that
+//! would claim tags were stored for a resource this service does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +81,20 @@
 //! * `ResourceArn` (__string) **required** — The Amazon Resource Name (ARN) for the resource.
 //!   You can get this from the response to any request to the resource.
 //! * `Tags` (__mapOf__string) **required** — A collection of tags associated with a resource
+//!
+//! ## Errors
+//!
+//! The model lists NONE for this operation
+//! (`smithy_query(query="operation",operation="TagResource")` reports `errors: []`), so
+//! the shapes below are widened in through `extra_errors`; each is a shape this SERVICE
+//! models and other operations of it declare:
+//!
+//! * `NotFoundException` (HTTP 404) - `ResourceArn` names no resource this service holds
+//!   in the Region the request is served in: the same condition, and the same channel,
+//!   `ListTagsForResource`, `UntagResource` and the describes answer a resource they hold
+//!   nothing for with.
+//! * `InternalServerErrorException` (HTTP 500) - the shared state store is unreachable,
+//!   worded exactly as every other operation of this service words it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -95,9 +134,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediapackagevod#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediapackagevod#TagResource",
+    extra_errors = ["InternalServerErrorException", "NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    /// Declared on the service (and on every operation that resolves a resource),
+    /// not on this operation: the shared store could not be reached.
+    InternalServerErrorException(InternalServerErrorException),
+    /// Declared on the service (and on every operation that resolves a resource),
+    /// not on this operation: the ARN names no resource this service holds here.
+    NotFoundException(NotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,23 +194,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = TAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
+    /// Add the tags `Tags` names to the resource `ResourceArn` names. Only those keys
+    /// change: every other tag of the resource, and the resource record itself, is left
+    /// exactly as it was.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // MediaPackage VOD is regional: this request resolves only the resources of
+        // the Region its SigV4 credential scope names.
+        let region = crate::state::request_region(ctx.parts());
+        // Judged BEFORE anything is written, so a refused call leaves the stored tags
+        // exactly as it found them. The same restrictions, worded the same way, the
+        // creates of this service judge a `Tags` map by.
+        crate::state::check_tags(Some(&input.tags))?;
+        let mut state = store.lock();
+        if !state.holds_arn_resource(&region, &input.resource_arn) {
+            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::arn_resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+            .into());
+        }
+        // How many tags a RESOURCE may carry is a restriction on the stored map, so the
+        // merged map is what it is judged against: adding a key the resource already
+        // carries replaces that tag and adds nothing to the count.
+        crate::state::check_tag_total(
+            state.tag_count_after_adding(&input.resource_arn, &input.tags),
+        )?;
+        // The ONE tag store, keyed by the resource's ARN: merging these entries here is
+        // what the describes, the listings and `ListTagsForResource` of this resource
+        // all report next. A key the request does not name keeps its stored value.
+        state.merge_tags(&input.resource_arn, &input.tags);
+        Ok(TagResourceOutput)
     }
 }

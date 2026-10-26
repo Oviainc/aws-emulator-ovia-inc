@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The ONE tag store, keyed by the resource's ARN: whatever the create (and,
-        // once they are implemented, `TagResource` / `UntagResource`) wrote for this
-        // resource is what the describes and the listings of it report too.
+        // The ONE tag store, keyed by the resource's ARN: whatever the create,
+        // `TagResource` and `UntagResource` wrote for this resource is what the
+        // describes and the listings of it report too.
         Ok(ListTagsForResourceOutput {
             tags: Some(state.tags_of(&input.resource_arn)),
         })

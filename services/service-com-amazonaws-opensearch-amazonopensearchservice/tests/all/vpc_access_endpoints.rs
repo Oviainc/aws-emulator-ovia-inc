@@ -158,7 +158,7 @@ fn endpoints(status: &Value, case: &str) -> Vec<(String, String)> {
                 });
                 (key.clone(), host.to_owned())
             })
-            .collect(),
+            .collect::<Vec<(String, String)>>(),
         other => panic!("case {case:?}: expected an Endpoints map or none at all, got {other:?}"),
     };
     entries.sort_by(|left, right| left.0.cmp(&right.0));

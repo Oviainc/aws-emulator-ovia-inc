@@ -9,11 +9,9 @@
 //!
 //! The answers with no content are the ones whose output shape has no members: each of the
 //! three deletes, which serve the recorded `204 No Content` (`DeleteAsset`,
-//! `DeletePackagingConfiguration`, `DeletePackagingGroup`), and `UntagResource`, modelled
-//! at HTTP 204 (`smithy_query(query="digest")`). The rule is asserted over all four rather
-//! than over the one a recording happened to cover; `TagResource` is the fifth such
-//! operation in the model and is still a stub, so it answers an envelope with a body and is
-//! asserted below with the other bodied answers.
+//! `DeletePackagingConfiguration`, `DeletePackagingGroup`), and `TagResource` and
+//! `UntagResource`, both modelled at HTTP 204 (`smithy_query(query="digest")`). The rule is
+//! asserted over all five rather than over the one a recording happened to cover.
 //!
 //! Each test is a TABLE whose rows differ along what the rule generalises over: which
 //! operation answers, which resource type it addresses, the FORM of the resource id, how
@@ -46,7 +44,7 @@ use crate::resource_tag_removal::untag_route;
 const EMPTY_BODY_LENGTH: &str = "0";
 
 /// The status every bodyless answer of this service carries: the modelled 204 of
-/// `UntagResource` and the recorded 204 of each delete.
+/// `TagResource` and `UntagResource` and the recorded 204 of each delete.
 const NO_CONTENT: u16 = 204;
 
 /// The modelled refusal of a resource this service does not hold
@@ -149,9 +147,13 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// Every answer of this service that carries no body states `content-length: 0` — the four
-/// implemented bodyless operations, over every row — and each of those answers really did
-/// the work it reports.
+/// The tag every row's `TagResource` adds, so that call has work to report: a key no row
+/// creates its resources with and no row's removal names.
+const ADDED_TAG: (&str, &str) = ("framing", "stated");
+
+/// Every answer of this service that carries no body states `content-length: 0` — the five
+/// bodyless operations, over every row — and each of those answers really did the work it
+/// reports.
 #[tokio::test]
 async fn every_bodyless_answer_states_its_length() {
     let router = crate::resource_tag_listing::router();
@@ -171,8 +173,30 @@ async fn every_bodyless_answer_states_its_length() {
         let asset_arn =
             create_with_tags(&router, REGION, KINDS[2], &asset, row.tags.as_ref(), row.case).await;
 
+        // `TagResource`: a bodyless 204 for each resource type, adding one tag.
+        let mut tagged = expected_map(row.tags.as_ref());
+        tagged.insert(ADDED_TAG.0.to_string(), ADDED_TAG.1.to_string());
+        for (kind, arn) in KINDS.iter().zip([&group_arn, &config_arn, &asset_arn]) {
+            let case = format!("{}/{}/TagResource", row.case, kind.name);
+            let answer = dispatch(
+                &router,
+                REGION,
+                "POST",
+                &tags_route(arn),
+                Some(json!({ "tags": { ADDED_TAG.0: ADDED_TAG.1 } })),
+            )
+            .await;
+            assert_empty_and_framed(&case, &answer, NO_CONTENT);
+            // The 204 reported an addition rather than being an empty answer to nothing.
+            let stored = listed_tags(&router, arn, &case).await;
+            assert_eq!(
+                stored, tagged,
+                "case {case:?}: after adding {ADDED_TAG:?} expected {tagged:?}, got {stored:?}"
+            );
+        }
+
         // `UntagResource`: a bodyless 204 for each resource type.
-        let mut expected = expected_map(row.tags.as_ref());
+        let mut expected = tagged.clone();
         for key in row.remove {
             expected.remove(*key);
         }
@@ -245,11 +269,10 @@ async fn every_bodyless_answer_states_its_length() {
 }
 
 /// RULE, the other half: a response that carries content is left exactly as the model's
-/// protocol renders it — on the success path, on the error path and on the
-/// not-yet-implemented path alike. This service adds no framing of its own to such an
-/// answer (the protocol states no length on a bodied response and leaves the framing to
-/// the transport), and a length that IS stated is the body's own, never the zero of an
-/// answer with no content.
+/// protocol renders it — on the success path and on the error path alike. This service adds
+/// no framing of its own to such an answer (the protocol states no length on a bodied
+/// response and leaves the framing to the transport), and a length that IS stated is the
+/// body's own, never the zero of an answer with no content.
 #[tokio::test]
 async fn an_answer_with_a_body_is_framed_from_the_body_it_carries() {
     let router = crate::resource_tag_listing::router();
@@ -266,8 +289,7 @@ async fn an_answer_with_a_body_is_framed_from_the_body_it_carries() {
     .await;
 
     // Rows: a create (200), a read, a listing, a tag listing, a read of a resource this
-    // service does not hold (404), a refused delete (404) and the one modelled bodyless
-    // operation that is still a stub, which answers the 501 envelope with a body.
+    // service does not hold (404) and a refused delete (404).
     let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
         (
             "CreatePackagingGroup",
@@ -305,12 +327,6 @@ async fn an_answer_with_a_body_is_framed_from_the_body_it_carries() {
             "DELETE",
             "/assets/no-such-asset".to_string(),
             None,
-        ),
-        (
-            "TagResource, still a stub",
-            "POST",
-            tags_route(&group_arn),
-            Some(json!({ "tags": { "environment": "production" } })),
         ),
     ];
 

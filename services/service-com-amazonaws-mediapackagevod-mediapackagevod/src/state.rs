@@ -159,6 +159,11 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// by this service rather than by the length of the key the caller sent.
 const TAG_KEY_LABEL_CHARS: usize = 32;
 
+/// The wire name of the member a caller's tag map arrives on — `tags` on every request
+/// that carries one, the creates and `TagResource` alike — which is what a refusal about
+/// that map is attributed to.
+const TAGS_MEMBER: &str = "tags";
+
 /// Length of the checksum prefix a pagination cursor carries, so a cursor this
 /// service did not issue is detectable rather than merely malformed.
 const PAGE_TOKEN_CHECK_LEN: usize = 8;
@@ -454,6 +459,42 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.tags_by_arn.insert(arn.to_string(), stored);
+    }
+
+    /// ADD `tags` to the map stored for `arn`, leaving every tag of that resource the
+    /// map does not name in place.
+    ///
+    /// A key the resource does not carry yet becomes a new tag; a key it already
+    /// carries takes the new value, since a tag key is unique per resource. Keys are
+    /// compared verbatim — a key differing in case or in surrounding whitespace is a
+    /// different key — and an empty map adds nothing, so the resource is left as it was.
+    ///
+    /// Stores what it is given: the caller-supplied map is judged against AWS's tagging
+    /// restrictions by [`check_tags`] and [`check_tag_total`] before a handler reaches
+    /// this, so a map that breaks them never gets here.
+    pub fn merge_tags(&mut self, arn: &str, tags: &HashMap<String, String>) {
+        if tags.is_empty() {
+            // Nothing to add, so no row is created for a resource that had none.
+            return;
+        }
+        let stored = self.tags_by_arn.entry(arn.to_string()).or_default();
+        for (key, value) in tags {
+            stored.insert(key.clone(), value.clone());
+        }
+    }
+
+    /// How many tags the resource `arn` would carry once `added` is merged into its
+    /// stored map — what [`check_tag_total`] judges against [`MAX_TAGS`].
+    ///
+    /// An added key the resource already carries REPLACES that tag rather than adding
+    /// one, so it counts once; a resource with no stored map counts only the added keys.
+    pub fn tag_count_after_adding(&self, arn: &str, added: &HashMap<String, String>) -> usize {
+        let stored = self.tags_by_arn.get(arn);
+        let fresh = added
+            .keys()
+            .filter(|key| stored.is_none_or(|stored| !stored.contains_key(key.as_str())))
+            .count();
+        stored.map_or(0, BTreeMap::len) + fresh
     }
 
     /// Forget the tags stored for `arn`, so a deleted resource leaves none behind.
@@ -1043,6 +1084,22 @@ pub fn check_tag_keys(
     }
 }
 
+/// Refuse a tag map that would leave a resource carrying more than [`MAX_TAGS`] tags.
+///
+/// The restriction is on the RESOURCE, not on one request, so `total` is how many tags
+/// the resource ends up with: the whole map for a create, and the stored map merged with
+/// the added one for `TagResource` ([`ComAmazonawsMediapackagevodMediapackagevodState::tag_count_after_adding`]).
+/// One place decides it, so both operations refuse the same request the same way.
+pub fn check_tag_total(total: usize) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    if total > MAX_TAGS {
+        return Err(crate::scaffolded::UnprocessableEntity::member(
+            TAGS_MEMBER,
+            format!("must carry at most {MAX_TAGS} tags, not {total}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a caller-supplied `Tags` map that breaks AWS's universal resource-tagging
 /// restrictions: more than [`MAX_TAGS`] entries, a key shorter than
 /// [`MIN_TAG_KEY_CHARS`] or longer than [`MAX_TAG_KEY_CHARS`], a value longer than
@@ -1057,17 +1114,8 @@ pub fn check_tag_keys(
 pub fn check_tags(
     tags: Option<&HashMap<String, String>>,
 ) -> Result<(), crate::scaffolded::UnprocessableEntity> {
-    const MEMBER: &str = "tags";
     let Some(tags) = tags else { return Ok(()) };
-    if tags.len() > MAX_TAGS {
-        return Err(crate::scaffolded::UnprocessableEntity::member(
-            MEMBER,
-            format!(
-                "must carry at most {MAX_TAGS} tags, not {}",
-                tags.len()
-            ),
-        ));
-    }
+    check_tag_total(tags.len())?;
     let mut entries: Vec<(&str, &str)> = tags
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -1076,12 +1124,12 @@ pub fn check_tags(
     let mut violations: Vec<(String, String)> = Vec::new();
     for (key, value) in entries {
         for phrase in tag_key_violations(key) {
-            violations.push((MEMBER.to_string(), phrase));
+            violations.push((TAGS_MEMBER.to_string(), phrase));
         }
         let length = value.chars().count();
         if length > MAX_TAG_VALUE_CHARS {
             violations.push((
-                MEMBER.to_string(),
+                TAGS_MEMBER.to_string(),
                 format!(
                     "the value of key {} must be at most {MAX_TAG_VALUE_CHARS} characters, \
                      not {length}",
