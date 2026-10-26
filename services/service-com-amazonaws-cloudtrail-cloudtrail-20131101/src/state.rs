@@ -1761,14 +1761,10 @@ pub fn parse_event_data_store_identifier(
 ) -> Result<EventDataStoreIdentifier, EventDataStoreRejection> {
     let reject = || Err(EventDataStoreRejection::InvalidArn(value.to_string()));
     if !value.contains(':') {
-        // The id suffix form, with or without the `eventdatastore/` resource
-        // prefix the full ARN carries.
-        let id = value
-            .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
-            .unwrap_or(value);
-        if !is_event_data_store_id(id) {
+        // The id suffix form, read by this service's ONE reading of it.
+        let Some(id) = read_event_data_store_id_suffix(value) else {
             return reject();
-        }
+        };
         return Ok(EventDataStoreIdentifier {
             id: id.to_string(),
             region: None,
@@ -1794,6 +1790,23 @@ pub fn parse_event_data_store_identifier(
         }),
         _ => reject(),
     }
+}
+
+/// Read the BARE id form of an event data store identifier — "the ID suffix of the
+/// ARN" — with or without the `eventdatastore/` resource prefix the whole ARN carries,
+/// and only when the suffix is an id this service could have minted
+/// ([`is_event_data_store_id`]). `None` is a bare value in no id form at all.
+///
+/// The ONE reading of that form: [`parse_event_data_store_identifier`] reads it for the
+/// members documented as "the ARN (or the ID suffix of the ARN) of an event data store",
+/// and the channel destination reader ([`crate::state::channels`]) reads it for a
+/// `Destination$Location` — whose refusal class for a value in NO identifier form is its
+/// own — so the resource prefix and the letter case cannot drift between the two.
+pub fn read_event_data_store_id_suffix(value: &str) -> Option<&str> {
+    let id = value
+        .strip_prefix(EVENT_DATA_STORE_RESOURCE_PREFIX)
+        .unwrap_or(value);
+    is_event_data_store_id(id).then_some(id)
 }
 
 /// Whether `value` is an id this service could have minted for an event data

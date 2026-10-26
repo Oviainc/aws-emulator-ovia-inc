@@ -17,6 +17,8 @@ mod access_grants_data_plane;
 mod access_grants_instance;
 #[path = "all/access_grants_location_register.rs"]
 mod access_grants_location_register;
+#[path = "all/access_grants_location_update.rs"]
+mod access_grants_location_update;
 #[path = "all/access_point_lifecycle.rs"]
 mod access_point_lifecycle;
 #[path = "all/batch_job_lifecycle.rs"]

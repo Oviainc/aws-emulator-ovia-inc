@@ -226,7 +226,8 @@ fn next_token(reply: &Reply) -> Option<String> {
 /// `ListContactLists` binds `NextToken` to `@httpQuery`, and the token is base64, whose
 /// alphabet includes `+`, `/` and `=` — characters a query string gives its own meaning
 /// to, so the value is escaped the way an SDK escapes it. Shared with the other suites
-/// of this test binary that walk an `@httpQuery` token.
+/// of this test binary that walk an `@httpQuery` token or put a filter in a query
+/// string.
 pub(crate) fn query_escaped(token: &str) -> String {
     token
         .chars()

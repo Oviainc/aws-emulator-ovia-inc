@@ -42,6 +42,15 @@ const CHANNEL_RESOURCE_TYPE: &str = "channel";
 /// partition names a resource no call here can reference.
 const AWS_PARTITION: &str = "aws";
 
+/// What a value WRITTEN as an ARN begins with — the first field of every ARN is the
+/// literal `arn` (`::service_common::arn::parse`).
+///
+/// A member that admits an ARN *or* a bare resource id reads this prefix to tell which
+/// form the caller wrote, because the two forms are refused differently: a value written
+/// as an ARN that is not a well-formed one of the expected resource is a malformed ARN,
+/// while a value in neither form is no identifier at all.
+const ARN_SCHEME_PREFIX: &str = "arn:";
+
 /// Whether `value` is written the way this service's model writes a `UUID`
 /// (`com.amazonaws.cloudtrail#UUID`: `@length 36`, `@pattern ^[a-f0-9\-]+$`) — five
 /// lowercase-hex groups of 8-4-4-4-12 digits, the canonical form AWS mints a channel
@@ -101,6 +110,16 @@ pub const CHANNEL_NOT_FOUND_HTTP_STATUS: u16 = 400;
 /// shape's body and changes only the status line.
 pub const EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS: u16 = 400;
 
+/// The `InvalidParameterException` text a `Destination$Location` that is no event data
+/// store identifier at all is refused with.
+///
+/// FIXED text: it names neither the value the request sent nor the channel, because the
+/// refusal is about the member, not about which characters it carried — and it states
+/// the two forms the member admits, an event data store ARN or the bare id of one, which
+/// is what [`read_destination_event_data_store`] reads.
+pub const DESTINATION_EVENT_DATA_STORE_INVALID_MESSAGE: &str =
+    "The EventDataStore value must be a valid EventDataStore ARN or ID.";
+
 /// Read a `Destination$Location`: `arn:aws:cloudtrail:<region>:<account>:eventdatastore/<uuid>`,
 /// answering the Region and the store id it carries — or `None` when `value` is not one.
 ///
@@ -110,9 +129,10 @@ pub const EVENT_DATA_STORE_NOT_FOUND_HTTP_STATUS: u16 = 400;
 /// and a 12-digit account, because an event data store is a Regional, account-owned
 /// resource, and the resource must be an `eventdatastore` carrying an id in the modelled
 /// `UUID` form. Stricter than [`super::parse_event_data_store_identifier`], which also
-/// accepts the bare id the query operations' members document — a `Destination$Location`
-/// is documented as an ARN, so only the ARN form is read here; expressing this as a
-/// narrowing of that one grammar belongs with the store operations that own it.
+/// accepts the bare id the query operations' members document — this reads the ARN form
+/// alone, and [`read_destination_event_data_store`] is what reads the other form a
+/// `Destination$Location` takes; expressing this as a narrowing of that one grammar
+/// belongs with the store operations that own it.
 fn parse_destination_event_data_store_arn(value: &str) -> Option<(&str, &str)> {
     let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
     let region = ::service_common::arn::region_of(value, SERVICE_NAMESPACE)?;
@@ -127,6 +147,53 @@ fn parse_destination_event_data_store_arn(value: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((region, id))
+}
+
+/// Read a `Destination$Location` as the event data store it names, in either of the two
+/// forms the member admits — an event data store ARN, or the bare id of one.
+///
+/// A value is classified by the FORM the caller wrote it in, because the two malformed
+/// forms are distinct refusals:
+///
+/// * written as an ARN ([`ARN_SCHEME_PREFIX`]) ⇒ it must BE an event data store ARN
+///   ([`parse_destination_event_data_store_arn`]); one that is not is a malformed ARN,
+///   refused with [`DestinationRejection::ArnInvalid`] naming the value as given.
+/// * in neither form — not written as an ARN and not the bare id of a store, read by
+///   this service's ONE reading of that form ([`super::read_event_data_store_id_suffix`],
+///   which [`super::parse_event_data_store_identifier`] reads it with too) ⇒ it is no
+///   event data store identifier at all, refused with
+///   [`DestinationRejection::InvalidParameter`] and
+///   [`DESTINATION_EVENT_DATA_STORE_INVALID_MESSAGE`].
+///
+/// Whether a store of that id EXISTS is the next question and not a question about the
+/// identifier's form, so a readable identifier of either form is answered here and
+/// resolved against the registry by [`ComAmazonawsCloudtrailCloudtrail20131101State::resolve_channel_destination`].
+fn read_destination_event_data_store(
+    location: &str,
+    request_region: &str,
+) -> Result<super::EventDataStoreIdentifier, DestinationRejection> {
+    if location.starts_with(ARN_SCHEME_PREFIX) {
+        let Some((region, id)) = parse_destination_event_data_store_arn(location) else {
+            return Err(DestinationRejection::ArnInvalid(
+                super::event_data_store_arn_invalid_message(location, request_region),
+            ));
+        };
+        return Ok(super::EventDataStoreIdentifier {
+            id: id.to_string(),
+            region: Some(region.to_string()),
+        });
+    }
+    let Some(id) = super::read_event_data_store_id_suffix(location) else {
+        return Err(DestinationRejection::InvalidParameter(
+            DESTINATION_EVENT_DATA_STORE_INVALID_MESSAGE.to_string(),
+        ));
+    };
+    // A bare id carries no Region, so it names a store of the Region the call
+    // addresses — the same completion every other bare store id of this service gets.
+    Ok(super::EventDataStoreIdentifier {
+        id: id.to_string(),
+        region: None,
+    })
 }
 
 /// The registry key: a channel id and the Region the channel lives in.
@@ -234,8 +301,8 @@ pub fn validate_channel_source(source: &str) -> Result<(), String> {
 /// way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationRejection {
-    /// Not an event data store ARN at all ⇒ `EventDataStoreARNInvalidException`
-    /// (HTTP 400).
+    /// WRITTEN as an ARN but not a well-formed event data store ARN ⇒
+    /// `EventDataStoreARNInvalidException` (HTTP 400).
     ArnInvalid(String),
     /// A well-formed event data store ARN naming no store the caller's Region can
     /// log to ⇒ `EventDataStoreNotFoundException`, answered with
@@ -244,8 +311,9 @@ pub enum DestinationRejection {
     /// The store exists but is not usable ⇒ `InactiveEventDataStoreException`
     /// (HTTP 400).
     Inactive(String),
-    /// A destination this operation cannot create ⇒ `InvalidParameterException`
-    /// (HTTP 400).
+    /// A destination this operation cannot create — a `Type` it does not serve, or a
+    /// `Location` that is no event data store identifier at all (neither an ARN nor the
+    /// bare id of a store) ⇒ `InvalidParameterException` (HTTP 400).
     InvalidParameter(String),
 }
 
@@ -357,7 +425,7 @@ pub fn is_minted_channel_id(value: &str) -> bool {
 /// addresses no key the registry orders, which is the reason
 /// [`super::is_minted_uuid_id`] states that form once for this service.
 pub fn parse_channel_identifier(value: &str) -> Option<ChannelIdentifier> {
-    if value.starts_with("arn:") {
+    if value.starts_with(ARN_SCHEME_PREFIX) {
         let arn = ::service_common::arn::parse_of(value, SERVICE_NAMESPACE)?;
         if arn.partition != AWS_PARTITION || arn.region.is_empty() || arn.account.is_empty() {
             return None;
@@ -477,12 +545,13 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     /// Check one `Destination` of a channel, for a call made in `request_region`.
     ///
     /// A channel created through `CreateChannel` logs to event data stores, so a
-    /// destination must be typed `EVENT_DATA_STORE` and its `Location` must be the
-    /// ARN of a store that exists in the SAME Region as the channel — a store lives
-    /// in one Region and a channel can only log to one it shares a Region with — and
-    /// be usable. The refusals are distinct: not an event data store ARN at all, a
-    /// well-formed ARN naming no store this Region can log to, and a store that is
-    /// inactive.
+    /// destination must be typed `EVENT_DATA_STORE` and its `Location` must name a
+    /// store that exists in the SAME Region as the channel — a store lives in one
+    /// Region and a channel can only log to one it shares a Region with — and be
+    /// usable. The refusals are distinct, and each class has its own modelled error:
+    /// a `Location` in neither identifier form, one written as an ARN that is not an
+    /// event data store ARN, a readable identifier naming no store this Region can log
+    /// to, and a store that is inactive.
     pub fn resolve_channel_destination(
         &self,
         destination: &Destination,
@@ -498,32 +567,37 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
                 destination.r#type
             )));
         }
-        // A `Location` is documented as "the ARN of an event data store", so only
-        // the ARN form is read here; the refusal wording is the store module's
+        // Which identifier form the `Location` is written in decides how an
+        // unreadable one is refused; the ARN-malformed wording is the store module's
         // shared one, which every operation that reads a store identifier answers
         // with.
-        let Some((arn_region, id)) = parse_destination_event_data_store_arn(location) else {
-            return Err(DestinationRejection::ArnInvalid(
-                super::event_data_store_arn_invalid_message(location, request_region),
-            ));
+        let identifier = read_destination_event_data_store(location, request_region)?;
+        // The store the identifier addressed, which is what a refusal naming a store
+        // names: an ARN as the request wrote it, and a bare id as the ARN it
+        // completes to in the Region the call addresses.
+        let addressed = if identifier.region.is_some() {
+            location.to_string()
+        } else {
+            identifier.arn(request_region)
         };
-        // The store has to be the one this ARN names AND be in the Region the call
-        // was made in; a store of another Region names no store this channel can
-        // log to.
+        // The store has to be the one the identifier addresses AND be in the Region
+        // the call was made in; a store of another Region is no store this channel
+        // can log to.
+        let addressed_region = identifier.addressed_region(request_region);
         let store = self
             .event_data_stores
-            .get(id)
-            .filter(|store| store.region == arn_region && store.region == request_region);
+            .get(&identifier.id)
+            .filter(|store| store.region == addressed_region && store.region == request_region);
         let Some(store) = store else {
             return Err(DestinationRejection::NotFound(
-                super::event_data_store_not_found_message(location),
+                super::event_data_store_not_found_message(&addressed),
             ));
         };
         // A store awaiting deletion is the one status the modelled
         // `InactiveEventDataStoreException` reports, for ingestion as for queries.
         if !store.status.is_queryable() {
             return Err(DestinationRejection::Inactive(format!(
-                "The event data store {location} is inactive."
+                "The event data store {addressed} is inactive."
             )));
         }
         Ok(store)

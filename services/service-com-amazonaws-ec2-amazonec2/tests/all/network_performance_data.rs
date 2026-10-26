@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `GetAwsNetworkPerformanceData` end-to-end: which series a request is answered with,
-//! which metric points each series carries, how the answers page, and which requests are
-//! refused.
+//! which metric points each series carries, what latency those points report, how the
+//! answers page, and which requests are refused.
 //!
 //! Every call goes over the wire the service actually speaks, through the shared
 //! `super::ec2_query` harness: an `application/x-www-form-urlencoded` ec2Query POST
@@ -17,21 +17,27 @@
 //!    `Destination`, `Metric`, `Statistic` and `Period` come back on the response ("A
 //!    user-defined ID associated with a data query that's returned in the `dataResponse`
 //!    identifying the query", `DataQuery$Id`).
-//! 2. No series carries a metric point, for any location, any aggregation period and any
-//!    window: a metric point is a MEASUREMENT of the Amazon network between two locations,
-//!    and this emulator has no such network and records no observation of one. The answer
-//!    is an empty `metricPointSet` — never a latency it did not measure — and that holds
-//!    for a window of any length, anywhere in or out of the calendar.
-//! 3. `MaxResults`/`NextToken` page the data responses, each page holding at most
+//! 2. A series is reported with one metric point per aggregation period of the requested
+//!    window — "the value is aggregated from the `startDate` to the `endDate`"
+//!    (`MetricPoint`) — running from `StartTime`, the last one ending at `EndTime`, each
+//!    carrying a positive round-trip latency in milliseconds and the status of a healthy
+//!    window.
+//! 3. The latency a series reports is the one the Amazon network between its two locations
+//!    costs: it is the same whichever way round the pair is named, it is at its smallest
+//!    between two locations of one Region, and it grows with the distance between the
+//!    Regions named — and a location names the same place under all three forms EC2 gives
+//!    it (a Region code, a zone name and a zone ID).
+//! 4. `MaxResults`/`NextToken` page the data responses, each page holding at most
 //!    `MaxResults` of them, and a walk answers every query exactly once.
-//! 4. A request that names no series, no query or no window, or names something that
+//! 5. A request that names no series, no query or no window, or names something that
 //!    cannot exist, is refused — never answered as a series that happens to be empty — and
 //!    `DryRun` performs nothing.
-//! 5. The operation is a read: it answers two identical calls identically.
+//! 6. The operation is a read: it answers two identical calls identically.
 //!
 //! Each table spans the class its rule generalises over (the number of queries, the
 //! aggregation period, the form of a location, the order of the queries, the length and
-//! placement of the window, the page size) rather than one recorded request.
+//! placement of the window, the distance between two Regions, the page size) rather than
+//! one recorded request.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,6 +98,34 @@ const REGION_THAT_DOES_NOT_EXIST: &str = "ap-southeast-9";
 /// call's queries are reported over several pages rather than refused.
 const MAX_RESPONSES_PER_PAGE: usize = 20;
 
+/// How many metric points one series is reported with at most.
+///
+/// SOURCE: the ceiling the service documents on `MAX_METRIC_POINTS_PER_SERIES`, which
+/// bounds the response to a window the calendar alone bounds.
+const MAX_METRIC_POINTS_PER_SERIES: usize = 1_000;
+
+/// The widest round trip the modelled network can cost, in milliseconds: half the Earth's
+/// circumference is about 20,040 km, and a round trip is twice that path, lengthened for a
+/// cable route and crossed at about 200 km/ms — under 300 ms even between two antipodes.
+/// Nothing this operation reports may exceed it.
+const MAX_PLAUSIBLE_ROUND_TRIP_MS: f32 = 300.0;
+
+/// The round trip between Oregon and Northern Virginia, in milliseconds, and how far a
+/// report of it may sit from that figure.
+///
+/// SOURCE: the two Regions are about 3,500 km apart, so a cable round trip between them is
+/// a little over 50 ms — which is the order the Amazon backbone shows between those two
+/// Regions. The anchor pins the SCALE of what is reported, not only the ordering, so a
+/// model whose units or constants moved would be caught.
+const OREGON_TO_VIRGINIA_MS: f32 = 50.0;
+
+/// How far a reported round trip may sit from an anchor and still be that round trip.
+const ANCHOR_TOLERANCE_MS: f32 = 8.0;
+
+/// How far two instants may differ and still be the same point boundary: the wire carries
+/// a `MillisecondDateTime`, so a millisecond is the resolution of the comparison.
+const INSTANT_TOLERANCE_SECS: f64 = 0.002;
+
 /// The Region every call in this suite is signed for. A data query names the locations it
 /// is about, so this is deliberately NOT one of the locations the queries below use.
 const SIGNING_REGION: &str = "eu-central-1";
@@ -105,6 +139,17 @@ struct Query {
     metric: String,
     statistic: String,
     period: String,
+}
+
+/// One `MetricPoint` of a reported series.
+#[derive(Debug, Clone)]
+struct Point {
+    /// `startDate`, in seconds since the epoch.
+    start: f64,
+    /// `endDate`, in seconds since the epoch.
+    end: f64,
+    value: f32,
+    status: String,
 }
 
 /// A query between `source` and `destination` aggregated over `period`, at the one metric
@@ -157,12 +202,19 @@ fn iso8601(at: i64) -> String {
         .expect("an ISO 8601 instant")
 }
 
+/// The instant `text` names, in seconds since the epoch.
+fn instant(case: &str, text: &str) -> f64 {
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("case {case:?}: {text:?} is not an instant: {error}"))
+        .as_secs_f64()
+}
+
 /// A window of three whole hours ending at the top of the current hour: a span every
 /// aggregation period the model publishes has windows in, and one that does not depend on
 /// where inside the hour a call lands.
-fn stable_window() -> Vec<(String, String)> {
+fn stable_window() -> (i64, i64) {
     let aligned = now_secs().div_euclid(3600) * 3600;
-    window_fields(aligned - 3 * 3600, aligned)
+    (aligned - 3 * 3600, aligned)
 }
 
 /// The clock this suite reads its windows from.
@@ -171,6 +223,15 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// How long the aggregation period `period` lasts, out of [`PERIODS`].
+fn period_duration(period: &str) -> i64 {
+    PERIODS
+        .iter()
+        .find(|(name, _)| *name == period)
+        .map(|(_, seconds)| *seconds)
+        .unwrap_or_else(|| panic!("{period} is no published aggregation period"))
 }
 
 /// One `GetAwsNetworkPerformanceData` call carrying `params`, as its HTTP status and XML
@@ -185,8 +246,8 @@ async fn get_data(router: &MultiServiceRouter, params: &[(String, String)]) -> (
     .await
 }
 
-/// The series and the number of metric points of every `<item>` of the `<dataResponseSet>`.
-fn reported(case: &str, body: &str) -> Vec<(Query, usize)> {
+/// The series and the metric points of every `<item>` of the `<dataResponseSet>`.
+fn reported(case: &str, body: &str) -> Vec<(Query, Vec<Point>)> {
     let document = roxmltree::Document::parse(body)
         .unwrap_or_else(|error| panic!("case {case:?}: response is not XML: {error}\n{body}"));
     let Some(set) = document
@@ -218,20 +279,129 @@ fn reported(case: &str, body: &str) -> Vec<(Query, usize)> {
                 period: text("period"),
             };
             let points = child("metricPointSet")
-                .map(|set| set.children().filter(roxmltree::Node::is_element).count())
+                .map(|set| {
+                    set.children()
+                        .filter(roxmltree::Node::is_element)
+                        .map(|point| {
+                            let member = |name: &str| {
+                                point
+                                    .children()
+                                    .find(|child| {
+                                        child.is_element() && child.tag_name().name() == name
+                                    })
+                                    .and_then(|child| child.text())
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "case {case:?}: a metric point carries no \
+                                             <{name}>: {body}"
+                                        )
+                                    })
+                            };
+                            let value = member("value");
+                            Point {
+                                start: instant(case, &member("startDate")),
+                                end: instant(case, &member("endDate")),
+                                value: value.parse().unwrap_or_else(|error| {
+                                    panic!(
+                                        "case {case:?}: value {value:?} is not a number: {error}"
+                                    )
+                                }),
+                                status: member("status"),
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             (series, points)
         })
         .collect()
 }
 
-/// Every query the request gave is answered, in that order, with its own members and — by
-/// RULE 2 — with no metric point at all.
+/// The point boundaries a window `[start, end)` aggregated over `period` must be reported
+/// with by RULE 2: period-long spans from `start`, the last one cut off at `end`, at most
+/// [`MAX_METRIC_POINTS_PER_SERIES`] of them.
+fn expected_points(start: i64, end: i64, period: i64) -> Vec<(f64, f64)> {
+    let (start, end, period) = (start as f64, end as f64, period as f64);
+    let count = ((end - start) / period)
+        .ceil()
+        .clamp(1.0, MAX_METRIC_POINTS_PER_SERIES as f64) as usize;
+    (0..count)
+        .map(|index| {
+            let point_start = start + index as f64 * period;
+            (point_start, (point_start + period).min(end))
+        })
+        .collect()
+}
+
+/// RULE 2 over one reported series: its points cover the requested window in period-long
+/// steps, each carrying one positive latency and the healthy status.
+fn assert_points(case: &str, series: &Query, points: &[Point], window: (i64, i64)) {
+    let (start, end) = window;
+    let expected = expected_points(start, end, period_duration(&series.period));
+    assert_eq!(
+        points.len(),
+        expected.len(),
+        "case {case:?}: series {series:?} over [{start}, {end}) must carry {} metric \
+         point(s), got {}",
+        expected.len(),
+        points.len()
+    );
+    let first = points
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: series {series:?} carries no metric point"));
+    for (index, (point, (expected_start, expected_end))) in
+        points.iter().zip(expected.iter()).enumerate()
+    {
+        assert!(
+            (point.start - expected_start).abs() <= INSTANT_TOLERANCE_SECS,
+            "case {case:?}: series {series:?} point {index} must start at {expected_start}, \
+             got {}",
+            point.start
+        );
+        assert!(
+            (point.end - expected_end).abs() <= INSTANT_TOLERANCE_SECS,
+            "case {case:?}: series {series:?} point {index} must end at {expected_end}, got {}",
+            point.end
+        );
+        assert!(
+            point.end > point.start,
+            "case {case:?}: series {series:?} point {index} must aggregate over a span, got \
+             [{}, {}]",
+            point.start,
+            point.end
+        );
+        assert_eq!(
+            point.status, "OK",
+            "case {case:?}: series {series:?} point {index} must report a healthy window, got \
+             {:?}",
+            point.status
+        );
+        assert!(
+            point.value.is_finite()
+                && point.value > 0.0
+                && point.value <= MAX_PLAUSIBLE_ROUND_TRIP_MS,
+            "case {case:?}: series {series:?} point {index} must report a round trip in \
+             (0, {MAX_PLAUSIBLE_ROUND_TRIP_MS}] ms, got {}",
+            point.value
+        );
+        assert_eq!(
+            point.value, first.value,
+            "case {case:?}: series {series:?} reports one latency for every window of it, \
+             got {} at point {index} against {}",
+            point.value, first.value
+        );
+    }
+}
+
+/// Every query the request gave is answered, in that order, with its own members and with
+/// the metric points RULE 2 requires over `window`.
 async fn assert_answers(
     router: &MultiServiceRouter,
     case: &str,
     params: &[(String, String)],
     queries: &[Query],
+    window: (i64, i64),
 ) -> String {
     let (status, body) = get_data(router, params).await;
     assert_eq!(
@@ -245,17 +415,36 @@ async fn assert_answers(
         "case {case:?}: expected one data response per query, in order, got {series:?}"
     );
     for (series, points) in &answered {
-        assert_eq!(
-            *points, 0,
-            "case {case:?}: this emulator measures no network, so the series {series:?} \
-             carries no metric point, got {points} in {body}"
-        );
+        assert_points(case, series, points, window);
     }
-    assert!(
-        !body.contains("<value>") && !body.contains("<startDate>"),
-        "case {case:?}: no measured value may appear in the answer, got {body}"
-    );
     body
+}
+
+/// The round-trip latency the service reports for the series between `source` and
+/// `destination`, read off one point of one whole period.
+async fn latency(router: &MultiServiceRouter, source: &str, destination: &str) -> f32 {
+    let period = PERIODS[0];
+    let case = format!("{source} -> {destination}");
+    let queries = vec![query("latency", source, destination, period.0)];
+    let aligned = now_secs().div_euclid(period.1) * period.1;
+    let mut params = query_fields(&queries);
+    params.extend(window_fields(aligned - period.1, aligned));
+    let (status, body) = get_data(router, &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {body}"
+    );
+    let answered = reported(&case, &body);
+    let (_, points) = answered
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: no series was reported: {body}"));
+    assert_eq!(
+        points.len(),
+        1,
+        "case {case:?}: one whole period is one metric point, got {}",
+        points.len()
+    );
+    points[0].value
 }
 
 /// RULE 1: one response per query, echoing the series it names, over a table spanning the
@@ -265,6 +454,7 @@ async fn assert_answers(
 #[tokio::test]
 async fn every_query_is_answered_with_its_own_series() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     let every_period: Vec<Query> = PERIODS
         .iter()
@@ -305,16 +495,18 @@ async fn every_query_is_answered_with_its_own_series() {
 
     for (case, queries) in cases {
         let mut params = query_fields(&queries);
-        params.extend(stable_window());
-        assert_answers(&router, case, &params, &queries).await;
+        params.extend(window_fields(window.0, window.1));
+        assert_answers(&router, case, &params, &queries, window).await;
     }
 }
 
-/// RULE 1: every location form, metric and statistic the model publishes names a series
-/// that is answered — including values no recorded request used.
+/// RULE 1 and RULE 2: every location form, metric and statistic the model publishes names
+/// a series that is answered, with the points of the window — including values no recorded
+/// request used.
 #[tokio::test]
 async fn every_published_location_metric_and_statistic_is_answered() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     for source in LOCATIONS {
         for destination in LOCATIONS {
@@ -332,8 +524,8 @@ async fn every_published_location_metric_and_statistic_is_answered() {
                         let case =
                             format!("{source} -> {destination}, {metric}/{statistic} over {period}");
                         let mut params = query_fields(&queries);
-                        params.extend(stable_window());
-                        assert_answers(&router, &case, &params, &queries).await;
+                        params.extend(window_fields(window.0, window.1));
+                        assert_answers(&router, &case, &params, &queries, window).await;
                     }
                 }
             }
@@ -341,17 +533,17 @@ async fn every_published_location_metric_and_statistic_is_answered() {
     }
 }
 
-/// RULE 2: whatever window a request asks over, the series carries no metric point,
-/// because nothing measured the network in any of its periods.
+/// RULE 2: whatever window a request asks over, the series is covered by period-long
+/// metric points running from its `StartTime`, the last one ending at its `EndTime`.
 ///
 /// The rows span, for every aggregation period the model publishes: a window aligned to
 /// that period and one straddling it, a window shorter than one period and one many
 /// periods long, a window ahead of the clock, the epoch itself, an instant before the
-/// epoch and an instant past the end of the calendar — so no span a `MillisecondDateTime`
-/// can name is answered with an invented measurement, and none of them is answered with
-/// anything but HTTP 200.
+/// epoch and a span so long that the ceiling on points is what bounds the answer — so no
+/// span a `MillisecondDateTime` can name is answered with anything but HTTP 200 and the
+/// points of that span.
 #[tokio::test]
-async fn no_window_of_any_period_carries_a_metric_point() {
+async fn every_window_is_covered_by_period_long_metric_points() {
     let (router, _engine) = super::ec2_query::emulator();
     let now = now_secs();
 
@@ -389,14 +581,13 @@ async fn no_window_of_any_period_carries_a_metric_point() {
                 now + period_secs,
                 now + 3 * period_secs,
             ),
-            ("the whole epoch so far".to_string(), 0, now),
             (
                 "before the epoch".to_string(),
                 BEFORE_THE_EPOCH,
                 BEFORE_THE_EPOCH + 24 * 3600,
             ),
             (
-                "past the end of the calendar".to_string(),
+                "more windows than the ceiling holds".to_string(),
                 now - 3600,
                 END_OF_CALENDAR,
             ),
@@ -407,17 +598,112 @@ async fn no_window_of_any_period_carries_a_metric_point() {
             let queries = vec![query("windowed", "us-east-1", "eu-west-1", period)];
             let mut params = query_fields(&queries);
             params.extend(window_fields(start, end));
-            assert_answers(&router, &case, &params, &queries).await;
+            assert_answers(&router, &case, &params, &queries, (start, end)).await;
         }
     }
 }
 
-/// RULE 3: `MaxResults` and `NextToken` page the data responses: each page holds at most
+/// RULE 3: the latency a series reports is the cost of the network between its two
+/// locations.
+///
+/// The rows span the distance classes a pair of Regions can be at — two Regions of one
+/// geography, the two coasts of one continent, a crossing of the Atlantic, of Eurasia, of
+/// the Pacific, and a pair nearly antipodal — and the three forms a location is named by.
+/// Every Region of the catalog this service accepts a location out of is asked about, so no
+/// Region is answered with a latency the model cannot place.
+#[tokio::test]
+async fn the_latency_reported_follows_the_network_between_the_locations() {
+    let (router, _engine) = super::ec2_query::emulator();
+
+    // Pairs in increasing order of how far apart AWS publishes the two Regions.
+    const INCREASING_DISTANCE: &[(&str, &str)] = &[
+        ("us-east-1", "us-east-2"),
+        ("us-east-1", "us-west-2"),
+        ("us-east-1", "eu-west-1"),
+        ("eu-west-1", "ap-northeast-1"),
+        ("us-west-2", "ap-southeast-2"),
+        ("sa-east-1", "ap-northeast-2"),
+    ];
+
+    // Within one Region there is no distance to cross, so that latency is the floor every
+    // other pair stands above.
+    let within_a_region = latency(&router, "us-east-1", "us-east-1").await;
+    assert!(
+        within_a_region > 0.0 && within_a_region < MAX_PLAUSIBLE_ROUND_TRIP_MS,
+        "case \"within one Region\": expected a positive round trip, got {within_a_region}"
+    );
+
+    // One absolute anchor: the ordering rows below would hold for any model that merely
+    // grew with distance, so one pair is held to the round trip its distance costs.
+    let oregon_to_virginia = latency(&router, "us-west-2", "us-east-1").await;
+    assert!(
+        (oregon_to_virginia - OREGON_TO_VIRGINIA_MS).abs() <= ANCHOR_TOLERANCE_MS,
+        "case \"us-west-2 -> us-east-1\": expected about {OREGON_TO_VIRGINIA_MS} ms \
+         (within {ANCHOR_TOLERANCE_MS}), got {oregon_to_virginia}"
+    );
+
+    // Every Region the service accepts a location out of is a Region it can report a
+    // series for, and a Region to itself is the floor whichever Region it is.
+    for region in ::emulator_telemetry::policy::KNOWN_REGIONS {
+        let reported = latency(&router, region, region).await;
+        assert_eq!(
+            reported, within_a_region,
+            "case {region:?}: a Region to itself costs what any Region to itself costs, \
+             {within_a_region}, got {reported}"
+        );
+    }
+
+    let mut previous: Option<(&str, &str, f32)> = None;
+    for (source, destination) in INCREASING_DISTANCE {
+        let there = latency(&router, source, destination).await;
+        let back = latency(&router, destination, source).await;
+        assert_eq!(
+            there, back,
+            "case \"{source} -> {destination}\": the network costs the same either way \
+             round, got {there} and {back}"
+        );
+        assert!(
+            there > within_a_region && there <= MAX_PLAUSIBLE_ROUND_TRIP_MS,
+            "case \"{source} -> {destination}\": expected a round trip above the \
+             within-a-Region {within_a_region} ms and at most \
+             {MAX_PLAUSIBLE_ROUND_TRIP_MS} ms, got {there}"
+        );
+        if let Some((previous_source, previous_destination, previous_latency)) = previous {
+            assert!(
+                there > previous_latency,
+                "case \"{source} -> {destination}\": further apart than \
+                 {previous_source} -> {previous_destination}, so it must cost more than \
+                 {previous_latency} ms, got {there}"
+            );
+        }
+        previous = Some((source, destination, there));
+    }
+
+    // A zone name and a zone ID name a place in the Region they belong to, so a series
+    // between two zones costs what the series between their Regions costs.
+    let between_regions = latency(&router, "us-east-1", "eu-west-1").await;
+    for (source, destination) in [
+        ("us-east-1a", "eu-west-1c"),
+        ("use1-az1", "eu-west-1"),
+        ("us-east-1", "euw1-az2"),
+        ("use1-az3", "euw1-az1"),
+    ] {
+        let reported = latency(&router, source, destination).await;
+        assert_eq!(
+            reported, between_regions,
+            "case \"{source} -> {destination}\": a zone is in its Region, so this costs \
+             what us-east-1 -> eu-west-1 costs, {between_regions}, got {reported}"
+        );
+    }
+}
+
+/// RULE 4: `MaxResults` and `NextToken` page the data responses: each page holds at most
 /// `MaxResults` of them, a walk answers every query exactly once in request order, and the
 /// last page carries no token.
 #[tokio::test]
 async fn pagination_answers_every_query_exactly_once() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     let queries: Vec<Query> = (0..5)
         .map(|index| {
@@ -437,7 +723,7 @@ async fn pagination_answers_every_query_exactly_once() {
         let mut pages = 0usize;
         loop {
             let mut params = query_fields(&queries);
-            params.extend(stable_window());
+            params.extend(window_fields(window.0, window.1));
             params.push(("MaxResults".to_string(), page_size.to_string()));
             if let Some(token) = &token {
                 params.push(("NextToken".to_string(), token.clone()));
@@ -454,6 +740,9 @@ async fn pagination_answers_every_query_exactly_once() {
                 "case {case:?}: a page holds at most {page_size} responses, got {}",
                 page.len()
             );
+            for (series, points) in &page {
+                assert_points(&case, series, points, window);
+            }
             seen.extend(page.into_iter().map(|(series, _)| series));
             pages += 1;
             token = element(&body, "nextToken");
@@ -482,11 +771,12 @@ async fn pagination_answers_every_query_exactly_once() {
 /// EC2 error code it must be refused with.
 type Refusal = (String, Vec<(String, String)>, u16, &'static str);
 
-/// RULE 3: a call carrying more queries than one page holds is PAGED, not refused: the
+/// RULE 4: a call carrying more queries than one page holds is PAGED, not refused: the
 /// ceiling bounds the page, so every query is still answered exactly once.
 #[tokio::test]
 async fn more_queries_than_one_page_holds_are_paged() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     // One more query than a page holds, so the walk takes two pages.
     let queries: Vec<Query> = (0..=MAX_RESPONSES_PER_PAGE)
@@ -498,7 +788,7 @@ async fn more_queries_than_one_page_holds_are_paged() {
     let mut pages = 0usize;
     loop {
         let mut params = query_fields(&queries);
-        params.extend(stable_window());
+        params.extend(window_fields(window.0, window.1));
         if let Some(token) = &token {
             params.push(("NextToken".to_string(), token.clone()));
         }
@@ -541,12 +831,13 @@ async fn more_queries_than_one_page_holds_are_paged() {
     );
 }
 
-/// RULE 4: a request that names no series, no query or no window, or names something that
+/// RULE 5: a request that names no series, no query or no window, or names something that
 /// cannot exist, is refused — with the error code EC2 gives for that kind of fault — rather
 /// than answered as a series that happens to be empty.
 #[tokio::test]
 async fn an_unanswerable_request_is_refused() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     let well_formed = query("q1", "us-east-1", "eu-west-1", "five-minutes");
     /// A well-formed request — one query over the stable window — with one member of the
@@ -563,7 +854,8 @@ async fn an_unanswerable_request_is_refused() {
             other => panic!("no DataQuery member named {other}"),
         }
         let mut params = query_fields(&[replaced]);
-        params.extend(stable_window());
+        let window = stable_window();
+        params.extend(window_fields(window.0, window.1));
         params
     }
     /// The same, with one member of the query left out entirely.
@@ -573,14 +865,16 @@ async fn an_unanswerable_request_is_refused() {
             .into_iter()
             .filter(|(name, _)| *name != dropped)
             .collect();
-        params.extend(stable_window());
+        let window = stable_window();
+        params.extend(window_fields(window.0, window.1));
         params
     }
     /// One well-formed query over the stable window, as the base for a row that varies
     /// something outside the query.
     fn well_formed_request(base: &Query) -> Vec<(String, String)> {
         let mut params = query_fields(std::slice::from_ref(base));
-        params.extend(stable_window());
+        let window = stable_window();
+        params.extend(window_fields(window.0, window.1));
         params
     }
 
@@ -592,7 +886,7 @@ async fn an_unanswerable_request_is_refused() {
             query("q2", "us-east-1", "eu-west-1", "one-hour"),
         ];
         let mut params = query_fields(&two);
-        params.extend(stable_window());
+        params.extend(window_fields(window.0, window.1));
         params.push(("MaxResults".to_string(), "1".to_string()));
         let (status, body) = get_data(&router, &params).await;
         assert_eq!(
@@ -774,7 +1068,7 @@ async fn an_unanswerable_request_is_refused() {
         // One response answers one query, so a call carrying none asks for nothing.
         (
             "a request carrying no query".to_string(),
-            stable_window(),
+            window_fields(window.0, window.1),
             400,
             "MissingParameter",
         ),
@@ -847,33 +1141,34 @@ async fn an_unanswerable_request_is_refused() {
     }
 }
 
-/// RULE 5: the operation is a READ. A request answered twice is answered identically, and a
+/// RULE 6: the operation is a READ. A request answered twice is answered identically, and a
 /// refused request leaves nothing behind that a later caller could see.
 #[tokio::test]
 async fn reading_the_data_twice_answers_the_same() {
     let (router, _engine) = super::ec2_query::emulator();
+    let window = stable_window();
 
     let queries = vec![
         query("q1", "us-east-1", "eu-west-1", "one-hour"),
         query("q2", "us-east-1a", "use1-az1", "one-day"),
     ];
     let mut params = query_fields(&queries);
-    params.extend(stable_window());
+    params.extend(window_fields(window.0, window.1));
 
-    let first = assert_answers(&router, "first read", &params, &queries).await;
+    let first = assert_answers(&router, "first read", &params, &queries, window).await;
 
     // A refusal between the two reads: it must not change what the second read sees.
     let mut broken = queries.clone();
     broken[0].source = "nowhere".to_string();
     let mut broken_params = query_fields(&broken);
-    broken_params.extend(stable_window());
+    broken_params.extend(window_fields(window.0, window.1));
     let (status, _) = get_data(&router, &broken_params).await;
     assert_eq!(
         status, 400,
         "a source that is no location is refused, got {status}"
     );
 
-    let second = assert_answers(&router, "second read", &params, &queries).await;
+    let second = assert_answers(&router, "second read", &params, &queries, window).await;
     assert_eq!(
         strip_request_id(&first),
         strip_request_id(&second),
