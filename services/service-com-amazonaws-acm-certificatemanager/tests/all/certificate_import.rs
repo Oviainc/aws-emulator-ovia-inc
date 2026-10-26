@@ -22,7 +22,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use x509_cert::der::DecodePem;
 
 use crate::certificate_lifecycle::{
-    call, error_code, error_message, list_all_arns, request_certificate, router, ACCOUNT, REGION,
+    call, call_in_region, error_code, error_message, list_all_arns, request_certificate, router,
+    ACCOUNT, REGION,
 };
 
 /// One imported certificate, as the test generated it.
@@ -145,12 +146,25 @@ pub(crate) fn import_body(generated: &Generated) -> Value {
     })
 }
 
-/// Import one certificate, requiring success, and return the ARN it was stored under.
+/// Import one certificate signed for [`REGION`], requiring success, and return the ARN
+/// it was stored under.
 pub(crate) async fn import(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
-    let (status, response) = call(router, "ImportCertificate", body).await;
+    import_in_region(router, case, REGION, body).await
+}
+
+/// Import one certificate signed for `region`, requiring success, and return the ARN it
+/// was stored under. A certificate is a regional resource, so the Region a suite imports
+/// in is part of what it is asserting.
+pub(crate) async fn import_in_region(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    body: &Value,
+) -> String {
+    let (status, response) = call_in_region(router, region, "ImportCertificate", body).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: ImportCertificate must answer 200, got {status} {response}"
+        "case {case:?}: ImportCertificate must answer 200 in {region}, got {status} {response}"
     );
     response["CertificateArn"]
         .as_str()

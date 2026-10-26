@@ -201,17 +201,29 @@ pub(crate) async fn request_certificate(router: &MultiServiceRouter, body: &Valu
         .to_string()
 }
 
-/// `DescribeCertificate`'s `Certificate` member, failing the test on any error.
+/// `DescribeCertificate`'s `Certificate` member, read in [`REGION`], failing the test on
+/// any error.
 pub(crate) async fn describe(router: &MultiServiceRouter, arn: &str) -> Value {
-    let (status, response) = call(
+    describe_in_region(router, REGION, arn).await
+}
+
+/// `DescribeCertificate`'s `Certificate` member, read signed for `region`, failing the
+/// test on any error.
+pub(crate) async fn describe_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+) -> Value {
+    let (status, response) = call_in_region(
         router,
+        region,
         "DescribeCertificate",
         &json!({ "CertificateArn": arn }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {arn}: DescribeCertificate must succeed, got {status} {response}"
+        "case {arn}: DescribeCertificate must succeed in {region}, got {status} {response}"
     );
     response["Certificate"].clone()
 }
