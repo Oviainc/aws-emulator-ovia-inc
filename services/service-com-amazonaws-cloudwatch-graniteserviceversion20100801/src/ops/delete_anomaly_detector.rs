@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAnomalyDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one anomaly detection model from this service's store, named either by its
+//! identifier or by what it watches. Implemented here, and the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +161,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAnomalyDetector"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAnomalyDetectorErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch anomaly detector store is unavailable".into()),
+            })
+        })?;
+
+        // WHICH model this call deletes: its identifier names it on its own — "If you specify
+        // this parameter, you do not need to specify a metric to identify the detector."
+        // (`DeleteAnomalyDetectorInput$AnomalyDetectorId`) — and otherwise the metric and
+        // statistic (or the queries) it watches do, under the rule both detector writers
+        // share.
+        let detector_id = match input.anomaly_detector_id.as_deref() {
+            Some(named) => {
+                // An identifier names the model on its own, so it is never combined with the
+                // metric that would name another one: the refusal lists the forms the request
+                // was found carrying, as the rule for the three metric forms does.
+                let mut found = vec![crate::state::DETECTOR_ID_FORM];
+                if input.namespace.is_some()
+                    || input.metric_name.is_some()
+                    || input.dimensions.is_some()
+                    || input.stat.is_some()
+                {
+                    found.push(crate::state::FLAT_METRIC_FORM);
+                }
+                if input.single_metric_anomaly_detector.is_some() {
+                    found.push(crate::state::SINGLE_METRIC_FORM);
+                }
+                if input.metric_math_anomaly_detector.is_some() {
+                    found.push(crate::state::METRIC_MATH_FORM);
+                }
+                if found.len() > 1 {
+                    return Err(invalid_combination(format!(
+                        "Either {}, {}, {} or {} can be set, found {}.",
+                        crate::state::DETECTOR_ID_FORM,
+                        crate::state::FLAT_METRIC_FORM,
+                        crate::state::SINGLE_METRIC_FORM,
+                        crate::state::METRIC_MATH_FORM,
+                        found.join(", ")
+                    )));
+                }
+                named.to_string()
+            }
+            None => {
+                let form = crate::state::anomaly_detector_form(
+                    input.single_metric_anomaly_detector.as_ref(),
+                    input.metric_math_anomaly_detector.as_ref(),
+                    crate::state::FlatSingleMetric {
+                        namespace: input.namespace.as_deref(),
+                        metric_name: input.metric_name.as_deref(),
+                        dimensions: input.dimensions.as_deref(),
+                        stat: input.stat.as_deref(),
+                    },
+                )
+                .map_err(form_refusal)?;
+                if let Some(missing) = crate::state::anomaly_detector_form_missing(&form) {
+                    return Err(missing_parameter(missing));
+                }
+                form.detector_id()
+            }
+        };
+
+        let mut store = state.lock();
+        if store.anomaly_detectors.remove(&detector_id).is_none() {
+            // "The named resource does not exist." (`ResourceNotFoundException`) — what a
+            // caller deleting a model no write of theirs created is told, whether they named
+            // it by identifier or by metric. The identifier is not echoed: the caller may have
+            // named a metric rather than an identifier at all.
+            return Err(
+                DeleteAnomalyDetectorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: None,
+                        resource_id: None,
+                        message: Some("Anomaly detector not found".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        Ok(DeleteAnomalyDetectorOutput {})
     }
+}
+
+/// The refusal a request that does not name exactly one detector earns: the parameter
+/// combination fault for parameters that cannot be used together, and the missing-parameter
+/// fault for a request that names no detector at all.
+fn form_refusal(error: crate::state::AnomalyDetectorFormError) -> DeleteAnomalyDetectorError {
+    match error {
+        crate::state::AnomalyDetectorFormError::Combination(message) => {
+            invalid_combination(message)
+        }
+        crate::state::AnomalyDetectorFormError::Missing(message) => missing_parameter(message),
+    }
+}
+
+/// Refuse the request with this operation's modelled `InvalidParameterCombinationException`
+/// (HTTP 400): "Parameters were used together that cannot be used together."
+fn invalid_combination(message: String) -> DeleteAnomalyDetectorError {
+    DeleteAnomalyDetectorErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// Refuse the request with this operation's modelled `MissingRequiredParameterException`
+/// (HTTP 400): "An input parameter that is required is missing."
+fn missing_parameter(message: String) -> DeleteAnomalyDetectorError {
+    DeleteAnomalyDetectorErrorModeled::MissingRequiredParameterException(
+        MissingRequiredParameterException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

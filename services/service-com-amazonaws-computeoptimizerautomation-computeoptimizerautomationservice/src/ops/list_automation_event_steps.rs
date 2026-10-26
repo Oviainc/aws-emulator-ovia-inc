@@ -181,17 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(format!(
-                        "Value '{token}' at 'nextToken' failed to satisfy constraint: Member must \
-                         be a token returned by a previous ListAutomationEventSteps call"
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous \
+                         ListAutomationEventSteps call",
                     )));
                 };
                 if cursor.filter_fingerprint != query_fingerprint {
-                    return Err(invalid_parameter(
-                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
-                         token returned for the same eventId"
-                            .to_string(),
-                    ));
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same eventId",
+                    )));
                 }
                 cursor.offset
             }
@@ -265,7 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled 400 (`InvalidParameterValueException`), for a `nextToken` this
 /// service did not issue for this query. The model's `NextToken` pattern cannot
-/// express "a token of mine", so the check is here rather than at the boundary.
+/// express "a token of mine", so the check is here rather than at the boundary,
+/// and the body is the crate's single validation report
+/// (`crate::state::constraint_report`), which echoes no request value.
 fn invalid_parameter(message: String) -> ListAutomationEventStepsError {
     ListAutomationEventStepsErrorModeled::InvalidParameterValueException(
         InvalidParameterValueException {

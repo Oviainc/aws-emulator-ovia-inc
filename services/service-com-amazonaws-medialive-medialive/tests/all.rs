@@ -47,6 +47,9 @@ mod channel_placement_group_deletion;
 #[path = "all/channel_placement_group_listing.rs"]
 mod channel_placement_group_listing;
 
+#[path = "all/channel_placement_group_node_resolution.rs"]
+mod channel_placement_group_node_resolution;
+
 #[path = "all/channel_placement_group_update.rs"]
 mod channel_placement_group_update;
 
@@ -184,6 +187,9 @@ mod multiplex_lifecycle;
 
 #[path = "all/multiplex_listing.rs"]
 mod multiplex_listing;
+
+#[path = "all/multiplex_program_deletion.rs"]
+mod multiplex_program_deletion;
 
 #[path = "all/multiplex_program_listing.rs"]
 mod multiplex_program_listing;

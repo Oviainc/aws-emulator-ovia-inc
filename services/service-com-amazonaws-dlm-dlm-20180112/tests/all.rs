@@ -15,6 +15,8 @@
 mod default_policy_configuration_precedence;
 #[path = "all/default_policy_only_parameters.rs"]
 mod default_policy_only_parameters;
+#[path = "all/default_policy_resource_type.rs"]
+mod default_policy_resource_type;
 #[path = "all/error_paths.rs"]
 mod error_paths;
 #[path = "all/execution_role_pass_role.rs"]

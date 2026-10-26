@@ -813,6 +813,46 @@ impl StoredZone {
         })
     }
 
+    /// The record sets that answer for one name and type: the single simple
+    /// record set there, or every member of the routing group that shares that
+    /// name and type, in `SetIdentifier` order.
+    ///
+    /// A `BTreeMap` keyed by [`RecordKey`] holds them as a CONTIGUOUS range —
+    /// the key order is name, then type, then set identifier, and `None` sorts
+    /// before every `Some` — so the walk is bounded by the group rather than by
+    /// the zone. Every spelling of a name gives one [`DnsNameKey`], so the
+    /// lookup is insensitive to case, to the trailing dot and to a presentation
+    /// escape.
+    pub fn records_at(&self, name: &str, rr_type: &str) -> Vec<&ResourceRecordSet> {
+        let group = RecordKey::of(name, rr_type, None);
+        self.records
+            .range(group.clone()..)
+            .take_while(|(key, _)| {
+                key.name_sort_key == group.name_sort_key && key.rr_type == group.rr_type
+            })
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// Whether this zone holds a record set at `name`, whatever its type.
+    ///
+    /// The DNS answer for a name the zone holds no record of the asked-for type
+    /// at depends on this: a name the zone knows exists and a name it does not
+    /// hold at all are two different answers.
+    pub fn holds_record_name(&self, name: &str) -> bool {
+        let from = RecordKey {
+            name_sort_key: dns_sort_key(name),
+            // The empty type sorts before every `RRType`, so the range opens at
+            // the first record set carrying this name.
+            rr_type: String::new(),
+            set_identifier: None,
+        };
+        self.records
+            .range(from.clone()..)
+            .next()
+            .is_some_and(|(key, _)| key.name_sort_key == from.name_sort_key)
+    }
+
     /// Where this zone's association list holds the VPC named by `vpc_id`, if it
     /// holds it at all.
     ///

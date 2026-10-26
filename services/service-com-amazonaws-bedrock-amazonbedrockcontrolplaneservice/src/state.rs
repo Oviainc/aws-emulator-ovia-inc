@@ -103,8 +103,9 @@
 //! row of — which is seeded with the store and never written, because no operation of this
 //! service creates a foundation model.
 //!
-//! And it holds the resource policies `ops/put_resource_policy.rs` attaches and
-//! `ops/get_resource_policy.rs` reports, keyed by the [`TaggedResource`] each one is
+//! And it holds the resource policies `ops/put_resource_policy.rs` attaches,
+//! `ops/get_resource_policy.rs` reports and `ops/delete_resource_policy.rs` takes away,
+//! keyed by the [`TaggedResource`] each one is
 //! attached to — one of the resources above, resolved out of the very same maps, so a
 //! policy is attached to a RESOURCE rather than to one spelling of its ARN.
 //!
@@ -2032,8 +2033,9 @@ pub struct AccountDataRetention {
 ///   written: no operation here creates or deletes a foundation model.
 ///
 /// * `resource_policies` holds at most one entry per live resource of the maps above: a
-///   policy is only ever attached to a resource this store HOLDS, and the attach drops
-///   the entries whose resource is gone ([`Self::attach_resource_policy`]).
+///   policy is only ever attached to a resource this store HOLDS, and both the attach and
+///   the detach drop the entries whose resource is gone
+///   ([`Self::attach_resource_policy`], [`Self::detach_resource_policy`]).
 ///
 /// * `use_case_for_model_access` is a single optional form, which a put replaces rather
 ///   than appends to, and whose size the model already caps
@@ -2292,10 +2294,11 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// by one spelling of that resource's ARN — the document `PutResourcePolicy` last
     /// stored for it and `GetResourcePolicy` reports back.
     ///
-    /// Read through [`Self::resource_policy`] and written only by
-    /// [`Self::attach_resource_policy`], which attaches a policy only to a resource this
-    /// store HOLDS ([`Self::policy_resource`]) and drops the entries whose resource is
-    /// gone — so this map holds at most one entry per live resource of this account and a
+    /// Read through [`Self::resource_policy`], attached by
+    /// [`Self::attach_resource_policy`] — which attaches a policy only to a resource this
+    /// store HOLDS ([`Self::policy_resource`]) — and taken away by
+    /// [`Self::detach_resource_policy`]; both drop the entries whose resource is
+    /// gone, so this map holds at most one entry per live resource of this account and a
     /// create/delete cycle cannot grow it.
     pub resource_policies: HashMap<TaggedResource, String>,
     /// The account's acknowledged use case for model access: the `formData` bytes
@@ -3295,6 +3298,28 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// resource's record is present exactly when the tags read off it are), so the map
     /// stays bounded by the live resources however many attach and delete cycles run.
     pub fn attach_resource_policy(&mut self, resource: TaggedResource, document: String) {
+        self.forget_policies_of_gone_resources();
+        self.resource_policies.insert(resource, document);
+    }
+
+    /// Detach the policy `resource` holds, reporting the document that was in force (or
+    /// `None` when that resource held none).
+    ///
+    /// The counterpart of [`Self::attach_resource_policy`], and bounded the same way: the
+    /// entries whose resource this store no longer holds are dropped here too, so a detach
+    /// cannot leave a document behind for a resource that is gone.
+    pub fn detach_resource_policy(&mut self, resource: &TaggedResource) -> Option<String> {
+        self.forget_policies_of_gone_resources();
+        self.resource_policies.remove(resource)
+    }
+
+    /// Drop every attached policy whose resource this store no longer holds.
+    ///
+    /// A resolved resource's record is present exactly when the tags read off it are, so a
+    /// resource whose record is gone can hold no policy: keeping its document would report
+    /// a grant on a resource that no longer exists and would let the map grow without
+    /// bound across create/delete cycles.
+    fn forget_policies_of_gone_resources(&mut self) {
         let gone: Vec<TaggedResource> = self
             .resource_policies
             .keys()
@@ -3304,7 +3329,6 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         for attached in gone {
             self.resource_policies.remove(&attached);
         }
-        self.resource_policies.insert(resource, document);
     }
 }
 

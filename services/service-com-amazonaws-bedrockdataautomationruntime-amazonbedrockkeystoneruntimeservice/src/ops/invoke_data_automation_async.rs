@@ -209,20 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every tag key must satisfy the modelled `TagKey` pattern, which the boundary
-        // walk cannot enforce (see `crate::state::tag_key_is_well_formed`). Checked
+        // walk cannot enforce (see `crate::state::malformed_tag_refusal`). Checked
         // before anything is minted, so a refused submission leaves no record.
-        if input
-            .tags
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|tag| !crate::state::tag_key_is_well_formed(&tag.key))
+        if let Some(message) =
+            crate::state::malformed_tag_refusal(input.tags.as_deref().unwrap_or_default())
         {
             return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::malformed_tag_key_message(
-                        "tags.member.key",
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

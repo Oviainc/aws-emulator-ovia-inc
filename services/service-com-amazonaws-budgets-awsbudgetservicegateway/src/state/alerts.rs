@@ -23,7 +23,9 @@
 //!
 //! The work splits in two so that no delivery is made while the store is locked:
 //! [`owed`] decides which alerts a write leaves owed (under the lock, from the state it
-//! wrote) and [`deliver`] publishes them (after the lock is released). The number of
+//! wrote) and [`deliver`] publishes them (after the lock is released). An alert is owed
+//! only on a topic of the account whose budget it names ([`publishable`]), so a budget's
+//! figures cannot be deposited on another account's topic. The number of
 //! alerts one call can owe is bounded by what a budget can hold — one `SNS` subscriber
 //! per notification ([`super::MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`]) and at most
 //! [`super::MAX_NOTIFICATIONS_PER_BUDGET`] notifications — so a request cannot grow the
@@ -35,7 +37,7 @@
 //! copied from any one recorded alert, and a client that parses the published AWS text
 //! should not expect to match it byte for byte.
 
-use crate::ops::types::{Budget, Notification, Spend, Subscriber};
+use crate::ops::types::{Budget, Notification, Subscriber};
 
 // Amazon SNS's own namespace: the vendor field an `SNS` subscriber's address has to
 // carry for that address to name a topic at all (which is what
@@ -44,31 +46,28 @@ use crate::ops::types::{Budget, Notification, Spend, Subscriber};
 // validation that admits an address and the publish that uses it read the same vendor.
 use super::SNS_NAMESPACE;
 
-/// The budget an alert is published FOR, copied out of the stored budget so the message
-/// can be built and published once the store's lock is released.
+/// The budget an alert is published FOR, copied out of the store so the alert can be
+/// decided, built and published once the store's lock is released.
 ///
-/// It carries what identifies the budget to whoever receives the alert — the account and
-/// the name that together identify a budget, what the budget tracks
-/// (`Budget$BudgetType`), the period it tracks it over (`Budget$TimeUnit`) and the limit
-/// the threshold is measured against (`Budget$BudgetLimit`, absent for a budget that
-/// holds none).
+/// It carries the account the budget belongs to, and the budget as a READ reports it
+/// (`crate::state::budget_as_read`): the name and the account identify it to whoever
+/// receives the alert, `Budget$BudgetType` and `Budget$TimeUnit` say what it tracks and
+/// over what period, and the `BudgetLimit` and `CalculatedSpend` it reads back with are
+/// what decides whether a notification of it is in alarm at all
+/// ([`super::notification_state`]).
 #[derive(Debug, Clone)]
 pub struct AlertSource {
     account_id: String,
-    budget_name: String,
-    budget_type: String,
-    time_unit: String,
-    budget_limit: Option<Spend>,
+    budget: Budget,
 }
 
-/// The budget `budget` of account `account_id`, as an alert for it names it.
+/// The budget `budget` of account `account_id`, as an alert for it names it. `budget` is
+/// the budget as a read reports it, so an alert cannot be decided from figures that
+/// disagree with `DescribeBudget`.
 pub fn source(account_id: &str, budget: &Budget) -> AlertSource {
     AlertSource {
         account_id: account_id.to_string(),
-        budget_name: budget.budget_name.clone(),
-        budget_type: budget.budget_type.clone(),
-        time_unit: budget.time_unit.clone(),
-        budget_limit: budget.budget_limit.clone(),
+        budget: budget.clone(),
     }
 }
 
@@ -83,30 +82,51 @@ pub struct BudgetAlert {
 
 /// The alerts a write owes, having left `notification` holding `subscribers`.
 ///
+/// Whether the notification is in alarm is the SERVICE's own reading of the spend behind
+/// the budget against the threshold the notification alerts on
+/// ([`super::notification_state`]), never a state a request asked for.
+///
 /// Empty for a notification that is not in alarm: nothing has passed its threshold, so
 /// no subscriber of it is owed anything. Empty, too, for a notification in alarm whose
-/// subscribers are all addresses no topic of this emulator can be reached at — an email
-/// mailbox, or an address that is not an SNS topic ARN in a Region.
+/// subscribers are all addresses no alert of THIS budget can be published to
+/// ([`publishable`]) — an email mailbox, an address that is not an SNS topic ARN in a
+/// Region, or a topic of another account.
 pub fn owed(
     source: &AlertSource,
     notification: &Notification,
     subscribers: &[Subscriber],
 ) -> Vec<BudgetAlert> {
-    if notification.notification_state.as_deref() != Some(super::NOTIFICATION_STATE_ALARM) {
+    if super::notification_state(&source.budget, notification) != super::NOTIFICATION_STATE_ALARM {
         return Vec::new();
     }
     let message = message(source, notification);
     subscribers
         .iter()
         .filter(|subscriber| subscriber.subscription_type == super::SUBSCRIPTION_TYPE_SNS)
-        // An address that names no SNS topic in a Region addresses no topic this
-        // emulator can publish to, so no alert is owed on it.
-        .filter(|subscriber| topic_region(&subscriber.address).is_some())
+        .filter(|subscriber| publishable(source, &subscriber.address))
         .map(|subscriber| BudgetAlert {
             topic_arn: subscriber.address.clone(),
             message: message.clone(),
         })
         .collect()
+}
+
+/// Whether an alert for a budget of the account `source` names can be published to the
+/// topic `address` names.
+///
+/// Two things have to hold, and both are read off the address through the ONE shared ARN
+/// parse (`service_common::arn`) rather than by splitting it here:
+///
+/// * it names an SNS topic in a Region, which is what makes it an address this emulator
+///   can route a publish to at all (see [`topic_region`]);
+/// * that topic belongs to the SAME account as the budget alerting on it. An alert carries
+///   the budget's own figures ([`message`]), and a budget's notifications deliver to the
+///   topics of the account that owns the budget, so an address naming any other account
+///   names no topic this alert goes to — it is dropped here rather than published.
+fn publishable(source: &AlertSource, address: &str) -> bool {
+    topic_region(address).is_some()
+        && ::service_common::arn::parse_of(address, SNS_NAMESPACE)
+            .is_some_and(|topic| topic.account == source.account_id)
 }
 
 /// The alert published for `notification` of the budget `source` names: the budget it
@@ -122,9 +142,9 @@ pub fn owed(
 fn message(source: &AlertSource, notification: &Notification) -> String {
     let mut alert = ::serde_json::json!({
         "accountId": source.account_id,
-        "budgetName": source.budget_name,
-        "budgetType": source.budget_type,
-        "timeUnit": source.time_unit,
+        "budgetName": source.budget.budget_name,
+        "budgetType": source.budget.budget_type,
+        "timeUnit": source.budget.time_unit,
         "notificationType": notification.notification_type,
         "comparisonOperator": notification.comparison_operator,
         "threshold": notification.threshold,
@@ -136,7 +156,7 @@ fn message(source: &AlertSource, notification: &Notification) -> String {
     });
     // A budget that holds no `BudgetLimit` has no limit to name, so the member is left
     // out rather than rendered as a null.
-    if let Some(limit) = &source.budget_limit {
+    if let Some(limit) = &source.budget.budget_limit {
         alert["budgetLimit"] = ::serde_json::json!({
             "amount": limit.amount,
             "unit": limit.unit,

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopParticipantReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopParticipantReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopParticipantReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a replication `StartParticipantReplication` started: the replication reaches the
+//! stopped state `ListParticipantReplicas` reports, the replica leaves the destination
+//! stage's session, and the stop is an occurrence of the session the replicated publisher
+//! is in that `ListParticipantEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ResponseHeaderPolicy;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,23 +152,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::STOP_PARTICIPANT_REPLICATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Stop the replication of the named publisher between the two named stages.
+    ///
+    /// A mutation the request asks for: the replication this store holds reaches its
+    /// stopped state, and the replica that replication put into the destination stage
+    /// leaves the session it joined.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopParticipantReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopParticipantReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing here reads request metadata: the replication this stops is named
+        // entirely by the three members of the request, whose modelled lengths and
+        // patterns the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                StopParticipantReplicationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // A replication runs BETWEEN two stages, so a request naming one stage twice names
+        // no replication at all. Refused on the request alone, before any lookup, in the
+        // words both operations that take the two ends of a replication state it with
+        // (`crate::state::same_stage_replication_message`).
+        if input.source_stage_arn == input.destination_stage_arn {
+            return Err(crate::state::validation_failed(
+                StopParticipantReplicationErrorModeled::ValidationException,
+                crate::state::same_stage_replication_message(
+                    Self::NAME,
+                    &input.destination_stage_arn,
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+        // Both stages the request names are resources of this service, so neither being
+        // held is the modelled `ResourceNotFoundException` (HTTP 404) — the same two
+        // lookups, in the same order, that starting the replication resolved.
+        for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
+            if !store.stages.contains_key(stage_arn) {
+                return Err(crate::state::resource_not_found(
+                    StopParticipantReplicationErrorModeled::ResourceNotFoundException,
+                    stage_arn,
+                ));
+            }
+        }
+
+        // The RUNNING replication the three members name. This service stores no id for a
+        // replication, so a request names one by its publisher and its two ends, exactly
+        // as `StartParticipantReplication` resolves the replication it would conflict
+        // with. A replication this store does not hold — never started, already stopped,
+        // or reclaimed with a stage — is no replicated participant session to stop, and
+        // this operation models no `ConflictException`, so it is answered as the resource
+        // this service does not hold.
+        let running = store
+            .participant_replicas
+            .get_mut(&input.source_stage_arn)
+            .and_then(|replicas| {
+                replicas.iter_mut().find(|replica| {
+                    replica.participant_id == input.participant_id
+                        && replica.destination_stage_arn == input.destination_stage_arn
+                        && replica.replication_state == crate::state::REPLICATION_STATE_ACTIVE
+                })
+            });
+        let Some(replication) = running else {
+            return Err(crate::state::resource_not_found(
+                StopParticipantReplicationErrorModeled::ResourceNotFoundException,
+                &crate::state::replication_identifier(
+                    &input.participant_id,
+                    &input.source_stage_arn,
+                    &input.destination_stage_arn,
+                ),
+            ));
+        };
+        // The stop takes effect now: `ReplicationState` carries no value between its two,
+        // so the replication every reader reports is stopped from here on. The record
+        // itself stays — that state is what `ListParticipantReplicas` reports for a replica
+        // whose replication has ended.
+        replication.replication_state = crate::state::REPLICATION_STATE_STOPPED.to_string();
+        let stopped = replication.clone();
+
+        // Replication stopping is an occurrence during the session the replicated publisher
+        // is in, the counterpart of the one its start recorded: the model marks
+        // `Event$destinationStageArn` and `Event$destinationSessionId` "applicable only if
+        // the event name is REPLICATION_STARTED or REPLICATION_STOPPED", so this event
+        // carries the destination the stopped replication named. The publisher itself is
+        // not a replica — it publishes in the source stage — so `replica` stays false.
+        let mut event = crate::state::ParticipantEvent::new(
+            crate::state::EVENT_REPLICATION_STOPPED,
+            &stopped.participant_id,
+        );
+        event.destination_stage_arn = Some(stopped.destination_stage_arn.clone());
+        event.destination_session_id = Some(stopped.destination_session_id.clone());
+        crate::state::record_participant_event(
+            &mut store,
+            &stopped.source_stage_arn,
+            &stopped.source_session_id,
+            event,
+        );
+
+        // The replica is what the replication put into the destination stage, so stopping
+        // it takes that participant back out of the destination stage's session, through
+        // the one place a participant leaves a session
+        // (`crate::state::leave_stage_session`): the record stays and is reported
+        // `DISCONNECTED`, and the session ends if it was the last participant in it. The
+        // publisher in the SOURCE stage is untouched — it is publishing there whether or
+        // not anything replicates it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopParticipantReplication"))
+        // Unless another replication STILL RUNNING puts that same participant into that
+        // same session: the participant is in the destination stage while any replication
+        // into it is, so only the last one to stop takes the replica out.
+        let still_replicated = store.participant_replicas.values().flatten().any(|replica| {
+            replica.participant_id == stopped.participant_id
+                && replica.destination_stage_arn == stopped.destination_stage_arn
+                && replica.destination_session_id == stopped.destination_session_id
+                && replica.replication_state == crate::state::REPLICATION_STATE_ACTIVE
+        });
+        if !still_replicated {
+            crate::state::leave_stage_session(
+                &mut store,
+                &stopped.destination_stage_arn,
+                &stopped.destination_session_id,
+                &stopped.participant_id,
+            );
+        }
+
+        // Every member of `StopParticipantReplicationResponse` is an `@httpHeader` binding
+        // for a CORS or security response header, so the whole modelled output of this
+        // operation is the endpoint's answer policy
+        // (`crate::state::ResponseHeaderPolicy`), reported here as it is on every other
+        // response of this service; the stop itself is the state written above.
+        Ok(StopParticipantReplicationOutput::default().with_response_header_policy())
     }
 }

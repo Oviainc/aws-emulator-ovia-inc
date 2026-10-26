@@ -18,7 +18,10 @@
 //!   `CreateGraphSnapshot` for a snapshot name), both as the call that TOOK the name and
 //!   as the call that collides with it;
 //! * the name itself, at the published ends of the modelled `@length(1..63)` and across
-//!   the forms its pattern admits (one letter, digits, several hyphen groups).
+//!   the forms its pattern admits (one letter, digits, several hyphen groups);
+//! * for a snapshot name, the graph the colliding call addresses — the same graph the
+//!   name was taken off, or another one — since the uniqueness the refusal reports is
+//!   keyed on the name alone.
 
 use std::sync::Arc;
 
@@ -179,14 +182,14 @@ async fn create_graph_using_import(router: &MultiServiceRouter, case: &str, name
 }
 
 /// `POST /snapshots` — take a snapshot name off `graph_id`, returning the minted
-/// snapshot id. The source graph goes through `SNAPSHOTTING`, so it is waited back into
-/// service before the caller's next call.
+/// snapshot's id and ARN. The source graph goes through `SNAPSHOTTING`, so it is waited
+/// back into service before the caller's next call.
 async fn create_snapshot(
     router: &MultiServiceRouter,
     case: &str,
     graph_id: &str,
     name: &str,
-) -> String {
+) -> (String, String) {
     let (status, created) = call(
         router,
         "POST",
@@ -202,9 +205,13 @@ async fn create_snapshot(
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no snapshot id in {created}"))
         .to_string();
+    let arn = created["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no snapshot ARN in {created}"))
+        .to_string();
     wait_until_available(router, case, &format!("/graphs/{graph_id}")).await;
     wait_until_available(router, case, &format!("/snapshots/{id}")).await;
-    id
+    (id, arn)
 }
 
 /// Assert one refusal: the status, the modelled error code, the whole message the rule
@@ -250,7 +257,7 @@ async fn a_taken_graph_name_is_refused_from_the_requested_name_alone() {
     // one of the colliding names.
     let source_graph = create_graph(&router, "restore source", "conflict-source").await;
     wait_until_available(&router, "restore source", &format!("/graphs/{source_graph}")).await;
-    let source_snapshot =
+    let (source_snapshot, _) =
         create_snapshot(&router, "restore source", &source_graph, "conflict-capture").await;
 
     for (row, name) in colliding_names().into_iter().enumerate() {
@@ -319,7 +326,7 @@ async fn a_taken_snapshot_name_is_refused_from_the_requested_name_alone() {
 
     for name in colliding_names() {
         let seeding = format!("seeding {name:?}");
-        let holder = create_snapshot(&router, &seeding, &graph_id, &name).await;
+        let (holder, _) = create_snapshot(&router, &seeding, &graph_id, &name).await;
 
         let case = format!("CreateGraphSnapshot on the taken name {name:?}");
         let (status, answer) = call(
@@ -340,6 +347,61 @@ async fn a_taken_snapshot_name_is_refused_from_the_requested_name_alone() {
         (200, Some(colliding_names().len())),
         "the seeded snapshots must all still be listed, got {listed_status}: {listed}"
     );
+}
+
+/// A snapshot name is unique in the SNAPSHOT namespace of the account's Region keyed on
+/// the NAME alone: a name a snapshot of one graph already holds refuses a snapshot of
+/// ANOTHER graph with the same request-derived wording, and the refusal discloses
+/// nothing of the record that holds the name — not its id, not its ARN, and not the
+/// graph it was taken off.
+#[tokio::test]
+async fn a_taken_snapshot_name_is_refused_whatever_graph_the_name_was_taken_off() {
+    let router = emulator();
+
+    let holder_graph = create_graph(&router, "holder graph", "holder-source").await;
+    wait_until_available(&router, "holder graph", &format!("/graphs/{holder_graph}")).await;
+    let other_graph = create_graph(&router, "other graph", "other-source").await;
+    wait_until_available(&router, "other graph", &format!("/graphs/{other_graph}")).await;
+
+    for name in colliding_names() {
+        let seeding = format!("seeding {name:?} off {holder_graph}");
+        let (holder_id, holder_arn) =
+            create_snapshot(&router, &seeding, &holder_graph, &name).await;
+
+        let case = format!(
+            "CreateGraphSnapshot off {other_graph} on the name {name:?} held by a snapshot \
+             of {holder_graph}"
+        );
+        let (status, answer) = call(
+            &router,
+            "POST",
+            "/snapshots",
+            Some(json!({"graphIdentifier": other_graph, "snapshotName": name})),
+        )
+        .await;
+        assert_name_conflict(&case, status, &answer, "Snapshot", &name, &holder_id);
+
+        let actual = message(&answer);
+        for (disclosed, value) in [
+            ("the ARN of the snapshot holding the name", &holder_arn),
+            ("the graph that snapshot was taken off", &holder_graph),
+        ] {
+            assert!(
+                !actual.contains(value.as_str()),
+                "case {case:?}: the refusal must not disclose {disclosed} ({value}), \
+                 got {actual:?}"
+            );
+        }
+
+        // The refused call left the graph it addressed in service: a name collision is
+        // reported, it starts no snapshot of that graph.
+        let (status, graph) = call(&router, "GET", &format!("/graphs/{other_graph}"), None).await;
+        assert_eq!(
+            (status, &graph["status"]),
+            (200, &json!("AVAILABLE")),
+            "case {case:?}: the addressed graph must stay AVAILABLE, got {status}: {graph}"
+        );
+    }
 }
 
 /// A snapshot name that is taken is reported as the name conflict it is WHATEVER the

@@ -36,9 +36,8 @@
 //!
 //! The groups the endpoints hang off are seeded through
 //! [`ec2::state::ComAmazonawsEc2Amazonec2State::insert_verified_access_group`], the writer
-//! seam `CreateVerifiedAccessGroup` will land on — that operation is still a scaffold stub
-//! with its own open issue — the way the subnet and image suites seed through their own
-//! insert seams.
+//! seam `CreateVerifiedAccessGroup` lands on, the way the subnet and image suites seed
+//! through their own insert seams.
 
 use std::time::Duration;
 
@@ -48,7 +47,7 @@ use ec2::ops::types::{
 };
 use ec2::state::{
     availability_zones_in_region, ComAmazonawsEc2Amazonec2State as Ec2State, NetworkInterfaceSpec,
-    SecurityGroupSpec, SubnetSpec, MAX_VERIFIED_ACCESS_ENDPOINTS_PAGE_SIZE,
+    SecurityGroupSpec, SubnetSpec, VerifiedAccessGroupRecord, MAX_VERIFIED_ACCESS_ENDPOINTS_PAGE_SIZE,
     MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES, TRANSITION_DELAY,
     VERIFIED_ACCESS_ENDPOINT_STATUS_ACTIVE, VERIFIED_ACCESS_ENDPOINT_STATUS_PENDING,
     VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR, VERIFIED_ACCESS_ENDPOINT_TYPE_LOAD_BALANCER,
@@ -64,7 +63,7 @@ use super::ec2_query::{call, element, elements, error_code, filters, indexed, un
 const REGION: &str = "us-west-2";
 
 /// The Verified Access instance the seeded group belongs to. Chosen by the test rather than
-/// created: nothing in this emulator stores Verified Access instances yet
+/// created: nothing in this emulator creates a Verified Access instance yet
 /// (`CreateVerifiedAccessInstance` is a scaffold stub with its own open issue), and an
 /// endpoint reports the instance of its GROUP whatever that id is.
 const INSTANCE_ID: &str = "vai-0123456789abcdef0";
@@ -166,20 +165,28 @@ fn seed(engine: &engine::InMemoryEngine) -> Fixture {
         })
         .expect("a seeded network interface");
     let group_id = guard.insert_verified_access_group(
-        VerifiedAccessGroup {
-            verified_access_instance_id: Some(INSTANCE_ID.to_string()),
-            description: Some("the group under test".to_string()),
-            ..VerifiedAccessGroup::default()
+        VerifiedAccessGroupRecord {
+            view: VerifiedAccessGroup {
+                verified_access_instance_id: Some(INSTANCE_ID.to_string()),
+                description: Some("the group under test".to_string()),
+                ..VerifiedAccessGroup::default()
+            },
+            ..VerifiedAccessGroupRecord::default()
         },
         REGION,
+        None,
     );
     let other_group_id = guard.insert_verified_access_group(
-        VerifiedAccessGroup {
-            verified_access_instance_id: Some(OTHER_INSTANCE_ID.to_string()),
-            description: Some("another group".to_string()),
-            ..VerifiedAccessGroup::default()
+        VerifiedAccessGroupRecord {
+            view: VerifiedAccessGroup {
+                verified_access_instance_id: Some(OTHER_INSTANCE_ID.to_string()),
+                description: Some("another group".to_string()),
+                ..VerifiedAccessGroup::default()
+            },
+            ..VerifiedAccessGroupRecord::default()
         },
         REGION,
+        None,
     );
 
     Fixture {

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/collection_element_refusals.rs"]
+mod collection_element_refusals;
 #[path = "all/compatible_versions.rs"]
 mod compatible_versions;
 #[path = "all/cross_cluster_connections.rs"]
@@ -43,6 +45,8 @@ mod insights;
 mod instance_type_catalog;
 #[path = "all/instance_type_limits.rs"]
 mod instance_type_limits;
+#[path = "all/package_association_listings.rs"]
+mod package_association_listings;
 #[path = "all/package_associations.rs"]
 mod package_associations;
 #[path = "all/package_registry.rs"]
@@ -69,3 +73,5 @@ mod upgrade_history;
 mod version_catalog;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;
+#[path = "all/vpc_endpoints.rs"]
+mod vpc_endpoints;

@@ -675,9 +675,14 @@ async fn accepting_an_address_already_in_use_conflicts() {
 
     let router = emulator();
     for (case, first_account, second_account, address) in cases {
+        // Both accounts ask for the address while nothing has been confirmed
+        // for it: two PENDING requests take it from nobody, so both starts are
+        // admitted and the acceptance below is what the rule has to refuse.
+        start_pending(&router, case, first_account, &address).await;
+        start_pending(&router, case, second_account, &address).await;
+
         // The first account takes the address, all the way to COMPLETED: the
         // address is in use from the instant that completion came due.
-        start_pending(&router, case, first_account, &address).await;
         let accepted = accept(&router, first_account, &address, WELL_FORMED_PASSCODES[0]).await;
         assert_eq!(
             accepted.status, 200,
@@ -690,9 +695,7 @@ async fn accepting_an_address_already_in_use_conflicts() {
             "case {case:?}: the first update must settle to {COMPLETED}"
         );
 
-        // The second account may ask for the same address — nothing has changed
-        // yet at that point — but completing the change conflicts.
-        start_pending(&router, case, second_account, &address).await;
+        // Completing the change the second account asked for conflicts.
         let conflict = accept(&router, second_account, &address, WELL_FORMED_PASSCODES[1]).await;
         assert_refused(case, &conflict, 409, "ConflictException");
         assert!(

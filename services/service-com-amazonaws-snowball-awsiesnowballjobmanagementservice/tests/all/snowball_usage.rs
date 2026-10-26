@@ -22,11 +22,11 @@
 //! Reporting only: the suite also asserts the call moves no job and changes no later
 //! answer, which is what a usage report must not do.
 //!
-//! The shipment states this API moves a job through are not served by this emulator yet, so
-//! a row that needs a job in a state other than the one `CreateJob` mints sets that state
-//! in the service's own store before calling (`job_unlock_code::set_job_state`), the store
-//! the handler reads; the `Cancelled` row needs no seeding, since `CancelJob` is served and
-//! drives it over the wire. Everything the rule is about still travels over HTTP.
+//! No operation of this API ships a device, so a row that needs a job in a state other
+//! than the one `CreateJob` mints sets that state in the service's own store before calling
+//! (`job_unlock_code::set_job_state`), the store the handler reads; the `Cancelled` row
+//! needs no seeding, since `CancelJob` is served and drives it over the wire. Everything
+//! the rule is about still travels over HTTP.
 
 use serde_json::{json, Value};
 // The quota this emulator reports, the export order's shape and the modelled `JobState`

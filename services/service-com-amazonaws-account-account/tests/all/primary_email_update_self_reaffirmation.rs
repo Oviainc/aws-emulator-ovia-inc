@@ -16,7 +16,7 @@
 //! a record, or an address a previous completed flow put there), in the
 //! address's length and form (both published `@length` bounds included) and in
 //! the passcode's form. Each row also carries the other side of the rule: a
-//! DIFFERENT account presented the same address is still refused with HTTP 409.
+//! DIFFERENT account asking for the same address is still refused with HTTP 409.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -379,13 +379,14 @@ async fn accepting_the_address_the_target_account_already_holds_completes() {
         );
 
         // The other side of the same rule: the address IS in use against every
-        // other account, so one of those presented it is refused — and the
-        // refusal leaves its own update waiting.
-        start_pending(&router, case, other_account_id, &address).await;
-        let conflict = accept(&router, other_account_id, &address, passcode).await;
+        // other account, so one of those asking for it is refused where it asks
+        // — and the refusal records nothing, so that account is still one this
+        // emulator has never been told about.
+        let conflict = start(&router, other_account_id, &address).await;
         assert_eq!(
             conflict.status, 409,
-            "case {case:?}: another account taking the address must answer 409, got {} with {:?}",
+            "case {case:?}: another account asking for the address must answer 409, got {} \
+             with {:?}",
             conflict.status, conflict.body
         );
         assert_eq!(
@@ -394,10 +395,16 @@ async fn accepting_the_address_the_target_account_already_holds_completes() {
             "case {case:?}: expected ConflictException, got {:?}",
             conflict.body
         );
+        let read = call(
+            &router,
+            "/getPrimaryEmailUpdateStatus",
+            json!({"AccountId": other_account_id}),
+        )
+        .await;
         assert_eq!(
-            update_status(&router, case, other_account_id).await,
-            PENDING,
-            "case {case:?}: a refused acceptance must leave the update {PENDING}"
+            read.status, 403,
+            "case {case:?}: a refused start must record nothing, got {} with {:?}",
+            read.status, read.body
         );
     }
 }

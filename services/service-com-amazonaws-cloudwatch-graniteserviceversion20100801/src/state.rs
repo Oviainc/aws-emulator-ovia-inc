@@ -23,6 +23,11 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
 //!   Contributor Insights rules written by `PutInsightRule` and read back by
 //!   `DescribeInsightRules`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::anomaly_detectors`] — the
+//!   anomaly detection models written by `PutAnomalyDetector`, read back by
+//!   `DescribeAnomalyDetectors` and removed by `DeleteAnomalyDetector`, each reported
+//!   `PENDING_TRAINING` until the training its write started comes due
+//!   ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::settle_anomaly_detector_training`]).
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dashboards`] — the
 //!   dashboards written by `PutDashboard` and read back by `GetDashboard` and
 //!   `ListDashboards`, each holding the `DashboardBody` document verbatim.
@@ -44,9 +49,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
-    ActionConfiguration, AlarmHistoryItem, CompositeAlarm, Dimension, EvaluationCriteria,
-    EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm, MetricAlarm, MetricDataQuery,
-    OTelEnrichmentMetricSelector, ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
+    ActionConfiguration, AlarmHistoryItem, AnomalyDetector, CompositeAlarm, Dimension,
+    EvaluationCriteria, EvaluationWindow, GetMetricStreamOutput, InsightRule, LogAlarm,
+    MetricAlarm, MetricDataQuery, MetricMathAnomalyDetector, OTelEnrichmentMetricSelector,
+    ScheduledQueryConfiguration, SingleMetricAnomalyDetector, Tag, WarmUpConfiguration,
 };
 
 /// The action notifications an alarm state transition owes, and how they are delivered to
@@ -933,6 +939,375 @@ pub fn o_tel_enrichment_filters(
     (!filters.is_empty()).then(|| filters.to_vec())
 }
 
+/// A stored anomaly detection model: the modelled shape `DescribeAnomalyDetectors` reports,
+/// and when the training that creating it started comes due.
+///
+/// Held as the modelled [`AnomalyDetector`] itself rather than a parallel record, so every
+/// member `PutAnomalyDetector` accepts round-trips through `DescribeAnomalyDetectors` without
+/// a field-by-field copy that can silently drop one — the same way an alarm is held.
+#[derive(Debug, Clone, Default)]
+pub struct StoredAnomalyDetector {
+    /// The detector as `DescribeAnomalyDetectors` reports it.
+    pub detector: AnomalyDetector,
+    /// When this detector's training is owed to have finished, as epoch seconds. Until that
+    /// instant the model is still being trained, which is the `PENDING_TRAINING` its
+    /// `StateValue` carries.
+    pub trained_due_secs: f64,
+}
+
+/// `PENDING_TRAINING`, one of the three modelled `AnomalyDetectorStateValue` values
+/// ([`crate::ops::types::ANOMALY_DETECTOR_STATE_VALUE_VALUES`]): the state a model is in while
+/// it is still being trained, which is what a freshly written detector reports.
+pub const ANOMALY_DETECTOR_PENDING_TRAINING: &str = "PENDING_TRAINING";
+
+/// `TRAINED`: the model has been trained on the metric's data, so a band drawn from it says
+/// what that metric's values are expected to be.
+pub const ANOMALY_DETECTOR_TRAINED: &str = "TRAINED";
+
+/// `TRAINED_INSUFFICIENT_DATA`: training has finished, but the metric the detector watches has
+/// published nothing for the model to learn from.
+pub const ANOMALY_DETECTOR_TRAINED_INSUFFICIENT_DATA: &str = "TRAINED_INSUFFICIENT_DATA";
+
+/// `SINGLE_METRIC`, one of the two modelled `AnomalyDetectorType` values
+/// ([`crate::ops::types::ANOMALY_DETECTOR_TYPE_VALUES`]): a detector over one metric and
+/// statistic.
+pub const ANOMALY_DETECTOR_TYPE_SINGLE_METRIC: &str = "SINGLE_METRIC";
+
+/// `METRIC_MATH`, the other modelled `AnomalyDetectorType` value: a detector over the single
+/// time series a metric math expression returns.
+pub const ANOMALY_DETECTOR_TYPE_METRIC_MATH: &str = "METRIC_MATH";
+
+/// How long after the write that stored an anomaly detector its training is owed to have
+/// finished.
+///
+/// A model is created "pending training" and only then reports a trained state, so the
+/// trained state is not due at the instant of the write: a caller reading straight after the
+/// write still sees the training it started. CloudWatch publishes no duration for real
+/// training (it reads hours of the metric's history), so this span is the emulator's own
+/// choice inside the framework's 250-750 ms window for a transition the clock owes, and it is
+/// never slept on — the due instant is stored and the transition is materialised by the first
+/// call at or after it ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::settle_anomaly_detector_training`]).
+pub const TRAINING_DELAY_SECS: f64 = 0.5;
+
+/// The largest number of anomaly detection models this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the detector records live in this process's memory, so
+/// their number has to be finite. `PutAnomalyDetector` answers its modelled
+/// `LimitExceededException` ("The operation exceeded one or more limits.") rather than growing
+/// without limit once it is reached; updating a detector that already exists adds none, so it
+/// is unaffected.
+pub const MAX_ANOMALY_DETECTORS: usize = 10_000;
+
+/// The most excluded time ranges one model's training configuration carries: "You can specify
+/// as many as 10 time ranges." (`PutAnomalyDetectorInput$Configuration`)
+pub const MAX_EXCLUDED_TIME_RANGES: usize = 10;
+
+/// The deprecated flat single-metric members a detector request may carry instead of its
+/// `SingleMetricAnomalyDetector` structure ("Use SingleMetricAnomalyDetector.",
+/// `PutAnomalyDetectorInput$Namespace`), so the two writers that accept both spellings read
+/// one rule.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlatSingleMetric<'a> {
+    /// The request's `Namespace`.
+    pub namespace: Option<&'a str>,
+    /// The request's `MetricName`.
+    pub metric_name: Option<&'a str>,
+    /// The request's `Dimensions`.
+    pub dimensions: Option<&'a [Dimension]>,
+    /// The request's `Stat`.
+    pub stat: Option<&'a str>,
+}
+
+impl FlatSingleMetric<'_> {
+    /// The flat members this request carries, named as the model names them.
+    fn named(&self) -> Vec<&'static str> {
+        let mut named = Vec::new();
+        if self.dimensions.is_some() {
+            named.push("Dimensions");
+        }
+        if self.metric_name.is_some() {
+            named.push("MetricName");
+        }
+        if self.namespace.is_some() {
+            named.push("Namespace");
+        }
+        if self.stat.is_some() {
+            named.push("Stat");
+        }
+        named
+    }
+
+    /// The flat members as the `SingleMetricAnomalyDetector` they are the deprecated spelling
+    /// of, so one stored shape serves either spelling.
+    fn as_structure(&self) -> SingleMetricAnomalyDetector {
+        SingleMetricAnomalyDetector {
+            account_id: None,
+            namespace: self.namespace.map(str::to_string),
+            metric_name: self.metric_name.map(str::to_string),
+            dimensions: self.dimensions.map(<[Dimension]>::to_vec),
+            stat: self.stat.map(str::to_string),
+        }
+    }
+}
+
+/// Which of the two forms of anomaly detector a request named, normalised: the deprecated flat
+/// members and the `SingleMetricAnomalyDetector` structure are the same detector, so they
+/// arrive here as one.
+#[derive(Debug, Clone)]
+pub enum AnomalyDetectorForm {
+    /// A detector over one metric and statistic.
+    SingleMetric(SingleMetricAnomalyDetector),
+    /// A detector over the time series a metric math expression returns.
+    MetricMath(MetricMathAnomalyDetector),
+}
+
+impl AnomalyDetectorForm {
+    /// This form's modelled `AnomalyDetectorType`, which is what
+    /// `DescribeAnomalyDetectors$AnomalyDetectorTypes` filters on.
+    pub fn detector_type(&self) -> &'static str {
+        match self {
+            Self::SingleMetric(_) => ANOMALY_DETECTOR_TYPE_SINGLE_METRIC,
+            Self::MetricMath(_) => ANOMALY_DETECTOR_TYPE_METRIC_MATH,
+        }
+    }
+
+    /// The unique identifier of the detector this form names.
+    ///
+    /// A detector is identified by WHAT it watches — the metric, its dimensions and the
+    /// statistic for a single-metric detector, and the queries for a metric-math one — so a
+    /// second write naming the same thing updates that model rather than creating a second
+    /// one, which is what lets `PutAnomalyDetector` report "the anomaly detector that you
+    /// created or updated" and lets a delete that names a metric find what a put created. The
+    /// training configuration and the metric characteristics are NOT part of the identity:
+    /// they are properties of the model rather than of the series it is trained on.
+    ///
+    /// The identifier is a digest of that identity in hex, which keeps it inside the modelled
+    /// `AnomalyDetectorId` (1..128, `^[A-Za-z0-9_./:%()+-]+$`) whatever a metric, a dimension
+    /// or an expression is spelled with.
+    pub fn detector_id(&self) -> String {
+        ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
+            self.identity().as_bytes(),
+        ))
+    }
+
+    /// What this form watches, rendered canonically: the dimension set is normalised, so the
+    /// same metric named with its dimensions in another order is the same detector.
+    fn identity(&self) -> String {
+        let mut document = Map::new();
+        document.insert(
+            "type".to_string(),
+            Value::from(self.detector_type().to_string()),
+        );
+        match self {
+            Self::SingleMetric(single) => {
+                insert_member(&mut document, "accountId", json_text(&single.account_id));
+                insert_member(&mut document, "namespace", json_text(&single.namespace));
+                insert_member(&mut document, "metricName", json_text(&single.metric_name));
+                document.insert(
+                    "dimensions".to_string(),
+                    dimensions_document(&dimension_list(&dimension_set(
+                        single.dimensions.as_deref(),
+                    ))),
+                );
+                insert_member(&mut document, "stat", json_text(&single.stat));
+            }
+            Self::MetricMath(math) => {
+                document.insert(
+                    "metricDataQueries".to_string(),
+                    Value::Array(
+                        math.metric_data_queries
+                            .iter()
+                            .flatten()
+                            .map(metric_query_document)
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        Value::Object(document).to_string()
+    }
+
+    /// The metric and statistic a single-metric detector watches, or `None` for a metric-math
+    /// one, which watches an expression instead.
+    pub fn single_metric(&self) -> Option<&SingleMetricAnomalyDetector> {
+        match self {
+            Self::SingleMetric(single) => Some(single),
+            Self::MetricMath(_) => None,
+        }
+    }
+
+    /// The single-metric form of the metric a series was retrieved for, so the model created
+    /// for that metric is found under the identity its write was keyed by.
+    pub fn of_series_metric(metric: &metric_math::SeriesMetric) -> Self {
+        Self::SingleMetric(SingleMetricAnomalyDetector {
+            // A series this store holds belongs to the account, so it is never one a
+            // cross-account detector named another account for.
+            account_id: None,
+            namespace: Some(metric.namespace.clone()),
+            metric_name: Some(metric.metric_name.clone()),
+            dimensions: Some(dimension_list(&metric.dimensions)),
+            stat: Some(metric.stat.clone()),
+        })
+    }
+}
+
+/// Why a request does not name exactly one anomaly detector.
+#[derive(Debug, Clone)]
+pub enum AnomalyDetectorFormError {
+    /// Parameters that cannot be used together, reported as the parameter-combination fault
+    /// both detector writers model.
+    Combination(String),
+    /// A parameter the detector cannot be identified without is missing, reported as the
+    /// missing-parameter fault both detector writers model.
+    Missing(String),
+}
+
+/// Which detector a request names, or why it names none.
+///
+/// Shared by `PutAnomalyDetector` and `DeleteAnomalyDetector`: both accept the same three
+/// spellings — the `SingleMetricAnomalyDetector` structure, the `MetricMathAnomalyDetector`
+/// structure, and the deprecated flat metric members — under the same rule, so neither can
+/// accept a combination the other refuses.
+pub fn anomaly_detector_form(
+    single: Option<&SingleMetricAnomalyDetector>,
+    math: Option<&MetricMathAnomalyDetector>,
+    flat: FlatSingleMetric<'_>,
+) -> Result<AnomalyDetectorForm, AnomalyDetectorFormError> {
+    let mut found: Vec<&str> = Vec::new();
+    if !flat.named().is_empty() {
+        found.push(FLAT_METRIC_FORM);
+    }
+    if single.is_some() {
+        found.push(SINGLE_METRIC_FORM);
+    }
+    if math.is_some() {
+        found.push(METRIC_MATH_FORM);
+    }
+    match (found.len(), single, math) {
+        (0, _, _) => Err(AnomalyDetectorFormError::Missing(format!(
+            "Either {FLAT_METRIC_FORM}, {SINGLE_METRIC_FORM} or {METRIC_MATH_FORM} must be set."
+        ))),
+        (1, Some(single), _) => Ok(AnomalyDetectorForm::SingleMetric(single.clone())),
+        (1, _, Some(math)) => Ok(AnomalyDetectorForm::MetricMath(math.clone())),
+        // The deprecated spelling of a single-metric detector: the flat members are the
+        // structure's, so they are read as that structure from here on.
+        (1, None, None) => Ok(AnomalyDetectorForm::SingleMetric(flat.as_structure())),
+        _ => Err(AnomalyDetectorFormError::Combination(
+            one_detector_form_message(&found),
+        )),
+    }
+}
+
+/// The deprecated flat metric members, as a refusal naming the forms a request mixed names
+/// them.
+pub const FLAT_METRIC_FORM: &str = "single metric attributes";
+
+/// The `SingleMetricAnomalyDetector` structure, as such a refusal names it.
+pub const SINGLE_METRIC_FORM: &str = "SingleMetricAnomalyDetector";
+
+/// The `MetricMathAnomalyDetector` structure, as such a refusal names it.
+pub const METRIC_MATH_FORM: &str = "MetricMathAnomalyDetector";
+
+/// `AnomalyDetectorId`, as such a refusal names it.
+pub const DETECTOR_ID_FORM: &str = "AnomalyDetectorId";
+
+/// CloudWatch's wording for a request that names a detector more than one way: the three forms
+/// one of which may be set, and then the ones the request was found carrying, in that order.
+pub fn one_detector_form_message(found: &[&str]) -> String {
+    format!(
+        "Either {FLAT_METRIC_FORM}, {SINGLE_METRIC_FORM} or {METRIC_MATH_FORM} can be set, \
+         found {}.",
+        found.join(", ")
+    )
+}
+
+/// Why the detector `form` names cannot be identified, or `None` when it can.
+///
+/// A single-metric detector is the metric AND the statistic — "The statistic to use for the
+/// metric and the anomaly detection model." (`PutAnomalyDetectorInput$Stat`) — so a form
+/// missing any of the three names no model to create or to find. A metric-math detector is
+/// identified by its queries, which the writers check separately.
+pub fn anomaly_detector_form_missing(form: &AnomalyDetectorForm) -> Option<String> {
+    let single = form.single_metric()?;
+    for (member, value) in [
+        ("Namespace", &single.namespace),
+        ("MetricName", &single.metric_name),
+        ("Stat", &single.stat),
+    ] {
+        if value.as_deref().unwrap_or_default().is_empty() {
+            return Some(format!("The parameter {member} must be specified."));
+        }
+    }
+    None
+}
+
+/// What the model `stored` trained says the values of `points` are expected to be, or `None`
+/// when it says nothing about them yet.
+///
+/// The band `ANOMALY_DETECTION_BAND` draws is the model's: "You can use the model to display a
+/// band of expected normal values when the metric is graphed." (`PutAnomalyDetector`) — so what
+/// is normal is what the series' OWN history has been, and the band's width is counted in the
+/// deviation of that history, which is what makes a wider band tolerate more. The model is
+/// therefore the mean of the values it was trained on and how far they spread from it, and the
+/// band reaches the requested number of those spreads either side of the mean.
+///
+/// It says nothing in two cases: while the model is still being trained (the trained state is
+/// owed at `now_secs`, so a caller reading before then sees the training its write started),
+/// and when the training was left with no value at all — a model trained on nothing has no
+/// expectation to report, which is the insufficient-data state it carries.
+///
+/// "An array of time ranges to exclude from use when the anomaly detection model is trained.
+/// Use this to make sure that events that could cause unusual values for the metric ... are not
+/// used when CloudWatch trains the model." (`AnomalyDetectorConfiguration$ExcludedTimeRanges`)
+/// — so a point inside an excluded range is left out of the training while still being a point
+/// the band is reported at.
+pub fn anomaly_model_of(
+    stored: &StoredAnomalyDetector,
+    points: &[(f64, f64)],
+    now_secs: f64,
+) -> Option<metric_math::AnomalyModel> {
+    if stored.trained_due_secs > now_secs {
+        return None;
+    }
+    let excluded: Vec<(f64, f64)> = stored
+        .detector
+        .configuration
+        .iter()
+        .flat_map(|configuration| configuration.excluded_time_ranges.iter().flatten())
+        .map(|range| {
+            (
+                from_timestamp(&range.start_time),
+                from_timestamp(&range.end_time),
+            )
+        })
+        .collect();
+    let trained: Vec<f64> = points
+        .iter()
+        .filter(|(at, _)| {
+            !excluded
+                .iter()
+                .any(|(start, end)| *at >= *start && *at < *end)
+        })
+        .map(|(_, value)| *value)
+        .collect();
+    if trained.is_empty() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let count = trained.len() as f64;
+    let expected = trained.iter().sum::<f64>() / count;
+    let deviation = (trained
+        .iter()
+        .map(|value| (value - expected) * (value - expected))
+        .sum::<f64>()
+        / count)
+        .sqrt();
+    Some(metric_math::AnomalyModel {
+        expected: points.iter().map(|(at, _)| (*at, expected)).collect(),
+        deviation: vec![deviation; points.len()],
+    })
+}
+
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
@@ -953,6 +1328,11 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub metric_streams: HashMap<String, StoredMetricStream>,
     /// Contributor Insights rules by rule name.
     pub insight_rules: HashMap<String, StoredInsightRule>,
+    /// Anomaly detection models by their unique identifier
+    /// ([`AnomalyDetectorForm::detector_id`]), which is what identifies the metric and
+    /// statistic (or the queries) a model was created for, so a second write for the same
+    /// thing updates that model rather than adding a second one.
+    pub anomaly_detectors: HashMap<String, StoredAnomalyDetector>,
     /// Dashboards by dashboard name.
     ///
     /// Not keyed by Region: "All dashboards in your account are global, not region-specific."
@@ -2082,6 +2462,86 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .then_with(|| left_name.cmp(right_name))
         });
         rules
+    }
+
+    /// Materialise the anomaly-detector training the clock has already made due.
+    ///
+    /// A detector's `StateValue` is not a value a caller writes: a model is created pending
+    /// training and reports a trained state once its training is done, so the transition is
+    /// the CLOCK's. It becomes due [`TRAINING_DELAY_SECS`] after the write that stored the
+    /// model, and from then on the state depends only on what the store holds — so whichever
+    /// call materialises it, every later caller sees the same thing.
+    pub fn settle_anomaly_detector_training(&mut self, now_secs: f64) {
+        let settled: Vec<(String, String)> = self
+            .anomaly_detectors
+            .iter()
+            .filter(|(_, stored)| {
+                stored.detector.state_value.as_deref() == Some(ANOMALY_DETECTOR_PENDING_TRAINING)
+                    && stored.trained_due_secs <= now_secs
+            })
+            .map(|(id, stored)| (id.clone(), self.trained_state_of(&stored.detector)))
+            .collect();
+        for (id, state_value) in settled {
+            if let Some(stored) = self.anomaly_detectors.get_mut(&id) {
+                stored.detector.state_value = Some(state_value);
+            }
+        }
+    }
+
+    /// What a model reports once its training is done: `TRAINED` when the series it watches
+    /// has published data for the model to learn from, and `TRAINED_INSUFFICIENT_DATA` when it
+    /// has not — a model trained on no datapoint has nothing to expect a value by.
+    fn trained_state_of(&self, detector: &AnomalyDetector) -> String {
+        let trained_on_data = match (
+            detector.single_metric_anomaly_detector.as_ref(),
+            detector.metric_math_anomaly_detector.as_ref(),
+        ) {
+            (Some(single), _) => self.has_datapoints(
+                single.namespace.as_deref().unwrap_or_default(),
+                single.metric_name.as_deref().unwrap_or_default(),
+                single.dimensions.as_deref(),
+            ),
+            // A metric-math model is trained on the series its expression returns, which is
+            // computed from the metrics its queries retrieve: data in any of them is data the
+            // expression has to train on.
+            (None, Some(math)) => math
+                .metric_data_queries
+                .iter()
+                .flatten()
+                .filter_map(|query| query.metric_stat.as_ref())
+                .any(|stat| {
+                    self.has_datapoints(
+                        stat.metric.namespace.as_deref().unwrap_or_default(),
+                        stat.metric.metric_name.as_deref().unwrap_or_default(),
+                        stat.metric.dimensions.as_deref(),
+                    )
+                }),
+            (None, None) => false,
+        };
+        if trained_on_data {
+            ANOMALY_DETECTOR_TRAINED.to_string()
+        } else {
+            ANOMALY_DETECTOR_TRAINED_INSUFFICIENT_DATA.to_string()
+        }
+    }
+
+    /// Whether this store holds any datapoint for one metric, named the way a request names
+    /// it: the dimension set is normalised, because the dimensions are part of the series'
+    /// identity ([`MetricKey`]).
+    fn has_datapoints(
+        &self,
+        namespace: &str,
+        metric_name: &str,
+        dimensions: Option<&[Dimension]>,
+    ) -> bool {
+        let key = MetricKey {
+            namespace: namespace.to_string(),
+            metric_name: metric_name.to_string(),
+            dimensions: dimension_set(dimensions),
+        };
+        self.metrics
+            .get(&key)
+            .is_some_and(|data| !data.is_empty())
     }
 
     /// Materialise every composite-alarm rule evaluation the clock has already made due.

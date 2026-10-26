@@ -55,6 +55,8 @@ mod payer_account_gate;
 mod payer_gate_precedes_idempotency_existence_and_assembly;
 #[path = "all/percentage_custom_line_item_resource_associations.rs"]
 mod percentage_custom_line_item_resource_associations;
+#[path = "all/pricing_plan_billing_periods.rs"]
+mod pricing_plan_billing_periods;
 #[path = "all/pricing_plan_delete.rs"]
 mod pricing_plan_delete;
 #[path = "all/pricing_plan_list.rs"]
