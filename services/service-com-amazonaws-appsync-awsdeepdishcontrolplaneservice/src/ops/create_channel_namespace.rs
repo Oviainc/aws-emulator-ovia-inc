@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelNamespace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelNamespaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A channel namespace is addressed under the `Api` that holds it, so an
+        // `apiId` naming no `Api` of this account — a GraphQL API's id, an id nothing
+        // created, or a value no `Api` id could even be — leaves nothing for this call
+        // to create the namespace under, and is reported as the absent API it is.
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let Some(api) = guard.event_apis.get_mut(&input.api_id) else {
+            return Err(CreateChannelNamespaceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The namespace's authorization overrides have to name types the API's own
+        // authorization providers set up; the rule is the API configuration's own and
+        // lives in [`crate::state::channel_namespace_auth_modes_refusal`], which
+        // `UpdateChannelNamespace` is refused on too.
+        let publish_auth_modes = input.publish_auth_modes.unwrap_or_default();
+        let subscribe_auth_modes = input.subscribe_auth_modes.unwrap_or_default();
+        if let Some(message) = crate::state::channel_namespace_auth_modes_refusal(
+            &crate::state::configured_auth_types(&api.event_config),
+            &publish_auth_modes,
+            &subscribe_auth_modes,
+        ) {
+            return Err(CreateChannelNamespaceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // A namespace's "name must be unique within the `Api`", so a create under a
+        // name the API already holds conflicts with the namespace that holds it rather
+        // than replacing it.
+        if api.channel_namespaces.contains_key(&input.name) {
+            return Err(CreateChannelNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::CHANNEL_NAMESPACE_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded, so repeated creates cannot grow it without limit: an
+        // `Api` holds at most [`crate::state::CHANNEL_NAMESPACES_PER_API`] channel
+        // namespaces, and `ServiceQuotaExceededException` — "The operation exceeded the
+        // service quota for this resource", as the model documents the shape — is the
+        // modelled refusal for a create past it.
+        if api.channel_namespaces.len() >= crate::state::CHANNEL_NAMESPACES_PER_API {
+            return Err(
+                CreateChannelNamespaceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(
+                            "The operation exceeded the service quota for this resource."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every ground for refusing the create has been read, so nothing below writes
+        // over a request that should have been refused.
+        let record = crate::state::ChannelNamespaceRecord {
+            api_id: api.api_id.clone(),
+            channel_namespace_arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::channel_namespace_resource(&api.api_id, &input.name),
+            ),
+            name: input.name.clone(),
+            publish_auth_modes,
+            subscribe_auth_modes,
+            code_handlers: input.code_handlers,
+            handler_configs: input.handler_configs,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created: now,
+            // Nothing has changed the namespace since it was created, so it was last
+            // changed when it was created.
+            last_modified: now,
+        };
+
+        // Answer from the STORED record, so this body is the one `GetChannelNamespace`
+        // answers with later: the record is projected through the entry it was
+        // inserted under, so the response cannot report a namespace the store does not
+        // hold.
+        let channel_namespace = Some(
+            api.channel_namespaces
+                .entry(input.name)
+                .or_insert(record)
+                .to_channel_namespace(),
+        );
+
+        Ok(CreateChannelNamespaceOutput { channel_namespace })
     }
 }

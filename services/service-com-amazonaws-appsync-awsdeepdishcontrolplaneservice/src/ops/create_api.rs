@@ -229,6 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event_config: input.event_config,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created: std::time::SystemTime::now(),
+            // A fresh API holds no channel namespaces: each one is created by
+            // `CreateChannelNamespace` under the API this call just minted.
+            channel_namespaces: std::collections::BTreeMap::new(),
             // A fresh API holds no API keys; `CreateApiKey` mints them under this
             // API the same way it does under a GraphQL API.
             api_keys: std::collections::BTreeMap::new(),

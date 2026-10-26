@@ -11,12 +11,13 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AppSyncRuntime, AuthMode, DataSource,
-    DynamodbDataSourceConfig, ElasticsearchDataSourceConfig, EnhancedMetricsConfig, EventConfig,
-    EventBridgeDataSourceConfig, FunctionConfiguration, GraphqlApi, HttpDataSourceConfig,
-    LambdaAuthorizerConfig, LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig,
-    OpenSearchServiceDataSourceConfig, RelationalDatabaseDataSourceConfig, SourceApiAssociation,
-    SourceApiAssociationConfig, SourceApiAssociationSummary, SyncConfig, UserPoolConfig,
+    AdditionalAuthenticationProvider, Api, ApiCache, ApiKey, AppSyncRuntime, AuthMode,
+    ChannelNamespace, DataSource, DynamodbDataSourceConfig, ElasticsearchDataSourceConfig,
+    EnhancedMetricsConfig, EventConfig, EventBridgeDataSourceConfig, FunctionConfiguration,
+    GraphqlApi, HandlerConfigs, HttpDataSourceConfig, LambdaAuthorizerConfig,
+    LambdaDataSourceConfig, LogConfig, OpenIDConnectConfig, OpenSearchServiceDataSourceConfig,
+    RelationalDatabaseDataSourceConfig, SourceApiAssociation, SourceApiAssociationConfig,
+    SourceApiAssociationSummary, SyncConfig, UserPoolConfig,
 };
 
 /// One stored `GraphqlApi`, plus the API keys created under it.
@@ -589,6 +590,13 @@ pub struct EventApiRecord {
     pub dns: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
     pub created: SystemTime,
+    /// The channel namespaces created under this API, keyed by their caller-supplied
+    /// name — a namespace "name must be unique within the `Api`", and the name is what
+    /// every channel-namespace operation addresses one by, so no second key is needed.
+    /// Bounded: `CreateChannelNamespace` refuses a create once the API holds the
+    /// AppSync per-API quota of channel namespaces, so this map cannot grow without
+    /// limit.
+    pub channel_namespaces: BTreeMap<String, ChannelNamespaceRecord>,
     /// The API keys created under this API, keyed by key id — the same resource a
     /// `GraphqlApiRecord` holds, since the API-key operations address an API of
     /// either family by the same `apiId` label (see
@@ -621,6 +629,129 @@ impl EventApiRecord {
         }
     }
 }
+
+/// One stored channel namespace of an [`EventApiRecord`]: "Describes a channel
+/// namespace associated with an `Api`. The `ChannelNamespace` contains the definitions
+/// for code handlers for the `Api`."
+///
+/// Every member of the modelled `ChannelNamespace` shape a create or update call can
+/// set is kept, so every reader projects exactly what was written rather than a
+/// subset. No creation-order field is needed: a namespace is addressed by a name
+/// unique within its `Api`, so the map key is itself the order a listing pages in.
+#[derive(Debug, Clone)]
+pub struct ChannelNamespaceRecord {
+    /// The id of the `Api` this namespace belongs to, which the projection reports.
+    pub api_id: String,
+    pub name: String,
+    pub channel_namespace_arn: String,
+    /// The namespace's own authorization overrides, empty where it overrides nothing
+    /// and the `Api`'s default configuration applies.
+    pub subscribe_auth_modes: Vec<AuthMode>,
+    pub publish_auth_modes: Vec<AuthMode>,
+    /// "The event handler functions that run custom business logic to process
+    /// published events and subscribe requests", or `None` when the namespace carries
+    /// no handler code.
+    pub code_handlers: Option<String>,
+    pub handler_configs: Option<HandlerConfigs>,
+    pub tags: BTreeMap<String, String>,
+    pub created: SystemTime,
+    /// When the namespace was last changed: its creation instant until an update
+    /// replaces its configuration.
+    pub last_modified: SystemTime,
+}
+
+impl ChannelNamespaceRecord {
+    /// This record as the modelled `ChannelNamespace` shape, code handlers included.
+    ///
+    /// The single projection the create, the update and `GetChannelNamespace` answer
+    /// with, so none of the three can disagree about one namespace.
+    pub fn to_channel_namespace(&self) -> ChannelNamespace {
+        ChannelNamespace {
+            api_id: Some(self.api_id.clone()),
+            name: Some(self.name.clone()),
+            // An override is reported only where the namespace carries one: an empty
+            // list overrides nothing, which is what a namespace that leaves the
+            // `Api`'s default authorization configuration in place has.
+            subscribe_auth_modes: (!self.subscribe_auth_modes.is_empty())
+                .then(|| self.subscribe_auth_modes.clone()),
+            publish_auth_modes: (!self.publish_auth_modes.is_empty())
+                .then(|| self.publish_auth_modes.clone()),
+            code_handlers: self.code_handlers.clone(),
+            // Reported whether or not the namespace holds tags, the way
+            // [`EventApiRecord::to_api`] reports an API's.
+            tags: Some(map_out(&self.tags)),
+            channel_namespace_arn: Some(self.channel_namespace_arn.clone()),
+            created: Some(::aws_smithy_types::DateTime::from(self.created)),
+            last_modified: Some(::aws_smithy_types::DateTime::from(self.last_modified)),
+            handler_configs: self.handler_configs.clone(),
+        }
+    }
+
+    /// This record as a listing reports it: the projection above WITHOUT the code
+    /// handlers, because `ListChannelNamespaces` "returns only high level details for
+    /// the channel namespace. To retrieve code handlers, use `GetChannelNamespace`".
+    pub fn to_channel_namespace_summary(&self) -> ChannelNamespace {
+        ChannelNamespace {
+            code_handlers: None,
+            ..self.to_channel_namespace()
+        }
+    }
+
+    /// Replace this namespace's configuration with what an update call carried, and
+    /// record that the change happened at `now`.
+    ///
+    /// Every settable member of the update request is the namespace's new value, so
+    /// the update REPLACES the stored configuration rather than merging into it: a
+    /// member the request omits is gone from the namespace. The identity (the name,
+    /// the ARN, the owning API and the creation instant) is not settable and is kept.
+    pub fn apply_update(
+        &mut self,
+        publish_auth_modes: Vec<AuthMode>,
+        subscribe_auth_modes: Vec<AuthMode>,
+        code_handlers: Option<String>,
+        handler_configs: Option<HandlerConfigs>,
+        now: SystemTime,
+    ) {
+        self.publish_auth_modes = publish_auth_modes;
+        self.subscribe_auth_modes = subscribe_auth_modes;
+        self.code_handlers = code_handlers;
+        self.handler_configs = handler_configs;
+        self.last_modified = now;
+    }
+}
+
+/// The resource portion of a channel namespace's ARN: a namespace is a child of its
+/// `Api`, so it is named under that API's own `apis/{apiId}` path, as
+/// `GetChannelNamespace`'s URI (`/v2/apis/{apiId}/channelNamespaces/{name}`) addresses
+/// it.
+pub fn channel_namespace_resource(api_id: &str, name: &str) -> String {
+    format!("apis/{api_id}/channelNamespace/{name}")
+}
+
+/// How many channel namespaces one `Api` holds in this emulator, which bounds the
+/// namespaces a single [`EventApiRecord`] stores: a create past it is refused with the
+/// modelled `ServiceQuotaExceededException`, so repeated creates cannot grow the store
+/// without limit. Set at AppSync's published quota of channel namespaces per Event
+/// API.
+pub const CHANNEL_NAMESPACES_PER_API: usize = 50;
+
+/// The text a `NotFoundException` (HTTP 404) carries for a channel namespace the
+/// addressed `Api` does not hold, on the path that REPORTS one.
+///
+/// A fixed sentence: the recordings this answers pin AppSync's own wording, which
+/// states the absent resource and names neither the namespace nor the API. The
+/// MUTATING paths word the same absence differently — they carry no message at all
+/// (`UpdateChannelNamespace`, `DeleteChannelNamespace`) — so this is the read path's
+/// text rather than the resource's.
+pub const CHANNEL_NAMESPACE_NOT_FOUND_MESSAGE: &str = "Channel namespace not found.";
+
+/// The text a `ConflictException` (HTTP 409) carries for a create whose name is already
+/// taken within the `Api`.
+///
+/// A namespace's "name must be unique within the `Api`", so a second create under a
+/// name the API already holds conflicts with the namespace that holds it rather than
+/// being malformed. A fixed sentence, as the recordings this answers word it.
+pub const CHANNEL_NAMESPACE_EXISTS_MESSAGE: &str = "Channel namespace already exists.";
 
 /// The authorization types an Event API configuration sets up, i.e. the types its
 /// authorization modes may name.
@@ -723,6 +854,34 @@ pub fn event_config_refusal(event_config: &EventConfig) -> Option<String> {
     }
 
     None
+}
+
+/// Why the authorization overrides a channel-namespace create or update carries are
+/// not well formed, as the text a `BadRequestException` (HTTP 400) states it with, or
+/// `None` when they are.
+///
+/// A namespace's `publishAuthModes` and `subscribeAuthModes` are authorization modes
+/// of the same kind the API's own configuration carries, and they "override the default
+/// `Api` authorization configuration" rather than extend it, so the rule the API's own
+/// mode lists follow holds for them too: a mode is valid only where the API's
+/// authorization providers set its type up. Both the create and the update carry the
+/// two members, so the rule lives here once; `configured` is the API's own
+/// [`configured_auth_types`], taken by the caller so the check needs no borrow of the
+/// API itself.
+pub fn channel_namespace_auth_modes_refusal(
+    configured: &std::collections::BTreeSet<String>,
+    publish_auth_modes: &[AuthMode],
+    subscribe_auth_modes: &[AuthMode],
+) -> Option<String> {
+    [
+        ("publishAuthModes", publish_auth_modes),
+        ("subscribeAuthModes", subscribe_auth_modes),
+    ]
+    .into_iter()
+    .find_map(|(member, modes)| {
+        unconfigured_auth_mode(modes, configured)
+            .map(|auth_type| unconfigured_auth_mode_message(member, auth_type))
+    })
 }
 
 /// One stored association between a Merged API and one of its source APIs.

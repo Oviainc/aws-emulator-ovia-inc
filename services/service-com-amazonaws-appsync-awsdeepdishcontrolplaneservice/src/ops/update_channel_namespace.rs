@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannelNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannelNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannelNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannelNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannelNamespace"))
+        // The new configuration comes from the deserialized input and the namespace's
+        // identity is kept, so no request metadata takes part and `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateChannelNamespaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A channel namespace is addressed under the `Api` that holds it, so an
+        // `apiId` naming no `Api` of this account — a GraphQL API's id, an id nothing
+        // created, or a value no `Api` id could even be — holds no namespace to
+        // update, and is reported as the absent API it is.
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        let Some(api) = guard.event_apis.get_mut(&input.api_id) else {
+            return Err(UpdateChannelNamespaceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The API's own configured authorization types, read before the namespace is
+        // borrowed so the absence of the namespace is reported first: an update to a
+        // namespace the API does not hold is that absence, whatever else the request
+        // carries.
+        let configured = crate::state::configured_auth_types(&api.event_config);
+
+        let Some(record) = api.channel_namespaces.get_mut(&input.name) else {
+            return Err(UpdateChannelNamespaceErrorModeled::NotFoundException(
+                NotFoundException {
+                    // The mutating paths report the absent namespace by the status and
+                    // the error shape alone: this refusal carries no message, where the
+                    // reporting path states
+                    // [`crate::state::CHANNEL_NAMESPACE_NOT_FOUND_MESSAGE`].
+                    message: None,
+                },
+            )
+            .into());
+        };
+
+        // The namespace's authorization overrides have to name types the API's own
+        // authorization providers set up, exactly as the create's do
+        // ([`crate::state::channel_namespace_auth_modes_refusal`]), and the request is
+        // refused before anything is stored.
+        let publish_auth_modes = input.publish_auth_modes.unwrap_or_default();
+        let subscribe_auth_modes = input.subscribe_auth_modes.unwrap_or_default();
+        if let Some(message) = crate::state::channel_namespace_auth_modes_refusal(
+            &configured,
+            &publish_auth_modes,
+            &subscribe_auth_modes,
+        ) {
+            return Err(UpdateChannelNamespaceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // Every settable member of the request is the namespace's new value, so the
+        // update REPLACES the stored configuration rather than merging into it: a
+        // member the request omits is gone from the namespace.
+        record.apply_update(
+            publish_auth_modes,
+            subscribe_auth_modes,
+            input.code_handlers,
+            input.handler_configs,
+            now,
+        );
+
+        // Answer from the record this update STORED, so this body is the one
+        // `GetChannelNamespace` answers with next.
+        Ok(UpdateChannelNamespaceOutput {
+            channel_namespace: Some(record.to_channel_namespace()),
+        })
     }
 }

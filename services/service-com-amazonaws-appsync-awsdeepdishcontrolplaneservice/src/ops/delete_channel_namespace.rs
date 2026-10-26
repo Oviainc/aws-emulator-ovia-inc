@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannelNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannelNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannelNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannelNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannelNamespace"))
+        // The namespace is addressed by the deserialized input alone, so no request
+        // metadata takes part and `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteChannelNamespaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A channel namespace is addressed under the `Api` that holds it, so an
+        // `apiId` naming no `Api` of this account — a GraphQL API's id, an id nothing
+        // created, or a value no `Api` id could even be — holds no namespace to
+        // delete, and is reported as the absent API it is.
+        let mut guard = state.lock();
+
+        let Some(api) = guard.event_apis.get_mut(&input.api_id) else {
+            return Err(DeleteChannelNamespaceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A namespace is addressed by name within its `Api`, so a name the API does
+        // not hold names no resource to delete — including one held by a DIFFERENT API,
+        // and one an earlier delete already removed. Removing the record is what makes
+        // the resource gone: every reader of that API (`GetChannelNamespace`,
+        // `ListChannelNamespaces`) answers without it afterwards, and the room it took
+        // in the per-API quota is free again.
+        if api.channel_namespaces.remove(&input.name).is_none() {
+            return Err(DeleteChannelNamespaceErrorModeled::NotFoundException(
+                NotFoundException {
+                    // The mutating paths report the absent namespace by the status and
+                    // the error shape alone: this refusal carries no message, where the
+                    // reporting path states
+                    // [`crate::state::CHANNEL_NAMESPACE_NOT_FOUND_MESSAGE`].
+                    message: None,
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteChannelNamespaceOutput {})
     }
 }
