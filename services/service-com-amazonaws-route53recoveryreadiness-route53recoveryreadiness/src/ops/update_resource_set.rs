@@ -11,6 +11,11 @@
 //! part of the set it describes, so they survive an update untouched — the tag
 //! operations are what change them.
 //!
+//! A replacement entry describing a DNS target resource is stored with the component
+//! identifier this service generates for it ([`crate::state::assign_component_ids`]), the
+//! same rule `CreateResourceSet` applies: whichever write put an entry in the store, the
+//! resource it describes is addressable in `GetReadinessCheckResourceStatus`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -213,6 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are.
         record.resource_set_type = input.resource_set_type;
         record.resources = input.resources;
+        // The same rule a create applies: an entry describing a DNS target resource and
+        // carrying no component identifier is stored with the one this service generates
+        // for it, so a resource the replacement introduces is addressable exactly as one
+        // a create stored.
+        crate::state::assign_component_ids(&input.resource_set_name, &mut record.resources);
 
         // Reported out of the record that was just written, so what the caller sees is
         // what a later `GetResourceSet` will see.

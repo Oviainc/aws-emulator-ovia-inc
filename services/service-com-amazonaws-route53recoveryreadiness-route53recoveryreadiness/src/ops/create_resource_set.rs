@@ -7,6 +7,11 @@
 //! That record is the only thing `GetResourceSet` and `ListResourceSets` read, so
 //! nothing here is echoed back to the caller without being persisted first.
 //!
+//! One member of the record is the SERVICE's rather than the caller's: a resource
+//! described by a DNS target resource carries the component identifier this service
+//! generates for it ([`crate::state::assign_component_ids`]), which is what addresses
+//! that resource in `GetReadinessCheckResourceStatus`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,12 +252,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource described by a DNS target resource carries no `ResourceArn`, so the
+        // component identifier this service generates for it is the only thing that
+        // addresses it afterwards: it is minted BEFORE the record is written, so the
+        // stored list and every read of it carry it.
+        let mut resources = input.resources;
+        crate::state::assign_component_ids(&input.resource_set_name, &mut resources);
+
         let arn = crate::state::resource_set_arn(&input.resource_set_name);
         let record = crate::state::ResourceSetRecord {
             arn: arn.clone(),
             name: input.resource_set_name.clone(),
             resource_set_type: input.resource_set_type,
-            resources: input.resources,
+            resources,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
         state.arn_index.insert(

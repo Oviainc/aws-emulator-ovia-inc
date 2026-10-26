@@ -21,14 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque list-pagination cursors: the page's first key, hex-encoded.
+# Opaque list-pagination cursors: the page's first key, hex-encoded; also the hex
+# rendering of a generated component identifier's digest.
 hex = { workspace = true }
+# The digest a generated DNS-target component identifier is derived from.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

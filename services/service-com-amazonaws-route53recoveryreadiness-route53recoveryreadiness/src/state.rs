@@ -11,9 +11,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{
-    CellOutput, ReadinessCheckOutput, ReadinessCheckSummary, RecoveryGroupOutput, Resource,
-    ResourceSetOutput,
+    CellOutput, DNSTargetResource, ReadinessCheckOutput, ReadinessCheckSummary, RecoveryGroupOutput,
+    Resource, ResourceSetOutput,
 };
 
 /// The `arnNamespace` this service's ARNs carry, from the model's `aws.api#service`
@@ -250,7 +252,9 @@ pub const STORE_UNAVAILABLE: &str =
 /// `resources` holds the modelled [`Resource`] shape itself rather than a parallel
 /// record type: the shape is `Clone` + `Debug`, every member of it (including the
 /// whole `DnsTargetResource` subtree) is preserved exactly as submitted, and one
-/// representation cannot drift from the other.
+/// representation cannot drift from the other. The ONE member the service fills in is
+/// the component identifier of a DNS target resource ([`assign_component_ids`]), which
+/// is written before the record is stored and so is read back like any other member.
 #[derive(Debug, Clone)]
 pub struct ResourceSetRecord {
     pub arn: String,
@@ -1213,6 +1217,127 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), String> {
     Ok(())
 }
 
+/// The prefix every component identifier this service GENERATES carries, so a generated
+/// identifier is distinguishable from one a caller wrote.
+///
+/// The model publishes no format for the generated value — `Resource$ComponentId` is only
+/// documented as "generated when DNS target resource is used"
+/// (`smithy_query(query="doc", shape="Resource", member="ComponentId")`) and the member
+/// targets a plain `__string` with neither `@length` nor `@pattern` — so the FORM below is
+/// this emulator's own. What the API does pin is the identifier's job: it is what
+/// `GetReadinessCheckResourceStatus` accepts in place of an ARN
+/// (`smithy_query(query="doc", shape="GetReadinessCheckResourceStatusRequest",
+/// member="ResourceIdentifier")`), so the value has to be unique within the set, stable
+/// across reads and usable as one URI path segment — which is why it is built out of
+/// characters no client has to escape.
+pub const GENERATED_COMPONENT_ID_PREFIX: &str = "dns-target-";
+
+/// How many hex characters of the digest a generated component identifier carries: 128
+/// bits, so two different DNS target resources of one set do not collide in practice (and
+/// [`assign_component_ids`] still disambiguates if they do).
+pub const GENERATED_COMPONENT_ID_DIGEST_CHARS: usize = 32;
+
+/// Give every entry that DESCRIBES A DNS TARGET RESOURCE and carries no component
+/// identifier the one this service generates for it, leaving every other entry — and
+/// every identifier a caller supplied — exactly as submitted.
+///
+/// This is the rule `Resource$ComponentId` states ("generated when DNS target resource is
+/// used"): such a resource carries no `ResourceArn`, so the generated identifier is the
+/// ONLY thing that addresses it in `GetReadinessCheckResourceStatus`. Applied by every
+/// operation that admits a resource list into the store, so a stored entry cannot be
+/// unaddressable whichever write put it there.
+///
+/// The identifier is derived from the set the entry belongs to and from the DNS target
+/// resource itself, so re-submitting the same entry yields the same identifier and two
+/// different entries get different ones; an identifier that would repeat one already in
+/// the list (an identical entry submitted twice, or a caller-supplied value that happens
+/// to collide) is given a disambiguating ordinal.
+pub fn assign_component_ids(resource_set_name: &str, resources: &mut [Resource]) {
+    let mut taken: BTreeSet<String> = resources
+        .iter()
+        .filter_map(|resource| resource.component_id.clone())
+        .collect();
+    for resource in resources.iter_mut() {
+        if resource.component_id.is_some() {
+            continue;
+        }
+        let Some(dns_target) = resource.dns_target_resource.as_ref() else {
+            continue;
+        };
+        let base = generated_component_id(resource_set_name, dns_target);
+        let mut candidate = base.clone();
+        let mut ordinal = 1usize;
+        while !taken.insert(candidate.clone()) {
+            ordinal += 1;
+            candidate = format!("{base}-{ordinal}");
+        }
+        resource.component_id = Some(candidate);
+    }
+}
+
+/// The component identifier this service generates for `dns_target` in the resource set
+/// named `resource_set_name`: [`GENERATED_COMPONENT_ID_PREFIX`] followed by
+/// [`GENERATED_COMPONENT_ID_DIGEST_CHARS`] hex characters of a digest over the set name
+/// and every leaf of the DNS target resource.
+///
+/// A FUNCTION OF THE RESOURCE, not of the clock or of a counter: the same DNS target
+/// resource in the same set always gets the same identifier, so an update that resubmits
+/// an entry does not silently re-address it, and nothing has to be read back to learn
+/// what an identifier was.
+pub fn generated_component_id(resource_set_name: &str, dns_target: &DNSTargetResource) -> String {
+    let mut digest = Sha256::new();
+    absorb(&mut digest, resource_set_name);
+    for (member, value) in dns_target_leaves(dns_target) {
+        absorb(&mut digest, member);
+        match value {
+            Some(value) => {
+                digest.update(b"=");
+                absorb(&mut digest, value);
+            }
+            // An ABSENT member is distinguished from an empty one, so two entries that
+            // differ only in which members they carry do not digest alike.
+            None => digest.update(b"~"),
+        }
+    }
+    let hexed: String = hex::encode(digest.finalize())
+        .chars()
+        .take(GENERATED_COMPONENT_ID_DIGEST_CHARS)
+        .collect();
+    format!("{GENERATED_COMPONENT_ID_PREFIX}{hexed}")
+}
+
+/// Every leaf member of the `DNSTargetResource` subtree, in a fixed order, so the digest
+/// above is over the whole submitted resource and does not change with how the request
+/// happened to be serialized (model: `smithy_query(query="shape",
+/// shape="DNSTargetResource,TargetResource,NLBResource,R53ResourceRecord")`).
+fn dns_target_leaves(dns_target: &DNSTargetResource) -> [(&'static str, Option<&str>); 7] {
+    let target = dns_target.target_resource.as_ref();
+    let nlb = target.and_then(|target| target.nlb_resource.as_ref());
+    let r53 = target.and_then(|target| target.r53_resource.as_ref());
+    [
+        ("domainName", dns_target.domain_name.as_deref()),
+        ("hostedZoneArn", dns_target.hosted_zone_arn.as_deref()),
+        ("recordSetId", dns_target.record_set_id.as_deref()),
+        ("recordType", dns_target.record_type.as_deref()),
+        ("nLBResource.arn", nlb.and_then(|nlb| nlb.arn.as_deref())),
+        (
+            "r53Resource.domainName",
+            r53.and_then(|r53| r53.domain_name.as_deref()),
+        ),
+        (
+            "r53Resource.recordSetId",
+            r53.and_then(|r53| r53.record_set_id.as_deref()),
+        ),
+    ]
+}
+
+/// Feed one string into `digest`, LENGTH-PREFIXED: without the length, two different
+/// member lists could concatenate to the same bytes and digest alike.
+fn absorb(digest: &mut Sha256, value: &str) {
+    digest.update(value.len().to_string().as_bytes());
+    digest.update(b":");
+    digest.update(value.as_bytes());
+}
 
 /// Refuse a tag map with more entries than this emulator stores per record, or one
 /// carrying a key or value the tagging contract does not admit.

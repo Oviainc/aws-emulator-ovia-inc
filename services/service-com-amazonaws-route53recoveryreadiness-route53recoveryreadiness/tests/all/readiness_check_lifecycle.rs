@@ -466,7 +466,58 @@ fn resource_set_cases() -> Vec<ResourceSetCase> {
     ]
 }
 
-fn assert_resource_set_reported(label: &str, reply: &Reply, expected: &ResourceSetCase) {
+/// Assert `reported` is the submitted resource list with the component identifiers the
+/// service generates added, and nothing else changed.
+///
+/// `Resource$ComponentId` is "generated when DNS target resource is used" (model:
+/// `smithy_query(query="doc", shape="Resource", member="ComponentId")`), so an entry that
+/// submitted a `dnsTargetResource` and no `componentId` comes back carrying one the
+/// service minted — the identifier that addresses it in `GetReadinessCheckResourceStatus`.
+/// Every other entry, and every identifier the caller wrote, is reported as submitted.
+/// `dns_target_component_ids.rs` is the table over this rule; here it is what keeps the
+/// lifecycle rows comparable member by member.
+fn assert_component_ids_generated_for_dns_entries(label: &str, reported: &Value, submitted: &Value) {
+    let reported = reported.as_array().cloned().unwrap_or_default();
+    let submitted = submitted.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        reported.len(),
+        submitted.len(),
+        "case {label:?}: expected {} resources back, got {reported:?}",
+        submitted.len()
+    );
+    for (index, (got, sent)) in reported.iter().zip(submitted.iter()).enumerate() {
+        let generated =
+            sent.get("componentId").is_none() && sent.get("dnsTargetResource").is_some();
+        let mut stripped = got.clone();
+        if generated {
+            let minted = got.get("componentId").and_then(Value::as_str);
+            assert!(
+                minted.is_some_and(|id| !id.is_empty()),
+                "case {label:?}: resource {index} describes a DNS target resource and \
+                 submitted no componentId, so the service generates one; got {got:?}"
+            );
+            stripped
+                .as_object_mut()
+                .expect("a resource is a JSON object")
+                .remove("componentId");
+        }
+        assert_eq!(
+            &stripped, sent,
+            "case {label:?}: resource {index}: expected every submitted member preserved, \
+             got {got:?}"
+        );
+    }
+}
+
+/// Assert the reply reports the row's record, with `expected_resources` as its resource
+/// list — the list the create answered, so a later read is held to the identical value
+/// (generated component identifiers included).
+fn assert_resource_set_reported(
+    label: &str,
+    reply: &Reply,
+    expected: &ResourceSetCase,
+    expected_resources: &Value,
+) {
     assert_eq!(
         reply.status, 200,
         "case {label:?}: expected HTTP 200, got {} with body {}",
@@ -491,9 +542,9 @@ fn assert_resource_set_reported(label: &str, reply: &Reply, expected: &ResourceS
         reply.string("resourceSetType")
     );
     assert_eq!(
-        reply.field("resources").cloned().unwrap_or(json!([])),
-        expected.resources,
-        "case {label:?}: expected every submitted resource member preserved, got {:?}",
+        &reply.field("resources").cloned().unwrap_or(json!([])),
+        expected_resources,
+        "case {label:?}: expected the stored resource list, got {:?}",
         reply.field("resources")
     );
     assert_eq!(
@@ -513,10 +564,28 @@ async fn a_created_resource_set_is_reported_by_get_and_list_exactly_as_stored() 
         let created = emulator
             .create(Kind::ResourceSet, expected.create_body())
             .await;
-        assert_resource_set_reported(&format!("{label} (create)"), &created, &expected);
+        // What the create reported, which is the submitted list plus the component
+        // identifiers the service generated: every later read is held to it exactly.
+        let stored_resources = created.field("resources").cloned().unwrap_or(json!([]));
+        assert_component_ids_generated_for_dns_entries(
+            &format!("{label} (create)"),
+            &stored_resources,
+            &expected.resources,
+        );
+        assert_resource_set_reported(
+            &format!("{label} (create)"),
+            &created,
+            &expected,
+            &stored_resources,
+        );
 
         let fetched = emulator.get(Kind::ResourceSet, &expected.name).await;
-        assert_resource_set_reported(&format!("{label} (get)"), &fetched, &expected);
+        assert_resource_set_reported(
+            &format!("{label} (get)"),
+            &fetched,
+            &expected,
+            &stored_resources,
+        );
 
         let listed = emulator
             .find_in_list(Kind::ResourceSet, &expected.name, label)
@@ -534,7 +603,7 @@ async fn a_created_resource_set_is_reported_by_get_and_list_exactly_as_stored() 
         );
         assert_eq!(
             listed.get("resources").cloned().unwrap_or(json!([])),
-            expected.resources,
+            stored_resources,
             "case {label:?}: expected the list entry to carry the stored resources, got {listed}"
         );
         assert_eq!(
