@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
+//! IMPLEMENTED: removes the `tagKeys` it names from the tag map of the vector bucket or
+//! vector index its `resourceArn` names, under that resource's own optimistic lock — so a
+//! removal that overlaps another mutation of the SAME resource is refused
+//! `ConflictException` (409) — and refuses a key in the reserved `aws:` namespace and a
+//! call the bucket's resource policy denies.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,11 +88,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#UntagResource",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -143,9 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about the removal depends on request metadata: the resource is
-        // named by an ARN, which already carries its region and account.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -158,16 +162,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `aws:` tag-key namespace is AWS's own: a tag in it cannot be deleted
         // by a caller any more than it can be created by one, so a request naming
         // such a key is refused before anything is resolved or removed.
-        crate::state::validate_tag_keys("tagKeys", input.tag_keys.iter().map(String::as_str))
+        crate::state::validate_tag_keys(input.tag_keys.iter().map(String::as_str))
             .map_err(refusal)?;
 
+        // Who the request speaks for, resolved before this service's own store is
+        // locked, so only one store is ever held at a time.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        // The read-modify-write this call makes is taken under the resource's own
+        // optimistic lock, which the guard is dropped before the commit span is waited
+        // out so another caller can reach the store and be told about the conflict.
+        let arn = {
+            let mut store = state.lock();
+            // The resource must exist for its tags to be removed: an ARN naming a vector
+            // bucket or vector index this store does not hold is the modelled 404, which
+            // is what an ARN of an already deleted resource answers too.
+            let arn = store
+                .tagged_resource_arn("resourceArn", &input.resource_arn)
+                .map_err(refusal)?;
+
+            // The resource policy of the vector bucket the ARN names decides this call
+            // before it removes anything: an explicit Deny of the action refuses it.
+            if let Some(message) = store
+                .authorization_target_for_arn("resourceArn", &input.resource_arn)
+                .map_err(refusal)?
+                .refusal(&caller, &[Self::NAME])
+            {
+                return Err(UntagResourceErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into());
+            }
+
+            store
+                .begin_tag_write(&arn, ::std::time::Instant::now())
+                .map_err(conflict)?;
+            arn
+        };
+
+        // The removal takes the span it takes to commit, and its own caller is answered
+        // only once it has: see TagResource, which this is the opposite write of.
+        ::tokio::time::sleep(crate::state::TAG_WRITE_COMMIT).await;
+
         let mut store = state.lock();
-        // The resource must exist for its tags to be removed: an ARN naming a vector
-        // bucket or vector index this store does not hold is the modelled 404, which
-        // is what an ARN of an already deleted resource answers too.
-        let arn = store
-            .tagged_resource_arn("resourceArn", &input.resource_arn)
-            .map_err(refusal)?;
+        // The resource may have been deleted while this removal was committing, in which
+        // case there is nothing left to remove tags from.
+        let resolved = store.tagged_resource_arn("resourceArn", &input.resource_arn);
+        store.end_tag_write(&arn);
+        resolved.map_err(refusal)?;
 
         // Removal is BY KEY and idempotent (the operation carries `@idempotent`): a
         // key the resource does not carry is simply not there rather than a failure,
@@ -196,4 +237,9 @@ fn refusal(error: crate::state::LookupError) -> UntagResourceError {
     } else {
         UntagResourceErrorModeled::ValidationException(error.validation_exception()).into()
     }
+}
+
+/// The modelled 409 for a removal that raced another mutation of the same resource.
+fn conflict(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::ConflictException(ConflictException { message }).into()
 }

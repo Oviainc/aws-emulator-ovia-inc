@@ -160,20 +160,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region, and a region holding no such Outpost lists none of its tasks.
         let region = crate::state::request_region(ctx.parts());
         // The Outpost the caller narrowed to, if any. The filter is modelled as an
-        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN and
-        // both name the same stored Outpost.
+        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN; an
+        // ARN carries a partition, a Region and an account of its own, and one that is
+        // not this endpoint's names no Outpost of this inventory — so nothing can
+        // match it ([`matches_filters`]).
         let outpost_filter = match input
             .outpost_identifier_filter
             .as_deref()
             .filter(|identifier| !identifier.is_empty())
         {
-            Some(identifier) => Some(crate::state::resolve_outpost_id(identifier).ok_or_else(
-                || {
+            Some(identifier) => Some(
+                crate::state::resolve_outpost_id(identifier, &region).ok_or_else(|| {
                     ListCapacityTasksErrorModeled::ValidationException(ValidationException {
                         message: Some(crate::state::outpost_identifier_filter_pattern_report()),
                     })
-                },
-            )?),
+                })?,
+            ),
             None => None,
         };
         // The resume point the caller's token names. A token this service did not
@@ -205,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|task| {
                     matches_filters(
                         task,
-                        outpost_filter.as_deref(),
+                        outpost_filter.as_ref(),
                         input.capacity_task_status_filter.as_deref(),
                     )
                 })
@@ -237,14 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// A filter is a filter and not an identifier the request is addressed to: it
 /// narrows the list the caller is reported, so one naming an Outpost that holds no
-/// task — including one this region does not hold at all — reports no task rather
-/// than failing.
+/// task — including one this endpoint does not hold at all, which is what an ARN of
+/// another partition, Region or account names — reports no task rather than failing.
 fn matches_filters(
     task: &crate::state::CapacityTaskRecord,
-    outpost_filter: Option<&str>,
+    outpost_filter: Option<&crate::state::ResolvedIdentifier>,
     status_filter: Option<&[String]>,
 ) -> bool {
-    let outpost_matches = outpost_filter.is_none_or(|outpost_id| task.outpost_id == outpost_id);
+    let outpost_matches = match outpost_filter {
+        None => true,
+        Some(filter) => filter
+            .here()
+            .is_some_and(|outpost_id| task.outpost_id == outpost_id),
+    };
     // The status filter is a list of accepted values, so it selects by the rule every
     // list of this service selects its own list filters by.
     let status_matches = crate::state::filter_accepts(status_filter, Some(task.status.as_str()));

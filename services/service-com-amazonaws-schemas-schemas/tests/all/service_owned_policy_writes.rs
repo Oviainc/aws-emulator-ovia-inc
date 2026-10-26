@@ -138,7 +138,7 @@ fn write_cases() -> Vec<Case> {
             // all, so it is never told whether one is there.
             case: "remove the policy",
             write: Write::Delete,
-            own_status: 204,
+            own_status: 200,
         },
     ]
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReleaseStaticIp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReleaseStaticIp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReleaseStaticIp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReleaseStaticIp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReleaseStaticIpErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReleaseStaticIp"))
+        // A static IP is addressed by the name the request names — the store
+        // holds it under that name alone — and where it was reserved is the
+        // location its own record holds, so nothing here comes from the request
+        // metadata `ctx` carries.
+        let _ = ctx;
+
+        // `staticIpName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or
+        // malformed one before this body ran.
+        let name = input.static_ip_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The removal is what RESOLVES the record, under one exclusive hold
+            // on the store, so a request naming a static IP this account does
+            // not hold removes nothing and is refused rather than reporting a
+            // release that did not happen.
+            //
+            // Nothing about the static IP itself can refuse the release: this
+            // operation "deletes a specific static IP from your account" with no
+            // precondition on the address — unlike `DeleteDisk`, whose modelled
+            // documentation states one ("the disk must be in the available
+            // state") — and the modelled `StaticIp` carries no lifecycle state a
+            // precondition could be about. An attachment the release gives up
+            // goes with the reservation, in the store's own one step.
+            let Some(released) = store.remove_static_ip(&name) else {
+                return Err(not_found(&name));
+            };
+            // The address is gone from the account as this call returns — a
+            // `StaticIp` carries no status member, so there is nothing left for
+            // the clock to settle later — which is why the operation this call
+            // logs is answered terminal. The entry is written against the
+            // removed record's own location, for the same reason every other
+            // delete in this crate does so: the log says where the resource was.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_RELEASE_STATIC_IP,
+                crate::state::RESOURCE_TYPE_STATIC_IP,
+                &released.name,
+                &released.location,
+                None,
+            );
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one releases exactly one static IP, and
+            // the address an instance was reachable at stops existing with the
+            // reservation rather than being detached from it as a mutation of
+            // its own, so it answers exactly one entry.
+            Ok(ReleaseStaticIpOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No static IP of that name is stored, so this release has no reservation to
+/// give up: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name. Releasing a static IP twice therefore
+/// fails the second time rather than reporting a release that did not happen.
+fn not_found(name: &str) -> ReleaseStaticIpError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_STATIC_IP,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> ReleaseStaticIpError {
+    ReleaseStaticIpErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail static IP store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
