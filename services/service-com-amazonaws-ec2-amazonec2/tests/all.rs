@@ -501,3 +501,8 @@ mod network_insights_access_scope_content;
 // answers ahead of that read.
 #[path = "all/create_fpga_image.rs"]
 mod create_fpga_image;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. Which ONE member of `FpgaImageAttribute`
+// `DescribeFpgaImageAttribute` reports out of the stored AFI, and what it refuses.
+#[path = "all/describe_fpga_image_attribute.rs"]
+mod describe_fpga_image_attribute;

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFpgaImageAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFpgaImageAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports ONE attribute of one stored Amazon FPGA Image (AFI), read off the
+//! AFI [`crate::state`] holds. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFpgaImageAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Describes the specified attribute of the specified Amazon FPGA Image (AFI)": the result
+//! carries the AFI's own id and the ONE member of `FpgaImageAttribute` the request's
+//! `Attribute` names, and nothing else. The refusals keep the same order as every other
+//! FPGA-image operation of this crate: a malformed id (`InvalidFpgaImageID.Malformed`), then
+//! `DryRun` (`DryRunOperation`), then an id the account holds no AFI for
+//! (`InvalidFpgaImageID.NotFound`).
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +67,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::FpgaImageRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -135,18 +136,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFpgaImageAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFpgaImageAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFpgaImageAttribute"))
+        use crate::state::{
+            dry_run_operation, fpga_image_id_is_well_formed, internal_error,
+            invalid_fpga_image_id_malformed, invalid_fpga_image_id_not_found,
+            invalid_parameter_value, require_service_state,
+        };
+
+        // An AFI carries no Region member of its own, so nothing here depends on the Region
+        // the request was signed for.
+        let _ = ctx;
+
+        if !fpga_image_id_is_well_formed(&input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
+
+        // "The AFI attribute" (`DescribeFpgaImageAttributeRequest$Attribute`) is ONE
+        // `FpgaImageAttributeName`, and the result carries only the member it names. The
+        // modelled enum constraint is already refused by the request walk before this
+        // handler runs; this is the same belt-and-braces check `DescribeImageAttribute`
+        // keeps, so an attribute no result member corresponds to is refused rather than
+        // answered with a result carrying no attribute at all.
+        let attribute = input.attribute.as_str();
+        if !FPGA_IMAGE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({attribute}) for parameter attribute is invalid. Unknown attribute."
+            )));
+        }
+
+        // The permission question, answered before the resource one — the order every
+        // FPGA-image operation of this crate keeps.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: an AFI's one clock-owed move is derived from its stored
+        // due instant on every report of it rather than written here, so two calls answer
+        // the same attribute and a read cannot change what a later caller sees.
+        let store = state.lock();
+        let Some(record) = store.fpga_images.get(&input.fpga_image_id) else {
+            return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
+        };
+
+        let reported = reported_attribute(attribute, record).ok_or_else(|| {
+            // Unreachable: the catalog check above admits only the attributes
+            // `reported_attribute` answers.
+            internal_error(format!(
+                "'{attribute}' is an AFI attribute this emulator holds no value for"
+            ))
+        })?;
+        Ok(DescribeFpgaImageAttributeOutput {
+            fpga_image_attribute: Some(reported),
+        })
     }
+}
+
+/// `record` as the answer to asking for its `attribute`: the ONE member that attribute
+/// names, read off the stored AFI, beside the AFI's own id. `None` for an attribute no
+/// member of `FpgaImageAttribute` corresponds to, which the handler has already refused.
+///
+/// Each arm names the `FpgaImageAttributeName` value the model publishes
+/// ([`FPGA_IMAGE_ATTRIBUTE_NAME_VALUES`]) and reads the `FpgaImageAttribute` member AWS
+/// documents that attribute as, so the mapping from attribute to value lives in one place:
+///
+/// ```text
+/// smithy_query(query="shape",shape="FpgaImageAttributeName,FpgaImageAttribute",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// A text member is reported as the AFI carries it, absent when the AFI holds none — an AFI
+/// created with no description has no description to report, which is a different answer
+/// from a description this emulator invented. A LIST member is reported as the list the AFI
+/// carries, empty or not, the way `DescribeImageAttribute` reports an AMI's product codes.
+fn reported_attribute(attribute: &str, record: &FpgaImageRecord) -> Option<FpgaImageAttribute> {
+    let mut reported = FpgaImageAttribute {
+        fpga_image_id: record.view.fpga_image_id.clone(),
+        ..FpgaImageAttribute::default()
+    };
+    match attribute {
+        "description" => reported.description = record.view.description.clone(),
+        "name" => reported.name = record.view.name.clone(),
+        // "The load permissions" (`FpgaImageAttribute$LoadPermissions`): which accounts and
+        // groups may load the AFI, as `ModifyFpgaImageAttribute` left them and
+        // `ResetFpgaImageAttribute` clears them.
+        "loadPermission" => reported.load_permissions = Some(record.load_permissions.clone()),
+        "productCodes" => {
+            reported.product_codes = Some(record.view.product_codes.clone().unwrap_or_default());
+        }
+        _ => return None,
+    }
+    Some(reported)
 }

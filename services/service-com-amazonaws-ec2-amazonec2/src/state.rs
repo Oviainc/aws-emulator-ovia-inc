@@ -25478,6 +25478,10 @@ pub const FPGA_IMAGE_ID_PREFIX: &str = "afi";
 /// apply to the FPGA image during creation"
 /// (`CreateFpgaImageRequest$TagSpecifications`), which is the `fpga-image` member of
 /// `ResourceType`.
+///
+/// It is also the term EC2 names this resource by when a request could not resolve one
+/// ([`invalid_fpga_image_id_not_found`]), so the spelling of the resource type lives in one
+/// place.
 pub const FPGA_IMAGE_TAGGABLE_RESOURCE: &str = "fpga-image";
 
 /// The resource types a restore of an AMI from Amazon S3 may tag: "You can tag the AMI, the
@@ -25530,11 +25534,19 @@ pub fn fpga_image_id_is_well_formed(id: &str) -> bool {
 
 /// Refuse a request that named an AFI id the account holds no FPGA image for: HTTP 400
 /// `InvalidFpgaImageID.NotFound`.
+///
+/// EC2 words a resource it could not resolve as "The `<resource-type>` ID '`<id>`' does not
+/// exist", naming the resource by the `ResourceType` member that spells it —
+/// [`FPGA_IMAGE_TAGGABLE_RESOURCE`] for an AFI, the same way this crate's refusals for a
+/// verified-access instance, a route server and a transit-gateway attachment read. Only the
+/// id is variable, and it is the one the REQUEST carried.
 pub fn invalid_fpga_image_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_FPGA_IMAGE_ID_NOT_FOUND,
         400,
-        format!("The FPGA image id '{fpga_image_id}' does not exist"),
+        format!(
+            "The {FPGA_IMAGE_TAGGABLE_RESOURCE} ID '{fpga_image_id}' does not exist"
+        ),
     )
 }
 
