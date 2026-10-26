@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeSecurityGroupIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeSecurityGroupIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the inbound rules the request describes to the security group it names
+//! — one rule per source a permission grants — storing each of them through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_security_group_rules`], which mints
+//! the `SecurityGroupRuleId` and recomputes the group's `IpPermissions` that
+//! `DescribeSecurityGroups` reports, and answers the rules it added.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeSecurityGroupIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +119,12 @@ use super::types::*;
 // `AuthorizeSecurityGroupIngressError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ec2-amazonec2.json");
 
+/// The direction this operation authorizes in: the INBOUND rules — "adds the specified
+/// inbound (ingress) rules to a security group" (`AuthorizeSecurityGroupIngress`). A group's
+/// inbound and outbound rules are two lists on one stored group, told apart by this flag,
+/// which is also the `IsEgress` an added rule is reported with.
+const IS_EGRESS: bool = false;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `AuthorizeSecurityGroupIngressError` alias below. An operation that models no errors
@@ -182,18 +186,245 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeSecurityGroupIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeSecurityGroupIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeSecurityGroupIngress"))
+        use crate::state;
+
+        // `ctx` carries the Region this request was signed for, which is what says which
+        // default VPC a group NAME is resolved in; the store is reached through the engine
+        // held on `self`.
+        let region = state::request_region(ctx.parts());
+
+        // "The permissions for the security group rules" (`$IpPermissions`) is one way to
+        // describe the rules to add; `CidrIp`/`IpProtocol`/`FromPort`/`ToPort` and
+        // `SourceSecurityGroupName`/`SourceSecurityGroupOwnerId` are the other, which
+        // describes ONE rule and whose own documentation says to "specify a set of IP
+        // permissions instead" to describe more than one. They are two spellings of the
+        // same thing, so a request that uses both has described one rule twice over.
+        let flat_members: [(&str, bool); 6] = [
+            ("cidrIp", input.cidr_ip.is_some()),
+            ("ipProtocol", input.ip_protocol.is_some()),
+            ("fromPort", input.from_port.is_some()),
+            ("toPort", input.to_port.is_some()),
+            (
+                "sourceSecurityGroupName",
+                input.source_security_group_name.is_some(),
+            ),
+            (
+                "sourceSecurityGroupOwnerId",
+                input.source_security_group_owner_id.is_some(),
+            ),
+        ];
+        let flat_member = flat_members
+            .iter()
+            .find(|(_, given)| *given)
+            .map(|(member, _)| *member);
+        let requested_permissions = input.ip_permissions.clone().unwrap_or_default();
+        // "The permissions for the security group rules" (`$IpPermissions`) is caller-sized
+        // and the model bounds it nowhere, so it is capped HERE, before any work or
+        // allocation proportional to it — the same cap every other operation of this crate
+        // holds a caller-sized list to.
+        if requested_permissions.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request describes {} permissions, above the maximum of {max}",
+                requested_permissions.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        if let Some(member) = flat_member {
+            if !requested_permissions.is_empty() {
+                return Err(state::invalid_parameter_combination(format!(
+                    "The parameter {member} describes one rule on its own, so it may not be \
+                     given beside ipPermissions"
+                )));
+            }
+        }
+
+        // The rules the request describes, however it spelled them: the permissions it
+        // carried, or the single permission its flat members describe. Reading the flat
+        // form into an `IpPermission` here is what lets everything below — the validation,
+        // the duplicate check, the quota and the write — have ONE form of a rule to work
+        // on, so neither spelling can take a different path through this handler.
+        let permissions: Vec<IpPermission> = if requested_permissions.is_empty() {
+            if flat_member.is_none() {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter ipPermissions",
+                ));
+            }
+            vec![permission_of_flat_members(&input)]
+        } else {
+            requested_permissions
+        };
+
+        // "The tags applied to the security group rule" (`$TagSpecifications`) — the shared
+        // reader refuses a specification naming any other resource type and holds the tag
+        // payload to the documented bounds. Every rule this call adds carries them, the way
+        // the specification applies to the resources the call creates.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_SECURITY_GROUP_RULE,
+            Self::NAME,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "[Default VPC] The name of the security group. For security groups for a default
+        // VPC you can specify either the ID or the name of the security group. For security
+        // groups for a nondefault VPC, you must specify the ID" (`$GroupName`): the shared
+        // resolver is the one place that rule lives, so every operation that takes both
+        // members reads them the same way.
+        let group_id = state::resolve_security_group_id(
+            &mut store,
+            &region,
+            input.group_id.as_deref(),
+            input.group_name.as_deref(),
+        )?;
+
+        // A group id this account holds no group for has no rules to add to.
+        let Some(group) = store.security_groups.get(&group_id) else {
+            return Err(state::invalid_group_not_found(&group_id));
+        };
+        let vpc_id = group.vpc_id.clone().unwrap_or_default();
+
+        // Every permission is read into the form it will be STORED in before anything is
+        // written: its protocol folded to the one spelling a protocol has, its CIDRs
+        // canonicalised, and a referenced group named only by name resolved to that group's
+        // id. A request that describes one rule it may not have is refused with nothing
+        // stored, however many of its other rules were fine. The reading is the one both
+        // directions share, so an inbound rule is validated exactly as an outbound one is.
+        let mut prepared: Vec<IpPermission> = Vec::with_capacity(permissions.len());
+        for (index, permission) in permissions.iter().enumerate() {
+            let position = index + 1;
+            let protocol = state::validated_ip_protocol(permission, position)?;
+            state::validate_ip_permission_port_range(
+                protocol,
+                position,
+                permission.from_port,
+                permission.to_port,
+            )?;
+            prepared.push(state::prepared_ip_permission(
+                &store, &vpc_id, permission, protocol, position, IS_EGRESS,
+            )?);
+        }
+
+        // How many rules the request asks for is how many sources it names, and that is
+        // bounded HERE, before any work proportional to it: "inbound or outbound rules per
+        // security group" is a published quota per side, so a request that would take the
+        // group past it is refused before a rule is stored for any of them.
+        let requested: usize = prepared.iter().map(state::ip_permission_grant_count).sum();
+        if !store.has_security_group_rule_capacity(&group_id, IS_EGRESS, requested) {
+            return Err(state::rules_per_security_group_limit_exceeded());
+        }
+
+        // "The specified rule already exists for that security group"
+        // (`InvalidPermission.Duplicate`): against the rules the group already holds on THIS
+        // side, and against the earlier rules of this same request, since one call cannot
+        // add the same rule twice either.
+        state::refuse_duplicate_security_group_rules(&store, &group_id, IS_EGRESS, &prepared)?;
+
+        // A rule count on its own admits unbounded bytes, because each rule holds a
+        // description, tags and a source the caller chose the length of. Charged with the
+        // SAME function the stored record is charged with, over every rule of the request at
+        // once: a request that would pass the budget is refused here with nothing stored,
+        // rather than part-way through the write below.
+        let payload_bytes = state::security_group_rules_charge(&prepared, &tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `insert_security_group_rules` expands one permission into one rule per source it
+        // grants, derives the rule id, its ARN and the owning account itself, and recomputes
+        // the group's `IpPermissions` — so this handler never invents an id and
+        // `DescribeSecurityGroups` cannot disagree with the rules answered here. The bounds
+        // it enforces were asked about EVERY rule of this request above, through the store's
+        // own functions, so it mints a rule for every grant; asserted rather than refused
+        // here, because a refusal at this point would answer an error with the earlier
+        // permissions of the same request already stored.
+        let mut rules: Vec<SecurityGroupRule> = Vec::with_capacity(requested);
+        for permission in &prepared {
+            let minted = store.insert_security_group_rules(
+                &group_id,
+                IS_EGRESS,
+                permission,
+                &tags,
+                true,
+                &region,
+            );
+            debug_assert_eq!(
+                minted.len(),
+                state::ip_permission_grant_count(permission),
+                "every grant of an authorised permission mints a rule"
+            );
+            for rule_id in minted {
+                if let Some(record) = store.security_group_rules.get(&rule_id) {
+                    rules.push(record.rule.clone());
+                }
+            }
+        }
+
+        // "Returns true if the request succeeds; otherwise, returns an error" (`$Return`),
+        // beside "information about the inbound (ingress) security group rules that were
+        // added" — the records as they were stored.
+        Ok(AuthorizeSecurityGroupIngressOutput {
+            r#return: Some(true),
+            security_group_rules: Some(rules),
+        })
+    }
+}
+
+/// The ONE rule a request's flat members describe, as the [`IpPermission`] the rest of this
+/// handler reads.
+///
+/// "The IPv4 address range, in CIDR format" (`$CidrIp`), "[Default VPC] The name of the
+/// source security group" (`$SourceSecurityGroupName`) with "the Amazon Web Services account
+/// ID for the source security group" (`$SourceSecurityGroupOwnerId`), and the protocol and
+/// port range (`$IpProtocol`, `$FromPort`, `$ToPort`): one source, one protocol, one port
+/// range — which is exactly one rule, and is why the members that name several of anything
+/// say to "use IP permissions instead". Every member is carried over as given: what is a
+/// valid protocol, port range, CIDR block or source group is decided for this permission
+/// where it is decided for a permission the request sent itself.
+fn permission_of_flat_members(input: &AuthorizeSecurityGroupIngressInput) -> IpPermission {
+    IpPermission {
+        ip_protocol: input.ip_protocol.clone(),
+        from_port: input.from_port,
+        to_port: input.to_port,
+        ip_ranges: input.cidr_ip.as_ref().map(|cidr_ip| {
+            vec![IpRange {
+                cidr_ip: Some(cidr_ip.clone()),
+                // The flat form carries no text for the rule: "to specify multiple rules
+                // and descriptions for the rules, use IP permissions instead" (`$CidrIp`).
+                description: None,
+            }]
+        }),
+        // "To specify an IPv6 address range, use IP permissions instead" (`$CidrIp`), and
+        // the flat form names no prefix list either.
+        ipv6_ranges: None,
+        prefix_list_ids: None,
+        user_id_group_pairs: input.source_security_group_name.as_ref().map(|group_name| {
+            vec![UserIdGroupPair {
+                group_name: Some(group_name.clone()),
+                // "The Amazon Web Services account ID for the source security group, if the
+                // source security group is in a different account"
+                // (`$SourceSecurityGroupOwnerId`): the request's value where it gave one,
+                // and otherwise this account's, which the shared reader fills in.
+                user_id: input.source_security_group_owner_id.clone(),
+                group_id: None,
+                description: None,
+                vpc_id: None,
+                vpc_peering_connection_id: None,
+                peering_status: None,
+            }]
+        }),
     }
 }

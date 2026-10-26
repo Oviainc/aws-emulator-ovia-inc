@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a stored EBS volume once no instance holds an attachment of it, so
+//! every later read of that id — `DescribeVolumes` above all — answers
+//! `InvalidVolume.NotFound` rather than reporting a volume that is no longer there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVolume"))
+        use crate::state::{
+            dry_run_operation, internal_error, invalid_volume_id_malformed,
+            invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
+            volume_in_use, VolumeRecord,
+        };
+
+        // A volume carries its own Availability Zone and is named by id, so nothing here
+        // depends on the Region the request was signed for; the store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // A value that is not a volume id names no volume in any account, so it is refused
+        // BEFORE the store is asked about it — the ordering `require_volume` keeps, spelled
+        // out here because the state check below needs the record mutably.
+        if !volume_id_is_well_formed(&input.volume_id) {
+            return Err(invalid_volume_id_malformed(&input.volume_id));
+        }
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        let now = ::std::time::Instant::now();
+
+        // "Deletes the specified EBS volume": a volume id this account holds no volume for
+        // is a refusal, not a no-op — a caller that deletes twice has to be able to tell the
+        // deletion it performed from one it did not, and a waiter polling for the volume to
+        // be gone needs the not-found answer to stop.
+        let Some(record) = store.volumes.get_mut(&input.volume_id) else {
+            return Err(invalid_volume_id_not_found(&input.volume_id));
+        };
+
+        // Whether an instance still holds the volume is a question about the CURRENT
+        // attachments, so a detach the clock already finished is applied before it is asked:
+        // the move was due at that instant whether or not anybody called.
+        record.materialize_due_detachments(now);
+
+        // "The volume must be in the available state (not attached to an instance)"
+        // (`DeleteVolume`) — so an attachment the volume still holds refuses the delete, and
+        // the refusal names what has to be detached first. The parenthesis is what that
+        // state means here: a volume that is still `creating` holds no attachment and is
+        // deletable, which is what the service does for a delete that follows the create at
+        // once; no `IncorrectState` refusal is made for the transient state on its own.
+        if let Some(attachment) = record.attachments_at(now).first() {
+            let holder = VolumeRecord::managed_resource_of(attachment)
+                .or(attachment.instance_id.as_deref())
+                .unwrap_or_default()
+                .to_string();
+            return Err(volume_in_use(&input.volume_id, &holder));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // `remove_volume` is what takes the client token that minted the volume and the
+        // modification record kept for it along with it, and what gives the record's
+        // caller-supplied bytes back to the store's budget.
+        if store.remove_volume(&input.volume_id).is_none() {
+            return Err(internal_error(
+                "the volume checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeleteVolumeOutput)
     }
 }

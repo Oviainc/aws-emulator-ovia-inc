@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCarrierGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCarrierGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the carrier gateway the request names from EC2 state and answers it
+//! as the delete leaves it — `deleting` — so the VPC it was attached to no longer has it as
+//! a dependency and a later read of that id answers `InvalidCarrierGatewayID.NotFound`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCarrierGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCarrierGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCarrierGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCarrierGateway"))
+        use crate::state;
+
+        // A carrier gateway is named by id, so nothing here depends on the Region the
+        // request was signed for; the store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The state the gateway is reported with is the one the clock has reached, so a
+        // `pending` gateway whose `available` move was already due is moved first: that move
+        // was owed at its due instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Deletes a carrier gateway": an id this account holds no gateway for is a refusal,
+        // not a no-op — a caller that deletes twice has to be able to tell the deletion it
+        // performed from one it did not.
+        if !store
+            .carrier_gateways
+            .contains_key(&input.carrier_gateway_id)
+        {
+            return Err(state::invalid_carrier_gateway_id_not_found(
+                &input.carrier_gateway_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `remove_carrier_gateway` is what takes the client token that minted the gateway
+        // and the move the clock may still owe it along with it, and what gives the
+        // record's caller-supplied bytes back to the store's budget. The gateway leaves the
+        // store at the delete: the route that targeted it "is a blackhole route"
+        // (`DeleteCarrierGateway`) rather than a reference the store has to keep, so nothing
+        // reads the record afterwards — which is why a describe of the id that follows
+        // answers not-found and the VPC it was attached to is deletable.
+        let Some(mut carrier_gateway) = store.remove_carrier_gateway(&input.carrier_gateway_id)
+        else {
+            return Err(state::internal_error(
+                "the carrier gateway checked a moment ago could not be removed",
+            ));
+        };
+        // "Information about the carrier gateway" (`DeleteCarrierGatewayResult$CarrierGateway`)
+        // as this call leaves it: the `CarrierGatewayState` a deletion puts a gateway into is
+        // `deleting` (`smithy_query(query="shape",shape="CarrierGatewayState")`), which is the
+        // state the answer reports rather than the one the gateway held before the call.
+        carrier_gateway.state = Some(state::CARRIER_GATEWAY_STATE_DELETING.to_string());
+        Ok(DeleteCarrierGatewayOutput {
+            carrier_gateway: Some(carrier_gateway),
+        })
     }
 }

@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What a delete does to the state behind it: the dependency refusals and the reads of a
+// resource that is gone. Declared here rather than in sorted position, for the reason the
+// note above gives — the sorted neighbourhood is the contended region of this file.
+#[path = "all/deleted_resources_and_dependencies.rs"]
+mod deleted_resources_and_dependencies;
 // What `CreateVpcEndpoint` stores for each endpoint type, and what it refuses. Declared here
 // rather than in sorted position, for the reason the note above gives: the sorted
 // neighbourhood is where every new ec2 suite inserts its lines.

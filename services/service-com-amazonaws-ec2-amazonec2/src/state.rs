@@ -7465,6 +7465,33 @@ pub fn system_time_to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime 
     ::aws_smithy_types::DateTime::from_secs_f64(seconds)
 }
 
+/// The `Operator` a resource of THIS account reports: no service provider manages it.
+///
+/// "Describes whether the resource is managed by a service provider and, if so, describes
+/// the service provider that manages it" (`OperatorResponse`), where "if `true`, the
+/// resource is managed by a service provider" (`$Managed`) and "if `managed` is `true`,
+/// then the principal is returned" (`$Principal`). So a resource the caller created for
+/// itself answers the question with `false` and names no principal — the member reports
+/// the ANSWER, and a resource nobody manages still has one.
+///
+/// The ONE reading of that answer for the records THIS module stores with an operator —
+/// the account's EBS volumes and its network interfaces — so those cannot report it two
+/// ways. It is not forced on a record whose own writer decides the member from the
+/// request: `CreateLaunchTemplate` takes an `OperatorRequest` from the caller and reports
+/// the operator it was given or none at all, which is that operation's rule rather than
+/// this one.
+pub fn unmanaged_operator() -> OperatorResponse {
+    OperatorResponse {
+        managed: Some(false),
+        principal: None,
+        // "If `true`, the resource is hidden by default based on the managed resource
+        // visibility settings for the account" (`$HiddenByDefault`): a resource no service
+        // provider manages is not hidden by any such setting, which is an answer of
+        // `false` rather than no answer at all.
+        hidden_by_default: Some(false),
+    }
+}
+
 /// One Availability Zone of one Region, as the describe reads it.
 ///
 /// `zone_type`, `state` and `opt_in_status` are `&'static str` because this emulator
@@ -11321,12 +11348,19 @@ impl VolumeRecord {
     /// This volume as `CreateVolume` reports it: [`VolumeRecord::view_at`] without
     /// the members the model says that operation does not return — "This parameter
     /// is not returned by CreateVolume" on `Attachments`, `FastRestored` and
-    /// `SseType`.
+    /// `SseType` — and without `Operator`.
+    ///
+    /// Those first three are dropped on the MODEL's word. `Operator` is dropped on
+    /// RECORDED behaviour only: the model notes nothing about it, and a recorded
+    /// `CreateVolume` answer carries no `operator` element where a recorded describe of the
+    /// same volume does. The two justifications are named apart here so a later reader can
+    /// tell which members the model decides and which one the corpus does.
     pub fn create_response(&self, now: Instant) -> VolumeView {
         VolumeView {
             attachments: None,
             fast_restored: None,
             sse_type: None,
+            operator: None,
             ..self.view_at(now)
         }
     }
@@ -11498,6 +11532,57 @@ pub fn invalid_volume_id_not_found<E>(volume_id: &str) -> crate::scaffolded::Sca
         400,
         format!("The volume '{volume_id}' does not exist."),
     )
+}
+
+/// EC2's error code for a request that needs the volume it names to hold no attachment
+/// while an instance still holds one (EC2 API error codes, "VolumeInUse").
+pub const VOLUME_IN_USE: &str = "VolumeInUse";
+
+/// Refuse a request that named a volume an instance still holds an attachment of, where
+/// the operation requires one that holds none: HTTP 400 `VolumeInUse`.
+///
+/// "The volume must be in the available state (not attached to an instance)"
+/// (`DeleteVolume`) — so the refusal names the volume the request named and the instance
+/// that holds it, which is what the caller has to detach first.
+pub fn volume_in_use<E>(volume_id: &str, instance_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        VOLUME_IN_USE,
+        400,
+        format!("Volume {volume_id} is currently attached to {instance_id}"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Remove the EBS volume `volume_id` and answer the record as it was stored, or `None`
+    /// when the account holds no such volume.
+    ///
+    /// Everything that is reached only THROUGH the volume goes with it: the `ClientToken`
+    /// that minted it (a token must never answer with a volume that is no longer stored)
+    /// and the modification `DescribeVolumesModifications` reports for it, which is a
+    /// modification OF this volume and so is nothing once the volume is gone. The bytes the
+    /// record held go back to the store's budget on exactly the terms
+    /// [`volume_payload_bytes`] took them on — the same accounting
+    /// [`Self::move_volume_to_recycle_bin`] makes when the volume leaves the store the
+    /// other way.
+    pub fn remove_volume(&mut self, volume_id: &str) -> Option<VolumeRecord> {
+        let record = self.volumes.remove(volume_id)?;
+        let client_token = self
+            .volume_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == volume_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &client_token {
+            self.volume_client_tokens.remove(token);
+        }
+        self.volume_modifications.remove(volume_id);
+        let view = &record.view;
+        self.release_stored_bytes(volume_payload_bytes(
+            view.tags.as_deref().unwrap_or_default(),
+            view.kms_key_id.as_deref(),
+            client_token.as_deref(),
+        ));
+        Some(record)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -15678,8 +15763,10 @@ impl ComAmazonawsEc2Amazonec2State {
             vpc_id: Some(spec.vpc_id),
             // Reported only for an IPv6 interface, which this slice does not create.
             deny_all_igw_traffic: None,
-            // Set for an interface a service provider manages; a caller's own has none.
-            operator: None,
+            // No service provider manages an interface the caller created for itself,
+            // which is the answer every resource of this store gives for its `Operator`
+            // ([`unmanaged_operator`]).
+            operator: Some(unmanaged_operator()),
             associated_subnets: Some(vec![spec.subnet_id.clone()]),
         };
         // Every caller-chosen byte the record retains — its tags, its description and the
@@ -16055,6 +16142,426 @@ pub fn invalid_permission_malformed<E>(message: impl Into<String>) -> Scaffolded
     Scaffolded::service_error(INVALID_PERMISSION_MALFORMED, 400, message)
 }
 
+// ---------------------------------------------------------------------------
+// Reading one AUTHORIZED permission
+// ---------------------------------------------------------------------------
+//
+// What `AuthorizeSecurityGroupIngress` and `AuthorizeSecurityGroupEgress` both do before
+// they write: read every `IpPermission` of the request into the form its rules will be
+// STORED in, and refuse the request as a whole if any one of them describes a rule it may
+// not have. An inbound rule and an outbound rule are the same rule shape pointing the
+// other way — "you must specify exactly one of the following sources/destinations: an IPv4
+// or IPv6 address range, a prefix list, or a security group", with the same protocol, port
+// range and description rules on both — so the reading lives HERE, once, and neither
+// direction can validate or canonicalise a permission differently from the other.
+
+/// The largest IANA protocol number a rule may name: protocol numbers are a single byte
+/// (`IpPermission$IpProtocol`, "or number (see Protocol Numbers)").
+pub const MAX_PROTOCOL_NUMBER: i32 = 255;
+
+/// The statuses a referenced group's `PeeringStatus` may name: "the status of a VPC peering
+/// connection, if applicable" (`UserIdGroupPair$PeeringStatus`), which is the model's
+/// `VpcPeeringConnectionStateReasonCode` vocabulary — named through the generated constant,
+/// so this validation cannot drift from the model.
+pub const PEERING_STATUSES: &[&str] =
+    crate::ops::types::VPC_PEERING_CONNECTION_STATE_REASON_CODE_VALUES;
+
+/// The protocol `permission` names, refused when it names none or names one no rule may
+/// carry. `position` is the 1-based `ipPermissions` entry it came from, so a refusal names
+/// the entry the caller has to fix.
+///
+/// "The IP protocol name (`tcp`, `udp`, `icmp`, `icmpv6`) or number (see Protocol Numbers).
+/// Use `-1` to specify all protocols" (`IpPermission$IpProtocol`) — so a protocol is one of
+/// those four names, a number a single byte holds, or `-1`.
+pub fn validated_ip_protocol<E>(
+    permission: &IpPermission,
+    position: usize,
+) -> Result<&str, Scaffolded<E>> {
+    let protocol = permission
+        .ip_protocol
+        .as_deref()
+        .filter(|protocol| !protocol.is_empty())
+        .ok_or_else(|| {
+            missing_parameter(format!(
+                "The request must contain the parameter ipPermissions.{position}.ipProtocol"
+            ))
+        })?;
+    if !ip_protocol_is_known(protocol) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid IP protocol '{protocol}' for ipPermissions.{position}: use a protocol \
+             name ({IP_PROTOCOL_TCP}, {IP_PROTOCOL_UDP}, {IP_PROTOCOL_ICMP}, \
+             {IP_PROTOCOL_ICMPV6}), a protocol number between 0 and {MAX_PROTOCOL_NUMBER}, \
+             or {ALL_IP_PROTOCOLS} for all protocols"
+        )));
+    }
+    Ok(protocol)
+}
+
+/// Whether `protocol` is a protocol a rule may name: one of the four names the model
+/// lists, a protocol number, or `-1` for every protocol (`IpPermission$IpProtocol`).
+pub fn ip_protocol_is_known(protocol: &str) -> bool {
+    if protocol == ALL_IP_PROTOCOLS {
+        return true;
+    }
+    if [
+        IP_PROTOCOL_TCP,
+        IP_PROTOCOL_UDP,
+        IP_PROTOCOL_ICMP,
+        IP_PROTOCOL_ICMPV6,
+    ]
+    .iter()
+    .any(|named| protocol.eq_ignore_ascii_case(named))
+    {
+        return true;
+    }
+    protocol
+        .parse::<i32>()
+        .is_ok_and(|number| (0..=MAX_PROTOCOL_NUMBER).contains(&number))
+}
+
+/// Hold one permission's port range to what the model says the protocol admits.
+///
+/// "For `tcp`, `udp`, and `icmp`, you must specify a port range. For `icmpv6`, the port
+/// range is optional", and "specifying `-1` or a protocol number other than `tcp`, `udp`,
+/// `icmp`, or `icmpv6` allows traffic on all ports, regardless of any port range you
+/// specify" (`IpPermission$IpProtocol`) — so a port range is required only for the first
+/// three, and a range that IS given has to be a range: for ICMP a type and a code, where
+/// "if the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP
+/// codes)" (`IpPermission$ToPort`), and for everything else a pair of port numbers in
+/// order.
+pub fn validate_ip_permission_port_range<E>(
+    protocol: &str,
+    position: usize,
+    from_port: Option<i32>,
+    to_port: Option<i32>,
+) -> Result<(), Scaffolded<E>> {
+    if protocol_requires_port_range(protocol) && (from_port.is_none() || to_port.is_none()) {
+        return Err(invalid_parameter_value(format!(
+            "ipPermissions.{position} must specify both fromPort and toPort for protocol \
+             '{protocol}'"
+        )));
+    }
+    let (Some(from_port), Some(to_port)) = (from_port, to_port) else {
+        // One end without the other is a half-described range on a protocol that needs
+        // none; neither end is a range at all, which is the shape of an all-ports rule.
+        return match (from_port, to_port) {
+            (None, None) => Ok(()),
+            _ => Err(invalid_permission_malformed(format!(
+                "ipPermissions.{position} carries one end of a port range: fromPort and \
+                 toPort are given together or not at all"
+            ))),
+        };
+    };
+    let highest = if protocol_is_icmp(protocol) {
+        MAX_ICMP_TYPE
+    } else {
+        MAX_PORT
+    };
+    for (member, value) in [("fromPort", from_port), ("toPort", to_port)] {
+        if value != ALL_PORTS && !(0..=highest).contains(&value) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{value}' for ipPermissions.{position}.{member}: it must be \
+                 between 0 and {highest}, or {ALL_PORTS} for all values"
+            )));
+        }
+    }
+    if from_port == ALL_PORTS && to_port != ALL_PORTS {
+        return Err(invalid_permission_malformed(format!(
+            "ipPermissions.{position} starts at {ALL_PORTS} (all values), so toPort must be \
+             {ALL_PORTS} too"
+        )));
+    }
+    if from_port != ALL_PORTS
+        && to_port != ALL_PORTS
+        && from_port > to_port
+        // For ICMP the two members are a TYPE and a CODE rather than the ends of a range
+        // ("this is the ICMP type", "this is the ICMP code" — `IpPermission$FromPort` and
+        // `$ToPort`), so there is no order between them to hold.
+        && !protocol_is_icmp(protocol)
+    {
+        return Err(invalid_permission_malformed(format!(
+            "ipPermissions.{position} ends at {to_port}, before it starts at {from_port}"
+        )));
+    }
+    Ok(())
+}
+
+/// Hold a rule's description to the bounds the model publishes for one.
+///
+/// "Constraints: Up to 255 characters in length. Allowed characters are a-z, A-Z, 0-9,
+/// spaces, and ._-:/()#,@[]+=&;{}!$*" (`IpRange$Description`, and the same sentence on
+/// `Ipv6Range`, `PrefixListId` and `UserIdGroupPair`) — the same bound and alphabet a
+/// group's own name and description carry, so one reader serves both.
+pub fn validate_security_group_rule_description<E>(
+    description: Option<&String>,
+) -> Result<(), Scaffolded<E>> {
+    let Some(description) = description else {
+        return Ok(());
+    };
+    if description.chars().count() > MAX_SECURITY_GROUP_TEXT_CHARS {
+        return Err(invalid_parameter_value(format!(
+            "Value ({description}) for parameter description is invalid. \
+             A security group rule description accepts at most \
+             {MAX_SECURITY_GROUP_TEXT_CHARS} characters"
+        )));
+    }
+    if !is_security_group_text(description) {
+        return Err(invalid_parameter_value(format!(
+            "Value ({description}) for parameter description is invalid. \
+             Valid characters: a-z, A-Z, 0-9, spaces, and {SECURITY_GROUP_PUNCTUATION}"
+        )));
+    }
+    Ok(())
+}
+
+/// `permission` in the form the rules it grants are STORED in, every member of it validated
+/// as the member it came from documents.
+///
+/// `is_egress` is the DIRECTION the permission is being authorized in, which is what the
+/// one refusal built here words: a rule's one grant is "exactly one of the following
+/// sources" inbound (`AuthorizeSecurityGroupIngress`) and "exactly one of the following
+/// destinations" outbound (`AuthorizeSecurityGroupEgress`), so the caller is told to name
+/// the one its own operation documents.
+///
+/// A CIDR range is canonicalised here — "Amazon Web Services canonicalizes IPv4 and IPv6
+/// CIDRs … any subsequent DescribeSecurityGroups and DescribeSecurityGroupRules calls will
+/// return the canonicalized form" — so the rule is stored and reported in the form AWS
+/// stores it in, and a second rule for the same block is the duplicate AWS calls it. A
+/// referenced group named only by NAME is resolved to its id inside the authorizing group's
+/// VPC, because "names are case-insensitive and must be unique within the VPC" and so name
+/// no group outside it, and because a rule references a group by id.
+pub fn prepared_ip_permission<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+    permission: &IpPermission,
+    protocol: &str,
+    position: usize,
+    is_egress: bool,
+) -> Result<IpPermission, Scaffolded<E>> {
+    let mut ip_ranges: Vec<IpRange> = Vec::new();
+    for range in permission.ip_ranges.iter().flatten() {
+        validate_security_group_rule_description(range.description.as_ref())?;
+        let cidr = range.cidr_ip.as_deref().unwrap_or_default();
+        let canonical = canonical_security_group_cidr(cidr).map_err(|_| {
+            invalid_parameter_value(format!(
+                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
+            ))
+        })?;
+        ip_ranges.push(IpRange {
+            cidr_ip: Some(canonical),
+            description: range.description.clone(),
+        });
+    }
+
+    let mut ipv6_ranges: Vec<Ipv6Range> = Vec::new();
+    for range in permission.ipv6_ranges.iter().flatten() {
+        validate_security_group_rule_description(range.description.as_ref())?;
+        let cidr = range.cidr_ipv6.as_deref().unwrap_or_default();
+        let canonical = canonical_ipv6_cidr(cidr).map_err(|_| {
+            invalid_parameter_value(format!(
+                "CIDR block '{cidr}' of ipPermissions.{position} is malformed"
+            ))
+        })?;
+        ipv6_ranges.push(Ipv6Range {
+            cidr_ipv6: Some(canonical),
+            description: range.description.clone(),
+        });
+    }
+
+    let mut prefix_list_ids: Vec<PrefixListId> = Vec::new();
+    for entry in permission.prefix_list_ids.iter().flatten() {
+        validate_security_group_rule_description(entry.description.as_ref())?;
+        let prefix_list_id = entry.prefix_list_id.as_deref().unwrap_or_default();
+        if !prefix_list_id_is_well_formed(prefix_list_id) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid prefix list id '{prefix_list_id}' for ipPermissions.{position}"
+            )));
+        }
+        prefix_list_ids.push(PrefixListId {
+            prefix_list_id: Some(prefix_list_id.to_string()),
+            description: entry.description.clone(),
+        });
+    }
+
+    let mut user_id_group_pairs: Vec<UserIdGroupPair> = Vec::new();
+    for pair in permission.user_id_group_pairs.iter().flatten() {
+        validate_security_group_rule_description(pair.description.as_ref())?;
+        user_id_group_pairs.push(prepared_user_id_group_pair(store, vpc_id, pair, position)?);
+    }
+
+    // "You must specify exactly one of the following sources" (an inbound rule) or
+    // "destinations" (an outbound one) — of a RULE, so a permission that names none
+    // describes no rule at all, and the refusal names the one ITS direction documents.
+    if ip_ranges.is_empty()
+        && ipv6_ranges.is_empty()
+        && prefix_list_ids.is_empty()
+        && user_id_group_pairs.is_empty()
+    {
+        let grant = if is_egress { "destination" } else { "source" };
+        return Err(missing_parameter(format!(
+            "The request must name a {grant} for ipPermissions.{position}: an IPv4 range \
+             (ipRanges), an IPv6 range (ipv6Ranges), a prefix list (prefixListIds) or a \
+             security group (groups)"
+        )));
+    }
+
+    Ok(IpPermission {
+        // Stored in the one form a protocol has, the way the CIDRs above are stored
+        // canonicalised, so one rule has one stored form however the request spelled it.
+        ip_protocol: Some(canonical_ip_protocol(protocol)),
+        from_port: permission.from_port,
+        to_port: permission.to_port,
+        user_id_group_pairs: Some(user_id_group_pairs),
+        ip_ranges: Some(ip_ranges),
+        ipv6_ranges: Some(ipv6_ranges),
+        prefix_list_ids: Some(prefix_list_ids),
+    })
+}
+
+/// One referenced-group grant in the form the rule that names it is stored in: the group by
+/// the ID a rule references it by, and the account that owns it.
+///
+/// "For a referenced security group in another VPC, the account ID of the referenced security
+/// group is returned in the response" (`UserIdGroupPair$UserId`): the owner is this account
+/// unless the request named another one. A group of ANOTHER account is not in this store, so
+/// whether it exists is not a question this emulator can answer; one of this account's has to
+/// exist.
+pub fn prepared_user_id_group_pair<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+    pair: &UserIdGroupPair,
+    position: usize,
+) -> Result<UserIdGroupPair, Scaffolded<E>> {
+    let user_id = pair
+        .user_id
+        .clone()
+        .filter(|user_id| !user_id.is_empty())
+        .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+    if !aws_account_id_is_well_formed(&user_id) {
+        return Err(invalid_parameter_value(format!(
+            "Invalid account id '{user_id}' for ipPermissions.{position}"
+        )));
+    }
+    // "The ID of the VPC for the referenced security group, if applicable"
+    // (`UserIdGroupPair$VpcId`) and "the ID of the VPC peering connection, if applicable"
+    // (`$VpcPeeringConnectionId`): a value that is not an id of its kind names no resource
+    // at all, so it is refused rather than stored on the rule.
+    for (member, prefix, value) in [
+        ("vpcId", "vpc-", pair.vpc_id.as_deref()),
+        (
+            "vpcPeeringConnectionId",
+            "pcx-",
+            pair.vpc_peering_connection_id.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            if !prefixed_id_is_well_formed(prefix, value) {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid id '{value}' for ipPermissions.{position}.{member}"
+                )));
+            }
+        }
+    }
+    if let Some(status) = pair.peering_status.as_deref().filter(|it| !it.is_empty()) {
+        if !PEERING_STATUSES.contains(&status) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{status}' for ipPermissions.{position}.peeringStatus: it must \
+                 be one of {known}",
+                known = PEERING_STATUSES.join(", "),
+            )));
+        }
+    }
+
+    let group_id = match (
+        pair.group_id.as_deref().filter(|id| !id.is_empty()),
+        pair.group_name.as_deref().filter(|name| !name.is_empty()),
+    ) {
+        // A value that is not a security group id names no group in any account, so it is
+        // refused whoever the request says owns it.
+        (Some(group_id), _) => {
+            if !security_group_id_is_well_formed(group_id) {
+                return Err(invalid_group_id_malformed(group_id));
+            }
+            let owned_here = user_id == ::engine::emulator_account_id();
+            if owned_here && !store.security_groups.contains_key(group_id) {
+                return Err(invalid_group_not_found(group_id));
+            }
+            group_id.to_string()
+        }
+        (None, Some(group_name)) => store
+            .security_group_id_for_name(vpc_id, group_name)
+            .ok_or_else(|| invalid_group_not_found(group_name))?,
+        (None, None) => {
+            return Err(invalid_permission_malformed(format!(
+                "ipPermissions.{position} names a security group with neither a groupId nor \
+                 a groupName"
+            )))
+        }
+    };
+
+    Ok(UserIdGroupPair {
+        group_id: Some(group_id),
+        group_name: pair.group_name.clone(),
+        user_id: Some(user_id),
+        description: pair.description.clone(),
+        vpc_id: pair.vpc_id.clone(),
+        vpc_peering_connection_id: pair.vpc_peering_connection_id.clone(),
+        peering_status: pair.peering_status.clone(),
+    })
+}
+
+/// Refuse an authorize that would add a rule `group_id` already holds on the `is_egress`
+/// side, or that one request describes twice — with nothing stored either way.
+///
+/// "The specified rule already exists for that security group"
+/// (`InvalidPermission.Duplicate`), asked of the rules the group holds on THAT side and of
+/// the earlier rules of the same request, since one call cannot add the same rule twice
+/// either. Whether two rules are ONE rule is [`SecurityGroupRuleAtom::identity`], the same
+/// comparison a revoke matches a rule by, so an authorize and a revoke cannot disagree
+/// about which rule a request names.
+pub fn refuse_duplicate_security_group_rules<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    group_id: &str,
+    is_egress: bool,
+    prepared: &[IpPermission],
+) -> Result<(), Scaffolded<E>> {
+    // The group's rules on this side, by identity, so a request of N rules costs N lookups
+    // rather than N times the rules the group holds.
+    let held: HashMap<SecurityGroupRuleKey, String> = store
+        .security_group_rules
+        .values()
+        .filter(|record| {
+            record.rule.group_id.as_deref() == Some(group_id)
+                && record.rule.is_egress == Some(is_egress)
+        })
+        .filter_map(|record| {
+            let atom = SecurityGroupRuleAtom::of_stored_rule(record)?;
+            Some((
+                atom.identity(),
+                record
+                    .rule
+                    .security_group_rule_id
+                    .clone()
+                    .unwrap_or_default(),
+            ))
+        })
+        .collect();
+    let mut described: HashSet<SecurityGroupRuleKey> = HashSet::new();
+    for (index, permission) in prepared.iter().enumerate() {
+        let position = index + 1;
+        for atom in security_group_rule_atoms(permission) {
+            let identity = atom.identity();
+            if let Some(rule_id) = held.get(&identity) {
+                return Err(invalid_permission_duplicate(rule_id));
+            }
+            if !described.insert(identity) {
+                return Err(invalid_permission_duplicate_in_request(position));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The caller-chosen bytes a stored VPC retains: its tags, plus the strings an IPv6
 /// association holds. The same quantity `CreateVpc` charged against the store's budget, so
 /// [`ComAmazonawsEc2Amazonec2State::remove_vpc`] gives back exactly what was taken.
@@ -16126,6 +16633,10 @@ pub const CARRIER_GATEWAY_STATE_PENDING: &str = "pending";
 /// A carrier gateway that is ready: the `CarrierGatewayState` enum's `available` member,
 /// the state the clock owes a `pending` gateway [`TRANSITION_DELAY`] after its create.
 pub const CARRIER_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// A carrier gateway a `DeleteCarrierGateway` has taken down: the `CarrierGatewayState`
+/// enum's `deleting` member, the state that delete answers the gateway with.
+pub const CARRIER_GATEWAY_STATE_DELETING: &str = "deleting";
 
 /// The `ResourceType` a `CreateCarrierGateway` tag specification may name: the gateway it
 /// creates (`ResourceType` enum member `carrier-gateway`).
@@ -16240,6 +16751,35 @@ impl ComAmazonawsEc2Amazonec2State {
         self.carrier_gateways
             .insert(carrier_gateway_id.clone(), carrier_gateway);
         carrier_gateway_id
+    }
+
+    /// Remove the carrier gateway `carrier_gateway_id` and answer it as it was last
+    /// reported, or `None` when the store holds no such gateway.
+    ///
+    /// The bytes the record held go back to the store's budget on the terms
+    /// [`carrier_gateway_payload_bytes`] took them on, the `ClientToken` that minted it goes
+    /// with it (a token must never answer with a gateway that is no longer stored), and so
+    /// does the `available` move the clock may still owe it, so a later materialisation
+    /// cannot resurrect a deleted gateway's state.
+    pub fn remove_carrier_gateway(
+        &mut self,
+        carrier_gateway_id: &str,
+    ) -> Option<crate::ops::types::CarrierGateway> {
+        let carrier_gateway = self.carrier_gateways.remove(carrier_gateway_id)?;
+        self.carrier_gateway_available_at.remove(carrier_gateway_id);
+        let client_token = self
+            .carrier_gateway_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == carrier_gateway_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &client_token {
+            self.carrier_gateway_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(carrier_gateway_payload_bytes(
+            carrier_gateway.tags.as_deref().unwrap_or_default(),
+            client_token.as_deref(),
+        ));
+        Some(carrier_gateway)
     }
 }
 
@@ -19693,6 +20233,29 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(address_payload_bytes(&address));
         self.addresses.insert(allocation_id.clone(), address);
         allocation_id
+    }
+
+    /// Release the Elastic IP address `allocation_id`: the account no longer holds it, so
+    /// the record leaves the store and is answered as it last was, or `None` when the
+    /// account holds no address under that id.
+    ///
+    /// "After releasing an Elastic IP address, it is released to the IP address pool"
+    /// (`ReleaseAddress`): the allocation is the account's claim on the address, so nothing
+    /// of it may outlive the release — the association it may still hold is ended first
+    /// ([`Self::detach_elastic_ip`], which also stops the instance reporting the address),
+    /// and the transfer offer the account may have made of it goes too, because an offer of
+    /// an address the account does not hold is an offer of nothing. The bytes the record
+    /// held go back to the store's budget on exactly the terms
+    /// [`address_payload_bytes`] took them on.
+    pub fn remove_address(&mut self, allocation_id: &str) -> Option<Address> {
+        if !self.addresses.contains_key(allocation_id) {
+            return None;
+        }
+        self.detach_elastic_ip(allocation_id);
+        let address = self.addresses.remove(allocation_id)?;
+        self.address_transfers.remove(allocation_id);
+        self.release_stored_bytes(address_payload_bytes(&address));
+        Some(address)
     }
 
     /// Whether another transit gateway fits inside the store's ceiling

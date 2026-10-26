@@ -27,7 +27,7 @@ use std::time::Duration;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, filters, indexed};
+use super::ec2_query::{element, elements, error_code, error_message, filters, indexed};
 use super::wire::{param, Param};
 
 /// The Region every call here is signed for: the Region the default VPC and its default
@@ -1215,8 +1215,10 @@ async fn delete_vpc_refuses_while_anything_is_associated_with_it() {
     );
 }
 
-/// `DeleteVpc` must refuse with `DependencyViolation`, naming `dependency`, and leave the
-/// VPC in place.
+/// `DeleteVpc` must refuse with `DependencyViolation`, with the message AWS words for that
+/// error class, and leave the VPC in place. `dependency` is what still holds the VPC: it
+/// names the case, and is deliberately NOT expected in the message — AWS's refusal names
+/// the VPC the request named and nothing else.
 async fn expect_dependency_violation(
     case: &str,
     router: &MultiServiceRouter,
@@ -1234,9 +1236,12 @@ async fn expect_dependency_violation(
         "DependencyViolation",
         "case {case:?}: expected DependencyViolation: {body}"
     );
-    assert!(
-        body.contains(dependency),
-        "case {case:?}: the refusal must name the dependency {dependency:?}: {body}"
+    let message = error_message(&body);
+    assert_eq!(
+        message,
+        format!("The vpc '{vpc_id}' has dependencies and cannot be deleted."),
+        "case {case:?}: the refusal must carry the message AWS words for a VPC that {dependency} \
+         still holds, got {message:?}"
     );
     let (status, body) = call(router, "DescribeVpcs", &indexed("VpcId", &[vpc_id])).await;
     assert_eq!(

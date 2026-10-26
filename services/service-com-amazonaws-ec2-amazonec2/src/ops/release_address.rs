@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReleaseAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReleaseAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: gives the Elastic IP address the request names back to the address pool —
+//! the allocation leaves this account's address state, so every later read of that
+//! allocation id answers `InvalidAllocationID.NotFound`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReleaseAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReleaseAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReleaseAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReleaseAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, internal_error, invalid_address_not_found, is_ipv4_address,
+            require_known_address, require_service_state,
+        };
+
+        // An Elastic IP address is a resource of the account, reached by the id or the
+        // address the request names, so nothing here depends on the request's metadata.
+        let _ = ctx;
+
+        // "The allocation ID. This parameter is required." (`$AllocationId`), and
+        // `PublicIp` is "Deprecated." — the older way of naming the SAME address. So either
+        // names the address, and one call names it once (the reading `AssociateAddress`
+        // holds the pair to).
+        if input.allocation_id.is_some() && input.public_ip.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "An Elastic IP address is named once, so allocationId and publicIp may \
+                 not be given together",
+            ));
+        }
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The address this call is about, resolved before anything else: a malformed
+        // allocation id is refused before an unknown one, the way the service orders the
+        // two, and a `PublicIp` that is not an address at all names nothing to release. The
+        // resolver answers the record it resolved to, so the refusals below read the address
+        // without a second lookup.
+        let (allocation_id, address) = match (
+            input.allocation_id.as_deref(),
+            input.public_ip.as_deref(),
+        ) {
+            (Some(allocation_id), _) => (
+                allocation_id.to_string(),
+                require_known_address(&store, allocation_id)?.clone(),
+            ),
+            (None, Some(public_ip)) => {
+                if !is_ipv4_address(public_ip) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{public_ip}' for publicIp. It must be an IPv4 address"
+                    )));
+                }
+                let allocation_id = store
+                    .allocation_id_for_public_ip(public_ip)
+                    .ok_or_else(|| invalid_address_not_found(public_ip))?;
+                let address = require_known_address(&store, &allocation_id)?.clone();
+                (allocation_id, address)
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must contain the parameter allocationId",
+                ))
+            }
+        };
+
+        // "The set of Availability Zones, Local Zones, or Wavelength Zones from which
+        // Amazon Web Services advertises IP addresses. If you provide an incorrect network
+        // border group, you receive an InvalidAddress.NotFound error"
+        // (`$NetworkBorderGroup`): the group is part of naming the address, so one that is
+        // not the address's own names no address of this account.
+        if let Some(requested) = input
+            .network_border_group
+            .as_deref()
+            .filter(|group| !group.is_empty())
+        {
+            if address.network_border_group.as_deref() != Some(requested) {
+                return Err(invalid_address_not_found(
+                    address.public_ip.as_deref().unwrap_or(&allocation_id),
+                ));
+            }
+        }
+
+        // "[Nondefault VPC] You must disassociate the Elastic IP address before you can
+        // release it. Otherwise, Amazon EC2 returns an error (InvalidIPAddress.InUse)"
+        // (`ReleaseAddress`): an address that still carries an association is in use, and
+        // the refusal names the address itself, which is what the caller holds.
+        if address.association_id.is_some() || address.instance_id.is_some() {
+            return Err(Scaffolded::invalid_ip_address_in_use(
+                address.public_ip.as_deref().unwrap_or(&allocation_id),
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been released yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // "After releasing an Elastic IP address, it is released to the IP address pool":
+        // `remove_address` is what takes the allocation out of the account's address state
+        // — with the transfer offer it may have carried — and gives the record's
+        // caller-supplied bytes back to the store's budget.
+        if store.remove_address(&allocation_id).is_none() {
+            return Err(internal_error(
+                "the address checked a moment ago could not be released",
+            ));
+        }
+        Ok(ReleaseAddressOutput)
     }
 }

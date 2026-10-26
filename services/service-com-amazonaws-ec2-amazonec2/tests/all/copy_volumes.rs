@@ -174,9 +174,11 @@ async fn a_copy_is_a_new_stored_volume_in_the_sources_zone_naming_its_source() {
             Some("false"),
             "case {case:?}: a copy of a volume restores no snapshot, got {body}"
         );
-        assert!(
-            element(&body, "snapshotId").is_none(),
-            "case {case:?}: a copy of a volume has no snapshot behind it, got {body}"
+        assert_eq!(
+            element(&body, "snapshotId").as_deref(),
+            Some(""),
+            "case {case:?}: a copy of a volume has no snapshot behind it, so its snapshotId \
+             must be reported carrying nothing, got {body}"
         );
 
         // ROUND TRIP: both volumes are in the store, and the copy still names its source.

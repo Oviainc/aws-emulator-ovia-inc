@@ -236,7 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             availability_zones_in_region, request_region, require_service_state,
-            system_time_to_date_time, tag_list, unresolvable_snapshot_id, validate_tag_size,
+            system_time_to_date_time, tag_list, unmanaged_operator, unresolvable_snapshot_id,
+            validate_tag_size,
             volume_iops_range, volume_limit_exceeded, volume_payload_bytes, volume_size_range,
             VolumeRecord, VolumeView, DEFAULT_GP3_IOPS,
             DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
@@ -536,8 +537,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // that would add an attachment, and it is still a stub.
                 attachments: Some(Vec::new()),
                 // The volume was created empty, not from a snapshot (a request naming
-                // one is refused above), and not as a copy of another volume.
-                snapshot_id: None,
+                // one is refused above), and not as a copy of another volume. "The
+                // snapshot from which the volume was created, if applicable"
+                // (`Volume$SnapshotId`): not applicable here, which a describe of the
+                // volume reports as the member carrying no snapshot rather than as the
+                // member being absent.
+                snapshot_id: Some(String::new()),
                 source_volume_id: None,
                 // "Indicates whether the volume was created using fast snapshot
                 // restore" (`Volume$FastRestored`): there is no snapshot to restore
@@ -546,9 +551,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "Reserved for future use" (`Volume$SseType`), and not returned by
                 // CreateVolume at all.
                 sse_type: None,
-                // "Reserved for internal use" (`CreateVolumeRequest$Operator`): this
-                // volume is the caller's, not a service's, so no managing operator.
-                operator: None,
+                // No service provider manages a volume the caller created for itself,
+                // which is the answer every resource of this store gives for its
+                // `Operator` ([`state::unmanaged_operator`]).
+                operator: Some(unmanaged_operator()),
                 // An Outpost volume is one created on an Outpost, which this emulator
                 // has none of.
                 outpost_arn: None,

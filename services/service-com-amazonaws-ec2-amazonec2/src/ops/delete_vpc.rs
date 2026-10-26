@@ -175,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delete removes it.
         let dependencies = store.vpc_dependencies(&input.vpc_id);
         if !dependencies.is_empty() {
+            // The refusal names the VPC THE REQUEST NAMED and nothing else: which resource
+            // still holds it is not part of the message AWS builds for this error class.
             return Err(state::dependency_violation(format!(
-                "The vpc '{vpc_id}' has dependencies and cannot be deleted: {held}",
+                "The vpc '{vpc_id}' has dependencies and cannot be deleted.",
                 vpc_id = input.vpc_id,
-                held = dependencies.join(", "),
             )));
         }
 

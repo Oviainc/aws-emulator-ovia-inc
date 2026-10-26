@@ -172,10 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::ComAmazonawsEc2Amazonec2State::subnet_dependencies`).
         let dependencies = store.subnet_dependencies(&input.subnet_id);
         if !dependencies.is_empty() {
+            // The refusal names the SUBNET THE REQUEST NAMED and nothing else: which
+            // resource still holds a place in it is not part of the message AWS builds for
+            // this error class.
             return Err(state::dependency_violation(format!(
-                "The subnet '{subnet_id}' has dependencies and cannot be deleted: {held}",
+                "The subnet '{subnet_id}' has dependencies and cannot be deleted.",
                 subnet_id = input.subnet_id,
-                held = dependencies.join(", "),
             )));
         }
 

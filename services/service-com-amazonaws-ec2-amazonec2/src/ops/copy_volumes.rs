@@ -180,7 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             request_region, require_known_volume, require_service_state, system_time_to_date_time,
-            tag_list, validate_tag_size, volume_iops_range, volume_limit_exceeded,
+            tag_list, unmanaged_operator, validate_tag_size, volume_iops_range,
+            volume_limit_exceeded,
             volume_payload_bytes, volume_size_range, VolumeRecord, VolumeView,
             DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT,
             DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE, MAX_CLIENT_TOKEN_CHARS,
@@ -482,14 +483,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // for volume copies" (`Volume$SourceVolumeId`).
                 source_volume_id: Some(input.source_volume_id.clone()),
                 // The copy was made from a volume, not restored from a snapshot — so there
-                // is no snapshot behind it and nothing was fast-restored.
-                snapshot_id: None,
+                // is no snapshot behind it and nothing was fast-restored. "The snapshot
+                // from which the volume was created, if applicable" (`Volume$SnapshotId`):
+                // not applicable here, which a describe of the volume reports as the member
+                // carrying no snapshot rather than as the member being absent.
+                snapshot_id: Some(String::new()),
                 fast_restored: Some(false),
                 // "Reserved for future use" (`Volume$SseType`).
                 sse_type: None,
-                // "Reserved for internal use": this volume is the caller's, not a
-                // service's, so no managing operator.
-                operator: None,
+                // No service provider manages a volume the caller created for itself, which
+                // is the answer every resource of this store gives for its `Operator`.
+                operator: Some(unmanaged_operator()),
                 // An Outpost volume is one created on an Outpost, which this emulator has
                 // none of.
                 outpost_arn: None,
