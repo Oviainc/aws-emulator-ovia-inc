@@ -58,7 +58,7 @@ pub(crate) async fn get(emulator: &Emulator, domain: &str, index: &str) -> Answe
 }
 
 /// `DeleteDomain`, so a case can reach a domain name the store no longer holds.
-async fn delete_domain(emulator: &Emulator, name: &str) -> Answer {
+pub(crate) async fn delete_domain(emulator: &Emulator, name: &str) -> Answer {
     emulator
         .call("DELETE", &format!("{PREFIX}/opensearch/domain/{name}"), None)
         .await
@@ -67,7 +67,7 @@ async fn delete_domain(emulator: &Emulator, name: &str) -> Answer {
 /// The index names the store holds for `domain`, read the way a handler reaches the
 /// store. Used where no implemented operation can report the set — a create refused
 /// for a malformed name must persist NOTHING, and no listing operation exists.
-fn stored_names(emulator: &Emulator, domain: &str, case: &str) -> Vec<String> {
+pub(crate) fn stored_names(emulator: &Emulator, domain: &str, case: &str) -> Vec<String> {
     let store = emulator.store();
     let guard = store.lock();
     guard
@@ -119,7 +119,7 @@ struct Row {
 
 /// A schema with `fields` text fields, so the table holds a row whose document is far
 /// larger than the hand-written ones.
-fn wide_schema(fields: usize) -> Value {
+pub(crate) fn wide_schema(fields: usize) -> Value {
     let properties: serde_json::Map<String, Value> = (0..fields)
         .map(|field| (format!("field_{field}"), json!({ "type": "text" })))
         .collect();

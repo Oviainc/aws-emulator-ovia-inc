@@ -507,7 +507,10 @@ pub struct DomainStatus {
     pub deleted: Option<bool>,
     pub endpoint: Option<String>,
     pub endpoint_v2: Option<String>,
-    pub endpoints: Option<std::collections::HashMap<String, String>>,
+    /// Held in key order so two reads of one domain publish its hosts in the same
+    /// order: what a caller sees of a stored record must not depend on how the map
+    /// was built.
+    pub endpoints: Option<std::collections::BTreeMap<String, String>>,
     pub domain_endpoint_v2_hosted_zone_id: Option<String>,
     pub processing: Option<bool>,
     pub upgrade_processing: Option<bool>,

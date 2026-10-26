@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one index from the named domain, so a later read of that index no longer
+//! finds it and the name is free for a fresh create.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +79,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::INDEX_STATUS_DELETED;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +155,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndex"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `IndexName`'s pattern is not enforced at the request boundary (see
+        // `crate::state::is_index_name`), so a name no index could have is refused
+        // here, as a malformed request, before the store is consulted: the same
+        // check `CreateIndex`, `GetIndex` and `UpdateIndex` make.
+        if !crate::state::is_index_name(&input.index_name) {
+            return Err(DeleteIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_name("IndexName", &input.index_name),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An index belongs to a domain, so a delete against a name the store holds no
+        // domain for is the modelled not-found refusal. `settled_mut` first
+        // materialises any configuration change the clock already owes that domain,
+        // which this call neither starts nor changes.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            DeleteIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // The domain exists; the name it carries names no index OF it. A delete
+        // removes an existing resource, so a name the domain does not hold is the
+        // modelled missing-resource refusal rather than a success — which is also
+        // what a second delete of the same index reaches, the record having gone.
+        if domain.indexes.remove(&input.index_name).is_none() {
+            return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
+                crate::state::index_not_found(&input.index_name),
+            )
+            .into());
+        }
+
+        // `DeleteIndexResponse$Status` is "the status of the index deletion
+        // operation": this call deleted the index, so it is `DELETED`.
+        Ok(DeleteIndexOutput {
+            status: INDEX_STATUS_DELETED.to_string(),
+        })
     }
 }

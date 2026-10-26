@@ -178,11 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         // The domain exists; the name it carries names no index OF it. An index is a
-        // resource of its own, so that is the modelled missing-resource refusal, and
-        // its message names both so a caller tells the two apart.
+        // resource of its own, so that is the modelled missing-resource refusal, in
+        // the fixed wording the service uses for a missing index.
         let index = domain.indexes.get(&input.index_name).ok_or_else(|| {
             GetIndexErrorModeled::ResourceNotFoundException(crate::state::index_not_found(
-                &input.domain_name,
                 &input.index_name,
             ))
         })?;

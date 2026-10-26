@@ -39,6 +39,8 @@ mod domain_nodes;
 mod engine_version_resolution;
 #[path = "all/inbound_connections.rs"]
 mod inbound_connections;
+#[path = "all/index_deletion.rs"]
+mod index_deletion;
 #[path = "all/index_registry.rs"]
 mod index_registry;
 #[path = "all/index_schema_updates.rs"]

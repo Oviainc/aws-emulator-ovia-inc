@@ -203,7 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled missing-resource refusal.
         let index = domain.indexes.get_mut(&input.index_name).ok_or_else(|| {
             UpdateIndexErrorModeled::ResourceNotFoundException(crate::state::index_not_found(
-                &input.domain_name,
                 &input.index_name,
             ))
         })?;

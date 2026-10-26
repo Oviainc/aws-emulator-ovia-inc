@@ -23,7 +23,7 @@
 //! because they are one resource sharing a `ConnectionId`.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -950,6 +950,10 @@ pub fn is_index_name(value: &str) -> bool {
 /// `IndexStatus`'s `UPDATED` value — the status `UpdateIndex` reports for the index
 /// whose schema it rewrote, the sibling of [`INDEX_STATUS_CREATED`].
 pub const INDEX_STATUS_UPDATED: &str = "UPDATED";
+
+/// `IndexStatus`'s `DELETED` value — the status `DeleteIndex` reports for the index
+/// it removed from its domain, the third sibling of [`INDEX_STATUS_CREATED`].
+pub const INDEX_STATUS_DELETED: &str = "DELETED";
 
 /// One OpenSearch index of a domain, as this emulator persists it.
 #[derive(Debug, Clone)]
@@ -2404,9 +2408,8 @@ pub fn scheduled_action_type_mismatch(
 }
 
 /// The `ResourceNotFoundException` payload for an `ActionID` that names no scheduled
-/// change of a domain the store DOES hold — the scheduled-change mirror of
-/// [`index_not_found`], naming both so a caller tells it apart from
-/// [`domain_not_found`].
+/// change of a domain the store DOES hold, naming both so a caller tells it apart
+/// from [`domain_not_found`].
 pub fn scheduled_action_not_found(
     action_id: &str,
     domain_name: &str,
@@ -3027,14 +3030,17 @@ impl Domain {
     /// uses VPC endpoints": the IPv4 host under `vpc`, and beside it the dual-stack
     /// host under `vpcv2` for a domain whose `IPAddressType` is `dualstack`, which is
     /// the setting that gives a domain a dual-stack host at all.
-    pub fn vpc_access_endpoints(&self) -> Option<HashMap<String, String>> {
+    ///
+    /// Ordered by key, so two reads of one domain publish the hosts in the same order:
+    /// what a caller sees of a stored record cannot depend on how the map was built.
+    pub fn vpc_access_endpoints(&self) -> Option<BTreeMap<String, String>> {
         // A domain is VPC-access exactly when it holds `VPCOptions`; the suffix is the
         // host id minted for it when it came to hold them.
         let suffix = match (self.vpc_options.as_ref(), self.vpc_access_suffix.as_deref()) {
             (Some(_), Some(suffix)) => suffix,
             _ => return None,
         };
-        let mut endpoints = HashMap::new();
+        let mut endpoints = BTreeMap::new();
         endpoints.insert(
             ENDPOINTS_KEY_VPC.to_string(),
             vpc_access_endpoint(suffix, &self.region),
@@ -4787,8 +4793,7 @@ pub fn package_not_available(package_id: &str, status: &str) -> ConflictExceptio
 
 /// The `ResourceNotFoundException` payload for a dissociation of a package the
 /// domain is not holding: the link the call asks to remove does not exist, so the
-/// refusal names both the package and the domain it is not on — the association
-/// mirror of [`index_not_found`].
+/// refusal names both the package and the domain it is not on.
 pub fn package_not_associated(package_id: &str, domain_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
@@ -5856,20 +5861,19 @@ pub fn data_source_exists(name: &str) -> ValidationException {
 /// domain the store DOES hold.
 ///
 /// An index is a resource of its own — `CreateIndex` models
-/// `ResourceAlreadyExistsException` for one the domain already has — so a read of
-/// one that does not exist is the modelled missing-resource refusal, naming both
-/// the domain and the index so a caller tells it apart from [`domain_not_found`].
-pub fn index_not_found(domain_name: &str, index_name: &str) -> ResourceNotFoundException {
+/// `ResourceAlreadyExistsException` for one the domain already has — so a call
+/// naming one that does not exist is the modelled missing-resource refusal. The
+/// wording the service uses for a missing index is fixed and names the `IndexName`
+/// from the request only, so every index operation reports it identically.
+pub fn index_not_found(index_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Index {index_name} doesn't exist in domain {domain_name}."
-        )),
+        message: Some(format!("Resource index {index_name} does not exist")),
     }
 }
 
 /// The `ResourceAlreadyExistsException` payload for a create naming an index the
-/// domain already holds — the mirror of [`index_not_found`], so one refusal reads
-/// like the other.
+/// domain already holds, naming both the domain and the index so a caller can place
+/// the collision.
 pub fn index_exists(domain_name: &str, index_name: &str) -> ResourceAlreadyExistsException {
     ResourceAlreadyExistsException {
         message: Some(format!(
