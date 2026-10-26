@@ -214,3 +214,5 @@ mod delete_request_validator;
 mod invalid_security_policy;
 #[path = "all/base_path_mapping.rs"]
 mod base_path_mapping;
+#[path = "all/delete_gateway_response.rs"]
+mod delete_gateway_response;

@@ -33,7 +33,10 @@ use crate::rest_api_lifecycle::{assert_failure, create_api, Gateway};
 /// says API Gateway generated it, and the generated status code where the type has one
 /// (`DEFAULT_4XX` and `DEFAULT_5XX` have none). Neither caller-supplied map is set,
 /// because no caller supplied one.
-fn generated_response(response_type: &str) -> Value {
+///
+/// Shared with the sibling `delete_gateway_response` suite, which asserts a cleared
+/// customization leaves exactly this record behind.
+pub(crate) fn generated_response(response_type: &str) -> Value {
     let mut record = Map::new();
     record.insert("responseType".to_string(), json!(response_type));
     record.insert("defaultResponse".to_string(), json!(true));

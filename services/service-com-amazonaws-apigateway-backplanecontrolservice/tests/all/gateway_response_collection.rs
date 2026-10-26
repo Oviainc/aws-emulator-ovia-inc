@@ -24,7 +24,9 @@ use crate::gateway_response::{generated_status_code, get_gateway_response, put_g
 use crate::rest_api_lifecycle::{assert_failure, create_api, page_items, Answer, Gateway};
 
 /// `GetGatewayResponses` for `api`, with `query` appended verbatim (empty for none).
-async fn get_gateway_responses(gateway: &Gateway, api: &str, query: &str) -> Answer {
+/// Shared with the sibling `delete_gateway_response` suite, which reads the collection
+/// back after clearing a customization.
+pub(crate) async fn get_gateway_responses(gateway: &Gateway, api: &str, query: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -37,7 +39,7 @@ async fn get_gateway_responses(gateway: &Gateway, api: &str, query: &str) -> Ans
 /// The collection of `api` as a `responseType`-keyed map of the reported records, with
 /// every member of each record kept: the listing is a collection of `GatewayResponse`
 /// objects, so this is what lets a case compare one against a single read.
-async fn collection_by_type(gateway: &Gateway, api: &str, case: &str) -> Vec<(String, Value)> {
+pub(crate) async fn collection_by_type(gateway: &Gateway, api: &str, case: &str) -> Vec<(String, Value)> {
     let listed = get_gateway_responses(gateway, api, "").await;
     assert_eq!(
         listed.status, 200,
