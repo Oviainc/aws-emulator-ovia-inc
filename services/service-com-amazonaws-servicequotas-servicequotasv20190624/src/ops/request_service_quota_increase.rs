@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut quotas_state = state.lock();
         // Decide every request already due before comparing against the value in
         // force: an increase is measured against the current value, not the default.
-        quotas_state.settle_due_requests(&region, now);
+        quotas_state.settle_due_requests(now);
 
         let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
         else {

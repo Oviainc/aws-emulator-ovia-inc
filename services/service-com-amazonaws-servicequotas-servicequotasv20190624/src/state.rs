@@ -990,8 +990,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .map_or(0, |state| state.request_order.len())
     }
 
-    /// Materialise every step the clock has already made due on `region`'s quota
-    /// increase requests.
+    /// Materialise every step the clock has already made due on the ACCOUNT's quota
+    /// increase requests — every region's request store, not only the endpoint the
+    /// call came in at.
     ///
     /// An OPEN request ([`is_open_request_status`]) whose `due_at` has passed takes
     /// the next step of the workflow its submitter asked for:
@@ -1017,10 +1018,38 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// request or moves it one place along `PENDING` -> `CASE_OPENED` -> decided, so
     /// the walk terminates.
     ///
-    /// This is the ONLY writer of the applied overlay, and the overlay goes where the
-    /// quota's own scope says: account-wide for a `GlobalQuota`, this region for a
-    /// regional one.
-    pub fn settle_due_requests(&mut self, region: &str, now: SystemTime) {
+    /// Those instants belong to the REQUEST, not to the endpoint that next calls, and
+    /// the value an approved increase puts in force reaches as far as the quota's own
+    /// scope does — account-wide for a `GlobalQuota`, whose ARN carries no region. So
+    /// the whole account is settled on every call: a step is never left unmaterialised,
+    /// and a value never left out of force, because the request happens to be recorded
+    /// at a regional endpoint nobody has called since it came due.
+    ///
+    /// This is the ONLY writer of the applied overlay.
+    pub fn settle_due_requests(&mut self, now: SystemTime) {
+        // Nothing is owed on the overwhelmingly common path, so the region keys are
+        // only copied out (to settle while holding them mutably) once a step is
+        // actually due somewhere.
+        let owed = self.regions.values().any(|state| {
+            state
+                .quota_requests
+                .values()
+                .any(|request| is_open_request_status(&request.status) && request.due_at <= now)
+        });
+        if !owed {
+            return;
+        }
+        let regions: Vec<String> = self.regions.keys().cloned().collect();
+        for region in regions {
+            self.settle_region_due_requests(&region, now);
+        }
+    }
+
+    /// [`Self::settle_due_requests`] for ONE region's request store: that region's
+    /// requests take the steps they owe, and the overlay each `APPROVED` one puts in
+    /// force goes where the quota's own scope keeps it — account-wide for a
+    /// `GlobalQuota`, this region for a regional one.
+    fn settle_region_due_requests(&mut self, region: &str, now: SystemTime) {
         loop {
             let Some(state) = self.regions.get(region) else {
                 return;

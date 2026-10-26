@@ -110,7 +110,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut quotas_state = state.lock();
-        quotas_state.settle_due_requests(&region, ::std::time::SystemTime::now());
+        quotas_state.settle_due_requests(::std::time::SystemTime::now());
 
         let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
         else {

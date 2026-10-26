@@ -23,6 +23,8 @@ mod auto_management_configuration;
 mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
 mod catalog_pagination;
+#[path = "all/cross_region_settlement.rs"]
+mod cross_region_settlement;
 #[path = "all/default_quota_catalog.rs"]
 mod default_quota_catalog;
 #[path = "all/error_envelope.rs"]

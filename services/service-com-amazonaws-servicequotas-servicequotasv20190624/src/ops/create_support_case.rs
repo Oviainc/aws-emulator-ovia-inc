@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The decisions the clock already owes are materialised first: a request whose
         // decision fell due before this call is no longer awaiting one, so no case is
         // opened for it.
-        quotas_state.settle_due_requests(&region, now);
+        quotas_state.settle_due_requests(now);
 
         match quotas_state.open_support_case(&region, &input.request_id, now) {
             Ok(_) => Ok(CreateSupportCaseOutput {}),

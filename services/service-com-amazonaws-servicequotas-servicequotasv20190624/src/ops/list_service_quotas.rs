@@ -123,7 +123,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let quotas = {
             let mut quotas_state = state.lock();
-            quotas_state.settle_due_requests(&region, ::std::time::SystemTime::now());
+            quotas_state.settle_due_requests(::std::time::SystemTime::now());
 
             if !quotas_state.knows_service(&input.service_code) {
                 return Err(ListServiceQuotasErrorModeled::NoSuchResourceException(

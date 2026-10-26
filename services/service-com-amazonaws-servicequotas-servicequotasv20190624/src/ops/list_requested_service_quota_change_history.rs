@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let history = {
             let now = ::std::time::SystemTime::now();
             let mut quotas_state = state.lock();
-            quotas_state.settle_due_requests(&region, now);
+            quotas_state.settle_due_requests(now);
 
             // A `ServiceCode` the catalog does not publish names no service, so the
             // listing is a lookup failure rather than an empty page. A caller that

@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due, the same way a quota read does. The report transitions the
         // clock owes are settled by the start itself, so a reused report answers with
         // the status a read of it at this instant reports.
-        quotas_state.settle_due_requests(&region, now);
+        quotas_state.settle_due_requests(now);
 
         let started = quotas_state.start_utilization_report(&region, now, &usage);
         let report = started.report();
