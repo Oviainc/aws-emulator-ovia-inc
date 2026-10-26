@@ -226,19 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             if record.policy_type != PREDICTIVE_SCALING {
-                return Err(validation(format!(
-                    "Value '{}' at 'policyName' failed to satisfy constraint: Member must name a \
-                     {PREDICTIVE_SCALING} policy, and that policy has policy type {}",
-                    key.policy_name, record.policy_type
-                )));
+                return Err(not_a_predictive_policy(&key.policy_name));
             }
             let Some(config) = record.predictive_config.clone() else {
-                return Err(validation(format!(
-                    "Value '{}' at 'policyName' failed to satisfy constraint: Member must name a \
-                     {PREDICTIVE_SCALING} policy carrying a \
-                     PredictiveScalingPolicyConfiguration",
-                    key.policy_name
-                )));
+                return Err(not_a_predictive_policy(&key.policy_name));
             };
             let (min_capacity, max_capacity) = state
                 .targets
@@ -279,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let series = load_series(&key.target, specification)?;
             let profile = HourlyProfile::of_series(&*self.engine, &series, now);
             let values: Vec<f64> = slots.iter().map(|slot| profile.at(*slot)).collect();
+            // A slot no load could be forecast for leaves the total with no value too: the
+            // capacity below is "based on the hourly load forecast", and a total that is
+            // partly unknown is unknown.
             for (total, value) in load_total.iter_mut().zip(&values) {
                 *total += *value;
             }
@@ -424,6 +418,10 @@ fn forecast_slots(start: i64, end: i64) -> Vec<i64> {
 /// below the target's `MinCapacity`, which the target is kept at or above. `MaxCapacity`
 /// caps it under the default `HonorMaxCapacity`; under `IncreaseMaxCapacity` the maximum is
 /// the one that gives way, so the capacity the load needs is reported as it is.
+///
+/// A slot whose load the analysis could not forecast carries no capacity either: there is no
+/// load to divide into capacity, so the slot reports no value rather than the floor it would
+/// have needed for no load at all.
 fn capacity_for(
     load: f64,
     target_value: f64,
@@ -433,9 +431,13 @@ fn capacity_for(
 ) -> f64 {
     let floor = f64::from(min_capacity);
     let ceiling = f64::from(max_capacity).max(floor);
+    // A slot with no forecast load has no forecast capacity: it reports no value.
+    if load.is_nan() {
+        return f64::NAN;
+    }
     // A target utilisation of zero (or one that is not a finite number) divides no load
     // into a capacity, so the forecast is the floor the target is held at.
-    if target_value <= 0.0 || !target_value.is_finite() || !load.is_finite() {
+    if target_value <= 0.0 || !target_value.is_finite() {
         return floor;
     }
     let needed = (load / target_value).ceil().max(floor);
@@ -554,7 +556,11 @@ fn customized_series(
 /// are aggregated into the clock hours they fall in, and each hour OF THE DAY is forecast
 /// as the mean of the hours of that time of day that were observed — the trend a daily
 /// load cycle has. An hour of the day nothing was observed at falls back to the mean over
-/// every observed hour, and a series with no observations at all forecasts no load.
+/// every observed hour; a series the analysis window holds no observation of at all is a
+/// series there is no historical load data to forecast from, so it forecasts NO VALUE.
+/// "Load forecasts are predictions of the hourly load values using historical load data
+/// from CloudWatch": without that data there is no prediction to report, and reporting one
+/// anyway would be a number the service never measured.
 #[derive(Debug, Default)]
 struct HourlyProfile {
     /// Per hour of the day, the total of the hourly loads observed at it and how many
@@ -622,7 +628,8 @@ impl HourlyProfile {
         profile
     }
 
-    /// The load this profile forecasts for the hour beginning at `slot`.
+    /// The load this profile forecasts for the hour beginning at `slot`, or the not-a-number
+    /// double when no observed load was analysed for it.
     fn at(&self, slot: i64) -> f64 {
         let hour_of_day = slot
             .div_euclid(FORECAST_INTERVAL_SECS)
@@ -635,8 +642,22 @@ impl HourlyProfile {
         if hours > 0 {
             return total / f64::from(hours);
         }
-        0.0
+        f64::NAN
     }
+}
+
+/// The refusal for a request whose `PolicyName` names no predictive scaling policy of this
+/// scalable target: one of another policy type, or one that carries no predictive scaling
+/// configuration to forecast from.
+///
+/// The refusal reports only what the REQUEST asked for — that no predictive scaling policy
+/// answers to the name it named — followed by the remediation the caller can act on. What is
+/// stored under that name instead is not part of the answer.
+fn not_a_predictive_policy(policy_name: &str) -> GetPredictiveScalingForecastError {
+    validation(format!(
+        "No predictive scaling policy with the name {policy_name} found. Verify the policy name \
+         and try again."
+    ))
 }
 
 /// This operation's modelled `ValidationException`, carrying `message`.

@@ -12,17 +12,21 @@
 //!   `EndTime`, and the capacity forecast reports at the same instants as the load
 //!   forecast;
 //! * each load slot is the hourly load observed in CloudWatch for the specification's load
-//!   series at that hour OF THE DAY, falling back to the mean over every observed hour and
-//!   to no load at all for a series nothing was published for;
+//!   series at that hour OF THE DAY, falling back to the mean over every observed hour;
+//! * a slot the analysis has no observed load for carries NO VALUE at all — the
+//!   not-a-number double, which the awsJson protocols put on the wire as its name — and so
+//!   does the capacity slot computed from it;
 //! * each capacity slot is the load divided by the target utilisation, rounded up, held
 //!   inside the target's `MinCapacity`/`MaxCapacity` window — and `MaxCapacity` gives way
 //!   instead under `IncreaseMaxCapacity`;
 //! * a policy that is not a `PredictiveScaling` policy (and a policy name that names
-//!   nothing) has no forecast, and a window outside the documented bounds is refused.
+//!   nothing) has no forecast, and a window outside the documented bounds is refused; the
+//!   refusal for a policy of another type reports that no predictive scaling policy answers
+//!   to the name the request named, and nothing about the policy stored under it.
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, Emulator};
+use super::emulator::{error_code, error_message, Emulator};
 
 /// The forecast interval: the model documents "the forecast interval duration of 3600
 /// seconds (60 minutes)" (`PredictiveScalingPolicyConfiguration$SchedulingBufferTime`).
@@ -207,19 +211,6 @@ const FORECAST_TABLE: &[ForecastRow] = &[
         // MinCapacity of 4.
         expected_load: 12.0,
         expected_capacity: 4.0,
-    },
-    ForecastRow {
-        case: "a series nothing was published for",
-        configuration: metric_pair_configuration,
-        series: ("AWS/ECS", "CPUUtilization", ECS_DIMENSIONS),
-        values_per_hour: &[],
-        min_capacity: 2,
-        max_capacity: 20,
-        start_hours_from_now: 0,
-        window_hours: 3,
-        start_off_the_hour: false,
-        expected_load: 0.0,
-        expected_capacity: 2.0,
     },
     ForecastRow {
         case: "a load the capacity window caps",
@@ -420,6 +411,292 @@ async fn a_forecast_follows_the_hour_of_day_trend_of_the_observed_load() {
         "case \"hour-of-day trend\": expected the capacity each hourly load needs at a target of \
          100, got {capacity_values:?}"
     );
+}
+
+/// One row of the no-observed-load table.
+struct NoHistoryRow {
+    case: &'static str,
+    /// The `PredictiveScalingPolicyConfiguration` the policy is put with.
+    configuration: fn() -> Value,
+    /// The CloudWatch series the row publishes into: namespace, metric name, dimensions.
+    series: (&'static str, &'static str, &'static [(&'static str, &'static str)]),
+    /// How many hours before the current hour the row publishes ONE observation at. Empty
+    /// publishes nothing at all.
+    published_hours_ago: &'static [i64],
+    /// The value each of those observations carries.
+    value_published: f64,
+    /// The target's capacity window.
+    min_capacity: i64,
+    max_capacity: i64,
+    /// How many hours past the current hour the requested window spans.
+    window_hours: i64,
+    /// Whether `StartTime` is pushed 17 minutes past the hour, so the first slot is the
+    /// NEXT hour boundary.
+    start_off_the_hour: bool,
+    /// The load and the capacity every slot must forecast, or `None` where every slot must
+    /// carry no value at all.
+    expected: Option<(f64, f64)>,
+}
+
+/// How long before now the historical analysis reads: "A minimum of 24 hours of data is
+/// required to create the initial forecasts. However, having a full 14 days of historical
+/// data results in more accurate forecasts"
+/// (`smithy_query(query="doc",shape="com.amazonaws.applicationautoscaling#GetPredictiveScalingForecast")`),
+/// so an observation older than 14 days is outside the window the forecast is computed from.
+const LOOKBACK_HOURS: i64 = 14 * 24;
+
+/// The table. Each row differs along what the rule generalises over: the form the load
+/// metric is named in, the series it names, whether anything was ever published for it and
+/// how far back, the length and alignment of the requested window, the target utilisation
+/// and the capacity window — including the one behaviour that lets `MaxCapacity` give way,
+/// which must not turn a value-less slot into a number either.
+const NO_HISTORY_TABLE: &[NoHistoryRow] = &[
+    NoHistoryRow {
+        case: "a metric pair whose series nothing was ever published for",
+        configuration: metric_pair_configuration,
+        series: ("AWS/ECS", "CPUUtilization", ECS_DIMENSIONS),
+        published_hours_ago: &[],
+        value_published: 0.0,
+        min_capacity: 2,
+        max_capacity: 20,
+        window_hours: 3,
+        start_off_the_hour: false,
+        expected: None,
+    },
+    NoHistoryRow {
+        case: "a predefined load metric whose series nothing was ever published for",
+        configuration: predefined_load_configuration,
+        series: ("AWS/ECS", "MemoryUtilization", ECS_DIMENSIONS),
+        published_hours_ago: &[],
+        value_published: 0.0,
+        min_capacity: 1,
+        max_capacity: 5,
+        window_hours: 1,
+        start_off_the_hour: false,
+        expected: None,
+    },
+    NoHistoryRow {
+        case: "a customized load metric whose series nothing was ever published for, over a \
+               window starting off the hour",
+        configuration: customized_load_configuration,
+        series: ("sim2real/forecast", "Backlog", &[("Queue", "orders")]),
+        published_hours_ago: &[],
+        value_published: 0.0,
+        min_capacity: 4,
+        max_capacity: 20,
+        window_hours: 6,
+        start_off_the_hour: true,
+        expected: None,
+    },
+    NoHistoryRow {
+        case: "a series published to only OUTSIDE the analysis window",
+        configuration: metric_pair_configuration,
+        series: ("AWS/ECS", "CPUUtilization", ECS_DIMENSIONS),
+        published_hours_ago: &[LOOKBACK_HOURS + 1, LOOKBACK_HOURS + 6 * 24],
+        value_published: 240.0,
+        min_capacity: 1,
+        max_capacity: 20,
+        window_hours: 2,
+        start_off_the_hour: false,
+        expected: None,
+    },
+    NoHistoryRow {
+        case: "a series nothing was published for, with MaxCapacity allowed to give way",
+        configuration: increase_max_capacity_configuration,
+        series: ("AWS/ECS", "CPUUtilization", ECS_DIMENSIONS),
+        published_hours_ago: &[],
+        value_published: 0.0,
+        min_capacity: 1,
+        max_capacity: 20,
+        window_hours: 2,
+        start_off_the_hour: false,
+        expected: None,
+    },
+    NoHistoryRow {
+        case: "a series published to just INSIDE the analysis window",
+        configuration: metric_pair_configuration,
+        series: ("AWS/ECS", "CPUUtilization", ECS_DIMENSIONS),
+        published_hours_ago: &[LOOKBACK_HOURS - 24],
+        value_published: 240.0,
+        min_capacity: 1,
+        max_capacity: 20,
+        window_hours: 2,
+        start_off_the_hour: false,
+        // 240 of load at a target utilisation of 40 needs 6 capacity units: the hour of the
+        // day the observation fell in forecasts it, and the other hours the mean over the
+        // observed hours, which is the same single value.
+        expected: Some((240.0, 6.0)),
+    },
+];
+
+#[tokio::test]
+async fn a_forecast_with_no_observed_load_carries_no_values() {
+    for row in NO_HISTORY_TABLE {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let target = emulator
+            .given_target(DIMENSION, row.min_capacity, row.max_capacity)
+            .await;
+        put_predictive_policy(&emulator, &target, (row.configuration)()).await;
+
+        let now = now_secs();
+        let current_hour = now - now.rem_euclid(INTERVAL);
+        let (namespace, metric_name, dimensions) = row.series;
+        for hours_ago in row.published_hours_ago {
+            publish(
+                &emulator,
+                namespace,
+                metric_name,
+                dimensions,
+                current_hour - hours_ago * INTERVAL,
+                &[row.value_published],
+            )
+            .await;
+        }
+
+        let start = current_hour + if row.start_off_the_hour { 17 * 60 } else { 0 };
+        let end = current_hour + row.window_hours * INTERVAL;
+        let mut request = target.clone();
+        request["PolicyName"] = json!(POLICY);
+        request["StartTime"] = json!(start);
+        request["EndTime"] = json!(end);
+        let (status, body) = emulator
+            .call("GetPredictiveScalingForecast", request)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} {body:?}"
+        );
+
+        // However the slots come out, the load and the capacity forecast report at the same
+        // ones, and a value-less slot is still a slot: the window is answered.
+        let expected_slots = usize::try_from(row.window_hours - i64::from(row.start_off_the_hour))
+            .expect("a window of whole hours");
+        let load_values = entries(&body["LoadForecast"][0]["Values"]);
+        let capacity_values = entries(&body["CapacityForecast"]["Values"]);
+        assert_eq!(
+            load_values.len(),
+            expected_slots,
+            "case {case:?}: expected {expected_slots} load slots, got {load_values:?}"
+        );
+        assert_eq!(
+            capacity_values.len(),
+            expected_slots,
+            "case {case:?}: expected {expected_slots} capacity slots, got {capacity_values:?}"
+        );
+
+        match row.expected {
+            None => {
+                assert!(
+                    load_values.iter().all(no_value),
+                    "case {case:?}: expected every load slot to carry no value, got \
+                     {load_values:?}"
+                );
+                assert!(
+                    capacity_values.iter().all(no_value),
+                    "case {case:?}: expected every capacity slot to carry no value, got \
+                     {capacity_values:?}"
+                );
+            }
+            Some((load, capacity)) => {
+                assert!(
+                    load_values.iter().all(|value| value.as_f64() == Some(load)),
+                    "case {case:?}: expected every load slot to forecast {load}, got \
+                     {load_values:?}"
+                );
+                assert!(
+                    capacity_values
+                        .iter()
+                        .all(|value| value.as_f64() == Some(capacity)),
+                    "case {case:?}: expected every capacity slot to forecast {capacity}, got \
+                     {capacity_values:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_forecast_refusal_for_a_policy_of_another_type_reports_only_the_requested_name() {
+    // The longest `PolicyName` the model admits (`PolicyName`, length 1-256), and one
+    // carrying the punctuation its pattern (^\p{Print}+$) admits: the refusal is built from
+    // whatever name the request named.
+    let long_name = "p".repeat(256);
+    let step_configuration = json!({"AdjustmentType": "ChangeInCapacity",
+                                    "StepAdjustments": [{"MetricIntervalLowerBound": 0.0,
+                                                         "ScalingAdjustment": 1}]});
+    let tracking_configuration = json!({"TargetValue": 40.0,
+                                        "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"}});
+    // (case, policy name, policy type, the configuration member that type carries, it)
+    let rows: Vec<(&str, String, &str, &str, Value)> = vec![
+        (
+            "a step scaling policy",
+            "stepper".to_string(),
+            "StepScaling",
+            "StepScalingPolicyConfiguration",
+            step_configuration.clone(),
+        ),
+        (
+            "a target tracking policy under a punctuated name",
+            "night shift (v2)".to_string(),
+            "TargetTrackingScaling",
+            "TargetTrackingScalingPolicyConfiguration",
+            tracking_configuration,
+        ),
+        (
+            "a step scaling policy under the longest name the model admits",
+            long_name,
+            "StepScaling",
+            "StepScalingPolicyConfiguration",
+            step_configuration,
+        ),
+    ];
+
+    for (case, policy_name, policy_type, member, configuration) in rows {
+        let emulator = Emulator::empty();
+        let target = emulator.given_target(DIMENSION, 1, 20).await;
+
+        let mut put = target.clone();
+        put["PolicyName"] = json!(policy_name);
+        put["PolicyType"] = json!(policy_type);
+        put[member] = configuration;
+        let (status, body) = emulator.call("PutScalingPolicy", put).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the policy to be put, got {status} {body:?}"
+        );
+
+        let mut request = target.clone();
+        request["PolicyName"] = json!(policy_name);
+        request["StartTime"] = json!(now_secs());
+        request["EndTime"] = json!(now_secs() + INTERVAL);
+        let (status, body) = emulator
+            .call("GetPredictiveScalingForecast", request)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {body:?}"
+        );
+        let expected = format!(
+            "No predictive scaling policy with the name {policy_name} found. Verify the policy \
+             name and try again."
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(policy_type),
+            "case {case:?}: expected the refusal to report nothing about the policy stored \
+             under that name, got {message:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -679,6 +956,26 @@ fn now_secs() -> i64 {
         .duration_since(::std::time::UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs() as i64
+}
+
+/// A JSON array as its entries, so a forecast's slots can be read one by one whether or not
+/// every one of them is a number.
+fn entries(value: &Value) -> Vec<Value> {
+    value.as_array().cloned().unwrap_or_default()
+}
+
+/// Whether a forecast slot carries NO value.
+///
+/// The awsJson protocols put a double that is not a finite number on the wire as its NAME
+/// rather than as a JSON number (`PutMetricData` refuses exactly such a value, "NaN", on the
+/// way in), so a slot with no value arrives as that name; a protocol that rendered it as a
+/// bare literal is accepted here too.
+fn no_value(entry: &Value) -> bool {
+    match entry {
+        Value::String(name) => name == "NaN",
+        Value::Number(number) => number.as_f64().is_some_and(f64::is_nan),
+        _ => false,
+    }
 }
 
 /// A JSON array of numbers as a vector, so a forecast's slots and values compare as one.
