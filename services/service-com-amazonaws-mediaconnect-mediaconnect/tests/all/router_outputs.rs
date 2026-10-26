@@ -821,15 +821,18 @@ async fn batch_get_reports_each_requested_arn_once_and_errors_for_the_rest() {
         "a batch read must not change what the next one sees, got {first} then {second}"
     );
     assert_eq!(
-        stored_count(&emulator),
+        stored_router_output_count(&emulator),
         3,
         "a read stores no router output, got {} stored",
-        stored_count(&emulator)
+        stored_router_output_count(&emulator)
     );
 }
 
 /// How many router outputs the store holds.
-fn stored_count(emulator: &Emulator) -> usize {
+///
+/// `pub(crate)` because `tests/all/create_router_output_request_bounds.rs` asserts the same
+/// thing — that a refused create stores nothing — so there is ONE reading of the store.
+pub(crate) fn stored_router_output_count(emulator: &Emulator) -> usize {
     emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>()
@@ -918,10 +921,10 @@ async fn a_replayed_client_token_mints_no_second_router_output() {
         "a replayed ClientToken answers with the output it minted, got {replay}"
     );
     assert_eq!(
-        stored_count(&emulator),
+        stored_router_output_count(&emulator),
         1,
         "a replayed ClientToken mints no second output, got {} stored",
-        stored_count(&emulator)
+        stored_router_output_count(&emulator)
     );
 
     // A DIFFERENT token is a different request: it mints its own output.
@@ -936,10 +939,10 @@ async fn a_replayed_client_token_mints_no_second_router_output() {
         "a different ClientToken mints a distinct output, got {other_arn}"
     );
     assert_eq!(
-        stored_count(&emulator),
+        stored_router_output_count(&emulator),
         2,
         "two tokens mint two outputs, got {} stored",
-        stored_count(&emulator)
+        stored_router_output_count(&emulator)
     );
     let (_, _, read) = batch_get_router_outputs(&emulator, &[&arn, &other_arn]).await;
     assert_eq!(
@@ -1169,7 +1172,7 @@ async fn refusals_name_the_modelled_error() {
         code: expected_code,
     } in cases
     {
-        let before = stored_count(&emulator);
+        let before = stored_router_output_count(&emulator);
         let (status, code, answer) = emulator.send(method, &uri, body).await;
         assert_eq!(
             (status, code.as_deref()),
@@ -1178,10 +1181,10 @@ async fn refusals_name_the_modelled_error() {
              {answer}"
         );
         assert_eq!(
-            stored_count(&emulator),
+            stored_router_output_count(&emulator),
             before,
             "case {case:?}: a refused request stores nothing, got {} stored",
-            stored_count(&emulator)
+            stored_router_output_count(&emulator)
         );
     }
 }
@@ -1219,10 +1222,10 @@ async fn create_refuses_past_the_store_ceiling() {
          {code:?}: {refused}"
     );
     assert_eq!(
-        stored_count(&emulator),
+        stored_router_output_count(&emulator),
         mc::MAX_ROUTER_OUTPUTS,
         "the refused create stored nothing, got {} stored",
-        stored_count(&emulator)
+        stored_router_output_count(&emulator)
     );
 }
 
