@@ -2481,6 +2481,33 @@ pub fn snapshot_name_conflict(snapshot_name: &str) -> ConflictException {
     duplicate_name_conflict("Snapshot", snapshot_name)
 }
 
+/// The modelled `ConflictException` for a call that would transition THE GRAPH ITSELF
+/// (`StartGraph`, `StopGraph`, `UpdateGraph`, `DeleteGraph`, `ResetGraph`) while the
+/// graph's current status does not permit that transition.
+///
+/// `action` is the verb of the operation asking for the transition ("start", "stop",
+/// "update", "delete", "reset"), and `status` is the status that held the request back.
+/// The service words this refusal as what it could not do and the state that stopped it
+/// — and nothing else: the graph was addressed by an identifier the caller sent, so the
+/// refusal does not front it, and the current status is the one fact the caller does
+/// not already hold. The modelled shape carries only `message` and `reason`
+/// (`smithy_query(query="shape",shape="ConflictException")`), so the message is the only
+/// place either fact can go. Written once here and reached by every one of those state
+/// gates, so no two of them word the same refusal differently.
+pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "Unable to {action} the graph because it is in the {} state.",
+            status.as_wire()
+        ),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`
+        // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a status
+        // that simply does not permit the transition is not a concurrent modification
+        // of the graph, so the member is left absent.
+        reason: None,
+    }
+}
+
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
 ///
 /// `total` is the number of entries the record would hold AFTER the call, so

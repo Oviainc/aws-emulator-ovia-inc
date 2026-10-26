@@ -211,13 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state too. A reset does not remove the graph, so deletion protection — which
         // holds back a DELETION — does not hold this request back.
         if graph_status != crate::state::GraphStatus::Available {
-            return Err(ResetGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "graph {graph_id} is in status {} and cannot be reset",
-                    graph_status.as_wire()
-                ),
-                reason: None,
-            })
+            return Err(ResetGraphErrorModeled::ConflictException(
+                crate::state::graph_state_conflict("reset", graph_status),
+            )
             .into());
         }
 

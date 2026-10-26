@@ -218,13 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REST can, whether it rests serving (`AVAILABLE`) or stopped (`STOPPED`): a
         // stopped graph is a graph that still exists, and deletion is how it goes away.
         if !graph_status.is_at_rest() {
-            return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "graph {graph_id} is in status {} and cannot be deleted",
-                    graph_status.as_wire()
-                ),
-                reason: None,
-            })
+            return Err(DeleteGraphErrorModeled::ConflictException(
+                crate::state::graph_state_conflict("delete", graph_status),
+            )
             .into());
         }
         // `skipSnapshot` is required, and `false` asks for a FINAL snapshot of the

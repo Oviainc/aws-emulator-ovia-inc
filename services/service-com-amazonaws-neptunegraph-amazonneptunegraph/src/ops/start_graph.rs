@@ -190,14 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with a transition still in flight (including a stop that has not come due) and
         // a graph already serving both conflict with this request.
         if graph.status != crate::state::GraphStatus::Stopped {
-            return Err(StartGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "graph {} is in status {} and cannot be started",
-                    graph.id,
-                    graph.status.as_wire()
-                ),
-                reason: None,
-            })
+            return Err(StartGraphErrorModeled::ConflictException(
+                crate::state::graph_state_conflict("start", graph.status),
+            )
             .into());
         }
 

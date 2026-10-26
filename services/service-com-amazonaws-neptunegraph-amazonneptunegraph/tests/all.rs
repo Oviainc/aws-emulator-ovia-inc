@@ -39,6 +39,8 @@ mod graph_run_state;
 mod graph_snapshot_lifecycle;
 #[path = "all/graph_snapshot_listing.rs"]
 mod graph_snapshot_listing;
+#[path = "all/graph_state_gate_messages.rs"]
+mod graph_state_gate_messages;
 #[path = "all/graph_summary.rs"]
 mod graph_summary;
 #[path = "all/import_task_lifecycle.rs"]

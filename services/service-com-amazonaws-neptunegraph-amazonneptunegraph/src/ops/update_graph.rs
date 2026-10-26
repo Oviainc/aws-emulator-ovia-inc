@@ -192,14 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A graph can only be reconfigured once it is serving: while an earlier
         // transition is still outstanding the graph's configuration is in flight.
         if graph.status != crate::state::GraphStatus::Available {
-            return Err(UpdateGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "graph {} is in status {} and cannot be updated",
-                    graph.id,
-                    graph.status.as_wire()
-                ),
-                reason: None,
-            })
+            return Err(UpdateGraphErrorModeled::ConflictException(
+                crate::state::graph_state_conflict("update", graph.status),
+            )
             .into());
         }
 
