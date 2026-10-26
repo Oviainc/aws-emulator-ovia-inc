@@ -21,15 +21,15 @@ use crate::microvm_lifecycle::{
 
 /// The longest `TagKey` the model accepts: `Tags`'s key is `@length(1..128)`
 /// (`smithy_query(query="shape",shape="Tags")`).
-const MAX_TAG_KEY_LENGTH: usize = 128;
+pub(crate) const MAX_TAG_KEY_LENGTH: usize = 128;
 
 /// The longest `TagValue` the model accepts, and a value may also be EMPTY: `Tags`'s
 /// value is `@length(0..256)` (`smithy_query(query="shape",shape="Tags")`).
-const MAX_TAG_VALUE_LENGTH: usize = 256;
+pub(crate) const MAX_TAG_VALUE_LENGTH: usize = 256;
 
 /// `POST /2017-03-31/tags/{Resource}` — the tagging URI this model binds, with the
 /// resource ARN as the path label and the tags in the body.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     resource: &str,
     tags: Value,
@@ -44,7 +44,7 @@ async fn tag_resource(
 }
 
 /// A `Tags` map of `count` distinct keys, each holding `value`.
-fn numbered_tags(count: usize, value: &str) -> Value {
+pub(crate) fn numbered_tags(count: usize, value: &str) -> Value {
     Value::Object(
         (0..count)
             .map(|index| (format!("key-{index:03}"), Value::String(value.to_string())))
@@ -53,7 +53,7 @@ fn numbered_tags(count: usize, value: &str) -> Value {
 }
 
 /// A `Tags` map as the wire shape.
-fn tag_map(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -63,7 +63,11 @@ fn tag_map(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// Create an image carrying `tags` and return the ARN the service minted for it.
-async fn image_with_tags(router: &MultiServiceRouter, name: &str, tags: Value) -> String {
+pub(crate) async fn image_with_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: Value,
+) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -76,7 +80,7 @@ async fn image_with_tags(router: &MultiServiceRouter, name: &str, tags: Value) -
 }
 
 /// The `tags` `GetMicrovmImage` projects for the resource `identifier` names.
-async fn stored_tags(router: &MultiServiceRouter, identifier: &str) -> Value {
+pub(crate) async fn stored_tags(router: &MultiServiceRouter, identifier: &str) -> Value {
     let (status, image) = get_image(router, identifier).await;
     assert_eq!(status, 200, "read {identifier} back: got {status} {image}");
     image["tags"].clone()

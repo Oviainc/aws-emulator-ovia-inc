@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set persisted on the resource its `Resource` ARN names — a
+//! [`crate::state::MicrovmImage`], the one resource type this service mints and
+//! therefore the only one its tagging operations can address. The tags come from the
+//! same stored record `GetMicrovmImage` projects, so both read paths agree on every
+//! edit a tagging call made, and the map is reported even when the resource carries no
+//! tags: a client always gets a map to iterate.
+//!
+//! This is a REPORTING operation (`@readonly`): it writes nothing of its own. It does
+//! apply the transitions the clock has already made due — an image whose asynchronous
+//! deletion came due is gone before this call is served — so it reads exactly the
+//! records every other operation sees at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("the MicroVM image store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // A resource whose asynchronous deletion the clock has already made due is gone
+        // before this call is served, so this read reports the same records every other
+        // operation sees at this instant. Nothing else is written: the operation only
+        // reports.
+        store.materialize_due(::std::time::Instant::now());
+
+        // `Resource` is "The ARN of the resource to list tags for", so the lookup is by
+        // the ARN this service minted for the resource — resolved through the same index
+        // every other operation resolves an identifier through, so an ARN of another
+        // partition, region or account resolves to nothing rather than to a local
+        // resource of the same name. `Resource`'s own pattern has already refused
+        // anything that is not a well-formed taggable ARN before this handler runs.
+        let Some(image) = store.image(&input.resource) else {
+            // A well-formed taggable ARN naming nothing this account holds is the
+            // missing-resource condition, not a bad request: `message` is the only
+            // required member of `ResourceNotFoundException`, and this service leaves
+            // `resourceType` and `resourceId` unset.
+            return Err(ListTagsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::image_not_found_message(&input.resource),
+                    resource_type: None,
+                    resource_id: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListTagsOutput {
+            // The tag set is reported as a map even when the resource carries none, so a
+            // client reading `Tags` always gets a map to iterate — the same projection
+            // the resource's own read path uses.
+            tags: crate::state::wire_map_present(&image.tags),
+        })
     }
 }

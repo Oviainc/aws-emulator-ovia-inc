@@ -15,6 +15,8 @@
 mod image_listing;
 #[path = "all/image_request_validation.rs"]
 mod image_request_validation;
+#[path = "all/list_tags_read_path.rs"]
+mod list_tags_read_path;
 #[path = "all/managed_base_image_catalogue.rs"]
 mod managed_base_image_catalogue;
 #[path = "all/managed_base_image_versions.rs"]
