@@ -43,6 +43,8 @@ mod partner_entry_rejection;
 mod partner_event_source;
 #[path = "all/pattern_and_connection_filters.rs"]
 mod pattern_and_connection_filters;
+#[path = "all/pattern_preflight.rs"]
+mod pattern_preflight;
 #[path = "all/pattern_refusal_wording.rs"]
 mod pattern_refusal_wording;
 #[path = "all/replay_cancellation.rs"]
