@@ -409,9 +409,9 @@ pub mod offerings;
 
 pub use offerings::{
     catalog, offering_by_id, offering_id, offering_index, offering_page,
-    reservation_resource_type, ChannelOfferingConfiguration, OfferingFilters, OfferingSpec,
-    OFFERING_CURRENCY_CODE, OFFERING_DURATION, OFFERING_DURATION_UNITS, OFFERING_FIXED_PRICE,
-    OFFERING_TYPE,
+    reservation_resource_type, specification_filter_refusal, ChannelOfferingConfiguration,
+    OfferingFilters, OfferingSpec, OFFERING_CURRENCY_CODE, OFFERING_DURATION,
+    OFFERING_DURATION_UNITS, OFFERING_FIXED_PRICE, OFFERING_TYPE,
 };
 
 /// The RESERVATION slice: the reserved resources the account has bought against

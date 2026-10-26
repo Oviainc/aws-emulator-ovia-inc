@@ -22,6 +22,13 @@
 //! [`ComAmazonawsMedialiveMedialiveState::update_reservation`]. Nothing else
 //! moves: a reservation reserves what it was bought to reserve.
 //!
+//! Reading the store back is either one reservation by its id
+//! ([`ComAmazonawsMedialiveMedialiveState::reservation_description`], which
+//! `DescribeReservation` answers from) or a page of them
+//! ([`ComAmazonawsMedialiveMedialiveState::reservation_page`], which
+//! `ListReservations` answers from, filtered by the configuration its request
+//! names through the offering catalog's own predicate).
+//!
 //! ## What the clock owns
 //!
 //! A reservation's `State` is DERIVED on every read rather than stored. The lease
@@ -39,6 +46,7 @@
 //! state lands.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Months, NaiveDateTime, Timelike, Utc};
@@ -46,7 +54,7 @@ use chrono::{DateTime, Datelike, Months, NaiveDateTime, Timelike, Utc};
 use crate::ops::types::{RenewalSettings, Reservation};
 
 use super::{
-    catalog, offering_id, ComAmazonawsMedialiveMedialiveState, OfferingSpec,
+    catalog, offering_id, ComAmazonawsMedialiveMedialiveState, OfferingFilters, OfferingSpec,
     OFFERING_CURRENCY_CODE, OFFERING_DURATION, OFFERING_DURATION_UNITS, OFFERING_FIXED_PRICE,
     OFFERING_TYPE,
 };
@@ -156,6 +164,16 @@ impl ReservationRecord {
         } else {
             reservation_state::EXPIRED
         }
+    }
+
+    /// Whether this reservation is one `filters` asks for: it reserves the
+    /// configuration the catalog entry it was bought from describes, so the
+    /// specification filters are matched against that entry — the SAME predicate
+    /// the offering catalog's own listing applies, so a filter admits a
+    /// reservation exactly when it admits the offering it was bought from.
+    fn matches(&self, filters: &OfferingFilters<'_>) -> bool {
+        self.offering()
+            .is_some_and(|offering| offering.matches(filters))
     }
 
     /// This record as the modelled `Reservation` every reader reports.
@@ -402,6 +420,44 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.reservations
             .get(id)
             .map(|reservation| reservation.id.as_str())
+    }
+
+    /// One page of the reservations `filters` admits, as of `now`: the stored
+    /// reservations from `start` on, at most `page_size` of them, and the id the
+    /// next page starts at — absent on the last page, since a token is handed out
+    /// only when an admitted reservation is left over after this page.
+    ///
+    /// Reported in `BTreeMap` key order, which is the order the ids were minted
+    /// in because they are minted from a counter at a fixed seven-digit width
+    /// (see [`FIRST_RESERVATION_ID`]), so a token means the same thing on the
+    /// next call as it did on this one. A token naming a reservation the store no
+    /// longer holds resumes at the next id past it rather than failing.
+    ///
+    /// Every reservation is projected through [`ReservationRecord::reservation`],
+    /// the one projection a purchase and `DescribeReservation` also answer from,
+    /// so a listed reservation cannot drift from a described one.
+    pub fn reservation_page(
+        &self,
+        filters: &OfferingFilters<'_>,
+        start: Option<&str>,
+        page_size: usize,
+        now: SystemTime,
+    ) -> (Vec<Reservation>, Option<String>) {
+        let first = match start {
+            Some(token) => Bound::Included(token),
+            None => Bound::Unbounded,
+        };
+        let mut admitted = self
+            .reservations
+            .range::<str, _>((first, Bound::Unbounded))
+            .filter(|(_, record)| record.matches(filters));
+        let reservations: Vec<Reservation> = admitted
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.reservation(now))
+            .collect();
+        let next_token = admitted.next().map(|(id, _)| id.clone());
+        (reservations, next_token)
     }
 
     /// The reservation `id` names as of `now`, or `None` when the account holds

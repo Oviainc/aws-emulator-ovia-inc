@@ -434,13 +434,16 @@ fn member_matches(filter: Option<&str>, offered: Option<&str>) -> bool {
     }
 }
 
-/// The filters one `ListOfferings` request named, each already checked against
-/// the value set its member accepts.
+/// The filters one request named over a reservable configuration, each already
+/// checked against the value set its member accepts (by
+/// [`specification_filter_refusal`]).
 ///
 /// Every member of `ReservationResourceSpecification` has a filter of the same
 /// name on the request, plus `Duration` on the offering itself and
 /// `ChannelConfiguration`, which is resolved to the configuration of a stored
-/// channel before it gets here.
+/// channel before it gets here. `ListOfferings` carries all of them;
+/// `ListReservations`, whose request names only the specification members, leaves
+/// the last two unset.
 #[derive(Debug, Clone, Default)]
 pub struct OfferingFilters<'request> {
     pub channel_class: Option<&'request str>,
@@ -453,6 +456,72 @@ pub struct OfferingFilters<'request> {
     pub special_feature: Option<&'request str>,
     pub video_quality: Option<&'request str>,
     pub channel_configuration: Option<ChannelOfferingConfiguration>,
+}
+
+/// Why the specification filters a request named are not ones this service can
+/// filter by, as the message of the refusal — `None` when every filter the
+/// request named carries a value its own member accepts.
+///
+/// Each of these filters names one member of
+/// `ReservationResourceSpecification`, whose target shape is an ENUM, but the
+/// request member itself targets the free-form `__string` — so the request
+/// boundary refuses no value, and a value outside the member's modelled set,
+/// which describes no reservable configuration, is refused here, naming the
+/// member and the values it accepts.
+///
+/// ONE copy of the check, shared by every operation whose request carries these
+/// filters (`ListOfferings` over the catalog, `ListReservations` over the
+/// reservations bought from it), so the two cannot disagree about which values a
+/// filter accepts or how the refusal reads.
+pub fn specification_filter_refusal(filters: &OfferingFilters<'_>) -> Option<String> {
+    for (member, filter, values) in [
+        (
+            "channelClass",
+            filters.channel_class,
+            CHANNEL_CLASS_VALUES,
+        ),
+        ("codec", filters.codec, RESERVATION_CODEC_VALUES),
+        (
+            "maximumBitrate",
+            filters.maximum_bitrate,
+            RESERVATION_MAXIMUM_BITRATE_VALUES,
+        ),
+        (
+            "maximumFramerate",
+            filters.maximum_framerate,
+            RESERVATION_MAXIMUM_FRAMERATE_VALUES,
+        ),
+        (
+            "resolution",
+            filters.resolution,
+            RESERVATION_RESOLUTION_VALUES,
+        ),
+        (
+            "resourceType",
+            filters.resource_type,
+            RESERVATION_RESOURCE_TYPE_VALUES,
+        ),
+        (
+            "specialFeature",
+            filters.special_feature,
+            RESERVATION_SPECIAL_FEATURE_VALUES,
+        ),
+        (
+            "videoQuality",
+            filters.video_quality,
+            RESERVATION_VIDEO_QUALITY_VALUES,
+        ),
+    ] {
+        if let Some(value) = filter {
+            if !values.contains(&value) {
+                return Some(format!(
+                    "{member} must be one of {}, got {value:?}",
+                    values.join(", ")
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The configuration of one stored channel, as the `ChannelConfiguration` filter

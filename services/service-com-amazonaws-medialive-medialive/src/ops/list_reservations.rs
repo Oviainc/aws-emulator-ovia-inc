@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReservations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReservations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReservations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The reservations this operation reports are the ones the account has bought,
+//! the [`crate::state::reservations`] store `PurchaseOffering` writes and
+//! `DescribeReservation` reads one of: reported through that store's own
+//! projection, filtered by the reserved configuration the request names, and cut
+//! into pages the way every other listing of this service cuts them.
+//!
+//! A reservation is reported for the region it was PURCHASED in, which is the
+//! region on its own record, so a listing reports every reservation the account
+//! holds exactly as `DescribeReservation` reports one of them.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReservations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReservationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReservations"))
+        // `ctx` carries request metadata only: every reservation is reported
+        // for the region it was purchased in, which is on its own record, not
+        // for the region this read was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing
+        // and is a bad request. It is clamped to a finite ceiling, and an absent
+        // one uses that ceiling, so no single request can ask the service to
+        // project an unbounded number of reservations in one response: the same
+        // rule, and the same ceiling, every other listing of this service
+        // applies.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // The filters this request carries are the members of the reserved
+        // configuration, each checked against the value set its own member
+        // accepts by the shared check every operation carrying these filters
+        // applies. The two `ListOfferings` carries beside them (`Duration` and
+        // `ChannelConfiguration`) are not on this request, so they filter
+        // nothing here.
+        let filters = crate::state::OfferingFilters {
+            channel_class: input.channel_class.as_deref(),
+            codec: input.codec.as_deref(),
+            maximum_bitrate: input.maximum_bitrate.as_deref(),
+            maximum_framerate: input.maximum_framerate.as_deref(),
+            resolution: input.resolution.as_deref(),
+            resource_type: input.resource_type.as_deref(),
+            special_feature: input.special_feature.as_deref(),
+            video_quality: input.video_quality.as_deref(),
+            ..crate::state::OfferingFilters::default()
+        };
+        if let Some(message) = crate::state::specification_filter_refusal(&filters) {
+            return Err(bad_request(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due, which were owed at this instant whether or not
+        // anybody listed. A reservation's own lifecycle needs no write at all:
+        // its `State` is derived from its `End` and this instant.
+        state.settle(now);
+
+        // `NextToken` is the `ReservationId` the next page starts at, which is
+        // the form this operation hands a token out as, so resuming is a range
+        // scan from that id.
+        let (reservations, next_token) =
+            state.reservation_page(&filters, input.next_token.as_deref(), page_size, now);
+
+        Ok(ListReservationsOutput {
+            reservations: Some(reservations),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot serve as asked, as the 400
+/// `BadRequestException` it models. The message names the member, the rule and
+/// the value the request carried, so a caller can fix the request from that text
+/// alone.
+fn bad_request(message: String) -> ListReservationsError {
+    ListReservationsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the account's reservations from. A modelled
+/// server error, never a fresh engine (which would answer from an empty store
+/// nobody ever wrote to).
+fn unavailable() -> ListReservationsError {
+    ListReservationsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

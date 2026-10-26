@@ -182,54 +182,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::MAX_LIST_PAGE_SIZE,
         };
 
-        // Each of these filters names one member of
-        // `ReservationResourceSpecification`, whose target shape is an ENUM, but
-        // the request member itself targets the free-form `__string` — so the
-        // request boundary refuses no value and a value outside the member's
-        // modelled set, which names no offering, is refused here, naming the
-        // member and the values it accepts.
-        for (member, filter, values) in [
-            ("channelClass", input.channel_class.as_deref(), CHANNEL_CLASS_VALUES),
-            ("codec", input.codec.as_deref(), RESERVATION_CODEC_VALUES),
-            (
-                "maximumBitrate",
-                input.maximum_bitrate.as_deref(),
-                RESERVATION_MAXIMUM_BITRATE_VALUES,
-            ),
-            (
-                "maximumFramerate",
-                input.maximum_framerate.as_deref(),
-                RESERVATION_MAXIMUM_FRAMERATE_VALUES,
-            ),
-            (
-                "resolution",
-                input.resolution.as_deref(),
-                RESERVATION_RESOLUTION_VALUES,
-            ),
-            (
-                "resourceType",
-                input.resource_type.as_deref(),
-                RESERVATION_RESOURCE_TYPE_VALUES,
-            ),
-            (
-                "specialFeature",
-                input.special_feature.as_deref(),
-                RESERVATION_SPECIAL_FEATURE_VALUES,
-            ),
-            (
-                "videoQuality",
-                input.video_quality.as_deref(),
-                RESERVATION_VIDEO_QUALITY_VALUES,
-            ),
-        ] {
-            if let Some(value) = filter {
-                if !values.contains(&value) {
-                    return Err(bad_request(format!(
-                        "{member} must be one of {}, got {value:?}",
-                        values.join(", ")
-                    )));
-                }
-            }
+        // The filters over the reserved configuration, checked against the value
+        // set each member accepts by the catalog's own shared check — the one
+        // every operation carrying these filters applies.
+        let mut filters = crate::state::OfferingFilters {
+            channel_class: input.channel_class.as_deref(),
+            codec: input.codec.as_deref(),
+            maximum_bitrate: input.maximum_bitrate.as_deref(),
+            maximum_framerate: input.maximum_framerate.as_deref(),
+            resolution: input.resolution.as_deref(),
+            resource_type: input.resource_type.as_deref(),
+            special_feature: input.special_feature.as_deref(),
+            video_quality: input.video_quality.as_deref(),
+            ..crate::state::OfferingFilters::default()
+        };
+        if let Some(message) = crate::state::specification_filter_refusal(&filters) {
+            return Err(bad_request(message));
         }
 
         // `Duration` is "Filter by offering duration, e.g. '12'" — a count of
@@ -291,18 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let filters = crate::state::OfferingFilters {
-            channel_class: input.channel_class.as_deref(),
-            codec: input.codec.as_deref(),
-            duration,
-            maximum_bitrate: input.maximum_bitrate.as_deref(),
-            maximum_framerate: input.maximum_framerate.as_deref(),
-            resolution: input.resolution.as_deref(),
-            resource_type: input.resource_type.as_deref(),
-            special_feature: input.special_feature.as_deref(),
-            video_quality: input.video_quality.as_deref(),
-            channel_configuration,
-        };
+        filters.duration = duration;
+        filters.channel_configuration = channel_configuration;
 
         let (offerings, next_token) =
             crate::state::offering_page(&filters, &region, start, page_size);
