@@ -20,6 +20,9 @@ mod data_api_surface;
 #[path = "all/emulator.rs"]
 mod emulator;
 
+#[path = "all/error_surface.rs"]
+mod error_surface;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

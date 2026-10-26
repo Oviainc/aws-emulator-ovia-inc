@@ -114,7 +114,7 @@
 use super::types::*;
 use crate::state::{
     decode_cursor, encode_cursor, non_empty, to_timestamp, Statement, CURSOR_STATEMENTS,
-    DEFAULT_LIST_PAGE_SIZE,
+    DEFAULT_LIST_PAGE_SIZE, INVALID_TOKEN_MESSAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -205,11 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => u64::MAX,
             Some(token) => match decode_cursor(CURSOR_STATEMENTS, token) {
                 Some(cursor) => cursor,
-                None => {
-                    return Err(validation(
-                        "NextToken is not a continuation token this operation issued",
-                    ))
-                }
+                None => return Err(validation(INVALID_TOKEN_MESSAGE)),
             },
         };
 
