@@ -548,8 +548,9 @@ async fn update_applies_only_the_members_the_request_carries() {
 #[tokio::test]
 async fn the_documented_severity_and_flag_combination_is_enforced() {
     // The rule documented on `notifyOnCaseSeverity`: `high` or `all` needs at least one
-    // of the three flags true, `none` needs every one of them false. Rows span the
-    // severity levels and the flag combinations on each side of that rule.
+    // of the three flags true, and `none` needs every flag the request is worded over
+    // to be false — on create, the whole configuration. Rows span the severity levels
+    // and the flag combinations on each side of that rule.
     let cases: [(&str, &str, [Option<bool>; 3], u16); 10] = [
         ("high with one flag true", "high", [Some(true), None, None], 200),
         (
@@ -626,9 +627,14 @@ async fn the_documented_severity_and_flag_combination_is_enforced() {
         }
     }
 
-    // The same rule on update, evaluated over the record the update would leave
-    // behind: the stored configuration notifies on create-or-reopen, so moving it to
-    // `none` without turning that flag off is refused, and turning both at once is not.
+    // The same rule on update, each clause over the scope the UPDATE request words it
+    // with: `all`/`high` over the record the update would leave behind, and `none`
+    // over only the notification flags the request itself specifies. The fixture
+    // notifies on create-or-reopen at severity `high`. The last two columns are the
+    // severity and the create-or-reopen flag the configuration must HOLD afterwards —
+    // for a refused row, the stored ones, since a refused update changes nothing. The
+    // scope of the `none` clause is covered exhaustively in
+    // [`crate::update_severity_rule_scope`].
     let fixture = json!({
         "teamId": "T012ABCDEFG",
         "channelId": "C01234A5BCD",
@@ -636,21 +642,41 @@ async fn the_documented_severity_and_flag_combination_is_enforced() {
         "notifyOnCreateOrReopenCase": true,
         "channelRoleArn": role_arn("SupportAppRole"),
     });
-    for (label, patch, expected_status) in [
+    for (label, patch, expected_status, expected_severity, expected_flag) in [
         (
-            "severity to none while a stored flag is true",
+            "severity to none with no notification flag in the request",
             json!({ "notifyOnCaseSeverity": "none" }),
-            400,
+            200,
+            "none",
+            true,
         ),
         (
             "severity to none with the stored flag turned off",
             json!({ "notifyOnCaseSeverity": "none", "notifyOnCreateOrReopenCase": false }),
             200,
+            "none",
+            false,
+        ),
+        (
+            "severity to none with a flag the request itself sets true",
+            json!({ "notifyOnCaseSeverity": "none", "notifyOnResolveCase": true }),
+            400,
+            "high",
+            true,
+        ),
+        (
+            "severity to none with the stored flag restated true",
+            json!({ "notifyOnCaseSeverity": "none", "notifyOnCreateOrReopenCase": true }),
+            400,
+            "high",
+            true,
         ),
         (
             "the only true flag turned off while severity stays high",
             json!({ "notifyOnCreateOrReopenCase": false }),
             400,
+            "high",
+            true,
         ),
     ] {
         let emulator = Emulator::new();
@@ -672,24 +698,29 @@ async fn the_documented_severity_and_flag_combination_is_enforced() {
             updated.status, updated.body
         );
         if expected_status == 400 {
-            // A refused update changed nothing.
-            let listed = emulator
-                .listed("T012ABCDEFG", "C01234A5BCD")
-                .await
-                .unwrap_or_else(|| panic!("case {label:?}: expected the configuration to survive"));
             assert_eq!(
-                listed.get("notifyOnCaseSeverity").and_then(Value::as_str),
-                Some("high"),
-                "case {label:?}: expected the stored severity to survive, got {listed}"
-            );
-            assert_eq!(
-                listed
-                    .get("notifyOnCreateOrReopenCase")
-                    .and_then(Value::as_bool),
-                Some(true),
-                "case {label:?}: expected the stored flag to survive, got {listed}"
+                updated.error_type, "ValidationException",
+                "case {label:?}: expected ValidationException, got {:?}",
+                updated.error_type
             );
         }
+        let listed = emulator
+            .listed("T012ABCDEFG", "C01234A5BCD")
+            .await
+            .unwrap_or_else(|| panic!("case {label:?}: expected the configuration to survive"));
+        assert_eq!(
+            listed.get("notifyOnCaseSeverity").and_then(Value::as_str),
+            Some(expected_severity),
+            "case {label:?}: expected severity {expected_severity:?} to be stored, got {listed}"
+        );
+        assert_eq!(
+            listed
+                .get("notifyOnCreateOrReopenCase")
+                .and_then(Value::as_bool),
+            Some(expected_flag),
+            "case {label:?}: expected NotifyOnCreateOrReopenCase {expected_flag} to be stored, \
+             got {listed}"
+        );
     }
 }
 

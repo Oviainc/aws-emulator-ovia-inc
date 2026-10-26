@@ -35,6 +35,8 @@ mod client_error_wire_status;
 mod delete_requires_the_entity;
 #[path = "all/describe_language_model.rs"]
 mod describe_language_model;
+#[path = "all/get_call_analytics_category_reads.rs"]
+mod get_call_analytics_category_reads;
 #[path = "all/get_medical_vocabulary_reads.rs"]
 mod get_medical_vocabulary_reads;
 #[path = "all/job_concurrency_quota.rs"]

@@ -185,7 +185,10 @@ pub struct AppBundleRecord {
     pub arn: String,
     /// The Region the create call was signed for: the Region this bundle lives
     /// in, whose quota it counts against (see [`MAX_APP_BUNDLES_PER_REGION`]),
-    /// and the one its [`arn`](Self::arn) carries.
+    /// and the one its [`arn`](Self::arn) carries. It is also the Region every
+    /// resource nested UNDER this bundle lives in, because a nested resource
+    /// belongs to the parent it hangs off rather than to the endpoint a later
+    /// create call was signed for.
     pub region: String,
     pub customer_managed_key_arn: Option<String>,
     pub tags: Vec<Tag>,
@@ -346,9 +349,10 @@ pub struct AppAuthorizationRecord {
     /// authorization's own URLs are built with (see
     /// [`AppAuthorizationRecord::auth_url`]).
     pub app_bundle_id: String,
-    /// The Region the create call was signed for: the Region this authorization
-    /// lives in, the one its [`arn`](Self::arn) carries, and the one whose
-    /// service endpoint its URLs name.
+    /// The Region this authorization lives in: the one the app bundle that owns
+    /// it lives in (see [`AppBundleRecord::region`]), which is the one its
+    /// [`arn`](Self::arn) carries and the one whose service endpoint its URLs
+    /// name — not whichever Region's endpoint the create call was signed for.
     pub region: String,
     pub app: String,
     pub tenant_identifier: String,

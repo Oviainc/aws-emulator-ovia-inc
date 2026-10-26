@@ -255,18 +255,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One update at a time per cluster: while another is running the cluster is in
-        // use, which is exactly what `ResourceInUseException` reports.
+        // use, which is exactly what `ResourceInUseException` reports, worded by
+        // [`crate::state::update_in_progress`] for the update type this call would have
+        // minted.
         if let Some(in_flight) = cluster.in_flight_update() {
             return Err(
                 AssociateIdentityProviderConfigErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "Cluster {} already has update {} in progress",
-                            input.cluster_name, in_flight.id
-                        )),
-                        ..Default::default()
-                    },
+                    crate::state::update_in_progress(
+                        UPDATE_TYPE_ASSOCIATE_IDENTITY_PROVIDER_CONFIG,
+                        &input.cluster_name,
+                        in_flight,
+                    ),
                 )
                 .into(),
             );

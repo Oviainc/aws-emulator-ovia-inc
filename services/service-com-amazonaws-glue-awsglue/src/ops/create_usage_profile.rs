@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsageProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsageProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsageProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one usage profile in this account's per-account usage profile namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::usage_profiles`]): the whole profile
+//! comes from the request, the name must be free, and the create answers with the name it
+//! stored. `GetUsageProfile` reads the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsageProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsageProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsageProfile"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateUsageProfileErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue usage profile store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A usage profile is addressed by `Name` alone, so a create under a name already
+        // taken is refused rather than overwriting the stored profile.
+        if store.usage_profiles.contains_key(&input.name) {
+            return Err(CreateUsageProfileErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    // Wording for this slice is pinned by no recording or doc, so the
+                    // refusal states the resource kind and withholds the requested name,
+                    // as this service's other already-exists refusals do.
+                    message: Some("Usage profile already exists.".to_string()),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the operation's own modelled limit error.
+        if !store.can_store_usage_profile() {
+            return Err(
+                CreateUsageProfileErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} usage profiles",
+                            crate::state::MAX_USAGE_PROFILES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both instants are the create's, and the configuration is stored exactly as sent,
+        // so a read reports the profile this write recorded.
+        store.usage_profiles.insert(
+            input.name.clone(),
+            crate::state::UsageProfileEntry::from_create_input(
+                &input,
+                ::std::time::SystemTime::now(),
+            ),
+        );
+        ::tracing::info!(
+            operation = "CreateUsageProfile",
+            usage_profile = %input.name,
+            "created a Glue usage profile"
+        );
+
+        // "The name of the usage profile that was created" — the name the record is now
+        // stored under, which is what a later read addresses it by.
+        Ok(CreateUsageProfileOutput {
+            name: Some(input.name),
+        })
     }
 }

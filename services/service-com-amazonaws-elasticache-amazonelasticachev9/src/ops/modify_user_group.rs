@@ -380,14 +380,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "A user group must contain the default user", so the membership this
         // change leaves behind has to keep it — see
-        // `crate::state::DEFAULT_USER_ID`.
+        // `crate::state::DEFAULT_USER_ID`. The refusal reads as the service
+        // words this error class, which is one sentence for every handler that
+        // raises it (`crate::state::DEFAULT_USER_REQUIRED_MESSAGE`).
         if removals.iter().any(|id| id == crate::state::DEFAULT_USER_ID) {
             return Err(ModifyUserGroupErrorModeled::DefaultUserRequired(
                 DefaultUserRequired {
-                    message: Some(format!(
-                        "A user group must contain the {} user.",
-                        crate::state::DEFAULT_USER_ID
-                    )),
+                    message: Some(crate::state::DEFAULT_USER_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());

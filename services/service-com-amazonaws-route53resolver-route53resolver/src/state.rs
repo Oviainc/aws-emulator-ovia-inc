@@ -2058,6 +2058,70 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.firewall_configs.len() < MAX_STORED_FIREWALL_CONFIGS
     }
 
+    /// Every VPC this store knows the account has, in the order the service came
+    /// to know of each one.
+    ///
+    /// A per-VPC singleton configuration ([`FirewallConfigRecord`],
+    /// [`ResolverConfigRecord`]) exists for every VPC of the account, not only
+    /// for those a caller moved off the default, so the operation that LISTS
+    /// such configurations enumerates VPCs and not override records. This
+    /// emulator keeps no VPC inventory of its own, so the VPCs it knows the
+    /// account has are exactly those its own records name: a VPC a Resolver rule
+    /// is associated with, a VPC a Resolver endpoint is hosted in, and a VPC one
+    /// of the per-VPC configurations was written for.
+    ///
+    /// Ordered by the position in the store's creation order ([`Self::id_seq`])
+    /// of the FIRST record that named the VPC, so the sequence never depends on
+    /// the hash order of the maps holding those records and a VPC that becomes
+    /// known later only ever appends — which is what lets a list operation cut a
+    /// page at an offset into it. A pure read: a VPC is not given any record
+    /// here.
+    pub fn known_vpc_ids(&self) -> Vec<String> {
+        let named = self
+            .resolver_rule_associations
+            .values()
+            .map(|record| (record.vpc_id.as_str(), record.seq))
+            .chain(self.resolver_endpoints.values().filter_map(|record| {
+                record
+                    .host_vpc_id
+                    .as_deref()
+                    .map(|vpc_id| (vpc_id, record.seq))
+            }))
+            .chain(
+                self.resolver_dnssec_configs
+                    .values()
+                    .map(|record| (record.resource_id.as_str(), record.seq)),
+            )
+            .chain(
+                self.resolver_configs
+                    .values()
+                    .map(|record| (record.resource_id.as_str(), record.seq)),
+            )
+            .chain(
+                self.firewall_configs
+                    .values()
+                    .map(|record| (record.resource_id.as_str(), record.seq)),
+            );
+
+        let mut first_seen: HashMap<&str, u64> = HashMap::new();
+        for (vpc_id, seq) in named {
+            let earliest = first_seen.entry(vpc_id).or_insert(seq);
+            *earliest = (*earliest).min(seq);
+        }
+
+        // The id and the sequence number together, so VPCs that became known in
+        // the same call still have ONE order rather than the map's.
+        let mut ordered: Vec<(u64, &str)> = first_seen
+            .into_iter()
+            .map(|(vpc_id, seq)| (seq, vpc_id))
+            .collect();
+        ordered.sort_unstable();
+        ordered
+            .into_iter()
+            .map(|(_, vpc_id)| vpc_id.to_string())
+            .collect()
+    }
+
     /// The Resolver behavior configuration of the VPC `resource_id`, which every
     /// VPC has: the stored record when one was written for it, and otherwise the
     /// default configuration that VPC reports — identical identity
@@ -2329,6 +2393,19 @@ pub fn outpost_resolver_list_scope(outpost_arn: Option<&str>) -> String {
 /// operation is not read as an offset into this one (see
 /// [`endpoint_list_scope`]).
 pub const FIREWALL_DOMAIN_LIST_LIST_SCOPE: &str = "ListFirewallDomainLists/all/v1";
+
+/// The cursor scope of one `ListFirewallConfigs` query.
+///
+/// `ListFirewallConfigs` models no filter either, so — for the same reason as
+/// [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`] — the scope is a constant that names the
+/// operation.
+pub const FIREWALL_CONFIG_LIST_SCOPE: &str = "ListFirewallConfigs/all/v1";
+
+/// The largest page `ListFirewallConfigs` may be asked for, from the range the
+/// model puts on its `MaxResults` (5..10,
+/// `smithy_query(query="operation",operation="ListFirewallConfigs")`), which is
+/// narrower than the usual 1..100 the other list operations carry.
+pub const MAX_FIREWALL_CONFIGS_PER_PAGE: i32 = 10;
 
 /// One page of a `@paginated` list operation.
 #[derive(Debug)]

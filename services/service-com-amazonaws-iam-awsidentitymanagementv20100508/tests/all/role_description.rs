@@ -7,10 +7,15 @@
 //! record of the named role with the text the request carried, changing no other member
 //! of that record, and reports the modified role; every later read of the record
 //! (`GetRole`) reports the new description; the role is matched by its case-folded name;
-//! a name the account does not hold is the modelled `NoSuchEntityException` (HTTP 404,
-//! awsQuery code `NoSuchEntity`); and a service-linked role is a protected resource, so
-//! the update is `UnmodifiableEntityException` (HTTP 400, `UnmodifiableEntity`). A
-//! refused call leaves the held description exactly as it was.
+//! and a name the account does not hold is the modelled `NoSuchEntityException` (HTTP
+//! 404, awsQuery code `NoSuchEntity`). A refused call leaves the held description exactly
+//! as it was.
+//!
+//! A description belongs to the account's own record of the role rather than to its
+//! permissions or its trust relationship, so a role a service links itself to is served
+//! here like any other; the protected-entity refusal guards the calls that change such a
+//! role's trust policy, its permissions or its existence, which have their own suites
+//! (`tests/all/role_trust_policy.rs`, `tests/all/role_deletion.rs`).
 //!
 //! No single recorded request is the specification, so every suite here is a TABLE whose
 //! rows differ along what the rule generalises over: the length of the description (zero
@@ -357,13 +362,12 @@ async fn updating_a_role_the_account_does_not_hold_is_not_found() {
     );
 }
 
-/// RULE: "service-linked roles are protected Amazon Web Services resources. Only the
-/// service that depends on the service-linked role can modify or delete the role on your
-/// behalf" — so a caller's update of such a role's description is refused with the
-/// modelled `UnmodifiableEntityException` (HTTP 400) and the role keeps the description
-/// the service's own role carries.
+/// RULE: a description is a setting of the account's own record of a role, not the
+/// permissions or trust relationship a service-linked role protects — so this update is
+/// served for such a role exactly as for any other, and a later `GetRole` reports the
+/// text it wrote.
 #[tokio::test]
-async fn updating_a_service_linked_roles_description_is_refused() {
+async fn updating_a_service_linked_roles_description_is_served() {
     let router = router();
 
     // Rows spanning the service the role is linked to.
@@ -384,27 +388,39 @@ async fn updating_a_service_linked_roles_description_is_refused() {
             "case {principal:?}: CreateServiceLinkedRole must succeed, got {status}: {created}"
         );
         let role_name = element(&created, "RoleName");
-        let held = read_back(&router, &role_name).await;
 
-        for (description_case, description) in descriptions().into_iter().take(3) {
+        for (description_case, description) in descriptions() {
             let case = format!("{principal} / {description_case}");
             let (status, body) = update(&router, &role_name, &description).await;
             assert_eq!(
-                status, 400,
-                "case {case:?}: expected 400 for a service-linked role, got {status}: {body}"
+                status, 200,
+                "case {case:?}: expected 200 for a service-linked role, got {status}: {body}"
             );
+            let answered = reported(&body);
             assert_eq!(
-                error_code(&body),
-                "UnmodifiableEntity",
-                "case {case:?}: expected the modelled awsQuery code, got {body}"
+                answered, description,
+                "case {case:?}: expected the response to report the new description, got \
+                 {answered:?}"
             );
             let read = read_back(&router, &role_name).await;
             assert_eq!(
-                read, held,
-                "case {case:?}: a refused update must leave the service's description alone, \
-                 got {read:?}"
+                read, description,
+                "case {case:?}: expected GetRole to read the new description back, got \
+                 {read:?}"
             );
         }
+
+        // The role is still the service's own: what makes it a service-linked role is
+        // its path, which this update does not touch.
+        let (status, body) = call(&router, "GetRole", &[("RoleName", &role_name)]).await;
+        assert_eq!(status, 200, "case {principal:?}: GetRole failed: {body}");
+        let path = element(&body, "Path");
+        assert_eq!(
+            path,
+            format!("/aws-service-role/{principal}/"),
+            "case {principal:?}: expected the service-linked path to be untouched, got \
+             {path:?}"
+        );
     }
 }
 

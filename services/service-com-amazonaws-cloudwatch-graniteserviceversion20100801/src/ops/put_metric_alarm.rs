@@ -730,12 +730,12 @@ fn write_alarm(
     // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name
     // another kind of alarm already holds, exactly as the other alarm writers refuse one a
     // metric alarm holds. Without every half the store could hold two alarms under one name.
-    if let Some(kind) = store
+    if store
         .alarm_kind(&input.alarm_name)
-        .filter(|kind| *kind != crate::state::ALARM_TYPE_METRIC)
+        .is_some_and(|kind| kind != crate::state::ALARM_TYPE_METRIC)
     {
         return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-            "a {kind} named {} already exists in this Region",
+            "AlarmName [{}] is already used by another alarm of a different type",
             input.alarm_name
         )));
     }

@@ -295,7 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if member.status != crate::state::STATUS_AVAILABLE {
+        // A member in service can create a proposal; one that is still creating or is on
+        // its way out cannot. A configuration change under way (`UPDATING`) leaves the
+        // member participating in the network, so it is not a refusal.
+        if !crate::state::is_in_service(&member.status) {
             return Err(CreateProposalErrorModeled::ResourceNotReadyException(
                 ResourceNotReadyException {
                     message: Some(format!(

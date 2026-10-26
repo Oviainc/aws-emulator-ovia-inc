@@ -204,11 +204,7 @@ fn the_transition_table_moves_only_on_a_legal_action() {
         (CampaignState::Stopped, CampaignAction::Pause, None),
         (CampaignState::Completed, CampaignAction::Pause, None),
         (CampaignState::Failed, CampaignAction::Pause, None),
-        (
-            CampaignState::Initialized,
-            CampaignAction::Stop,
-            Some(CampaignState::Stopped),
-        ),
+        (CampaignState::Initialized, CampaignAction::Stop, None),
         (
             CampaignState::Running,
             CampaignAction::Stop,

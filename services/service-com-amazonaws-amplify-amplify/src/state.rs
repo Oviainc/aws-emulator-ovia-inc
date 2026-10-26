@@ -9,9 +9,10 @@
 //! `GetApp` after `CreateApp` return the created record field-for-field: a reader
 //! clones what the writer stored, so the two cannot drift.
 //!
-//! Branches, webhooks and domain associations live INSIDE their owning app, so
-//! `DeleteApp` removes them transitively and `ListBranches` / `ListWebhooks` /
-//! `ListDomainAssociations` can never reach another app's records. Jobs live INSIDE their owning branch for the same reason: `DeleteBranch`
+//! Branches, webhooks, domain associations and backend environments live INSIDE their
+//! owning app, so `DeleteApp` removes them transitively and `ListBranches` /
+//! `ListWebhooks` / `ListDomainAssociations` / `ListBackendEnvironments` can never
+//! reach another app's records. Jobs live INSIDE their owning branch for the same reason: `DeleteBranch`
 //! takes that branch's jobs with it, and `GetJob` can never reach a job of another
 //! branch. A deployment reserved on a branch and not started yet lives there too, so
 //! it shares its branch's lifetime and its `jobId` cannot collide with another
@@ -19,10 +20,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{App, Branch, DomainAssociation, Job, Step, Webhook};
+use crate::ops::types::{App, BackendEnvironment, Branch, DomainAssociation, Job, Step, Webhook};
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
-/// plus the branches, domain associations and webhooks created on it.
+/// plus the branches, domain associations, webhooks and backend environments created
+/// on it.
 ///
 /// The maps are `BTreeMap`s, not `HashMap`s, because the list operations are
 /// `@paginated` and a page boundary is only meaningful over a stable order: the
@@ -48,16 +50,26 @@ pub struct AmplifyApp {
     /// addressed afterwards by its own id alone (`GET /webhooks/{webhookId}`), which
     /// [`ComAmazonawsAmplifyAmplifyState::webhook`] resolves across the apps.
     pub webhooks: BTreeMap<String, Webhook>,
+    /// The backend environments of this app, keyed by `environmentName`.
+    ///
+    /// A backend environment is created under an app
+    /// (`POST /apps/{appId}/backendenvironments`) and addressed afterwards by that app
+    /// and its environment name
+    /// (`GET /apps/{appId}/backendenvironments/{environmentName}`), so it is held by
+    /// the app rather than in a store-wide map: the same environment name created on
+    /// two apps is two records, and neither app's reader can reach the other's.
+    pub backend_environments: BTreeMap<String, BackendEnvironment>,
 }
 
 impl AmplifyApp {
-    /// A newly created app with no branches and no webhooks.
+    /// A newly created app with no branches, webhooks, domains or backend environments.
     pub fn new(app: App) -> Self {
         Self {
             app,
             branches: BTreeMap::new(),
             domains: BTreeMap::new(),
             webhooks: BTreeMap::new(),
+            backend_environments: BTreeMap::new(),
         }
     }
 }
@@ -910,6 +922,10 @@ pub const WEBHOOK_ENTITY: &str = "Webhook";
 /// The entity name [`not_found_message`] and [`already_exists_message`] use for a
 /// domain association addressed by `domainName`.
 pub const DOMAIN_ENTITY: &str = "Domain";
+
+/// The entity name [`not_found_message`] and [`already_exists_message`] use for a
+/// backend environment addressed by `environmentName`.
+pub const BACKEND_ENVIRONMENT_ENTITY: &str = "Backend environment";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

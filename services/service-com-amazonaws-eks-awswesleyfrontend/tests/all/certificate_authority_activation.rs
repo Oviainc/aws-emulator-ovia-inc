@@ -49,7 +49,7 @@ use crate::wire::{call, emulator, emulator_with_engine, encode_label, error_code
 
 /// `ActivateCertificateAuthority`:
 /// `POST /clusters/{clusterName}/certificate-authorities/{certificateAuthorityId}/activate`.
-async fn activate_authority(
+pub(crate) async fn activate_authority(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,

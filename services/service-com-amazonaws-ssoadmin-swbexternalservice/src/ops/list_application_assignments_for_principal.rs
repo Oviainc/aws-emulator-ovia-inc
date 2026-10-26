@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationAssignmentsForPrincipal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationAssignmentsForPrincipal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the direct application assignments one principal holds under
+//! one instance in this service's state (`crate::state`), narrowed by the request's
+//! `ListApplicationAssignmentsFilter`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationAssignmentsForPrincipal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read, paged by `MaxResults` with a `NextToken` that resumes from the
+//! `ApplicationArn` the previous page ended on, and absent on the last page. Each listed
+//! assignment is projected from the stored `state::ApplicationAssignmentRecord` — the same
+//! row `CreateApplicationAssignment` wrote and `DescribeApplicationAssignment` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +178,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationAssignmentsForPrincipal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationAssignmentsForPrincipalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationAssignmentsForPrincipal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationAssignmentsForPrincipalErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // "Filters the output to include only assignments associated with the application
+        // that has the specified ARN": the filter NARROWS the enumeration to one
+        // application, and a filter the caller left out narrows nothing. A filter is
+        // required only of a member account calling against an organization instance; this
+        // emulator serves one account, which is the account that holds the instance, so
+        // every request here is one of the cases the documentation calls filter-optional.
+        let application_filter = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.application_arn.as_deref());
+
+        // The cursor is scoped to THIS enumeration: the operation, the instance it walks,
+        // the principal whose assignments it reports and the filter that selected the rows.
+        let scope = crate::state::cursor_application_assignments_for_principal(
+            &input.instance_arn,
+            &input.principal_type,
+            &input.principal_id,
+            application_filter,
+        );
+        // A `NextToken` this service did not issue for THIS enumeration is a bad request,
+        // not an empty page: answering an empty page would silently end a caller's
+        // enumeration early.
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListApplicationAssignmentsForPrincipalErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        // The model's `ValidationExceptionReason` enum carries only KMS key
+                        // states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, ApplicationAssignmentForPrincipal)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes: an instance whose deletion
+            // instant has passed is gone, and the applications held inside it — with the
+            // assignments to them — with it. The account's ambient instance is enabled
+            // here too if nothing has decided the account's enablement yet, so this read
+            // resolves the instance every other read at this instant resolves.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // Assignments are enumerated UNDER an instance, so an `InstanceArn` this
+            // account holds no instance for is refused rather than answered with an empty
+            // page that would read as "this principal is assigned to no application".
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListApplicationAssignmentsForPrincipalErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::instance_not_found_message(
+                                &input.instance_arn,
+                            )),
+                            // The model's `ResourceNotFoundExceptionReason` enum carries
+                            // only KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A filter naming an application this instance holds none of resolves to no
+            // application at all, which is a missing resource rather than an empty page —
+            // the same answer every other read of an unknown `ApplicationArn` gives.
+            if let Some(application_arn) = application_filter {
+                if store
+                    .application(application_arn)
+                    .is_none_or(|record| record.instance_arn != input.instance_arn)
+                {
+                    return Err(
+                        ListApplicationAssignmentsForPrincipalErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(crate::state::application_not_found_message(
+                                    application_arn,
+                                )),
+                                reason: None,
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            // Exactly the stored rows whose principal is the one asked for, held under an
+            // application of the instance asked for, keyed and ordered by `ApplicationArn`
+            // — both the page order and the cursor order, and the one part of an
+            // assignment's identity tuple the request has not already fixed.
+            let mut rows: Vec<(String, ApplicationAssignmentForPrincipal)> = Vec::new();
+            for record in &store.application_assignments {
+                if record.principal_type != input.principal_type
+                    || record.principal_id != input.principal_id
+                {
+                    continue;
+                }
+                if application_filter.is_some_and(|arn| record.application_arn != arn) {
+                    continue;
+                }
+                if store
+                    .application(&record.application_arn)
+                    .is_none_or(|application| application.instance_arn != input.instance_arn)
+                {
+                    continue;
+                }
+                rows.push((
+                    record.application_arn.clone(),
+                    ApplicationAssignmentForPrincipal {
+                        application_arn: Some(record.application_arn.clone()),
+                        principal_type: Some(record.principal_type.clone()),
+                        principal_id: Some(record.principal_id.clone()),
+                    },
+                ));
+            }
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows
+        };
+
+        // `MaxResults` carries the model's own default (100) and range (1..100), already
+        // enforced before this handler runs; `page` clamps to the same ceiling.
+        let (application_assignments, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), Some(input.max_results));
+        Ok(ListApplicationAssignmentsForPrincipalOutput {
+            application_assignments: Some(application_assignments),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationSetTrackingOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationSetTrackingOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationSetTrackingOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates a custom open-and-click redirect domain with a configuration set
+//! that carries none, so the next `DescribeConfigurationSet` reports the domain
+//! this call stored and `UpdateConfigurationSetTrackingOptions` has an
+//! association to modify. The set must be one the account holds, the domain
+//! must be one Amazon SES would redirect through, and a set that already
+//! carries an association keeps it.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +110,19 @@ impl From<CreateConfigurationSetTrackingOptionsErrorModeled> for CreateConfigura
     }
 }
 
+/// Refuse the request as `InvalidTrackingOptions` (HTTP 400), the error a
+/// tracking-options write reports for a custom redirect domain Amazon SES would
+/// not redirect through — the same refusal, in the same wording, as
+/// `UpdateConfigurationSetTrackingOptions`.
+fn invalid_tracking_options(message: String) -> CreateConfigurationSetTrackingOptionsError {
+    CreateConfigurationSetTrackingOptionsErrorModeled::InvalidTrackingOptionsException(
+        InvalidTrackingOptionsException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `CreateConfigurationSetTrackingOptions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +159,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationSetTrackingOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationSetTrackingOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationSetTrackingOptions"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let name = input.configuration_set_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateConfigurationSetTrackingOptions",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The tracking options the request SUPPLIES are read first, through the
+        // one shared rule both tracking-options writers follow — see
+        // `update_configuration_set_tracking_options.rs` for why that order is
+        // the one the model admits.
+        let domain = state
+            .tracking_domain(input.tracking_options.custom_redirect_domain.as_deref())
+            .map_err(invalid_tracking_options)?;
+
+        let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                CreateConfigurationSetTrackingOptionsErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Indicates that the configuration set you specified already contains a
+        // TrackingOptions object": the existing association is kept, and
+        // `UpdateConfigurationSetTrackingOptions` is what replaces it.
+        if configuration_set.custom_redirect_domain.is_some() {
+            return Err(
+                CreateConfigurationSetTrackingOptionsErrorModeled::TrackingOptionsAlreadyExistsException(
+                    TrackingOptionsAlreadyExistsException {
+                        configuration_set_name: Some(name.clone()),
+                        // The sentence the model documents for this error, which
+                        // carries no value of its own; the set it is about is the
+                        // member above.
+                        message: Some(
+                            "The configuration set you specified already contains a \
+                             TrackingOptions object."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        configuration_set.custom_redirect_domain = Some(domain);
+        Ok(CreateConfigurationSetTrackingOptionsOutput {})
     }
 }

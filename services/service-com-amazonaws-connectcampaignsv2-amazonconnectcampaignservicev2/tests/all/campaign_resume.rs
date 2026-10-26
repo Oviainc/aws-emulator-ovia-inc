@@ -14,97 +14,21 @@
 //! * resume/pause cycles are not limited in number: each cycle moves the stored
 //!   state and nothing accumulates.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    CampaignAction, CampaignState, ONBOARDING_JOB_DURATION,
+    CampaignAction, CampaignState,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+// The campaign fixture (onboard, create, read the state, drive the lifecycle) is the
+// shared one every lifecycle suite in this crate sets its cases up with.
+use super::common::{
+    call, campaign_state as state, create_campaign, drive_lifecycle as drive, error_code, router,
+};
 
-/// Onboard the Connect instance a campaign belongs to: `CreateCampaign` mints a
-/// campaign only for an instance whose onboarding job has SUCCEEDED, which it does
-/// one [`ONBOARDING_JOB_DURATION`] after `StartInstanceOnboardingJob`.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
-    let (status, started) = call(
-        router,
-        region,
-        "PUT",
-        &format!("/v2/connect-instance/{instance}/onboarding"),
-        &json!({"encryptionConfig": {"enabled": false}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "StartInstanceOnboardingJob {instance}: expected 200, got {status} {started}"
-    );
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + std::time::Duration::from_millis(100)).await;
-}
-
-/// A campaign on a freshly onboarded instance, returning its minted id.
+/// A campaign on an onboarded instance, returning its minted id.
 async fn campaign(router: &MultiServiceRouter, region: &str, instance: &str) -> String {
-    onboard(router, region, instance).await;
-    let (status, created) = call(
-        router,
-        region,
-        "PUT",
-        "/v2/campaigns",
-        &json!({
-            "name": format!("resume-{instance}"),
-            "connectInstanceId": instance,
-            "channelSubtypeConfig": {
-                "telephony": {
-                    "outboundMode": {"agentless": {}},
-                    "defaultOutboundConfig": {"connectContactFlowId": "flow-0001"}
-                }
-            },
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateCampaign on {instance}: expected 200, got {status} {created}"
-    );
-    created["id"]
-        .as_str()
-        .expect("a minted campaign id")
-        .to_string()
-}
-
-/// `GetCampaignState` for `id`.
-async fn state(router: &MultiServiceRouter, region: &str, id: &str, case: &str) -> String {
-    let (status, body) = call(
-        router,
-        region,
-        "GET",
-        &format!("/v2/campaigns/{id}/state"),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: GetCampaignState expected 200, got {status} {body}"
-    );
-    body["state"].as_str().unwrap_or("<no state>").to_string()
-}
-
-/// Drive the lifecycle actions in `path` (each asserted to succeed), leaving the
-/// campaign in whatever state they wrote.
-async fn drive(router: &MultiServiceRouter, region: &str, id: &str, path: &[&str], case: &str) {
-    for action in path {
-        let (status, body) = call(
-            router,
-            region,
-            "POST",
-            &format!("/v2/campaigns/{id}/{action}"),
-            &Value::Null,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: setup {action} expected 200, got {status} {body}"
-        );
-    }
+    create_campaign(router, region, instance, &format!("resume-{instance}"), None).await
 }
 
 /// The transition table for `Resume`, over EVERY modelled state: only `Paused`
@@ -171,8 +95,8 @@ async fn resume_succeeds_only_from_paused_over_every_reachable_state() {
             "Stopped",
         ),
         (
-            "resume a campaign stopped straight from Initialized",
-            &["stop"],
+            "resume a campaign stopped after a pause",
+            &["start", "pause", "stop"],
             "Stopped",
             409,
             "Stopped",

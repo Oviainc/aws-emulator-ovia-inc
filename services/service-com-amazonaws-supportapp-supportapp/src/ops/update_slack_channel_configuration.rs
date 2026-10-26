@@ -6,6 +6,13 @@
 //! — the ones it omits keep their persisted values — and answers with the
 //! post-update record read back out of the store, not with an echo of the request.
 //!
+//! The documented `notifyOnCaseSeverity` consistency rule is enforced here with each
+//! of its clauses over the scope THIS request's wording gives it: the `all`/`high`
+//! clause over the configuration the update would leave behind, and the `none` clause
+//! over only the notification flags the request itself specifies — a flag the request
+//! omits keeps its current value and is not something the request says, so it is not
+//! constrained. See `crate::state::notification_rule_violation`.
+//!
 //! The configuration lives inside a Slack workspace registered to the account, so an
 //! update whose `teamId` is not in the registry
 //! (`state::slack_workspace_configurations`, written by
@@ -263,6 +270,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The flags this request CARRIES, before the merge below consumes them: the
+        // scope the update's own `none` clause is worded over.
+        let requested_flags = crate::state::NotificationFlags::new(
+            input.notify_on_create_or_reopen_case,
+            input.notify_on_add_correspondence_to_case,
+            input.notify_on_resolve_case,
+        );
+
         // "If you don't specify these parameters in your request, the Amazon Web
         // Services Support App uses the current values by default"
         // (`notifyOnCaseSeverity`): an omitted member keeps what is stored, so the
@@ -288,13 +303,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The severity/flag combination rule documented on `notifyOnCaseSeverity`,
-        // evaluated over the configuration the update would leave behind.
+        // each clause over the scope the UPDATE request words it with: the `all`/`high`
+        // clause over the configuration this update would leave behind, and the `none`
+        // clause over the flags the request itself specifies — a flag the request does
+        // not carry keeps its current value and is not something this request says, so
+        // it is not constrained.
         if let Some(message) = crate::state::notification_rule_violation(
             Self::NAME,
             &merged.notify_on_case_severity,
-            merged.notify_on_create_or_reopen_case.unwrap_or(false),
-            merged.notify_on_add_correspondence_to_case.unwrap_or(false),
-            merged.notify_on_resolve_case.unwrap_or(false),
+            crate::state::NotificationFlags::new(
+                merged.notify_on_create_or_reopen_case,
+                merged.notify_on_add_correspondence_to_case,
+                merged.notify_on_resolve_case,
+            ),
+            requested_flags,
         ) {
             return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
                 ValidationException {

@@ -169,7 +169,7 @@ async fn a_created_dashboard_reports_the_configuration_it_was_given() {
         let expected_protection = request
             .get("TerminationProtectionEnabled")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(state::DASHBOARD_TERMINATION_PROTECTION_DEFAULT);
 
         assert_eq!(
             created["DashboardArn"],
@@ -518,7 +518,10 @@ async fn a_name_already_taken_is_a_conflict_not_an_overwrite() {
     let emulator = Emulator::new();
     let name = "contested-dashboard";
     emulator
-        .create(name, json!({"Widgets": [widget(0)]}))
+        .create(
+            name,
+            json!({"Widgets": [widget(0)], "TerminationProtectionEnabled": false}),
+        )
         .await
         .expect_ok("the first create");
 

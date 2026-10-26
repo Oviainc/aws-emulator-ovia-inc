@@ -534,13 +534,17 @@ pub fn is_private_target_address(address: IpAddr) -> bool {
 ///   first, because whether the address is one an `ip` target may carry at all does not
 ///   depend on the zone — and then needs the zone that is to serve it.
 ///
+/// So WHICH refusal a registration earns is decided by where the address falls, never by
+/// whether the request named a zone, and each refusal states that class's own constraint
+/// against the address the request carried ([`address_not_allowed_message`],
+/// [`address_in_no_subnet_message`], [`availability_zone_required_message`]).
+///
 /// `vpc_cidrs` and `subnets` are what EC2 answered for the group's VPC; a caller that
 /// could not ask EC2 does not call this at all, because a refusal has to be grounded in
 /// what EC2 reported.
 pub fn resolve_ip_target(
     address: IpAddr,
     availability_zone: Option<&str>,
-    vpc_id: &str,
     vpc_cidrs: &[IpNet],
     subnets: &[SubnetFacts],
 ) -> Result<Option<String>, String> {
@@ -551,20 +555,14 @@ pub fn resolve_ip_target(
             .or_else(|| availability_zone.map(str::to_string)));
     }
     if inside_any(vpc_cidrs, address) {
-        return Err(format!(
-            "The IP address '{address}' is in the CIDR of VPC {vpc_id} but is not in any \
-             of its subnets"
-        ));
+        return Err(address_in_no_subnet_message(address));
     }
     // Outside the VPC. Whether the address is one an `ip` target may carry AT ALL does not
-    // depend on the zone, so it is answered first: a publicly routable address is refused
-    // on its own terms ("you can't specify publicly routable IP addresses"), whether or
-    // not the request named a zone, and naming one would not make it registrable.
+    // depend on the zone, so it is answered first: the ranges such a target comes from are
+    // what the address is judged against (`TargetType`), whether or not the request named a
+    // zone, and naming one would not make an address outside them registrable.
     if !is_private_target_address(address) {
-        return Err(format!(
-            "The IP address '{address}' is not valid: you can't specify publicly routable \
-             IP addresses"
-        ));
+        return Err(address_not_allowed_message(address));
     }
     // The address is one the group may carry, so what is left is which zone serves it:
     // "an Availability Zone or `all`. This determines whether the target receives traffic
@@ -572,7 +570,7 @@ pub fn resolve_ip_target(
     // Availability Zones for the load balancer" — and nothing else can be inferred, since
     // no subnet of the group's VPC holds it.
     let Some(zone) = availability_zone else {
-        return Err(AVAILABILITY_ZONE_REQUIRED.to_string());
+        return Err(availability_zone_required_message(address));
     };
     Ok(Some(zone.to_string()))
 }
@@ -595,11 +593,35 @@ pub fn parse_ip_target(id: &str, ip_address_type: Option<&str>) -> Result<IpAddr
     }
 }
 
+/// The refusal an address no `ip` target may carry earns: it is of none of the ranges
+/// such a target comes from, so no zone and no VPC makes it registrable. Names the
+/// address the request carried and the ranges one must come from.
+pub fn address_not_allowed_message(address: IpAddr) -> String {
+    format!(
+        "The IP address '{address}' is not allowed, as it must be an address from a VPC \
+         subnet, RFC1918, or RFC6598"
+    )
+}
+
+/// The refusal an address inside the target group's VPC but in none of its subnets earns:
+/// the load balancer reaches a target through a subnet of that VPC, so there is nothing to
+/// supply for an address the VPC holds outside every one of them. Names the address and
+/// that constraint — and no VPC id, which the request never named.
+pub fn address_in_no_subnet_message(address: IpAddr) -> String {
+    format!(
+        "The IP address '{address}' is within the VPC, but is not within a VPC subnet so \
+         it can't be registered"
+    )
+}
+
 /// The refusal an `ip` target outside the target group's VPC earns when the request names
-/// no Availability Zone for it: a fixed sentence, because what the caller has to supply is
-/// the member rather than anything about the value — the zone that is to serve the
-/// address, or `all` for "all enabled Availability Zones for the load balancer"
-/// (`TargetDescription$AvailabilityZone`).
-pub const AVAILABILITY_ZONE_REQUIRED: &str =
-    "You must specify a valid Availability Zone or select 'all' for all enabled \
-     Availability Zones for the load balancer";
+/// no Availability Zone for it: the address itself is one the group may carry, so what is
+/// missing is the member — the zone that is to serve the address, or `all` for all enabled
+/// Availability Zones (`TargetDescription$AvailabilityZone`) — and the sentence names the
+/// address so the caller knows which target it has to supply it for.
+pub fn availability_zone_required_message(address: IpAddr) -> String {
+    format!(
+        "You must specify a valid Availability Zone or select 'all' for all enabled \
+         Availability zones, since the IP address '{address}' is outside the VPC"
+    )
+}

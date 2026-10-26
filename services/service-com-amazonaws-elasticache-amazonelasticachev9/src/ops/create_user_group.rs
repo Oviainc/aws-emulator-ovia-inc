@@ -293,14 +293,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             members.push(user.user_id.clone());
         }
         // "A user group must contain the default user": the user every account
-        // starts with, see `crate::state::DEFAULT_USER_ID`.
+        // starts with, see `crate::state::DEFAULT_USER_ID`. The refusal reads as
+        // the service words this error class — the same one sentence
+        // `ModifyUserGroup` answers with
+        // (`crate::state::DEFAULT_USER_REQUIRED_MESSAGE`).
         if !members.iter().any(|id| id == crate::state::DEFAULT_USER_ID) {
             return Err(CreateUserGroupErrorModeled::DefaultUserRequired(
                 DefaultUserRequired {
-                    message: Some(format!(
-                        "A user group must contain the {} user.",
-                        crate::state::DEFAULT_USER_ID
-                    )),
+                    message: Some(crate::state::DEFAULT_USER_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
