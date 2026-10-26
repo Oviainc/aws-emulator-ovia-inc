@@ -79,6 +79,8 @@ mod list_generated_templates;
 mod list_stack_instances;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
+#[path = "all/list_stack_set_operations.rs"]
+mod list_stack_set_operations;
 #[path = "all/list_types.rs"]
 mod list_types;
 #[path = "all/nested_resource_outputs.rs"]

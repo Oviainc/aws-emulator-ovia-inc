@@ -66,7 +66,9 @@
 //! oldest-first),
 //! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set,
 //! [`stack_sets::MAX_STACK_SETS`] stack sets with
-//! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first),
+//! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances and
+//! [`stack_sets::MAX_OPERATIONS_PER_STACK_SET`] recorded operations each (all
+//! oldest-first),
 //! [`handler_progress::MAX_HANDLER_INVOCATIONS`] resource-handler invocations with a
 //! progress record (oldest-first),
 //! and [`resource_scans::MAX_RESOURCE_SCANS`] recorded resource scans (oldest-first), each
@@ -279,7 +281,8 @@ pub mod generated_template;
 pub mod wait_conditions;
 
 /// The stack sets this account and Region holds, and the stack instances each one carries,
-/// which `ListStackInstances` reports summaries of.
+/// which `ListStackInstances` reports summaries of, plus the operations performed on each,
+/// which `ListStackSetOperations` reports summaries of.
 pub mod stack_sets;
 
 /// The TIMELINE of one stack operation's walk over a stack's resources: when each resource
@@ -3108,6 +3111,9 @@ impl ComAmazonawsCloudformationCloudformationState {
         for scan in &mut self.resource_scans {
             scan.settle(now);
         }
+        for stack_set in &mut self.stack_sets {
+            stack_set.settle(now);
+        }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
     }
@@ -4334,6 +4340,8 @@ pub enum PageOf {
     TypeSummaries,
     /// `ListStackInstances`'s `Summaries`.
     StackInstanceSummaries,
+    /// `ListStackSetOperations`'s `Summaries`.
+    StackSetOperationSummaries,
     /// `ListGeneratedTemplates`'s `Summaries`.
     TemplateSummaries,
 }
@@ -4356,6 +4364,7 @@ impl PageOf {
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
             Self::StackInstanceSummaries => "stack-instance-summaries",
+            Self::StackSetOperationSummaries => "stack-set-operation-summaries",
             Self::TemplateSummaries => "template-summaries",
         }
     }

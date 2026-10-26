@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackSetOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackSetOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackSetOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the operations the named StackSet has had performed on it: one
+//! `StackSetOperationSummary` per recorded operation, every member read off the stored
+//! operation record, most recently initiated first and one bounded page at a time. A
+//! `StackSetName` that resolves to no StackSet of this administrator account and Region is
+//! refused with the modelled `StackSetNotFoundException` rather than answered with an empty
+//! list.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +84,45 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{StoredOperationPreferences, StoredStackSetOperation};
+
+/// One stored operation as the modelled `StackSetOperationSummary`.
+///
+/// Every member is read off the operation record, so this read cannot disagree with the
+/// record about an operation's id, action, status, instants or preferences. A member the
+/// record does not carry — the end instant of an operation that has not ended, a status with
+/// no reason, the details of one the service holds no counts for, the preferences of one
+/// whose request named none — is absent rather than reported empty.
+fn stack_set_operation_summary(stored: &StoredStackSetOperation) -> StackSetOperationSummary {
+    StackSetOperationSummary {
+        operation_id: Some(stored.operation_id.clone()),
+        action: Some(stored.action.clone()),
+        status: Some(stored.status.clone()),
+        creation_timestamp: Some(crate::state::timestamp(stored.creation)),
+        end_timestamp: stored.end.map(crate::state::timestamp),
+        status_reason: stored.status_reason.clone(),
+        status_details: stored.failed_stack_instances_count.map(|failed| {
+            StackSetOperationStatusDetails {
+                failed_stack_instances_count: Some(failed),
+            }
+        }),
+        operation_preferences: stored.preferences.as_ref().map(preferences_view),
+    }
+}
+
+/// The stored preferences as the modelled `StackSetOperationPreferences`: the members the
+/// request that started the operation named, and nothing else.
+fn preferences_view(stored: &StoredOperationPreferences) -> StackSetOperationPreferences {
+    StackSetOperationPreferences {
+        region_concurrency_type: stored.region_concurrency_type.clone(),
+        region_order: crate::state::non_empty(stored.region_order.clone()),
+        failure_tolerance_count: stored.failure_tolerance_count,
+        failure_tolerance_percentage: stored.failure_tolerance_percentage,
+        max_concurrent_count: stored.max_concurrent_count,
+        max_concurrent_percentage: stored.max_concurrent_percentage,
+        concurrency_mode: stored.concurrency_mode.clone(),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +192,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackSetOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackSetOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackSetOperations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackSetOperations",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value reads the
+        // same store, and the operation models no error to refuse one with.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the clock
+        // had already made due — the conclusion of an operation still in flight, which was
+        // owed at that instant whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // The operations are listed for ONE StackSet, named the way every read of a StackSet
+        // names it ("the name or unique ID of the StackSet"), and a `StackSetName` this
+        // administrator account and Region holds no StackSet for is the modelled
+        // `StackSetNotFoundException` ("The specified StackSet doesn't exist"), not an empty
+        // list.
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                ListStackSetOperationsErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // That StackSet's own operation history, most recently initiated first. A StackSet
+        // nothing has been performed on yet answers the EMPTY list, which is a different
+        // answer from one that does not exist.
+        let summaries: Vec<StackSetOperationSummary> = stack_set
+            .operations_newest_first()
+            .map(stack_set_operation_summary)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries,
+        // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
+        // asks for, and the token resumes just past that page. The cursor counts into this
+        // StackSet's operations, as every paginated read of this service counts into the
+        // collection it answers.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackSetOperationSummaries,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackSetOperationsOutput {
+            // Always present, as an empty element for a StackSet nothing has been performed
+            // on: a client reading the list sees the same shape either way.
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }
