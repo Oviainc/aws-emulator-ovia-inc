@@ -39,7 +39,11 @@ pub struct AccessPointRecord {
     /// VPC-restricted, otherwise `Internet`.
     pub network_origin: String,
     pub vpc_configuration: Option<VpcConfiguration>,
-    pub public_access_block_configuration: Option<PublicAccessBlockConfiguration>,
+    /// The access point's EFFECTIVE public-access block settings — the
+    /// configuration the create request supplied, or
+    /// [`default_public_access_block`] when it supplied none. Not an `Option`:
+    /// an access point always has these settings, so every read reports them.
+    pub public_access_block_configuration: PublicAccessBlockConfiguration,
     pub creation_date: ::aws_smithy_types::DateTime,
     /// The tags `CreateAccessPoint` was given. Recorded here because they are
     /// part of the resource; the operations that report them
@@ -69,6 +73,129 @@ impl AccessPointRecord {
             data_source_id: None,
             data_source_type: None,
         }
+    }
+}
+
+/// The public-access block settings an access point resource carries when the
+/// request that created it supplied none: all four blocked.
+///
+/// Amazon S3 blocks public access to a newly created access point by default —
+/// every one of the four settings of `PublicAccessBlockConfiguration` is
+/// enabled unless the create request asks otherwise — so the settings are part
+/// of the resource from the moment it exists and a read never reports it
+/// without them.
+pub fn default_public_access_block() -> PublicAccessBlockConfiguration {
+    PublicAccessBlockConfiguration {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: true,
+        restrict_public_buckets: true,
+    }
+}
+
+/// The public-access block settings a create request leaves on the resource it
+/// creates: exactly the configuration it supplied, or
+/// [`default_public_access_block`] when it supplied none.
+pub fn effective_public_access_block(
+    requested: Option<&PublicAccessBlockConfiguration>,
+) -> PublicAccessBlockConfiguration {
+    requested
+        .cloned()
+        .unwrap_or_else(default_public_access_block)
+}
+
+/// The condition keys that, named in a statement's `Condition`, fix WHO the
+/// statement lets in and so keep a wildcard principal from being public.
+///
+/// Amazon S3 reads a resource policy as public when it grants access to a
+/// wildcard principal, except where the statement's condition pins the
+/// requester — its identity, its account, its organization, or the source the
+/// call comes through. Compared case-insensitively, as IAM compares condition
+/// keys.
+const REQUESTER_NARROWING_CONDITION_KEYS: [&str; 10] = [
+    "aws:principalarn",
+    "aws:principalaccount",
+    "aws:principalorgid",
+    "aws:principalorgpaths",
+    "aws:sourcearn",
+    "aws:sourceaccount",
+    "aws:sourceowner",
+    "aws:sourcevpc",
+    "aws:sourcevpce",
+    "s3:dataaccesspointarn",
+];
+
+/// Whether a statement's `Principal` (or `NotPrincipal`) lets ANY principal in:
+/// the `"*"` wildcard, bare or under the `AWS` key, alone or among named
+/// principals.
+fn principal_is_wildcard(principal: &::serde_json::Value) -> bool {
+    match principal {
+        ::serde_json::Value::String(named) => named == "*",
+        ::serde_json::Value::Array(named) => named.iter().any(principal_is_wildcard),
+        ::serde_json::Value::Object(by_kind) => by_kind.values().any(principal_is_wildcard),
+        _ => false,
+    }
+}
+
+/// Whether a statement's `Condition` pins the requester, which is what keeps a
+/// wildcard principal from granting public access.
+fn condition_narrows_requester(condition: &::serde_json::Value) -> bool {
+    let Some(operators) = condition.as_object() else {
+        return false;
+    };
+    operators.values().any(|keys| {
+        keys.as_object().is_some_and(|keys| {
+            keys.keys().any(|key| {
+                REQUESTER_NARROWING_CONDITION_KEYS.contains(&key.to_lowercase().as_str())
+            })
+        })
+    })
+}
+
+/// Whether one statement of a resource policy grants public access.
+fn statement_grants_public_access(statement: &::serde_json::Value) -> bool {
+    let Some(statement) = statement.as_object() else {
+        return false;
+    };
+    // Only an `Allow` grants anything; a `Deny` never makes a policy public.
+    if statement.get("Effect").and_then(|effect| effect.as_str()) != Some("Allow") {
+        return false;
+    }
+    // `NotPrincipal` on an `Allow` grants everyone it does not name, so it is
+    // as public as a wildcard `Principal`.
+    let open_to_anyone = statement
+        .get("Principal")
+        .is_some_and(principal_is_wildcard)
+        || statement.contains_key("NotPrincipal");
+    if !open_to_anyone {
+        return false;
+    }
+    !statement
+        .get("Condition")
+        .is_some_and(condition_narrows_requester)
+}
+
+/// Whether a resource policy document grants public access — the derivation
+/// `PolicyStatus$IsPublic` reports, and the one a `BlockPublicPolicy` setting
+/// refuses a put of.
+///
+/// A document that is not a policy object, or whose statements grant nothing to
+/// anyone, is not public; a document that is not JSON at all grants nothing
+/// either (`PutAccessPointPolicy` refuses it as malformed before it is ever
+/// stored).
+pub fn policy_grants_public_access(document: &str) -> bool {
+    let Ok(policy) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
+    };
+    let Some(statements) = policy.get("Statement") else {
+        return false;
+    };
+    match statements {
+        ::serde_json::Value::Array(statements) => {
+            statements.iter().any(statement_grants_public_access)
+        }
+        // A single statement may be written as the object itself.
+        one => statement_grants_public_access(one),
     }
 }
 
@@ -581,7 +708,10 @@ pub struct MultiRegionAccessPointRecord {
     pub account_id: String,
     pub alias: String,
     pub created_at: ::aws_smithy_types::DateTime,
-    pub public_access_block: Option<PublicAccessBlockConfiguration>,
+    /// The access point's EFFECTIVE public-access block settings, defaulted by
+    /// [`effective_public_access_block`] when the create request supplied none;
+    /// reported on every read of the record.
+    pub public_access_block: PublicAccessBlockConfiguration,
     /// The Regions and buckets the create request associated, in the order it
     /// listed them.
     pub regions: Vec<RegionReport>,
@@ -601,7 +731,7 @@ impl MultiRegionAccessPointRecord {
             name: Some(self.name.clone()),
             alias: Some(self.alias.clone()),
             created_at: Some(self.created_at),
-            public_access_block: self.public_access_block.clone(),
+            public_access_block: Some(self.public_access_block.clone()),
             status: Some(self.status.clone()),
             regions: Some(self.regions.clone()),
         }
@@ -1146,6 +1276,23 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
 }
 
 impl ComAmazonawsS3controlAwss3controlservicev20180820State {
+    /// Whether `BlockPublicPolicy` is in force for the access point `key` names:
+    /// the access point's OWN setting or the owning account's `PublicAccessBlock`
+    /// configuration, either of which blocks on its own — the most restrictive of
+    /// the settings that apply is the one in force. False when the store holds no
+    /// such access point.
+    pub fn block_public_policy_in_force(&self, key: &AccessPointKey) -> bool {
+        let own = self
+            .access_points
+            .get(key)
+            .is_some_and(|record| record.public_access_block_configuration.block_public_policy);
+        let account = self
+            .public_access_blocks
+            .get(&key.0)
+            .is_some_and(|configuration| configuration.block_public_policy);
+        own || account
+    }
+
     /// A fresh service-assigned id for a resource this store is about to hold,
     /// over this store's own counter (see [`new_resource_uuid`]) — the one place
     /// the counter is bumped, so two ids are distinct whatever kind of resource
@@ -1692,12 +1839,22 @@ pub fn no_such_access_point<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
 
 /// `NoSuchAccessPointPolicy` (HTTP 404): the access point exists but carries no
 /// policy, because none was ever put on it (or it was deleted).
-pub fn no_such_access_point_policy<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+///
+/// The message is fixed text, naming no access point: it is what the service
+/// answers for every access point that carries no policy.
+pub fn no_such_access_point_policy<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
         "NoSuchAccessPointPolicy",
         404,
-        format!("The specified access point does not have a policy: {name}"),
+        "The specified accesspoint policy does not exist".to_string(),
     )
+}
+
+/// `AccessDenied` (HTTP 403): a `BlockPublicPolicy` setting in force for the
+/// access point refuses a policy document that grants public access, so the
+/// document is not stored.
+pub fn public_policy_access_denied<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure("AccessDenied", 403, "Access Denied".to_string())
 }
 
 /// `AccessPointAlreadyOwnedByYou` (HTTP 409): the account already owns an access

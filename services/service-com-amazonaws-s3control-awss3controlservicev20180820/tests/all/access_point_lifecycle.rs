@@ -494,28 +494,20 @@ async fn create_then_get_reports_the_stored_access_point_for_every_shape_of_crea
         );
 
         let flags = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"];
-        match case.public_access_block {
-            None => {
-                for flag in flags {
-                    assert!(
-                        read.text(flag).is_none(),
-                        "case {:?}: expected no PublicAccessBlockConfiguration, got {flag} in body {}",
-                        case.case,
-                        read.body
-                    );
-                }
-            }
-            Some(expected) => {
-                for (flag, expected) in flags.iter().zip(expected) {
-                    assert_eq!(
-                        read.text(flag).as_deref(),
-                        Some(if expected { "true" } else { "false" }),
-                        "case {:?}: expected the stored {flag}, got body {}",
-                        case.case,
-                        read.body
-                    );
-                }
-            }
+        // Public access is blocked by default, so a create that supplied no
+        // configuration leaves all four settings on; one that supplied a
+        // configuration leaves exactly it.
+        let expected_block = case
+            .public_access_block
+            .unwrap_or([true, true, true, true]);
+        for (flag, expected) in flags.iter().zip(expected_block) {
+            assert_eq!(
+                read.text(flag).as_deref(),
+                Some(if expected { "true" } else { "false" }),
+                "case {:?}: expected the effective {flag}, got body {}",
+                case.case,
+                read.body
+            );
         }
 
         let creation_date = read.text("CreationDate").unwrap_or_default();
@@ -592,7 +584,14 @@ async fn a_repeat_create_is_a_conflict_and_leaves_the_stored_access_point_alone(
 #[tokio::test]
 async fn a_policy_round_trips_byte_for_byte_and_the_last_put_wins() {
     let emulator = Emulator::start();
-    let case = CreateCase::new("policy round trip", "policy-ap", "reports");
+    // Created with every public-access setting spelled OFF, so this suite stays
+    // about the bytes of the document: a public document put on an access point
+    // whose `BlockPublicPolicy` is on is refused rather than stored, which the
+    // sibling suite pins.
+    let case = CreateCase {
+        public_access_block: Some([false, false, false, false]),
+        ..CreateCase::new("policy round trip", "policy-ap", "reports")
+    };
     assert_eq!(emulator.create(ACCOUNT, &case).await.status, 200);
 
     // Documents differing in whitespace, escaping, nesting and alphabet: every

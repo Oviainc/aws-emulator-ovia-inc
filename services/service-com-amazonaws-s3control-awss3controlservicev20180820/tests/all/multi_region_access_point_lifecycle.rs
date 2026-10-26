@@ -401,14 +401,13 @@ async fn create_then_get_reports_the_stored_access_point_for_every_shape_of_crea
             case.case,
             read.body
         );
-        let block = case.public_access_block.map(|[acls, ignore, policy, restrict]| {
-            vec![
-                acls.to_string(),
-                ignore.to_string(),
-                policy.to_string(),
-                restrict.to_string(),
-            ]
-        });
+        // Public access is blocked by default, so a create that supplied no
+        // configuration leaves all four settings on.
+        let block = case
+            .public_access_block
+            .unwrap_or([true, true, true, true])
+            .map(|setting| setting.to_string())
+            .to_vec();
         let reported_block = [
             "BlockPublicAcls",
             "IgnorePublicAcls",
@@ -419,8 +418,9 @@ async fn create_then_get_reports_the_stored_access_point_for_every_shape_of_crea
         .map(|member| leaf(&leaves, &format!("AccessPoint/PublicAccessBlock/{member}")))
         .collect::<Option<Vec<String>>>();
         assert_eq!(
-            reported_block, block,
-            "case {:?}: expected the public-access block the create submitted, got body {}",
+            reported_block,
+            Some(block),
+            "case {:?}: expected the effective public-access block, got body {}",
             case.case, read.body
         );
         assert!(

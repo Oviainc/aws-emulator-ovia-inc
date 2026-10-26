@@ -3,7 +3,9 @@
 //! @op PutAccessPointPolicy
 //!
 //! Stores a policy document on the named access point, byte for byte, replacing
-//! any policy already on it.
+//! any policy already on it — unless a `BlockPublicPolicy` setting in force for
+//! the access point refuses a document that grants public access, which is
+//! answered `AccessDenied` with nothing stored.
 //!
 //! ## Shape of an operation
 //!
@@ -191,9 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (input.account_id.clone(), input.name.clone());
         let mut store = state.lock();
+        // Read before the record is borrowed mutably: the setting in force is
+        // the access point's own together with its account's configuration.
+        let public_policies_blocked = store.block_public_policy_in_force(&key);
         let Some(record) = store.access_points.get_mut(&key) else {
             return Err(crate::state::no_such_access_point(&input.name));
         };
+        // A `BlockPublicPolicy` setting in force for this access point refuses a
+        // document that grants public access, and nothing is stored: the
+        // caller's next read finds the access point's policy exactly as it was.
+        if public_policies_blocked && crate::state::policy_grants_public_access(&input.policy) {
+            return Err(crate::state::public_policy_access_denied());
+        }
 
         // Stored verbatim: `GetAccessPointPolicy` answers the document the
         // caller sent, not a re-serialized form of it.

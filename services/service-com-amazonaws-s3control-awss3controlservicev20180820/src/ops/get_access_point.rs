@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             bucket: Some(record.bucket.clone()),
             network_origin: Some(record.network_origin.clone()),
             vpc_configuration: record.vpc_configuration.clone(),
-            public_access_block_configuration: record.public_access_block_configuration.clone(),
+            public_access_block_configuration: Some(
+                record.public_access_block_configuration.clone(),
+            ),
             creation_date: Some(record.creation_date),
             alias: Some(record.alias.clone()),
             access_point_arn: Some(record.arn.clone()),

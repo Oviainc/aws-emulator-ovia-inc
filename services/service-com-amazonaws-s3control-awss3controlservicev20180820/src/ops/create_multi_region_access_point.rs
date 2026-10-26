@@ -234,7 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.details.name,
             ),
             created_at,
-            public_access_block: input.details.public_access_block.clone(),
+            // A Multi-Region Access Point is blocked from public access by
+            // default, like the single-Region access points of this service:
+            // the settings the request supplied, or all four blocked when it
+            // supplied none.
+            public_access_block: crate::state::effective_public_access_block(
+                input.details.public_access_block.as_ref(),
+            ),
             regions: regions.clone(),
             // The create is asynchronous, so the access point is reported as
             // `CREATING` until the clock owes it `READY`.

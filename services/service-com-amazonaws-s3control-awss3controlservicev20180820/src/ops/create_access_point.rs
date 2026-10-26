@@ -214,7 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             alias: crate::state::access_point_alias(&input.account_id, &input.name),
             network_origin: crate::state::network_origin(input.vpc_configuration.as_ref()),
             vpc_configuration: input.vpc_configuration.clone(),
-            public_access_block_configuration: input.public_access_block_configuration.clone(),
+            // An access point is blocked from public access by default: the
+            // settings the request supplied, or all four blocked when it
+            // supplied none.
+            public_access_block_configuration: crate::state::effective_public_access_block(
+                input.public_access_block_configuration.as_ref(),
+            ),
             creation_date: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
             tags: input.tags.clone().unwrap_or_default(),
             // An access point is created with no policy on it; one arrives only
