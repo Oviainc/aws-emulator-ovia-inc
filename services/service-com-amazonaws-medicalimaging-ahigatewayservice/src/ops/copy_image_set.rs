@@ -353,9 +353,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it stands when the copy is admitted, delivered when the copy completes.
         let copied_image_frames = source.image_frames.clone();
         // The DICOM attributes travel with it: a copy of an image set describes the same
-        // patient, study and series, so the destination is searchable by them once the
-        // copy has landed.
-        let copied_dicom_tags = source.dicom_tags.clone();
+        // patient, study and series — the attributes the model names and the attributes a
+        // metadata update wrote alike — so the destination is searchable by them, and
+        // reports them, once the copy has landed.
+        let copied_attributes = source.attributes();
         let held_image_sets = datastore.image_sets.len();
 
         // Every refusal the destination can raise, before anything is written.
@@ -444,7 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The destination describes the source's patient, study and series from the
             // same instant: the attributes a search filters on are delivered with the
             // content they describe.
-            delivered_dicom_tags: Some(copied_dicom_tags),
+            delivered_attributes: Some(copied_attributes),
             // A copy does not retire an image set: both the source and the destination
             // are still there once it has landed.
             retires_image_set: false,
@@ -522,7 +523,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // source's read-only lock delivers no pixel data.
             delivered_image_frames: None,
             // Nor any DICOM attributes: the source already holds its own.
-            delivered_dicom_tags: None,
+            delivered_attributes: None,
             ..copy_due
         });
 

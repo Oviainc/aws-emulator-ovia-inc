@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 delivered_image_frames: None,
                 // Nor any DICOM attributes: a delete takes content away rather than
                 // bringing any.
-                delivered_dicom_tags: None,
+                delivered_attributes: None,
                 retires_image_set: true,
             });
         }

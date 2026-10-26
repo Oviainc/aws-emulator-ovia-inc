@@ -9,6 +9,12 @@
 //! instance hierarchy DICOM gives them. An attribute nothing has stored is not in the
 //! document at all, so a caller can never read an attribute this emulator invented.
 //!
+//! The model names sixteen DICOM attributes and DICOM defines thousands, so an image set
+//! also holds the attributes written into it that the model does not name
+//! ([`crate::state::ImageSet::extra_attributes`]). Those are reported at the very path of
+//! this document they were written at, merged over the levels built above — an attribute
+//! is served from where it was stored, whether or not the model has a member for it.
+//!
 //! The document is JSON, written into the blob as it stands: `contentType` states the
 //! format a client reads it as ([`METADATA_CONTENT_TYPE`]), and `contentEncoding` — "the
 //! compression format in which image set metadata attributes are returned" — is absent,
@@ -19,7 +25,10 @@
 //! hold is absent (404) exactly as it is for `GetImageSet`. The DICOM attributes this
 //! service persists belong to the image SET rather than to one version of it — the
 //! model's own `DICOMTags` is per image set — so every version the image set holds
-//! aggregates the same content.
+//! aggregates the same content. What an EARLIER version held is kept for the one call that
+//! puts it back, a metadata update's revert
+//! ([`crate::state::ImageSet::attributes_of_version`]); once it has, those attributes are
+//! what the image set holds, and this document reports them.
 //!
 //! A DELETED image set holds no content: its pixel data went with the deletion
 //! ([`crate::state::ImageSet::advance_to`]), so there is no document to aggregate and
@@ -241,13 +250,36 @@ fn series(image_set: &ImageSet) -> Value {
     Value::Object(series)
 }
 
+/// Merge the attributes the model does not name into the document, each at the path it
+/// was written at.
+///
+/// A DEEP merge over objects: a stored object descends into the document level of the same
+/// name, and anything else is the attribute's own value and takes the place the document
+/// held for it. So a level the document already builds gains the attributes stored under
+/// it, and a level the document has no member for appears because something stored one.
+fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
+    let Some(level) = document.as_object_mut() else {
+        return;
+    };
+    for (name, value) in stored {
+        match (level.get_mut(name), value) {
+            (Some(held), Value::Object(nested)) if held.is_object() => {
+                merge_stored_attributes(held, nested);
+            }
+            _ => {
+                level.insert(name.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// The whole aggregated metadata document of `image_set`, as it stands in `datastore_id`.
 ///
 /// Every value in it is read from state: the two identifiers name the records the document
 /// was built from, and the attribute objects carry what has been stored for the image set
 /// and nothing besides.
 fn metadata_document(datastore_id: &str, image_set: &ImageSet) -> Value {
-    ::serde_json::json!({
+    let mut document = ::serde_json::json!({
         "SchemaVersion": METADATA_SCHEMA_VERSION,
         "DatastoreID": datastore_id,
         "ImageSetID": image_set.image_set_id,
@@ -256,7 +288,9 @@ fn metadata_document(datastore_id: &str, image_set: &ImageSet) -> Value {
             "DICOM": study_attributes(&image_set.dicom_tags),
             "Series": series(image_set),
         },
-    })
+    });
+    merge_stored_attributes(&mut document, &image_set.extra_attributes);
+    document
 }
 
 

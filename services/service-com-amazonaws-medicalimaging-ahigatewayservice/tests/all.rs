@@ -31,6 +31,8 @@ mod image_set_copy;
 mod image_set_deletion;
 #[path = "all/image_set_metadata.rs"]
 mod image_set_metadata;
+#[path = "all/image_set_metadata_updates.rs"]
+mod image_set_metadata_updates;
 #[path = "all/image_set_promotion.rs"]
 mod image_set_promotion;
 #[path = "all/image_set_properties.rs"]

@@ -106,6 +106,13 @@ pub const IMAGE_SET_COPY_DELAY: Duration = Duration::from_millis(400);
 /// after the call still observes the deletion in flight.
 pub const IMAGE_SET_DELETION_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after `UpdateImageSetMetadata` the update completes: the image set leaves
+/// the `LOCKED` / `UPDATING` pair the update put it in for `ACTIVE` / `UPDATED`. A
+/// chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`] — AWS publishes no
+/// duration for a metadata update, and a caller reading the image set straight after the
+/// call still observes the update in flight.
+pub const IMAGE_SET_UPDATE_DELAY: Duration = Duration::from_millis(400);
+
 /// The external version identifier an image set's FIRST version carries. AWS numbers
 /// image set versions from 1 (`ImageSetExternalVersionId` is `^\d+$`), and each later
 /// version is one past the one it supersedes.
@@ -167,6 +174,17 @@ pub const MAX_IMAGE_SETS_PER_DATASTORE: usize = 128;
 /// list without limit. Past the cap the call is refused with the operation's own
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_IMAGE_SET_VERSIONS: usize = 128;
+
+/// How many attributes OUTSIDE the ones the model names one image set will hold at once
+/// ([`ImageSetAttributes::extra_attributes`]).
+///
+/// A memory bound, not an AWS quota, and the companion of [`MAX_IMAGE_SET_VERSIONS`]: a
+/// metadata update persists the attributes it names, and every version the image set keeps
+/// holds a snapshot of them, so without a cap repeated updates could grow one image set
+/// without limit. Past the cap the update is refused with its own
+/// `ServiceQuotaExceededException` (HTTP 402). The modelled attributes need no such cap:
+/// there are sixteen of them, whatever is written.
+pub const MAX_IMAGE_SET_EXTRA_ATTRIBUTES: usize = 512;
 
 /// How many `@idempotencyToken` entries the ledger keeps.
 ///
@@ -257,6 +275,15 @@ pub const IMAGE_SET_NOT_ACTIVE_MESSAGE: &str =
 /// idempotent.
 pub const IMAGE_SET_NOT_DELETABLE_MESSAGE: &str =
     "The image set is locked by an action already in flight, so it cannot be deleted.";
+
+/// The text this service refuses a METADATA UPDATE of an image set that cannot take one
+/// with — one that is not `ACTIVE`, or one an action already in flight is holding. An
+/// update admitted there would leave that action and the update disagreeing about the
+/// image set, which is what `ConflictException` (HTTP 409) reports. Constant, and stated
+/// by rule rather than by which image set it was, like [`IMAGE_SET_NOT_ACTIVE_MESSAGE`]
+/// one operation across.
+pub const IMAGE_SET_NOT_UPDATABLE_MESSAGE: &str =
+    "The image set is not in the ACTIVE state, so its metadata cannot be updated.";
 
 /// The text this service answers a request naming an image frame an image set does not
 /// hold with — the resource KIND, by the same rule as [`IMAGE_SET_NOT_FOUND_MESSAGE`],
@@ -350,6 +377,10 @@ pub fn constraint_clause(violation: &Violation) -> String {
 ///   instances a copy takes, which the model marks `@sensitive`
 ///   (`smithy_query(query="shape",shape="MetadataCopies")`) — the model itself saying
 ///   the value must not be reproduced.
+/// * `updatableAttributes` and `removableAttributes` carry a caller-composed document of
+///   DICOM attributes, which the model marks `@sensitive` the same way
+///   (`smithy_query(query="shape",shape="DICOMUpdates")`): both target `DICOMAttribute`,
+///   so a document of patient detail is never reproduced in an error body.
 ///
 /// A member that names another AWS resource (`lambdaAuthorizerArn`, `dataAccessRoleArn`)
 /// is in neither class and keeps its echoed value — which is what the recorded corpus
@@ -360,6 +391,8 @@ const VALUE_WITHHOLDING_MEMBERS: &[&str] = &[
     "jobname",
     "kmskeyarn",
     "copiableattributes",
+    "updatableattributes",
+    "removableattributes",
 ];
 
 /// The DICOM attribute members, in the same lowercased spelling. The model marks every
@@ -941,6 +974,28 @@ pub struct ImageSetVersion {
     pub forced: bool,
     /// `message` — the error message an image set action failed with, absent otherwise.
     pub message: Option<String>,
+    /// The DICOM attributes this version held, recorded at the instant a LATER version
+    /// superseded it — what reverting the image set to this version puts back.
+    ///
+    /// `None` on the LATEST version, whose attributes are the ones the image set holds
+    /// now ([`ImageSet::dicom_tags`], [`ImageSet::extra_attributes`]), so a version and
+    /// the image set can never disagree about the content the image set is serving.
+    pub superseded_attributes: Option<ImageSetAttributes>,
+}
+
+/// The DICOM attributes one image set holds, in the two parts this service keeps them in.
+///
+/// The model NAMES sixteen of them (`DICOMTags`), which is what `SearchImageSets` filters
+/// on and reports; DICOM itself defines thousands, and a metadata update may write any of
+/// them. So an attribute the model does not name is persisted too — under the path of the
+/// aggregated metadata document it was written at — rather than accepted and dropped.
+#[derive(Debug, Clone, Default)]
+pub struct ImageSetAttributes {
+    pub dicom_tags: DICOMTags,
+    /// Every attribute the model does not name, nested exactly as the aggregated
+    /// metadata document nests it (`Patient` → `DICOM` → keyword, `Study` → `Series` →
+    /// series UID → …), so what is reported is what was written and nothing besides.
+    pub extra_attributes: ::serde_json::Map<String, ::serde_json::Value>,
 }
 
 impl ImageSetVersion {
@@ -968,7 +1023,7 @@ pub struct PendingImageSetTransition {
     /// source's DICOM content to its destination, so the destination answers a search
     /// over those attributes exactly when the copy that delivered them completed, and
     /// not before.
-    pub delivered_dicom_tags: Option<DICOMTags>,
+    pub delivered_attributes: Option<ImageSetAttributes>,
     /// Whether this transition RETIRES the image set — the landing of the delete a
     /// `DeleteImageSet` call started. The record stays readable afterwards, because
     /// `deletedAt` ("the timestamp when the image set properties were deleted") is a
@@ -1005,6 +1060,11 @@ pub struct ImageSet {
     /// zero) for an image set nothing has delivered DICOM content to yet, exactly as it
     /// holds no pixel data: an attribute is searchable only once something stored it.
     pub dicom_tags: DICOMTags,
+    /// The attributes of this image set the model does NOT name, which a metadata update
+    /// may write and `GetImageSetMetadata` reports from where they were written — the
+    /// other half of [`ImageSetAttributes`], held beside the modelled attributes rather
+    /// than inside them so every reader of `dicom_tags` keeps reading what it did.
+    pub extra_attributes: ::serde_json::Map<String, ::serde_json::Value>,
     pub created_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
     /// When the DICOM content this image set holds was last ACCESSED — what
@@ -1044,6 +1104,9 @@ impl ImageSet {
                 updated_at: now,
                 forced,
                 message: None,
+                // The latest version's attributes are the image set's own; a snapshot is
+                // recorded only when a later version supersedes this one.
+                superseded_attributes: None,
             },
             earlier_versions: Vec::new(),
             // A freshly minted image set holds no pixel data: a frame is readable only
@@ -1052,6 +1115,8 @@ impl ImageSet {
             is_primary,
             // No DICOM content either, for the same reason the frame map is empty.
             dicom_tags: DICOMTags::default(),
+            // Nor any attribute outside the modelled ones: nothing has written one.
+            extra_attributes: ::serde_json::Map::new(),
             created_at: now,
             deleted_at: None,
             // Nothing has accessed the content of an image set that has only just come
@@ -1117,6 +1182,11 @@ impl ImageSet {
     /// Supersede the latest version with a new one, numbered one past it, and answer
     /// the new version's identifier. The old latest becomes the newest earlier version,
     /// so a reader naming it still gets what it reported before.
+    ///
+    /// The superseded version keeps the DICOM attributes the image set holds AT THIS
+    /// INSTANT ([`ImageSetVersion::superseded_attributes`]): whatever content the new
+    /// version goes on to carry, the version it replaced still reports the content it
+    /// was serving, which is what a revert to that version restores.
     pub fn push_version(
         &mut self,
         image_set_state: ImageSetState,
@@ -1125,7 +1195,8 @@ impl ImageSet {
         now: SystemTime,
     ) -> u32 {
         let version_id = self.latest_version.version_id.saturating_add(1);
-        let superseded = ::std::mem::replace(
+        let superseded_attributes = self.attributes();
+        let mut superseded = ::std::mem::replace(
             &mut self.latest_version,
             ImageSetVersion {
                 version_id,
@@ -1134,10 +1205,41 @@ impl ImageSet {
                 updated_at: now,
                 forced,
                 message: None,
+                superseded_attributes: None,
             },
         );
+        superseded.superseded_attributes = Some(superseded_attributes);
         self.earlier_versions.push(superseded);
         version_id
+    }
+
+    /// The DICOM attributes this image set holds right now — the latest version's.
+    pub fn attributes(&self) -> ImageSetAttributes {
+        ImageSetAttributes {
+            dicom_tags: self.dicom_tags.clone(),
+            extra_attributes: self.extra_attributes.clone(),
+        }
+    }
+
+    /// Replace the DICOM attributes this image set holds, both halves together, so the
+    /// modelled attributes a search filters on and the attributes a metadata document
+    /// reports always describe the same content.
+    pub fn set_attributes(&mut self, attributes: ImageSetAttributes) {
+        self.dicom_tags = attributes.dicom_tags;
+        self.extra_attributes = attributes.extra_attributes;
+    }
+
+    /// The DICOM attributes the version `wire_version_id` (`^\d+$`) held, or `None` when
+    /// this image set holds no such version. The latest version's are the ones the image
+    /// set holds now; an earlier version's are the snapshot taken when it was superseded.
+    pub fn attributes_of_version(&self, wire_version_id: &str) -> Option<ImageSetAttributes> {
+        let version = self.version(wire_version_id)?;
+        Some(
+            version
+                .superseded_attributes
+                .clone()
+                .unwrap_or_else(|| self.attributes()),
+        )
     }
 
     /// Put EVERY version of this image set into `image_set_state`.
@@ -1168,7 +1270,7 @@ impl ImageSet {
         // the transition that delivers it fell DUE rather than at `now`, so what
         // `lastAccessedAt` reports does not move between reads.
         let delivers_content =
-            pending.delivered_image_frames.is_some() || pending.delivered_dicom_tags.is_some();
+            pending.delivered_image_frames.is_some() || pending.delivered_attributes.is_some();
         if delivers_content {
             self.record_access(pending.due_at);
         }
@@ -1182,8 +1284,8 @@ impl ImageSet {
         // The DICOM attributes the transition owed land with it too, so what
         // `SearchImageSets` filters on and reports for this image set only ever
         // describes content the image set already holds.
-        if let Some(delivered) = pending.delivered_dicom_tags {
-            self.dicom_tags = delivered;
+        if let Some(delivered) = pending.delivered_attributes {
+            self.set_attributes(delivered);
         }
         // A deletion the clock owed lands the same way, at the DUE instant rather than at
         // `now`, so `deletedAt` does not move between reads — and the pixel data this
