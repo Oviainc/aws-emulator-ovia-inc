@@ -78,7 +78,10 @@ pub(crate) async fn agreement_holding(
 }
 
 /// `UpdatePurchaseOrders` over `orders`.
-async fn update(router: &MultiServiceRouter, orders: Value) -> Answer {
+///
+/// `pub(crate)` because `purchase_order_charge_revisions` drives the same
+/// operation over the same wire helper rather than a second one of its own.
+pub(crate) async fn update(router: &MultiServiceRouter, orders: Value) -> Answer {
     call(
         router,
         "UpdatePurchaseOrders",
@@ -103,7 +106,10 @@ pub(crate) fn items(answer: &Answer) -> Vec<Value> {
 /// The purchase order reference each charge of `agreement` carries, keyed by
 /// charge id — `None` for a charge with no association, which is the absent
 /// member `Charge$purchaseOrderReference` ("if any") states.
-async fn references(
+///
+/// `pub(crate)` because `purchase_order_charge_revisions` reads the same report
+/// back rather than building a second reader.
+pub(crate) async fn references(
     router: &MultiServiceRouter,
     agreement: &str,
 ) -> BTreeMap<String, Option<String>> {

@@ -59,6 +59,8 @@ mod payment_request_selector_resolution;
 mod payment_requests;
 #[path = "all/purchase_order_associations.rs"]
 mod purchase_order_associations;
+#[path = "all/purchase_order_charge_revisions.rs"]
+mod purchase_order_charge_revisions;
 #[path = "all/purchase_order_updates.rs"]
 mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]

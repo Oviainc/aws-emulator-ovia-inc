@@ -13,7 +13,8 @@
 //! carries one reference, so associating a charge that already has one replaces it.
 //!
 //! The list is refused whole, before anything is written, when an element names a
-//! charge no agreement holds, names one twice, carries no reference
+//! charge no agreement holds, names one twice, carries no reference, or states a
+//! `chargeRevision` other than the revision the charge it names is at
 //! (`crate::state::validate_purchase_orders`, the rule `AcceptAgreementRequest` refuses
 //! its own `purchaseOrders` under) or states an `agreementId` other than the agreement
 //! holding the charge it names.
@@ -168,18 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store's single counter, so a `chargeId` names at most one charge
         // of at most one agreement.
         let owners = store.charge_owners();
-        let charges: ::std::collections::BTreeSet<&str> =
-            owners.keys().map(String::as_str).collect();
+        // The revision each of those charges is at, as the charge report states
+        // it, which is what an element's `chargeRevision` precondition is
+        // checked against.
+        let revisions = store.charge_revisions();
 
         // The same rule `AcceptAgreementRequest` refuses its own
         // `purchaseOrders` under, applied to the charges of every agreement this
         // call can reach: an element must name a charge that exists, name it at
-        // most once across the list, and carry the reference the association
-        // exists to record (`crate::state::validate_purchase_orders`). The list
+        // most once across the list, carry the reference the association exists
+        // to record, and — where it states one — state the revision that charge
+        // is actually at (`crate::state::validate_purchase_orders`). The list
         // is refused BEFORE anything is written, so a refused call associates
         // nothing.
         if let Err(refusal) =
-            crate::state::validate_purchase_orders(&input.purchase_orders, &charges)
+            crate::state::validate_purchase_orders(&input.purchase_orders, &revisions)
         {
             return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
                 crate::state::validation_exception(&refusal.reason, refusal.path),

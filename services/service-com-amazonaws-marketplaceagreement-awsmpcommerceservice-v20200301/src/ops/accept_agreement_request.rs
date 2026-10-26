@@ -206,14 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the agreement charges": each supplied `PurchaseOrder` associates one
         // reference with ONE charge of the agreement being accepted, and the
         // charges of that agreement are the ones this request's quote minted
-        // into `ChargeSummary$expectedCharges`. A list that names a charge the
-        // request does not hold, names one twice, or carries no reference to
-        // associate is refused before anything is stored — see
+        // into `ChargeSummary$expectedCharges` — each at its first revision,
+        // since this call is what mints them. A list that names a charge the
+        // request does not hold, names one twice, carries no reference to
+        // associate, or states a `chargeRevision` other than the revision its
+        // charge is at is refused before anything is stored — see
         // `crate::state::validate_purchase_orders` for the rule.
         let purchase_orders = input.purchase_orders.unwrap_or_default();
         if let Err(refusal) = crate::state::validate_purchase_orders(
             &purchase_orders,
-            &crate::state::expected_charge_ids(&request.charge_summary),
+            &crate::state::expected_charge_revisions(&request.charge_summary),
         ) {
             return Err(AcceptAgreementRequestErrorModeled::ValidationException(
                 crate::state::validation_exception(&refusal.reason, refusal.path),
