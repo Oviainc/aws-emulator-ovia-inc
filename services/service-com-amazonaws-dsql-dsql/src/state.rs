@@ -55,6 +55,13 @@ pub const STATUS_UPDATING: &str = "UPDATING";
 pub const STATUS_DELETING: &str = "DELETING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETED: &str = "DELETED";
+/// See [`STATUS_CREATING`]: the status of a multi-Region cluster whose peering is
+/// not established on both sides yet, so the cluster is not usable
+/// ([`multi_region_setup_complete`]).
+pub const STATUS_PENDING_SETUP: &str = "PENDING_SETUP";
+/// See [`STATUS_CREATING`]: the status of a multi-Region cluster whose deletion is
+/// unwinding its peering, before the removal itself starts.
+pub const STATUS_PENDING_DELETE: &str = "PENDING_DELETE";
 
 /// The `StreamStatus` values a stream is driven through, spelled as the enum
 /// spells them on the wire (`smithy_query(query="shape", shape="StreamStatus")`:
@@ -227,6 +234,52 @@ impl Cluster {
             resource_id: Some(self.identifier.clone()),
             resource_type: Some(RESOURCE_TYPE_CLUSTER.to_string()),
         })
+    }
+
+    /// The refusal an update that CONFIGURES this cluster's multi-Region setup
+    /// answers with, or `None` when the cluster takes it.
+    ///
+    /// A cluster waiting in [`STATUS_PENDING_SETUP`] takes no other mutation, but
+    /// it does take this one: the peering it is waiting for is established by
+    /// configuring BOTH sides, so the configuration change is the very call the
+    /// wait is for. Every other status answers exactly as it does to any other
+    /// mutation ([`Self::mutation_conflict`]).
+    pub fn multi_region_configuration_conflict(&self) -> Option<ConflictException> {
+        if self.status == STATUS_PENDING_SETUP {
+            return None;
+        }
+        self.mutation_conflict("be updated")
+    }
+
+    /// The peer clusters this cluster's multi-Region configuration names, or an
+    /// empty slice when it names none.
+    pub fn multi_region_peers(&self) -> &[String] {
+        self.multi_region_properties
+            .as_ref()
+            .and_then(|properties| properties.clusters.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// Whether this cluster has a multi-Region configuration at all: one naming a
+    /// witness Region, peer clusters, or both. A `multiRegionProperties` carrying
+    /// neither member asks for no multi-Region cluster, so such a cluster is a
+    /// single-Region one.
+    pub fn is_multi_region(&self) -> bool {
+        self.multi_region_properties.as_ref().is_some_and(|properties| {
+            properties
+                .witness_region
+                .as_deref()
+                .is_some_and(|witness| !witness.trim().is_empty())
+                || !self.multi_region_peers().is_empty()
+        })
+    }
+
+    /// Whether this cluster's multi-Region configuration names `peer_arn` as one
+    /// of its peer clusters.
+    pub fn names_peer(&self, peer_arn: &str) -> bool {
+        self.multi_region_peers()
+            .iter()
+            .any(|peer| peer == peer_arn)
     }
 
     /// Every resource identifier that ceases to exist when this cluster does:
@@ -594,12 +647,32 @@ impl ComAmazonawsDsqlDsqlState {
     /// Called by reporting operations too: it writes nothing a caller asked for,
     /// only what was already due at this instant even if nobody had called.
     ///
+    /// A change can owe a FURTHER change of its own ([`Self::owed_after`]), so the
+    /// passes run until nothing more moves, bounded by [`Self::SETTLE_PASSES`].
+    pub fn settle(&mut self, now: SystemTime) {
+        for _ in 0..Self::SETTLE_PASSES {
+            if !self.settle_once(now) {
+                return;
+            }
+        }
+    }
+
+    /// The most passes one [`Self::settle`] makes.
+    ///
+    /// The longest chain the clock owes is a multi-Region cluster's deletion — the
+    /// peering tear-down, then the removal, then the cluster going away — so this
+    /// many passes leave nothing behind that was already due, and the bound keeps
+    /// the work of one request constant whatever the store holds.
+    const SETTLE_PASSES: usize = 3;
+
+    /// Materialise every change due at `now`, reporting whether anything moved.
+    ///
     /// The scan is over [`Self::clusters`], which is capped at [`MAX_CLUSTERS`],
     /// and each cluster's streams, capped at [`MAX_STREAMS_PER_CLUSTER`], so the
-    /// per-request cost and the critical section it runs in are bounded by a
+    /// per-pass cost and the critical section it runs in are bounded by a
     /// constant rather than by anything a caller can grow. Nothing is allocated
     /// unless a transition is actually due.
-    pub fn settle(&mut self, now: SystemTime) {
+    fn settle_once(&mut self, now: SystemTime) -> bool {
         let is_due = |pending: &Option<PendingTransition>| {
             pending.as_ref().is_some_and(|pending| pending.due_at <= now)
         };
@@ -611,7 +684,7 @@ impl ComAmazonawsDsqlDsqlState {
                     .any(|stream| is_due(&stream.pending))
         });
         if !anything_due {
-            return;
+            return false;
         }
 
         // Every cluster is visited, because a settled stream transition can be
@@ -653,6 +726,78 @@ impl ComAmazonawsDsqlDsqlState {
                     }
                     self.retire(identifier, retired);
                 }
+                continue;
+            }
+            // The status this change reached can owe a further one of its own, a
+            // settle span after the change that reached it — materialised by a
+            // later pass, or by a later request, once it is due in turn.
+            if let Some(next_status) = self.owed_after(&identifier) {
+                let due_at = pending.due_at + SETTLE_AFTER;
+                if let Some(cluster) = self.clusters.get_mut(&identifier) {
+                    cluster.pending = Some(PendingTransition {
+                        due_at,
+                        next_status,
+                    });
+                }
+            }
+        }
+        true
+    }
+
+    /// The status change the clock owes a cluster that has just reached a status
+    /// of its own, or `None` when it reached one it stays in.
+    ///
+    /// The statuses the clock itself produces are the ones a chain passes
+    /// through: a deletion's peering tear-down ([`STATUS_PENDING_DELETE`]) is
+    /// followed by the removal ([`STATUS_DELETING`]) and that by the cluster
+    /// going away ([`STATUS_DELETED`]). A cluster waiting for its peering
+    /// ([`STATUS_PENDING_SETUP`]) is owed nothing until that peering is
+    /// established on both sides, which a request against the OTHER cluster is
+    /// what brings about ([`Self::owe_active_to_completed_peerings`]).
+    fn owed_after(&self, identifier: &str) -> Option<&'static str> {
+        let cluster = self.clusters.get(identifier)?;
+        match cluster.status.as_str() {
+            STATUS_PENDING_DELETE => Some(STATUS_DELETING),
+            STATUS_DELETING => Some(STATUS_DELETED),
+            STATUS_PENDING_SETUP => {
+                multi_region_setup_complete(cluster, &self.clusters).then_some(STATUS_ACTIVE)
+            }
+            _ => None,
+        }
+    }
+
+    /// Owe [`STATUS_ACTIVE`] to every cluster whose multi-Region peering has just
+    /// become established.
+    ///
+    /// A cluster waiting in [`STATUS_PENDING_SETUP`] waits for the OTHER side of
+    /// its peering to be configured, and that is a request against that other
+    /// cluster — so the call which configures one side is what ends the wait of
+    /// every cluster now named by both, and the clock carries each of them to
+    /// `ACTIVE` a settle span later. Called by the operations that WRITE a
+    /// cluster's multi-Region configuration; a cluster whose peering is still
+    /// outstanding is owed nothing.
+    ///
+    /// The scan is over [`Self::clusters`], capped at [`MAX_CLUSTERS`], and reads
+    /// a cluster's peers — capped at [`MAX_MULTI_REGION_PEERS`] — only once the
+    /// cheap status test has selected it, so the per-request cost is bounded by a
+    /// constant the way [`Self::settle_once`]'s is.
+    pub fn owe_active_to_completed_peerings(&mut self, now: SystemTime) {
+        let completed: Vec<String> = self
+            .clusters
+            .values()
+            .filter(|cluster| {
+                cluster.status == STATUS_PENDING_SETUP
+                    && cluster.pending.is_none()
+                    && multi_region_setup_complete(cluster, &self.clusters)
+            })
+            .map(|cluster| cluster.identifier.clone())
+            .collect();
+        for identifier in completed {
+            if let Some(cluster) = self.clusters.get_mut(&identifier) {
+                cluster.pending = Some(PendingTransition {
+                    due_at: now + SETTLE_AFTER,
+                    next_status: STATUS_ACTIVE,
+                });
             }
         }
     }
@@ -1309,6 +1454,108 @@ pub fn validate_witness_region(
         ));
     }
     Ok(())
+}
+
+/// The member a peer-cluster-list refusal names, spelled with its path from the
+/// request root the way the operations' own documentation spells it
+/// (`multiRegionProperties.clusters`), so a caller reading `fieldList` knows which
+/// nested member to fix.
+pub const PEER_CLUSTERS_MEMBER: &str = "multiRegionProperties.clusters";
+
+/// The most peer clusters one multi-Region configuration may name.
+///
+/// A ceiling this emulator CHOOSES, not a published quota: `ClusterArnList`
+/// carries no `@length` (`smithy_query(query="shape",
+/// shape="MultiRegionProperties")`), yet the list is held on the cluster record
+/// for the life of the process and is walked whenever a peering is resolved
+/// ([`multi_region_setup_complete`]), so without a maximum one request would
+/// decide how much memory and work every later one spends. A multi-Region cluster
+/// is formed from the clusters peered with it, so a handful is the shape of the
+/// member.
+pub const MAX_MULTI_REGION_PEERS: usize = 8;
+
+/// Check a `multiRegionProperties` against [`MAX_MULTI_REGION_PEERS`].
+///
+/// An input-constraint refusal the model cannot express, so every operation that
+/// WRITES the member checks it here and refuses identically — with the
+/// `ValidationException` both of them model, before anything is created or
+/// changed.
+pub fn validate_multi_region_peers(
+    properties: Option<&MultiRegionProperties>,
+) -> Result<(), ValidationException> {
+    let peers = properties
+        .and_then(|properties| properties.clusters.as_deref())
+        .unwrap_or_default();
+    if peers.len() > MAX_MULTI_REGION_PEERS {
+        return Err(invalid_member_value(
+            PEER_CLUSTERS_MEMBER,
+            &format!("must name at most {MAX_MULTI_REGION_PEERS} peer clusters"),
+            &peers.len().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The cluster a `multiRegionProperties.clusters` entry names, when this service
+/// holds it.
+///
+/// A peer is named by ARN, and an ARN carries the partition, Region and account
+/// its cluster was minted in, so an entry resolves only to a cluster MINTED with
+/// that very ARN ([`cluster_arn`]): a cluster of another Region, account or
+/// partition that happens to share an identifier is a different cluster.
+fn peer_cluster<'a>(
+    clusters: &'a BTreeMap<String, Cluster>,
+    peer_arn: &str,
+) -> Option<&'a Cluster> {
+    let resource = parse_resource_arn(peer_arn)?;
+    if resource.resource_type != RESOURCE_TYPE_CLUSTER {
+        return None;
+    }
+    clusters
+        .get(&resource.resource_id)
+        .filter(|cluster| cluster.arn == peer_arn)
+}
+
+/// Whether `cluster`'s multi-Region configuration is established.
+///
+/// A peering is a relationship both clusters carry, so it is established when
+/// the cluster names at least one peer and every peer it names is a cluster this
+/// service holds whose own configuration names it back. A cluster that names a
+/// peer which does not name it is still waiting for that other side to be
+/// configured, and a configuration naming no peer at all (a witness Region
+/// alone) has no peering yet either.
+///
+/// The walk is over the cluster's own peers, capped at
+/// [`MAX_MULTI_REGION_PEERS`] by every operation that writes the member
+/// ([`validate_multi_region_peers`]), so its cost is bounded by a constant.
+pub fn multi_region_setup_complete(
+    cluster: &Cluster,
+    clusters: &BTreeMap<String, Cluster>,
+) -> bool {
+    let peers = cluster.multi_region_peers();
+    !peers.is_empty()
+        && peers.iter().all(|peer_arn| {
+            peer_cluster(clusters, peer_arn).is_some_and(|peer| peer.names_peer(&cluster.arn))
+        })
+}
+
+/// The status the clock owes a cluster whose creation or reconfiguration is
+/// finishing: the cluster is usable ([`STATUS_ACTIVE`]) unless it is a
+/// multi-Region cluster whose peering is not established on both sides, which
+/// waits in [`STATUS_PENDING_SETUP`] until it is.
+///
+/// Shared by every operation that writes a cluster's configuration, so the
+/// status a created cluster settles into and the one a reconfigured cluster
+/// settles into are decided by one rule.
+pub fn settled_cluster_status(
+    cluster: &Cluster,
+    clusters: &BTreeMap<String, Cluster>,
+) -> &'static str {
+    if cluster.is_multi_region() && !multi_region_setup_complete(cluster, clusters) {
+        STATUS_PENDING_SETUP
+    } else {
+        STATUS_ACTIVE
+    }
 }
 
 /// The modelled `ValidationException` for a `nextToken` this service never issued,

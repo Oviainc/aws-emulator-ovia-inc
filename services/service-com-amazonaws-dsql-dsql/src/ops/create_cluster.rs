@@ -4,13 +4,17 @@
 //!
 //! Mints and persists a cluster: a fresh lowercase-ULID `identifier`, the ARN and
 //! endpoint derived from it and the request's region, `CREATING` with the clock
-//! owing it `ACTIVE`, and the `tags` / `kmsEncryptionKey` / `multiRegionProperties`
+//! owing it the status its configuration settles into — `ACTIVE` for a
+//! single-Region cluster, and `PENDING_SETUP` for one created with a
+//! `multiRegionProperties` configuration, whose peering is not established on
+//! both sides yet — and the `tags` / `kmsEncryptionKey` / `multiRegionProperties`
 //! / `policy` the caller supplied. A repeated `clientToken` with the same
 //! parameters returns the cluster the first call minted rather than minting a
 //! second one; the same token with different parameters is refused as a conflict.
 //! A `multiRegionProperties.witnessRegion` naming the request's OWN Region — the
 //! Region the minted cluster belongs to — is refused with `ValidationException`
-//! (400) and nothing is created.
+//! (400) and nothing is created, as is a `multiRegionProperties.clusters` naming
+//! more peers than `state::MAX_MULTI_REGION_PEERS`.
 //!
 //! ## Shape of an operation
 //!
@@ -233,6 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
         }
 
+        // The peer clusters a configuration names are held on the cluster record
+        // and walked whenever a peering is resolved, so the member is bounded:
+        // a configuration naming more peers than one multi-Region cluster is
+        // formed from is refused before any cluster is minted.
+        if let Err(invalid) =
+            crate::state::validate_multi_region_peers(input.multi_region_properties.as_ref())
+        {
+            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+        }
+
         // The `tags` a create carries are written exactly as `TagResource` writes
         // them, so they are held to the same rule: a key under the prefix AWS
         // reserves for its own tags is not the caller's to write, and the request is
@@ -322,13 +336,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy: None,
             policy_versions_issued: 0,
             streams: std::collections::BTreeMap::new(),
-            // The clock, not a later caller, owes this cluster its ACTIVE status.
-            pending: Some(crate::state::PendingTransition {
-                due_at: now + crate::state::SETTLE_AFTER,
-                next_status: crate::state::STATUS_ACTIVE,
-            }),
+            pending: None,
             identifier: identifier.clone(),
         };
+        // The clock, not a later caller, owes this cluster the status its
+        // configuration settles into: `ACTIVE` for a single-Region cluster, and
+        // `PENDING_SETUP` for one created with a multi-Region configuration,
+        // whose peering is not established on both sides yet — no peer cluster
+        // can already name a cluster whose ARN this call has just minted.
+        let settles_to = crate::state::settled_cluster_status(&cluster, &state.clusters);
+        cluster.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::SETTLE_AFTER,
+            next_status: settles_to,
+        });
         // A policy supplied at creation is attached with its first version, so
         // `GetClusterPolicy` reports it exactly as it reports one `PutClusterPolicy`
         // attached.

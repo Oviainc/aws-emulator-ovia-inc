@@ -33,6 +33,8 @@ mod harness;
 mod idempotent_replay_result;
 #[path = "all/modeled_validation_exception.rs"]
 mod modeled_validation_exception;
+#[path = "all/multi_region_cluster_status.rs"]
+mod multi_region_cluster_status;
 #[path = "all/multi_region_witness.rs"]
 mod multi_region_witness;
 #[path = "all/pagination_token_refusal.rs"]

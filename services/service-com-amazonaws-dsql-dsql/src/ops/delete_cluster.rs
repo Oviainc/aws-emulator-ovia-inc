@@ -3,7 +3,9 @@
 //! @op DeleteCluster
 //!
 //! Retires the persisted cluster named by the `@httpLabel` `identifier`: it reports
-//! `DELETING` and the clock removes it, so a later `GetCluster` answers
+//! `DELETING` — or `PENDING_DELETE` for a multi-Region cluster, whose peering is
+//! unwound before the removal starts — and the clock removes it, so a later
+//! `GetCluster` answers
 //! `ResourceNotFoundException` and `ListClusters` stops listing it. A cluster with
 //! deletion protection enabled is refused with `ValidationException` (400) — the
 //! condition is permanent until the caller changes the cluster, not a transient
@@ -265,11 +267,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if cluster.status != crate::state::STATUS_DELETING {
-            cluster.status = crate::state::STATUS_DELETING.to_string();
+            // A multi-Region cluster's deletion unwinds its peering first: it
+            // reports `PENDING_DELETE` until the removal itself starts, which the
+            // clock then carries on to `DELETING` and to the cluster going away. A
+            // single-Region cluster has no peering to unwind, so its removal starts
+            // straight away.
+            let unwinding_peering = cluster.is_multi_region();
+            cluster.status = if unwinding_peering {
+                crate::state::STATUS_PENDING_DELETE
+            } else {
+                crate::state::STATUS_DELETING
+            }
+            .to_string();
             // The clock, not a later caller, finishes the deletion.
             cluster.pending = Some(crate::state::PendingTransition {
                 due_at: now + crate::state::SETTLE_AFTER,
-                next_status: crate::state::STATUS_DELETED,
+                next_status: if unwinding_peering {
+                    crate::state::STATUS_DELETING
+                } else {
+                    crate::state::STATUS_DELETED
+                },
             });
         }
 

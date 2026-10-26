@@ -378,6 +378,11 @@ async fn update_mutates_only_the_members_the_request_carries() {
         want_protection: bool,
         want_encryption_type: &'static str,
         want_witness: Value,
+        /// The status the clock settles the reconfigured cluster into: `ACTIVE`,
+        /// or `PENDING_SETUP` while a multi-Region peering the update asks for is
+        /// not established on both sides (see
+        /// `tests/all/multi_region_cluster_status.rs`).
+        want_settled_status: &'static str,
     }
 
     let peer = format!(
@@ -391,6 +396,7 @@ async fn update_mutates_only_the_members_the_request_carries() {
             want_protection: false,
             want_encryption_type: "AWS_OWNED_KMS_KEY",
             want_witness: Value::Null,
+            want_settled_status: "ACTIVE",
         },
         UpdateCase {
             name: "deletionProtectionEnabled only",
@@ -398,6 +404,7 @@ async fn update_mutates_only_the_members_the_request_carries() {
             want_protection: true,
             want_encryption_type: "AWS_OWNED_KMS_KEY",
             want_witness: Value::Null,
+            want_settled_status: "ACTIVE",
         },
         UpdateCase {
             name: "kmsEncryptionKey only",
@@ -405,6 +412,7 @@ async fn update_mutates_only_the_members_the_request_carries() {
             want_protection: false,
             want_encryption_type: "CUSTOMER_MANAGED_KMS_KEY",
             want_witness: Value::Null,
+            want_settled_status: "ACTIVE",
         },
         UpdateCase {
             name: "multiRegionProperties only",
@@ -412,6 +420,7 @@ async fn update_mutates_only_the_members_the_request_carries() {
             want_protection: false,
             want_encryption_type: "AWS_OWNED_KMS_KEY",
             want_witness: json!("eu-west-2"),
+            want_settled_status: "PENDING_SETUP",
         },
         UpdateCase {
             name: "every updatable member at once",
@@ -423,6 +432,7 @@ async fn update_mutates_only_the_members_the_request_carries() {
             want_protection: true,
             want_encryption_type: "CUSTOMER_MANAGED_KMS_KEY",
             want_witness: json!("eu-central-1"),
+            want_settled_status: "PENDING_SETUP",
         },
     ];
 
@@ -467,9 +477,10 @@ async fn update_mutates_only_the_members_the_request_carries() {
         let after = dsql.get(&identifier).await;
         assert_eq!(
             after.str("status"),
-            "ACTIVE",
-            "case {:?}: the clock must settle UPDATING back to ACTIVE, got {:?}",
+            case.want_settled_status,
+            "case {:?}: the clock must settle UPDATING into {:?}, got {:?}",
             case.name,
+            case.want_settled_status,
             after.str("status")
         );
         assert_eq!(

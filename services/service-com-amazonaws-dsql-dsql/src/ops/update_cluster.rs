@@ -4,9 +4,15 @@
 //!
 //! Mutates the persisted cluster named by the `@httpLabel` `identifier`, applying
 //! only the members the request carries, and moves it to `UPDATING` with the clock
-//! owing it `ACTIVE` again. Unknown identifier -> `ResourceNotFoundException` (404);
-//! a cluster in a status that does not accept a mutation -> `ConflictException` (409);
-//! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region ->
+//! owing it the status its new configuration settles into — `ACTIVE` again, or
+//! `PENDING_SETUP` while a multi-Region peering it asks for is not established on
+//! both sides. Unknown identifier -> `ResourceNotFoundException` (404);
+//! a cluster in a status that does not accept a mutation -> `ConflictException` (409),
+//! except that a cluster waiting in `PENDING_SETUP` takes the configuration change
+//! that completes its peering;
+//! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region, or a
+//! `multiRegionProperties.clusters` naming more peers than
+//! `state::MAX_MULTI_REGION_PEERS` ->
 //! `ValidationException` (400), with the cluster left unchanged.
 //! A repeat of the same `clientToken` with the same parameters is the same request,
 //! so it answers from the cluster the first call acted on — ahead of that status
@@ -238,6 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateClusterErrorModeled::ValidationException(invalid).into());
         }
 
+        // The peer clusters a configuration names are held on the cluster record
+        // and walked whenever a peering is resolved, so the member is bounded
+        // here exactly as `CreateCluster` bounds it, with the cluster left
+        // unchanged.
+        if let Err(invalid) =
+            crate::state::validate_multi_region_peers(input.multi_region_properties.as_ref())
+        {
+            return Err(UpdateClusterErrorModeled::ValidationException(invalid).into());
+        }
+
         // `@idempotencyToken`: a repeat of the SAME request is the same request,
         // so it answers from the cluster the first call acted on — ahead of the
         // status gate below, which would otherwise refuse the retry for the very
@@ -274,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+        let Some(stored) = state.clusters.get(&input.identifier) else {
             return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&region, &input.identifier),
             )
@@ -282,10 +298,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A cluster the clock still owes a transition, or one on its way out, cannot
-        // take a configuration change.
-        if let Some(conflict) = cluster.mutation_conflict("be updated") {
+        // take a configuration change — with the one exception a request CONFIGURING
+        // the multi-Region setup gets: a cluster waiting in `PENDING_SETUP` is
+        // waiting for exactly that call.
+        let refusal = if input.multi_region_properties.is_some() {
+            stored.multi_region_configuration_conflict()
+        } else {
+            stored.mutation_conflict("be updated")
+        };
+        if let Some(conflict) = refusal {
             return Err(UpdateClusterErrorModeled::ConflictException(conflict).into());
         }
+
+        // The record this call leaves behind, written back under the same key. It is
+        // built beside the store rather than in it so that the status the clock owes
+        // it can be read off the OTHER clusters — its peers — at the same time.
+        let mut cluster = stored.clone();
 
         // Only the members the request carries are applied; an absent member leaves
         // the stored value alone.
@@ -307,14 +335,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The reconfiguration is asynchronous: the cluster reports `UPDATING` and the
-        // clock owes it `ACTIVE` again.
+        // clock owes it the status its configuration settles into — `ACTIVE` again,
+        // or `PENDING_SETUP` while the multi-Region peering it now asks for is not
+        // established on both sides.
         cluster.status = crate::state::STATUS_UPDATING.to_string();
+        let settles_to = crate::state::settled_cluster_status(&cluster, &state.clusters);
         cluster.pending = Some(crate::state::PendingTransition {
             due_at: now + crate::state::SETTLE_AFTER,
-            next_status: crate::state::STATUS_ACTIVE,
+            next_status: settles_to,
         });
 
-        let updated = updated_cluster_output(cluster);
+        let updated = updated_cluster_output(&cluster);
+        state.clusters.insert(input.identifier.clone(), cluster);
+        // Configuring one side of a peering can complete the OTHER side's wait, so
+        // the clock now owes `ACTIVE` to every cluster this call finished peering.
+        state.owe_active_to_completed_peerings(now);
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::UpdateCluster)
