@@ -296,3 +296,7 @@ mod profile_notifications;
 // a new suite does not collide with another insertion.
 #[path = "all/review_template_write_instants.rs"]
 mod review_template_write_instants;
+
+// Declared last for the same reason as the declarations above.
+#[path = "all/lens_notifications.rs"]
+mod lens_notifications;

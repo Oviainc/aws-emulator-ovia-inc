@@ -32,7 +32,11 @@
 //! `ListProfileNotifications` reports are DERIVED from those associations rather than
 //! stored: an association pinned at a version the profile has moved past is the
 //! notification, so nothing has to be recorded when a profile is revised and no read has
-//! to write. The shares of a profile
+//! to write. The LENS notifications `ListNotifications` reports are derived the same way,
+//! from the lens reviews of the workloads and of the review templates: a review pinned at a
+//! version its lens has published past
+//! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::superseded_lens_review`])
+//! is the notification an upgrade of that review clears. The shares of a profile
 //! (`CreateProfileShare`, `ListProfileShares`, `DeleteProfileShare`) are held like a
 //! workload's, keyed by the `ProfileArn` they share then by the share's own `ShareId`, and
 //! each raises the invitation `ListShareInvitations` reports to the principal it was
@@ -2210,21 +2214,12 @@ impl WorkloadRecord {
         })
     }
 
-    /// The lens reviews this workload has: every attached lens's [`lens_alias`] — the
-    /// identity the lens is ONE lens under, so a lens attached under two spellings has
-    /// exactly one review — beside the name the attach recorded it under, which is how a
-    /// `LensAlias` of a custom lens is its ARN.
-    ///
-    /// The map's own key order is the list order a page over these reviews follows: it is
-    /// TOTAL and stable, so a cursor carrying the last alias served resumes the
-    /// enumeration without repeating or skipping a review, whatever lenses are attached
-    /// or detached in between.
+    /// The lens reviews this workload has, through the one place that rule lives
+    /// ([`lens_reviews_of`]): every attached lens's [`lens_alias`] beside the name the
+    /// attach recorded it under, in the stable total order a page over these reviews
+    /// follows.
     pub fn lens_reviews(&self) -> BTreeMap<&str, &str> {
-        let mut reviews = BTreeMap::new();
-        for lens in &self.lenses {
-            reviews.entry(lens_alias(lens)).or_insert(lens.as_str());
-        }
-        reviews
+        lens_reviews_of(&self.lenses)
     }
 
     /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
@@ -2942,6 +2937,13 @@ impl ReviewTemplateRecord {
     /// when the lens was applied or last moved by an upgrade.
     pub fn lens_review_version(&self, lens: &str) -> Option<&str> {
         self.lens_review_record(lens)?.lens_version.as_deref()
+    }
+
+    /// The lens reviews this template has, through the one place that rule lives
+    /// ([`lens_reviews_of`]) — the same rule a WORKLOAD's lens reviews follow
+    /// ([`WorkloadRecord::lens_reviews`]).
+    pub fn lens_reviews(&self) -> BTreeMap<&str, &str> {
+        lens_reviews_of(&self.lenses)
     }
 
     /// The pillars ONE lens review of this template reports a summary for, through the
@@ -3764,6 +3766,25 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
     })
 }
 
+/// The lens reviews a resource applying `lenses` has: every applied lens's [`lens_alias`]
+/// — the identity the lens is ONE lens under, so a lens applied under two spellings has
+/// exactly one review — beside the name the apply recorded it under, which is how a
+/// `LensAlias` of a custom lens is its ARN.
+///
+/// The map's own key order is the list order a page over these reviews follows: it is TOTAL
+/// and stable, so a cursor carrying the last alias served resumes the enumeration without
+/// repeating or skipping a review, whatever lenses are applied or removed in between. One
+/// place, because a WORKLOAD's lens reviews ([`WorkloadRecord::lens_reviews`]) and a REVIEW
+/// TEMPLATE's ([`ReviewTemplateRecord::lens_reviews`]) are both the reviews of the lenses
+/// their resource applies, and the two cannot disagree about which lens is one review.
+pub fn lens_reviews_of(lenses: &[String]) -> BTreeMap<&str, &str> {
+    let mut reviews = BTreeMap::new();
+    for lens in lenses {
+        reviews.entry(lens_alias(lens)).or_insert(lens.as_str());
+    }
+    reviews
+}
+
 /// The lens a `LensAlias` names, as its bare alias.
 ///
 /// "For Amazon Web Services official lenses, this is either the lens alias, such as
@@ -4537,6 +4558,17 @@ pub const PROFILE_OWNER_TYPE_SHARED: &str = "SHARED";
 /// drops every association of a deleted profile with the profile itself, leaving no
 /// association that points at one that is gone.
 pub const PROFILE_NOTIFICATION_ANSWERS_UPDATED: &str = "PROFILE_ANSWERS_UPDATED";
+
+/// `NotificationType$LENS_VERSION_UPGRADED`: the lens a resource's lens review is a review
+/// of has published a version later than the one that review is pinned at
+/// (`smithy_query(query="shape", shape="NotificationType")`, which publishes
+/// `LENS_VERSION_UPGRADED` and `LENS_VERSION_DEPRECATED`).
+///
+/// The other member cannot arise from the state this emulator keeps: no lens in either half
+/// of the catalog is ever retired — an AWS-official lens is one of the published aliases
+/// ([`AWS_OFFICIAL_LENS_ALIASES`]) for the life of the process, and a custom lens's versions
+/// only ever accumulate — so no lens review is a review of a deprecated lens.
+pub const LENS_NOTIFICATION_VERSION_UPGRADED: &str = "LENS_VERSION_UPGRADED";
 
 /// One stored Well-Architected Tool profile: the resource `CreateProfile` mints and
 /// `GetProfile` reports.
@@ -6681,6 +6713,29 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         }
     }
 
+    /// The two versions ONE lens review is BEHIND by — `(the version the review is pinned
+    /// at, the lens's latest version)` — or `None` when it is not behind at all.
+    ///
+    /// A lens review is a review against ONE version of the lens, and a lens's versions only
+    /// ever accumulate, so a pinned version that is not the lens's latest is one the lens has
+    /// moved PAST: that is what makes the review `NOT_CURRENT` ([`Self::reviewed_lens_at`])
+    /// and what an upgrade of the review clears. A review pinning no version is against the
+    /// lens's latest by definition, and a lens this emulator holds no content for has no
+    /// latest version to be behind, so neither is behind anything.
+    ///
+    /// The one place that comparison lives, so a review template's update status, the
+    /// notifications a stale review raises and an upgrade cannot disagree about which reviews
+    /// are behind.
+    pub fn superseded_lens_review(
+        &self,
+        lens: &str,
+        pinned: Option<&str>,
+    ) -> Option<(String, String)> {
+        let latest = self.latest_lens_version(lens)?;
+        let pinned = pinned.filter(|pinned| *pinned != latest)?;
+        Some((pinned.to_string(), latest.to_string()))
+    }
+
     /// `ReviewTemplate$UpdateStatus` / `ReviewTemplateSummary$UpdateStatus` of one stored
     /// template: [`REVIEW_TEMPLATE_UPDATE_STATUS_LENS_NOT_CURRENT`] while ANY lens review
     /// of it is against a version its lens has superseded, else
@@ -6691,11 +6746,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// lens reviews reports.
     pub fn review_template_update_status(&self, template: &ReviewTemplateRecord) -> &'static str {
         let superseded = template.lenses.iter().any(|lens| {
-            let pinned = template.lens_review_version(lens);
-            matches!(
-                (pinned, self.latest_lens_version(lens)),
-                (Some(pinned), Some(latest)) if pinned != latest
-            )
+            self.superseded_lens_review(lens, template.lens_review_version(lens))
+                .is_some()
         });
         if superseded {
             REVIEW_TEMPLATE_UPDATE_STATUS_LENS_NOT_CURRENT
@@ -7731,6 +7783,27 @@ pub fn decode_profile_notification_next_token(token: &str) -> Option<(String, St
     let workload_id = cursor.get("w")?.as_str()?.to_string();
     let profile_arn = cursor.get("f")?.as_str()?.to_string();
     Some((workload_id, profile_arn))
+}
+
+/// Encode a `ListNotifications` cursor: the `(resource key, lens alias)` of the last lens
+/// notification the page served, in the same opaque scheme as [`encode_next_token`].
+///
+/// A lens notification is ABOUT one lens review of one resource, so the pair that names that
+/// review is the whole cursor: the key of the resource holding it — a workload's `WorkloadId`
+/// or a review template's `TemplateArn`, each fixed for that resource's life and the key its
+/// map is held under — and the [`lens_alias`] the review is one review under. Its own keys,
+/// so a cursor issued by another paginated operation is not a cursor here.
+pub fn encode_lens_notification_next_token(resource_key: &str, alias: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "nr": resource_key, "nl": alias }))
+}
+
+/// The `(resource key, lens alias)` a `ListNotifications` `NextToken` points just past, or
+/// `None` when the token is not one this service issued.
+pub fn decode_lens_notification_next_token(token: &str) -> Option<(String, String)> {
+    let cursor = decode_cursor(token)?;
+    let resource_key = cursor.get("nr")?.as_str()?.to_string();
+    let alias = cursor.get("nl")?.as_str()?.to_string();
+    Some((resource_key, alias))
 }
 
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same
