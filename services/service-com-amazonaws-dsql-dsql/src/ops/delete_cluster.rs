@@ -258,16 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cluster the clock still owes a transition cannot start deleting; one that
         // is already deleting answers with the delete in flight.
-        if cluster.status != crate::state::STATUS_DELETING && !cluster.accepts_mutation() {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} cannot be deleted while its status is {}",
-                    cluster.identifier, cluster.status
-                ),
-                resource_id: Some(cluster.identifier.clone()),
-                resource_type: Some("cluster".to_string()),
-            })
-            .into());
+        if cluster.status != crate::state::STATUS_DELETING {
+            if let Some(conflict) = cluster.mutation_conflict("be deleted") {
+                return Err(DeleteClusterErrorModeled::ConflictException(conflict).into());
+            }
         }
 
         if cluster.status != crate::state::STATUS_DELETING {

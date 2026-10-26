@@ -15,6 +15,8 @@
 mod boundary_validation_exception;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_mutation_status_gate.rs"]
+mod cluster_mutation_status_gate;
 #[path = "all/cluster_policy.rs"]
 mod cluster_policy;
 #[path = "all/delete_cluster_idempotency.rs"]
