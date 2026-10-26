@@ -176,23 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // What a tag entry has to satisfy before it can be stored: its key and value stay
-        // within the set of characters `Tags` documents and within the caps that bound
-        // caller-driven growth of one stored record, and the merged tag set stays within
-        // the per-resource maximum. Checked over the whole request before anything is
-        // written, so a refused call leaves no partial write and a later
-        // `ListTagsForResource` cannot report an entry this service refused.
-        for (key, value) in &input.tags {
-            crate::state::check_tag_entry(key, value)
-                .map_err(crate::scaffolded::Scaffolded::validation)?;
-        }
-        let merged = stored.len()
-            + input
-                .tags
-                .keys()
-                .filter(|key| !stored.contains_key(*key))
-                .count();
-        crate::state::check_tag_count(merged).map_err(crate::scaffolded::Scaffolded::validation)?;
+        // What a tag entry has to satisfy before it can be stored, through the admission
+        // rule every write of a tag in this service passes
+        // (`crate::state::check_tag_map`): its key and value stay within the set of
+        // characters `Tags` documents and within the caps that bound caller-driven growth
+        // of one stored record, and the merged tag set stays within the per-resource
+        // maximum. Checked over the whole request before anything is written, so a refused
+        // call leaves no partial write and a later `ListTagsForResource` cannot report an
+        // entry this service refused.
+        crate::state::check_tag_map(&input.tags, Some(stored))?;
 
         for (key, value) in input.tags {
             stored.insert(key, value);

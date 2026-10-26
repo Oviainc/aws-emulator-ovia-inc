@@ -1572,6 +1572,48 @@ pub fn tag_character_allowed(character: char) -> bool {
     character.is_alphanumeric() || character == ' ' || TAG_PUNCTUATION.contains(&character)
 }
 
+/// Refuse a tag set a caller submitted unless the whole of it may be written: every
+/// submitted entry passes [`check_tag_entry`], and the number of tags the record would
+/// hold once the write landed passes [`check_tag_count`].
+///
+/// This is the one admission rule every operation that writes a tag applies — the two
+/// `Start` operations minting a record's tag set and `TagResource` merging into a stored
+/// one — so the per-entry check, the count that is checked, the order of the two checks
+/// and the refusal channel are decided here once instead of per handler.
+///
+/// `stored` is the tag set the write merges into: `None` for a create, which starts from
+/// nothing, so the post-write count is simply what the request carries; for a merge it is
+/// the entries already held, and the post-write count adds only the submitted keys that
+/// are not among them, because a submitted key that is already stored is overwritten
+/// rather than added.
+///
+/// The whole set is checked before anything is written, so a refused call leaves no
+/// partial write and a later read cannot report an entry this service refused.
+///
+/// `E` is NOT a choice this helper makes: the refusal it answers with is always the
+/// `ValidationException` variant of the error wrapper, and `E` is only the calling
+/// operation's modelled error enum, which every handler's own error type fixes, so each
+/// call site writes `check_tag_map(..)?` and names nothing.
+pub fn check_tag_map<E>(
+    submitted: &HashMap<String, String>,
+    stored: Option<&HashMap<String, String>>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    for (key, value) in submitted {
+        check_tag_entry(key, value).map_err(crate::scaffolded::Scaffolded::validation)?;
+    }
+    let count = match stored {
+        Some(stored) => {
+            stored.len()
+                + submitted
+                    .keys()
+                    .filter(|key| !stored.contains_key(*key))
+                    .count()
+        }
+        None => submitted.len(),
+    };
+    check_tag_count(count).map_err(crate::scaffolded::Scaffolded::validation)
+}
+
 /// Refuse a tag set that would leave one job holding more than [`MAX_TAGS_PER_JOB`]
 /// tags. `count` is the number of tags the job would hold after the write.
 pub fn check_tag_count(count: usize) -> Result<(), String> {
