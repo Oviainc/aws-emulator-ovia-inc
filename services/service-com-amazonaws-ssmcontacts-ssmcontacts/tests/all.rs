@@ -19,6 +19,8 @@ mod account_gate_request_shapes;
 mod arn_read_precondition;
 #[path = "all/cold_account_gate.rs"]
 mod cold_account_gate;
+#[path = "all/contact_channel_address_format.rs"]
+mod contact_channel_address_format;
 #[path = "all/contact_channel_deactivation.rs"]
 mod contact_channel_deactivation;
 #[path = "all/contact_channel_name_uniqueness.rs"]

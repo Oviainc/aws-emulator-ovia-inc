@@ -18,7 +18,10 @@
 //! 2. The resource lookup: an ARN naming no stored channel is the modelled
 //!    `ResourceNotFoundException` (HTTP 404).
 //! 3. The request is checked WHOLE: a request naming neither updatable member describes no
-//!    update, a `DeliveryAddress` carrying no `SimpleAddress` names nothing to engage, and a
+//!    update, a `DeliveryAddress` carrying no `SimpleAddress` names nothing to engage, an
+//!    address in a form the channel's own `Type` does not engage (the per-`ChannelType`
+//!    formats `ContactChannelAddress$SimpleAddress` documents, checked by
+//!    [`crate::state::check_delivery_address`]) names nothing reachable, and a
 //!    `Name` another live channel of the SAME contact already carries would leave that
 //!    contact with two channels answering to one name — the inconsistent state this
 //!    operation's modelled `ConflictException` (HTTP 409) is for, and the same uniqueness
@@ -212,6 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let contact_arn = channel.contact_arn.clone();
         let stored_name = channel.name.clone();
+        let stored_type = channel.channel_type.clone();
         let stored_address = channel.delivery_address.simple_address.clone();
 
         // The request is checked WHOLE before any of it is applied, so a refused update
@@ -238,6 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             None => None,
         };
+
+        // The address' FORM is a function of the channel's `Type`, which this operation
+        // cannot change: an update may move a channel's address, but only to another address
+        // the channel's own type can engage, so an address in the wrong form is refused and
+        // the stored one stays.
+        if let Some(address) = &new_address {
+            crate::state::check_delivery_address(&stored_type, address).map_err(validation)?;
+        }
 
         // A channel's `Name` identifies it WITHIN its contact, so a rename onto a name a
         // SIBLING channel of the same contact already carries is refused rather than

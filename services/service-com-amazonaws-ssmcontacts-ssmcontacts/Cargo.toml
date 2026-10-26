@@ -26,7 +26,9 @@ sha2 = { workspace = true }
 # Renders that digest, and the opaque `NextToken` payload, as printable text.
 hex = { workspace = true }
 # `service-common` carries the workspace's ONE caller-supplied-ARN parse, which the tagging
-# operations read their unpatterned `ResourceARN` against before resolving it.
+# operations read their unpatterned `ResourceARN` against before resolving it, and its ONE
+# reading of a caller-supplied email address, which a contact channel's delivery address is
+# read against when the channel's type is the one documented to carry an email format.
 service-common = { path = "../common" }
 
 [build-dependencies]

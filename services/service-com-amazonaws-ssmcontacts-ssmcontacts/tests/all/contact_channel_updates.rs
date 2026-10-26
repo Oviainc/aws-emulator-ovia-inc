@@ -20,14 +20,15 @@
 //! address form (the model's whole `ChannelType` value set), whether its creation deferred
 //! activation and whether it is `ACTIVATED` when the update arrives, which members the
 //! request names (one, the other, both), and the value a named member carries (a rename, the
-//! name it already had, `ChannelName`'s published bounds 1 and 255, a non-ASCII name,
-//! `SimpleAddress`' published bounds 1 and 320, the address it already had). Each row's
-//! expectation is COMPUTED as "what was created, overlaid with what the request named", so
-//! the assertions state the rule rather than a transcript.
+//! name it already had, `ChannelName`'s published bounds 1 and 255, a non-ASCII name, another
+//! address of the channel's own format, the longest that format admits, the address it
+//! already had). Each row's expectation is COMPUTED as "what was created, overlaid with what
+//! the request named", so the assertions state the rule rather than a transcript.
 //!
-//! The service does not tie a channel's address FORM to its `Type` — `CreateContactChannel`
-//! stores whatever `SimpleAddress` the request carries — so the address rows are applied to
-//! every channel type.
+//! An address' FORM follows the channel's `Type`, which this operation cannot change
+//! (`ContactChannelAddress$SimpleAddress` documents one format per `ChannelType`), so every
+//! address a row names is built for the type of the channel it is applied to; the refusal of
+//! an address in another form is `contact_channel_address_format`'s subject.
 
 use serde_json::{json, Value};
 
@@ -96,67 +97,66 @@ const BASE_CHANNELS: &[BaseChannel] = &[
 /// request names (`Name` only, `DeliveryAddress` only, both), and the value a named one
 /// carries. The name values span the modelled `ChannelName` shape — len 1..255, pattern
 /// `^[\p{L}\p{Z}\p{N}_.\-]*$` (`smithy_query(query="shape",shape="ChannelName")`) — and the
-/// address values span the modelled `SimpleAddress` length 1..320
-/// (`smithy_query(query="shape",shape="ContactChannelAddress")`). Two rows deliberately name
-/// the value the channel ALREADY carries, which is a write that changes nothing.
+/// address values span the forms the channel's `Type` admits, up to the longest of them. Two
+/// rows deliberately name the value the channel ALREADY carries, which is a write that
+/// changes nothing.
 struct UpdateRow {
     case: &'static str,
-    /// Built from the channel's CURRENT name and address, so a row can name the value the
-    /// channel already carries however many updates it has already taken.
-    patch: fn(&str, &str) -> Value,
+    /// Built from the channel's `Type` and its CURRENT name and address, so a row can name an
+    /// address of the form that type prescribes, or the value the channel already carries
+    /// however many updates it has already taken.
+    patch: fn(&str, &str, &str) -> Value,
 }
 
 const UPDATE_ROWS: &[UpdateRow] = &[
     UpdateRow {
         case: "Name only, a plain rename",
-        patch: |_, _| json!({"Name": "renamed channel"}),
+        patch: |_, _, _| json!({"Name": "renamed channel"}),
     },
     UpdateRow {
         case: "Name only, at ChannelName's published minimum length of 1",
-        patch: |_, _| json!({"Name": "e"}),
+        patch: |_, _, _| json!({"Name": "e"}),
     },
     UpdateRow {
         case: "Name only, at ChannelName's published maximum length of 255",
-        patch: |_, _| json!({"Name": "n".repeat(255)}),
+        patch: |_, _, _| json!({"Name": "n".repeat(255)}),
     },
     UpdateRow {
         case: "Name only, non-ASCII letters with a separator, digits, '_', '.' and '-'",
-        patch: |_, _| json!({"Name": "Überwachung téléphone_2.work-1"}),
+        patch: |_, _, _| json!({"Name": "Überwachung téléphone_2.work-1"}),
     },
     UpdateRow {
         case: "Name only, the name the channel already carries",
-        patch: |name, _| json!({"Name": name}),
+        patch: |_, name, _| json!({"Name": name}),
     },
     UpdateRow {
-        case: "DeliveryAddress only, a different address",
-        patch: |_, _| json!({"DeliveryAddress": {"SimpleAddress": "oncall@example.com"}}),
+        case: "DeliveryAddress only, another address of the channel's own format",
+        patch: |channel_type, _, _| {
+            json!({"DeliveryAddress": {"SimpleAddress": another_address(channel_type)}})
+        },
     },
     UpdateRow {
-        case: "DeliveryAddress only, at SimpleAddress' published minimum length of 1",
-        patch: |_, _| json!({"DeliveryAddress": {"SimpleAddress": "x"}}),
-    },
-    UpdateRow {
-        case: "DeliveryAddress only, at SimpleAddress' published maximum length of 320",
-        patch: |_, _| {
-            json!({"DeliveryAddress": {"SimpleAddress": long_address()}})
+        case: "DeliveryAddress only, the longest address the channel's format admits",
+        patch: |channel_type, _, _| {
+            json!({"DeliveryAddress": {"SimpleAddress": longest_address(channel_type)}})
         },
     },
     UpdateRow {
         case: "DeliveryAddress only, the address the channel already carries",
-        patch: |_, address| json!({"DeliveryAddress": {"SimpleAddress": address}}),
+        patch: |_, _, address| json!({"DeliveryAddress": {"SimpleAddress": address}}),
     },
     UpdateRow {
         case: "both members named",
-        patch: |_, _| {
+        patch: |channel_type, _, _| {
             json!({
                 "Name": "paging-escalation.1",
-                "DeliveryAddress": {"SimpleAddress": "+15550199"},
+                "DeliveryAddress": {"SimpleAddress": another_address(channel_type)},
             })
         },
     },
     UpdateRow {
         case: "both members named, the address being the one already stored",
-        patch: |_, address| {
+        patch: |_, _, address| {
             json!({
                 "Name": "kept-address",
                 "DeliveryAddress": {"SimpleAddress": address},
@@ -165,10 +165,29 @@ const UPDATE_ROWS: &[UpdateRow] = &[
     },
 ];
 
-/// An address exactly at `SimpleAddress`' published maximum length of 320.
-fn long_address() -> String {
-    let domain = "@example.com";
-    format!("{}{domain}", "a".repeat(320 - domain.len()))
+/// Another address of the form `channel_type` prescribes — the one a row that MOVES the
+/// address names. The formats are the model's own, per `ChannelType`
+/// (`smithy_query(query="doc",shape="ContactChannelAddress",member="SimpleAddress")`): a
+/// standard email format for `EMAIL`, '+' and the country code and phone number otherwise.
+fn another_address(channel_type: &str) -> String {
+    match channel_type {
+        "EMAIL" => "oncall@example.com".to_string(),
+        _ => "+15550198".to_string(),
+    }
+}
+
+/// The longest address `channel_type`'s format admits inside `SimpleAddress`' published
+/// maximum length of 320: an email address at that maximum — a 64-character local part, '@'
+/// and a 255-character domain of four 63-character labels — and, for a telephone channel, '+'
+/// followed by E.164's maximum of 15 digits.
+fn longest_address(channel_type: &str) -> String {
+    match channel_type {
+        "EMAIL" => {
+            let domain = vec!["b".repeat(63); 4].join(".");
+            format!("{}@{domain}", "a".repeat(64))
+        }
+        _ => format!("+{}", "9".repeat(15)),
+    }
 }
 
 /// What a read must report for a channel that carried `name_before`/`address_before` in
@@ -353,7 +372,7 @@ async fn an_update_replaces_the_members_it_names_and_leaves_the_rest() {
             let (contact, channel, status_before) =
                 base_channel(&emulator, "oncall-primary", base).await;
 
-            let patch = (row.patch)(base.name, base.address);
+            let patch = (row.patch)(base.channel_type, base.name, base.address);
             let (status, body) = update(&emulator, &channel, &patch).await;
             assert_eq!(
                 status, 200,
@@ -452,7 +471,7 @@ async fn updates_accumulate_and_applying_one_twice_changes_nothing_more() {
         let case = format!("{case}, at {}", row.case);
         // The row is built against the channel as it stands NOW, so the rows naming "the
         // value it already carries" really do name the current value.
-        let patch = (row.patch)(&name, &address);
+        let patch = (row.patch)(base.channel_type, &name, &address);
         let (expected_name, expected_address, expected_status) =
             expected_after(&name, &address, &patch, &status);
 
@@ -565,7 +584,7 @@ async fn changing_the_delivery_address_requires_activating_the_channel_again() {
         );
 
         // Moving it does.
-        let moved = "moved@example.com";
+        let moved = another_address(base.channel_type);
         let (status, body) = update(
             &emulator,
             &channel,
@@ -585,7 +604,7 @@ async fn changing_the_delivery_address_requires_activating_the_channel_again() {
         );
         assert_eq!(
             stored["DeliveryAddress"]["SimpleAddress"].as_str(),
-            Some(moved),
+            Some(moved.as_str()),
             "case {case:?}: expected the new address to be stored, got {stored:?}"
         );
 
@@ -793,8 +812,12 @@ async fn an_update_of_an_unstored_channel_answers_404() {
         for row in UPDATE_ROWS {
             let case = format!("{target_case}, updated by {}", row.case);
             let before = stored_channels(&emulator);
-            let (status, body) =
-                update(&emulator, target, &(row.patch)(base.name, base.address)).await;
+            let (status, body) = update(
+                &emulator,
+                target,
+                &(row.patch)(base.channel_type, base.name, base.address),
+            )
+            .await;
             assert_eq!(
                 status, 404,
                 "case {case:?}: expected HTTP 404, got {status} {body:?}"
@@ -954,8 +977,12 @@ async fn an_update_is_refused_when_the_account_has_no_active_replication_set() {
                 set_replication_set(&emulator, replication_set.clone());
                 let case = format!("{account_case}, {target_case}, updated by {}", row.case);
 
-                let (status, body) =
-                    update(&emulator, target, &(row.patch)(base.name, base.address)).await;
+                let (status, body) = update(
+                    &emulator,
+                    target,
+                    &(row.patch)(base.channel_type, base.name, base.address),
+                )
+                .await;
                 assert_eq!(
                     status, 400,
                     "case {case:?}: expected the account precondition to answer 400, got \

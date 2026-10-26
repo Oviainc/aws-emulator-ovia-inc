@@ -1582,6 +1582,88 @@ pub fn check_enum(member: &str, value: &str, allowed: &[&str]) -> Result<(), Str
     ))
 }
 
+/// The `ChannelType` values whose delivery address is a telephone number, and the one whose
+/// delivery address is an email address — spelled as the model's own value set
+/// ([`CHANNEL_TYPE_VALUES`]) spells them.
+const CHANNEL_TYPE_SMS: &str = "SMS";
+const CHANNEL_TYPE_VOICE: &str = "VOICE";
+const CHANNEL_TYPE_EMAIL: &str = "EMAIL";
+
+/// The form an `SMS`/`VOICE` channel's delivery address takes, worded as the model documents
+/// it, for the message a mismatched address is refused with.
+const PHONE_NUMBER_FORM: &str = "'+' followed by the country code and phone number";
+
+/// The form an `EMAIL` channel's delivery address takes, worded as the model documents it.
+const EMAIL_ADDRESS_FORM: &str = "a standard email format";
+
+/// The most digits an international telephone number carries after its '+': ITU-T
+/// Recommendation E.164 caps an international public telecommunication number at 15 digits,
+/// country code included.
+const MAX_PHONE_NUMBER_DIGITS: usize = 15;
+
+/// The fewest: a country code (one digit at the least) and one digit of the number it
+/// reaches, since neither alone names a telephone.
+///
+/// No higher floor is imposed: how many digits an assigned number carries is a
+/// numbering-plan question, and the documented form states only that the address is '+',
+/// the country code and the phone number — a plan lookup would refuse numbers the service
+/// accepts.
+const MIN_PHONE_NUMBER_DIGITS: usize = 2;
+
+/// `Ok` when `address` is in the form `channel_type` prescribes, else the
+/// `ValidationException` message naming the member, the address at fault and the form
+/// expected of it.
+///
+/// A channel's delivery address is what Incident Manager engages the contact THROUGH, and
+/// the model documents its format as a function of the channel's `ChannelType`: an `SMS` or
+/// `VOICE` channel carries "'+' followed by the country code and phone number", an `EMAIL`
+/// channel "any standard email format". An address in another form reaches nothing through a
+/// channel of that type, so every operation that writes a channel's address checks it here
+/// and refuses the request rather than storing it.
+///
+/// The email half reads `service_common::email_address`, the workspace's ONE reading of a
+/// caller-supplied email address, so this service and every other agree on the form.
+///
+/// A `channel_type` outside the modelled value set is NOT refused here — that refusal is
+/// [`check_enum`]'s, and a STORED channel always carries a modelled type.
+pub fn check_delivery_address(channel_type: &str, address: &str) -> Result<(), String> {
+    let expected = match channel_type {
+        CHANNEL_TYPE_EMAIL => {
+            if ::service_common::email_address::is_email_address(address) {
+                return Ok(());
+            }
+            EMAIL_ADDRESS_FORM
+        }
+        CHANNEL_TYPE_SMS | CHANNEL_TYPE_VOICE => {
+            if is_international_phone_number(address) {
+                return Ok(());
+            }
+            PHONE_NUMBER_FORM
+        }
+        _ => return Ok(()),
+    };
+    Err(format!(
+        "Value '{address}' at 'deliveryAddress.simpleAddress' failed to satisfy constraint: \
+         Member must be {expected} for a contact channel of type {channel_type}"
+    ))
+}
+
+/// Whether `address` is '+' followed by a country code and a phone number.
+///
+/// The check is on the FORM the model documents, not on a numbering plan: a leading '+', then
+/// decimal digits only, the first of them not `0` (E.164 assigns no country code beginning
+/// with zero), and between [`MIN_PHONE_NUMBER_DIGITS`] and [`MAX_PHONE_NUMBER_DIGITS`] of
+/// them. Whether a well-formed number is assigned to a subscriber is not something the format
+/// decides.
+fn is_international_phone_number(address: &str) -> bool {
+    let Some(digits) = address.strip_prefix('+') else {
+        return false;
+    };
+    (MIN_PHONE_NUMBER_DIGITS..=MAX_PHONE_NUMBER_DIGITS).contains(&digits.len())
+        && digits.bytes().all(|digit| digit.is_ascii_digit())
+        && !digits.starts_with('0')
+}
+
 /// `Ok` when `recurrence` describes a schedule, else the `ValidationException` message
 /// saying why it does not.
 ///

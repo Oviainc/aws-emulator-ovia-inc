@@ -13,6 +13,12 @@
 //! (HTTP 409) naming the channel in use, rather than minting a second channel of that
 //! name.
 //!
+//! A channel's `DeliveryAddress` is what Incident Manager engages the contact through, and
+//! its format is a function of the channel's `Type` (`ContactChannelAddress$SimpleAddress`
+//! documents one per `ChannelType`), so an address in another form is refused with the
+//! modelled `ValidationException` (HTTP 400) naming `deliveryAddress.simpleAddress` instead
+//! of being stored — see [`crate::state::check_delivery_address`].
+//!
 //! The ACCOUNT-level Incident Manager precondition
 //! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
 //! is evaluated FIRST: the channel lives in the Regions of the account's replication set,
@@ -186,7 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_enum, contact_channel_arn, ContactChannelRecord};
+        use crate::state::{
+            check_delivery_address, check_enum, contact_channel_arn, ContactChannelRecord,
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateContactChannelErrorModeled::InternalServerException(
@@ -225,6 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         };
+
+        // The address' FORM is a function of the channel's `Type`: an address in another
+        // form names nothing a channel of that type can engage, so the request is refused
+        // before a channel is minted and before an activation code is delivered to it.
+        check_delivery_address(&input.r#type, &delivery_address).map_err(validation)?;
 
         // The referenced contact is resolved BEFORE any replay: a token does not excuse a
         // `ContactId` that names nothing, so a retry pointed at a different or absent
