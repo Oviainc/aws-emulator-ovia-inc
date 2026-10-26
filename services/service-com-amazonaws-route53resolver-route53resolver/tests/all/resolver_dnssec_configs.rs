@@ -3,6 +3,10 @@
 //! End-to-end tests for the DNSSEC validation slice:
 //! `UpdateResolverDnssecConfig` and `GetResolverDnssecConfig`.
 //!
+//! `ListResolverDnssecConfigs` has its own suite,
+//! [`super::resolver_dnssec_config_listing`], because what it pins is the
+//! paging contract of a `@paginated` list operation.
+//!
 //! Every case goes over the wire the service actually speaks, through the
 //! shared [`super::harness`], so what is asserted is the HTTP behaviour and not
 //! a handler called directly.
@@ -96,6 +100,68 @@ fn assert_config(case: &str, reported: &Value, resource_id: &str, validation_sta
     id
 }
 
+/// Every VPC has a configuration for DNSSEC validation the service maintains
+/// itself: reading one that nothing has written reports validation off,
+/// settled, with an identity that does not move between reads — and the first
+/// update of that VPC reports the very same `Id`.
+///
+/// The table spans what the rule generalises over — the form of the VPC id the
+/// configuration is asked for (`ResourceId`, length 1..64, is the only
+/// constraint the model puts on it): the two id widths EC2 mints, the shortest
+/// and the longest id the model admits, and an id that does not read like one
+/// AWS mints at all.
+#[tokio::test]
+async fn every_vpc_reports_a_dnssec_configuration_with_validation_off() {
+    let cases: Vec<(&str, String)> = vec![
+        ("the 8-hex-digit form", "vpc-1a2b3c4d".to_string()),
+        (
+            "the 17-hex-digit form",
+            "vpc-0abcdef1234567890".to_string(),
+        ),
+        ("one character, the modelled minimum", "v".to_string()),
+        (
+            "64 characters, the modelled maximum",
+            format!("vpc-{}", "0".repeat(60)),
+        ),
+        ("an id in no form AWS mints", "my.private.network".to_string()),
+    ];
+
+    let router = emulator();
+    let mut seen: Vec<(String, String)> = Vec::new();
+
+    for (case, resource_id) in &cases {
+        let reported = get(&router, resource_id).await;
+        let id = assert_config(case, config(&reported), resource_id, DNSSEC_STATUS_DISABLED);
+
+        // A read reports a configuration without creating one, so a second read
+        // of the same VPC answers exactly the same object.
+        let again = get(&router, resource_id).await;
+        assert_eq!(
+            config(&again),
+            config(&reported),
+            "case {case:?}: two reads of one VPC must report the same configuration"
+        );
+
+        // The identity a read reports is the one the configuration keeps: the
+        // first update of that VPC answers with the same `Id`.
+        let updated = update(&router, resource_id, VALIDATION_ENABLE).await;
+        let updated_id = assert_config(case, config(&updated), resource_id, DNSSEC_STATUS_ENABLING);
+        assert_eq!(
+            updated_id, id,
+            "case {case:?}: the first update must keep the Id the read reported, got {updated}"
+        );
+        seen.push((case.to_string(), id));
+    }
+
+    for (case, id) in &seen {
+        let clashes = seen.iter().filter(|(_, other)| other == id).count();
+        assert_eq!(
+            clashes, 1,
+            "case {case:?}: each VPC's configuration carries its own Id, but {id:?} is reported for {clashes} of them"
+        );
+    }
+}
+
 /// One row of the update table: the VPC, the setting the request asks for, and
 /// the pair of statuses the configuration must report for it — the transient
 /// one straight after the call, the settled one once the clock owes the move.
@@ -108,31 +174,34 @@ struct UpdateCase {
     settled: &'static str,
 }
 
-/// An update creates the configuration the VPC had none of, and both the update
-/// and a later read compute every member from that stored record.
+/// An update moves the validation setting of the configuration the VPC already
+/// has, keeping its identity, and both the update and a later read compute every
+/// member from the stored record.
 ///
 /// The table spans what the rule generalises over: each of the three values the
 /// modelled `Validation` enum declares, and a `ResourceId` at both ends of the
 /// member's modelled 1..64 length.
 #[tokio::test]
-async fn an_update_creates_the_configuration_and_is_read_back_from_state() {
+async fn an_update_moves_the_validation_status_and_is_read_back_from_state() {
     let cases = vec![
         UpdateCase {
-            case: "ENABLE on a VPC with no configuration",
+            case: "ENABLE on a VPC at its default",
             resource_id: "vpc-0123456789abcdef0".to_string(),
             validation: VALIDATION_ENABLE,
             in_flight: DNSSEC_STATUS_ENABLING,
             settled: DNSSEC_STATUS_ENABLED,
         },
         UpdateCase {
-            case: "DISABLE on a VPC with no configuration",
+            // Validation off is the setting a VPC at its default already has,
+            // so nothing moves and no transient status appears.
+            case: "DISABLE on a VPC at its default",
             resource_id: "vpc-00000000000000001".to_string(),
             validation: VALIDATION_DISABLE,
-            in_flight: DNSSEC_STATUS_DISABLING,
+            in_flight: DNSSEC_STATUS_DISABLED,
             settled: DNSSEC_STATUS_DISABLED,
         },
         UpdateCase {
-            case: "USE_LOCAL_RESOURCE_SETTING on a VPC with no configuration",
+            case: "USE_LOCAL_RESOURCE_SETTING on a VPC at its default",
             resource_id: "vpc-00000000000000002".to_string(),
             validation: VALIDATION_USE_LOCAL_RESOURCE_SETTING,
             in_flight: DNSSEC_STATUS_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING,
@@ -148,9 +217,9 @@ async fn an_update_creates_the_configuration_and_is_read_back_from_state() {
         UpdateCase {
             case: "a 64-character ResourceId, the maximum of the modelled length",
             resource_id: format!("vpc-{}", "a".repeat(60)),
-            validation: VALIDATION_DISABLE,
-            in_flight: DNSSEC_STATUS_DISABLING,
-            settled: DNSSEC_STATUS_DISABLED,
+            validation: VALIDATION_USE_LOCAL_RESOURCE_SETTING,
+            in_flight: DNSSEC_STATUS_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING,
+            settled: DNSSEC_STATUS_USE_LOCAL_RESOURCE_SETTING,
         },
     ];
 
@@ -158,12 +227,25 @@ async fn an_update_creates_the_configuration_and_is_read_back_from_state() {
     let mut created: Vec<(String, String, &'static str)> = Vec::with_capacity(cases.len());
 
     for case in &cases {
+        let before = get(&router, &case.resource_id).await;
+        let before_id = assert_config(
+            case.case,
+            config(&before),
+            &case.resource_id,
+            DNSSEC_STATUS_DISABLED,
+        );
+
         let updated = update(&router, &case.resource_id, case.validation).await;
         let id = assert_config(
             case.case,
             config(&updated),
             &case.resource_id,
             case.in_flight,
+        );
+        assert_eq!(
+            id, before_id,
+            "case {:?}: an update must not change the configuration's Id, got {updated} after {before}",
+            case.case
         );
 
         // The configuration is persisted, not computed per call: a read
@@ -339,32 +421,8 @@ async fn repeating_an_in_flight_update_does_not_restart_the_clock() {
     );
 }
 
-/// A read of a VPC the store holds no configuration for is refused, and the
-/// refusal is not changed by configurations of other VPCs existing.
-#[tokio::test]
-async fn a_read_of_a_vpc_with_no_configuration_is_refused() {
-    let router = emulator();
-    update(&router, "vpc-configured", VALIDATION_ENABLE).await;
-
-    let cases = [
-        "vpc-never-configured",
-        "v",
-        &format!("vpc-{}", "b".repeat(60)),
-    ];
-    for case in cases {
-        expect_error(
-            &router,
-            "GetResolverDnssecConfig",
-            json!({ "ResourceId": case }),
-            case,
-            "ResourceNotFoundException",
-        )
-        .await;
-    }
-}
-
 /// A `Validation` the modelled enum does not declare is refused, and the refusal
-/// writes nothing: the VPC still has no configuration afterwards.
+/// writes nothing: the VPC still reports the configuration it had.
 #[tokio::test]
 async fn a_validation_outside_the_modelled_enum_is_refused() {
     let router = emulator();
@@ -386,15 +444,10 @@ async fn a_validation_outside_the_modelled_enum_is_refused() {
             "ValidationException",
         )
         .await;
-        // The refusal wrote nothing: the VPC still has no configuration.
-        expect_error(
-            &router,
-            "GetResolverDnssecConfig",
-            json!({ "ResourceId": "vpc-refused" }),
-            case,
-            "ResourceNotFoundException",
-        )
-        .await;
+        // The refusal wrote nothing: the VPC still reports validation off, the
+        // setting it had before the refused call.
+        let read = get(&router, "vpc-refused").await;
+        assert_config(case, config(&read), "vpc-refused", DNSSEC_STATUS_DISABLED);
     }
 
     // Every value the enum does declare is accepted on that same VPC.
